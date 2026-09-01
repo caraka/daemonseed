@@ -125,6 +125,24 @@ pub enum ContactCacheError {
         first_seen_ms: i64,
         last_seen_ms: i64,
     },
+    /// `ss0` is all zeroes, which no key agreement produces.
+    ///
+    /// **Refused because a record's `ss0` is load-bearing beyond decryption.**
+    /// `AR` descends from it, and
+    /// [`ContactRecord::addresses_same_channel`] reads that root to tell a
+    /// correspondent's lost at-rest state from an introduction re-seeded (#261).
+    /// A placeholder record therefore does not merely fail to decrypt — it
+    /// derives a root no correspondent can ever present, so every knock from
+    /// that identity reads as state loss and irreversibly ends its queue.
+    ///
+    /// **This refuses the placeholder, not every wrong secret**, and the
+    /// distinction is honest: a record cannot check that its `ss0` is the one
+    /// the correspondent holds, because nothing at rest witnesses that. All
+    /// zeroes is the pattern a caller reaches for when it means *not filled in
+    /// yet*, and this type has no such state — the same argument as
+    /// [`Self::TimestampsOutOfOrder`], which refuses a self-contradicting record
+    /// at construction rather than leaving it for a validator.
+    PlaceholderSecret,
 }
 
 impl std::fmt::Display for ContactCacheError {
@@ -145,6 +163,10 @@ impl std::fmt::Display for ContactCacheError {
                 f,
                 "the contact was last seen at {last_seen_ms}, before it was first \
                  seen at {first_seen_ms}"
+            ),
+            Self::PlaceholderSecret => f.write_str(
+                "the contact record's shared secret is all zeroes, which is a placeholder \
+                 rather than a key agreement's output",
             ),
         }
     }
@@ -196,7 +218,8 @@ impl ContactRecord {
     ///
     /// Refuses `last_seen_ms < first_seen_ms`: the two are one fact about a span
     /// of time, and a span that ends before it starts is not a record to be
-    /// checked later but a record that must not be built.
+    /// checked later but a record that must not be built. Refuses an all-zero
+    /// `ss0` for the same reason — see [`ContactCacheError::PlaceholderSecret`].
     ///
     /// `ss0` arrives already wrapped so it can be *moved* in. Taking a bare
     /// `[u8; SS0_LEN]` would copy it at the call site and leave that copy live
@@ -213,6 +236,11 @@ impl ContactRecord {
                 first_seen_ms,
                 last_seen_ms,
             });
+        }
+        // Not a constant-time comparison: the pattern being refused is the one
+        // value that is not a secret at all.
+        if ss0.iter().all(|b| *b == 0) {
+            return Err(ContactCacheError::PlaceholderSecret);
         }
         Ok(Self {
             pk_lt,
@@ -291,6 +319,52 @@ impl ContactRecord {
     /// and keeps it in memory only.
     pub fn address_root(&self) -> Result<[u8; ROOT_LEN], FirstContactError> {
         Ok(derive_channel_roots(&self.ss0)?.ar)
+    }
+
+    /// Whether `ar` addresses the channel this record already holds (#261).
+    ///
+    /// **The fact that separates a correspondent's lost state from their
+    /// restart, and it is the only one at rest that can.** `AR` descends from
+    /// `ss0`, `ss0` is encapsulated afresh for every first-contact entry, and
+    /// this record is written from the entry that opened the correspondence. So
+    /// an entry arriving under the recorded root is the *same* introduction —
+    /// the sender re-seeding it on the schedule, which the design requires them
+    /// to do until they see evidence of establishment, and which therefore keeps
+    /// arriving for up to seven days after a first contact that worked
+    /// perfectly. An entry under a different root is a *new* `ss0`, which a
+    /// correspondent who still held their at-rest state would never mint:
+    /// re-establishment after a restart is an ordinary frame on the channel
+    /// plane, addressed under the `AR` they still have.
+    ///
+    /// A restart therefore cannot reach the false branch, and a re-seed cannot
+    /// either — which is the whole reason this compares roots rather than merely
+    /// noticing that a known identity knocked.
+    ///
+    /// **Not a constant-time comparison, and it does not need to be.** `ar` is
+    /// derived from an `ss0` its sender chose and already knows, so the only
+    /// party who can drive this comparison learns nothing from its timing that
+    /// the return value does not state outright. `ss0` itself is never compared.
+    ///
+    /// # The invariant this assumes, which nothing enforces
+    ///
+    /// **One at-rest store per `pk_lt`.** A second device belonging to the same
+    /// correspondent would knock with a fresh `ss0` while the first device's
+    /// channel is perfectly alive: `pk_lt` is mnemonic-derived and identical
+    /// across a user's devices, while the doorbell slot secret is deliberately
+    /// *not* multi-device-consistent (`docs/design/direct-messaging.md`, the
+    /// 2026-07-28 note on the identity-scoped slot label). A caller acting on
+    /// this predicate would then mark pending frames the first device can still
+    /// collect as undelivered — irreversibly, since that transition is terminal.
+    ///
+    /// **Not a defect today: M11 records that the recovery-phrase model recovers
+    /// identity but not DM reachability**, so a second device has no live
+    /// channel to contradict. It becomes one the day multi-device lands, and the
+    /// fix is a design question rather than a predicate change — this comparison
+    /// has no way to tell a second device from a restored one, because at rest
+    /// there is nothing that distinguishes them. **Multi-device support must
+    /// revisit this before it ships.**
+    pub fn addresses_same_channel(&self, ar: &[u8; ROOT_LEN]) -> Result<bool, FirstContactError> {
+        Ok(self.address_root()? == *ar)
     }
 
     /// The at-rest form, for [`crate::storage::dm_store`] to seal.
@@ -556,7 +630,7 @@ mod tests {
         let sparse = ContactRecord::new(
             Box::new([0u8; ml_dsa::PK_LEN]),
             Box::new([0u8; ml_dsa::PK_LEN]),
-            Zeroizing::new([0u8; SS0_LEN]),
+            Zeroizing::new([0x01u8; SS0_LEN]),
             0,
             0,
         )
@@ -747,5 +821,86 @@ mod tests {
         // Positive control: restored, the same bytes decode.
         bytes[0] = CONTACT_RECORD_VERSION;
         assert!(ContactRecord::decode(&bytes).is_ok());
+    }
+
+    /// **The predicate that separates a correspondent's lost state from their
+    /// restart, checked in both directions.**
+    ///
+    /// The mirror control is what makes it a predicate rather than a constant: a
+    /// body of `Ok(false)` fires on every re-seed and marks live messages
+    /// undelivered, and a body of `Ok(true)` never fires at all — one of the two
+    /// assertions below kills each.
+    #[test]
+    fn a_record_recognises_its_own_channel_and_no_other() {
+        let r = record();
+        let mine = r.address_root().expect("derives");
+        assert!(
+            r.addresses_same_channel(&mine).expect("derives"),
+            "a record did not recognise its own address root"
+        );
+
+        // A different `ss0`, which is the only way a different root arises, and
+        // is what a correspondent who lost their at-rest state mints.
+        let mut other_secret = ss0();
+        other_secret[0] ^= 0xAA;
+        let other = ContactRecord::new(
+            pk(0x01),
+            pk(0x80),
+            Zeroizing::new(other_secret),
+            FIRST_SEEN,
+            LAST_SEEN,
+        )
+        .expect("ordered timestamps")
+        .address_root()
+        .expect("derives");
+        assert_ne!(mine, other, "the fixture built two equal roots");
+        assert!(
+            !r.addresses_same_channel(&other).expect("derives"),
+            "a record claimed a channel it does not hold"
+        );
+
+        // The identity keys are equal across the two records, so this reads
+        // `ss0` and nothing else — a predicate comparing `pk_lt` would pass both
+        // assertions above only by never firing on the case #261 exists for.
+    }
+
+    /// **A placeholder `ss0` is refused at both doors**, because a record
+    /// carrying one derives a root no correspondent can present — so every knock
+    /// from that identity would read as lost at-rest state and irreversibly end
+    /// its queue (#261).
+    ///
+    /// The control is the neighbouring non-zero secret: a refusal that fired on
+    /// any low-entropy value, or on nothing at all, fails one of the two halves.
+    #[test]
+    fn a_placeholder_shared_secret_is_refused_at_both_doors() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let build = |secret: [u8; SS0_LEN]| {
+            ContactRecord::new(pk(0x01), pk(0x80), Zeroizing::new(secret), 0, 0)
+        };
+
+        // Control: one bit away from the refused pattern, and accepted.
+        let mut nearly = [0u8; SS0_LEN];
+        nearly[SS0_LEN - 1] = 1;
+        let good = build(nearly).expect("a real secret was refused");
+
+        assert_eq!(
+            build([0u8; SS0_LEN]).expect_err("a placeholder secret was accepted"),
+            ContactCacheError::PlaceholderSecret
+        );
+
+        // The at-rest door, over bytes that never went through `new` — which is
+        // the one that matters, since a placeholder on disk is what a future
+        // writer would leave behind.
+        let mut bytes = good.encode().to_vec();
+        let at = 1 + 2 * ml_dsa::PK_LEN;
+        bytes[at..at + SS0_LEN].fill(0);
+        assert_eq!(
+            ContactRecord::decode(&Zeroizing::new(bytes)).expect_err("decode accepted one"),
+            ContactCacheError::PlaceholderSecret
+        );
+
+        // And it says so, rather than only having a name.
+        let said = ContactCacheError::PlaceholderSecret.to_string();
+        assert!(said.contains("placeholder"), "unhelpful rendering: {said}");
     }
 }

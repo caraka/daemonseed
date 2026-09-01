@@ -739,17 +739,18 @@ impl Teardown {
 
     /// The trust event this teardown must be surfaced as.
     ///
-    /// The taxonomy is the loudness. Both keys are
+    /// The taxonomy is the loudness. Every key here is
     /// [`PersistentNonBlocking`](crate::trust_events::TrustEventClass::PersistentNonBlocking),
     /// so each reappears at every start until acted on and each is written to the
     /// audit log — and ISC-A-C12 forbids a client suppressing or down-classing
-    /// either. A returned value a caller could ignore would not be a fix; a
+    /// any of them. A returned value a caller could ignore would not be a fix; a
     /// classed event it is forbidden to ignore is.
     pub fn event(&self) -> TrustEventKey {
         match self.cause {
             TeardownCause::NoProvisionalRecord => TrustEventKey::DmChannelTornDownOnRestart,
             TeardownCause::RecordUnusable(_) => TrustEventKey::DmProvisionalHandshakeLost,
             TeardownCause::StoreUnreadable(_) => TrustEventKey::DmProvisionalRecordUnreadable,
+            TeardownCause::CorrespondentStateLost => TrustEventKey::DmCorrespondentStateLost,
         }
     }
 }
@@ -776,6 +777,44 @@ impl std::fmt::Display for Teardown {
                  storage, so this conversation is not open yet; it is most likely still \
                  there and will be tried again next time: {e}"
             ),
+            // The one string here that does NOT promise messages keep trying,
+            // because under this cause they provably cannot. Says so plainly
+            // rather than leaving the user to infer it from a queue that has
+            // stopped moving.
+            TeardownCause::CorrespondentStateLost => write!(
+                f,
+                "the other person's app lost this conversation and has started a new \
+                 one; messages that had not reached them yet cannot be delivered on \
+                 the old conversation and have to be sent again"
+            ),
+        }
+    }
+}
+
+impl Teardown {
+    /// The teardown a correspondent's lost at-rest state produces (#261).
+    ///
+    /// **The second door into this type, and it is deliberately narrow.** The
+    /// invariant is that holding a [`Teardown`] means the decision was actually
+    /// taken, not that [`restart`] took it — and this decision is taken
+    /// elsewhere, because its evidence is a first-contact entry rather than a
+    /// stored record. `pub(crate)` so the only caller is
+    /// `DmPersist::correspondent_state_lost`, which owns the predicate.
+    ///
+    /// **What that does and does not guarantee, stated exactly.** It gates this
+    /// *type*: a [`Teardown`] carrying this cause was produced by the one place
+    /// holding the evidence, so the user-facing statement and the trust event
+    /// cannot be minted from a hunch. It does **not** gate the *effect* —
+    /// [`TeardownCause`] and
+    /// [`Outbox::channel_torn_down`](crate::dm::outbox::Outbox::channel_torn_down)
+    /// are both public, so anything holding an outbox can apply the behaviour
+    /// without coming through here. That is deliberate rather than an oversight:
+    /// the outbox is a data structure and a constructor is not a capability
+    /// check. What stops a queue being ended wrongly is the predicate, not this
+    /// visibility.
+    pub(crate) fn correspondent_state_lost() -> Self {
+        Self {
+            cause: TeardownCause::CorrespondentStateLost,
         }
     }
 }
@@ -804,6 +843,23 @@ pub enum TeardownCause {
     /// filesystem fault. Here the channel still does not open, and that is
     /// honest, but nothing is declared lost and nothing is asked of the user.
     StoreUnreadable(String),
+    /// The correspondent lost their at-rest state and came back under a fresh
+    /// first contact (#261).
+    ///
+    /// **The only cause here that is not about this client's own storage**, and
+    /// that is what makes it the one cause under which queued messages stop. The
+    /// other three describe a record *we* could not resume; the correspondence's
+    /// addressing survives all of them, because a page address is
+    /// `HKDF(AR ‖ dir ‖ page)` and `AR` descends from the `ss0` the contact cache
+    /// holds. Under this cause the peer holds neither: they minted a new `ss0`,
+    /// so they cannot derive the record our pending frames were published to, and
+    /// their receive chain is gone, so those frames would not open if they could.
+    ///
+    /// Constructed only from an opened, verified first-contact entry whose
+    /// address root differs from the one already recorded for that identity — see
+    /// `DmPersist::correspondent_state_lost`. Nothing that a mere restart can
+    /// produce reaches it.
+    CorrespondentStateLost,
 }
 
 /// Decide what a channel does at startup, from whatever its store held for it.
@@ -1352,6 +1408,67 @@ mod tests {
     }
 
     // ---- the loud teardown ---------------------------------------------------
+
+    /// **`restart` cannot mint [`TeardownCause::CorrespondentStateLost`], on any
+    /// input.**
+    ///
+    /// That cause is a statement about the *correspondent's* store, and its
+    /// evidence is an opened first-contact entry — something `restart` never
+    /// sees. If it could arise here, our own restart would end every pending
+    /// message the way #261 ends them, which is the exact harm the split exists
+    /// to prevent: a restart keeps its sealed frames trying to arrive.
+    ///
+    /// Every teardown-producing input is driven, so this guards the function
+    /// rather than restating one arm of it. Making any arm produce the fourth
+    /// cause fails here.
+    #[test]
+    fn a_restart_can_never_produce_the_correspondent_state_loss_cause() {
+        let key = key();
+        let mut tampered = record().seal(&key, &ctx()).expect("seals");
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+
+        let inputs: Vec<(&str, ChannelRestart)> = vec![
+            (
+                "an absent record",
+                restart(Ok::<_, std::io::Error>(None), &key, &ctx()),
+            ),
+            (
+                "an unusable record",
+                restart(Ok::<_, std::io::Error>(Some(&tampered)), &key, &ctx()),
+            ),
+            (
+                "an unreadable store",
+                restart(
+                    Err(std::io::Error::other("EIO")) as Result<Option<&[u8]>, _>,
+                    &key,
+                    &ctx(),
+                ),
+            ),
+        ];
+
+        let mut torn = 0;
+        for (what, outcome) in inputs {
+            let t = match outcome {
+                ChannelRestart::TornDown(t) => t,
+                ChannelRestart::HandshakeResumes(_) => panic!("{what} resumed a handshake"),
+            };
+            torn += 1;
+            assert_ne!(
+                t.cause(),
+                &TeardownCause::CorrespondentStateLost,
+                "{what} produced a cause only a correspondent's lost state may produce"
+            );
+            assert_ne!(
+                t.event(),
+                TrustEventKey::DmCorrespondentStateLost,
+                "{what} would tell the user their correspondent lost their state"
+            );
+        }
+        // The loop really ran: three inputs, three teardowns. Without this a
+        // fixture that resumed everything would assert nothing and pass.
+        assert_eq!(torn, 3, "an input did not tear the channel down");
+    }
 
     /// **The oracle for #243.** An established channel has no provisional record,
     /// and what it gets instead of a silent rebuild is a teardown that carries a

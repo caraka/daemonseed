@@ -105,8 +105,8 @@ use zeroize::Zeroizing;
 
 use crate::dm::block_list::{BlockList, BlockListError};
 use crate::dm::contact_cache::{ContactCacheError, ContactRecord};
-use crate::dm::firstcontact::{FirstContactError, ROOT_LEN};
-use crate::dm::outbox::{Outbox, OutboxError};
+use crate::dm::firstcontact::{FirstContactError, ROOT_LEN, VerifiedFirstContact};
+use crate::dm::outbox::{Outbox, OutboxError, TeardownOutcome};
 use crate::dm::provisional::{
     ChannelRestart, ProvisionalError, ProvisionalRecord, ReceiveCursor, RecordContext, Teardown,
     derive_seal_key, restart,
@@ -196,6 +196,14 @@ pub enum DmPersistError {
     /// is what says the store needs attention and reveals nothing the caller did
     /// not already supply.
     AmbiguousCorrespondent { matches: usize },
+    /// A channel root could not be derived from a stored contact record.
+    ///
+    /// The store read fine; the crypto module or the KDF underneath it did not.
+    /// Its own variant rather than folded into [`Self::Contact`], which means the
+    /// bytes would not decode — a record that decoded and then failed to derive
+    /// is a fault in this process, not in what is on disk, and the remedy
+    /// differs.
+    FirstContact(FirstContactError),
 }
 
 impl std::fmt::Display for DmPersistError {
@@ -228,6 +236,7 @@ impl std::fmt::Display for DmPersistError {
                 "{matches} correspondences hold the same long-term identity key, \
                  so there is no single correspondence for it"
             ),
+            Self::FirstContact(e) => write!(f, "channel roots: {e}"),
         }
     }
 }
@@ -242,6 +251,7 @@ impl std::error::Error for DmPersistError {
             Self::Contact(e) => Some(e),
             Self::BlockList(e) => Some(e),
             Self::Ratchet(e) => Some(e),
+            Self::FirstContact(e) => Some(e),
             Self::BlockListMissing
             | Self::OutboxDirectionMismatch { .. }
             | Self::CursorNotCorroborated { .. }
@@ -289,6 +299,12 @@ impl From<OutboxError> for DmPersistError {
 impl From<RatchetError> for DmPersistError {
     fn from(e: RatchetError) -> Self {
         Self::Ratchet(e)
+    }
+}
+
+impl From<FirstContactError> for DmPersistError {
+    fn from(e: FirstContactError) -> Self {
+        Self::FirstContact(e)
     }
 }
 
@@ -1072,6 +1088,96 @@ impl DmPersist {
         }
     }
 
+    /// Answer an opened first-contact entry against what is already on disk, and
+    /// stop the outbox where that entry means the correspondent lost their
+    /// at-rest state (#261).
+    ///
+    /// **The signal, and why the doorbell carries it.** A first-contact entry is
+    /// evidence of establishment in the other direction (`docs/design/
+    /// direct-messaging.md` § Task 2), so a fresh one from an identity we already
+    /// hold a correspondence with is the one thing an established correspondent
+    /// has no reason to send. Re-establishment after a restart is an ordinary
+    /// frame on the channel plane, addressed under the `AR` a restart keeps.
+    ///
+    /// **A restart cannot reach the acting branch, and neither can a re-seed.**
+    /// The predicate is [`ContactRecord::addresses_same_channel`], not the mere
+    /// existence of a correspondence, and the difference is not caution: the
+    /// design has first-contact messages re-seeding on the full schedule until
+    /// evidence of establishment, so entries from an introduction that *worked*
+    /// keep arriving for up to seven days afterwards. Firing on those would mark
+    /// live messages undelivered on a healthy correspondence — the same harm as
+    /// firing on a restart, arriving by a route a "did a known identity knock?"
+    /// test would not see. A re-seed carries the recorded `ss0` and so the
+    /// recorded root; only a new `ss0` yields a new one.
+    ///
+    /// **[`DmPersistError::AmbiguousCorrespondent`] fails closed and marks
+    /// nothing**, which is the answer this path adds to that variant's own
+    /// refusal to guess. Ending an entry is terminal —
+    /// [`Outbox::channel_torn_down`] skips non-pending entries, so a later
+    /// correct answer cannot revive one — and with two correspondences holding
+    /// one identity key there is no way to say which one's queue belongs to the
+    /// lost state. Acting on both would declare a healthy correspondence's
+    /// messages undelivered; acting on either would do it by a coin toss the
+    /// caller cannot see. Refusing costs only the optimisation: the entries fall
+    /// back to the seven-day give-up, which is wasteful and never false.
+    ///
+    /// **What the user is told, and by what route.** The entries reach
+    /// [`Lifecycle::Undelivered`](crate::dm::outbox::Lifecycle::Undelivered) —
+    /// the same terminal state the give-up produces, because it is the same
+    /// truth — and the *reason* travels beside them in the returned
+    /// [`Teardown`], whose
+    /// [`TrustEventKey`](crate::trust_events::TrustEventKey) and user-facing text
+    /// are its own. The reason is deliberately not stored on the entry: a
+    /// lifecycle carrying a cause would be a new tag in the outbox's at-rest
+    /// encoding, and #235 asks for delivery states that are true, not for a
+    /// delivery queue that is also a history.
+    ///
+    /// Touches the outbox and nothing else. The new first contact is a separate
+    /// offer, accepted or declined on its own terms, and no pending frame is
+    /// migrated onto it — they are sealed under a chain it does not have.
+    ///
+    /// `direction` names this side's outbox, as [`Self::update_outbox`] requires.
+    #[must_use = "the surfaced sequences are what the user is owed; dropping them abandons silently"]
+    pub fn correspondent_state_lost(
+        &self,
+        knock: &VerifiedFirstContact,
+        direction: Direction,
+        now_ms: i64,
+    ) -> Result<StateLoss, DmPersistError> {
+        let Some(correspondence) = self.correspondence_for_pk_lt(knock.pk_lt())? else {
+            return Ok(StateLoss::NoCorrespondence);
+        };
+        // Present by construction: `correspondence_for_pk_lt` matched on a
+        // contact record, and it propagates rather than skipping one that will
+        // not decode. A concurrent writer could still have removed it between the
+        // two reads, and that reads as "no correspondence to act on" — the same
+        // conservative answer as never having found one.
+        let Some(contact) = self.read_contact(&correspondence)? else {
+            return Ok(StateLoss::NoCorrespondence);
+        };
+        if contact.addresses_same_channel(&knock.roots().ar)? {
+            return Ok(StateLoss::SameChannel(correspondence));
+        }
+        let teardown = Teardown::correspondent_state_lost();
+        let outcome = self.update_outbox(&correspondence, direction, now_ms, |outbox| {
+            let outcome = outbox.channel_torn_down(teardown.cause(), now_ms);
+            // Nothing surfaced means no entry was pending, which under this cause
+            // means nothing changed at all — this arm ends every pending entry,
+            // so it leaves none behind in `retained`. `Unchanged` then spends no
+            // seal on a correspondence with an idle queue.
+            Ok(if outcome.surfaced.is_empty() {
+                Mutation::Unchanged(outcome)
+            } else {
+                Mutation::Changed(outcome)
+            })
+        })?;
+        Ok(StateLoss::Confirmed {
+            correspondence,
+            teardown,
+            outcome,
+        })
+    }
+
     /// Load the contact record, let `f` change it, and write it back — all under
     /// one lock.
     ///
@@ -1292,6 +1398,39 @@ fn decode_cursor(raw: &[u8], read_through: u64) -> Result<ReceiveCursor, DmPersi
         .ok_or(DmPersistError::CursorNotCorroborated { read_through })
 }
 
+/// What an opened first-contact entry meant for what is already on disk (#261).
+///
+/// Three facts, three answers, for [`DmPersist::restart_channel`]'s reason: a
+/// two-valued "was this state loss?" would have to fold *this identity is not
+/// known* together with *this is the introduction we already accepted, arriving
+/// again*, and those two differ in everything a caller does next.
+///
+/// A [`DmPersistError::AmbiguousCorrespondent`] is not a fourth arm here. It is
+/// the error, deliberately: see [`DmPersist::correspondent_state_lost`].
+#[derive(Debug)]
+#[must_use = "an unread answer leaves the pending queue's fate undecided"]
+pub enum StateLoss {
+    /// No correspondence holds this identity — an ordinary first contact from a
+    /// stranger, and nothing at rest is affected.
+    NoCorrespondence,
+    /// The entry addresses the channel already recorded for this identity, so it
+    /// is the introduction that established it, re-seeded. **Not state loss**,
+    /// and nothing was touched.
+    SameChannel(CorrespondenceLabel),
+    /// A known correspondent knocked under a channel we do not hold: their
+    /// at-rest state is gone. Every pending entry in `outcome.surfaced` is now
+    /// [`Lifecycle::Undelivered`](crate::dm::outbox::Lifecycle::Undelivered) and
+    /// is owed to the user, with `teardown` carrying why.
+    Confirmed {
+        /// The correspondence whose queue was stopped.
+        correspondence: CorrespondenceLabel,
+        /// The ending, for its trust event and its user-facing text.
+        teardown: Teardown,
+        /// What the outbox did. `retained` is empty under this cause.
+        outcome: TeardownOutcome,
+    },
+}
+
 /// What a stored channel does at startup — [`ChannelRestart`], with the
 /// resumption arm carrying its store.
 ///
@@ -1416,7 +1555,7 @@ mod tests {
 
     use crate::crypto::suite::Registry;
     use crate::dm::contact_cache::{CONTACT_RECORD_LEN, CONTACT_RECORD_VERSION};
-    use crate::dm::firstcontact::SS0_LEN;
+    use crate::dm::firstcontact::{SS0_LEN, VerifiedFirstContact, derive_channel_roots};
     use crate::dm::keyrec;
     use crate::dm::outbox::{DeliveryState, OUTBOX_MAGIC, OutboxTarget, SealedFrame, Surfacing};
     use crate::dm::paging::MAX_PAGE;
@@ -1424,6 +1563,7 @@ mod tests {
     use crate::dm::ratchet::EphemeralDecapKey;
     use crate::dm::resume::SendFloor;
     use crate::storage::dm_store::CORRESPONDENCE_LABEL_LEN;
+    use crate::trust_events::TrustEventKey;
 
     const AT_REST: [u8; AEAD_KEY_LEN] = [0x7Eu8; AEAD_KEY_LEN];
 
@@ -4219,5 +4359,407 @@ mod tests {
             p.update_block_list(|list| Ok(list.len())),
             Err(DmPersistError::BlockListMissing)
         ));
+    }
+
+    // ---- state loss versus restart (#261) ----------------------------------
+
+    /// The `ss0` a contact record built by `contact_tagged` holds, so a knock can
+    /// be built to match one or to differ from it deliberately.
+    fn ss0_tagged(tag: u8) -> [u8; SS0_LEN] {
+        let mut out = ss0();
+        out[0] ^= tag;
+        out
+    }
+
+    /// An opened first-contact entry from the identity `pk(tag)`, carrying
+    /// `secret` as its encapsulated `ss0`.
+    ///
+    /// The roots are derived from that secret rather than passed in, because it
+    /// is exactly their agreement with `ss0` that the predicate reads; a fixture
+    /// free to disagree could pass while the production derivation was wrong.
+    fn knock(tag: u8, secret: [u8; SS0_LEN]) -> VerifiedFirstContact {
+        let roots = derive_channel_roots(&secret).expect("roots");
+        let mut ek = vec![0u8; oxicrypt_ml_kem::EK_LEN].into_boxed_slice();
+        for (i, b) in ek.iter_mut().enumerate() {
+            *b = tag.wrapping_add((i as u8).wrapping_mul(5));
+        }
+        VerifiedFirstContact::new_for_test(
+            pk(tag),
+            pk(tag.wrapping_add(0x7F)),
+            ek.try_into().expect("allocated at EK_LEN"),
+            0,
+            FIRST_SEEN,
+            "hello again".to_string(),
+            secret,
+            roots,
+        )
+    }
+
+    /// One unsealed entry and one sealed one, the two shapes a teardown parts.
+    fn seed_two_pending(p: &DmPersist, l: &CorrespondenceLabel, now: i64) {
+        p.update_outbox(l, Direction::AToB, now, |outbox| {
+            outbox.enqueue_awaiting_key(1, OutboxTarget::ChannelPage, now)?;
+            outbox.enqueue_sealed(
+                2,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![0x5C; 8]),
+            )?;
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+    }
+
+    /// Both entries as the store holds them, so an assertion reads what was
+    /// persisted rather than what an in-memory outbox was left saying.
+    fn stored_states(p: &DmPersist, l: &CorrespondenceLabel, now: i64) -> Vec<DeliveryState> {
+        let ob = p.read_outbox(l, now).expect("reads").expect("present");
+        [1u64, 2]
+            .into_iter()
+            .map(|seq| ob.entry(seq).expect("the entry").delivery_state())
+            .collect()
+    }
+
+    /// **A known correspondent knocking under a channel we do not hold stops the
+    /// queue at once — both entry shapes, sealed included.**
+    ///
+    /// The sealed half is the whole of #261: every other teardown keeps a sealed
+    /// frame re-seeding, because the correspondent can still derive its address
+    /// and still open it. Here they can do neither.
+    #[test]
+    fn a_fresh_channel_from_a_known_correspondent_ends_every_pending_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0xB1);
+        let now = FIRST_SEEN;
+
+        seed_contact(&p, &l, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        seed_two_pending(&p, &l, now);
+        assert_eq!(
+            stored_states(&p, &l, now),
+            vec![DeliveryState::Composed, DeliveryState::Composed],
+            "the fixture did not start pending"
+        );
+
+        // A different `ss0` from the same identity: they minted a new one, which
+        // only a correspondent who lost their at-rest state does.
+        let fresh = knock(0x01, ss0_tagged(0xAA));
+        let (correspondence, teardown, outcome) =
+            match p.correspondent_state_lost(&fresh, Direction::AToB, now) {
+                Ok(StateLoss::Confirmed {
+                    correspondence,
+                    teardown,
+                    outcome,
+                }) => (correspondence, teardown, outcome),
+                other => panic!("a fresh channel was not read as state loss: {other:?}"),
+            };
+
+        assert_eq!(correspondence, l);
+        assert_eq!(outcome.surfaced, vec![1, 2]);
+        assert!(
+            outcome.retained.is_empty(),
+            "an entry was left re-seeding into an address that cannot be read"
+        );
+        assert_eq!(
+            teardown.event(),
+            TrustEventKey::DmCorrespondentStateLost,
+            "the user would be told the wrong thing about why this stopped"
+        );
+
+        // Persisted, not merely returned — the whole point of the persist-side
+        // call, and what stops the re-seed surviving the next load.
+        assert_eq!(
+            stored_states(&p, &l, now),
+            vec![DeliveryState::Undelivered, DeliveryState::Undelivered]
+        );
+        let reloaded = p.read_outbox(&l, now).expect("reads").expect("present");
+        for seq in [1u64, 2] {
+            let entry = reloaded.entry(seq).expect("the entry");
+            assert!(
+                !entry.is_due(now + 7 * DAY_MS),
+                "entry {seq} is still due to be re-seeded"
+            );
+            assert_eq!(
+                entry.surfacing(),
+                Surfacing::Owed,
+                "entry {seq} stopped without anything owed to the user"
+            );
+        }
+    }
+
+    /// **The restart control: a correspondent who kept their at-rest state
+    /// cannot reach the acting branch, and their queue is untouched.**
+    ///
+    /// A restart re-establishes on the channel plane under the `AR` it still
+    /// holds, so the only first-contact entry it can produce is the *same* entry
+    /// re-seeded — which the design has it doing on the full schedule until it
+    /// sees evidence of establishment, for up to seven days after an
+    /// introduction that worked. Firing on that would mark live messages
+    /// undelivered on a healthy correspondence.
+    ///
+    /// The two knocks differ only in `ss0`, so a predicate that fired on "a
+    /// known identity knocked" passes the test above and fails here.
+    #[test]
+    fn a_reseeded_entry_from_an_established_correspondent_is_not_state_loss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0xB2);
+        let now = FIRST_SEEN;
+
+        seed_contact(&p, &l, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        seed_two_pending(&p, &l, now);
+
+        // The same `ss0` the record was written from: the introduction we
+        // already accepted, arriving again.
+        let reseed = knock(0x01, ss0_tagged(0x01));
+        match p.correspondent_state_lost(&reseed, Direction::AToB, now) {
+            Ok(StateLoss::SameChannel(named)) => assert_eq!(named, l),
+            other => panic!("a re-seed was read as state loss: {other:?}"),
+        }
+        assert_eq!(
+            stored_states(&p, &l, now),
+            vec![DeliveryState::Composed, DeliveryState::Composed],
+            "a re-seed ended a live message"
+        );
+
+        // And our own restart, the other thing that must not fire: the teardown
+        // it produces keeps every sealed frame trying to arrive.
+        let torn = p
+            .update_outbox(&l, Direction::AToB, now, |outbox| {
+                Ok(Mutation::Changed(outbox.channel_torn_down(
+                    &TeardownCause::NoProvisionalRecord,
+                    now,
+                )))
+            })
+            .expect("tears down");
+        assert_eq!(
+            torn.retained,
+            vec![2],
+            "our own restart abandoned a sealed frame"
+        );
+        assert_eq!(
+            stored_states(&p, &l, now),
+            vec![DeliveryState::Undelivered, DeliveryState::Composed],
+            "our own restart did not leave the sealed frame alone"
+        );
+    }
+
+    /// **An identity no correspondence holds touches nothing.** An ordinary
+    /// first contact from a stranger, which is most of them.
+    #[test]
+    fn a_first_contact_from_an_unknown_identity_is_not_state_loss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0xB3);
+        let now = FIRST_SEEN;
+
+        seed_contact(&p, &l, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        seed_two_pending(&p, &l, now);
+
+        let stranger = knock(0x40, ss0_tagged(0x40));
+        match p.correspondent_state_lost(&stranger, Direction::AToB, now) {
+            Ok(StateLoss::NoCorrespondence) => {}
+            other => panic!("a stranger was read as a correspondent: {other:?}"),
+        }
+        assert_eq!(
+            stored_states(&p, &l, now),
+            vec![DeliveryState::Composed, DeliveryState::Composed],
+            "a stranger's knock ended someone else's messages"
+        );
+    }
+
+    /// **Two correspondences holding one identity key stop nothing at all.**
+    ///
+    /// Failing closed: ending an entry is terminal, so a wrong guess here cannot
+    /// be undone by a later correct answer, and there is nothing in the store
+    /// that says which queue belongs to the lost state. Refusing costs only the
+    /// optimisation — both queues fall back to the give-up.
+    #[test]
+    fn an_ambiguous_correspondent_stops_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let (one, two) = (label(0xB4), label(0xB5));
+        let now = FIRST_SEEN;
+
+        seed_contact(&p, &one, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        seed_two_pending(&p, &one, now);
+        seed_two_pending(&p, &two, now);
+
+        // Positive control: with one holder the call really does act, so the
+        // refusal below is the duplicate rather than a fixture that never fired.
+        let fresh = knock(0x01, ss0_tagged(0xAA));
+        assert!(matches!(
+            p.correspondent_state_lost(&fresh, Direction::AToB, now),
+            Ok(StateLoss::Confirmed { .. })
+        ));
+
+        // Re-seed the first queue and add the duplicate holder.
+        p.update_outbox(&one, Direction::AToB, now, |outbox| {
+            outbox.enqueue_sealed(
+                3,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![0x77; 4]),
+            )?;
+            Ok(Mutation::Changed(()))
+        })
+        .expect("seeds");
+        seed_contact(&p, &two, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+
+        match p
+            .correspondent_state_lost(&fresh, Direction::AToB, now)
+            .expect_err("an ambiguous identity was resolved to one correspondence")
+        {
+            DmPersistError::AmbiguousCorrespondent { matches } => assert_eq!(matches, 2),
+            other => panic!("wrong error: {other:?}"),
+        }
+
+        for (l, seqs) in [(one, vec![3u64]), (two, vec![1, 2])] {
+            let ob = p.read_outbox(&l, now).expect("reads").expect("present");
+            for seq in seqs {
+                assert!(
+                    ob.entry(seq).expect("the entry").is_due(now),
+                    "the refusal still ended entry {seq}"
+                );
+            }
+        }
+    }
+
+    /// **A correspondence with an idle queue costs no seal**, so the signal can
+    /// be answered on every knock without the store paying for it.
+    #[test]
+    fn state_loss_on_an_idle_queue_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0xB6);
+        let now = FIRST_SEEN;
+
+        seed_contact(&p, &l, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        assert!(
+            p.read_outbox(&l, now).expect("reads").is_none(),
+            "the fixture already had an outbox"
+        );
+
+        let fresh = knock(0x01, ss0_tagged(0xAA));
+        match p.correspondent_state_lost(&fresh, Direction::AToB, now) {
+            Ok(StateLoss::Confirmed { outcome, .. }) => {
+                assert!(outcome.surfaced.is_empty());
+                assert!(outcome.retained.is_empty());
+            }
+            other => panic!("a fresh channel was not read as state loss: {other:?}"),
+        }
+        assert!(
+            p.read_outbox(&l, now).expect("reads").is_none(),
+            "an idle queue was written back as an empty record"
+        );
+    }
+
+    /// **An unreadable contact record fails the call; it does not read as a
+    /// stranger.** Reading it as absence would answer `NoCorrespondence` for an
+    /// identity whose record is on disk, and the caller's remedy for a stranger
+    /// is to run first contact — minting a second correspondence for one
+    /// identity, which is the duplicate this path refuses to resolve. Softening
+    /// the propagation to `.ok().flatten()` fails here and nowhere else.
+    #[test]
+    fn an_unreadable_contact_record_fails_the_call_rather_than_reading_as_a_stranger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0xB7);
+        let now = FIRST_SEEN;
+
+        seed_contact(&p, &l, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        seed_two_pending(&p, &l, now);
+        let fresh = knock(0x01, ss0_tagged(0xAA));
+
+        // Positive control: readable, the call reaches its decision.
+        assert!(matches!(
+            p.correspondent_state_lost(&fresh, Direction::AToB, now),
+            Ok(StateLoss::Confirmed { .. })
+        ));
+
+        // Re-seed the queue, then corrupt the record around the reader.
+        seed_two_pending(&p, &label(0xB8), now);
+        let mut bytes = contact_tagged(0x01, FIRST_SEEN, LAST_SEEN)
+            .encode()
+            .to_vec();
+        bytes[0] = CONTACT_RECORD_VERSION + 1;
+        write_contact_bytes(&p, &l, &bytes);
+
+        match p
+            .correspondent_state_lost(&fresh, Direction::AToB, now)
+            .expect_err("an unreadable contact record read as a stranger")
+        {
+            DmPersistError::Contact(ContactCacheError::UnsupportedVersion { .. }) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+        // The other correspondence's queue is untouched: the refusal stopped
+        // before any write, rather than half-marking the store.
+        let ob = p
+            .read_outbox(&label(0xB8), now)
+            .expect("reads")
+            .expect("present");
+        assert!(ob.entry(2).expect("the entry").is_due(now));
+    }
+
+    /// **`direction` is used, not decorative.** Every other test here passes
+    /// `AToB`, so hardcoding the direction inside the call would survive all of
+    /// them; a caller confused about which end it is must be refused rather than
+    /// quietly answered with the record's own direction.
+    #[test]
+    fn the_wrong_direction_is_refused_and_marks_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0xB9);
+        let now = FIRST_SEEN;
+
+        seed_contact(&p, &l, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        seed_two_pending(&p, &l, now); // seeded AToB
+        let fresh = knock(0x01, ss0_tagged(0xAA));
+
+        match p
+            .correspondent_state_lost(&fresh, Direction::BToA, now)
+            .expect_err("the other direction was accepted")
+        {
+            DmPersistError::OutboxDirectionMismatch { stored, requested } => {
+                assert_eq!(stored, Direction::AToB);
+                assert_eq!(requested, Direction::BToA);
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+        assert_eq!(
+            stored_states(&p, &l, now),
+            vec![DeliveryState::Composed, DeliveryState::Composed],
+            "a refused call still ended a message"
+        );
+
+        // Positive control: the right direction on the same fixture does act,
+        // so the refusal above is the direction and not a wedged store.
+        assert!(matches!(
+            p.correspondent_state_lost(&fresh, Direction::AToB, now),
+            Ok(StateLoss::Confirmed { .. })
+        ));
+    }
+
+    /// **`DmPersistError::FirstContact` renders, sources and converts.** A
+    /// variant no test constructs is a variant whose `Display` and `source` are
+    /// whatever they were typed as.
+    #[test]
+    fn a_channel_root_failure_renders_and_keeps_its_source() {
+        let err: DmPersistError = FirstContactError::Aead.into();
+        match &err {
+            DmPersistError::FirstContact(FirstContactError::Aead) => {}
+            other => panic!("the From impl built the wrong variant: {other:?}"),
+        }
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("channel roots: ") && rendered.contains("did not open"),
+            "unhelpful rendering: {rendered}"
+        );
+        // It wraps something, unlike the variants that are this module's own
+        // findings — so a caller can reach the underlying fault.
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "a wrapped first-contact error reported no source"
+        );
     }
 }

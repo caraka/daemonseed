@@ -152,6 +152,18 @@ pub enum TrustEventKey {
     /// success that leaves the secret readable. That makes it a state only a human
     /// can clear, and a correspondence stuck in it cannot complete establishment.
     DmRecordErasureBlocked,
+    /// A correspondent came back under a fresh first contact, so their at-rest
+    /// state is gone and everything queued for the old channel is undeliverable
+    /// (#261).
+    ///
+    /// Distinct from [`Self::DmChannelTornDownOnRestart`], and the distinction is
+    /// the whole of #261. That key is *our* restart, after which the channel's
+    /// addressing survives and queued messages keep trying to arrive. This one is
+    /// the *correspondent's* loss, after which they hold neither the address root
+    /// those messages were published under nor the chain they were sealed with —
+    /// so the queue does not keep trying, it stops, and the user is told it
+    /// stopped rather than watching it run out the seven-day give-up.
+    DmCorrespondentStateLost,
 }
 
 /// Every key, in declaration order. Used by exhaustiveness tests and any caller
@@ -179,6 +191,7 @@ pub const ALL_EVENT_KEYS: &[TrustEventKey] = &[
     TrustEventKey::DmProvisionalHandshakeLost,
     TrustEventKey::DmProvisionalRecordUnreadable,
     TrustEventKey::DmRecordErasureBlocked,
+    TrustEventKey::DmCorrespondentStateLost,
 ];
 
 /// The affordance class for a key (ISC-C28 per-event assignment table). Total
@@ -225,6 +238,14 @@ pub const fn class_of(key: TrustEventKey) -> TrustEventClass {
         // there is no decision for the user to make here and nothing to hold back
         // that the refusal has not already stopped.
         DmRecordErasureBlocked => PersistentNonBlocking,
+        // The class A3.8 assigns every loud anomaly, and the reason is #235's
+        // truthfulness rule rather than severity: messages have just moved to
+        // *undelivered*, and a surface that lost the notice would render them as
+        // still sending. `PersistentNonBlocking` is what forbids that — it
+        // reappears until acted on and it reaches the audit log. Not `Blocking`:
+        // the new first contact is a separate offer with its own accept/decline
+        // gate, and there is nothing here to hold back.
+        DmCorrespondentStateLost => PersistentNonBlocking,
     }
 }
 
@@ -256,6 +277,7 @@ pub const fn event_key_string(key: TrustEventKey) -> &'static str {
         DmProvisionalHandshakeLost => "dm-provisional-handshake-lost",
         DmProvisionalRecordUnreadable => "dm-provisional-record-unreadable",
         DmRecordErasureBlocked => "dm-record-erasure-blocked",
+        DmCorrespondentStateLost => "dm-correspondent-state-lost",
     }
 }
 
@@ -1021,32 +1043,73 @@ mod tests {
         }
     }
 
-    /// Every key maps to exactly one class, and the count matches the C28 table
-    /// plus the two M7 additions (F31, F32), the three DM restart keys (#243) and
-    /// the erasure-blocked key (#296 work, added with `Locked::delete`'s repair)
-    /// = 22.
+    /// **Every variant is in `ALL_EVENT_KEYS`, in declaration order — proved by
+    /// walking a wildcard-free chain, not by counting.**
     ///
-    /// **Adding a key touches SEVEN sites, and the two that bite are the two no
-    /// grep for the key's name can reach.** Six of the seven name the key — the
-    /// enum, `ALL_EVENT_KEYS`, `class_of`, the frozen string table,
-    /// `a_dm_teardown_reaches_the_audit_log` and `class_assignments_match_c28_table`
-    /// — so a name search finds them *once they are written*. This bare count is the
-    /// seventh and names nothing, but the compiler fails on it, so it cannot be
-    /// forgotten quietly.
+    /// The count this replaced was inverted against its own claim. The
+    /// exhaustive `match`es make the compiler catch a variant with no class and
+    /// no stable string, but a variant added to the enum and to both matches
+    /// while **omitted from `ALL_EVENT_KEYS`** compiled and passed everything:
+    /// the count is a literal, so it was updated to whatever the slice happened
+    /// to hold. `event_key_from_str` is a linear scan of that slice, so such a
+    /// key parses back as `None` and the audit-log decoder drops its entries
+    /// into `unreadable_entries` — silently, which is the one thing the log
+    /// exists not to do.
     ///
-    /// `class_assignments_match_c28_table` is the genuinely dangerous one. It
-    /// hand-lists `class_of` assertions, so omitting a key leaves it **passing on a
-    /// shorter list** — no compiler error, and a name grep run before writing it
-    /// reports the site as simply not existing. It was missed when
-    /// `DmRecordErasureBlocked` was added and found only by review.
+    /// `next` has no wildcard, so a new variant fails to compile here and has to
+    /// be threaded into the chain; the walk then contains it, and the comparison
+    /// below is against the walk rather than against a number. Omitting it from
+    /// the slice now fails.
     ///
-    /// The durable lesson is not the number, which will go stale: **a hand-listed
-    /// table is invisible to both the compiler and a name grep, so enumerate the
-    /// class by reading the module rather than by trusting any list — including
-    /// this one.**
+    /// **Adding a key touches SIX sites, all of which the compiler or this walk
+    /// reaches:** the enum, `ALL_EVENT_KEYS`, `class_of`, the frozen string
+    /// table, `a_dm_teardown_reaches_the_audit_log` and
+    /// `class_assignments_match_c28_table`. The last two are hand-lists that
+    /// pass on a shorter list, so they remain the ones to check by reading the
+    /// module rather than by trusting any list — including this one.
     #[test]
-    fn every_key_has_a_class() {
-        assert_eq!(ALL_EVENT_KEYS.len(), 22);
+    fn every_key_is_listed_in_all_event_keys_in_declaration_order() {
+        fn next(k: TrustEventKey) -> Option<TrustEventKey> {
+            use TrustEventKey::*;
+            Some(match k {
+                ServerKeyRotated => ServerKeyMismatch,
+                ServerKeyMismatch => SuiteDeprecationPending,
+                SuiteDeprecationPending => SuiteDeprecationCutoffHit,
+                SuiteDeprecationCutoffHit => CircleContentBelowMinSuite,
+                CircleContentBelowMinSuite => CircleCrossFamilyDeprecated,
+                CircleCrossFamilyDeprecated => NoCommonVersion,
+                NoCommonVersion => ConnectionRateLimited,
+                ConnectionRateLimited => ConnectionRateLimitedExhausted,
+                ConnectionRateLimitedExhausted => UpdateVerificationFailed,
+                UpdateVerificationFailed => EmergencySecurityUpdateAvailable,
+                EmergencySecurityUpdateAvailable => UnsupportedIdentityProofSuite,
+                UnsupportedIdentityProofSuite => ServerDeprecationPolicyUnreadable,
+                ServerDeprecationPolicyUnreadable => ServerDeprecationPolicyRollback,
+                ServerDeprecationPolicyRollback => UpdateRelayFallbackUsed,
+                UpdateRelayFallbackUsed => ServerDeprecationPolicyExpiredOffline,
+                ServerDeprecationPolicyExpiredOffline => FederationPeerKeyDivergence,
+                FederationPeerKeyDivergence => ServerSourceUnverified,
+                ServerSourceUnverified => DmChannelTornDownOnRestart,
+                DmChannelTornDownOnRestart => DmProvisionalHandshakeLost,
+                DmProvisionalHandshakeLost => DmProvisionalRecordUnreadable,
+                DmProvisionalRecordUnreadable => DmRecordErasureBlocked,
+                DmRecordErasureBlocked => DmCorrespondentStateLost,
+                DmCorrespondentStateLost => return None,
+            })
+        }
+
+        let mut walked = vec![TrustEventKey::ServerKeyRotated];
+        // Bounded so a chain accidentally wired into a cycle fails here rather
+        // than hanging the suite.
+        while let Some(n) = next(*walked.last().expect("seeded")) {
+            assert!(walked.len() < 512, "the key chain does not terminate");
+            walked.push(n);
+        }
+        assert_eq!(
+            walked,
+            ALL_EVENT_KEYS.to_vec(),
+            "ALL_EVENT_KEYS does not hold every variant, once each, in declaration order"
+        );
         for &k in ALL_EVENT_KEYS {
             // `class_of` is total; this just exercises every arm.
             let _ = class_of(k);
@@ -1092,6 +1155,7 @@ mod tests {
             PersistentNonBlocking
         );
         assert_eq!(class_of(DmRecordErasureBlocked), PersistentNonBlocking);
+        assert_eq!(class_of(DmCorrespondentStateLost), PersistentNonBlocking);
     }
 
     /// A teardown must reach the audit log, which is what makes it loud rather
@@ -1105,6 +1169,7 @@ mod tests {
             TrustEventKey::DmProvisionalHandshakeLost,
             TrustEventKey::DmProvisionalRecordUnreadable,
             TrustEventKey::DmRecordErasureBlocked,
+            TrustEventKey::DmCorrespondentStateLost,
         ] {
             let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
             log.append(TrustEvent::observed(1_000, key, None, None));
@@ -2025,7 +2090,7 @@ mod tests {
 
     /// **Every key but the erasure one encodes no record kind.**
     ///
-    /// `observed` is the only constructor the other twenty-one keys use and it
+    /// `observed` is the only constructor the other twenty-two keys use and it
     /// cannot set one, so this is a guard against a future careless `Some`
     /// reaching the log — and against the field being populated by default,
     /// which the round-trip tests above would not notice.

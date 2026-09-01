@@ -26,6 +26,26 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_core::dm::persist` — `DmPersist::correspondent_state_lost`, which answers an opened
+  first-contact entry against what is stored and stops that correspondence's outbox where the entry
+  means the correspondent lost their at-rest state. `StateLoss::NoCorrespondence` for an identity no
+  correspondence holds, `StateLoss::SameChannel` for an entry addressing the recorded channel (an
+  introduction re-seeded, which changes nothing), `StateLoss::Confirmed` for an entry under a channel
+  the store does not hold — which ends every pending entry as `Undelivered` and surfaces it at once,
+  without waiting out the `GIVE_UP_MS` window, carrying a `Teardown` for the reason.
+  `DmPersistError::AmbiguousCorrespondent` is propagated and nothing is marked. An idle queue is
+  not written. **Breaking (crate API):** `DmPersistError` gains a `FirstContact` variant. (#261)
+- `daemonseed_core::dm::contact_cache` — `ContactRecord::addresses_same_channel`, which reports
+  whether an address root is the one this record's `ss0` derives. The comparison is not
+  constant-time. It holds only under one at-rest store per `pk_lt`, which nothing enforces. (#261)
+- `daemonseed_core::dm::contact_cache` — `ContactRecord::new` and `decode` refuse an all-zero `ss0`
+  as `ContactCacheError::PlaceholderSecret`. **Breaking (crate API):** `ContactCacheError` gains a
+  `PlaceholderSecret` variant. (#261)
+- `daemonseed_core::dm::provisional` — `TeardownCause::CorrespondentStateLost`, the fourth cause and
+  the only one under which `Outbox::channel_torn_down` ends an `AwaitingCollection` entry. Its
+  `TeardownOutcome::retained` is always empty. (#261)
+- `daemonseed_core::trust_events` — `TrustEventKey::DmCorrespondentStateLost`, class
+  `PersistentNonBlocking`, stable string `dm-correspondent-state-lost`. (#261)
 - `daemonseed_core::dm::persist` — `DmPersist::correspondence_for_pk_lt`, which names the
   correspondence whose contact record holds a given long-term identity key. It is a scan of
   the store's correspondences and their contact records, not a stored index, and is

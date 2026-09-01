@@ -1798,8 +1798,23 @@ impl Outbox {
     /// moment a caller is listening. It is surfaced instead, and by the give-up
     /// rather than by the teardown, so the reason it stopped is the true one.
     ///
+    /// **[`TeardownCause::CorrespondentStateLost`] is the one cause that ends
+    /// `AwaitingCollection` too**, and it is the exact inverse of the paragraph
+    /// three above. Both of that paragraph's premises fail here. The addresses do
+    /// *not* survive: `AR` descends from `ss0`, and a correspondent who lost their
+    /// at-rest state minted a new one, so they cannot derive the record these
+    /// frames are published to. And their receive chain is not merely untouched
+    /// but gone, so a frame sealed under the old chain would not open even if they
+    /// reached it. The teardown's promise that *"messages already sent keep trying
+    /// to arrive"* is true under the other three causes and false under this one,
+    /// which is why this one gets a different string as well as a different arm.
+    /// Retaining would re-seed roughly twenty times over the give-up window into
+    /// an address that provably cannot be read, and would render as *sending* for
+    /// seven days a message that became undeliverable in the first minute — which
+    /// #235's truthful delivery states forbid.
+    ///
     /// **The cause match is wildcard-free** for the reason [`Lifecycle`]'s is:
-    /// a fourth [`TeardownCause`] would otherwise inherit
+    /// a further [`TeardownCause`] would otherwise inherit
     /// surface-the-`AwaitingKey`-entry semantics with no compile error and no
     /// test, and `StoreUnreadable`'s whole existence is the proof that a new
     /// cause can need the opposite treatment.
@@ -1824,6 +1839,14 @@ impl Outbox {
             match cause {
                 // Nothing is known lost, so nothing is declared lost.
                 TeardownCause::StoreUnreadable(_) => retained.push(entry.seq),
+                // Every pending entry ends, whatever it was waiting for: an
+                // `AwaitingKey` entry waits on a channel that will not come, and
+                // an `AwaitingCollection` entry is addressed and sealed to state
+                // the correspondent no longer holds.
+                TeardownCause::CorrespondentStateLost => {
+                    entry.end(Lifecycle::Undelivered);
+                    surfaced.push(entry.seq);
+                }
                 TeardownCause::NoProvisionalRecord | TeardownCause::RecordUnusable(_) => {
                     match entry.lifecycle {
                         Lifecycle::AwaitingCollection(_) => retained.push(entry.seq),
@@ -3615,47 +3638,109 @@ mod tests {
         assert_eq!(ob, before);
     }
 
-    /// Every teardown cause, each stating what it does to an unsealed entry.
+    /// Every teardown cause, each stating what it does to **both** entry shapes.
     ///
     /// **Exhaustive by construction, not by hand.** The `match` below has no
-    /// wildcard, so a fourth [`TeardownCause`] fails to compile here rather than
-    /// silently inheriting surface-the-`AwaitingKey`-entry semantics with no
-    /// test — which is what listing two of three causes against a
-    /// cause-wildcarding match used to allow. `StoreUnreadable`'s own existence
-    /// is the proof that a new cause can need the opposite treatment.
+    /// wildcard, so a further [`TeardownCause`] fails to compile here rather than
+    /// silently inheriting another cause's semantics with no test — which is what
+    /// listing two of three causes against a cause-wildcarding match used to
+    /// allow. `StoreUnreadable`'s own existence is the proof that a new cause can
+    /// need the opposite treatment, and
+    /// [`TeardownCause::CorrespondentStateLost`] is the proof that the two entry
+    /// shapes can part company: it is the only cause under which a *sealed*
+    /// entry stops, so a table testing the unsealed shape alone would have said
+    /// nothing at all about what #261 added.
     #[test]
-    fn every_teardown_cause_states_what_it_does_to_an_unsealed_entry() {
-        let all = [
-            TeardownCause::NoProvisionalRecord,
-            TeardownCause::RecordUnusable(crate::dm::provisional::ProvisionalError::Aead),
-            TeardownCause::StoreUnreadable("EIO".into()),
-        ];
+    fn every_teardown_cause_states_what_it_does_to_both_entry_shapes() {
+        // **The list is walked, not written.** A hand-written array plus a
+        // count assertion was inverted against its own claim: a fifth cause
+        // added to the enum and to the match below, but omitted from the array,
+        // compiled and passed — the count is a literal, so it was updated to
+        // whatever the array happened to hold, and the new cause was never run
+        // against a real outbox at all. `next` has no wildcard, so a fifth cause
+        // fails to compile here and has to be threaded into the chain, which
+        // *is* the list.
+        fn next(cause: &TeardownCause) -> Option<TeardownCause> {
+            Some(match cause {
+                TeardownCause::NoProvisionalRecord => {
+                    TeardownCause::RecordUnusable(crate::dm::provisional::ProvisionalError::Aead)
+                }
+                TeardownCause::RecordUnusable(_) => TeardownCause::StoreUnreadable("EIO".into()),
+                TeardownCause::StoreUnreadable(_) => TeardownCause::CorrespondentStateLost,
+                TeardownCause::CorrespondentStateLost => return None,
+            })
+        }
+        // The chain alone is not enough: an author who wires a fifth cause in as
+        // its own terminator rather than into the chain truncates the walk, and
+        // a bare length check passes on the shorter list — the same inversion
+        // the literal count had. `tag` is the second wildcard-free match, so a
+        // fifth cause must be given a number here too, and the three assertions
+        // below cannot all hold unless the walk reaches every number issued.
+        fn tag(cause: &TeardownCause) -> usize {
+            match cause {
+                TeardownCause::NoProvisionalRecord => 0,
+                TeardownCause::RecordUnusable(_) => 1,
+                TeardownCause::StoreUnreadable(_) => 2,
+                TeardownCause::CorrespondentStateLost => 3,
+            }
+        }
+        const CAUSE_COUNT: usize = 4;
+
+        let mut all = vec![TeardownCause::NoProvisionalRecord];
+        while let Some(n) = next(all.last().expect("seeded")) {
+            assert!(all.len() < 64, "the cause chain does not terminate");
+            all.push(n);
+        }
+        let mut tags: Vec<usize> = all.iter().map(tag).collect();
+        tags.sort_unstable();
+        assert_eq!(
+            tags,
+            (0..CAUSE_COUNT).collect::<Vec<_>>(),
+            "the walk did not reach every cause exactly once; a cause has a match arm \
+             but is not on the chain, so it is never run against a real outbox"
+        );
+        assert_eq!(
+            all.len(),
+            CAUSE_COUNT,
+            "a cause was added without a case above"
+        );
         for cause in &all {
-            // The exhaustiveness proof: adding a cause breaks this match.
-            let surfaces = match cause {
-                TeardownCause::NoProvisionalRecord => true,
-                TeardownCause::RecordUnusable(_) => true,
+            // The exhaustiveness proof: adding a cause breaks this match. The
+            // pair is (unsealed surfaces, sealed surfaces).
+            let (unsealed_surfaces, sealed_surfaces) = match cause {
+                // Our own restart: the introduction is over, but the frames
+                // already sealed keep trying to arrive.
+                TeardownCause::NoProvisionalRecord => (true, false),
+                TeardownCause::RecordUnusable(_) => (true, false),
                 // Nothing was read, so nothing is declared lost.
-                TeardownCause::StoreUnreadable(_) => false,
+                TeardownCause::StoreUnreadable(_) => (false, false),
+                // Their loss: neither shape can be delivered on this channel.
+                TeardownCause::CorrespondentStateLost => (true, true),
             };
 
             let mut ob = empty();
             ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
+            ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
             let outcome = ob.channel_torn_down(cause, T0);
-            if surfaces {
-                assert_eq!(outcome.surfaced, vec![1], "cause {cause:?} did not surface");
-                assert!(outcome.retained.is_empty());
-            } else {
-                assert!(
-                    outcome.surfaced.is_empty(),
-                    "cause {cause:?} declared a message lost"
-                );
-                assert_eq!(outcome.retained, vec![1]);
+
+            let mut want_surfaced = Vec::new();
+            let mut want_retained = Vec::new();
+            for (seq, surfaces) in [(1u64, unsealed_surfaces), (2, sealed_surfaces)] {
+                if surfaces {
+                    want_surfaced.push(seq);
+                } else {
+                    want_retained.push(seq);
+                }
             }
+            assert_eq!(
+                outcome.surfaced, want_surfaced,
+                "cause {cause:?} surfaced the wrong entries"
+            );
+            assert_eq!(
+                outcome.retained, want_retained,
+                "cause {cause:?} retained the wrong entries"
+            );
         }
-        // The array really did cover every variant: three causes, three
-        // distinct discriminants.
-        assert_eq!(all.len(), 3, "a cause was added without a case above");
     }
 
     /// **A teardown reads the clock, so a past-window entry is surfaced rather

@@ -1031,9 +1031,13 @@ modules:
       itself could not be read; Teardown::event() maps those to
       TrustEventKey::DmChannelTornDownOnRestart, DmProvisionalHandshakeLost and
       DmProvisionalRecordUnreadable, and Display renders the user-facing statement —
-      StoreUnreadable's says nothing is known lost. All three keys are
-      PersistentNonBlocking, so each reappears at every start and is written to the
-      trust-event audit log. restart, ChannelRestart, Teardown and
+      StoreUnreadable's says nothing is known lost. A fourth cause,
+      CorrespondentStateLost, exists and restart never produces it: it is
+      constructed by DmPersist::correspondent_state_lost from an opened
+      first-contact entry, maps to TrustEventKey::DmCorrespondentStateLost, and
+      its Display is the one that does not promise messages keep trying. All four
+      keys are PersistentNonBlocking, so each reappears at every start and is
+      written to the trust-event audit log. restart, ChannelRestart, Teardown and
       ReceiveCursor::advance_to are #[must_use].
       ReceiveCursor is the receive high-water page number, not secret and not
       sealed: START is page zero, new(page) refuses a page above paging::MAX_PAGE,
@@ -1134,7 +1138,13 @@ modules:
       encode() -> Zeroizing<Vec<u8>> and decode(&Zeroizing<Vec<u8>>) are the
       at-rest form; the record carries no seal of its own and the store seals it.
       address_root() -> Result<[u8; ROOT_LEN], FirstContactError> derives the
-      channel root from ss0; chan_id is not exposed. new and decode refuse a
+      channel root from ss0; chan_id is not exposed.
+      addresses_same_channel(&[u8; ROOT_LEN]) -> Result<bool, FirstContactError>
+      reports whether that root is the one address_root derives; the comparison is
+      not constant-time. It assumes one at-rest store per pk_lt, which nothing
+      enforces and multi-device support must revisit.
+      new and decode refuse an all-zero ss0 with
+      ContactCacheError::PlaceholderSecret. new and decode refuse a
       record whose last_seen_ms precedes its first_seen_ms with
       ContactCacheError::TimestampsOutOfOrder; decode also gives
       WrongLength { expected, actual } for any payload that is not
@@ -1382,6 +1392,24 @@ modules:
       comparison is not constant-time. The answer is not
       a snapshot: a writer can establish a correspondence before the caller acts
       on it, and a caller that then writes does so under update_contact.
+      correspondent_state_lost(&VerifiedFirstContact, Direction, now_ms) ->
+      Result<StateLoss, DmPersistError> answers an opened first-contact entry
+      against what is stored and stops that correspondence's outbox where the
+      entry means the correspondent lost their at-rest state. StateLoss is
+      NoCorrespondence when no correspondence holds the entry's pk_lt;
+      SameChannel(label) when the stored record's address root is the entry's,
+      which is the introduction that established it arriving again and changes
+      nothing; Confirmed { correspondence, teardown, outcome } when the roots
+      differ, in which case every pending entry becomes Lifecycle::Undelivered
+      with Surfacing::Owed and appears in outcome.surfaced, outcome.retained is
+      empty, and teardown carries TeardownCause::CorrespondentStateLost and
+      TrustEventKey::DmCorrespondentStateLost. The outbox write goes through
+      update_outbox, so a correspondence with no pending entry spends no seal and
+      writes no record. DmPersistError::AmbiguousCorrespondent is propagated and
+      nothing is marked. DmPersistError::FirstContact(FirstContactError) carries
+      a stored record whose channel roots would not derive. Only the outbox is
+      touched; the entry itself is accepted or declined separately and no pending
+      frame is migrated onto the new channel.
       read_block_list() -> Result<BlockList, DmPersistError> reads the profile's
       block list through the store's lock-free profile read. An absent record is
       DmPersistError::BlockListMissing, never an empty list: DmStore::open
@@ -1395,7 +1423,8 @@ modules:
       DmPersistError::BlockList(BlockListError) carries a stored list that will
       not decode and a caller's own over-ceiling change.
       read_outbox/read_cursor/read_contact/read_block_list and
-      correspondence_for_pk_lt are lock-free.
+      correspondence_for_pk_lt are lock-free; correspondent_state_lost takes the
+      lock only when it reaches the outbox.
       The provisional
       record is sealed by its own path and again by the store: the record's seal
       binds RecordContext and refuses one lifted from another channel, the store's AAD binds label
@@ -1495,7 +1524,9 @@ modules:
       surfaced } surfaces any pending entry past its give-up window whatever the
       cause, then retains published entries with their bytes, surfaces AwaitingKey
       entries as Undelivered, and changes nothing further on
-      TeardownCause::StoreUnreadable. TeardownOutcome is #[must_use] as a type,
+      TeardownCause::StoreUnreadable. TeardownCause::CorrespondentStateLost ends
+      every pending entry instead, published ones included, so retained is empty
+      under it. The cause match has no wildcard. TeardownOutcome is #[must_use] as a type,
       so the obligation travels with the value rather than only binding at the
       call. encode() / decode(bytes, now_ms) ->
       Result<Outbox, OutboxError> are the at-rest form under OUTBOX_MAGIC

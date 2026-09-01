@@ -610,6 +610,25 @@ pub struct FirstContactRequest<'a> {
 /// `SHA-384(ct0 ‖ sealed)`: the work is spent on this exact entry, so it cannot be
 /// precomputed for an entry that does not exist yet, and it cannot be carried to a
 /// second one.
+///
+/// # A re-seal must reuse the existing `ss0` — it must not call this again
+///
+/// **Every call encapsulates a fresh `ss0`, and a fresh `ss0` is read by the
+/// receiver as the sender having lost their at-rest state** (#261:
+/// [`ContactRecord::addresses_same_channel`](crate::dm::contact_cache::ContactRecord::addresses_same_channel)).
+/// That is safe today only because the re-seed is byte-identical, so the entry a
+/// sender re-publishes on the keep-alive schedule carries the `ss0` it was built
+/// with, and because first-contact epoch acceptance spans the seven-day give-up.
+///
+/// Two later changes would break it, and both look local. Implementing the
+/// design's jittered boundary re-seal by calling `build` a second time would mint
+/// a new `ss0` for an introduction already in flight; so would shortening the
+/// first-contact period below the give-up window, which forces a re-seal inside
+/// the life of a pending entry. **In either case every healthy pending
+/// introduction reads as state loss at the receiver, and its outbox is
+/// irreversibly marked undelivered.** A re-seal re-seals the same secret: it
+/// re-derives the entry's addressing and re-mints its proof of work, and it does
+/// not run key agreement again.
 pub fn build(
     request: FirstContactRequest<'_>,
 ) -> Result<(Vec<u8>, FirstContactState), FirstContactError> {
