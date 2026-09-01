@@ -279,6 +279,17 @@ work lives in the maintainer's own planning notes, not here.
   under the share name via core `no_scatter`, matching the GUI. A nested share is
   unchanged. (#216)
 
+- Corrected both shares panes, which drew every row from the first and clipped at the pane
+  height, so a row past the fold was selectable but never drawn. Each pane draws the page of
+  rows its selection falls in, moving a page at a time rather than a line. Rows truncate
+  rather than wrap and are budgeted to the pane width: a row that cannot fit keeps its name
+  down to a twelve-character floor and middle-ellipsizes the trailing field — the publish
+  state in My-shares, the rating and sharer handle in Public-shares. The defined-shares
+  header is 72 characters, fits an 80-column terminal, and stays drawn above every page
+  along with the indexer status rather than paging with the rows. The public-share selection clamps
+  against the visible count rather than the raw listing, so a selection that survives a hide
+  no longer sits past the last drawn row with `f` a no-op. (#352)
+
 ### Removed
 
 - The default path for `cargo xtask findings-resolved`, which pointed outside the

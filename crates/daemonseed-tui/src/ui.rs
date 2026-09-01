@@ -661,11 +661,119 @@ fn render_shares(app: &App, frame: &mut Frame, area: Rect) {
     render_public_shares_pane(app, frame, chunks[1]);
 }
 
+/// Scroll-window anchor for a line-oriented pane: the index of the first line
+/// to draw so that `cursor` lands inside `[start, start + pane_rows)`.
+///
+/// **Paged, not sticky, and not bottom-anchored.** The window is the
+/// `pane_rows`-sized page the cursor falls in, so the pane holds still for
+/// `pane_rows - 1` of every `pane_rows` moves and rows *below* the cursor stay
+/// drawn. The fetch preview (`render_preview_tree`, ISC-C72) is sticky — it
+/// carries a `preview_scroll` anchor a `&mut` render path can adjust — and
+/// this renderer cannot copy that: `ui::render` takes `&App`, so nothing here
+/// can write an anchor back, and the key handlers that could never learn the
+/// pane height. Bottom-anchoring is the other stateless option and is worse:
+/// it scrolls on every keypress and never draws a row past the cursor. Paging
+/// beats it in `pane_rows - 1` of every `pane_rows` cursor positions, not
+/// categorically — a cursor landing on the last line of its page shows nothing
+/// below it either. Note also that only `defined_sel` drives the My-shares
+/// cursor, so the indexed-file list never scrolls on its own; with no defined
+/// share selected the pane sits on page 0, exactly as it did before #352.
+///
+/// The `cursor.min` is defensive against a caller this crate does not yet
+/// have: both panes clamp their selection before render, so no fixture can
+/// drive a cursor past the last line. It is pinned by unit test, not by a
+/// render fixture.
+fn scroll_window_start(cursor: usize, total_lines: usize, pane_rows: usize) -> usize {
+    if pane_rows == 0 || total_lines <= pane_rows {
+        return 0;
+    }
+    (cursor.min(total_lines - 1) / pane_rows) * pane_rows
+}
+
+/// Middle-ellipsize `s` to at most `max` characters, keeping its head and tail.
+fn ellipsize(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_owned();
+    }
+    match max {
+        0 => String::new(),
+        1 => "…".to_owned(),
+        _ => {
+            let keep = max - 1;
+            let head = keep.div_ceil(2);
+            let tail = keep - head;
+            let mut out: String = chars[..head].iter().collect();
+            out.push('…');
+            out.extend(&chars[chars.len() - tail..]);
+            out
+        }
+    }
+}
+
+/// Columns a row always keeps for its name, before the suffix may be cut.
+const NAME_FLOOR: usize = 12;
+
+/// Compose a list row that fits `width` columns, spending the width on the name
+/// first and shrinking the suffix only once the name is down to [`NAME_FLOOR`].
+///
+/// Both shares panes put the row's actionable state last — `● published` for
+/// My-shares, the rating and sharer for Public-shares — so a plain right-edge
+/// truncation drops exactly the field the row's keys act on, and two long-named
+/// shares from different sharers render identically. There is no horizontal
+/// scroll, so that text is unrecoverable.
+///
+/// When name and suffix cannot both fit, the NAME wins down to the floor: a
+/// relay-supplied `sharer_handle` can be long enough on its own to leave the
+/// name no columns at all, and a row you cannot name is useless for every key
+/// the pane offers — `[p]`, `[u]`, `[x]`, `f` all act on the selected row's
+/// identity. Losing the tail of a sharer handle costs recognition; losing the
+/// name costs the ability to tell two rows apart at all. The result is always
+/// at most `width` characters.
+///
+/// **Measured in `char`s, not display columns**, and this is a real gap rather
+/// than a rounding one: a 39-character CJK name is 78 columns, so a name budget
+/// of 63 admits it whole and the terminal then clips the suffix away entirely —
+/// the field this function exists to protect. `ellipsize` can also split a ZWJ
+/// sequence or a combining mark and leave a fragment. Fixing both needs a
+/// display-width crate as a direct dependency, which is deliberately not taken
+/// here. It costs the guarantee, never the layout: the pane does not wrap, so
+/// an over-long line is clipped and the window is unaffected.
+fn fit_row(prefix: &str, name: &str, suffix: &str, width: usize) -> String {
+    let pre = prefix.chars().count();
+    if width <= pre {
+        return prefix.chars().take(width).collect();
+    }
+    let avail = width - pre;
+    let suffix_n = suffix.chars().count();
+    if name.chars().count() + suffix_n <= avail {
+        return format!("{prefix}{name}{suffix}");
+    }
+    // The suffix keeps whatever the name does not need, but never so much that
+    // the name drops below the floor (itself capped by what the pane has).
+    let name_budget = avail.saturating_sub(suffix_n).max(NAME_FLOOR.min(avail));
+    let name_fit = ellipsize(name, name_budget);
+    let suffix_fit = ellipsize(suffix, avail - name_fit.chars().count());
+    format!("{prefix}{name_fit}{suffix_fit}")
+}
+
+/// Lines at the head of the My-shares pane that are pinned rather than
+/// scrolled: the indexer status, then the defined-share legend. The count is
+/// exact and structural — `render_my_shares_pane` pushes the status line, then
+/// exactly one of the two `defined…` lines, before any share row. A third
+/// pinned line means pushing it in both arms and raising this.
+const MY_SHARES_HEADER_LINES: usize = 2;
+
 /// My-shares: the user's own [`daemonseed_core::storage::share_index::ShareIndex`]
 /// entries, preceded by the indexer status line. The status line is
 /// information-only and never blocks input (ISC-A-C7) — even mid-cold-scan,
 /// the user can press Tab to leave the pane.
 fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" my shares ")
+        .title_alignment(Alignment::Left);
+    let inner = block.inner(area);
     let status = match app.indexer_status() {
         IndexerStatus::Idle => "indexer: idle (no share root configured)".to_owned(),
         IndexerStatus::Indexing { seen, total } => match total {
@@ -680,7 +788,12 @@ fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
         IndexerStatus::Ready { .. } => Color::Green,
     };
 
-    let mut lines: Vec<Line> = Vec::with_capacity(2 + app.local_shares().len());
+    let mut lines: Vec<Line> =
+        Vec::with_capacity(MY_SHARES_HEADER_LINES + app.local_shares().len());
+    // Line index of the `[`/`]` selection cursor, for the scroll window below.
+    // Stays 0 while no defined share is selectable, which pins the pane to the
+    // top — the status line.
+    let mut cursor_line = 0usize;
     lines.push(Line::from(status).style(Style::default().fg(status_color)));
 
     // My-defined shares (M16 C1, ISC-C69): the roots the user has defined this
@@ -696,13 +809,21 @@ fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         lines.push(
             Line::from(
-                "defined shares  ([ / ] select · [p] publish · [u] unpublish/cancel · [x] remove):"
+                // 72 chars: fits an 80-column terminal's 78-column inner pane,
+                // so the no-wrap `LineTruncator` does not clip it (#352). The
+                // old wording was 81 and lost its last key to the clip; the
+                // pane title already says "shares", so that word paid for it.
+                "defined ([ / ] select · [p] publish · [u] unpublish/cancel · [x] remove)"
                     .to_owned(),
             )
             .style(Style::default().fg(Color::DarkGray)),
         );
         for (i, (root, name)) in app.defined_shares().iter().enumerate() {
             let marker = if i == app.defined_sel() { "▶ " } else { "  " };
+            if i == app.defined_sel() {
+                // The windowed pane scrolls to keep this line on-screen (#352).
+                cursor_line = lines.len();
+            }
             // Marker per defined ROW by root (M16 smoke fix, ISC-A-C34) — the
             // old name-keyed dedup rendered two live serve tasks as one
             // marker, hiding an accidental double-publish from the publisher.
@@ -716,7 +837,9 @@ fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
             } else {
                 Style::default()
             };
-            lines.push(Line::from(format!("{marker}{name}{pub_marker}")).style(style));
+            lines.push(
+                Line::from(fit_row(marker, name, pub_marker, inner.width as usize)).style(style),
+            );
         }
     }
 
@@ -726,19 +849,55 @@ fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
         );
     } else {
         for entry in app.local_shares() {
-            lines.push(Line::from(format!(
-                "  {}   {} bytes",
-                entry.rel_path, entry.size
+            lines.push(Line::from(fit_row(
+                "  ",
+                &entry.rel_path,
+                &format!("   {} bytes", entry.size),
+                inner.width as usize,
             )));
         }
     }
-    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" my shares ")
-            .title_alignment(Alignment::Left),
+    // #352: window the pane to the `[`/`]` cursor rather than always drawing
+    // from line 0, so a defined-share row past the fold is reachable.
+    //
+    // The two header lines are held OUT of the window and redrawn above every
+    // page. They are the pane's only statement of what `[`/`]`, `[p]`, `[u]`
+    // and `[x]` do, and the indexer status is the only place indexing progress
+    // appears; windowing them with the rows scrolls both away the moment the
+    // cursor leaves page one, leaving a user on page two with rows and no
+    // affordances. Only the rows below the header page.
+    //
+    // ⚠️ The absence of `.wrap()` is what holds one-logical-line-to-one-
+    // terminal-row, and the window is only correct while it does: without it a
+    // `Paragraph` uses `LineTruncator`, which clips at the right edge and
+    // cannot wrap at any length. DO NOT restore `Wrap` here to "fix" a clipped
+    // row — that re-opens #352 for every row longer than the pane. `fit_row`
+    // is a separate concern: it decides WHICH text survives the clip, not
+    // whether the row stays on one line.
+    let pane_rows = inner.height as usize;
+    let body_rows = pane_rows.saturating_sub(MY_SHARES_HEADER_LINES);
+    if body_rows == 0 {
+        // A pane with no room for the header AND a row: window the whole
+        // vector as one region, exactly as before the header was pinned. A
+        // fixed header would fill the pane on its own here and displace the
+        // selected row entirely, which is worse than losing the legend — the
+        // cursor is what the window exists to keep on screen.
+        let start = scroll_window_start(cursor_line, lines.len(), pane_rows);
+        let windowed: Vec<Line> = lines.into_iter().skip(start).take(pane_rows).collect();
+        frame.render_widget(Paragraph::new(windowed).block(block), area);
+        return;
+    }
+    // `cursor_line` indexes the whole vector and is only ever set inside the
+    // defined-share loop, which runs after both header pushes — so it is
+    // either 0 (no selection, page 0) or at least `MY_SHARES_HEADER_LINES`.
+    let body = lines.split_off(MY_SHARES_HEADER_LINES);
+    let start = scroll_window_start(
+        cursor_line.saturating_sub(MY_SHARES_HEADER_LINES),
+        body.len(),
+        body_rows,
     );
-    frame.render_widget(body, area);
+    lines.extend(body.into_iter().skip(start).take(body_rows));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Public-shares: the relay-published listing after the client-local
@@ -746,6 +905,11 @@ fn render_my_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
 /// `sharer_handle` is in the hide set are absent (ISC-A-C3 by construction
 /// — no wire field carries the hide set).
 fn render_public_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" public shares ")
+        .title_alignment(Alignment::Left);
+    let inner = block.inner(area);
     let visible = app.visible_public_shares();
     let lines: Vec<Line> = if visible.is_empty() {
         let msg = if app.public_shares_raw().is_empty() {
@@ -773,7 +937,12 @@ fn render_public_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
                 } else {
                     format!("  [{}]", s.rating)
                 };
-                let line = format!("{marker}{}{rating}    by {sharer}", s.name);
+                let line = fit_row(
+                    marker,
+                    &s.name,
+                    &format!("{rating}    by {sharer}"),
+                    inner.width as usize,
+                );
                 let style = if i == app.share_sel() {
                     Style::default().fg(Color::Cyan).bold()
                 } else {
@@ -783,13 +952,16 @@ fn render_public_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
             })
             .collect()
     };
-    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" public shares ")
-            .title_alignment(Alignment::Left),
-    );
-    frame.render_widget(body, area);
+    // #352: window the pane to `share_sel` rather than always drawing from row
+    // 0. Row index and line index coincide here, so the selection is the
+    // window cursor directly. Unwrapped for the same reason as My-shares — the
+    // no-wrap `LineTruncator` is what keeps one row on one line, and restoring
+    // `Wrap` re-opens #352 — with `fit_row` deciding which of the name, rating
+    // and sharer survives the clip.
+    let pane_rows = inner.height as usize;
+    let start = scroll_window_start(app.share_sel(), lines.len(), pane_rows);
+    let windowed: Vec<Line> = lines.into_iter().skip(start).take(pane_rows).collect();
+    frame.render_widget(Paragraph::new(windowed).block(block), area);
 }
 
 /// The Public Space view (ISC-25 / ISC-S7 / ISC-A-S3): the connected relay's
@@ -1683,5 +1855,104 @@ fn render_first_start_body(fs: &FirstStartUi, frame: &mut Frame, area: Rect) {
                 area,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ellipsize, fit_row, scroll_window_start};
+
+    /// The window always contains the cursor, never starts past the last page,
+    /// and is page-aligned — checked at every boundary the render can hit,
+    /// including the ones no pane fixture reaches (`pane_rows` 0 and 1, and a
+    /// list exactly one line longer than the pane).
+    #[test]
+    fn scroll_window_start_holds_the_cursor_at_every_boundary() {
+        // A pane with no body rows: no arithmetic, no panic.
+        assert_eq!(scroll_window_start(9, 40, 0), 0);
+        // Everything fits: never scroll.
+        assert_eq!(scroll_window_start(6, 7, 7), 0);
+        // One line more than fits: the last line must become reachable.
+        assert_eq!(scroll_window_start(6, 8, 7), 0);
+        assert_eq!(scroll_window_start(7, 8, 7), 7);
+        // A one-row pane degenerates to "draw the cursor".
+        for cursor in 0..5 {
+            assert_eq!(scroll_window_start(cursor, 5, 1), cursor);
+        }
+        for pane_rows in 1..=8usize {
+            for total in 1..=24usize {
+                for cursor in 0..total {
+                    let start = scroll_window_start(cursor, total, pane_rows);
+                    assert!(
+                        start <= cursor && cursor < start + pane_rows,
+                        "cursor {cursor} inside [{start}, {}) for total {total} rows {pane_rows}",
+                        start + pane_rows
+                    );
+                    assert_eq!(start % pane_rows, 0, "page-aligned");
+                    assert!(start < total, "never starts past the end");
+                }
+            }
+        }
+    }
+
+    /// The `cursor.min(total_lines - 1)` is defensive — no pane can drive it,
+    /// both clamp their selection before render. Pinned directly so deleting
+    /// it is not free: an out-of-range cursor must still land on the last page
+    /// rather than page off the end into a blank pane.
+    #[test]
+    fn scroll_window_start_clamps_a_cursor_past_the_end() {
+        assert_eq!(scroll_window_start(99, 10, 4), 8);
+        assert_eq!(scroll_window_start(usize::MAX, 3, 2), 2);
+    }
+
+    /// `fit_row` spends the width on the name and never on the suffix.
+    #[test]
+    fn fit_row_shrinks_the_name_and_keeps_the_suffix() {
+        let row = fit_row("▶ ", &"L".repeat(70), "  ● published", 78);
+        assert!(row.ends_with("  ● published"), "suffix survives: {row}");
+        assert_eq!(
+            row.chars().count(),
+            78,
+            "row fills but does not exceed: {row}"
+        );
+        assert!(row.contains('…'), "the name is ellipsized: {row}");
+        // A suffix wider than the pane: the NAME survives to the floor and the
+        // suffix pays, and the row still never exceeds `width`. Asserting only
+        // "does not panic" here is what let an unbounded row through before.
+        let sharer = format!("  [PG13]    by {}", "S".repeat(70));
+        let squeezed = fit_row("▶ ", "holiday-photos", &sharer, 78);
+        assert!(
+            squeezed.chars().count() <= 78,
+            "never exceeds the pane: {squeezed}"
+        );
+        assert!(
+            squeezed.contains("holiday") || squeezed.contains('…'),
+            "the name is not deleted: {squeezed}"
+        );
+        assert_ne!(
+            squeezed,
+            fit_row("▶ ", "tax-returns", &sharer, 78),
+            "two names under one long sharer stay distinguishable"
+        );
+        // Degenerate widths: bounded, and no panic.
+        for width in 0..20usize {
+            let row = fit_row("▶ ", "name", "  ● published", width);
+            assert!(row.chars().count() <= width, "w={width}: {row}");
+        }
+        // Nothing to shrink: the row is returned untouched.
+        assert_eq!(fit_row("  ", "short", "", 78), "  short");
+    }
+
+    /// Ellipsis keeps head and tail, so two names differing only in their tail
+    /// stay distinguishable.
+    #[test]
+    fn ellipsize_keeps_head_and_tail() {
+        assert_eq!(ellipsize("abcdef", 6), "abcdef");
+        assert_eq!(ellipsize("abcdef", 5), "ab…ef");
+        assert_eq!(ellipsize("abcdef", 1), "…");
+        assert_eq!(ellipsize("abcdef", 0), "");
+        let a = ellipsize(&format!("{}ALPHA", "L".repeat(70)), 40);
+        let b = ellipsize(&format!("{}OMEGA", "L".repeat(70)), 40);
+        assert_ne!(a, b, "tails distinguish the two names");
     }
 }

@@ -1747,7 +1747,11 @@ impl App {
                 self.public_shares = remote;
                 self.indexer_status = indexer_status;
                 // Clamp the selection so it never points past the new list.
-                let max_idx = self.public_shares.len().saturating_sub(1);
+                // Against the VISIBLE count, not the raw one: the pane renders
+                // the post-hide-filter subset, so a selection valid against the
+                // raw snapshot can still sit past the last drawn row, leaving
+                // nothing highlighted and `f` a no-op (#352).
+                let max_idx = self.visible_public_shares_count().saturating_sub(1);
                 if self.share_sel > max_idx {
                     self.share_sel = max_idx;
                 }
@@ -7590,6 +7594,439 @@ mod tests {
         }
         app.on_key(press(KeyCode::Enter));
         assert_eq!(app.share_sel(), 0, "clamped after hide");
+    }
+
+    /// #352: a public-share listing longer than the pane windows to the
+    /// selection — the cursor row stays on-screen and an early row scrolls off.
+    /// Same shape as `c72_scroll_keeps_cursor_visible_on_standard_terminal`.
+    #[test]
+    fn public_shares_pane_scrolls_to_keep_selection_visible() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        let remote: Vec<ShareListing> = (0..40)
+            .map(|i| listing(&format!("s{i:02}"), &format!("pubshare{i:02}"), "", ""))
+            .collect();
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote,
+            indexer_status: IndexerStatus::Idle,
+        });
+        // Cursor at the top: the first row draws, the last is past the fold.
+        let text = render_text(&app, 80, 24);
+        assert!(
+            text.contains("pubshare00"),
+            "first row visible; got:\n{text}"
+        );
+        assert!(
+            !text.contains("pubshare39"),
+            "last row is past the fold with the cursor at the top; got:\n{text}"
+        );
+        // Drive the cursor to the last row.
+        for _ in 0..40 {
+            app.on_key(press(KeyCode::Down));
+        }
+        assert_eq!(app.share_sel(), 39, "cursor at the last visible row");
+        let text = render_text(&app, 80, 24);
+        assert!(
+            text.contains("pubshare39"),
+            "the cursor row must stay visible after scrolling; got:\n{text}"
+        );
+        assert!(
+            !text.contains("pubshare00"),
+            "early rows scroll off when the cursor is at the bottom; got:\n{text}"
+        );
+    }
+
+    /// Buffer rows as separate strings, for assertions about a row's POSITION
+    /// (adjacency, which row carries the cursor) rather than its mere presence.
+    /// `buffer_text` concatenates every row into one string with no separator,
+    /// so it cannot answer either question — this splits on the real width.
+    fn buffer_rows(app: &App, w: u16, h: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| crate::ui::render(app, f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// Define `n` share roots named `mine00`..; leaves focus on Shares.
+    fn define_n_shares(app: &mut App, n: usize) {
+        let base = std::env::temp_dir();
+        for i in 0..n {
+            let dir = base.join(format!("ds-352-defined-{i:02}"));
+            std::fs::create_dir_all(&dir).expect("mk defined-share dir");
+            // Chat → DefineShare is four Tabs; after Enter focus returns to
+            // Shares, one Tab short of DefineShare again.
+            for _ in 0..if i == 0 { 4 } else { 1 } {
+                app.on_key(press(KeyCode::Tab));
+            }
+            assert_eq!(app.main_focus(), MainFocus::DefineShare);
+            for ch in format!("{}|mine{i:02}", dir.display()).chars() {
+                app.on_key(press(KeyCode::Char(ch)));
+            }
+            app.on_key(press(KeyCode::Enter));
+            let _ = app.take_pending_share_define();
+        }
+        assert_eq!(app.defined_shares().len(), n, "all roots defined");
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+    }
+
+    /// #352 (sibling pane): the My-shares defined list windows to the `[`/`]`
+    /// cursor. Asserted by sweeping EVERY selection and reading the row that
+    /// actually carries the `▶` marker — presence-at-the-extremes would survive
+    /// a `cursor_line` that drifts a few lines past the true row, because the
+    /// window is wide enough to still contain it.
+    #[test]
+    fn my_shares_pane_scrolls_to_keep_defined_selection_visible() {
+        let mut app = drive_to_main();
+        define_n_shares(&mut app, 12);
+        for i in 0..12usize {
+            if i > 0 {
+                app.on_key(press(KeyCode::Char(']')));
+            }
+            assert_eq!(app.defined_sel(), i, "cursor walked to defined row {i}");
+            let rows = buffer_rows(&app, 80, 24);
+            let marked: Vec<&String> = rows.iter().filter(|r| r.contains("▶ mine")).collect();
+            assert_eq!(
+                marked.len(),
+                1,
+                "the selected defined row must be drawn exactly once (sel={i}); got:\n{}",
+                rows.join("\n")
+            );
+            assert!(
+                marked[0].contains(&format!("mine{i:02}")),
+                "the marked row must be the selected one (sel={i}); got: {}",
+                marked[0]
+            );
+        }
+    }
+
+    /// #352: the My-shares header — the indexer status and the defined-share
+    /// key legend — is pinned above the window rather than paged with the rows.
+    /// Swept across EVERY selection because the failure only appears once the
+    /// cursor leaves page one: a header inside the windowed region survives the
+    /// first page and then scrolls away, leaving rows whose keys are advertised
+    /// nowhere. Pins the selection too, so a header held by shrinking the
+    /// window onto the cursor cannot pass.
+    #[test]
+    fn shares_header_is_pinned_across_every_page() {
+        let mut app = drive_to_main();
+        define_n_shares(&mut app, 12);
+        for i in 0..12usize {
+            if i > 0 {
+                app.on_key(press(KeyCode::Char(']')));
+            }
+            let rows = buffer_rows(&app, 80, 24);
+            let screen = rows.join("\n");
+            assert!(
+                rows.iter().any(|r| r.contains("indexer:")),
+                "the indexer status stays drawn (sel={i}); got:\n{screen}"
+            );
+            // `[u] unpublish/cancel` rather than `[p] publish`: the latter also
+            // appears in the main-input block title while Shares has focus, so
+            // it is drawn on this screen whether the legend is windowed away or
+            // not. That assertion passes today only because the title's leading
+            // hints clip its tail at 78 columns — a wider terminal, or one hint
+            // fewer, and it would pass with the legend fully scrolled off. This
+            // needle appears at exactly one site, the legend itself.
+            assert!(
+                rows.iter().any(|r| r.contains("[u] unpublish/cancel")),
+                "the defined-share legend stays drawn (sel={i}); got:\n{screen}"
+            );
+            let marked: Vec<&String> = rows.iter().filter(|r| r.contains("▶ mine")).collect();
+            assert_eq!(
+                marked.len(),
+                1,
+                "the selected row is still drawn beneath the header (sel={i}); got:\n{screen}"
+            );
+            // Without this, the sweep is vacuous under a selection bug: freeze
+            // `defined_sel` and all twelve iterations render page one, where the
+            // header is drawn whether it is pinned or windowed. Naming the row
+            // makes the sweep prove it reached the later pages it is here for.
+            assert!(
+                marked[0].contains(&format!("mine{i:02}")),
+                "the marked row is the selected one (sel={i}); got: {}",
+                marked[0]
+            );
+            // The pinned header must not be bought by shrinking the window onto
+            // the cursor: a body window of one row satisfies a `▶ mine` count of
+            // one just as well as a correct page does. At 80x24 the pane leaves
+            // `body_rows == 5`, so a correct page draws five rows wherever the
+            // cursor sits — except the last page, which holds the remaining two.
+            // Matched on the ROW SHAPE, not on the name: a bare `mine` needle
+            // also catches the status line (`! selected 2/12: mine01`) and the
+            // main-input title, both of which name the selected share on this
+            // same screen. A defined row is the border, then the two-column
+            // marker, then the name — nothing else on the screen has that.
+            let drawn = rows
+                .iter()
+                .filter(|r| {
+                    let inner = r.trim_matches('│');
+                    inner.starts_with("▶ mine") || inner.starts_with("  mine")
+                })
+                .count();
+            let expected = if i >= 10 { 2 } else { 5 };
+            assert_eq!(
+                drawn, expected,
+                "a full page of rows is drawn, not just the cursor (sel={i}); \
+                 got {drawn}:\n{screen}"
+            );
+        }
+    }
+
+    /// #352: the pane too short to hold the header and a row falls back to
+    /// windowing everything, so the cursor stays on screen at the cost of the
+    /// legend. The branch's comment claims that trade explicitly and nothing
+    /// else reaches it — every other shares render here is 24 rows or taller,
+    /// where the fallback is unreachable.
+    #[test]
+    fn a_pane_too_short_for_the_header_keeps_the_cursor_not_the_legend() {
+        let mut app = drive_to_main();
+        define_n_shares(&mut app, 12);
+        for _ in 0..11 {
+            app.on_key(press(KeyCode::Char(']')));
+        }
+        // Height 14 leaves the My-shares pane an inner height of 2, so
+        // `body_rows` is 0 and the fallback is taken.
+        let rows = buffer_rows(&app, 80, 14);
+        let screen = rows.join("\n");
+        assert!(
+            rows.iter().any(|r| r.contains("▶ mine11")),
+            "the selected row survives a pane too short for the header:\n{screen}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("[u] unpublish/cancel")),
+            "the legend is what gives way, not the cursor:\n{screen}"
+        );
+    }
+
+    /// #352: the pane budgets the row against its own width, so the trailing
+    /// state survives a name long enough to have swallowed it. Also pins ONE
+    /// logical line to ONE terminal row: the defined-shares header is 80 chars
+    /// against a 78-column inner pane, so a restored `Wrap` splits it in two
+    /// and the first defined row stops being adjacent.
+    #[test]
+    fn shares_rows_budget_the_name_and_never_wrap() {
+        let mut app = drive_to_main();
+        let long = "L".repeat(70);
+        // My-shares: a long name must not cost the `● published` state.
+        let dir = std::env::temp_dir().join("ds-352-longname");
+        std::fs::create_dir_all(&dir).expect("mk dir");
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        for ch in format!("{}|{long}", dir.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+        app.on_net_event(NetEvent::PublishStarted {
+            share_id: "idL".to_owned(),
+            root: dir.clone(),
+            name: long.clone(),
+            file_count: 1,
+        });
+        // Public shares: two long names differing only in their tail, from
+        // different sharers — the rating and sharer must both survive, and the
+        // two rows must not render identically.
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                listing("s1", &format!("{long}ALPHA"), "PG13", "alice#aabbccddeeff"),
+                listing("s2", &format!("{long}OMEGA"), "R18", "bob#001122334455"),
+            ],
+            indexer_status: IndexerStatus::Idle,
+        });
+
+        let rows = buffer_rows(&app, 80, 24);
+        let joined = rows.join("\n");
+        let my_row = rows
+            .iter()
+            .find(|r| r.contains("▶ L") && r.contains("published"))
+            .unwrap_or_else(|| panic!("my-shares row keeps its publish state; got:\n{joined}"));
+        assert!(
+            my_row.contains('…'),
+            "the name is ellipsized to pay for the suffix; got: {my_row}"
+        );
+        let alice = rows
+            .iter()
+            .position(|r| r.contains("by alice"))
+            .unwrap_or_else(|| panic!("alice's sharer survives the long name; got:\n{joined}"));
+        let bob = rows
+            .iter()
+            .position(|r| r.contains("by bob"))
+            .unwrap_or_else(|| panic!("bob's sharer survives the long name; got:\n{joined}"));
+        assert!(
+            rows[alice].contains("[PG13]") && rows[bob].contains("[R18]"),
+            "each row keeps its own rating; got:\n{joined}"
+        );
+        assert_ne!(
+            rows[alice].trim(),
+            rows[bob].trim(),
+            "two long-named shares must stay distinguishable"
+        );
+        assert_eq!(
+            bob - alice,
+            1,
+            "one logical row occupies exactly one terminal row; got:\n{joined}"
+        );
+        // One logical line to one terminal row, pinned where a line genuinely
+        // overruns: at 40 columns the 72-char defined-shares header is far
+        // wider than the 38-column inner pane. Restoring `Wrap` splits it and
+        // the first defined row stops being adjacent; the no-wrap
+        // `LineTruncator` clips it and adjacency holds.
+        let narrow = buffer_rows(&app, 40, 24);
+        let header = narrow
+            .iter()
+            .position(|r| r.contains("defined ("))
+            .unwrap_or_else(|| panic!("defined header drawn; got:\n{}", narrow.join("\n")));
+        assert!(
+            narrow[header + 1].contains("▶ L"),
+            "the header occupies one row, so the first defined row follows it; got:\n{}",
+            narrow.join("\n")
+        );
+    }
+
+    /// #352: a `sharer_handle` long enough that the suffix alone overruns the
+    /// pane must not delete the name — two shares from that sharer with the
+    /// same rating would then render byte-identical, the exact failure the row
+    /// budget exists to prevent. Reachable at a plain 80x24.
+    #[test]
+    fn a_long_sharer_handle_never_costs_the_share_name() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        let sharer = format!("{}#aabbccddeeff", "S".repeat(57));
+        assert_eq!(sharer.chars().count(), 70, "a suffix wider than the pane");
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                listing("s1", "holiday-photos", "PG13", &sharer),
+                listing("s2", "tax-returns", "PG13", &sharer),
+            ],
+            indexer_status: IndexerStatus::Idle,
+        });
+        let rows = buffer_rows(&app, 80, 24);
+        let joined = rows.join("\n");
+        let a = rows
+            .iter()
+            .find(|r| r.contains("holid"))
+            .unwrap_or_else(|| panic!("the first share keeps its name; got:\n{joined}"));
+        let b = rows
+            .iter()
+            .find(|r| r.contains("tax-r"))
+            .unwrap_or_else(|| panic!("the second share keeps its name; got:\n{joined}"));
+        assert_ne!(a.trim(), b.trim(), "the two rows stay distinguishable");
+        // The sharer is what pays, and it pays partially: its head survives.
+        assert!(
+            a.contains("by SS") && b.contains("by SS"),
+            "the sharer is shortened, not dropped; got:\n{joined}"
+        );
+    }
+
+    /// #352: a pane too short to hold even one body row (inner height 0) must
+    /// render, not panic. Without the `pane_rows == 0` guard the window
+    /// arithmetic underflows in debug and takes the whole TUI down.
+    #[test]
+    fn shares_panes_render_on_a_terminal_too_short_for_a_body_row() {
+        let mut app = drive_to_main();
+        define_n_shares(&mut app, 6);
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: (0..20)
+                .map(|i| listing(&format!("s{i:02}"), &format!("pubshare{i:02}"), "", ""))
+                .collect(),
+            indexer_status: IndexerStatus::Idle,
+        });
+        app.on_key(press(KeyCode::Char(']')));
+        for _ in 0..19 {
+            app.on_key(press(KeyCode::Down));
+        }
+        for h in 3..=10u16 {
+            let text = render_text(&app, 80, h);
+            assert!(
+                !text.is_empty(),
+                "the Shares view renders at height {h} instead of panicking"
+            );
+        }
+    }
+
+    /// #352: a snapshot clamps the selection against the VISIBLE subset, not
+    /// the raw listing. A snapshot can keep its row count while swapping rows
+    /// for ones an existing hide entry filters out, so a raw-length clamp
+    /// leaves the selection past the last drawn row — nothing highlighted, `f`
+    /// a no-op, and the scroll window anchored on empty space.
+    #[test]
+    fn snapshot_clamps_selection_against_visible_subset() {
+        let mut app = drive_to_main();
+        to_shares(&mut app);
+        // Hide bob up front, while no bob row is listed — so the hide-box's own
+        // clamp is a no-op and only the snapshot clamp is under test.
+        app.on_key(press(KeyCode::Tab)); // → DefineShare
+        app.on_key(press(KeyCode::Tab)); // → Hide
+        for ch in "bob#001122334455".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        // Tab back round to Shares (the focus ring has more stops than Hide).
+        for _ in 0..16 {
+            if app.main_focus() == MainFocus::Shares {
+                break;
+            }
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(
+            app.main_focus(),
+            MainFocus::Shares,
+            "back on the Shares view"
+        );
+
+        // Three alice rows, all visible; select the last.
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                listing("s1", "Alice one", "", "alice#aabbccddeeff"),
+                listing("s2", "Alice two", "", "alice#aabbccddeeff"),
+                listing("s3", "Alice three", "", "alice#aabbccddeeff"),
+            ],
+            indexer_status: IndexerStatus::Idle,
+        });
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Down));
+        assert_eq!(app.share_sel(), 2, "cursor on the third visible row");
+
+        // Same row COUNT, but two of them are bob's and therefore filtered out.
+        app.on_net_event(NetEvent::SharesSnapshot {
+            local: Vec::new(),
+            remote: vec![
+                listing("s1", "Alice one", "", "alice#aabbccddeeff"),
+                listing("s4", "Bob one", "", "bob#001122334455"),
+                listing("s5", "Bob two", "", "bob#001122334455"),
+            ],
+            indexer_status: IndexerStatus::Idle,
+        });
+        assert_eq!(
+            app.visible_public_shares().len(),
+            1,
+            "only alice is visible"
+        );
+        assert_eq!(
+            app.share_sel(),
+            0,
+            "selection clamped to the visible subset, not the raw snapshot"
+        );
+        // And the clamped selection still fetches the surviving row rather
+        // than nothing: `f` indexes the same visible subset the clamp used.
+        app.on_key(press(KeyCode::Char('f')));
+        assert_eq!(
+            app.take_pending_share_fetch()
+                .map(|(id, _, _)| id)
+                .as_deref(),
+            Some("s1"),
+            "`f` after the shrink targets the surviving visible row"
+        );
     }
 
     // ── Public Space pane (ISC-25 / ISC-S7 / ISC-A-S3) ─────────────────────
