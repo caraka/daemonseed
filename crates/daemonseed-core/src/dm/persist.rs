@@ -92,6 +92,7 @@
 use std::path::PathBuf;
 
 use oxicrypt_aes::Aes256Key;
+use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_ml_kem as ml_kem;
 use zeroize::Zeroizing;
 
@@ -168,6 +169,26 @@ pub enum DmPersistError {
     /// prevent. The remedy needs no number: sweep from
     /// [`ReceiveCursor::START`].
     CursorNotCorroborated { read_through: u64 },
+    /// More than one correspondence holds the long-term identity key
+    /// [`DmPersist::correspondence_for_pk_lt`] was asked about, so it has no
+    /// single answer.
+    ///
+    /// **Refused rather than resolved.** Nothing in the store forbids it: a
+    /// label is minted per correspondence and a contact record's keys are
+    /// write-once, so two first contacts with one identity — a racing pair, or a
+    /// second correspondence deliberately established — leave two records
+    /// holding one `pk_lt`. Answering with either of them would route a knock
+    /// into one of two correspondences by whichever the scan reached first,
+    /// which is a fact about nothing the caller can see. A `last_seen_ms`
+    /// tiebreak would be worse: it invents a policy the protocol has not
+    /// decided, and it decides it silently.
+    ///
+    /// **The labels are deliberately not carried, and the count is.** A label is
+    /// the stable per-correspondence identifier whose [`core::fmt::Debug`] is
+    /// redacted precisely so it does not reach a log through an error; the count
+    /// is what says the store needs attention and reveals nothing the caller did
+    /// not already supply.
+    AmbiguousCorrespondent { matches: usize },
 }
 
 impl std::fmt::Display for DmPersistError {
@@ -195,6 +216,11 @@ impl std::fmt::Display for DmPersistError {
                 "the persisted receive cursor is past what has been read \
                  (through page {read_through}), so it cannot be believed"
             ),
+            Self::AmbiguousCorrespondent { matches } => write!(
+                f,
+                "{matches} correspondences hold the same long-term identity key, \
+                 so there is no single correspondence for it"
+            ),
         }
     }
 }
@@ -211,7 +237,8 @@ impl std::error::Error for DmPersistError {
             Self::Ratchet(e) => Some(e),
             Self::BlockListMissing
             | Self::OutboxDirectionMismatch { .. }
-            | Self::CursorNotCorroborated { .. } => None,
+            | Self::CursorNotCorroborated { .. }
+            | Self::AmbiguousCorrespondent { .. } => None,
         }
     }
 }
@@ -832,6 +859,83 @@ impl DmPersist {
             // cleartext record — and the store zeroizes only its own copy.
             Some(bytes) => Ok(Some(ContactRecord::decode(&Zeroizing::new(bytes))?)),
             None => Ok(None),
+        }
+    }
+
+    /// Which correspondence holds `pk_lt`, or `Ok(None)` if none does (#261).
+    ///
+    /// The question a knock asks: a frame arrives carrying a long-term identity
+    /// key, and the receiver has to know whether that identity is one it already
+    /// corresponds with and under which label.
+    ///
+    /// **Derived, never stored, and that is a design decision rather than an
+    /// omission** (`docs/design/direct-messaging.md` § A3.14: *"No journal, no
+    /// index, no count"*). A persisted `pk_lt`-to-label index would be a second
+    /// record that has to commit with the contact record it describes, and the
+    /// store's whole no-journal argument rests on there being no invariant whose
+    /// truth requires two records to have committed together. So the mapping is
+    /// re-derived from the contact records themselves, which are its single
+    /// authority. It is also the cheap direction: a scan spends **no seal** —
+    /// the store's scarce resource is spent by writes — and it fires per opened
+    /// knock, at first-contact rate, on a path that is already doing key
+    /// agreement.
+    ///
+    /// **No cache, deliberately.** One rebuilt at open is permitted and is not
+    /// built here, because it would have to be invalidated by every writer and
+    /// this process is not the only one: the store's lock exists because two
+    /// processes may hold one root, so a cached answer would be the "two calls
+    /// straddle a writer" staleness [`Self::read_contact`] warns about, widened
+    /// from a two-call window to the lifetime of the process. Build one when a
+    /// measurement says the scan costs something.
+    ///
+    /// **Two or more matches is [`DmPersistError::AmbiguousCorrespondent`], not
+    /// a winner.** See that variant. The cost is that the scan cannot stop at
+    /// the first match — every correspondence is read on every call, which is
+    /// what makes the ambiguity detectable at all.
+    ///
+    /// **A contact record that will not decode fails the whole lookup**, rather
+    /// than being skipped, which is [`Self::read_contact`]'s propagation carried
+    /// up unchanged rather than softened one layer above it. Skipping would
+    /// merge unreadable back into absent, and the merged answer is the dangerous
+    /// one: the unreadable record may be the very correspondence sought, so the
+    /// caller would be told this identity is unknown, run first contact against
+    /// a correspondent it already has, and mint a second label — manufacturing
+    /// exactly the duplicate the paragraph above refuses to resolve. Failing
+    /// closed leaves the disk untouched and the decision with the caller.
+    ///
+    /// **Not a snapshot, and not a read-modify-write**, per
+    /// [`Self::read_contact`]: a writer can establish a correspondence between
+    /// this call and whatever is done with its answer. A caller that decides
+    /// from the label and then writes must do so under
+    /// [`Self::update_contact`].
+    pub fn correspondence_for_pk_lt(
+        &self,
+        pk_lt: &[u8; ml_dsa::PK_LEN],
+    ) -> Result<Option<CorrespondenceLabel>, DmPersistError> {
+        let mut first = None;
+        let mut matches = 0usize;
+        for label in self.store.correspondences()? {
+            // A correspondence with no contact record is skipped, not an error:
+            // `critical_section` establishes the directory by being entered, so
+            // an established correspondence that has not yet recorded who it is
+            // with is an ordinary state. A record that *exists* and will not
+            // decode is the other case entirely, and `?` carries it out.
+            let Some(contact) = self.read_contact(&label)? else {
+                continue;
+            };
+            // Not a secret and not a constant-time comparison: `pk_lt` is a
+            // public key the caller already holds, and the scan's timing is a
+            // function of how many correspondences exist, which the directory
+            // listing states outright to anyone holding the disk.
+            if contact.pk_lt() == pk_lt {
+                matches += 1;
+                first.get_or_insert(label);
+            }
+        }
+        match matches {
+            0 => Ok(None),
+            1 => Ok(first),
+            matches => Err(DmPersistError::AmbiguousCorrespondent { matches }),
         }
     }
 
@@ -2835,6 +2939,244 @@ mod tests {
         bytes[0] = CONTACT_RECORD_VERSION;
         write_contact_bytes(&p, &l, &bytes);
         p.read_contact(&l).expect("reads").expect("present");
+    }
+
+    // ---- the pk_lt lookup (#261) -------------------------------------------
+
+    /// The lookup answers with the correspondence that holds the key, over a
+    /// store holding several — and answers `None` for a key no record holds.
+    ///
+    /// The `pk_pc` case is the control that matters: every fixture's `pk_pc` is
+    /// also a stored key, so a lookup comparing the wrong field would pass every
+    /// other assertion here and fail only this one.
+    #[test]
+    fn a_pk_lt_lookup_names_the_correspondence_that_holds_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+
+        // Before anything is seeded: absence, over a store that exists.
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x01).as_ref())
+                .expect("scans"),
+            None,
+            "an empty store named a correspondence"
+        );
+
+        let seeded = [
+            (label(0xA1), 0x01u8),
+            (label(0xA2), 0x02),
+            (label(0xA3), 0x03),
+        ];
+        for (l, tag) in &seeded {
+            seed_contact(&p, l, contact_tagged(*tag, FIRST_SEEN, LAST_SEEN));
+        }
+
+        for (l, tag) in &seeded {
+            assert_eq!(
+                p.correspondence_for_pk_lt(pk(*tag).as_ref())
+                    .expect("scans"),
+                Some(*l),
+                "the lookup named the wrong correspondence for tag {tag:#04x}"
+            );
+        }
+
+        // A key nothing holds.
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x2A).as_ref())
+                .expect("scans"),
+            None,
+            "an unknown key matched a correspondence"
+        );
+
+        // A key that is stored, but as `pk_pc` rather than `pk_lt`.
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x01u8.wrapping_add(0x7F)).as_ref())
+                .expect("scans"),
+            None,
+            "the lookup matched against pk_pc"
+        );
+    }
+
+    /// A correspondence established without a contact record is skipped rather
+    /// than failing the scan: entering a critical section creates the directory,
+    /// so an established correspondence that has recorded nothing yet is an
+    /// ordinary state and not a corrupt one.
+    #[test]
+    fn a_correspondence_with_no_contact_record_is_skipped_by_a_pk_lt_lookup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let bare = label(0xB1);
+        let known = label(0xB2);
+
+        p.store()
+            .critical_section(&bare, |_| -> Result<(), DmStoreError> { Ok(()) })
+            .expect("establishes");
+        assert!(
+            p.read_contact(&bare).expect("reads").is_none(),
+            "the bare correspondence has a contact record, so this test proves nothing"
+        );
+        assert!(
+            p.store().correspondences().expect("lists").contains(&bare),
+            "the bare correspondence is not listed, so the skip is never exercised"
+        );
+
+        // With only the bare correspondence there, the scan runs and finds
+        // nothing rather than failing.
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x01).as_ref())
+                .expect("scans"),
+            None
+        );
+
+        seed_contact(&p, &known, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x01).as_ref())
+                .expect("scans"),
+            Some(known),
+            "the bare correspondence stopped the scan reaching the seeded one"
+        );
+    }
+
+    /// **Two correspondences holding one `pk_lt` is an error, not a winner.**
+    /// Without this the lookup would answer from whichever directory the scan
+    /// reached first and route a knock into one of two correspondences by
+    /// filesystem order.
+    #[test]
+    fn two_correspondences_holding_one_pk_lt_are_ambiguous_rather_than_arbitrary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let (one, two, other) = (label(0xC1), label(0xC2), label(0xC3));
+
+        seed_contact(&p, &one, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        seed_contact(&p, &other, contact_tagged(0x02, FIRST_SEEN, LAST_SEEN));
+
+        // Positive control: with one holder the key resolves, so the refusal
+        // below is the duplicate and not the lookup failing generally.
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x01).as_ref())
+                .expect("scans"),
+            Some(one)
+        );
+
+        seed_contact(&p, &two, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+
+        match p
+            .correspondence_for_pk_lt(pk(0x01).as_ref())
+            .expect_err("a duplicated pk_lt resolved to one correspondence")
+        {
+            DmPersistError::AmbiguousCorrespondent { matches } => assert_eq!(matches, 2),
+            other => panic!("wrong error: {other:?}"),
+        }
+
+        // The ambiguity is about the one key: every other correspondence still
+        // resolves, so the refusal is not a wedged store.
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x02).as_ref())
+                .expect("scans"),
+            Some(other)
+        );
+
+        // A third holder counts too: `matches` is the number found, not a flag
+        // spelled as one. Narrowing the arm to `2 => Err(..)` passes every
+        // assertion above and fails here.
+        let three = label(0xC4);
+        seed_contact(&p, &three, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        let err = p
+            .correspondence_for_pk_lt(pk(0x01).as_ref())
+            .expect_err("three holders resolved to one correspondence");
+        match &err {
+            DmPersistError::AmbiguousCorrespondent { matches } => assert_eq!(*matches, 3),
+            other => panic!("wrong error: {other:?}"),
+        }
+
+        // The rendering asserted is the *returned* error's, not one built here
+        // — otherwise this checks `Display` and says nothing about the value the
+        // lookup produced. It names the count and the fact, and no label.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains('3') && rendered.contains("long-term identity key"),
+            "unhelpful rendering: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&hex::encode(one.as_bytes()))
+                && !rendered.contains(&hex::encode(two.as_bytes())),
+            "a label reached the rendered error: {rendered}"
+        );
+
+        // It wraps nothing: the ambiguity is this function's own finding, not a
+        // failure handed up from a record or the store.
+        assert!(
+            std::error::Error::source(&err).is_none(),
+            "AmbiguousCorrespondent reported a source"
+        );
+    }
+
+    /// **A store error during the scan is propagated, not read as "no
+    /// correspondence holds this key".** Absence sends the caller to first
+    /// contact, which mints a second label for an identity that already has one
+    /// — the ambiguity the test above refuses to resolve, arriving through the
+    /// enumeration instead of through the records.
+    #[test]
+    fn a_store_error_during_the_scan_fails_the_lookup_rather_than_answering_absence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0xE1);
+        seed_contact(&p, &l, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+
+        // Positive control: the key resolves while the store is intact.
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x01).as_ref())
+                .expect("scans"),
+            Some(l)
+        );
+
+        std::fs::remove_dir_all(p.store().root()).expect("removes");
+        match p
+            .correspondence_for_pk_lt(pk(0x01).as_ref())
+            .expect_err("a vanished store answered that the key is unknown")
+        {
+            DmPersistError::Store(DmStoreError::Io { .. }) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    /// **An unreadable contact record fails the lookup; it is not skipped.**
+    /// Skipping would report the sought identity as unknown while its record is
+    /// on disk, and the caller's remedy for unknown is to run first contact —
+    /// minting a second correspondence for one identity, which is the very
+    /// duplicate the test above refuses to resolve.
+    #[test]
+    fn an_unreadable_contact_record_fails_a_pk_lt_lookup_rather_than_being_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let (sought, corrupt) = (label(0xD1), label(0xD2));
+
+        seed_contact(&p, &sought, contact_tagged(0x01, FIRST_SEEN, LAST_SEEN));
+        seed_contact(&p, &corrupt, contact_tagged(0x02, FIRST_SEEN, LAST_SEEN));
+
+        // Positive control: both readable, the key resolves.
+        assert_eq!(
+            p.correspondence_for_pk_lt(pk(0x01).as_ref())
+                .expect("scans"),
+            Some(sought)
+        );
+
+        let mut bytes = contact_tagged(0x02, FIRST_SEEN, LAST_SEEN)
+            .encode()
+            .to_vec();
+        bytes[0] = CONTACT_RECORD_VERSION + 1;
+        write_contact_bytes(&p, &corrupt, &bytes);
+
+        // The sought record is still perfectly readable on its own — so a `None`
+        // or a `Some` here would be the scan quietly walking past the other one.
+        assert!(p.read_contact(&sought).expect("reads").is_some());
+        match p
+            .correspondence_for_pk_lt(pk(0x01).as_ref())
+            .expect_err("an unreadable contact record was skipped")
+        {
+            DmPersistError::Contact(ContactCacheError::UnsupportedVersion { .. }) => {}
+            other => panic!("wrong error: {other:?}"),
+        }
     }
 
     /// **A stored record that will not decode wedges every later update**, and

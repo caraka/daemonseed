@@ -238,7 +238,15 @@ modules:
       yields a Locked guard carrying read/replace/delete/present, so a
       read-modify-write cannot be written without the lock; entering one
       establishes the correspondence on disk. read_unlocked and present_unlocked
-      answer without the lock and create nothing. A nested critical_section on
+      answer without the lock and create nothing. correspondences() ->
+      Result<Vec<CorrespondenceLabel>, DmStoreError> lists every correspondence
+      established under the root, without the lock and creating nothing. A root
+      entry is a correspondence when its name is a label's lower-case hex
+      directory form and it resolves to a directory; a symlink is followed. The
+      profile lock and the profile-scoped record files are not correspondences.
+      The list is sorted. A listed correspondence may hold no record. An
+      unreadable root, or a per-entry IO error that is not NotFound, is a
+      DmStoreError; only a vanished entry is skipped. A nested critical_section on
       one label from one thread returns DmStoreError::Reentrant instead of
       deadlocking. RecordScope is Correspondence or Profile, and
       RecordKind::scope() -> RecordScope says which one a kind belongs to.
@@ -1357,6 +1365,19 @@ modules:
       replaces a stored pk_pc. DmPersistError::Contact(ContactCacheError)
       carries a stored record that will not decode and a caller's own contact
       error raised inside f.
+      correspondence_for_pk_lt(&[u8; ml_dsa::PK_LEN]) ->
+      Result<Option<CorrespondenceLabel>, DmPersistError> names the
+      correspondence whose contact record holds that long-term identity key. It
+      is a scan of DmStore::correspondences and each one's contact record; no
+      index is stored and no answer is cached. Ok(None) is no match. Two or more
+      matches is DmPersistError::AmbiguousCorrespondent { matches }, which
+      carries the count and no label; the scan reads every correspondence on
+      every call, so it does not stop at the first match. A correspondence with
+      no contact record is skipped; a record that exists and will not decode
+      fails the whole lookup, as does an IO error that is not absence. The key
+      comparison is not constant-time. The answer is not
+      a snapshot: a writer can establish a correspondence before the caller acts
+      on it, and a caller that then writes does so under update_contact.
       read_block_list() -> Result<BlockList, DmPersistError> reads the profile's
       block list through the store's lock-free profile read. An absent record is
       DmPersistError::BlockListMissing, never an empty list: DmStore::open
@@ -1369,7 +1390,8 @@ modules:
       refuses before the replace, leaving the stored list as it was.
       DmPersistError::BlockList(BlockListError) carries a stored list that will
       not decode and a caller's own over-ceiling change.
-      read_outbox/read_cursor/read_contact/read_block_list are lock-free.
+      read_outbox/read_cursor/read_contact/read_block_list and
+      correspondence_for_pk_lt are lock-free.
       The provisional
       record is sealed by its own path and again by the store: the record's seal
       binds RecordContext and refuses one lifted from another channel, the store's AAD binds label

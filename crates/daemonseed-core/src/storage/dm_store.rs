@@ -651,6 +651,36 @@ impl CorrespondenceLabel {
     fn dir_name(&self) -> String {
         hex::encode(self.0)
     }
+
+    /// The inverse of [`Self::dir_name`]: the label a directory name encodes, or
+    /// `None` if this name is not one this store wrote.
+    ///
+    /// **Strict, because the answer is used to decide what is a correspondence
+    /// at all.** Exactly `2 * CORRESPONDENCE_LABEL_LEN` characters, and every one
+    /// of them lowercase hex — not `hex::decode`'s own rules, which accept
+    /// uppercase and would let one label round-trip through two distinct names
+    /// on a case-sensitive filesystem and collide on a case-insensitive one.
+    /// Only the exact form [`Self::dir_name`] produces is accepted, so the pair
+    /// is a bijection and `a_label_round_trips_through_its_directory_name` holds
+    /// it there.
+    ///
+    /// A rejected name is not an error: the root holds the profile lock and the
+    /// profile records too, and a caller may have put something of its own
+    /// there. See [`DmStore::correspondences`] for why that is a skip rather
+    /// than a refusal.
+    fn from_dir_name(name: &std::ffi::OsStr) -> Option<Self> {
+        let name = name.to_str()?;
+        if name.len() != 2 * CORRESPONDENCE_LABEL_LEN
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        let mut bytes = [0u8; CORRESPONDENCE_LABEL_LEN];
+        hex::decode_to_slice(name, &mut bytes).ok()?;
+        Some(Self(bytes))
+    }
 }
 
 /// Redacted. The label is a stable per-correspondence identifier, so a `Debug`
@@ -1170,6 +1200,104 @@ impl DmStore {
             }
         }
         Ok(present)
+    }
+
+    /// Every correspondence established under this root, without taking a lock
+    /// and without creating anything.
+    ///
+    /// The other axis of [`DmStore::present_unlocked`]: that call answers "which
+    /// records does *this* correspondence hold", this one answers "which
+    /// correspondences are there". Neither establishes anything, for
+    /// [`DmStore::read_unlocked`]'s reason — asking must not answer itself into
+    /// existence (#253).
+    ///
+    /// **What is a correspondence here is decided by the name, not by a list of
+    /// things to skip.** The root also holds the profile lock and one file per
+    /// profile-scoped [`RecordKind`] ([`RecordScope::Profile`]), and a
+    /// skip-list naming them would have to be extended by hand every time a
+    /// profile record is added — the failure being silent, since a missed name
+    /// is reported as a correspondence rather than as an error. So the test runs
+    /// the other way: an entry is a correspondence exactly when its name is
+    /// `CorrespondenceLabel::from_dir_name`'s inverse of a label — de-linked
+    /// because that reader is private, and it stays private: nothing outside
+    /// this module turns a name back into a label — and it resolves to a
+    /// directory. `no_profile_record_name_can_be_read_as_a_correspondence` pins
+    /// the answer for every profile-scoped kind's file name and for the lock —
+    /// **on length, which is all those names need**, so it is not what holds the
+    /// character class. That belongs to
+    /// `a_label_round_trips_through_its_directory_name`, whose upper-case case
+    /// is the only one the class uniquely refuses (`hex::decode_to_slice` would
+    /// accept it).
+    ///
+    /// **A missing root is an error, not an empty list.** A failing `read_dir`
+    /// is propagated whole: "the store root is gone" and "this profile
+    /// corresponds with nobody" have different remedies, and only one of them
+    /// is answered by establishing a correspondence.
+    ///
+    /// **A directory here means the correspondence exists, not that it holds any
+    /// record.** [`DmStore::critical_section`] establishes the directory by
+    /// being entered, so one that was entered and wrote nothing is listed. A
+    /// caller wanting only correspondences with a particular record asks
+    /// [`DmStore::present_unlocked`] about each.
+    ///
+    /// **Sorted**, so two runs over one store agree. `read_dir` yields in
+    /// whatever order the filesystem holds, and a caller that stops at the first
+    /// match would otherwise be choosing by directory layout.
+    ///
+    /// Carries [`DmStore::present_unlocked`]'s caveat: the answer is not a
+    /// snapshot, so a writer can establish or remove a correspondence between
+    /// two calls.
+    pub fn correspondences(&self) -> Result<Vec<CorrespondenceLabel>, DmStoreError> {
+        let mut found = Vec::new();
+        let entries = std::fs::read_dir(&self.root).map_err(|e| DmStoreError::io(&self.root, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| DmStoreError::io(&self.root, e))?;
+            // The name first, so an entry that is not a label costs no syscall
+            // — the profile records and the lock never reach the type check.
+            let Some(label) = CorrespondenceLabel::from_dir_name(&entry.file_name()) else {
+                continue;
+            };
+            let path = entry.path();
+            // **Errors propagate; only a vanished entry is a skip.** `file_type`
+            // is free only while the directory supplies `d_type`; where it does
+            // not (`ftype=0` XFS, several FUSE and network filesystems) std
+            // falls back to `lstat`, which can fail for reasons that are not
+            // absence. Swallowing those would report an empty list for a store
+            // full of correspondences, and the caller's remedy for "not there"
+            // is to mint a second label for an identity that already has one —
+            // the ambiguity this enumeration exists to let
+            // `crate::dm::persist::DmPersist::correspondence_for_pk_lt` detect.
+            // `Self::sweep_root_orphans` may skip, because a missed orphan
+            // merely survives; here the direction of the failure is inverted.
+            // `NotFound` alone is real absence, as in `Self::read_record`.
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(DmStoreError::io(&path, e)),
+            };
+            // **A symlink is followed here, unlike in `sweep_root_orphans`.**
+            // That sweep must not follow one, because it deletes what it finds.
+            // This must, because `Self::read_record` reads through
+            // `std::fs::read`, which follows — so refusing here would make the
+            // enumerator and the reader disagree about which correspondences
+            // exist after an ordinary relocation (move the directory elsewhere,
+            // symlink it back), and the lookup would answer absence for a record
+            // it can read perfectly well.
+            let is_dir = if file_type.is_symlink() {
+                match std::fs::metadata(&path) {
+                    Ok(meta) => meta.is_dir(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(DmStoreError::io(&path, e)),
+                }
+            } else {
+                file_type.is_dir()
+            };
+            if is_dir {
+                found.push(label);
+            }
+        }
+        found.sort_unstable();
+        Ok(found)
     }
 
     /// The read both paths share: [`Locked::read`] under the lock, and
@@ -4945,6 +5073,370 @@ mod tests {
         let mut want = vec![RecordKind::Outbox, RecordKind::ReceiveCursor];
         want.sort_by_key(|k| k.aad_tag());
         assert_eq!(found, want, "and it names exactly the records that exist");
+    }
+
+    /// A label's directory name reads back as the same label, and the reader
+    /// accepts nothing else. Without the second half the store would list a
+    /// correspondence under a name it could never have written.
+    #[test]
+    fn a_label_round_trips_through_its_directory_name() {
+        for seed in [0u8, 1, 0x5A, 0xFF] {
+            let l = label(seed);
+            let name = l.dir_name();
+            assert_eq!(
+                CorrespondenceLabel::from_dir_name(std::ffi::OsStr::new(&name)),
+                Some(l),
+                "a label's own directory name did not read back"
+            );
+        }
+
+        // The forms that must be refused, each a different way of being not the
+        // name `dir_name` writes.
+        let name = label(0xAB).dir_name();
+        for bad in [
+            String::new(),
+            name[..name.len() - 1].to_string(),
+            format!("{name}0"),
+            name.to_uppercase(),
+            format!("{}g", &name[..name.len() - 1]),
+            "not-a-label".to_string(),
+        ] {
+            assert_eq!(
+                CorrespondenceLabel::from_dir_name(std::ffi::OsStr::new(&bad)),
+                None,
+                "{bad:?} was read as a correspondence label"
+            );
+        }
+    }
+
+    /// The enumerator names exactly the correspondences that were established:
+    /// not the profile lock, not the profile records, and not a directory whose
+    /// name no label produces.
+    #[test]
+    fn correspondences_names_every_established_correspondence_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let root = tmp.path().join("dm");
+
+        // A store that has only ever been opened holds the profile lock and the
+        // profile records, and no correspondence — so an answer that included
+        // either would be visible here before anything else is written.
+        assert!(
+            s.correspondences().unwrap().is_empty(),
+            "a store with no correspondence named one"
+        );
+        assert_eq!(
+            root_entries(&root),
+            (Vec::new(), expected_root_files()),
+            "the fixture is not the root this test assumes"
+        );
+
+        // This test does not assert the ordering — the set is what it is
+        // checking, and a fixture whose creation order happened to match
+        // `read_dir`'s would make an ordering assertion here pass for free.
+        // `correspondences_are_sorted_whatever_order_they_were_created` owns
+        // that, and checks its own fixture before asserting.
+        let established = [label(30), label(31), label(32)];
+        for l in &established {
+            s.critical_section::<_, DmStoreError>(l, |_| Ok(()))
+                .unwrap();
+        }
+        // One of them holds a record and the others hold none: a directory is
+        // the correspondence, and an empty one is still established.
+        s.critical_section::<_, DmStoreError>(&established[1], |g| {
+            g.replace(RecordKind::Outbox, b"owed")
+        })
+        .unwrap();
+
+        // Names that must not be read as correspondences: a directory of the
+        // right length that is not hex, the same label in upper case, and one
+        // character short.
+        let real = established[0].dir_name();
+        for stray in [
+            "not-a-correspondence".to_string(),
+            real.to_uppercase(),
+            real[..real.len() - 1].to_string(),
+        ] {
+            std::fs::create_dir(root.join(stray)).unwrap();
+        }
+
+        // And a *file* whose name is a perfectly good label: a correspondence is
+        // a directory, so the name test alone is not the whole filter.
+        std::fs::write(root.join(label(33).dir_name()), b"not a correspondence").unwrap();
+
+        let mut want: Vec<String> = established.iter().map(|l| l.dir_name()).collect();
+        want.sort();
+        let got: Vec<String> = s
+            .correspondences()
+            .unwrap()
+            .iter()
+            .map(|l| l.dir_name())
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// No profile record's file name, and not the lock's, reads as a
+    /// correspondence label — the guard against a future
+    /// [`RecordScope::Profile`] kind whose file name nobody re-checked.
+    ///
+    /// **What this covers, stated exactly, because it is narrower than it
+    /// looks.** Every real name here is refused on its *length* alone. The final
+    /// loop stretches each to a label's exact length — the shape a future kind
+    /// would need before length stopped saving us — and those are refused by the
+    /// character class, but `hex::decode_to_slice` behind it would refuse them
+    /// equally, so **no case in this test uniquely kills the character class**:
+    /// deleting it leaves every assertion here passing, as a mutation run
+    /// confirmed. The class's one unique job is refusing *upper-case* hex, which
+    /// the decoder accepts, and
+    /// `a_label_round_trips_through_its_directory_name`'s `to_uppercase` case is
+    /// the sole thing that kills its deletion.
+    #[test]
+    fn no_profile_record_name_can_be_read_as_a_correspondence() {
+        for kind in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Profile)
+        {
+            assert_eq!(
+                CorrespondenceLabel::from_dir_name(std::ffi::OsStr::new(kind.file_name())),
+                None,
+                "{kind:?}'s file name reads as a correspondence label"
+            );
+        }
+        assert_eq!(
+            CorrespondenceLabel::from_dir_name(std::ffi::OsStr::new(LOCK_FILE_NAME)),
+            None,
+            "the profile lock's name reads as a correspondence label"
+        );
+
+        // Positive control: the loop above ran over something, and the assertion
+        // it makes is one a label would fail.
+        assert!(
+            RecordKind::ALL
+                .into_iter()
+                .any(|k| k.scope() == RecordScope::Profile),
+            "no profile-scoped kind exists, so the loop asserted nothing"
+        );
+
+        // The case that does reach the character class: the length gate cannot
+        // be what refuses these.
+        for kind in RecordKind::ALL
+            .into_iter()
+            .filter(|k| k.scope() == RecordScope::Profile)
+        {
+            let name: String = kind
+                .file_name()
+                .chars()
+                .cycle()
+                .take(2 * CORRESPONDENCE_LABEL_LEN)
+                .collect();
+            assert_eq!(name.len(), 2 * CORRESPONDENCE_LABEL_LEN);
+            assert_eq!(
+                CorrespondenceLabel::from_dir_name(std::ffi::OsStr::new(&name)),
+                None,
+                "{name:?} passed the character class"
+            );
+        }
+    }
+
+    /// **Determinism is asserted rather than inherited from the filesystem, and
+    /// the fixture proves it can tell the difference before asserting anything.**
+    ///
+    /// The obvious version of this test — establish them in descending order and
+    /// assert the answer is ascending — is not portable and was actively wrong
+    /// here: `read_dir` on this tmpfs returns neither insertion order nor sorted
+    /// order (it came back reverse-of-insertion), so seeding descending made the
+    /// *unsorted* answer already sorted and the mutation survived. There is no
+    /// creation order that is safe to assume. So the raw order is **read** and
+    /// checked: if it already matches sorted order the fixture cannot detect a
+    /// missing sort, and this fails as a fixture defect rather than passing.
+    #[test]
+    fn correspondences_are_sorted_whatever_order_they_were_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let root = tmp.path().join("dm");
+        let scattered = [
+            label(0x5A),
+            label(0x0A),
+            label(0xF0),
+            label(0x33),
+            label(0x91),
+            label(0x02),
+            label(0xCC),
+            label(0x40),
+        ];
+        for l in &scattered {
+            s.critical_section::<_, DmStoreError>(l, |_| Ok(()))
+                .unwrap();
+        }
+
+        let mut want: Vec<String> = scattered.iter().map(|l| l.dir_name()).collect();
+        want.sort();
+
+        // The control, and it is the whole point: what `read_dir` hands the
+        // enumerator, in its own order, restricted to the correspondences.
+        let raw: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| want.contains(n))
+            .collect();
+        assert_eq!(raw.len(), scattered.len(), "the control lost an entry");
+        assert_ne!(
+            raw, want,
+            "this filesystem already returns the correspondences sorted, so the \
+             fixture cannot detect a missing sort"
+        );
+
+        assert_eq!(
+            s.correspondences()
+                .unwrap()
+                .iter()
+                .map(|l| l.dir_name())
+                .collect::<Vec<_>>(),
+            want
+        );
+    }
+
+    /// **A correspondence reached through a symlink is a correspondence**, and
+    /// the reason is agreement with the reader: `read_record` goes through
+    /// `std::fs::read`, which follows symlinks, so an enumerator that did not
+    /// would report absence for a record the store reads perfectly well — and
+    /// the caller's remedy for absence is to establish a *second* correspondence
+    /// for the same identity. Contrast `sweep_root_orphans`, which must not
+    /// follow one because it deletes what it finds.
+    #[test]
+    fn a_correspondence_behind_a_symlink_is_enumerated_and_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let root = tmp.path().join("dm");
+        let l = label(44);
+
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Outbox, b"owed"))
+            .unwrap();
+
+        // Relocate the directory out of the root and symlink it back — the
+        // ordinary "this disk is full" move.
+        let elsewhere = tmp.path().join("relocated");
+        std::fs::rename(root.join(l.dir_name()), &elsewhere).unwrap();
+        assert_eq!(
+            s.correspondences().unwrap(),
+            Vec::new(),
+            "the relocated correspondence is still listed, so the symlink proves nothing"
+        );
+        std::os::unix::fs::symlink(&elsewhere, root.join(l.dir_name())).unwrap();
+
+        assert_eq!(
+            s.correspondences().unwrap(),
+            vec![l],
+            "a correspondence the store can read was not enumerated"
+        );
+        // And the reader agrees, which is the whole point of following.
+        assert_eq!(
+            s.read_unlocked(&l, RecordKind::Outbox).unwrap().as_deref(),
+            Some(&b"owed"[..])
+        );
+
+        // A symlink to a *file* is still not a correspondence: following resolves
+        // the target's kind, it does not accept any link.
+        let target = tmp.path().join("a-file");
+        std::fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, root.join(label(45).dir_name())).unwrap();
+        assert_eq!(
+            s.correspondences().unwrap(),
+            vec![l],
+            "a symlink to a file was enumerated as a correspondence"
+        );
+
+        // A dangling symlink named as a label is absence, not an error.
+        std::os::unix::fs::symlink(
+            tmp.path().join("nothing-here"),
+            root.join(label(46).dir_name()),
+        )
+        .unwrap();
+        assert_eq!(
+            s.correspondences().unwrap(),
+            vec![l],
+            "a dangling symlink was enumerated as a correspondence"
+        );
+    }
+
+    /// **An IO error that is not absence is propagated, not read as "no such
+    /// correspondence".** The drivable half of that rule: a symlink into an
+    /// unsearchable directory makes `metadata` fail with `PermissionDenied`,
+    /// which is exactly the shape of failure that must never be mistaken for a
+    /// correspondence not existing — the caller's remedy for absence is to mint
+    /// a second label for an identity that already has one.
+    ///
+    /// Skipped when the tests run as root, which searches a `000` directory
+    /// regardless. Nothing is asserted in that case, and the assertion below is
+    /// what says so out loud rather than passing quietly.
+    #[test]
+    fn an_unreadable_correspondence_is_an_error_rather_than_an_absent_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let root = tmp.path().join("dm");
+
+        let blocked = tmp.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let target = blocked.join("real");
+        std::fs::create_dir(&target).unwrap();
+        let l = label(48);
+        std::os::unix::fs::symlink(&target, root.join(l.dir_name())).unwrap();
+
+        // Positive control: while the parent is searchable it enumerates, so the
+        // refusal below is the permission and not the symlink.
+        assert_eq!(s.correspondences().unwrap(), vec![l]);
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let answer = s.correspondences();
+        // **Probed while the mode is still 000.** Reading it after the restore
+        // below always says the directory is searchable, which silently turns
+        // this whole test into an early return — it passed under a mutation that
+        // swallows the error before that was caught.
+        let mode_is_enforced = std::fs::metadata(&target).is_err();
+        // Restore before asserting, so a failure does not leave an undeletable
+        // tempdir behind.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if !mode_is_enforced {
+            // Root, or a filesystem ignoring the mode. Say so; do not pass.
+            eprintln!("skipped: this user can search a 000 directory");
+            return;
+        }
+        match answer.expect_err("an unreadable correspondence was reported as absent") {
+            DmStoreError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
+    }
+
+    /// **A store root that is not there is an error, not an empty list.**
+    /// Answering absence would tell `correspondence_for_pk_lt`'s caller that an
+    /// identity it corresponds with is unknown, and the remedy for unknown is to
+    /// mint a second label — manufacturing the very ambiguity the lookup exists
+    /// to detect, through the enumeration meant to prevent it.
+    #[test]
+    fn a_vanished_store_root_is_an_error_rather_than_no_correspondences() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(47);
+        s.critical_section::<_, DmStoreError>(&l, |_| Ok(()))
+            .unwrap();
+
+        // Positive control: it answers before the root goes.
+        assert_eq!(s.correspondences().unwrap(), vec![l]);
+
+        std::fs::remove_dir_all(tmp.path().join("dm")).unwrap();
+        match s
+            .correspondences()
+            .expect_err("a vanished store root was reported as no correspondences")
+        {
+            DmStoreError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("wrong error: {other:?}"),
+        }
     }
 
     /// The other half of the pair, pinned so the split stays honest: entering a

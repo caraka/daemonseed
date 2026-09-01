@@ -26,6 +26,20 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_core::dm::persist` — `DmPersist::correspondence_for_pk_lt`, which names the
+  correspondence whose contact record holds a given long-term identity key. It is a scan of
+  the store's correspondences and their contact records, not a stored index, and is
+  lock-free. `Ok(None)` is no match; two or more matches is
+  `DmPersistError::AmbiguousCorrespondent`, carrying the count and no label. A
+  correspondence with no contact record is skipped; a contact record that exists and will
+  not decode fails the whole lookup. **Breaking (crate API):** `DmPersistError` gains an
+  `AmbiguousCorrespondent` variant. (#261)
+- `daemonseed_core::storage::dm_store` — `DmStore::correspondences`, the sorted list of every
+  correspondence established under the store root, taken without the lock and creating
+  nothing. A root entry counts when its name is a label's lower-case hex directory form and
+  resolves to a directory, so the profile lock and the profile-scoped records are excluded by
+  name. A listed correspondence may hold no record. An unreadable root, or a per-entry IO
+  error that is not `NotFound`, is a `DmStoreError`. (#261)
 - `daemonseed_core::dm::block_list` — `BlockList::encode` and `BlockList::decode`, the
   block list's at-rest form: every blocked long-term identity key concatenated in ascending
   byte order, with no header, count or occupancy map. `BLOCK_LIST_MAX_ENTRIES` (512) is the
