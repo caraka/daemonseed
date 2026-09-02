@@ -822,6 +822,42 @@ route taken to reach a decision are not recorded here — the git history and `C
   direction of the second would end a healthy queue on a coin toss. The cost is that a genuine
   post-restart re-knock from a known correspondent is surfaced to the user rather than resolved.
 
+- **A send is priced against the outbox before the ratchet steps, using the worst-case sealed frame
+  length, through one predicate the enqueue also runs.** A ratchet step cannot be rolled back, so a
+  refusal after it would spend a sequence number the outbox never holds. Pricing with the worst
+  case rather than the real frame refuses a send the real frame would have fitted, by the margin
+  between the two; that margin is the documented floor of the record and is accepted. Two copies
+  of the predicate were refused because they drift.
+
+- **A give-up is reported before its surfacing is cleared, and the clear waits for the front end
+  to say the report was shown.** Clearing in the same write that discovers the give-up persists the
+  clear while the report is still in memory, so a crash between the two loses the report — the
+  defect the surfacing flag was added to remove. The cost is a per-session memory of what has been
+  reported, so a report is not repeated within one process.
+
+- **The initiator's first-contact entry is the outbox's sequence zero, targeting the doorbell.**
+  Re-seeding then re-emits identical bytes from the record, and a failed publish is an unconfirmed
+  entry with a backoff rather than an orphaned handshake record. The alternative, publishing the
+  entry outside the outbox, gives the one write that must be byte-identical across retries no home
+  that retries.
+
+- **Only a complete page sweep is folded into collection.** A sweep with no failed reads and either
+  no slot attempted or every slot attempted is complete; anything else re-plans and advances
+  nothing. Folding a partial sweep could advance the contiguous cursor past a slot that was never
+  read, which is the one move the cursor must never make. The cost is a re-sweep of the page.
+
+- **After a restart the outbox keeps re-seeding doorbell entries and reporting give-ups, taking the
+  direction from the stored record; only page addressing waits for a session key schedule.** A
+  correspondence from an earlier process resumes collection at page zero and refuses sends, because
+  its key schedule is not persisted. Gating the whole outbox on the key schedule was refused: the
+  first-contact entry needs only the recipient's doorbell address and its stored bytes.
+
+- **The reply direction is not swept until a frame carries the acceptor's pseudonym verifying key.**
+  Nothing built yet carries it, so an acceptor's frames and acknowledgements cannot be verified by
+  the initiator; frames skipped for that reason are counted and reported rather than opened under
+  a guessed key. A piggybacked acknowledgement inside a received frame is counted and not yet
+  folded into the outbox.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the

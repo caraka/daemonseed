@@ -129,11 +129,16 @@ pub enum DmEvent {
         /// The state now recorded for it.
         state: DeliveryState,
     },
-    /// A first contact could not proceed.
+    /// A message could not be sent — a first contact, or a channel send.
+    ///
+    /// **One event for both, because a front end does the same thing with
+    /// either**: the body did not go, and this says how far it got and why.
+    /// [`RefusalReason`] is what distinguishes them, and its variants say which
+    /// plane they belong to.
     Refused {
         /// The intended recipient's long-term identity key.
         to: PkLt,
-        /// How far the first contact got.
+        /// How far the send got.
         acceptance: Acceptance,
         /// Where it stopped.
         reason: RefusalReason,
@@ -204,6 +209,69 @@ pub enum DmEvent {
         /// next re-seed is read normally — but nothing else would say that
         /// first contact had stopped.
         pending_full: u64,
+    },
+    /// One correspondence's channel-plane accounting, cumulative for this
+    /// session.
+    ///
+    /// **Observability, and every counter here is a state a silent driver would
+    /// hide.** A page sweep that folds nothing looks identical whether the page
+    /// was empty, unreadable, or full of frames this session cannot open — and
+    /// the three demand different answers. Emitted only when a counter moved, so
+    /// a healthy conversation is silent.
+    ChannelHealth {
+        /// The correspondent's long-term identity key.
+        with: PkLt,
+        /// Sweeps refused because the transport did not read every slot.
+        ///
+        /// Nothing was folded and nothing advanced: a partial page cannot say a
+        /// position is absent, only that it was not seen, and advancing on that
+        /// reading skips messages that were there. The page is re-planned on the
+        /// next cadence.
+        partial_sweeps: u64,
+        /// Frames whose ratchet position was already consumed.
+        ///
+        /// **One path reaches this, and the ordinary re-seed is not it.** A
+        /// sender re-seeds until acknowledged, so the same bytes sit in the same
+        /// slot and come back on every sweep — but a settled position is filtered
+        /// out of
+        /// [`PageObservation::unsettled`](daemonseed_core::dm::collect::PageObservation)
+        /// before the ratchet is ever offered the frame, so a re-seed of a
+        /// collected message is silent and costs nothing.
+        ///
+        /// What does reach it is a position that was *opened* and could not be
+        /// *acknowledged*: `Collection::collected` refuses with
+        /// `AckError::TooManyRuns` when the beyond-prefix set is full, leaving
+        /// the position unsettled while its message key is spent. The driver
+        /// retains such a position and retries it, and the sweep in between
+        /// re-offers the frame to a ratchet that has already consumed it. So a
+        /// non-zero count here means the acknowledgement's run capacity is under
+        /// pressure, not that the network is repeating itself.
+        already_consumed: u64,
+        /// Frames that did not open or did not verify.
+        ///
+        /// The slot is left unsettled rather than abandoned: abandonment settles
+        /// a position permanently, and a frame this session cannot read is not
+        /// proof that no readable frame will ever occupy that slot. Page
+        /// owner-write authority is symmetric, so an unopenable frame is an
+        /// ordinary input — the correspondent's own writes are what the
+        /// authorship signature separates from everybody else's.
+        unopenable: u64,
+        /// Sweeps skipped because the correspondent's pseudonym key is not
+        /// known here, so nothing found could be verified.
+        ///
+        /// The acceptor learns the initiator's pseudonym from the knock; the
+        /// initiator learns nothing of the acceptor's, because no frame carries
+        /// it and the resume record that homes it (A4.8 / A9.2) cannot be
+        /// written until the channel has re-established once. So an initiator
+        /// does not sweep at all, and this counter is the only statement of it.
+        peer_pseudonym_unknown: u64,
+        /// Piggybacked acknowledgements carried by frames this session opened
+        /// and did not fold.
+        ///
+        /// The fold — merge into the retained send-direction state, settle the
+        /// outbox, report the settled sequences — is the acknowledgement slice's.
+        /// Counted here so a dropped claim is visible rather than silent.
+        peer_acks_deferred: u64,
     },
     /// A contact lookup failed during a sweep, so knocks were dropped.
     ///
@@ -281,6 +349,39 @@ pub enum RefusalReason {
     /// A derivation or a keygen failed. A condition of this machine's crypto
     /// module, not of the recipient or the network.
     Module,
+    /// The correspondence's outbox cannot hold another message (#339).
+    ///
+    /// **Nothing was spent finding this out**, and that is the point. The
+    /// refusal is priced before the ratchet takes its step, so no sequence
+    /// number was consumed and no frame was sealed: the user may send the same
+    /// message again once the queue has drained. A refusal taken *after* the
+    /// mint would burn a position the correspondent's contiguous prefix then
+    /// waits on for the seven-day give-up.
+    ///
+    /// This is expected in ordinary use rather than exceptional — the record is
+    /// a fixed size and holds on the order of a hundred *owed* messages against
+    /// a seven-day window.
+    OutboxFull {
+        /// Bytes the record would have needed, against a capacity it names
+        /// itself in
+        /// [`OutboxError::Full`](daemonseed_core::dm::outbox::OutboxError::Full).
+        needed: usize,
+    },
+    /// There is no live channel with this correspondent in this process.
+    ///
+    /// Either no correspondence exists at all, or one exists on disk and its key
+    /// schedule does not: a ratchet has no at-rest record, and the pseudonym
+    /// pair is homed in a resume record that cannot be written until the channel
+    /// has re-established once. So a correspondence established before a restart
+    /// is on disk, is listed, and cannot be spoken on until re-establishment —
+    /// a documented limit, not a transient condition, and the user is told
+    /// rather than left with a message that silently never moves.
+    NotEstablishedThisSession,
+    /// The body is over the channel cap.
+    BodyTooLarge,
+    /// The frame would not seal. A crypto-module or signing condition on this
+    /// machine, and nothing was queued.
+    SealFailed,
 }
 
 /// Why an accepted request was not established.
@@ -406,6 +507,23 @@ impl core::fmt::Debug for DmEvent {
                     f,
                     "DoorbellHealth {{ outcome: {outcome:?}, admission: {admission:?}, \
                      pending_full: {pending_full} }}"
+                )
+            }
+            DmEvent::ChannelHealth {
+                partial_sweeps,
+                already_consumed,
+                unopenable,
+                peer_pseudonym_unknown,
+                peer_acks_deferred,
+                ..
+            } => {
+                f.write_str("ChannelHealth { with: ")?;
+                redacted_pk(f)?;
+                write!(
+                    f,
+                    ", partial_sweeps: {partial_sweeps}, already_consumed: {already_consumed}, \
+                     unopenable: {unopenable}, peer_pseudonym_unknown: {peer_pseudonym_unknown}, \
+                     peer_acks_deferred: {peer_acks_deferred} }}"
                 )
             }
             DmEvent::ContactLookupFailed => f.write_str("ContactLookupFailed"),

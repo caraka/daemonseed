@@ -976,7 +976,10 @@ modules:
       messages it missed rather than the whole direction, and a previous chain too
       far behind to walk is retired outright at a ratchet step. losses() reports
       DeliveryLosses { pending, evicted, abandoned } — the two loss counts are
-      permanent and distinct. send_direction()/recv_direction() give the frame
+      permanent and distinct. next_send_seq() reads the sequence number send_next()
+      will place on the next message, so a sender can price a message before
+      minting its key; reading it commits nothing.
+      send_direction()/recv_direction() give the frame
       layer the direction to bind without re-deriving it per site; Outbound also
       carries it. initiator() rejects an opening ephemeral whose halves are not a
       keypair (EphemeralDecapKey::matches, a FIPS 203 embedded-ek memcmp) because
@@ -1297,9 +1300,15 @@ modules:
       { got, max }; Aead is the uniform open-path authentication failure and covers
       a wrong direction, a wrong conversation and a wrong chan_id alike. dir is the
       direction of the messages being acknowledged, as in dm::ack. NOT YET
-      AVAILABLE: the piggyback path (#235).
+      AVAILABLE: the standalone-record path (#235).
       Sub-module dm::collect is the pure collection state machine for one
-      direction of one conversation. Collection::new() holds two pointers:
+      direction of one conversation. Collection::new() holds two pointers, and
+      Collection::resuming_from_page(page) is one whose frontier starts at a
+      persisted cursor's page with nothing settled; a page above MAX_PAGE resumes
+      nothing. Because nothing is settled, every position below the frontier
+      reads as unsettled, so a caller resuming a LIVE collection must consult its
+      own message log before displaying anything or it re-delivers (ISC-A-C21);
+      the cursor names a page and not a set, and this type cannot close that. The two pointers are:
       frontier_page() -> Option<u64> is the highest page observed holding any
       populated slot, and contiguous_through() -> Option<u64> is the
       acknowledgement's contiguous prefix, settled rather than collected.
@@ -1476,7 +1485,11 @@ modules:
       same way; an unknown seq is OutboxError::UnknownSequence. Both gates price
       the candidate before mutating, so a refusal leaves the outbox byte-identical.
       encoded_len() -> usize is the exact length encode() would produce and is
-      what both gates consult. prune() -> usize removes entries that are terminal
+      what both gates consult. room_for(seq, target, frame_len) -> Result<(),
+      OutboxError> answers whether a sealed entry of that size would be accepted,
+      through the same private gate the enqueue passes, so the two answers cannot
+      differ; a caller that cannot know its frame's length before sealing passes
+      frame::WORST_CASE_SEALED_FRAME_LEN. prune() -> usize removes entries that are terminal
       AND already Surfacing::Clear, returning how many went, and is the only thing
       that shrinks the record: without it the record grows with lifetime rather
       than owed messages and every persist fails permanently past capacity.

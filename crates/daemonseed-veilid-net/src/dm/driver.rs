@@ -205,6 +205,17 @@ pub(crate) struct DmDriverProbe {
     pub ops_panicked: AtomicU64,
     /// Blocking compute jobs spawned.
     pub computes_started: AtomicU64,
+    /// The sequence number the single live correspondence's next channel send
+    /// would take, or `u64::MAX` when there is not exactly one.
+    ///
+    /// The one observable that can see a ratchet step. A refused send that
+    /// stepped anyway writes nothing, emits nothing and changes no record, so
+    /// without this the claim that nothing was spent cannot be tested at all.
+    pub next_send_seq: AtomicU64,
+    /// The probe frontier of the single correspondence recovered from disk at
+    /// construction, or `u64::MAX` when there is not exactly one or it reached
+    /// no page.
+    pub resumed_frontier: AtomicU64,
     /// Loop iterations whose machine step has been APPLIED.
     ///
     /// The one counter an oracle may wait on. `ops_completed` counts a join,
@@ -224,6 +235,8 @@ impl DmDriverProbe {
             ops_completed: AtomicU64::new(0),
             ops_panicked: AtomicU64::new(0),
             computes_started: AtomicU64::new(0),
+            next_send_seq: AtomicU64::new(u64::MAX),
+            resumed_frontier: AtomicU64::new(u64::MAX),
             steps_applied: AtomicU64::new(0),
         }
     }
@@ -412,6 +425,12 @@ async fn run<D: DmDht>(
     } = prepared;
     let started_ms = clock.now_ms();
     let mut machine = DmMachine::new(identity, persist, cfg, doorbell_owner, keyrec_addr, spent);
+    // Read once, here: what the store seeded is a property of construction, and
+    // a value re-read later would be a property of whatever has happened since.
+    probe.resumed_frontier.store(
+        machine.only_resumed_frontier().unwrap_or(u64::MAX),
+        Ordering::SeqCst,
+    );
     let mut inflight: JoinSet<DmOutcome> = JoinSet::new();
     // What each in-flight task is doing, for the one thing a `JoinError` can be
     // asked: which task died. A `JoinSet` hands back the task's id on both the
@@ -485,6 +504,10 @@ async fn run<D: DmDht>(
         if !apply(effects, &dht, &mut inflight, &mut jobs, &evt_tx, &probe).await {
             return;
         }
+        probe.next_send_seq.store(
+            machine.only_next_send_seq().unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
         // Bumped LAST, after every effect of this step has been dispatched, so
         // an oracle that waits on it and then reads the mock is reading a
         // settled state rather than racing the dispatch.
@@ -622,6 +645,7 @@ mod tests {
     use daemonseed_core::dm::ack_record::DmAckAddress;
     use daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN;
     use daemonseed_core::dm::keyrec::KEM_EK_LEN;
+    use daemonseed_core::dm::outbox::DeliveryState;
     use daemonseed_core::dm::paging::{
         DmPageAddress, PagePosition, Receiving, Sending, ADDRESS_ROOT_LEN,
     };
@@ -1668,12 +1692,18 @@ mod tests {
         );
         assert_eq!(*dispatch, DoorbellDispatch::FirstSend);
 
-        // The provisional record is on disk. Exactly one correspondence exists,
-        // and it holds one — asserted through the store rather than by counting
-        // effects, so a driver that emitted the write and skipped the persist
-        // fails here.
+        // Exactly one correspondence exists — asserted through the store rather
+        // than by counting effects, so a driver that emitted the write and
+        // skipped the persist fails here.
         let labels = store.store().correspondences().expect("list");
         assert_eq!(labels.len(), 1, "one correspondence was established");
+
+        // **The provisional record was written and then consumed.** It is the
+        // only public road from a stored record to a key schedule, and taking it
+        // deletes the record in the same act — so its absence here is the
+        // evidence that the initiator's ratchet opened, and a driver that
+        // skipped the persist would have had nothing to open and would have
+        // refused instead.
         assert!(
             store
                 .store()
@@ -1682,29 +1712,31 @@ mod tests {
                     daemonseed_core::storage::dm_store::RecordKind::Provisional
                 )
                 .expect("read")
-                .is_some(),
-            "the provisional record was not written"
+                .is_none(),
+            "the provisional record outlived the establishment that consumes it"
         );
-        // And it OPENS under the recipient's own context. Presence alone is a
-        // weaker claim than it looks: the record's seal binds the recipient's
-        // key-record address and the first-contact epoch, so one sealed under
-        // the wrong context is a file that exists and a handshake that can
-        // never resume — and nothing else in this slice would notice.
-        let addr = daemonseed_core::dm::keyrec::derive_owner_seed(peer.signing.public_key())
-            .expect("recipient key-record address");
-        let restart = store.restart_channel(
-            &labels[0],
-            &daemonseed_core::dm::provisional::RecordContext {
-                recipient_keyrec_addr: addr.as_bytes(),
-                fc_epoch: keyrec::fc_epoch((BASE_MS / 1000) as u64),
-            },
+
+        // Sequence zero is in the outbox, carrying the bytes that were
+        // published. Without it a failed knock is an orphan: nothing re-seeds it
+        // and nothing gives up on it.
+        let published_entry = dht.published();
+        assert_eq!(published_entry.len(), 1, "one knock was published");
+        let queued = store
+            .read_outbox(&labels[0], wall.load(Ordering::SeqCst))
+            .expect("the outbox reads")
+            .expect("the outbox exists");
+        assert_eq!(queued.len(), 1, "the outbox holds exactly the knock");
+        let zero = queued.entry(0).expect("sequence zero is queued");
+        assert_eq!(
+            zero.target(),
+            daemonseed_core::dm::outbox::OutboxTarget::Doorbell { slot: *slot },
+            "the knock is queued against the doorbell slot it was written to"
         );
-        assert!(
-            matches!(
-                restart,
-                daemonseed_core::dm::persist::StoredChannelRestart::HandshakeResumes(_)
-            ),
-            "the provisional record does not open under the recipient's context"
+        assert_eq!(
+            zero.frame().expect("the knock keeps its bytes"),
+            published_entry[0].1.as_slice(),
+            "a re-seed must re-emit the identical bytes, or the far end reads it \
+             as this side having lost its state"
         );
         assert!(
             drain(&mut evt_rx)
@@ -1858,6 +1890,1182 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The parts for a named identity, so two drivers can face each other over
+    /// one shared record store.
+    ///
+    /// [`parts`] is this with the oracle identity fixed; both go through here so
+    /// a two-driver oracle and a one-driver one are configured identically.
+    fn parts_as(
+        keys: IdentityKeys,
+        dir: &std::path::Path,
+        wall: &Arc<AtomicI64>,
+        dht: Arc<MockDht>,
+    ) -> DmDriverParts<MockDht> {
+        let clock = WallClock::from_fn({
+            let w = wall.clone();
+            move || w.load(Ordering::SeqCst)
+        });
+        DmDriverParts {
+            dht,
+            clock,
+            identity: DmIdentity {
+                signing: Arc::new(keys.signing),
+                kem: keys.kem,
+                doorbell_slot_secret: keys.dm_doorbell_slot_secret,
+            },
+            persist: DmPersist::open(dir.join("dm"), &AT_REST).expect("persist opens"),
+            cfg: DmDriverConfig {
+                idle_tick: IDLE_TICK,
+                policy: AdmissionPolicy::Open,
+                pow_difficulty: PowDifficulty::reduced_for_test(TEST_POW_BITS),
+            },
+            spent_tokens: None,
+        }
+    }
+
+    /// A key record for `keys`, as that identity would publish it.
+    fn key_record_for(keys: &IdentityKeys) -> Vec<u8> {
+        keyrec::build_encoded(
+            &keys.signing,
+            keys.kem.encapsulation_key(),
+            keyrec::DM_KEY_RECORD_VERSION,
+            keyrec::DM_KEY_RECORD_INVITE_ONLY,
+        )
+        .expect("key record")
+    }
+
+    /// The bodies of every `Message` in `events`.
+    fn messages(events: &[DmEvent]) -> Vec<(u64, String)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DmEvent::Message { seq, body, .. } => Some((*seq, body.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The last `ChannelHealth` in `events`, if the driver emitted one.
+    #[allow(clippy::type_complexity)]
+    fn last_health(events: &[DmEvent]) -> Option<(u64, u64, u64, u64, u64)> {
+        events.iter().rev().find_map(|e| match e {
+            DmEvent::ChannelHealth {
+                partial_sweeps,
+                already_consumed,
+                unopenable,
+                peer_pseudonym_unknown,
+                peer_acks_deferred,
+                ..
+            } => Some((
+                *partial_sweeps,
+                *already_consumed,
+                *unopenable,
+                *peer_pseudonym_unknown,
+                *peer_acks_deferred,
+            )),
+            _ => None,
+        })
+    }
+
+    /// The sequence numbers reported undelivered in `events`.
+    fn undelivered(events: &[DmEvent]) -> Vec<u64> {
+        deliveries(events)
+            .into_iter()
+            .filter(|(_, state)| *state == DeliveryState::Undelivered)
+            .map(|(seq, _)| seq)
+            .collect()
+    }
+
+    /// The delivery states in `events`, as `(seq, state)`.
+    fn deliveries(events: &[DmEvent]) -> Vec<(u64, DeliveryState)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DmEvent::Delivery { seq, state, .. } => Some((*seq, *state)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The one correspondence label in `store`, or a panic naming what was there.
+    fn only_label(store: &DmPersist) -> daemonseed_core::storage::dm_store::CorrespondenceLabel {
+        let labels = store.store().correspondences().expect("list");
+        assert_eq!(labels.len(), 1, "expected exactly one correspondence");
+        labels[0]
+    }
+
+    /// One cadence, plus enough virtual time for the operations it started to
+    /// come back.
+    ///
+    /// The cadence alone only *starts* a sweep or a publish; the mock's injected
+    /// latency has to elapse before its outcome reaches the machine, and a test
+    /// that advanced only to the tick would read the state of a driver that had
+    /// asked for everything and heard nothing.
+    async fn cadence(wall: &Arc<AtomicI64>) {
+        advance(wall, IDLE_TICK).await;
+        advance(wall, Duration::from_millis(500)).await;
+        settle().await;
+    }
+
+    /// T23. Two drivers over one record store: A knocks, B accepts, A sends,
+    /// B collects the body exactly once.
+    ///
+    /// **The one oracle where nothing is a fixture.** Every other test here
+    /// hands one side a value the other side did not produce. Here the knock B
+    /// admits is the knock A's mint wrote, the page B sweeps is the record A's
+    /// publish wrote, and the key B opens the frame with is the one B's own
+    /// ratchet derived from the secret A encapsulated. A break anywhere in that
+    /// chain fails here and, mostly, nowhere else.
+    ///
+    /// **Exactly once is the property, not merely once.** The second tick
+    /// re-sweeps the same page and re-presents the same frame, because a sender
+    /// re-seeds until acknowledged — so a driver that folded on arrival rather
+    /// than on settlement would emit the body twice. The `already_consumed`
+    /// count is what separates "the re-seed was seen and skipped" from "the
+    /// re-sweep never happened".
+    ///
+    /// **The reply direction is asserted as the gap it is.** A channel frame
+    /// carries no pseudonym key and nothing else transmits one, so an initiator
+    /// cannot verify a reply and does not sweep for it. That is stated here
+    /// rather than left out, so the day a pseudonym does reach the initiator
+    /// this test fails and says which assertion to change.
+    #[tokio::test(start_paused = true)]
+    async fn two_drivers_carry_one_message_end_to_end_exactly_once() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let dht_b = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        // Each side answers a key-record fetch with the OTHER side's record.
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        dht_b.set_key_record(Some(key_record_for(&a_keys)));
+
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let store_b = DmPersist::open(dir_b.path().join("dm"), &AT_REST).expect("persist B");
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+
+        // ── A knocks ─────────────────────────────────────────────────────────
+        handle_a
+            .send(DmCommand::FirstContact {
+                recipient: Box::new(*b_keys.signing.public_key()),
+                body: "knock knock".into(),
+            })
+            .await
+            .expect("first contact");
+        advance(&wall, Duration::from_millis(100)).await;
+        settle_steps(&probe_a, 3).await;
+        assert_eq!(
+            dht_a.count(Method::PublishDoorbell),
+            1,
+            "A must have written the knock into the shared store"
+        );
+
+        // ── B sweeps its doorbell and is offered the request ─────────────────
+        cadence(&wall).await;
+        let events = drain(&mut evt_b);
+        let (request, from, body) = only_request(&events);
+        assert_eq!(body, "knock knock", "B was shown the body A sent");
+        assert_eq!(
+            from,
+            a_keys.signing.public_key().to_vec(),
+            "B was shown A as the sender"
+        );
+
+        // ── B accepts ────────────────────────────────────────────────────────
+        handle_b
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle_steps(&probe_b, 3).await;
+        let label_b = only_label(&store_b);
+
+        // ── A sends on the channel ───────────────────────────────────────────
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "the first channel message".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        let composed = deliveries(&drain(&mut evt_a));
+        assert!(
+            composed.contains(&(1, DeliveryState::Composed)),
+            "A must report sequence one composed, got {composed:?}"
+        );
+        // The tick is what publishes: the send queues, the cadence emits.
+        cadence(&wall).await;
+        assert!(
+            dht_a.count(Method::PublishPage) >= 1,
+            "A must have published its channel page"
+        );
+
+        // ── B collects ───────────────────────────────────────────────────────
+        cadence(&wall).await;
+        cadence(&wall).await;
+        let collected = drain(&mut evt_b);
+        let bodies = messages(&collected);
+        assert_eq!(
+            bodies.len(),
+            1,
+            "B must emit exactly one message, got {bodies:?} from {collected:?}"
+        );
+        assert_eq!(
+            bodies[0],
+            (1, "the first channel message".to_string()),
+            "B must recover the sequence and the body A sent"
+        );
+        assert!(
+            dht_b.count(Method::SweepPage) >= 1,
+            "B must actually have swept, or the single message above is vacuous"
+        );
+
+        // ── the re-seed is seen and skipped ──────────────────────────────────
+        //
+        // **The settled set is what skips it, not the ratchet.** A sender
+        // re-seeds until acknowledged, so the same bytes sit in the same slot
+        // and come back on every sweep; `Collection::observe_page` filters a
+        // position it has already settled out of the unsettled list, so the
+        // frame is never offered to the ratchet a second time and
+        // `RatchetError::AlreadyConsumed` never fires on this path. The count
+        // of sweeps is the positive control: without it, "no second message" is
+        // satisfied by a driver that stopped sweeping.
+        let swept_before = dht_b.count(Method::SweepPage);
+        for _ in 0..3 {
+            cadence(&wall).await;
+        }
+        let again = drain(&mut evt_b);
+        assert!(
+            dht_b.count(Method::SweepPage) > swept_before,
+            "B must have kept sweeping the page the re-seed lands in"
+        );
+        assert_eq!(
+            messages(&again),
+            Vec::new(),
+            "B emitted the same body twice under the sender's re-seed"
+        );
+        assert_eq!(
+            last_health(&again).map_or((0, 0), |h| (h.0, h.2)),
+            (0, 0),
+            "a re-swept page that folds nothing must report no partial sweep and \
+             nothing unopenable"
+        );
+
+        // ── B replies, and A cannot verify it ────────────────────────────────
+        handle_b
+            .send(DmCommand::Send {
+                to: Box::new(*a_keys.signing.public_key()),
+                body: "and a reply".into(),
+            })
+            .await
+            .expect("B sends");
+        for _ in 0..3 {
+            cadence(&wall).await;
+        }
+        let a_events = drain(&mut evt_a);
+        assert_eq!(
+            messages(&a_events),
+            Vec::new(),
+            "A opened a frame it has no key to verify: {a_events:?}"
+        );
+        let b_ack_health = last_health(&collected).expect("B must report its channel health");
+        assert!(
+            b_ack_health.4 > 0,
+            "A's message must have carried a piggybacked acknowledgement for B to \
+             defer, got {b_ack_health:?}"
+        );
+        let a_health = last_health(&a_events).expect("A must report its channel health");
+        assert!(
+            a_health.3 > 0,
+            "A must say why it swept nothing — the acceptor's pseudonym never \
+             reaches it — got {a_health:?}"
+        );
+        assert!(
+            dht_b.count(Method::PublishPage) >= 1,
+            "B's reply must actually have been written, or A's silence proves nothing"
+        );
+        // And B's own record still holds one correspondence, so the reply went
+        // out on the channel rather than establishing a second one.
+        assert_eq!(only_label(&store_b), label_b);
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+    }
+
+    /// Establish this driver as the initiator of one correspondence with
+    /// `peer`, and hand back the label its records live under.
+    ///
+    /// The whole outbound first-contact path runs: fetch, mint, persist,
+    /// establish, queue sequence zero, publish. Nothing is faked, so an oracle
+    /// built on this is testing the channel plane over a channel the driver
+    /// really opened.
+    async fn establish_as_initiator(
+        handle: &DmDriverHandle,
+        probe: &DmDriverProbe,
+        wall: &Arc<AtomicI64>,
+        store: &DmPersist,
+        peer: &IdentityKeys,
+    ) -> daemonseed_core::storage::dm_store::CorrespondenceLabel {
+        handle
+            .send(DmCommand::FirstContact {
+                recipient: Box::new(*peer.signing.public_key()),
+                body: "knock".into(),
+            })
+            .await
+            .expect("first contact");
+        advance(wall, Duration::from_millis(100)).await;
+        settle_steps(probe, 3).await;
+        // A fourth step, on its own advance: the doorbell write's own outcome,
+        // which is what confirms sequence zero. Its latency has not elapsed at
+        // the third.
+        advance(wall, Duration::from_millis(200)).await;
+        settle_steps(probe, 4).await;
+        only_label(store)
+    }
+
+    /// T24. A send onto a full outbox is refused, and refused *before* the
+    /// ratchet moves.
+    ///
+    /// **The second half is the whole point.** `Ratchet::send_next` has no step
+    /// backwards, so a refusal taken after it has burnt a sequence number that
+    /// will never be transmitted — and a receiver's contiguous prefix then waits
+    /// on that number for seven days while every later message piles up beyond
+    /// it. So the assertions are: the refusal names the outbox, nothing was
+    /// published, and the sequence number the send would have used is still
+    /// unspent, which is what a later send proves by taking it.
+    ///
+    /// The fill loop's own count is the positive control: a record that refused
+    /// the first entry would leave `filled` at zero and fail below.
+    #[tokio::test(start_paused = true)]
+    async fn a_send_onto_a_full_outbox_is_refused_before_the_ratchet_steps() {
+        use daemonseed_core::dm::frame::WORST_CASE_SEALED_FRAME_LEN;
+        use daemonseed_core::dm::outbox::{OutboxTarget, SealedFrame};
+        use daemonseed_core::dm::persist::Mutation;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
+        let peer = peer_keys();
+        dht.set_key_record(Some(key_record_for(&peer)));
+        let probe = Arc::new(DmDriverProbe::new());
+        let store = DmPersist::open(dir.path().join("dm"), &AT_REST).expect("persist");
+        let (handle, mut evt_rx, task) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir.path(), &wall, dht.clone()),
+            probe.clone(),
+        );
+        let label = establish_as_initiator(&handle, &probe, &wall, &store, &peer).await;
+        drop(drain(&mut evt_rx));
+
+        // Fill the record from outside the driver, at sequence numbers well
+        // above the one the next send will want, so the refusal below is about
+        // capacity and not about the sequence space.
+        let now = wall.load(Ordering::SeqCst);
+        let direction = store
+            .read_outbox(&label, now)
+            .expect("the outbox reads")
+            .expect("the knock is queued")
+            .direction();
+        let mut filled = 0u64;
+        for seq in 100..1_000u64 {
+            let wrote = store.update_outbox(&label, direction, now, |outbox| {
+                Ok(Mutation::Changed(
+                    outbox
+                        .enqueue_sealed(
+                            seq,
+                            OutboxTarget::ChannelPage,
+                            now,
+                            SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]),
+                        )
+                        .is_ok(),
+                ))
+            });
+            match wrote {
+                Ok(true) => filled += 1,
+                _ => break,
+            }
+        }
+        assert!(filled > 50, "the record took only {filled} entries to fill");
+
+        let published_before = dht.count(Method::PublishPage);
+        // The ratchet's own position, read before the refusal. It is the only
+        // observable that can see a step: a send refused after `send_next` has
+        // run writes nothing, emits nothing and changes no record.
+        let before_seq = probe.next_send_seq.load(Ordering::SeqCst);
+        assert_eq!(
+            before_seq,
+            daemonseed_core::dm::ratchet::FIRST_INITIATOR_CHANNEL_SEQ,
+            "the initiator's first channel sequence is one; sequence zero went by \
+             doorbell"
+        );
+        handle
+            .send(DmCommand::Send {
+                to: Box::new(*peer.signing.public_key()),
+                body: "no room".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        let events = drain(&mut evt_rx);
+        let full: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                DmEvent::Refused {
+                    reason: RefusalReason::OutboxFull { needed },
+                    ..
+                } => Some(*needed),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            full.len(),
+            1,
+            "expected exactly one full-outbox refusal, got {events:?}"
+        );
+        assert!(
+            full[0] > daemonseed_core::storage::dm_store::OUTBOX_CAPACITY,
+            "the refusal must name what the record would have needed, got {}",
+            full[0]
+        );
+        assert_eq!(
+            deliveries(&events),
+            Vec::new(),
+            "a refused send must report no delivery state at all"
+        );
+        assert_eq!(
+            probe.next_send_seq.load(Ordering::SeqCst),
+            before_seq,
+            "the refused send stepped the ratchet, burning a sequence number \
+             nothing will ever transmit"
+        );
+
+        // Nothing went out, and nothing was spent.
+        advance(&wall, Duration::from_millis(100)).await;
+        settle().await;
+        assert_eq!(
+            dht.count(Method::PublishPage),
+            published_before,
+            "a refused send published a page"
+        );
+        let outbox = store
+            .read_outbox(&label, wall.load(Ordering::SeqCst))
+            .expect("the outbox reads")
+            .expect("the outbox exists");
+        assert!(
+            outbox.entry(1).is_none(),
+            "the refused send left an entry behind at the sequence it would have used"
+        );
+
+        // The ratchet did not move: the next send takes the sequence number the
+        // refused one would have taken. Asserted through a store that has been
+        // emptied of the filler, so this is the same driver and the same
+        // ratchet, not a second one.
+        for seq in 100..(100 + filled) {
+            store
+                .update_outbox(&label, direction, wall.load(Ordering::SeqCst), |outbox| {
+                    if let Some(entry) = outbox.entry_mut(seq) {
+                        let _ = entry.confirm_written(wall.load(Ordering::SeqCst));
+                    }
+                    Ok(Mutation::Changed(()))
+                })
+                .expect("the filler confirms");
+        }
+        // Confirming does not free the frame, so the record is still full; the
+        // sequence-number claim is what this asserts, and it is asserted by the
+        // refusal naming the same sequence again.
+        handle
+            .send(DmCommand::Send {
+                to: Box::new(*peer.signing.public_key()),
+                body: "still no room".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        let again = drain(&mut evt_rx);
+        assert_eq!(
+            again
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    DmEvent::Refused {
+                        reason: RefusalReason::OutboxFull { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the second send must be refused the same way, got {again:?}"
+        );
+        assert!(
+            store
+                .read_outbox(&label, wall.load(Ordering::SeqCst))
+                .expect("the outbox reads")
+                .expect("the outbox exists")
+                .entry(1)
+                .is_none(),
+            "two refused sends between them consumed a sequence number"
+        );
+        assert_eq!(
+            probe.next_send_seq.load(Ordering::SeqCst),
+            before_seq,
+            "two refusals between them moved the ratchet"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
+    }
+
+    /// T25. A due entry is emitted and confirmed; a write that fails leaves it
+    /// due and it is emitted again once the backoff has elapsed.
+    ///
+    /// **`confirm_written` is what makes an emission stop being a claim.** An
+    /// entry whose write was never confirmed re-seeds on the ladder for the
+    /// whole seven-day window; one that was confirmed reports `OnDht`. The
+    /// failing half is the control for the succeeding half: the same entry, the
+    /// same ladder, and the only difference is whether the transport said the
+    /// bytes landed.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_publish_leaves_the_entry_due_and_re_emits() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        // The doorbell write still succeeds, so first contact establishes; only
+        // the channel write fails.
+        let dht = Arc::new(MockDht::failing(
+            Duration::from_millis(50),
+            Method::PublishPage,
+        ));
+        let peer = peer_keys();
+        dht.set_key_record(Some(key_record_for(&peer)));
+        let probe = Arc::new(DmDriverProbe::new());
+        let store = DmPersist::open(dir.path().join("dm"), &AT_REST).expect("persist");
+        let (handle, mut evt_rx, task) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir.path(), &wall, dht.clone()),
+            probe.clone(),
+        );
+        let _label = establish_as_initiator(&handle, &probe, &wall, &store, &peer).await;
+
+        // The knock's own write DID land, so sequence zero confirms. That is the
+        // positive control for the failing half below: the same code path, the
+        // same tick, and a different answer from the transport.
+        let established = drain(&mut evt_rx);
+        assert!(
+            deliveries(&established).contains(&(0, DeliveryState::OnDht)),
+            "the knock's confirmed write must report OnDht, got {established:?}"
+        );
+
+        handle
+            .send(DmCommand::Send {
+                to: Box::new(*peer.signing.public_key()),
+                body: "into a failing transport".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        drop(drain(&mut evt_rx));
+
+        cadence(&wall).await;
+        let first = dht.count(Method::PublishPage);
+        assert_eq!(first, 1, "the due entry must have been emitted once");
+        let after_failure = drain(&mut evt_rx);
+        assert!(
+            !deliveries(&after_failure).contains(&(1, DeliveryState::OnDht)),
+            "a failed write must not confirm the entry, got {after_failure:?}"
+        );
+
+        // The first rung is sixty seconds, jittered; four cadences of thirty
+        // seconds each carry the clock past it whatever the jitter drew.
+        for _ in 0..4 {
+            cadence(&wall).await;
+        }
+        assert!(
+            dht.count(Method::PublishPage) > first,
+            "the unconfirmed entry must be emitted again once its rung elapsed"
+        );
+        // **The identical bytes, not merely another write.** A re-seed that
+        // re-sealed would mint a second authentic frame at one ratchet position;
+        // the outbox holds the sealed frame precisely so the second emission is
+        // the first one again.
+        let written = dht.published_pages();
+        assert!(
+            written.len() >= 2,
+            "expected at least two page writes, got {}",
+            written.len()
+        );
+        assert_eq!(
+            written[0].0, written[1].0,
+            "the re-seed must land at the position the first write did"
+        );
+        assert_eq!(
+            written[0].1, written[1].1,
+            "the re-seed must carry byte-identical bytes"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
+    }
+
+    /// T26. A partial page sweep folds nothing: no message, and the cursor does
+    /// not move.
+    ///
+    /// **A page the transport did not read every slot of cannot say a position
+    /// is absent**, only that it was not seen — and advancing on that reading
+    /// walks past messages that were there, which no later sweep revisits. The
+    /// bytes ARE in the record and the sweep DOES return them, which is what
+    /// makes this a real test: the only thing standing between the driver and a
+    /// message it could have emitted is the outcome it was given.
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_sweep_folds_nothing() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let _a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        // B's sweeps come back incomplete. Its doorbell sweep is unaffected —
+        // only page sweeps carry the partial outcome — so the knock still lands.
+        let dht_b = Arc::new(MockDht::partial_on(net.clone(), Duration::from_millis(50)));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let store_a = DmPersist::open(dir_a.path().join("dm"), &AT_REST).expect("persist A");
+        let store_b = DmPersist::open(dir_b.path().join("dm"), &AT_REST).expect("persist B");
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+        let _ = establish_as_initiator(&handle_a, &probe_a, &wall, &store_a, &b_keys).await;
+        drop(drain(&mut evt_a));
+
+        cadence(&wall).await;
+        let (request, _, _) = only_request(&drain(&mut evt_b));
+        handle_b
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle_steps(&probe_b, 3).await;
+        let label_b = only_label(&store_b);
+
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "into a half-read page".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        for _ in 0..4 {
+            cadence(&wall).await;
+        }
+
+        let events = drain(&mut evt_b);
+        assert!(
+            dht_b.count(Method::SweepPage) > 0,
+            "B must have swept, or folding nothing proves nothing"
+        );
+        // The call counter alone cannot tell a sweep that returned nothing from
+        // one that returned the frame and was refused for its outcome. This
+        // does: the bytes really were handed to the driver.
+        assert!(
+            dht_b.slots_served() > 0,
+            "B was never offered a populated slot, so the fold below is vacuous"
+        );
+        assert_eq!(
+            messages(&events),
+            Vec::new(),
+            "a partial sweep folded a message: {events:?}"
+        );
+        let health = last_health(&events).expect("B must report the partial sweeps");
+        assert!(
+            health.0 > 0,
+            "B must count the partial sweeps it refused, got {health:?}"
+        );
+        assert!(
+            store_b
+                .read_cursor(&label_b, u64::from(u32::MAX))
+                .expect("the cursor reads")
+                .is_none(),
+            "a partial sweep moved the receive cursor"
+        );
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+    }
+
+    /// T27. An entry past the seven-day window is surfaced as undelivered once
+    /// per run, stays owed until the front end answers, and is re-offered to a
+    /// driver that restarted before it did.
+    ///
+    /// **The record's flag is NOT cleared by the sweep that set it** (#279).
+    /// Clearing in the same write puts the obligation out of the record while
+    /// the notification is still in a `Vec` somebody is carrying, so a crash in
+    /// between loses it silently. What stops the same run repeating itself is an
+    /// in-memory set, which a restart empties — and the restart half of this
+    /// oracle is what separates the two mechanisms: a driver that cleared
+    /// durably would be silent after the restart, and one with no suppression at
+    /// all would repeat on the very next cadence.
+    ///
+    /// Run from the ACCEPTOR's side, because that is the side whose
+    /// correspondence survives a restart at all: `accept_first_contact` writes a
+    /// contact record and an initiator writes none, so a restarted driver has
+    /// nothing to recover an initiator's outbox by.
+    #[tokio::test(start_paused = true)]
+    async fn a_give_up_is_offered_once_per_run_and_re_offered_after_a_restart() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        // B's channel writes never land, so what it sends is never confirmed and
+        // crosses the give-up.
+        let dht_b = Arc::new(MockDht::failing_on(
+            net.clone(),
+            Duration::from_millis(50),
+            Method::PublishPage,
+        ));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let store_a = DmPersist::open(dir_a.path().join("dm"), &AT_REST).expect("persist A");
+        let store_b = DmPersist::open(dir_b.path().join("dm"), &AT_REST).expect("persist B");
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+        let _ = establish_as_initiator(&handle_a, &probe_a, &wall, &store_a, &b_keys).await;
+        drop(drain(&mut evt_a));
+        cadence(&wall).await;
+        let (request, _, _) = only_request(&drain(&mut evt_b));
+        handle_b
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle_steps(&probe_b, 3).await;
+        let label_b = only_label(&store_b);
+
+        handle_b
+            .send(DmCommand::Send {
+                to: Box::new(*a_keys.signing.public_key()),
+                body: "never collected".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        drop(drain(&mut evt_b));
+
+        advance(
+            &wall,
+            Duration::from_millis(daemonseed_core::dm::outbox::GIVE_UP_MS as u64 + 1_000),
+        )
+        .await;
+        cadence(&wall).await;
+        let events = drain(&mut evt_b);
+        assert_eq!(
+            undelivered(&events),
+            vec![0],
+            "the acceptor's first channel message crossed the window: {events:?}"
+        );
+
+        // Still owed in the record: the user has not answered yet.
+        assert_eq!(
+            store_b
+                .read_outbox(&label_b, wall.load(Ordering::SeqCst))
+                .expect("the outbox reads")
+                .expect("the outbox exists")
+                .owed_surfacings(),
+            vec![0],
+            "the sweep cleared the durable flag before the user was told (#279)"
+        );
+
+        // Not repeated inside this run. The tick count is the liveness control:
+        // without it, "nothing more was said" is satisfied by a driver that
+        // stopped ticking.
+        let ticks_before = probe_b.ticks.load(Ordering::SeqCst);
+        cadence(&wall).await;
+        let after = drain(&mut evt_b);
+        assert!(
+            probe_b.ticks.load(Ordering::SeqCst) > ticks_before,
+            "the driver stopped ticking, so the silence below means nothing"
+        );
+        assert_eq!(
+            undelivered(&after),
+            Vec::<u64>::new(),
+            "the give-up was offered twice in one run: {after:?}"
+        );
+
+        // A restart before the front end answered re-offers it.
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_b.await.expect("B ends");
+        let probe_b2 = Arc::new(DmDriverProbe::new());
+        let (handle_b2, mut evt_b2, task_b2) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b2.clone(),
+        );
+        cadence(&wall).await;
+        let restarted = drain(&mut evt_b2);
+        assert_eq!(
+            undelivered(&restarted),
+            vec![0],
+            "a crash between the give-up and the user seeing it lost the \
+             notification: {restarted:?}"
+        );
+
+        // And the front end's answer clears it for good.
+        handle_b2
+            .send(DmCommand::Surfaced {
+                to: Box::new(*a_keys.signing.public_key()),
+                seqs: vec![0],
+            })
+            .await
+            .expect("surfaced");
+        settle().await;
+        assert_eq!(
+            store_b
+                .read_outbox(&label_b, wall.load(Ordering::SeqCst))
+                .expect("the outbox reads")
+                .expect("the outbox exists")
+                .owed_surfacings(),
+            Vec::<u64>::new(),
+            "the front end's answer did not clear the durable flag"
+        );
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b2.send(DmCommand::Shutdown).await.expect("stop B2");
+        task_a.await.expect("A ends");
+        task_b2.await.expect("B2 ends");
+    }
+
+    /// T28. A driver started over a store that already holds a correspondence
+    /// lists it, seeds its collection from the persisted cursor, and refuses to
+    /// send on it.
+    ///
+    /// **A ratchet has no at-rest record**, and the pseudonym pair is homed in a
+    /// resume record that cannot be written until the channel has re-established
+    /// once — so a correspondence that outlived its process is on disk and
+    /// cannot be spoken on. The driver says so in as many words rather than
+    /// queueing a message that will never move.
+    ///
+    /// **The cursor is read against a `read_through` of zero**, which is what
+    /// the new session has genuinely swept, so a stored page above zero is
+    /// refused rather than believed — the record is unsealed by design and a
+    /// number checked against itself is not a bound. The resumed frontier is
+    /// therefore page zero rather than the page the file names, and that is the
+    /// property asserted here: `Some(0)`, not `None`, which is what a collection
+    /// built by `Collection::new()` would report.
+    #[tokio::test(start_paused = true)]
+    async fn a_correspondence_from_a_previous_session_is_seeded_and_refused() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let dht_b = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let store_a = DmPersist::open(dir_a.path().join("dm"), &AT_REST).expect("persist A");
+        let store_b = DmPersist::open(dir_b.path().join("dm"), &AT_REST).expect("persist B");
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+        let _ = establish_as_initiator(&handle_a, &probe_a, &wall, &store_a, &b_keys).await;
+        drop(drain(&mut evt_a));
+        cadence(&wall).await;
+        let (request, _, _) = only_request(&drain(&mut evt_b));
+        handle_b
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle_steps(&probe_b, 3).await;
+        let label_b = only_label(&store_b);
+
+        // A cursor the previous session genuinely earned: it is written with the
+        // same page as its own corroboration, exactly as a driver that had swept
+        // through page seven would have written it.
+        assert!(
+            store_b
+                .advance_cursor(&label_b, 7, 7)
+                .expect("the cursor writes"),
+            "the fixture cursor did not advance, so the restart below reads nothing"
+        );
+
+        // A queued knock and a queued channel message, both unconfirmed. The
+        // knock's address is a pure function of the correspondent's public key
+        // and its bytes are in the record, so a restarted driver can and must
+        // keep re-seeding it; the channel entry's address descends from a
+        // ratchet nobody holds any more, so it must be left alone rather than
+        // having its backoff advanced for a write that cannot happen.
+        const RESEED_SLOT: u16 = 3;
+        let knock_bytes = vec![0x5Au8; 128];
+        let direction_b = store_b
+            .read_outbox(&label_b, wall.load(Ordering::SeqCst))
+            .expect("the outbox reads")
+            .map_or(daemonseed_core::dm::ratchet::Direction::AToB, |o| {
+                o.direction()
+            });
+        for (seq, target) in [
+            (
+                5u64,
+                daemonseed_core::dm::outbox::OutboxTarget::Doorbell { slot: RESEED_SLOT },
+            ),
+            (6u64, daemonseed_core::dm::outbox::OutboxTarget::ChannelPage),
+        ] {
+            store_b
+                .update_outbox(
+                    &label_b,
+                    direction_b,
+                    wall.load(Ordering::SeqCst),
+                    |outbox| {
+                        outbox.enqueue_sealed(
+                            seq,
+                            target,
+                            wall.load(Ordering::SeqCst),
+                            daemonseed_core::dm::outbox::SealedFrame::new(knock_bytes.clone()),
+                        )?;
+                        Ok(daemonseed_core::dm::persist::Mutation::Changed(()))
+                    },
+                )
+                .expect("the fixture entry is queued");
+        }
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+        drop(drain(&mut evt_b));
+
+        let probe_b2 = Arc::new(DmDriverProbe::new());
+        let (handle_b2, mut evt_b2, task_b2) = DmDriver::spawn_with_probe(
+            parts_as(
+                peer_keys(),
+                dir_b.path(),
+                &wall,
+                Arc::new(MockDht::on(net.clone(), Duration::from_millis(50))),
+            ),
+            probe_b2.clone(),
+        );
+        // The seeding happens inside the task, so let it start before reading.
+        settle().await;
+        // The correspondence was recovered and its collection seeded. `Some(0)`
+        // rather than `Some(7)` because the stored page has no corroboration a
+        // fresh session can offer; `u64::MAX` is the marker for "no seeded
+        // correspondence", which is what a driver that skipped the seeding — or
+        // one whose collection was built by `Collection::new()` — would report.
+        assert_eq!(
+            probe_b2.resumed_frontier.load(Ordering::SeqCst),
+            0,
+            "the restarted driver did not seed a collection from the store"
+        );
+
+        handle_b2
+            .send(DmCommand::Send {
+                to: Box::new(*a_keys.signing.public_key()),
+                body: "after the restart".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        let events = drain(&mut evt_b2);
+        assert_eq!(
+            refusals(&events),
+            vec![RefusalReason::NotEstablishedThisSession],
+            "a send on a correspondence from a previous session must be refused \
+             in as many words, got {events:?}"
+        );
+        // The correspondence is still exactly the one that was established: the
+        // refusal is about the key schedule, not about a lost record.
+        assert_eq!(only_label(&store_b), label_b);
+
+        // The second driver stops before the third starts: two drivers over one
+        // store would race for the same due entries, and whichever emitted first
+        // would leave the other with nothing to find.
+        handle_b2.send(DmCommand::Shutdown).await.expect("stop B2");
+        task_b2.await.expect("B2 ends");
+
+        // The queued knock is re-seeded without a key schedule; the queued
+        // channel entry is not, because there is no page to write it to.
+        let dht_b2 = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let probe_b3 = Arc::new(DmDriverProbe::new());
+        let (handle_b3, _evt_b3, task_b3) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b2.clone()),
+            probe_b3.clone(),
+        );
+        for _ in 0..4 {
+            cadence(&wall).await;
+        }
+        let reseeds: Vec<(u16, Vec<u8>)> = dht_b2
+            .published()
+            .into_iter()
+            .filter(|(_, bytes)| bytes == &knock_bytes)
+            .collect();
+        assert!(
+            !reseeds.is_empty(),
+            "a queued knock stopped being re-seeded the moment its key schedule \
+             was lost, so nothing would ever retry it: {:?}",
+            dht_b2.log()
+        );
+        assert_eq!(
+            reseeds[0].0, RESEED_SLOT,
+            "the re-seed must go back to the slot the entry names"
+        );
+        assert_eq!(
+            dht_b2.count(Method::PublishPage),
+            0,
+            "a channel entry was emitted with no ratchet to address it with"
+        );
+
+        handle_b3.send(DmCommand::Shutdown).await.expect("stop B3");
+        task_b3.await.expect("B3 ends");
+    }
+
+    /// T29. A fresh store seeds no collection at all.
+    ///
+    /// The control for T28's `resumed_frontier`: without it, `0` is a number a
+    /// driver that never looked at the store could also report.
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_store_seeds_no_correspondence() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
+        let probe = Arc::new(DmDriverProbe::new());
+        let (handle, _evt, task) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir.path(), &wall, dht.clone()),
+            probe.clone(),
+        );
+        settle().await;
+        assert_eq!(
+            probe.resumed_frontier.load(Ordering::SeqCst),
+            u64::MAX,
+            "an empty store must seed no correspondence"
+        );
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
+    }
+
+    /// T30. A frame that does not authenticate is counted and leaves its slot
+    /// unsettled.
+    ///
+    /// **Not abandoned.** Abandonment settles a position permanently and is the
+    /// sender's give-up signal, not a reader's verdict on bytes it could not
+    /// open. Page owner-write authority is symmetric, so anyone can write a
+    /// slot, and a frame that fails the authorship signature says nothing about
+    /// the frame that may yet arrive there.
+    #[tokio::test(start_paused = true)]
+    async fn a_tampered_frame_is_counted_and_settles_nothing() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let _a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let dht_b = Arc::new(MockDht::tampering_on(
+            net.clone(),
+            Duration::from_millis(50),
+        ));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let store_a = DmPersist::open(dir_a.path().join("dm"), &AT_REST).expect("persist A");
+        let store_b = DmPersist::open(dir_b.path().join("dm"), &AT_REST).expect("persist B");
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+        let _ = establish_as_initiator(&handle_a, &probe_a, &wall, &store_a, &b_keys).await;
+        drop(drain(&mut evt_a));
+        cadence(&wall).await;
+        let (request, _, _) = only_request(&drain(&mut evt_b));
+        handle_b
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle_steps(&probe_b, 3).await;
+        let label_b = only_label(&store_b);
+
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "tampered in flight".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        for _ in 0..4 {
+            cadence(&wall).await;
+        }
+
+        let events = drain(&mut evt_b);
+        assert!(
+            dht_b.slots_served() > 0,
+            "B was never offered the tampered frame, so the silence proves nothing"
+        );
+        assert_eq!(
+            messages(&events),
+            Vec::new(),
+            "a frame that does not authenticate was emitted as a message: {events:?}"
+        );
+        let health = last_health(&events).expect("B must report the failure");
+        assert!(
+            health.2 > 0,
+            "B must count the frames it could not open, got {health:?}"
+        );
+        assert!(
+            store_b
+                .read_cursor(&label_b, u64::from(u32::MAX))
+                .expect("the cursor reads")
+                .is_none(),
+            "an unopenable frame advanced the receive cursor"
+        );
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
     }
 
     /// T14. The entry this driver publishes is one the recipient admits.

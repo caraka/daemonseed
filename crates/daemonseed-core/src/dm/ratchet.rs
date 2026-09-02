@@ -1154,6 +1154,18 @@ impl Ratchet {
         self.role.recv_dir()
     }
 
+    /// The sequence number [`Self::send_next`] will place on the next message.
+    ///
+    /// **Exposed so a sender can price a message before minting its key.** The
+    /// mint is a step forward with no step back, so a caller that discovers only
+    /// afterwards that it cannot queue the message has burnt a sequence number
+    /// that will never be transmitted — see [`crate::dm::outbox::Outbox::room_for`],
+    /// which takes this value. Reading it changes nothing and commits nothing;
+    /// two reads with no intervening send give the same answer.
+    pub fn next_send_seq(&self) -> u64 {
+        self.next_send_seq
+    }
+
     /// Mint the key for our next outbound message, taking a generation step first
     /// if the peer has published a fresh ephemeral since our last one.
     pub fn send_next(&mut self) -> Result<Outbound, RatchetError> {

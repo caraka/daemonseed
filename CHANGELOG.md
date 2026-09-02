@@ -36,6 +36,19 @@ work lives in the maintainer's own planning notes, not here.
   `SpentTokensNotPersisted`. `DoorbellHealth` also carries `pending_full`, the slots this sweep
   skipped because the held-request list was full. `RefusalReason::TaskPanicked` is a panicked
   transport task, distinct from `MintPanicked`. (#236)
+- `daemonseed_core::dm::outbox::Outbox::room_for(seq, target, frame_len)` — whether a sealed entry of
+  that size would be accepted, priced by the same gate `enqueue_sealed` passes. (#236, #339)
+- `daemonseed_core::dm::collect::Collection::resuming_from_page(page)` — a collection whose probe
+  frontier starts at a persisted cursor's page; the settled set is not restored. (#236)
+- `daemonseed_core::dm::ratchet::Ratchet::next_send_seq` — the sequence number the next `send_next`
+  will place on a message. (#236, #339)
+- `daemonseed_veilid_net::dm::DmEvent::ChannelHealth { with, partial_sweeps, already_consumed,
+  unopenable, peer_pseudonym_unknown, peer_acks_deferred }` — one correspondence's channel-plane
+  accounting, cumulative per session, emitted only when a counter moves. (#236)
+- `daemonseed_veilid_net::dm::RefusalReason` — `OutboxFull { needed }`, `NotEstablishedThisSession`,
+  `BodyTooLarge` and `SealFailed`. (#236, #339)
+- `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` counts `peer_pseudonym_unknown`: an initiator
+  learns no pseudonym for its correspondent, so it verifies nothing and does not sweep. (#236)
 - `daemonseed_core::dm::admission::SeenSet::forget` — un-record one entry hash, for a caller that
   abandoned an entry's verification rather than finishing it. (#236)
 - `daemonseed_core::dm::persist::DmPersistError::AlreadyEstablished` — `accept_first_contact` refuses a
@@ -406,6 +419,32 @@ work lives in the maintainer's own planning notes, not here.
   path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
+
+- `daemonseed_veilid_net::dm::DmCommand::Send` sends on an established channel: the outbox is priced
+  before the ratchet steps, the frame is sealed with the collection's acknowledgement piggybacked,
+  and `DmEvent::Delivery { state: Composed }` reports the queued sequence. A full outbox is
+  `DmEvent::Refused { reason: OutboxFull { needed } }` with nothing spent. (#236, #339)
+- `daemonseed_veilid_net::dm::DmCommand::Surfaced` clears the surfacing owed on the named sequence
+  numbers. (#236, #279)
+- The driver's idle cadence emits due outbox entries, publishes them at
+  `DmPageAddress::sending(..)`, confirms a landed write, sweeps given-up entries as
+  `DmEvent::Delivery { state: Undelivered }`, and sweeps the receiving pages
+  `Collection::probe_plan` names. A page sweep that did not read the whole record folds nothing.
+  (#236, #279)
+- A give-up is offered to the front end without clearing the outbox's surfacing flag; only
+  `DmCommand::Surfaced` clears it, and a session that has already offered one does not repeat it.
+  (#236, #279)
+- The outbox is driven for a correspondence recovered from disk: the direction comes from the stored
+  record, so a queued `OutboxTarget::Doorbell` entry is re-seeded and given up on without a key
+  schedule. A `ChannelPage` entry is left un-emitted, having no address without a ratchet. (#236)
+- A page sweep counts as complete only when nothing failed AND the transport attempted either no
+  subkey (an absent record) or every subkey the record holds. (#236)
+- A first contact queues its entry in the outbox as sequence zero against
+  `OutboxTarget::Doorbell { slot }`, so a re-seed re-emits the identical bytes and a failed publish
+  is an unconfirmed entry. The initiator's ratchet opens at that point, consuming the provisional
+  record. (#236)
+- `daemonseed_veilid_net::dm::DmEvent::Refused` covers a channel send as well as a first contact.
+  (#236)
 
 - `VeilidNetHandle::subscribe_room`, `resweep_rendezvous`, `repair_rendezvous` and
   `rendezvous_record_key` take a `RendezvousOwner` in place of a raw `[u8; 32]` owner

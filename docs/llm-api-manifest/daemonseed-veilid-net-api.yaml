@@ -303,7 +303,26 @@ types:
       arriving at a full held-request list is skipped BEFORE admission and counted
       on DoorbellHealth's pending_full, and a slot whose contact lookup failed is
       left unverified and unrecorded — both are read normally on a later sweep
-      rather than being burnt into the seen set. `spawn` does the one-off work
+      rather than being burnt into the seen set. The same cadence drives the
+      channel plane per correspondence: due outbox entries are emitted and
+      published at DmPageAddress::sending, a landed write is confirmed, entries
+      past the seven-day window are surfaced as Delivery{state: Undelivered} and
+      recorded surfaced in the same write, and the pages Collection::probe_plan
+      names are swept at DmPageAddress::receiving. A sweep counts as complete
+      only when nothing failed AND the transport attempted either no subkey (an
+      absent record) or every subkey the record holds; anything else folds
+      nothing and advances nothing. A give-up is offered without clearing the
+      outbox's surfacing flag — only DmCommand::Surfaced clears it, and a session
+      does not repeat an offer it has already made — so a restart before the
+      front end answers re-offers. The outbox is driven for a correspondence
+      recovered from disk too, taking its direction from the stored record, so a
+      queued doorbell entry keeps re-seeding without a key schedule while a
+      channel entry, having no address without a ratchet, is left alone. A collected
+      frame emits DmEvent::Message and advances the persisted receive cursor when
+      the contiguous prefix moved, bounded by the pages this session has swept. A
+      correspondence found on disk at startup is listed with no ratchet — a
+      ratchet has no at-rest record — so it sweeps nothing and a Send to it is
+      refused with NotEstablishedThisSession. `spawn` does the one-off work
       before the task starts — deriving this identity's own doorbell and
       key-record owner seeds, provisioning the block list, and opening the
       spent-token set — so neither their failure modes nor Argon2id's cost land on
@@ -352,7 +371,16 @@ types:
       record and publishes the knock; Accept establishes through
       DmPersist::accept_first_contact; Decline persists nothing; Block and Unblock
       write the block list, and a refused 513th entry surfaces as
-      DmEvent::BlockListFull. FirstContact is refused with
+      DmEvent::BlockListFull. Send seals on an established channel: the outbox is
+      priced against frame::WORST_CASE_SEALED_FRAME_LEN before the ratchet steps,
+      the frame carries the collection's acknowledgement piggybacked, and the
+      queued sequence is reported as Delivery{state: Composed}. Surfaced clears
+      the surfacing owed on the named sequence numbers. Send is refused with
+      RefusalReason::NotEstablishedThisSession when no ratchet is held for that
+      identity, OutboxFull{needed} when the record cannot take another message,
+      BodyTooLarge over DM_BODY_CAP, and SealFailed when the frame will not seal;
+      an OutboxFull refusal spends no sequence number. FirstContact is refused
+      with
       RefusalReason::AlreadyEstablished when a correspondence with that identity
       exists and AlreadyInFlight when an introduction to it is already between the
       command and the doorbell write; a panicked mint refuses it with MintPanicked
@@ -368,8 +396,16 @@ types:
       Message{from,seq,body,sent_unix_ms}, Delivery{to,seq,state},
       Refused{to,acceptance,reason}, AcceptFailed{request,from,reason},
       ChannelLost{with,cause,surfaced}, ChannelDirectionUnknown{with},
-      DoorbellHealth{outcome,admission,pending_full}, ContactLookupFailed,
-      BlockListFull{count}, BlockListProvisioned, SpentTokensNotPersisted. Refused
+      DoorbellHealth{outcome,admission,pending_full},
+      ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred},
+      ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
+      SpentTokensNotPersisted. ChannelHealth is one correspondence's channel-plane
+      accounting, cumulative for the session and emitted only when a counter
+      moves; already_consumed is reachable only through the TooManyRuns retry
+      path, since a settled position is filtered out before the ratchet sees it,
+      and peer_pseudonym_unknown says an initiator swept nothing because no frame
+      carries the acceptor's pseudonym. Refused covers a channel send as well as
+      a first contact, and Refused
       carries a RefusalReason and AcceptFailed an AcceptFailure; ChannelLost
       carries the surfaced sequence numbers the user is owed; DoorbellHealth
       carries admission's running AdmissionCounters plus pending_full, the slots
@@ -381,10 +417,12 @@ types:
     module: daemonseed_veilid_net::dm
     kind: enum
     description: >-
-      Where a first contact stopped — NoKeyRecord, KeyRecordInvalid, PublishFailed,
+      Where a send stopped — NoKeyRecord, KeyRecordInvalid, PublishFailed,
       StoreFailure, AlreadyEstablished, AlreadyInFlight, MintPanicked, TaskPanicked,
-      MintFailed, Module. Acceptance says how far the write got; this says why it
-      went no further, and folding them loses the second.
+      MintFailed, Module, OutboxFull{needed}, NotEstablishedThisSession,
+      BodyTooLarge, SealFailed. The first ten are first-contact refusals and the
+      last four channel-send ones. Acceptance says how far the write got; this
+      says why it went no further, and folding them loses the second.
   - name: AcceptFailure
     module: daemonseed_veilid_net::dm
     kind: enum

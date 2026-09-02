@@ -228,6 +228,50 @@ impl Collection {
         Self::default()
     }
 
+    /// A collection whose probe starts at the page a persisted
+    /// [`ReceiveCursor`](crate::dm::provisional::ReceiveCursor) named, rather
+    /// than at page zero.
+    ///
+    /// **The frontier is restored; the settled set is not, and the asymmetry is
+    /// the record's, not a shortcut here.** The cursor is eight bytes naming a
+    /// page — that is the whole of what survives a restart — so nothing on disk
+    /// can say which positions inside that page were collected. A caller
+    /// therefore resumes with an empty [`Self::ack`] and a frontier already at the
+    /// page the cursor named, and the acknowledgement rebuilds from the first
+    /// position settled after the restart rather than claiming a prefix it cannot
+    /// vouch for. Under-claiming is the fail-safe direction — the sender re-seeds
+    /// a message that was in fact read, which costs a round trip and never
+    /// reports a message delivered that was not.
+    ///
+    /// **The limit this leaves is not a slow rescan, it is re-delivery, and a
+    /// caller must close it before resuming a live collection.** With the
+    /// frontier restored and nothing settled, [`Self::probe_plan`] backfills
+    /// from page zero and [`Self::observe_page`] reports every position it finds
+    /// there as unsettled — including ones this profile already collected and
+    /// showed. A caller that opens and displays whatever `unsettled` names would
+    /// show the user old messages as new, which ISC-A-C21 forbids. Nothing in
+    /// this type can prevent that: the record it resumes from names a page and
+    /// not a set, so the knowledge simply is not there. What closes it is a
+    /// message log the caller consults before displaying, or a settled set that
+    /// survives the restart alongside the cursor.
+    ///
+    /// It is unreachable in the current build for an unrelated reason — a
+    /// resumed correspondence has no key schedule, so it opens nothing — and
+    /// that is a reason to state the limit here rather than to leave it
+    /// unwritten.
+    ///
+    /// `page` above [`MAX_PAGE`] yields [`Self::new`], because such a page holds
+    /// no position and a probe started there would never find a message. The
+    /// cursor's own constructors refuse that value, so this arm is reachable only
+    /// by a caller passing a bare number.
+    pub fn resuming_from_page(page: u64) -> Self {
+        Self {
+            ack: AckState::new(),
+            frontier: (page <= MAX_PAGE).then_some(page),
+            last_probe_ms: None,
+        }
+    }
+
     /// Fold one swept page: `page`, and the slot indices that came back holding
     /// bytes.
     ///
@@ -560,6 +604,68 @@ mod tests {
     /// The position of a sequence number, for tests that speak in sequences.
     fn at(seq: u64) -> PagePosition {
         position_of(seq)
+    }
+
+    /// A resumed collection probes from the page the cursor named, and claims
+    /// nothing about what is settled below it.
+    ///
+    /// Both halves are asserted against a fresh collection as the control: a
+    /// `resuming_from_page` that ignored its argument would produce exactly the
+    /// fresh plan, and one that fabricated a prefix would differ from the fresh
+    /// cursor.
+    #[test]
+    fn a_resumed_collection_probes_from_the_cursor_and_settles_nothing() {
+        const RESUMED_AT: u64 = 40;
+
+        let fresh = Collection::new();
+        let resumed = Collection::resuming_from_page(RESUMED_AT);
+
+        assert_eq!(
+            resumed.frontier_page(),
+            Some(RESUMED_AT),
+            "the frontier must resume at the page the cursor named"
+        );
+        assert_eq!(
+            fresh.frontier_page(),
+            None,
+            "a fresh collection must have reached no page, or the assertion above is vacuous"
+        );
+        assert_eq!(
+            resumed.contiguous_through(),
+            fresh.contiguous_through(),
+            "a resumed collection must claim exactly what a fresh one does: nothing"
+        );
+        assert!(
+            resumed.outstanding().is_empty(),
+            "nothing can be outstanding before anything has been settled"
+        );
+
+        let mut resumed = resumed;
+        let plan = resumed
+            .probe_plan(0)
+            .expect("a collection that has never probed is due");
+        assert_eq!(
+            plan,
+            vec![RESUMED_AT, RESUMED_AT + 1, 0, 1],
+            "the plan must lead with the resumed page and the next one, then backfill \
+             from the bottom — the cursor named a page, not a settled set"
+        );
+        assert_eq!(
+            Collection::new()
+                .probe_plan(0)
+                .expect("a fresh collection is due"),
+            vec![0, 1],
+            "a fresh collection must plan only page zero and its successor, or the \
+             resumed plan above proves nothing about the frontier"
+        );
+
+        // A page above the sequence space names no position, so it is not a page
+        // a probe could start from.
+        assert_eq!(
+            Collection::resuming_from_page(MAX_PAGE + 1).frontier_page(),
+            None,
+            "a page outside the sequence space must resume nothing"
+        );
     }
 
     /// Collect a sequence number, asserting the ack accepted it.

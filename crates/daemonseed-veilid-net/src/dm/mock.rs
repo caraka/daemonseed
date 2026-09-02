@@ -11,12 +11,15 @@
 //! `DmPageAddress::with_owner_seed` is the one way to reach it; nothing here calls
 //! it, so a recorded call can be compared without a secret leaving the address.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use daemonseed_core::dm::ack_record::DmAckAddress;
-use daemonseed_core::dm::paging::{DmPageAddress, Receiving, Sending};
+use daemonseed_core::dm::paging::{
+    DmPageAddress, PagePosition, Receiving, Sending, DM_PAGE_OWNER_SEED_LEN, PAGE_SLOTS,
+};
 use daemonseed_core::dm::ratchet::Direction;
 
 use crate::actor::{DmPageSweep, DoorbellDispatch, DoorbellSweep};
@@ -100,6 +103,38 @@ pub(crate) enum MockCall {
     FetchAck { direction: Direction },
 }
 
+/// The records two mocks share, so one driver's write is another's sweep.
+///
+/// **A record store, not a message bus.** A slot holds whatever was last written
+/// to it and holds it indefinitely, which is what a DHT record does and what
+/// makes a re-seed testable: the second write of the same bytes to the same slot
+/// is not distinguishable from the first, and a sweep after either returns one
+/// entry rather than two.
+///
+/// Pages are keyed by the record-owner seed both ends derive, which is the only
+/// thing that identifies one record to two parties who never exchange an
+/// address. It is reached through `DmPageAddress::with_owner_seed` and stays
+/// inside this map: nothing puts it in [`MockCall`], so the log is still a
+/// non-secret projection.
+#[derive(Default)]
+pub(crate) struct MockNetwork {
+    /// Page records, by the owner seed both ends derive.
+    pages: Mutex<BTreeMap<[u8; DM_PAGE_OWNER_SEED_LEN], Slots>>,
+    /// Doorbell records, by the owner seed a sender derives from a public key.
+    doorbells: Mutex<BTreeMap<[u8; 32], Slots>>,
+}
+
+/// One record's populated subkeys: slot index to whatever was last written to
+/// it.
+type Slots = BTreeMap<u16, Vec<u8>>;
+
+impl MockNetwork {
+    /// A network nobody has written to.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+}
+
 /// A counting [`DmDht`] with an injected latency.
 pub(crate) struct MockDht {
     counts: [AtomicU64; 7],
@@ -129,11 +164,41 @@ pub(crate) struct MockDht {
     /// elapsed. Distinct from `panic_on`: a transport failure is an ordinary
     /// outcome the driver must handle, a panic is not.
     fail_on: Option<Method>,
+    /// Whether a page sweep reports an incomplete read, in the shape the
+    /// transport actually produces: fewer subkeys attempted than the record
+    /// holds, and nothing failed.
+    partial_sweeps: bool,
+    /// Whether a served page frame has one byte flipped, so it parses and does
+    /// not authenticate.
+    tamper_pages: bool,
+    /// Populated slots handed back by page sweeps, cumulative.
+    ///
+    /// The call counter cannot stand in for this: a sweep that returned nothing
+    /// and a sweep that returned a frame are the same call, and an oracle
+    /// asserting a driver folded nothing needs to know the bytes were actually
+    /// offered to it.
+    slots_served: AtomicU64,
+    /// Every page frame written, in call order, as `(position, bytes)`.
+    ///
+    /// Beside `net.pages` rather than read from it: the record holds only the
+    /// last write of a slot, and a re-seed's whole property is that the SECOND
+    /// write carries the same bytes as the first.
+    published_pages: Mutex<Vec<(PagePosition, Vec<u8>)>>,
+    /// The records this mock reads and writes. Shared with any other mock built
+    /// on the same [`MockNetwork`], which is what makes a two-driver oracle
+    /// possible; private to this mock otherwise.
+    net: Arc<MockNetwork>,
 }
 
 impl MockDht {
     /// A mock whose every call takes `latency` of virtual time.
     pub(crate) fn new(latency: Duration) -> Self {
+        Self::on(MockNetwork::new(), latency)
+    }
+
+    /// A mock reading and writing `net`, so two drivers can see each other's
+    /// writes.
+    pub(crate) fn on(net: Arc<MockNetwork>, latency: Duration) -> Self {
         Self {
             counts: Default::default(),
             log: Mutex::new(Vec::new()),
@@ -143,6 +208,11 @@ impl MockDht {
             latency,
             panic_on: None,
             fail_on: None,
+            partial_sweeps: false,
+            tamper_pages: false,
+            slots_served: AtomicU64::new(0),
+            published_pages: Mutex::new(Vec::new()),
+            net,
         }
     }
 
@@ -152,6 +222,54 @@ impl MockDht {
             fail_on: Some(method),
             ..Self::new(latency)
         }
+    }
+
+    /// A mock on `net` whose page sweeps report that they did not read the whole
+    /// record.
+    ///
+    /// The populated slots it did reach still come back, which is the case worth
+    /// testing: a sweep that returned nothing would fold nothing whether or not
+    /// the driver honoured the outcome.
+    pub(crate) fn partial_on(net: Arc<MockNetwork>, latency: Duration) -> Self {
+        Self {
+            partial_sweeps: true,
+            ..Self::on(net, latency)
+        }
+    }
+
+    /// A mock on `net` whose `method` returns a transport error.
+    pub(crate) fn failing_on(net: Arc<MockNetwork>, latency: Duration, method: Method) -> Self {
+        Self {
+            fail_on: Some(method),
+            ..Self::on(net, latency)
+        }
+    }
+
+    /// A mock on `net` that flips one byte of every page frame it serves.
+    ///
+    /// The frame still parses — the corruption is inside the sealed envelope —
+    /// so it reaches the ratchet and fails to authenticate, which is the case
+    /// worth testing: page owner-write authority is symmetric, so anyone can
+    /// write a slot and the authorship signature is the only thing separating
+    /// the correspondent's writes from everybody else's.
+    pub(crate) fn tampering_on(net: Arc<MockNetwork>, latency: Duration) -> Self {
+        Self {
+            tamper_pages: true,
+            ..Self::on(net, latency)
+        }
+    }
+
+    /// Populated slots handed back by page sweeps so far.
+    pub(crate) fn slots_served(&self) -> u64 {
+        self.slots_served.load(Ordering::SeqCst)
+    }
+
+    /// Every page frame written, in call order.
+    pub(crate) fn published_pages(&self) -> Vec<(PagePosition, Vec<u8>)> {
+        self.published_pages
+            .lock()
+            .expect("mock published pages")
+            .clone()
     }
 
     /// The doorbell entries written so far, in call order.
@@ -262,6 +380,15 @@ impl DmDht for MockDht {
         let latency = self.latency;
         let boom = self.panics(Method::PublishDoorbell);
         let dud = self.fails(Method::PublishDoorbell);
+        if !dud && !boom {
+            self.net
+                .doorbells
+                .lock()
+                .expect("mock doorbells")
+                .entry(owner_seed)
+                .or_default()
+                .insert(slot, entry.clone());
+        }
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
@@ -280,7 +407,32 @@ impl DmDht for MockDht {
         let latency = self.latency;
         let boom = self.panics(Method::SweepDoorbell);
         let dud = self.fails(Method::SweepDoorbell);
+        // A scripted sweep first, then the shared record. The queue is how a
+        // single-driver oracle hands the machine one exact entry; the record is
+        // how a second driver's knock arrives on its own.
         let queued = self.doorbell.lock().expect("mock doorbell").pop_front();
+        let queued = queued.or_else(|| {
+            let held = self
+                .net
+                .doorbells
+                .lock()
+                .expect("mock doorbells")
+                .get(&owner_seed)
+                .cloned()
+                .unwrap_or_default();
+            (!held.is_empty()).then(|| {
+                let slots: Vec<(u16, Vec<u8>)> = held.into_iter().collect();
+                let found = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+                DoorbellSweep {
+                    slots,
+                    outcome: SweepOutcome {
+                        attempted: 32,
+                        failed: 0,
+                        found,
+                    },
+                }
+            })
+        });
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
@@ -309,6 +461,29 @@ impl DmDht for MockDht {
         let latency = self.latency;
         let boom = self.panics(Method::PublishPage);
         let dud = self.fails(Method::PublishPage);
+        // Written at call time, like the counters, and before the scripted
+        // failure below: a `fail_on` publish is a write the transport reported
+        // as failed, which is exactly the case where the bytes may still have
+        // landed. That is the guarantee every DM write has, so the mock offers
+        // the same one.
+        // Logged whatever the transport is scripted to do with it: the bytes
+        // were handed over, and the re-seed property this log exists to pin is
+        // about what the driver emitted, not about what landed.
+        self.published_pages
+            .lock()
+            .expect("mock published pages")
+            .push((at, frame.clone()));
+        if !dud && !boom {
+            address.with_owner_seed(|seed| {
+                self.net
+                    .pages
+                    .lock()
+                    .expect("mock pages")
+                    .entry(*seed)
+                    .or_default()
+                    .insert(at.slot(), frame.clone());
+            });
+        }
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
@@ -321,17 +496,69 @@ impl DmDht for MockDht {
 
     fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> DmDhtFuture<DmPageSweep> {
         let conversation = *address.conversation();
+        let page = address.page();
         self.record(
             Method::SweepPage,
             MockCall::SweepPage {
                 conversation,
-                page: address.page(),
+                page,
                 direction: address.direction(),
             },
         );
         let latency = self.latency;
         let boom = self.panics(Method::SweepPage);
         let dud = self.fails(Method::SweepPage);
+        let held = address.with_owner_seed(|seed| {
+            self.net
+                .pages
+                .lock()
+                .expect("mock pages")
+                .get(seed)
+                .cloned()
+                .unwrap_or_default()
+        });
+        let absent = held.is_empty();
+        let tamper = self.tamper_pages;
+        let slots: Vec<(PagePosition, Vec<u8>)> = held
+            .into_iter()
+            .filter_map(|(slot, mut bytes)| {
+                if tamper {
+                    if let Some(last) = bytes.last_mut() {
+                        *last ^= 0xFF;
+                    }
+                }
+                PagePosition::new(page, slot).map(|at| (at, bytes))
+            })
+            .collect();
+        self.slots_served
+            .fetch_add(slots.len() as u64, Ordering::SeqCst);
+        let found = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+        // The three shapes the transport actually produces, and they are not
+        // interchangeable. An ABSENT record is `attempted: 0` — nothing was
+        // opened, so nothing was read, and there is nothing there to have
+        // missed. A COMPLETE read attempted every subkey the record holds. A
+        // PARTIAL one stopped part way with `failed` still zero, which is why a
+        // rule reading `failed` alone cannot tell it from a complete read of an
+        // emptier page.
+        let outcome = if absent {
+            SweepOutcome {
+                attempted: 0,
+                failed: 0,
+                found: 0,
+            }
+        } else if self.partial_sweeps {
+            SweepOutcome {
+                attempted: u32::from(PAGE_SLOTS) - 1,
+                failed: 0,
+                found,
+            }
+        } else {
+            SweepOutcome {
+                attempted: u32::from(PAGE_SLOTS),
+                failed: 0,
+                found,
+            }
+        };
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
@@ -344,8 +571,8 @@ impl DmDht for MockDht {
             // fanning out over correspondents depends on.
             Ok(DmPageSweep {
                 conversation,
-                slots: Vec::new(),
-                outcome: empty_outcome(),
+                slots,
+                outcome,
             })
         })
     }

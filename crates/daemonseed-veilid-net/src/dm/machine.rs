@@ -26,18 +26,25 @@ use std::time::Duration;
 use daemonseed_core::dm::ack_record::DmAckAddress;
 use daemonseed_core::dm::admission::{AdmissionCounters, AdmissionOutcome, Admitter, SeenSet};
 use daemonseed_core::dm::block_list::{BlockList, BlockListError};
+use daemonseed_core::dm::collect::Collection;
 use daemonseed_core::dm::doorbell;
 use daemonseed_core::dm::firstcontact::{
-    self, FirstContactError, FirstContactRequest, FirstContactState, VerifiedFirstContact,
-    AR_FINGERPRINT_LEN,
+    self, recipient_hash, FirstContactError, FirstContactRequest, FirstContactState,
+    VerifiedFirstContact, AR_FINGERPRINT_LEN, ROOT_LEN,
 };
+use daemonseed_core::dm::frame::{self, AuthorKeys, WORST_CASE_SEALED_FRAME_LEN};
 use daemonseed_core::dm::keyrec::KEM_EK_LEN;
 use daemonseed_core::dm::keyrec::{self, DM_KEYREC_OWNER_SEED_LEN};
-use daemonseed_core::dm::paging::{DmPageAddress, Receiving, Sending};
-use daemonseed_core::dm::persist::{DmPersist, DmPersistError, StateLoss};
+use daemonseed_core::dm::outbox::{DeliveryState, OutboxError, OutboxTarget, SealedFrame};
+use daemonseed_core::dm::paging::{
+    position_of, DmPageAddress, PagePosition, Receiving, Sending, ADDRESS_ROOT_LEN, PAGE_SLOTS,
+};
+use daemonseed_core::dm::persist::{
+    DmPersist, DmPersistError, Mutation, StateLoss, StoredChannelRestart,
+};
 use daemonseed_core::dm::pow;
 use daemonseed_core::dm::provisional::RecordContext;
-use daemonseed_core::dm::ratchet::Ratchet;
+use daemonseed_core::dm::ratchet::{Direction, Ratchet, RatchetError};
 use daemonseed_core::dm::token::SpentTokenSet;
 use daemonseed_core::identity::keys::{SignKeypair, IDENTITY_PK_LEN, ML_DSA_SEED_LEN};
 use daemonseed_core::storage::dm_store::CorrespondenceLabel;
@@ -91,14 +98,29 @@ impl core::fmt::Debug for DmEffect {
 /// machine can attribute an outcome without remembering dispatch order.
 pub(crate) struct OpTag {
     /// The conversation's `AR` fingerprint, where the operation has one.
-    // Items 3-4 tag channel-plane operations with it; the doorbell plane has no
-    // conversation until a knock is accepted.
-    #[allow(dead_code)]
+    ///
+    /// The doorbell plane has no conversation until a knock is accepted; every
+    /// channel-plane operation carries one, and it is what a page sweep's
+    /// outcome is attributed by.
     pub conversation: Option<[u8; AR_FINGERPRINT_LEN]>,
-    /// The message sequence number, where the operation has one.
-    // Item 3 tags an outbox emission with its sequence number.
-    #[allow(dead_code)]
+    /// The message sequence number, where the operation has one — an outbox
+    /// emission, so the write's outcome can confirm the entry that produced it.
     pub seq: Option<u64>,
+    /// The page a sweep addressed.
+    ///
+    /// **Carried rather than recovered from the result**, because an empty page
+    /// comes back with no position in it and a page number is exactly what
+    /// [`Collection::observe_page`] needs. Recovering it from the first
+    /// populated slot would work on every page that had something in it and
+    /// silently do nothing on the ones that did not.
+    pub page: Option<u64>,
+    /// The correspondent a channel-plane write belongs to.
+    ///
+    /// **Distinct from `conversation`, and needed because they have different
+    /// lifetimes.** A conversation fingerprint exists only while a ratchet does;
+    /// a queued doorbell entry outlives one, and its write still has to be
+    /// confirmed against the entry it came from.
+    pub correspondent: Option<PkLt>,
     /// The correspondent an in-flight introduction is addressed to.
     ///
     /// A first contact has no conversation yet — that is what it is for — so
@@ -114,6 +136,8 @@ impl OpTag {
         Self {
             conversation: None,
             seq: None,
+            page: None,
+            correspondent: None,
             introduction: None,
         }
     }
@@ -123,7 +147,25 @@ impl OpTag {
         Self {
             conversation: None,
             seq: None,
+            page: None,
+            correspondent: None,
             introduction: Some(recipient),
+        }
+    }
+
+    /// A tag naming one conversation, and optionally the sequence number or the
+    /// page the operation is about.
+    fn channel(
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        seq: Option<u64>,
+        page: Option<u64>,
+    ) -> Self {
+        Self {
+            conversation: Some(conversation),
+            seq,
+            page,
+            correspondent: None,
+            introduction: None,
         }
     }
 }
@@ -134,6 +176,11 @@ impl core::fmt::Debug for OpTag {
         f.debug_struct("OpTag")
             .field("conversation", &self.conversation.map(|_| "<AR>"))
             .field("seq", &self.seq)
+            .field("page", &self.page)
+            .field(
+                "correspondent",
+                &self.correspondent.as_ref().map(|_| "PkLt(..)"),
+            )
             .field(
                 "introduction",
                 &self.introduction.as_ref().map(|_| "PkLt(..)"),
@@ -144,9 +191,8 @@ impl core::fmt::Debug for OpTag {
 
 /// One DHT operation, as the machine asks for it.
 //
-// The channel-plane variants — PublishPage, SweepPage, PublishAck, FetchAck —
-// are dispatched and oracle-covered but constructed by nothing yet: items 3 and
-// 4 construct them.
+// PublishAck and FetchAck are dispatched and oracle-covered but constructed by
+// nothing yet: the acknowledgement slice constructs them.
 #[allow(dead_code)]
 pub(crate) enum DhtOp {
     /// Fetch a correspondent's key record.
@@ -216,8 +262,8 @@ impl DhtOp {
 
 /// What one completed DHT operation yielded.
 //
-// `Page` and `Ack` carry payloads the machine matches on but does not yet read:
-// items 3 and 4 read them.
+// `Ack` carries a payload the machine matches on but does not yet read: the
+// acknowledgement slice reads it.
 #[allow(dead_code)]
 pub(crate) enum DhtResult {
     /// A key-record fetch; `None` is the awaiting-key state.
@@ -451,32 +497,128 @@ struct Introduction {
 struct Correspondence {
     /// The correspondent's long-term identity key.
     pk_lt: PkLt,
+    /// The store label this correspondence's records live under — its outbox,
+    /// its receive cursor, its contact record.
+    label: CorrespondenceLabel,
     /// The conversation key schedule.
     ///
-    /// `None` on the initiator's side until the correspondent replies: the
-    /// initiator's ratchet opens from the provisional record on that reply,
-    /// which is item 3. The entry exists before then so the pseudonym below is
-    /// not the thing that gets lost in between.
+    /// `None` for a correspondence found on disk at startup and nothing else.
+    /// A ratchet has no at-rest record, so it is exactly the correspondences
+    /// established in this process that can be spoken on; see this struct's own
+    /// note above and [`RefusalReason::NotEstablishedThisSession`].
     ratchet: Option<Ratchet>,
     /// Our per-contact pseudonym — what signs every frame we send here.
-    // Item 3 signs with it; item 2's job is only to make sure the mint's copy
-    // is not the one that gets dropped.
-    #[allow(dead_code)]
-    signing_pc: SignKeypair,
+    ///
+    /// `None` exactly when `ratchet` is: the pseudonym is minted in the process
+    /// that establishes the correspondence and has nowhere at rest to live.
+    signing_pc: Option<SignKeypair>,
     /// The correspondent's pseudonym — what every frame they send is verified
     /// against.
     ///
-    /// Known from the knock on the acceptor's side. `None` on the initiator's
-    /// until the correspondent's first frame carries it, which is item 3.
+    /// Known from the knock on the acceptor's side. **`None` on the initiator's
+    /// side and there is no path that fills it in**, which is a gap in the build
+    /// rather than a step not yet taken: a channel frame carries no pseudonym
+    /// key, and the resume record that homes the pair (A4.8 / A9.2) cannot be
+    /// written until the channel has re-established once. An initiator therefore
+    /// cannot verify authorship on anything it sweeps, so it does not sweep, and
+    /// says so on [`DmEvent::ChannelHealth`]'s `peer_pseudonym_unknown`.
     peer_pk_pc: Option<Box<[u8; IDENTITY_PK_LEN]>>,
+    /// The conversation's address root and channel id, derived from `ss0` at
+    /// establishment. `None` alongside a `None` ratchet, and for the same
+    /// reason — nothing at rest carries them.
+    channel: Option<ChannelRoots>,
+    /// What has been collected on the receiving direction.
+    collection: Collection,
+    /// The highest page this session has actually swept — the corroboration
+    /// [`DmPersist::advance_cursor`] refuses to move the stored cursor without.
+    ///
+    /// **This session's own knowledge, never a number read back from the file.**
+    /// The cursor record is unsealed by design, so a value taken from it and
+    /// handed back as its own bound would be checking an untrusted number
+    /// against itself.
+    read_through: u64,
+    /// Positions opened and displayed whose acknowledgement the beyond-prefix
+    /// set had no room for, retried at the head of the next fold.
+    ///
+    /// Retained rather than dropped because the message key is already spent:
+    /// re-offering the slot yields
+    /// [`RatchetError::AlreadyConsumed`], never a second copy, so a discarded
+    /// position is one the sender re-seeds to the give-up and reports
+    /// undelivered for a message that was in fact read.
+    owed_acks: Vec<PagePosition>,
+    /// Give-ups this session has already told the front end about.
+    ///
+    /// **Not a substitute for the record's own flag**, which stays owed until
+    /// [`DmCommand::Surfaced`] answers it — this only stops the same run
+    /// repeating itself on every tick. A restart empties it, so anything the
+    /// front end never answered is offered again, which is the #279 direction.
+    offered_this_session: Vec<u64>,
+    /// This correspondence's channel-plane accounting, cumulative.
+    health: ChannelCounters,
+}
+
+/// The conversation's two derived roots, held together because they are derived
+/// together and are meaningless apart.
+struct ChannelRoots {
+    /// The address root every page and acknowledgement record hangs off.
+    address_root: [u8; ADDRESS_ROOT_LEN],
+    /// The channel id every frame's seal and signature bind. Never serialized
+    /// (§ v4 minor invariant).
+    chan_id: [u8; ROOT_LEN],
+}
+
+/// What one correspondence's channel plane has counted, cumulative for this
+/// session. Mirrors [`DmEvent::ChannelHealth`]'s fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChannelCounters {
+    partial_sweeps: u64,
+    already_consumed: u64,
+    unopenable: u64,
+    peer_pseudonym_unknown: u64,
+    peer_acks_deferred: u64,
 }
 
 impl core::fmt::Debug for Correspondence {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // `signing_pc` holds a secret key and both public halves name a person.
+        // `signing_pc` holds a secret key and both public halves name a person;
+        // the roots address the conversation.
         f.debug_struct("Correspondence")
             .field("peer_pk_pc_known", &self.peer_pk_pc.is_some())
+            .field("live", &self.ratchet.is_some())
+            .field("read_through", &self.read_through)
+            .field("health", &self.health)
             .finish_non_exhaustive()
+    }
+}
+
+impl Correspondence {
+    /// The three things a live channel needs together, or nothing.
+    ///
+    /// **One accessor rather than three unwraps**, because they are set in one
+    /// act and are meaningless apart: a ratchet with no pseudonym cannot sign,
+    /// and a pseudonym with no roots cannot address. Every caller that speaks on
+    /// the channel goes through here, so "established this session" has one
+    /// spelling.
+    fn live(&self) -> Option<(&Ratchet, &SignKeypair, &ChannelRoots)> {
+        match (&self.ratchet, &self.signing_pc, &self.channel) {
+            (Some(r), Some(pc), Some(ch)) => Some((r, pc, ch)),
+            _ => None,
+        }
+    }
+
+    /// Emit this correspondence's accounting if anything moved since `before`.
+    fn health_event(&self, before: ChannelCounters) -> Option<DmEffect> {
+        if self.health == before {
+            return None;
+        }
+        Some(DmEffect::Emit(DmEvent::ChannelHealth {
+            with: Box::new(*self.pk_lt),
+            partial_sweeps: self.health.partial_sweeps,
+            already_consumed: self.health.already_consumed,
+            unopenable: self.health.unopenable,
+            peer_pseudonym_unknown: self.health.peer_pseudonym_unknown,
+            peer_acks_deferred: self.health.peer_acks_deferred,
+        }))
     }
 }
 
@@ -556,6 +698,7 @@ impl DmMachine {
         keyrec_addr: [u8; DM_KEYREC_OWNER_SEED_LEN],
         spent: SpentTokens,
     ) -> Self {
+        let correspondences = seed_from_store(&persist);
         Self {
             identity,
             persist,
@@ -571,7 +714,7 @@ impl DmMachine {
             outbound: Vec::new(),
             minting: Vec::new(),
             provisionals: Vec::new(),
-            correspondences: Vec::new(),
+            correspondences,
         }
     }
 
@@ -592,8 +735,8 @@ impl DmMachine {
             }
             DmCommand::Block { pk_lt } => self.set_blocked(&pk_lt, true),
             DmCommand::Unblock { pk_lt } => self.set_blocked(&pk_lt, false),
-            // Items 3 and 4. The channel plane decides nothing yet.
-            DmCommand::Send { .. } | DmCommand::Surfaced { .. } => Vec::new(),
+            DmCommand::Send { to, body } => self.send(now_ms, &to, body),
+            DmCommand::Surfaced { to, seqs } => self.record_surfaced(now_ms, &to, &seqs),
             // The shell breaks its loop on this and never asks the machine.
             DmCommand::Shutdown => Vec::new(),
         }
@@ -607,10 +750,16 @@ impl DmMachine {
     /// "nobody knocked" and "every GET errored".
     pub(crate) fn on_tick(&mut self, now_ms: i64) -> Vec<DmEffect> {
         self.last_tick_ms = Some(now_ms);
-        vec![DmEffect::Dht(DhtOp::SweepDoorbell {
+        let mut out = vec![DmEffect::Dht(DhtOp::SweepDoorbell {
             tag: OpTag::none(),
             owner_seed: self.doorbell_owner,
-        })]
+        })];
+        for index in 0..self.correspondences.len() {
+            out.extend(self.give_ups(now_ms, index));
+            out.extend(self.due_emissions(now_ms, index));
+            out.extend(self.probe(now_ms, index));
+        }
+        out
     }
 
     /// Step on a completed off-loop operation.
@@ -666,14 +815,15 @@ impl DmMachine {
                     // The doorbell write landed, so the introduction is no
                     // longer in flight and a later `FirstContact` to this
                     // recipient is a new one rather than a duplicate.
-                    if let Some(recipient) = tag.introduction {
+                    if let Some(recipient) = tag.introduction.as_ref() {
                         self.minting
                             .retain(|pk| pk.as_slice() != recipient.as_slice());
                     }
-                    Vec::new()
+                    self.confirm_written(now_ms, &tag)
                 }
-                // Items 3 and 4 read these.
-                Ok(DhtResult::Page(_)) | Ok(DhtResult::Ack(_)) => Vec::new(),
+                Ok(DhtResult::Page(sweep)) => self.on_page(now_ms, &tag, sweep),
+                // The acknowledgement slice reads this.
+                Ok(DhtResult::Ack(_)) => Vec::new(),
             },
         }
     }
@@ -692,6 +842,39 @@ impl DmMachine {
         self.last_tick_ms
     }
 
+    /// The sequence number the next channel send would take, when this session
+    /// holds exactly one live correspondence.
+    ///
+    /// **A probe read, and the only way an oracle can see the ratchet did not
+    /// move.** A refused send that stepped the ratchet anyway is invisible in
+    /// every other observable — no event, no write, no store change — so
+    /// without this the "nothing was spent" claim cannot be tested. `None` when
+    /// there is not exactly one live correspondence, so an oracle cannot read it
+    /// as a number about the wrong conversation.
+    pub(crate) fn only_next_send_seq(&self) -> Option<u64> {
+        let mut live = self.correspondences.iter().filter_map(|c| c.live());
+        let (ratchet, _, _) = live.next()?;
+        live.next().is_none().then(|| ratchet.next_send_seq())
+    }
+
+    /// The resumed probe frontier of the single correspondence recovered from
+    /// disk, for the oracle that pins the cursor seeding.
+    ///
+    /// A recovered correspondence is the one with neither a ratchet nor a
+    /// pseudonym; `None` when there is not exactly one, or when it reached no
+    /// page.
+    pub(crate) fn only_resumed_frontier(&self) -> Option<u64> {
+        let mut seeded = self
+            .correspondences
+            .iter()
+            .filter(|c| c.ratchet.is_none() && c.signing_pc.is_none());
+        let first = seeded.next()?;
+        if seeded.next().is_some() {
+            return None;
+        }
+        first.collection.frontier_page()
+    }
+
     /// The correspondences this session holds, for the machine's own oracles.
     #[cfg(test)]
     pub(crate) fn correspondence_count(&self) -> usize {
@@ -703,6 +886,670 @@ impl DmMachine {
     #[cfg(test)]
     pub(crate) fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    // ---- the channel plane: sending ----------------------------------------
+
+    /// Send one message on an established channel.
+    ///
+    /// **The order is priced-refused-sealed-queued, and the first two steps come
+    /// before the ratchet moves.** [`Ratchet::send_next`] takes a step with no
+    /// step back, so a refusal discovered after it has burnt a sequence number
+    /// that will never be transmitted — and the correspondent's contiguous
+    /// prefix then waits on that number for the seven-day give-up while every
+    /// later message sits beyond the prefix. So the body cap and the outbox's
+    /// capacity are both asked *first*, and the capacity ask is priced against
+    /// [`WORST_CASE_SEALED_FRAME_LEN`] because no caller can know its frame's
+    /// real length before sealing it. That over-refuses by the margin between a
+    /// real frame and the largest possible one; over-refusing is a message the
+    /// user can send again, and the alternative is a hole nothing can fill.
+    ///
+    /// **The ask and the enqueue are two writes with a seal between them, and
+    /// that is sound only because one driver owns the store.** Each takes the
+    /// store's own lock, so a second writer could fill the record in the gap and
+    /// the enqueue would then fail where the ask said yes — reported as
+    /// [`RefusalReason::StoreFailure`] rather than as a capacity refusal, with
+    /// the sequence number spent. One driver per profile is the invariant that
+    /// keeps that unreachable; a second writer would need the two steps merged
+    /// under one lock, which means sealing inside the closure.
+    fn send(&mut self, now_ms: i64, to: &PkLt, body: String) -> Vec<DmEffect> {
+        let Some(index) = self.index_of(to) else {
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::NotEstablishedThisSession,
+            ))];
+        };
+        let Some((ratchet, _, _)) = self.correspondences[index].live() else {
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::NotEstablishedThisSession,
+            ))];
+        };
+        let label = self.correspondences[index].label;
+        let direction = ratchet.send_direction();
+        let next_seq = ratchet.next_send_seq();
+
+        // Checked here rather than left to `seal`, which reports it only after
+        // the ratchet has already stepped.
+        if body.len() > firstcontact::DM_BODY_CAP {
+            return vec![DmEffect::Emit(refused(to, RefusalReason::BodyTooLarge))];
+        }
+
+        // The ask. `Unchanged` because nothing is written: this is a question
+        // about the record, taken under the same lock and after the same prune
+        // the enqueue below will see.
+        let asked = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                Ok(Mutation::Unchanged(outbox.room_for(
+                    next_seq,
+                    OutboxTarget::ChannelPage,
+                    WORST_CASE_SEALED_FRAME_LEN,
+                )))
+            });
+        match asked {
+            Ok(Ok(())) => {}
+            Ok(Err(OutboxError::Full { needed, .. })) => {
+                return vec![DmEffect::Emit(refused(
+                    to,
+                    RefusalReason::OutboxFull { needed },
+                ))];
+            }
+            Ok(Err(e)) => {
+                crate::vtrace!("dm driver: the outbox refused sequence {next_seq}: {e}");
+                return vec![DmEffect::Emit(refused(to, RefusalReason::StoreFailure))];
+            }
+            Err(e) => {
+                crate::vtrace!("dm driver: the outbox could not be read: {e}");
+                return vec![DmEffect::Emit(refused(to, RefusalReason::StoreFailure))];
+            }
+        }
+
+        // Disjoint borrows: the identity's own public key is read while the
+        // correspondence is held mutably for the ratchet step.
+        let Self {
+            identity,
+            persist,
+            correspondences,
+            ..
+        } = self;
+        let correspondence = &mut correspondences[index];
+        let recipient = match recipient_hash(&correspondence.pk_lt) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::vtrace!("dm driver: recipient hash failed: {e}");
+                return vec![DmEffect::Emit(refused(to, RefusalReason::Module))];
+            }
+        };
+        let (Some(ratchet), Some(signing_pc), Some(channel)) = (
+            correspondence.ratchet.as_mut(),
+            correspondence.signing_pc.as_ref(),
+            correspondence.channel.as_ref(),
+        ) else {
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::NotEstablishedThisSession,
+            ))];
+        };
+        // Past this line a sequence number has been spent.
+        let outbound = match ratchet.send_next() {
+            Ok(o) => o,
+            Err(e) => {
+                crate::vtrace!("dm driver: the ratchet refused to mint a key: {e}");
+                return vec![DmEffect::Emit(refused(to, RefusalReason::SealFailed))];
+            }
+        };
+        let seq = outbound.header.seq;
+        // The piggybacked acknowledgement rides for free: `seal` reads the
+        // collection's own state, so a message going out carries what has come
+        // in without a second record, a second write, or a second signature.
+        let sealed = match frame::seal(
+            outbound,
+            &channel.chan_id,
+            signing_pc,
+            identity.signing.public_key(),
+            &recipient,
+            now_ms,
+            &body,
+            Some(correspondence.collection.ack()),
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                crate::vtrace!("dm driver: the frame would not seal: {e}");
+                return vec![DmEffect::Emit(refused(to, RefusalReason::SealFailed))];
+            }
+        };
+        let queued = persist.update_outbox(&label, direction, now_ms, |outbox| {
+            outbox.enqueue_sealed(
+                seq,
+                OutboxTarget::ChannelPage,
+                now_ms,
+                SealedFrame::new(sealed),
+            )?;
+            Ok(Mutation::Changed(()))
+        });
+        if let Err(e) = queued {
+            // The ask said there was room and the record has not been touched
+            // since, so this is a store fault rather than the capacity refusal
+            // — and the sequence number IS spent, because the seal is behind us.
+            crate::vtrace!("dm driver: sequence {seq} sealed and could not be queued: {e}");
+            return vec![DmEffect::Emit(refused(to, RefusalReason::StoreFailure))];
+        }
+        vec![DmEffect::Emit(DmEvent::Delivery {
+            to: Box::new(**to),
+            seq,
+            state: DeliveryState::Composed,
+        })]
+    }
+
+    /// The UI has shown these delivery states, so stop re-offering them (#279).
+    ///
+    /// **This is the only thing that clears the durable flag**, and it runs
+    /// after the event reached the front end rather than in the write that
+    /// produced it — the ordering [`Outbox::record_surfaced`] requires. The
+    /// in-memory suppression is dropped alongside it, so a sequence the front
+    /// end never answered is offered again on the next run.
+    fn record_surfaced(&mut self, now_ms: i64, to: &PkLt, seqs: &[u64]) -> Vec<DmEffect> {
+        let Some(index) = self.index_of(to) else {
+            return Vec::new();
+        };
+        let label = self.correspondences[index].label;
+        let Some(direction) = self.stored_direction(&label, now_ms) else {
+            return Vec::new();
+        };
+        match self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                outbox.record_surfaced(seqs);
+                Ok(Mutation::Changed(()))
+            }) {
+            Ok(()) => {
+                self.correspondences[index]
+                    .offered_this_session
+                    .retain(|seq| !seqs.contains(seq));
+            }
+            Err(e) => {
+                crate::vtrace!("dm driver: the surfacing record could not be written: {e}");
+            }
+        }
+        Vec::new()
+    }
+
+    /// Turn the seven-day window into events, for this correspondence.
+    ///
+    /// **Nothing is cleared here, and that is the #279 ordering.**
+    /// [`Outbox::record_surfaced`] must run *after* the user has been told, not
+    /// in the write that swept: clearing first puts the flag out of the record
+    /// while the notification is still in a `Vec` somebody is carrying, so a
+    /// crash in between loses it for good. So the flag stays owed until
+    /// [`DmCommand::Surfaced`] says the front end has shown it, and every crash
+    /// before that re-offers.
+    ///
+    /// Re-offering on every tick is what an in-memory set suppresses instead:
+    /// the record keeps the durable obligation and this session declines to
+    /// repeat itself, so a front end sees one event per give-up per run and a
+    /// restart before the answer sees it again.
+    ///
+    /// **The direction comes from the stored record, not from a ratchet.** An
+    /// outbox outlives the key schedule, so a correspondence recovered from disk
+    /// still owes its user the fate of everything queued in it.
+    fn give_ups(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        let label = self.correspondences[index].label;
+        let Some(direction) = self.stored_direction(&label, now_ms) else {
+            return Vec::new();
+        };
+        let owed = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                let swept = outbox.sweep_give_ups(now_ms);
+                // The full owed list, never only what the sweep moved: an entry
+                // owed by a previous run's give-up is owed just the same, and
+                // one whose entry has since gone from the map is owed too — it
+                // is reported with the state a given-up entry has, because that
+                // is the only ending that reaches `owed_surfacings` without an
+                // entry behind it.
+                let owed: Vec<(u64, DeliveryState)> = outbox
+                    .owed_surfacings()
+                    .into_iter()
+                    .map(|seq| {
+                        let state = outbox
+                            .entry(seq)
+                            .map_or(DeliveryState::Undelivered, |e| e.delivery_state());
+                        (seq, state)
+                    })
+                    .collect();
+                Ok(if swept.is_empty() {
+                    Mutation::Unchanged(owed)
+                } else {
+                    Mutation::Changed(owed)
+                })
+            });
+        let owed = match owed {
+            Ok(owed) => owed,
+            Err(e) => {
+                crate::vtrace!("dm driver: the give-up sweep failed: {e}");
+                return Vec::new();
+            }
+        };
+        let correspondence = &mut self.correspondences[index];
+        let mut out = Vec::new();
+        for (seq, state) in owed {
+            if correspondence.offered_this_session.contains(&seq) {
+                continue;
+            }
+            correspondence.offered_this_session.push(seq);
+            out.push(DmEffect::Emit(DmEvent::Delivery {
+                to: Box::new(*correspondence.pk_lt),
+                seq,
+                state,
+            }));
+        }
+        out
+    }
+
+    /// The direction the stored outbox was written for, or `None` when there is
+    /// no record and so nothing to drive.
+    ///
+    /// **Read from the store rather than from the ratchet**, because the two
+    /// have different lifetimes: the record survives a restart and the key
+    /// schedule does not, and a queued knock still has to be re-seeded and still
+    /// has to be given up on.
+    fn stored_direction(&self, label: &CorrespondenceLabel, now_ms: i64) -> Option<Direction> {
+        match self.persist.read_outbox(label, now_ms) {
+            Ok(Some(outbox)) => Some(outbox.direction()),
+            Ok(None) => None,
+            Err(e) => {
+                crate::vtrace!("dm driver: the outbox would not read: {e}");
+                None
+            }
+        }
+    }
+
+    /// Emit every entry the re-seed ladder says is due, for this correspondence.
+    ///
+    /// [`OutboxEntry::emit`] advances the jittered backoff, so the emission and
+    /// the schedule move together under one lock: an entry whose bytes were
+    /// handed to the transport is not due again until its next rung, whatever
+    /// the transport then does with them.
+    ///
+    /// **A doorbell entry needs no key schedule and is re-seeded without one.**
+    /// Its address is a pure function of the correspondent's public identity key
+    /// and its bytes are in the record, so a correspondence recovered from disk
+    /// keeps re-seeding an unconfirmed knock — which is the whole point of
+    /// queueing the knock rather than publishing it once. A channel entry is
+    /// different: its address descends from the ratchet, so without one there is
+    /// no page to write to, and such an entry is left un-emitted rather than
+    /// having its backoff advanced for a write that cannot happen.
+    fn due_emissions(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        let label = self.correspondences[index].label;
+        let Some(direction) = self.stored_direction(&label, now_ms) else {
+            return Vec::new();
+        };
+        let live = self.correspondences[index].live().is_some();
+        let emitted = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                let mut out: Vec<(u64, OutboxTarget, Vec<u8>)> = Vec::new();
+                for seq in outbox.due(now_ms) {
+                    let Some(entry) = outbox.entry_mut(seq) else {
+                        continue;
+                    };
+                    let target = entry.target();
+                    if matches!(target, OutboxTarget::ChannelPage) && !live {
+                        continue;
+                    }
+                    // A refusal here is `NothingToEmit` or `GaveUp`; the first
+                    // is not this call's business and the second is the sweep's,
+                    // which ran before it.
+                    match entry.emit(now_ms) {
+                        Ok(bytes) => out.push((seq, target, bytes.to_vec())),
+                        Err(e) => {
+                            crate::vtrace!("dm driver: sequence {seq} was due and refused: {e}");
+                        }
+                    }
+                }
+                Ok(if out.is_empty() {
+                    Mutation::Unchanged(out)
+                } else {
+                    Mutation::Changed(out)
+                })
+            });
+        let emitted = match emitted {
+            Ok(emitted) => emitted,
+            Err(e) => {
+                crate::vtrace!("dm driver: the due-entry scan failed: {e}");
+                return Vec::new();
+            }
+        };
+        let correspondence = &self.correspondences[index];
+        // A conversation tag only exists where a ratchet does; a doorbell
+        // re-seed on a restored correspondence is attributed by its recipient
+        // instead, which is what the write's own outcome carries back.
+        let conversation = correspondence.live().map(|(r, _, _)| *r.ar_fingerprint());
+        let mut out = Vec::new();
+        for (seq, target, frame) in emitted {
+            match target {
+                OutboxTarget::ChannelPage => {
+                    let Some((ratchet, _, channel)) = correspondence.live() else {
+                        continue;
+                    };
+                    let address = match DmPageAddress::sending(
+                        &channel.address_root,
+                        ratchet,
+                        position_of(seq),
+                    ) {
+                        Ok(address) => address,
+                        Err(e) => {
+                            crate::vtrace!("dm driver: page address derivation failed: {e}");
+                            continue;
+                        }
+                    };
+                    out.push(DmEffect::Dht(DhtOp::PublishPage {
+                        tag: OpTag {
+                            conversation,
+                            seq: Some(seq),
+                            page: None,
+                            correspondent: Some(Box::new(*correspondence.pk_lt)),
+                            introduction: None,
+                        },
+                        address,
+                        frame,
+                    }));
+                }
+                // The knock, re-seeded. Its bytes come back from the outbox
+                // unchanged, which is the whole reason it is queued there: a
+                // second `firstcontact::build` would encapsulate a fresh `ss0`
+                // and read at the far end as this side having lost its state.
+                OutboxTarget::Doorbell { slot } => {
+                    let owner_seed = match doorbell::derive_owner_seed(&correspondence.pk_lt) {
+                        Ok(seed) => *seed.as_bytes(),
+                        Err(e) => {
+                            crate::vtrace!("dm driver: doorbell derivation failed: {e}");
+                            continue;
+                        }
+                    };
+                    out.push(DmEffect::Dht(DhtOp::PublishDoorbell {
+                        tag: OpTag {
+                            conversation,
+                            seq: Some(seq),
+                            page: None,
+                            correspondent: Some(Box::new(*correspondence.pk_lt)),
+                            introduction: None,
+                        },
+                        owner_seed,
+                        slot,
+                        entry: frame,
+                        dispatch: DoorbellDispatch::Reseed,
+                    }));
+                }
+            }
+        }
+        out
+    }
+
+    /// Ask the collection which receiving pages to sweep now.
+    fn probe(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        let correspondence = &mut self.correspondences[index];
+        if correspondence.live().is_none() {
+            return Vec::new();
+        }
+        // The cadence is consumed whether or not the sweep can proceed, so a
+        // correspondence that cannot verify anything reports once per cadence
+        // rather than once per tick.
+        let Some(plan) = correspondence.collection.probe_plan(probe_ms(now_ms)) else {
+            return Vec::new();
+        };
+        let before = correspondence.health;
+        if correspondence.peer_pk_pc.is_none() {
+            correspondence.health.peer_pseudonym_unknown += 1;
+            return correspondence.health_event(before).into_iter().collect();
+        }
+        let Some((ratchet, _, channel)) = correspondence.live() else {
+            return Vec::new();
+        };
+        let conversation = *ratchet.ar_fingerprint();
+        let mut out = Vec::new();
+        for page in plan {
+            match DmPageAddress::receiving(&channel.address_root, ratchet, page) {
+                Ok(address) => out.push(DmEffect::Dht(DhtOp::SweepPage {
+                    tag: OpTag::channel(conversation, None, Some(page)),
+                    address,
+                })),
+                Err(e) => crate::vtrace!("dm driver: receiving address derivation failed: {e}"),
+            }
+        }
+        out
+    }
+
+    /// One write landed: record it against the entry that produced it.
+    ///
+    /// **Attributed by the correspondent, not by the conversation.** A queued
+    /// doorbell entry outlives the key schedule that names a conversation, and
+    /// its write still has to stop being due.
+    fn confirm_written(&mut self, now_ms: i64, tag: &OpTag) -> Vec<DmEffect> {
+        let (Some(correspondent), Some(seq)) = (tag.correspondent.as_ref(), tag.seq) else {
+            return Vec::new();
+        };
+        let Some(index) = self.index_of(correspondent) else {
+            return Vec::new();
+        };
+        let label = self.correspondences[index].label;
+        let Some(direction) = self.stored_direction(&label, now_ms) else {
+            return Vec::new();
+        };
+        let confirmed = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                match outbox.entry_mut(seq).map(|e| e.confirm_written(now_ms)) {
+                    Some(Ok(())) => Ok(Mutation::Changed(true)),
+                    // An ordinary race, both of them: the entry settled or was
+                    // pruned between the write being dispatched and its outcome
+                    // arriving. Neither is a fault and neither is a change.
+                    Some(Err(OutboxError::NothingToConfirm(_))) | None => {
+                        Ok(Mutation::Unchanged(false))
+                    }
+                    Some(Err(e)) => Err(e.into()),
+                }
+            });
+        match confirmed {
+            Ok(true) => vec![DmEffect::Emit(DmEvent::Delivery {
+                to: Box::new(*self.correspondences[index].pk_lt),
+                seq,
+                state: DeliveryState::OnDht,
+            })],
+            Ok(false) => Vec::new(),
+            Err(e) => {
+                crate::vtrace!("dm driver: sequence {seq} could not be confirmed: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    // ---- the channel plane: collecting -------------------------------------
+
+    /// Fold one swept page.
+    ///
+    /// **A partial sweep folds nothing** (policy R4). A page the transport did
+    /// not read every slot of cannot say a position is *absent*, only that it
+    /// was not seen — and the collection's whole job is to distinguish those.
+    /// Advancing the frontier or the cursor on a partial read walks past
+    /// messages that were there, and no later sweep revisits them. So the page
+    /// is left exactly as it was and re-planned on the next cadence.
+    fn on_page(&mut self, _now_ms: i64, tag: &OpTag, sweep: DmPageSweep) -> Vec<DmEffect> {
+        let (Some(conversation), Some(page)) = (tag.conversation, tag.page) else {
+            return Vec::new();
+        };
+        let Some(index) = self.index_of_conversation(&conversation) else {
+            return Vec::new();
+        };
+        let Self {
+            identity,
+            persist,
+            correspondences,
+            ..
+        } = self;
+        let correspondence = &mut correspondences[index];
+        let before = correspondence.health;
+        // **A complete read is not the absence of a failure.** The transport
+        // reports an absent record as `attempted: 0` and a run that stopped part
+        // way as an `attempted` below the record's subkey count with `failed`
+        // still zero — so a rule reading `failed` alone folds a half-read page
+        // as though every empty slot were genuinely empty, which walks past
+        // messages no later sweep revisits.
+        let outcome = sweep.outcome;
+        let complete = outcome.failed == 0
+            && (outcome.attempted == 0 || outcome.attempted == u32::from(PAGE_SLOTS));
+        if !complete {
+            correspondence.health.partial_sweeps += 1;
+            return correspondence.health_event(before).into_iter().collect();
+        }
+        // This session has now genuinely read this page, which is the only thing
+        // that may bound the stored cursor.
+        correspondence.read_through = correspondence.read_through.max(page);
+
+        // The slot indices are what the collection folds; the bytes stay beside
+        // it, keyed by the position they were found at, because a position is
+        // what `open` must be given and a slot index alone has lost the page.
+        let populated: Vec<u16> = sweep.slots.iter().map(|(at, _)| at.slot()).collect();
+        let bytes: std::collections::BTreeMap<PagePosition, Vec<u8>> =
+            sweep.slots.into_iter().collect();
+        let observation = match correspondence.collection.observe_page(page, &populated) {
+            Ok(observation) => observation,
+            Err(e) => {
+                crate::vtrace!("dm driver: page {page} would not fold: {e}");
+                correspondence.health.unopenable += 1;
+                return correspondence.health_event(before).into_iter().collect();
+            }
+        };
+
+        let cursor_before = correspondence.collection.contiguous_through();
+        let mut out = Vec::new();
+
+        // The retry queue first: a position whose acknowledgement the
+        // beyond-prefix set had no room for is already opened and displayed, so
+        // it needs settling and nothing else.
+        let owed = std::mem::take(&mut correspondence.owed_acks);
+        for at in owed {
+            if correspondence.collection.collected(at).is_err() {
+                correspondence.owed_acks.push(at);
+            }
+        }
+
+        let recipient = match recipient_hash(identity.signing.public_key()) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::vtrace!("dm driver: own recipient hash failed: {e}");
+                return Vec::new();
+            }
+        };
+        for at in observation.unsettled {
+            let Some(encoded) = bytes.get(&at) else {
+                continue;
+            };
+            let parsed = match frame::parse(encoded) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    crate::vtrace!("dm driver: a swept slot is not a frame: {e}");
+                    correspondence.health.unopenable += 1;
+                    continue;
+                }
+            };
+            // `break`, never `return`: messages already opened from earlier
+            // slots of this same page are in `out`, and the cursor advance and
+            // the health event below are owed whatever stopped the loop.
+            let (Some(ratchet), Some(peer_pk_pc), Some(channel)) = (
+                correspondence.ratchet.as_mut(),
+                correspondence.peer_pk_pc.as_ref(),
+                correspondence.channel.as_ref(),
+            ) else {
+                break;
+            };
+            let author = AuthorKeys {
+                pc: peer_pk_pc,
+                lt: &correspondence.pk_lt,
+            };
+            let direction = ratchet.recv_direction();
+            // Nested on purpose: the outer result is the ratchet's verdict on
+            // the position and the inner one this frame's own authentication.
+            // The ratchet commits nothing when the inner one fails, so a frame
+            // that does not authenticate has not spent its key.
+            let opened =
+                ratchet.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |key| {
+                    parsed.open(key, &channel.chan_id, direction, at, &recipient, author)
+                });
+            match opened {
+                Ok(Ok(verified)) => {
+                    if correspondence.collection.collected(at).is_err() {
+                        correspondence.owed_acks.push(at);
+                    }
+                    if verified.peer_ack.is_some() {
+                        correspondence.health.peer_acks_deferred += 1;
+                    }
+                    out.push(DmEffect::Emit(DmEvent::Message {
+                        from: Box::new(*correspondence.pk_lt),
+                        seq: verified.seq,
+                        body: verified.body,
+                        sent_unix_ms: verified.sent_unix_ms,
+                    }));
+                }
+                // Ordinary under re-seeds: the sender re-presents a frame this
+                // side has already opened, and will until an acknowledgement
+                // reaches it.
+                Err(RatchetError::AlreadyConsumed { .. }) => {
+                    correspondence.health.already_consumed += 1;
+                }
+                // **The slot is left unsettled, never abandoned.** Abandonment
+                // settles a position permanently and is the sender's give-up
+                // signal, not a reader's verdict on bytes it could not open.
+                // Page owner-write authority is symmetric, so anyone can write
+                // a slot; the authorship signature is what separates the
+                // correspondent's writes from everybody else's, and a frame
+                // that fails it says nothing about the frame that may yet
+                // arrive.
+                Err(e) => {
+                    crate::vtrace!("dm driver: the ratchet refused a swept frame: {e}");
+                    correspondence.health.unopenable += 1;
+                }
+                Ok(Err(e)) => {
+                    crate::vtrace!("dm driver: a swept frame did not authenticate: {e}");
+                    correspondence.health.unopenable += 1;
+                }
+            }
+        }
+
+        // The cursor moves only on the contiguous prefix, and only as far as the
+        // page that prefix now reaches — bounded by what this session has
+        // actually swept.
+        let cursor_now = correspondence.collection.contiguous_through();
+        if let Some(through) = cursor_now.filter(|_| cursor_now != cursor_before) {
+            let reached = position_of(through).page();
+            match persist.advance_cursor(
+                &correspondence.label,
+                reached,
+                correspondence.read_through,
+            ) {
+                Ok(_) => {}
+                Err(e) => crate::vtrace!("dm driver: the receive cursor would not advance: {e}"),
+            }
+        }
+        out.extend(correspondence.health_event(before));
+        out
+    }
+
+    /// The correspondence holding this identity, if this session holds one.
+    fn index_of(&self, pk_lt: &[u8; IDENTITY_PK_LEN]) -> Option<usize> {
+        self.correspondences
+            .iter()
+            .position(|c| c.pk_lt.as_slice() == pk_lt.as_slice())
+    }
+
+    /// The correspondence one channel-plane operation belongs to.
+    fn index_of_conversation(&self, conversation: &[u8; AR_FINGERPRINT_LEN]) -> Option<usize> {
+        self.correspondences.iter().position(|c| {
+            c.ratchet
+                .as_ref()
+                .is_some_and(|r| r.ar_fingerprint() == conversation)
+        })
     }
 
     // ---- the inbound half --------------------------------------------------
@@ -995,6 +1842,14 @@ impl DmMachine {
         let held = self.pending.remove(index);
         let pk_lt: PkLt = Box::new(*held.knock.pk_lt());
         let peer_pk_pc = Box::new(*held.knock.pk_pc());
+        // Copied out before the knock is consumed. Both are derivations of
+        // `ss0`, which `accept_first_contact` moves, so this is the last point
+        // either can be read — and without them the channel has no address and
+        // no seal binding.
+        let channel = ChannelRoots {
+            address_root: held.knock.roots().ar,
+            chan_id: held.knock.roots().chan_id,
+        };
 
         // **The recoverable refusals are taken here, before the knock is
         // consumed.** `accept_first_contact` moves the `VerifiedFirstContact`
@@ -1023,13 +1878,37 @@ impl DmMachine {
         };
 
         match self.persist.accept_first_contact(*held.knock, now_ms) {
-            Ok((_label, ratchet)) => {
-                self.correspondences.push(Correspondence {
-                    pk_lt,
-                    ratchet: Some(ratchet),
-                    signing_pc,
-                    peer_pk_pc: Some(peer_pk_pc),
-                });
+            Ok((label, ratchet)) => {
+                // **Updated in place where an entry already exists**, never
+                // pushed a second time. A mutual knock — each side knocking
+                // before either answered — leaves this side holding a
+                // correspondence it minted as an initiator AND accepting one as
+                // a recipient, and two entries for one `pk_lt` would make
+                // `index_of` answer with whichever came first for ever, so
+                // sends and sweeps would use different halves of the same
+                // conversation.
+                if let Some(index) = self.index_of(&pk_lt) {
+                    let existing = &mut self.correspondences[index];
+                    existing.label = label;
+                    existing.ratchet = Some(ratchet);
+                    existing.signing_pc = Some(signing_pc);
+                    existing.peer_pk_pc = Some(peer_pk_pc);
+                    existing.channel = Some(channel);
+                } else {
+                    self.correspondences.push(Correspondence {
+                        pk_lt,
+                        label,
+                        ratchet: Some(ratchet),
+                        signing_pc: Some(signing_pc),
+                        peer_pk_pc: Some(peer_pk_pc),
+                        channel: Some(channel),
+                        collection: Collection::new(),
+                        read_through: 0,
+                        owed_acks: Vec::new(),
+                        offered_this_session: Vec::new(),
+                        health: ChannelCounters::default(),
+                    });
+                }
                 Vec::new()
             }
             // Past the consuming call. The knock is gone, so the request
@@ -1233,6 +2112,13 @@ impl DmMachine {
                 return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
             }
         };
+        // Read before `into_provisional` moves the state: the record recomputes
+        // both from `ss0` and hands back neither, and `chan_id` is never
+        // serialized at all (§ v4 minor invariant).
+        let channel = ChannelRoots {
+            address_root: state.roots().ar,
+            chan_id: state.roots().chan_id,
+        };
         let record = match state.into_provisional() {
             Ok(r) => r,
             Err(e) => {
@@ -1268,36 +2154,120 @@ impl DmMachine {
                 return self.refuse_introduction(&recipient, RefusalReason::Module);
             }
         };
-        let _ = now_ms;
-        // Our own pseudonym for this conversation is kept from here: it signs
-        // every later frame, and nothing else holds it — see `Correspondence`
-        // for the at-rest gap that leaves.
-        if !self
-            .correspondences
-            .iter()
-            .any(|c| c.pk_lt.as_slice() == recipient.as_slice())
-        {
+        // **The initiator's ratchet opens here, from the record just written, and
+        // the record is erased in the same act.** The initiator's opening burst
+        // hangs from the first-contact secret directly — nothing about it waits
+        // on the correspondent — so a channel send is possible from this moment,
+        // and `PendingHandshake::establish` is the only public road from a stored
+        // record to a key schedule. What it costs is the resumption that record
+        // existed for: after this the handshake cannot be resumed from disk.
+        // That cost is already paid regardless, because the pseudonym below has
+        // nowhere at rest to live either (see `Correspondence`), so a restart
+        // before re-establishment loses this channel either way.
+        let ratchet = match self.persist.restart_channel(
+            &label,
+            &RecordContext {
+                recipient_keyrec_addr: &recipient_keyrec_addr,
+                fc_epoch,
+            },
+        ) {
+            StoredChannelRestart::HandshakeResumes(pending) => match pending.establish() {
+                Ok(ratchet) => ratchet,
+                Err(e) => {
+                    crate::vtrace!("dm driver: the initiator's ratchet would not open: {e}");
+                    return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+                }
+            },
+            StoredChannelRestart::TornDown(teardown) => {
+                crate::vtrace!(
+                    "dm driver: the record just written would not open: {:?}",
+                    teardown.cause()
+                );
+                return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+            }
+        };
+        let conversation = *ratchet.ar_fingerprint();
+        let direction = ratchet.send_direction();
+        self.provisionals
+            .retain(|(pk, _)| pk.as_slice() != recipient.as_slice());
+
+        // **The correspondence is recorded BEFORE the enqueue, and the order is
+        // not cosmetic.** Establishment has already consumed the provisional
+        // record, so the key schedule in hand is the only copy there is: a
+        // fallible step taken before it is stored would, on failure, return with
+        // the record gone and the ratchet dropped — a correspondence that can
+        // never be spoken on and never be resumed.
+        if let Some(index) = self.index_of(&recipient) {
+            let existing = &mut self.correspondences[index];
+            existing.label = label;
+            existing.ratchet = Some(ratchet);
+            existing.signing_pc = Some(signing_pc);
+            existing.channel = Some(channel);
+        } else {
             self.correspondences.push(Correspondence {
                 pk_lt: Box::new(*recipient),
-                // The initiator's ratchet opens from the provisional record
-                // when the correspondent replies, which is item 3.
-                ratchet: None,
-                signing_pc,
-                // Learned from that reply, likewise item 3's.
+                label,
+                ratchet: Some(ratchet),
+                signing_pc: Some(signing_pc),
+                // No frame carries the acceptor's pseudonym and no record homes
+                // it yet, so this side cannot verify a reply. See the field.
                 peer_pk_pc: None,
+                channel: Some(channel),
+                collection: Collection::new(),
+                read_through: 0,
+                owed_acks: Vec::new(),
+                offered_this_session: Vec::new(),
+                health: ChannelCounters::default(),
             });
         }
+
+        // **Sequence zero is queued in the outbox, not merely published.** The
+        // knock shares the channel's sequence space so the contiguous prefix can
+        // confirm the opening message, and queueing it here is what makes a
+        // re-seed re-emit the identical bytes — a second `firstcontact::build`
+        // would encapsulate a fresh `ss0` and read at the far end as this side
+        // having lost its state. It also makes a failed publish an unconfirmed
+        // entry rather than an orphan: nothing else would ever try again.
+        let queued = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                outbox.enqueue_sealed(
+                    0,
+                    OutboxTarget::Doorbell { slot },
+                    now_ms,
+                    SealedFrame::new(entry.clone()),
+                )?;
+                Ok(Mutation::Changed(()))
+            });
+        if let Err(e) = queued {
+            crate::vtrace!("dm driver: the knock could not be queued: {e}");
+            return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+        }
+
         // The recipient stays in `minting` until this write's outcome lands, so
         // a refused write is still attributable to the introduction that asked
-        // for it. The knock's re-seed cadence — the geometric backoff and the
-        // seven-day give-up — is item 4's, driven from the outbox.
-        vec![DmEffect::Dht(DhtOp::PublishDoorbell {
-            tag: OpTag::introduction(recipient),
-            owner_seed,
-            slot,
-            entry,
-            dispatch: DoorbellDispatch::FirstSend,
-        })]
+        // for it. The tag also carries the conversation and sequence zero, so
+        // the same outcome confirms the outbox entry the bytes came from.
+        vec![
+            DmEffect::Emit(DmEvent::Delivery {
+                to: Box::new(*recipient),
+                seq: 0,
+                state: DeliveryState::Composed,
+            }),
+            DmEffect::Dht(DhtOp::PublishDoorbell {
+                tag: OpTag {
+                    conversation: Some(conversation),
+                    seq: Some(0),
+                    page: None,
+                    correspondent: Some(Box::new(*recipient)),
+                    introduction: Some(Box::new(*recipient)),
+                },
+                owner_seed,
+                slot,
+                entry,
+                dispatch: DoorbellDispatch::FirstSend,
+            }),
+        ]
     }
 
     /// The label this recipient's provisional record belongs under.
@@ -1406,6 +2376,91 @@ fn refused(recipient: &[u8; IDENTITY_PK_LEN], reason: RefusalReason) -> DmEvent 
         acceptance: daemonseed_core::dm::outbox::Acceptance::Unconfirmed,
         reason,
     }
+}
+
+/// The correspondences already on disk, as this session can hold them.
+///
+/// **Every one of these is deaf and mute, and that is the honest state rather
+/// than a stub.** A [`Ratchet`] has no at-rest record and the pseudonym pair is
+/// homed in a resume record that cannot be written until the channel has
+/// re-established once (A4.8 / A9.2), so a correspondence established before
+/// this process began has no key schedule here: it cannot open what it sweeps
+/// and cannot sign what it would send. What it does carry is the correspondent's
+/// identity, the store label its records live under, the correspondent's
+/// pseudonym as the contact record recorded it, and a collection seeded from the
+/// persisted cursor — so the correspondence is *listed*, a
+/// [`DmCommand::Send`] to it is refused in as many words rather than silently
+/// dropped, and re-establishment has somewhere to land.
+///
+/// **The persisted cursor is read against a `read_through` of zero, which is
+/// what this session has genuinely swept: nothing.** The cursor record is
+/// unsealed by design, so anything able to write the file chooses that number,
+/// and the bound is the caller's own knowledge or it is not a bound at all. A
+/// stored page above zero is therefore refused rather than believed, and the
+/// collection resumes from the start — a full rescan, which is the failure that
+/// type is allowed to have.
+///
+/// A store that will not enumerate, a contact record that will not decode and a
+/// cursor that will not corroborate are each traced and skipped rather than
+/// fatal: a driver that refused to start over one unreadable correspondence
+/// would take every other correspondence down with it.
+fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
+    let labels = match persist.store().correspondences() {
+        Ok(labels) => labels,
+        Err(e) => {
+            crate::vtrace!("dm driver: the store would not enumerate: {e}");
+            return Vec::new();
+        }
+    };
+    let mut out = Vec::new();
+    for label in labels {
+        let record = match persist.read_contact(&label) {
+            Ok(Some(record)) => record,
+            // A label with no contact record is a correspondence that was never
+            // established — a provisional handshake, or a directory left by a
+            // refused accept.
+            Ok(None) => continue,
+            Err(e) => {
+                crate::vtrace!("dm driver: a contact record would not decode: {e}");
+                continue;
+            }
+        };
+        let page = match persist.read_cursor(&label, 0) {
+            Ok(Some(cursor)) => cursor.page(),
+            Ok(None) => 0,
+            Err(e) => {
+                crate::vtrace!("dm driver: the stored cursor was not corroborated: {e}");
+                0
+            }
+        };
+        out.push(Correspondence {
+            pk_lt: Box::new(*record.pk_lt()),
+            label,
+            ratchet: None,
+            signing_pc: None,
+            peer_pk_pc: Some(Box::new(*record.pk_pc())),
+            channel: None,
+            collection: Collection::resuming_from_page(page),
+            read_through: 0,
+            owed_acks: Vec::new(),
+            offered_this_session: Vec::new(),
+            health: ChannelCounters::default(),
+        });
+    }
+    out
+}
+
+/// Unix milliseconds as the unsigned value the collection's cadence takes.
+///
+/// **The one conversion between the two clock types, and it is here so it is
+/// not spelled `as` at four call sites.** The outbox and the persist layer take
+/// `i64` because their values are wall times that must be comparable to a
+/// seven-day give-up; [`Collection::probe_plan`] takes `u64` because it reads
+/// only differences and any epoch will do. A pre-epoch clock saturates to zero
+/// rather than wrapping to 292 million years hence, which would park the probe
+/// for the size of the step.
+fn probe_ms(now_ms: i64) -> u64 {
+    u64::try_from(now_ms.max(0)).unwrap_or(0)
 }
 
 /// Unix seconds from unix milliseconds, floored at zero.

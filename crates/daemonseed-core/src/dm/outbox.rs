@@ -1441,6 +1441,97 @@ impl Outbox {
         self.insert(seq, target, now_ms, Lifecycle::AwaitingCollection(frame))
     }
 
+    /// Whether this outbox could take a sealed entry of `frame_len` bytes at
+    /// `seq`, **without minting anything to find out**.
+    ///
+    /// The answer is the one [`Self::enqueue_sealed`] would give, priced by the
+    /// same private gate, so the two cannot drift: `Ok(())` here and a refusal
+    /// there would require the record to have changed in between.
+    ///
+    /// **This exists because sealing is not free and is not undoable.** A frame
+    /// is sealed under a message key the ratchet has already stepped to mint, and
+    /// a ratchet has no step backwards — so a sender that seals first and
+    /// discovers [`OutboxError::Full`] second has burnt a sequence number that
+    /// will never be transmitted. The receiver's contiguous prefix stops at that
+    /// gap and every later message is reported beyond it for the seven-day
+    /// give-up. Asking first turns an unrecoverable hole into a refusal the user
+    /// can act on, which is the whole of #339.
+    ///
+    /// **`frame_len` is what the caller is prepared to spend, not a measurement.**
+    /// A caller that cannot know its frame's length until it has sealed — which is
+    /// every caller, since padding is applied inside
+    /// [`crate::dm::frame::seal`] — passes
+    /// [`crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN`] and gets an answer that
+    /// holds for any frame `seal` can produce. That over-refuses by exactly the
+    /// margin between a real frame and the largest possible one, and over-refusing
+    /// is the safe direction: the alternative is the burnt sequence number above.
+    pub fn room_for(
+        &self,
+        seq: u64,
+        target: OutboxTarget,
+        frame_len: usize,
+    ) -> Result<(), OutboxError> {
+        self.admits(seq, target, 8 + frame_len)
+    }
+
+    /// The admission gate every enqueue passes: the target, the sequence space,
+    /// the dedup, and the capacity.
+    ///
+    /// `payload_len` is what the entry's lifecycle costs *beyond* its tag, so a
+    /// caller pricing a sealed entry passes the length prefix plus the frame and
+    /// one pricing an entry that carries no bytes passes zero.
+    ///
+    /// **One body, consulted by both the enqueue and the ask** — see
+    /// [`Self::room_for`]. Nothing mutates here, so a refusal on either road
+    /// leaves the outbox exactly as it found it and there is no partially-applied
+    /// state to unwind.
+    fn admits(
+        &self,
+        seq: u64,
+        target: OutboxTarget,
+        payload_len: usize,
+    ) -> Result<(), OutboxError> {
+        validate_target(target)?;
+        // Below the high-water the entry is GONE rather than absent, so
+        // `contains_key` cannot answer this and would admit a repeat (#323). Both
+        // answers are `DuplicateSequence` because both mean the same thing to a
+        // caller — this sequence has already been used on this correspondence — and
+        // a second variant would invite a caller to treat one as recoverable.
+        // Before the dedup, because the dedup depends on it: see
+        // `OutboxError::SequenceExhausted`.
+        if seq == u64::MAX {
+            return Err(OutboxError::SequenceExhausted);
+        }
+        if seq < self.pruned_high_water || self.entries.contains_key(&seq) {
+            return Err(OutboxError::DuplicateSequence(seq));
+        }
+        // The capacity gate, and it lives here rather than at any public door
+        // deliberately: both `enqueue_awaiting_key` and `enqueue_sealed` funnel
+        // through `insert`, which funnels through here, so one check covers the
+        // whole surface and no future caller can enqueue around it (#291).
+        //
+        // Refusing at ENQUEUE is the point. `Locked::replace` already refuses an
+        // oversized payload at the write, and refusing there is right — a truncated
+        // outbox parses to fewer messages than it had and is wrong in a way nothing
+        // downstream detects. But that fires after this outbox has accepted the
+        // message, i.e. after the sender has been told it is queued, and a crash
+        // before the next successful write then loses it silently. A refusal the
+        // sender can act on has to come first.
+        //
+        // Priced from the candidate's own fields rather than by inserting and
+        // measuring.
+        let needed =
+            self.encoded_len() + ENTRY_FIXED_LEN + target_encoded_len(target) + payload_len;
+        if needed > OUTBOX_CAPACITY {
+            return Err(OutboxError::Full {
+                seq,
+                needed,
+                capacity: OUTBOX_CAPACITY,
+            });
+        }
+        Ok(())
+    }
+
     /// **The compose time is the caller's clock at compose, and there is no way
     /// to say otherwise.**
     ///
@@ -1467,47 +1558,7 @@ impl Outbox {
         now_ms: i64,
         lifecycle: Lifecycle,
     ) -> Result<&mut OutboxEntry, OutboxError> {
-        validate_target(target)?;
-        // Below the high-water the entry is GONE rather than absent, so
-        // `contains_key` cannot answer this and would admit a repeat (#323). Both
-        // answers are `DuplicateSequence` because both mean the same thing to a
-        // caller — this sequence has already been used on this correspondence — and
-        // a second variant would invite a caller to treat one as recoverable.
-        // Before the dedup, because the dedup depends on it: see
-        // `OutboxError::SequenceExhausted`.
-        if seq == u64::MAX {
-            return Err(OutboxError::SequenceExhausted);
-        }
-        if seq < self.pruned_high_water || self.entries.contains_key(&seq) {
-            return Err(OutboxError::DuplicateSequence(seq));
-        }
-        // The capacity gate, and it lives here rather than at either public door
-        // deliberately: `insert` is private and both `enqueue_awaiting_key` and
-        // `enqueue_sealed` funnel through it, so one check covers the whole surface
-        // and no future caller can enqueue around it (#291).
-        //
-        // Refusing at ENQUEUE is the point. `Locked::replace` already refuses an
-        // oversized payload at the write, and refusing there is right — a truncated
-        // outbox parses to fewer messages than it had and is wrong in a way nothing
-        // downstream detects. But that fires after this outbox has accepted the
-        // message, i.e. after the sender has been told it is queued, and a crash
-        // before the next successful write then loses it silently. A refusal the
-        // sender can act on has to come first.
-        //
-        // Priced from the candidate's own fields rather than by inserting and
-        // measuring, so a refusal leaves the outbox exactly as it found it — there is
-        // no partially-applied state to unwind.
-        let needed = self.encoded_len()
-            + ENTRY_FIXED_LEN
-            + target_encoded_len(target)
-            + lifecycle_payload_len(&lifecycle);
-        if needed > OUTBOX_CAPACITY {
-            return Err(OutboxError::Full {
-                seq,
-                needed,
-                capacity: OUTBOX_CAPACITY,
-            });
-        }
+        self.admits(seq, target, lifecycle_payload_len(&lifecycle))?;
         let entry = OutboxEntry {
             seq,
             target,
@@ -2330,6 +2381,89 @@ mod tests {
 
     fn frame(seed: u8) -> SealedFrame {
         SealedFrame::new(frame_bytes(seed))
+    }
+
+    /// The ask and the enqueue agree, at the boundary and on both sides of it.
+    ///
+    /// Both halves are the control for each other. "`room_for` said no" is
+    /// satisfied by a predicate that always says no, and "`enqueue_sealed`
+    /// succeeded" is satisfied by a predicate nobody consulted — so the property
+    /// worth pinning is that the two answers MATCH on a record filled right up to
+    /// the gate, which is the only place they could differ.
+    #[test]
+    fn room_for_answers_exactly_what_the_enqueue_would() {
+        use crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN;
+
+        let worst = || SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]);
+        let mut ob = empty();
+
+        // Fill until the enqueue itself refuses, asking first every time. The
+        // loop bound is the positive control: an outbox that refused immediately
+        // would leave `accepted` at zero and fail the assertion below.
+        let mut accepted = 0u64;
+        for seq in 1..=1_000u64 {
+            let asked = ob.room_for(seq, OutboxTarget::ChannelPage, WORST_CASE_SEALED_FRAME_LEN);
+            match ob.enqueue_sealed(seq, OutboxTarget::ChannelPage, T0, worst()) {
+                Ok(_) => {
+                    assert!(
+                        asked.is_ok(),
+                        "entry {seq} was enqueued after the ask refused it: {asked:?}"
+                    );
+                    accepted += 1;
+                }
+                Err(e) => {
+                    assert_eq!(
+                        asked.unwrap_err(),
+                        e,
+                        "the ask and the enqueue must refuse entry {seq} identically"
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(
+            accepted >= 100,
+            "the record must hold at least a hundred worst-case frames, held {accepted}"
+        );
+        assert!(
+            ob.room_for(
+                accepted + 1,
+                OutboxTarget::ChannelPage,
+                WORST_CASE_SEALED_FRAME_LEN
+            )
+            .is_err(),
+            "a full record must still refuse the ask after the loop broke"
+        );
+
+        // And the gate is a capacity gate rather than a blanket refusal: a small
+        // frame still fits where a worst-case one does not.
+        assert!(
+            ob.room_for(accepted + 1, OutboxTarget::ChannelPage, 0)
+                .is_ok(),
+            "a zero-length frame must still fit in the margin a worst-case one does not"
+        );
+    }
+
+    /// The ask reports the sequence-space refusals too, not only capacity.
+    #[test]
+    fn room_for_refuses_a_sequence_the_enqueue_would_refuse() {
+        let mut ob = empty();
+        ob.enqueue_sealed(7, OutboxTarget::ChannelPage, T0, frame(1))
+            .expect("the first entry fits");
+        assert_eq!(
+            ob.room_for(7, OutboxTarget::ChannelPage, 16),
+            Err(OutboxError::DuplicateSequence(7)),
+            "a sequence already held must be refused by the ask"
+        );
+        assert_eq!(
+            ob.room_for(u64::MAX, OutboxTarget::ChannelPage, 16),
+            Err(OutboxError::SequenceExhausted),
+            "the unusable top of the sequence space must be refused by the ask"
+        );
+        assert!(
+            ob.room_for(8, OutboxTarget::ChannelPage, 16).is_ok(),
+            "an unused sequence must be admitted, or the two refusals above prove nothing"
+        );
     }
 
     /// Turn a freshly-encoded v4 record into the v2 bytes a pre-#278 build wrote.
