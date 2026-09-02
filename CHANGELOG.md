@@ -340,6 +340,13 @@ work lives in the maintainer's own planning notes, not here.
   page will ever hold, so the contiguous prefix starts and the initiator's opening message can be
   confirmed. (#235)
 
+- `crates/daemonseed-veilid-net/tests/two_node_dm_driver.rs` — opt-in `#[ignore]`d live oracle: two
+  nodes, one `DmDriver` each over its own `VeilidNetHandle`, driven through the driver's command and
+  event channels. `FirstContact` → `ContactRequest` at the correspondent → `Accept` → the acceptance
+  collected at sequence zero → one channel message each way, each collected exactly once → both
+  outboxes at `DeliveryState::ConfirmedCollected`. Proof of work minted and verified at
+  `PowDifficulty::PRODUCTION`. (#235, #236)
+
 ### Fixed
 
 - Corrected the direct-message outbox record's growth, which retained every entry ever
