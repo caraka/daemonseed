@@ -447,7 +447,7 @@ types:
       Refused{to,acceptance,reason}, AcceptFailed{request,from,reason},
       ChannelLost{with,cause,event,surfaced}, ChannelDirectionUnknown{with},
       DoorbellHealth{outcome,admission,pending_full},
-      ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified},
+      ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified,cursor_records_repaired},
       ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
       BlockListUnreadable, SpentTokensNotPersisted. BlockListUnreadable says the
       profile's block-list record would not read on an idle tick, so no
@@ -464,7 +464,10 @@ types:
       four sweeps counts four. peer_acks_deferred counts peer acknowledgements that
       would not merge into the retained state, peer_acks_clipped counts claims above
       the highest sequence this side has sent, and peer_acks_unverified counts
-      fetched records that did not decode or did not verify. Refused covers a channel send as well as
+      fetched records that did not decode or did not verify.
+      cursor_records_repaired counts receive-cursor records found unreadable and
+      replaced with this session's own page. Refused covers a channel send as well as
+
       a first contact, and Refused
       carries a RefusalReason and AcceptFailed an AcceptFailure; ChannelLost
       carries the surfaced sequence numbers the user is owed and the

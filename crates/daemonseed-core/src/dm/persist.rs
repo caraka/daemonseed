@@ -29,8 +29,8 @@
 //! *means*: it seals opaque bytes into a fixed bucket, derives the filename, and
 //! holds the lock. Everything this module adds is DM semantics — which context a
 //! provisional record must be opened under, that a record becoming a ratchet is
-//! the moment it must stop existing, that a cursor read from an unsealed file is
-//! a hint needing corroboration. Putting that in `storage` would make a storage
+//! the moment it must stop existing, that a cursor read back from disk is a hint
+//! needing corroboration however it was stored. Putting that in `storage` would make a storage
 //! module import half of `dm` to know when a delete is due; putting it in `dm`
 //! costs one import of the store and leaves each side knowing its own business.
 //!
@@ -168,14 +168,29 @@ pub enum DmPersistError {
     /// The persisted receive cursor names a page the caller's own reading does
     /// not support, or one past the last page that can hold a position.
     ///
-    /// **The stored number is deliberately not carried.** The cursor's file is
-    /// unsealed by design, so anything able to write it chooses that number, and
+    /// **The stored number is deliberately not carried.** The seal says who wrote
+    /// the record, never that its number is right, and
     /// an error that handed it back would be a route by which a caller could
     /// corroborate the value against itself — the one thing
     /// [`ReceiveCursor::from_be_bytes`]'s `read_through` argument exists to
     /// prevent. The remedy needs no number: sweep from
     /// [`ReceiveCursor::START`].
     CursorNotCorroborated { read_through: u64 },
+    /// The receive-cursor record opened and its payload is not
+    /// [`RECEIVE_CURSOR_LEN`] bytes.
+    ///
+    /// **Reachable from a well-formed file, which is why it is its own error.**
+    /// The store's fixed size is a property of the *file*; the payload inside the
+    /// seal carries its own length prefix, so a record written with a shorter
+    /// payload is a full-width, authentic file holding something this module
+    /// cannot read as a page number. Reporting it as the store's
+    /// [`DmStoreError::WrongFileLen`] described a 40-byte file as being however
+    /// many bytes the payload was.
+    ///
+    /// The payload itself is not carried, for
+    /// [`Self::CursorNotCorroborated`]'s reason: the remedy is to sweep from
+    /// [`ReceiveCursor::START`] and needs no number.
+    CursorPayloadWrongLen { expected: usize, actual: usize },
     /// More than one correspondence holds the long-term identity key
     /// [`DmPersist::correspondence_for_pk_lt`] was asked about, so it has no
     /// single answer.
@@ -247,6 +262,11 @@ impl std::fmt::Display for DmPersistError {
                 "the persisted receive cursor is past what has been read \
                  (through page {read_through}), so it cannot be believed"
             ),
+            Self::CursorPayloadWrongLen { expected, actual } => write!(
+                f,
+                "the receive cursor's payload is {expected} bytes, this record \
+                 opened to {actual}"
+            ),
             Self::AmbiguousCorrespondent { matches } => write!(
                 f,
                 "{matches} correspondences hold the same long-term identity key, \
@@ -275,8 +295,44 @@ impl std::error::Error for DmPersistError {
             Self::BlockListMissing
             | Self::OutboxDirectionMismatch { .. }
             | Self::CursorNotCorroborated { .. }
+            | Self::CursorPayloadWrongLen { .. }
             | Self::AmbiguousCorrespondent { .. }
             | Self::AlreadyEstablished => None,
+        }
+    }
+}
+
+impl DmPersistError {
+    /// Whether this says a *record on disk* is unreadable, as opposed to the
+    /// environment being unusable or the record being readable but unbelievable.
+    ///
+    /// **The caller this exists for is a repair.** A record that will not read
+    /// cannot be written past either, so the only way out is to replace it — and
+    /// the decision to overwrite must not be taken on an IO failure, which says
+    /// nothing about the bytes, nor on
+    /// [`Self::CursorNotCorroborated`], which is a record that read perfectly
+    /// well and holds a number this session cannot vouch for. At a cold start
+    /// every stored page above zero is uncorroborated, so treating that as a
+    /// repair would rewrite a healthy cursor on every boot.
+    ///
+    /// Exhaustive, so a new variant has to be classified rather than defaulting
+    /// into the repairing half.
+    pub fn is_unreadable_record(&self) -> bool {
+        match self {
+            Self::Store(e) => is_unreadable_record(e),
+            Self::CursorPayloadWrongLen { .. } => true,
+            Self::Record(_)
+            | Self::Outbox(_)
+            | Self::Resume(_)
+            | Self::Contact(_)
+            | Self::BlockList(_)
+            | Self::BlockListMissing
+            | Self::Ratchet(_)
+            | Self::OutboxDirectionMismatch { .. }
+            | Self::CursorNotCorroborated { .. }
+            | Self::AmbiguousCorrespondent { .. }
+            | Self::AlreadyEstablished
+            | Self::FirstContact(_) => false,
         }
     }
 }
@@ -913,8 +969,9 @@ impl DmPersist {
     ///
     /// **`read_through` is a parameter, not something recovered from the file,
     /// and this call is the only way the file's number is reachable.** The
-    /// cursor is unsealed by design, so anything able to write the file chooses
-    /// that number; a cursor set past what was actually read makes a sweep start
+    /// record is sealed (#389), which says who wrote it and nothing about
+    /// whether the number is right — this profile writing a wrong one seals just
+    /// as well; a cursor set past what was actually read makes a sweep start
     /// beyond unread pages, which are then never revisited — messages that
     /// arrived, silently never delivered. Because the read and the bound happen
     /// inside this one call, the unbounded value never exists as anything a
@@ -938,38 +995,84 @@ impl DmPersist {
         }
     }
 
-    /// Move the persisted cursor to `page`, and say whether it moved.
+    /// Move the persisted cursor to `page`, and say what happened.
     ///
     /// Read-modify-write under one lock, because
     /// [`ReceiveCursor::advance_to`]'s backwards check is against the cursor's
     /// *current* value — done as a separate read and write, a concurrent
     /// advance between the two would be overwritten by the older number.
     ///
-    /// `Ok(false)` is the refusal [`ReceiveCursor::advance_to`] returns:
-    /// backwards, past the last usable page, or past `read_through`. Nothing is
-    /// written in that case, so a refused advance cannot leave a cursor the next
-    /// read would decline to believe.
+    /// [`CursorAdvance::moved`] is `false` for the refusal
+    /// [`ReceiveCursor::advance_to`] returns: backwards, past the last usable
+    /// page, or past `read_through`. Nothing is written in that case, so a
+    /// refused advance cannot leave a cursor the next read would decline to
+    /// believe.
     ///
     /// A correspondence with no cursor yet starts from [`ReceiveCursor::START`],
     /// which is the same thing a receiver with no persisted cursor does.
+    ///
+    /// **A record that will not read is replaced, not reported**
+    /// ([`CursorAdvance::repaired`]). A `cursor.bin` that is the wrong width, does
+    /// not authenticate, or holds an interrupted erase cannot be read *or*
+    /// written past: the read fails inside every critical section, so the record
+    /// stays exactly as it is and **no session ever persists this
+    /// correspondence's progress again** — every advance it would make is
+    /// refused at the read, permanently, with nothing but a trace line saying so.
+    ///
+    /// The from-zero rescan at a cold start is *not* the discriminator, and
+    /// saying it was would be wrong: a cold start reads with `read_through` of
+    /// zero, so a perfectly healthy stored page above zero is uncorroborated
+    /// there too and yields the same rescan. What the wrecked record loses is
+    /// everything after that — the advances the session goes on to make, which a
+    /// healthy record keeps and this one cannot. Nothing is
+    /// adopted by repairing it — the stored number is discarded unread and what
+    /// lands is the caller's own page, already bounded by `read_through` — so the
+    /// repair can only cost a rescan, which is the failure this cursor is allowed
+    /// to have. Where the caller's page does not advance past
+    /// [`ReceiveCursor::START`] the record is still rewritten, because clearing
+    /// the unreadable one is the whole point.
+    ///
+    /// **Only an unreadable record is repaired.** A store error that is about the
+    /// environment rather than the record — IO, a lock, a key — propagates: it
+    /// says nothing about what is on disk, and overwriting a record on the
+    /// strength of it would destroy a good one. A
+    /// [`DmPersistError::CursorNotCorroborated`] propagates too: that record read
+    /// perfectly well, and refusing it while leaving it alone is the documented
+    /// behaviour of a number this session cannot vouch for.
     pub fn advance_cursor(
         &self,
         correspondence: &CorrespondenceLabel,
         page: u64,
         read_through: u64,
-    ) -> Result<bool, DmPersistError> {
-        self.store
-            .critical_section(correspondence, |guard| -> Result<bool, DmPersistError> {
-                let mut cursor = match guard.read(RecordKind::ReceiveCursor)? {
-                    Some(raw) => decode_cursor(&raw, read_through)?,
-                    None => ReceiveCursor::START,
+    ) -> Result<CursorAdvance, DmPersistError> {
+        self.store.critical_section(
+            correspondence,
+            |guard| -> Result<CursorAdvance, DmPersistError> {
+                let (mut cursor, repaired) = match guard.read(RecordKind::ReceiveCursor) {
+                    Ok(Some(raw)) => match decode_cursor(&raw, read_through) {
+                        Ok(cursor) => (cursor, false),
+                        // The record opened and holds something that is not a
+                        // cursor — unreadable in the sense that matters.
+                        Err(DmPersistError::CursorPayloadWrongLen { .. }) => {
+                            (ReceiveCursor::START, true)
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    Ok(None) => (ReceiveCursor::START, false),
+                    Err(e) if is_unreadable_record(&e) => (ReceiveCursor::START, true),
+                    Err(e) => return Err(e.into()),
                 };
-                if !cursor.advance_to(page, read_through) {
-                    return Ok(false);
+                let moved = cursor.advance_to(page, read_through);
+                if !moved && !repaired {
+                    return Ok(CursorAdvance {
+                        moved: false,
+                        repaired: false,
+                    });
                 }
                 guard.replace(RecordKind::ReceiveCursor, &cursor.to_be_bytes())?;
-                Ok(true)
-            })
+                Ok(CursorAdvance { moved, repaired })
+            },
+        )
     }
 
     /// Read what is known about the correspondent, or `Ok(None)` if nothing has
@@ -1514,21 +1617,84 @@ impl DmPersist {
     }
 }
 
+/// What [`DmPersist::advance_cursor`] did.
+///
+/// **Two facts rather than one bool, because the second is a health signal.** A
+/// repair means a `cursor.bin` was found unreadable and replaced; the
+/// correspondence carries on either way, so a caller that only wants to know
+/// whether the number moved reads [`Self::moved`] and is unaffected. What the
+/// repair must not be is silent — an unreadable record is either tampering or
+/// corruption, and a driver that fixes one without saying so reports a healthy
+/// channel while the disk is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use = "an ignored advance is a cursor that may not have moved, or a record that was repaired"]
+pub struct CursorAdvance {
+    moved: bool,
+    repaired: bool,
+}
+
+impl CursorAdvance {
+    /// Whether the stored cursor advanced to the requested page.
+    pub fn moved(self) -> bool {
+        self.moved
+    }
+
+    /// Whether an unreadable record was replaced on the way.
+    ///
+    /// Independent of [`Self::moved`]: a repair whose caller-supplied page does
+    /// not advance past [`ReceiveCursor::START`] still rewrites the record.
+    pub fn repaired(self) -> bool {
+        self.repaired
+    }
+}
+
+/// Whether this store error says the *record* is unreadable, as opposed to the
+/// environment being unusable.
+///
+/// **The split is what makes the repair safe.** The first class is a fact about
+/// bytes on disk that no retry improves, and replacing them loses nothing that
+/// could be recovered. The second says nothing about the record at all — an IO
+/// failure, a lock, a key that will not derive — and a repair on the strength of
+/// one would overwrite a record that may be perfectly good.
+///
+/// Written as an exhaustive match rather than a wildcard so a new variant has to
+/// be classified here instead of defaulting into the repairing half.
+fn is_unreadable_record(e: &DmStoreError) -> bool {
+    match e {
+        DmStoreError::WrongFileLen { .. }
+        | DmStoreError::NotAuthentic { .. }
+        | DmStoreError::ErasureInterrupted { .. }
+        | DmStoreError::CorruptPayloadLen { .. } => true,
+        DmStoreError::Io { .. }
+        | DmStoreError::Write { .. }
+        | DmStoreError::Lock(_)
+        | DmStoreError::Reentrant
+        | DmStoreError::WrongScope { .. }
+        | DmStoreError::Kdf
+        | DmStoreError::Module
+        | DmStoreError::EntropySource(_)
+        | DmStoreError::ErasureBlocked { .. }
+        | DmStoreError::PayloadTooLong { .. } => false,
+    }
+}
+
 /// Read a cursor's at-rest bytes, bounded by `read_through`.
 ///
 /// One body for both the locked and the unlocked path, so the bound cannot be
 /// applied in one and forgotten in the other.
 fn decode_cursor(raw: &[u8], read_through: u64) -> Result<ReceiveCursor, DmPersistError> {
-    // The store checks every file against its kind's fixed size before returning
-    // it, so a slice of another length cannot arrive here. Reported rather than
-    // unwrapped anyway: the alternative is a panic in a public path if that check
-    // ever moves.
+    // The store's fixed size bounds the FILE, not the payload: the seal carries a
+    // length prefix, so a record written with fewer bytes opens and unpads to
+    // fewer bytes from a perfectly well-formed record. That is this module's
+    // shape to check, and reporting it as the store's file-length error described
+    // a full-width file as being the payload's length.
     let bytes: [u8; RECEIVE_CURSOR_LEN] =
-        raw.try_into().map_err(|_| DmStoreError::WrongFileLen {
-            kind: RecordKind::ReceiveCursor,
-            expected: RECEIVE_CURSOR_LEN,
-            actual: raw.len(),
-        })?;
+        raw.try_into()
+            .map_err(|_| DmPersistError::CursorPayloadWrongLen {
+                expected: RECEIVE_CURSOR_LEN,
+                actual: raw.len(),
+            })?;
+
     ReceiveCursor::from_be_bytes(bytes, read_through)
         .ok_or(DmPersistError::CursorNotCorroborated { read_through })
 }
@@ -3311,7 +3477,7 @@ mod tests {
         let l = label(16);
 
         assert!(p.read_cursor(&l, 100).expect("reads").is_none());
-        assert!(p.advance_cursor(&l, 12, 20).expect("advances"));
+        assert!(p.advance_cursor(&l, 12, 20).expect("advances").moved());
         assert_eq!(
             p.read_cursor(&l, 20)
                 .expect("reads")
@@ -3365,7 +3531,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = persist(tmp.path());
         let l = label(19);
-        assert!(p.advance_cursor(&l, 40, 40).expect("advances"));
+        assert!(p.advance_cursor(&l, 40, 40).expect("advances").moved());
 
         assert!(matches!(
             p.read_cursor(&l, 3),
@@ -3389,15 +3555,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = persist(tmp.path());
         let l = label(20);
-        assert!(p.advance_cursor(&l, 9, 9).expect("advances"));
+        assert!(p.advance_cursor(&l, 9, 9).expect("advances").moved());
         let before = std::fs::read(record_path(&p, &l, "cursor.bin")).expect("reads");
 
         // Backwards, and past what was read: both refusals.
-        assert!(!p.advance_cursor(&l, 4, 9).expect("refuses"));
-        assert!(!p.advance_cursor(&l, 50, 20).expect("refuses"));
+        assert!(!p.advance_cursor(&l, 4, 9).expect("refuses").moved());
+        assert!(!p.advance_cursor(&l, 50, 20).expect("refuses").moved());
         assert!(
             !p.advance_cursor(&l, MAX_PAGE + 1, u64::MAX)
                 .expect("refuses")
+                .moved()
         );
 
         assert_eq!(
@@ -3407,22 +3574,355 @@ mod tests {
         );
     }
 
-    /// The cursor file is the one unsealed record, and it is exactly its eight
-    /// bytes — the store's own contract, checked from this side because this is
-    /// the module that supplies the payload.
+    /// This module supplies exactly eight bytes, and the disk holds none of
+    /// them (#389).
+    ///
+    /// The payload width is this module's contract — [`decode_cursor`] refuses
+    /// anything else — and it is checked from this side because this is the
+    /// module that produces it. The store's side is the file: sealed, padded to
+    /// one width, and carrying the page number nowhere a reader without the key
+    /// can find it.
     #[test]
-    fn the_cursor_is_eight_unsealed_bytes() {
+    fn the_cursor_is_eight_sealed_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let p = persist(tmp.path());
         let l = label(21);
-        assert!(p.advance_cursor(&l, 258, 258).expect("advances"));
+        assert!(p.advance_cursor(&l, 258, 258).expect("advances").moved());
 
         let raw = std::fs::read(record_path(&p, &l, "cursor.bin")).expect("reads");
-        assert_eq!(raw.len(), RECEIVE_CURSOR_LEN);
         assert_eq!(
-            raw,
-            258u64.to_be_bytes(),
-            "the page number is not on disk verbatim"
+            raw.len(),
+            RecordKind::ReceiveCursor.on_disk_len(),
+            "the record is not a sealed record's width"
+        );
+
+        let page = 258u64.to_be_bytes();
+        // Positive control: the same search over the same width finds the value
+        // when it is planted, so the absence below is absence.
+        let mut planted = raw.clone();
+        planted[..RECEIVE_CURSOR_LEN].copy_from_slice(&page);
+        assert!(planted.windows(RECEIVE_CURSOR_LEN).any(|w| w == page));
+        assert!(
+            !raw.windows(RECEIVE_CURSOR_LEN).any(|w| w == page),
+            "the page number is on disk verbatim"
+        );
+
+        // And the value is still recoverable through the one call that bounds
+        // it, so the assertion above is not about a write that never happened.
+        assert_eq!(
+            p.read_cursor(&l, 258).expect("reads").map(|c| c.page()),
+            Some(258)
+        );
+    }
+
+    /// A full-width, authentic record whose payload is not eight bytes is
+    /// refused as a payload-shape error, not as a file-length one.
+    ///
+    /// The store's fixed size bounds the file; the seal carries the payload's
+    /// own length prefix, so `replace(ReceiveCursor, &[..3])` writes a valid
+    /// 40-byte record that opens to three bytes. Before this had its own error
+    /// the fallback reported `WrongFileLen { expected: 8, actual: 3 }`, whose
+    /// Display describes a 40-byte file as three bytes long.
+    #[test]
+    fn a_cursor_record_whose_payload_is_not_eight_bytes_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(23);
+
+        for short in [0usize, 3, RECEIVE_CURSOR_LEN - 1] {
+            p.store()
+                .critical_section::<_, DmStoreError>(&l, |g| {
+                    g.replace(RecordKind::ReceiveCursor, &vec![0xABu8; short])
+                })
+                .expect("writes");
+
+            // The file is well-formed: full width, and it opens. Without this the
+            // refusal below could be about a damaged record.
+            let raw = std::fs::read(record_path(&p, &l, "cursor.bin")).expect("reads");
+            assert_eq!(raw.len(), RecordKind::ReceiveCursor.on_disk_len());
+            assert_eq!(
+                p.store()
+                    .read_unlocked(&l, RecordKind::ReceiveCursor)
+                    .expect("opens")
+                    .map(|v| v.len()),
+                Some(short),
+                "the record must open to the short payload"
+            );
+
+            let err = p
+                .read_cursor(&l, u64::MAX)
+                .expect_err("a short cursor payload must not decode");
+            assert!(
+                matches!(
+                    err,
+                    DmPersistError::CursorPayloadWrongLen {
+                        expected: RECEIVE_CURSOR_LEN,
+                        actual,
+                    } if actual == short
+                ),
+                "got {err:?}"
+            );
+        }
+
+        // Positive control: eight bytes in the same slot decode, so the refusals
+        // above are the payload width and not a correspondence that stopped
+        // working. Written through the store rather than `advance_cursor`, which
+        // repairs an unreadable record and would make this pass either way.
+        p.store()
+            .critical_section::<_, DmStoreError>(&l, |g| {
+                g.replace(RecordKind::ReceiveCursor, &11u64.to_be_bytes())
+            })
+            .expect("writes");
+
+        assert_eq!(
+            p.read_cursor(&l, 11).expect("reads").map(|c| c.page()),
+            Some(11)
+        );
+    }
+
+    /// An unreadable `cursor.bin` is replaced by the next advance, and says so.
+    ///
+    /// **The wedge this closes.** The advance's read happens inside its critical
+    /// section, so a record that will not read fails the write too: the bad bytes
+    /// stay, every boot rescans from page zero, every frame comes back
+    /// already-consumed, and the only report is a trace line. Both shapes are
+    /// driven — a tampered full-width record and a clear eight-byte one — because
+    /// they fail at different checks (`NotAuthentic` and `WrongFileLen`) and a
+    /// repair keyed on one would leave the other wedged.
+    ///
+    /// Nothing is adopted: what lands is this caller's own page.
+    #[test]
+    fn an_unreadable_cursor_record_is_repaired_by_the_next_advance() {
+        for (name, wreck) in [
+            (
+                "tampered",
+                Box::new(|raw: Vec<u8>| {
+                    let mut b = raw;
+                    // Flip a ciphertext byte: full width, authentic-looking, and
+                    // it will not open.
+                    let last = b.len() - 1;
+                    b[last] ^= 0xFF;
+                    b
+                }) as Box<dyn Fn(Vec<u8>) -> Vec<u8>>,
+            ),
+            (
+                "clear eight bytes",
+                Box::new(|_: Vec<u8>| 4_096u64.to_be_bytes().to_vec()),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let p = persist(tmp.path());
+            let l = label(24);
+            let path = record_path(&p, &l, "cursor.bin");
+
+            assert!(
+                p.advance_cursor(&l, 3, 3).expect("advances").moved(),
+                "{name}: setup"
+            );
+            let good = std::fs::read(&path).expect("reads");
+            std::fs::write(&path, wreck(good.clone())).expect("wrecks the record");
+
+            // Positive control: the record really is unreadable now, so the
+            // repair below is a repair and not a no-op.
+            assert!(
+                p.read_cursor(&l, u64::MAX).is_err(),
+                "{name}: the wrecked record still reads"
+            );
+
+            let advance = p.advance_cursor(&l, 5, 5).expect("advances over a wreck");
+            assert!(advance.repaired(), "{name}: the repair was not reported");
+            assert!(advance.moved(), "{name}: the caller's page did not land");
+
+            // The record is valid, sealed, and holds the caller's own number —
+            // never the wrecked file's.
+            let raw = std::fs::read(&path).expect("reads");
+            assert_eq!(
+                raw.len(),
+                RecordKind::ReceiveCursor.on_disk_len(),
+                "{name}: the repaired record is not a sealed record's width"
+            );
+            assert_eq!(
+                p.read_cursor(&l, 5).expect("reads").map(|c| c.page()),
+                Some(5),
+                "{name}: the repaired cursor does not read back"
+            );
+
+            // And the repair is reported once: the next advance over a healthy
+            // record is an ordinary one.
+            let next = p.advance_cursor(&l, 6, 6).expect("advances");
+            assert!(next.moved(), "{name}: the next advance did not move");
+            assert!(!next.repaired(), "{name}: the repair was reported twice");
+        }
+    }
+
+    /// An environment failure is not a licence to overwrite the record.
+    ///
+    /// The repair above keys on the record being unreadable. `is_unreadable_record`
+    /// is the split, and it is exhaustive so a new store error has to be
+    /// classified rather than defaulting into the repairing half — this pins both
+    /// sides of it, since a mutation that returned `true` for everything would
+    /// make a failed lock or a failed IO destroy a good cursor.
+    ///
+    /// The public [`DmPersistError::is_unreadable_record`] is driven here too,
+    /// including the arm the `Store` wrapper cannot reach
+    /// ([`DmPersistError::CursorPayloadWrongLen`]) and the one that matters most
+    /// to a cold start ([`DmPersistError::CursorNotCorroborated`], which is a
+    /// record that read perfectly well).
+    #[test]
+    fn only_an_unreadable_record_licenses_a_repair() {
+        for e in [
+            DmStoreError::WrongFileLen {
+                kind: RecordKind::ReceiveCursor,
+                expected: 40,
+                actual: 8,
+            },
+            DmStoreError::NotAuthentic {
+                kind: RecordKind::ReceiveCursor,
+            },
+            DmStoreError::ErasureInterrupted {
+                kind: RecordKind::ReceiveCursor,
+            },
+            DmStoreError::CorruptPayloadLen {
+                kind: RecordKind::ReceiveCursor,
+                declared: 99,
+                capacity: RECEIVE_CURSOR_LEN,
+            },
+        ] {
+            assert!(is_unreadable_record(&e), "{e:?} must license a repair");
+        }
+
+        for e in [
+            DmStoreError::Reentrant,
+            DmStoreError::Kdf,
+            DmStoreError::Module,
+            DmStoreError::Io {
+                path: std::path::PathBuf::from("/nonexistent"),
+                source: std::io::Error::other("disk"),
+            },
+        ] {
+            assert!(!is_unreadable_record(&e), "{e:?} must not license a repair");
+        }
+
+        // The public wrapper, including the two arms that are not a `Store`
+        // error at all and so cannot be reached through the loops above.
+        assert!(
+            DmPersistError::CursorPayloadWrongLen {
+                expected: RECEIVE_CURSOR_LEN,
+                actual: 3,
+            }
+            .is_unreadable_record(),
+            "a record that opens to the wrong payload width must license a repair"
+        );
+        assert!(
+            !DmPersistError::CursorNotCorroborated { read_through: 0 }.is_unreadable_record(),
+            "an uncorroborated cursor read perfectly well — repairing it would \
+             rewrite a healthy record at every cold start"
+        );
+        assert!(
+            DmPersistError::Store(DmStoreError::NotAuthentic {
+                kind: RecordKind::ReceiveCursor,
+            })
+            .is_unreadable_record(),
+            "the wrapper must carry the store's own verdict through"
+        );
+        assert!(
+            !DmPersistError::BlockListMissing.is_unreadable_record(),
+            "an unrelated variant must not license a repair"
+        );
+    }
+
+    /// A cursor file left in the clear is refused, not adopted (#389).
+    ///
+    /// **Nothing migrates, deliberately.** The at-rest format is unreleased, so
+    /// no such file exists in the field; the store's migrations
+    /// (`storage::seeds::touch_reseal`, `storage::recovery_file::open_v1`) exist
+    /// for formats that shipped and are gated on an explicit magic, which
+    /// `cursor.bin` has never had — a legacy file is distinguishable only by its
+    /// width. Accepting one would leave a permanent door that takes an
+    /// unauthenticated page number off the disk, which is the whole of what this
+    /// change closed.
+    ///
+    /// The refusal needs no new code: the file is not the kind's width, so the
+    /// store's own length check names it. What this pins is that it stays a
+    /// refusal — a value planted in the clear is never handed back as a cursor.
+    ///
+    /// **The advance path does not refuse it, it repairs it**
+    /// (`an_unreadable_cursor_record_is_repaired_by_the_next_advance`), because a
+    /// record that will not read cannot be written past either and would wedge
+    /// the correspondence for ever. Repairing adopts nothing, and the assertion
+    /// that the caller's own page — not the clear file's number — is what reads
+    /// back afterwards is what says so.
+    #[test]
+    fn a_clear_cursor_file_is_refused_rather_than_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(22);
+
+        // Establish the correspondence and a real cursor, then overwrite it with
+        // exactly what the pre-#389 store wrote: eight clear bytes.
+        assert!(p.advance_cursor(&l, 3, 3).expect("advances").moved());
+        let path = record_path(&p, &l, "cursor.bin");
+        let decoy = 4_096u64.to_be_bytes();
+        std::fs::write(&path, decoy).expect("plants the decoy");
+
+        let err = p
+            .read_cursor(&l, u64::MAX)
+            .expect_err("a clear cursor must not read as a cursor");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Store(DmStoreError::WrongFileLen {
+                    kind: RecordKind::ReceiveCursor,
+                    ..
+                })
+            ),
+            "got {err:?}"
+        );
+
+        // The advance path does not adopt it either, and does not wedge on it:
+        // it repairs (`an_unreadable_cursor_record_is_repaired_by_the_next_advance`
+        // drives both shapes) and what lands is the caller's own page, never the
+        // decoy's 4096.
+        let advance = p.advance_cursor(&l, 5, 5).expect("repairs and advances");
+        assert!(
+            advance.repaired(),
+            "the clear file was not reported repaired"
+        );
+        assert!(advance.moved(), "the caller's own page did not land");
+        assert_ne!(
+            std::fs::read(&path).expect("reads"),
+            decoy,
+            "the clear bytes are still on disk"
+        );
+        // Nothing from the decoy is adopted: 4096 was the number in the clear
+        // and 5 is what this caller supplied, bounded by its own reading.
+        assert_eq!(
+            p.read_cursor(&l, u64::MAX)
+                .expect("reads")
+                .map(|c| c.page()),
+            Some(5),
+            "the decoy's number survived the repair"
+        );
+
+        // Reported once: a second advance over the now-healthy record is
+        // ordinary.
+        let next = p.advance_cursor(&l, 6, 6).expect("advances");
+        assert!(next.moved() && !next.repaired(), "the repair repeated");
+
+        // Positive control: the repaired record reads back as the caller's page,
+        // so the refusal above is about the clear file and not about a
+        // correspondence that stopped working.
+        p.store()
+            .critical_section::<_, DmStoreError>(&l, |g| {
+                g.replace(RecordKind::ReceiveCursor, &9u64.to_be_bytes())
+            })
+            .expect("writes");
+
+        assert_eq!(
+            p.read_cursor(&l, u64::MAX)
+                .expect("reads")
+                .map(|c| c.page()),
+            Some(9)
         );
     }
     // ------------------------------------------------------------ the resume record (A9.2)

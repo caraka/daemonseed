@@ -332,7 +332,22 @@ pub enum DmEvent {
         /// nothing at all. Counted rather than surfaced: the sender's own re-seed
         /// ladder and give-up already carry the user-visible consequence.
         peer_acks_unverified: u64,
+        /// Receive-cursor records found unreadable and replaced.
+        ///
+        /// A `cursor.bin` that is the wrong width, does not authenticate, or
+        /// holds an interrupted erase cannot be read or written past: the read
+        /// fails inside the advance's own critical section, so without the repair
+        /// the record stays and no session persists that correspondence's
+        /// progress again — every advance is refused at the read, permanently.
+        /// The from-zero rescan at a cold start is not the tell: a healthy stored
+        /// page is uncorroborated at that point too, having nothing this session
+        /// has read to be believed against. The repair adopts nothing — the stored number is
+        /// discarded unread and this session's own page lands instead, so the
+        /// cost is one rescan — but the record was tampered with or corrupted
+        /// either way, which is why it is counted rather than only traced.
+        cursor_records_repaired: u64,
     },
+
     /// A contact lookup failed during a sweep, so knocks were dropped.
     ///
     /// Emitted at most once per sweep. The lookup fails closed — an

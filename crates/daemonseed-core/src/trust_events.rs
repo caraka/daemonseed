@@ -958,9 +958,9 @@ fn decode_log(bytes: &[u8], version: BodyVersion) -> Option<TrustEventLog> {
             // the price of `RecordKind` staying closed, and it is the right
             // side of the trade — an `Unknown(String)` variant would put an
             // unbounded caller-unvalidated string into the one log ISC-A-C1
-            // governs, and would force `file_name`, `capacity`, `bucket_len`,
-            // `on_disk_len` and `is_sealed` to invent an answer for a kind that
-            // has no record on disk.
+            // governs, and would force `file_name`, `capacity`, `bucket_len`
+            // and `on_disk_len` to invent an answer for a kind that has no
+            // record on disk.
             BodyVersion::V2 if c.u8()? == 1 => {
                 let len = c.u16()? as usize;
                 let raw = c.bytes(len)?;
@@ -1295,9 +1295,9 @@ mod tests {
     /// Dismissal is scoped to the kind of record too, so acknowledging a
     /// blocked erasure of one kind leaves the other three standing.
     ///
-    /// **The asymmetry is the reason this exists.** `ReceiveCursor` is the one
-    /// unsealed kind and has nothing secret behind it; `Provisional` failing to
-    /// erase leaves `ss0` readable. Before the scope carried the kind, one
+    /// **The asymmetry is the reason this exists.** `ReceiveCursor` holds one
+    /// page number and no key material; `Provisional` failing to erase leaves
+    /// `ss0` readable. Before the scope carried the kind, one
     /// keystroke on the harmless one silenced the dangerous one.
     #[test]
     fn dismiss_is_scoped_to_the_record_kind() {

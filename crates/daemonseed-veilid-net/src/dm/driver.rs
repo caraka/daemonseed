@@ -3532,7 +3532,8 @@ mod tests {
         assert!(
             store_b
                 .advance_cursor(&label_b, 7, 7)
-                .expect("the cursor writes"),
+                .expect("the cursor writes")
+                .moved(),
             "the fixture cursor did not advance, so the restart below reads nothing"
         );
 

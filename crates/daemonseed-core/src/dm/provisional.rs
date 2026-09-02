@@ -684,7 +684,11 @@ fn boxed_from_slice<const N: usize>(bytes: &[u8]) -> Box<[u8; N]> {
 /// key from it, and a receiver that has lost it reads more than it needed to
 /// rather than reading wrongly.
 ///
-/// **Not secret**, so it is not sealed. It is also not a *message* cursor: the
+/// **Not secret, and sealed at rest anyway** (#389): a plaintext read-through
+/// page number is a per-correspondence message-volume disclosure to anyone
+/// holding the disk, whatever it is worth to the receiver. The seal is not what
+/// makes the number believable — see [`Self::advance_to`]. It is also not a
+/// *message* cursor: the
 /// contiguous cursor over positions is the acknowledgement's
 /// ([`crate::dm::collect`]), and a second copy of that fact here would be free to
 /// disagree with it.
@@ -717,10 +721,11 @@ impl ReceiveCursor {
     /// rescan — the inefficiency this type exists to avoid, and nothing worse.
     /// Forwards past what was actually read makes a sweep start beyond unread
     /// pages, and those pages are never revisited: messages that arrived are
-    /// silently never delivered, with no loss reported anywhere. Since the at-rest
-    /// form is **unsealed** by design, anything able to write the file can choose
-    /// that number, and a cursor set to [`MAX_PAGE`] means the receiver never
-    /// reads again.
+    /// silently never delivered, with no loss reported anywhere. **Sealing the
+    /// at-rest form buys nothing here**: the seal attests to the profile's key
+    /// having written the record, never to the page it names having been read,
+    /// and this profile writing a wrong number seals exactly as well. A cursor
+    /// set to [`MAX_PAGE`] and believed means the receiver never reads again.
     ///
     /// So both directions are refused, against different references: backwards
     /// against the cursor's own value, forwards against what the caller can vouch
@@ -736,7 +741,9 @@ impl ReceiveCursor {
         true
     }
 
-    /// The at-rest form: eight big-endian bytes, unsealed.
+    /// The at-rest form: eight big-endian bytes. What the store then does with
+    /// them — seal, pad to a fixed bucket — is the store's own business
+    /// (`crate::storage::dm_store`).
     pub fn to_be_bytes(self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
@@ -744,8 +751,9 @@ impl ReceiveCursor {
     /// Read the at-rest form back, refusing a page past [`MAX_PAGE`] **or past
     /// `read_through`**.
     ///
-    /// The file is unsealed, so its number is a hint and not a fact; the ceiling
-    /// is what makes it safe to act on. A caller with nothing to corroborate it
+    /// The file's number is a hint and not a fact — the store's seal says who
+    /// wrote it, not that it is right — so the ceiling is what makes it safe to
+    /// act on. A caller with nothing to corroborate it
     /// against passes `0` and gets [`Self::START`] or nothing — a full rescan,
     /// which is the failure this type is allowed to have.
     pub fn from_be_bytes(bytes: [u8; 8], read_through: u64) -> Option<Self> {
@@ -1727,16 +1735,16 @@ mod tests {
         assert_eq!(c.page(), 5);
     }
 
-    /// The at-rest form is **unsealed** by design, so anything able to write the
-    /// file can choose the number. It is believed only up to what the caller can
-    /// corroborate.
+    /// The at-rest form's number is believed only up to what the caller can
+    /// corroborate. Sealing the record (#389) does not change that: it attests
+    /// to the writer, not to the number.
     #[test]
     fn a_persisted_cursor_is_not_believed_past_what_was_read() {
         let tampered = ReceiveCursor::new(MAX_PAGE).unwrap().to_be_bytes();
         assert_eq!(
             ReceiveCursor::from_be_bytes(tampered, 10),
             None,
-            "an unsealed cursor at MAX_PAGE was believed"
+            "a stored cursor at MAX_PAGE was believed"
         );
 
         let c = ReceiveCursor::new(7).unwrap();

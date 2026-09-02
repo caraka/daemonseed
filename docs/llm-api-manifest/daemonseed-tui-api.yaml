@@ -386,7 +386,8 @@ public_types:
     description: "(#339) The last DmEvent::DoorbellHealth, flattened: outcome (SweepOutcome), admission (AdmissionCounters), pending_full (u64 — slots this sweep skipped because the held-request list was full)."
   - name: daemonseed_tui::app::DmChannelHealth
     kind: struct
-    description: "(#339) The last DmEvent::ChannelHealth, flattened: with (PkLt) plus partial_sweeps, already_consumed, unopenable, peer_pseudonym_unknown, peer_acks_deferred, peer_acks_clipped, peer_acks_unverified (all u64)."
+    description: "(#339) The last DmEvent::ChannelHealth, flattened: with (PkLt) plus partial_sweeps, already_consumed, unopenable, peer_pseudonym_unknown, peer_acks_deferred, peer_acks_clipped, peer_acks_unverified, cursor_records_repaired (all u64 — cursor_records_repaired counts receive-cursor records found unreadable and replaced)."
+
   - name: daemonseed_tui::net::DmSessionKeys
     kind: struct
     description: "(#339) The secret DM halves NetCommand::Connect carries to the DM driver, never to the net actor: signing (Arc<SignKeypair>), kem (the full KemKeypair, decapsulation half included), doorbell_slot_secret (DmDoorbellSlotSecret), at_rest_key (Zeroizing<[u8; AEAD_KEY_LEN]> — the profile key DmPersist::open uses). Debug prints no field. Not Clone: KemKeypair is ZeroizeOnDrop with no constructor, and the driver takes it by value — which is why NetCommand is Debug-only."

@@ -69,9 +69,8 @@
 //!
 //! ## What the store does and does not protect
 //!
-//! Every kind except [`RecordKind::ReceiveCursor`] is sealed with
-//! `seal_envelope` before it reaches the disk, so the store holds opaque bytes
-//! (ISC-A-C6). The AAD binds the record kind and the correspondence label, so a
+//! Every kind is sealed with `seal_envelope` before it reaches the disk, so the
+//! store holds opaque bytes and nothing else (ISC-A-C6). The AAD binds the record kind and the correspondence label, so a
 //! blob lifted from one slot cannot be replayed into another — the key is
 //! per-*profile*, exactly as [`crate::dm::provisional::derive_seal_key`]'s is,
 //! and without a per-slot binding every file in a profile would be an
@@ -160,6 +159,17 @@
 //! correspondence has one outbox, so several due entries settle in one seal.
 //! Both are small against the poll term.
 //!
+//! **The cursor became a term in this budget when it was sealed** (#389), and
+//! its size is not yet measured. What bounds it is that
+//! [`crate::dm::persist::DmPersist::advance_cursor`] writes only when the number
+//! genuinely moves — a refused or unchanged advance returns before the replace —
+//! so the draw is one seal per *advance*, not one per receive poll. An advance
+//! is one page of received messages rather than one message, which puts it below
+//! the per-message terms above for any correspondence whose pages fill. The
+//! rate under representative traffic is an open measurement; there is no
+//! transport driver cadence to measure it against yet, which is the same reason
+//! the poll table's cadence is still unset.
+//!
 //! `reseeds_before_give_up_is_the_documented_figure` pins the ladder arithmetic to
 //! the constants it is computed from, so a cadence change fails rather than
 //! silently invalidating this.
@@ -170,12 +180,23 @@
 //! in every record's AAD and a migration for records already on disk, which is a
 //! record-format decision that belongs with the format, not with this module.
 //!
-//! The cursor is **not** sealed, deliberately:
-//! [`crate::dm::provisional::ReceiveCursor`] documents it as not secret, and its
-//! `from_be_bytes` already refuses a value it cannot corroborate against the
-//! caller's own knowledge. Sealing it here would suggest the number can be
-//! trusted because it decrypted, which is the belief that type is built to
-//! deny.
+//! **The cursor is sealed like everything else** (#389). It was the one kind
+//! written in the clear, on the argument that
+//! [`crate::dm::provisional::ReceiveCursor`] is not secret. It is not secret;
+//! it is a *disclosure* — eight plaintext bytes naming how far reading has got
+//! is a monotone proxy for how many messages a correspondence has received,
+//! legible to anyone holding the disk and no key. The directory name discloses
+//! that a correspondence exists; its file contents should not go on to
+//! disclose its volume.
+//!
+//! **The seal does not make the number trustworthy, and nothing here should be
+//! read as saying it does.** A cursor that opens says only that something
+//! holding this profile's key wrote it, which includes this profile writing a
+//! wrong one. [`crate::dm::persist::DmPersist::read_cursor`] still bounds every
+//! value it recovers by what the caller has actually read
+//! ([`crate::dm::provisional::ReceiveCursor::from_be_bytes`]'s `read_through`),
+//! and that check is what the correctness of a resumed sweep rests on — before
+//! this change and after it.
 //!
 //! Two things this store does **not** do, stated so no one reads them into it:
 //!
@@ -228,13 +249,12 @@ use crate::storage::seeds::AEAD_KEY_LEN;
 /// user as a possible attack — the false alarm that teaches people to ignore
 /// real ones.
 ///
-/// It cannot collide with a live record. Every sealed kind begins with a random
-/// nonce, and the one unsealed kind ([`RecordKind::ReceiveCursor`]) begins with
-/// a length prefix whose first byte is bounded by that kind's small payload.
+/// It cannot collide with a live record: every kind begins with a random nonce.
 /// `pub(crate)` so a sibling module's tests can synthesise the exact crash state
 /// — sentinel written, unlink not reached — rather than approximating it. Never
 /// used directly by the write or read paths: both go through
-/// [`erasure_sentinel`], which is the only place the length bound is expressed.
+/// [`erasure_sentinel`], and through [`sentinel_for_width`] beneath it, which is
+/// the only place the length bound is expressed.
 pub(crate) const ERASURE_SENTINEL: &[u8; 32] = b"daemonseed/dm/store/erased/v1\0\0\0";
 
 /// The sentinel prefix for `kind`, bounded by that kind's own record length.
@@ -247,14 +267,18 @@ pub(crate) const ERASURE_SENTINEL: &[u8; 32] = b"daemonseed/dm/store/erased/v1\0
 /// displace. Expressing the bound twice made that agreement a convention held by
 /// nothing; expressing it here makes disagreement unconstructible.
 ///
-/// The bound only ever bites for [`RecordKind::ReceiveCursor`]. Every sealed kind
-/// is `NONCE_LEN + LEN_PREFIX + capacity + TAG_LEN` ≥ 33 bytes, so its prefix is
-/// the whole 32; the unsealed cursor is [`RECEIVE_CURSOR_LEN`] = 8.
+/// **The bound bites for no current kind, and stays anyway.** Every kind is
+/// `NONCE_LEN + LEN_PREFIX + capacity + TAG_LEN` ≥ 33 bytes, so every prefix is
+/// the whole 32 — including the cursor, which is the kind the bound was written
+/// for and was 8 bytes until #389 sealed it. The bound is the guard that makes a
+/// short kind unable to *grow* its own file mid-erase; removing it now would put
+/// that failure one variant away, with nothing between.
 ///
 /// **Two floors this must not cross, and both are load-bearing rather than
-/// tidiness** — `record_kinds_admit_a_usable_sentinel` holds them:
+/// tidiness** — `record_kinds_admit_a_usable_sentinel` holds them over the kinds
+/// that exist:
 ///
-/// 1. **At least [`NONCE_LEN`] for a sealed kind.** Phase 1's durability barrier
+/// 1. **At least [`NONCE_LEN`].** Phase 1's durability barrier
 ///    is what makes the crash window safe, and it is safe *because* those bytes
 ///    overwrite the AEAD nonce. Shortening the prefix below the nonce would leave
 ///    an openable record across the window with nothing failing anywhere.
@@ -262,7 +286,19 @@ pub(crate) const ERASURE_SENTINEL: &[u8; 32] = b"daemonseed/dm/store/erased/v1\0
 ///    with a zero-length record would read every record it has as an interrupted
 ///    erase.
 fn erasure_sentinel(kind: RecordKind) -> &'static [u8] {
-    &ERASURE_SENTINEL[..ERASURE_SENTINEL.len().min(kind.on_disk_len())]
+    sentinel_for_width(kind.on_disk_len())
+}
+
+/// The sentinel truncated to `width`.
+///
+/// **The width is a parameter so the truncation has a seam a fixture can
+/// reach.** No kind is shorter than the sentinel any more, so over
+/// [`RecordKind::ALL`] the `min` is a no-op and deleting it changes nothing any
+/// test could observe — the guard would read as held while being unpinned.
+/// `the_sentinel_never_exceeds_the_record_it_stamps` drives this directly with
+/// widths no kind has, which is the only way the bound is checked at all.
+fn sentinel_for_width(width: usize) -> &'static [u8] {
+    &ERASURE_SENTINEL[..ERASURE_SENTINEL.len().min(width)]
 }
 
 /// Bytes in a [`CorrespondenceLabel`].
@@ -364,7 +400,9 @@ const _: () = assert!(
 pub const OUTBOX_CAPACITY: usize = 2_097_152;
 
 /// Bytes in a persisted [`crate::dm::provisional::ReceiveCursor`] — its
-/// `to_be_bytes` form, verbatim.
+/// `to_be_bytes` form. The record's *payload* length, not its length on disk:
+/// the cursor is sealed and padded like every other kind, so
+/// [`RecordKind::ReceiveCursor`]'s [`RecordKind::on_disk_len`] is larger.
 pub const RECEIVE_CURSOR_LEN: usize = 8;
 
 /// Which record. The other half of a record's identity is the
@@ -383,7 +421,14 @@ pub enum RecordKind {
     /// side still owes the correspondent.
     Outbox,
     /// How far the receiver has read ([`crate::dm::provisional::ReceiveCursor`]).
-    /// The one unsealed kind.
+    ///
+    /// **Sealed like every other kind** (#389). It held the store's one
+    /// plaintext record until then, and eight clear bytes of read-through page
+    /// number is a per-correspondence message-volume disclosure to anyone
+    /// holding the disk. Sealing it does not make the number *trustworthy* —
+    /// [`crate::dm::persist::DmPersist::read_cursor`] bounds every value it
+    /// recovers by what the caller has actually read, and that is still the
+    /// only thing standing behind it.
     ReceiveCursor,
     /// What is known about the correspondent themselves
     /// ([`crate::dm::contact_cache::ContactRecord`]) — their long-term and
@@ -500,9 +545,6 @@ impl RecordKind {
     }
 
     /// The largest payload [`Locked::replace`] accepts for this kind.
-    ///
-    /// For [`RecordKind::ReceiveCursor`] this is also the *smallest*: see
-    /// [`RecordKind::is_sealed`].
     pub const fn capacity(self) -> usize {
         match self {
             RecordKind::Resume => RESUME_CAPACITY,
@@ -521,15 +563,8 @@ impl RecordKind {
     }
 
     /// The padded plaintext length: the length prefix plus [`Self::capacity`].
-    ///
-    /// The unsealed kind carries no prefix — there is nowhere secret to put one,
-    /// and it has no padding to describe.
     pub const fn bucket_len(self) -> usize {
-        if self.is_sealed() {
-            LEN_PREFIX + self.capacity()
-        } else {
-            self.capacity()
-        }
+        LEN_PREFIX + self.capacity()
     }
 
     /// The exact size of this kind's file on disk, for every record of it.
@@ -538,16 +573,7 @@ impl RecordKind {
     /// rests on, and `every_record_file_is_exactly_its_kinds_on_disk_len` is
     /// what holds the code to it.
     pub const fn on_disk_len(self) -> usize {
-        if self.is_sealed() {
-            NONCE_LEN + self.bucket_len() + TAG_LEN
-        } else {
-            self.bucket_len()
-        }
-    }
-
-    /// Whether this kind is sealed at rest. Everything but the cursor is.
-    pub const fn is_sealed(self) -> bool {
-        !matches!(self, RecordKind::ReceiveCursor)
+        NONCE_LEN + self.bucket_len() + TAG_LEN
     }
 
     /// The byte this kind contributes to the seal's AAD.
@@ -561,9 +587,10 @@ impl RecordKind {
             RecordKind::Resume => 1,
             RecordKind::Provisional => 2,
             RecordKind::Outbox => 3,
-            // Assigned but never used: the cursor is not sealed, so it has no
-            // AAD. It is here so the mapping stays total and a later decision to
-            // seal it does not have to invent a value that might collide.
+            // Reserved before it was needed, for exactly this: the cursor was
+            // unsealed and had no AAD, and sealing it (#389) took the value that
+            // was already held for it rather than inventing one that might
+            // collide with a kind already on disk.
             RecordKind::ReceiveCursor => 4,
             RecordKind::ContactCache => 5,
             RecordKind::BlockList => 6,
@@ -810,7 +837,6 @@ fn aad_for(label: Option<&CorrespondenceLabel>, kind: RecordKind) -> Vec<u8> {
 /// core dump or a swapped page after it, and a zero-filled buffer announces the
 /// payload's true length there without needing the key at all.
 fn pad_with_filler(kind: RecordKind, payload: &[u8]) -> Result<Vec<u8>, DmStoreError> {
-    debug_assert!(kind.is_sealed(), "an unsealed kind has no padding");
     let capacity = kind.capacity();
     if payload.len() > capacity {
         return Err(DmStoreError::PayloadTooLong {
@@ -1109,7 +1135,7 @@ impl DmStore {
         kind: RecordKind,
         bytes: &[u8],
     ) -> Result<(), DmStoreError> {
-        let sealed = if kind.is_sealed() {
+        let sealed = {
             let mut plain = pad_with_filler(kind, bytes)?;
             let aad = aad_for(label, kind);
             let outcome = seal_envelope(&self.key, &aad, &plain)
@@ -1122,15 +1148,6 @@ impl DmStore {
             #[cfg(test)]
             self.seals.fetch_add(1, Ordering::Relaxed);
             sealed
-        } else {
-            if bytes.len() != kind.capacity() {
-                return Err(DmStoreError::UnsealedPayloadNotExact {
-                    kind,
-                    expected: kind.capacity(),
-                    actual: bytes.len(),
-                });
-            }
-            bytes.to_vec()
         };
 
         debug_assert_eq!(
@@ -1347,17 +1364,10 @@ impl DmStore {
         // Through `erasure_sentinel`, which is also what the writer uses — the
         // two cannot drift, because there is only one of them.
         //
-        // No legitimate record can match. The sealed kinds open with a random
-        // nonce. The unsealed cursor is a big-endian page number bounded by
-        // `MAX_PAGE` (`u64::MAX / PAGE_SLOTS`), while the sentinel's first eight
-        // bytes decode to 7_233_173_997_229_077_349 — over six times MAX_PAGE,
-        // so `ReceiveCursor::new` cannot construct a colliding value at all.
-        // That is a bound, not an improbability.
+        // No legitimate record can match: every kind opens with a random nonce,
+        // and a 32-byte prefix of a fixed string is not one.
         if raw.starts_with(erasure_sentinel(kind)) {
             return Err(DmStoreError::ErasureInterrupted { kind });
-        }
-        if !kind.is_sealed() {
-            return Ok(Some(raw));
         }
 
         let aad = aad_for(label, kind);
@@ -1698,16 +1708,19 @@ impl Locked<'_> {
     }
 
     /// Replace `kind`'s record with `bytes`, padded to the kind's fixed size and
-    /// (except for the cursor) sealed.
+    /// sealed.
     ///
     /// Refuses a payload larger than [`RecordKind::capacity`] with
     /// [`DmStoreError::PayloadTooLong`] rather than truncating: a truncated
     /// record is a record that opens, parses to something shorter than it was,
     /// and is wrong in a way nothing downstream can detect.
     ///
-    /// [`RecordKind::ReceiveCursor`] is unsealed and therefore carries no length
-    /// prefix, so its payload must be **exactly** [`RECEIVE_CURSOR_LEN`] — there
-    /// is nowhere to record that a shorter one was padded.
+    /// A payload *shorter* than the capacity is padded and recovered exactly,
+    /// [`RecordKind::ReceiveCursor`] included — it was the one kind that had to
+    /// be handed exactly its width, because unsealed it had nowhere to record
+    /// that it had been padded (#389). What still requires the cursor to be
+    /// eight bytes is [`crate::dm::persist`], which is the module that supplies
+    /// the payload and the only one that decodes it.
     ///
     /// On error the destination is in the state
     /// [`DmStoreError::Write`]'s inner [`AtomicReplaceError`] names — untouched,
@@ -2021,14 +2034,15 @@ fn repair_owner_write(_path: &std::path::Path) -> std::io::Result<()> {
 /// pushes bytes to the kernel and stops there, and the unlink that follows would
 /// be free to discard them still-dirty.
 ///
-/// **The sentinel is bounded by the kind's own length, because the shortest kind
-/// is shorter than the sentinel.** [`RecordKind::ReceiveCursor`] is
-/// [`RECEIVE_CURSOR_LEN`] bytes against a 32-byte sentinel, so writing the whole
-/// sentinel would *grow* the file: phase 2's loop would never be entered and a
-/// reader would report [`DmStoreError::WrongFileLen`] — precisely the truncation
-/// shape the sentinel exists to displace. The bound lives in
-/// [`erasure_sentinel`], which [`DmStore::read_record`] also calls, so the writer
-/// and the reader cannot disagree about it.
+/// **The sentinel is bounded by the record's own length**, so a kind shorter than
+/// the 32-byte sentinel cannot be *grown* by its own erase: phase 2's loop would
+/// never be entered and a reader would report [`DmStoreError::WrongFileLen`] —
+/// precisely the truncation shape the sentinel exists to displace. No current
+/// kind is that short ([`RecordKind::ReceiveCursor`] was, until #389 sealed it),
+/// so the bound is unobservable through any kind and is pinned instead at
+/// [`sentinel_for_width`], which takes the width as an argument for that reason.
+/// Both this function and [`DmStore::read_record`] reach it through
+/// [`erasure_sentinel`], so the writer and the reader cannot disagree about it.
 ///
 /// **The overwrite covers the file's real length, never only its declared one.**
 /// A file longer than its kind is refused on read, but it can exist on disk — and
@@ -2205,8 +2219,8 @@ pub enum DmStoreError {
     /// [`DmStore::read_profile_unlocked`] can never see, so a block would appear
     /// to be taken and would suppress nothing. A correspondence kind reached
     /// through [`LockedProfile`] would put that record at the store root under
-    /// the profile AAD, and for the one unsealed kind
-    /// ([`RecordKind::ReceiveCursor`]) it would write **plaintext** there.
+    /// the profile AAD, where nothing that reads a correspondence's records
+    /// looks and where the file name says which kind it is.
     /// Neither is reachable through any in-tree caller; both are reachable
     /// through the public guards, which is exactly when a `debug_assert` is the
     /// wrong instrument — it is compiled out of the build that ships.
@@ -2310,14 +2324,6 @@ pub enum DmStoreError {
     PayloadTooLong {
         kind: RecordKind,
         capacity: usize,
-        actual: usize,
-    },
-
-    /// An unsealed kind was handed a payload that is not exactly its size. It
-    /// carries no length prefix, so a short payload could not be recovered.
-    UnsealedPayloadNotExact {
-        kind: RecordKind,
-        expected: usize,
         actual: usize,
     },
 
@@ -2435,14 +2441,6 @@ impl core::fmt::Display for DmStoreError {
                 f,
                 "a {kind:?} payload holds at most {capacity} bytes, this one is {actual}"
             ),
-            DmStoreError::UnsealedPayloadNotExact {
-                kind,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "an unsealed {kind:?} payload is exactly {expected} bytes, this one is {actual}"
-            ),
             DmStoreError::CorruptPayloadLen {
                 kind,
                 declared,
@@ -2473,8 +2471,8 @@ impl DmStoreError {
     /// for.** One key fires for every kind and they do not cost the same:
     /// a blocked [`RecordKind::Provisional`] erasure leaves `ss0` readable,
     /// which roots `RK0` — the forward-secrecy premise the fail-closed delete
-    /// exists to protect — while [`RecordKind::ReceiveCursor`] is the one
-    /// unsealed kind and has no secret behind it at all. Returning the key
+    /// exists to protect — while [`RecordKind::ReceiveCursor`] holds one page
+    /// number and no key material at all. Returning the key
     /// alone told a user their record would not erase and left them unable to
     /// tell those two apart. The kind is a closed-set discriminant naming a
     /// *type* of record, never an instance, so it says nothing about who the
@@ -2511,7 +2509,6 @@ impl core::error::Error for DmStoreError {
             | DmStoreError::ErasureInterrupted { .. }
             | DmStoreError::WrongFileLen { .. }
             | DmStoreError::PayloadTooLong { .. }
-            | DmStoreError::UnsealedPayloadNotExact { .. }
             | DmStoreError::CorruptPayloadLen { .. } => None,
         }
     }
@@ -2766,13 +2763,24 @@ mod tests {
         assert_eq!(RecordKind::BlockList.capacity(), BLOCK_LIST_CAPACITY);
         assert_eq!(BLOCK_LIST_CAPACITY, 512 * 2592);
 
-        assert_eq!(RecordKind::ReceiveCursor.on_disk_len(), 8, "unsealed");
-        for kind in RecordKind::ALL.iter().filter(|k| k.is_sealed()) {
+        // Every kind, with no exemption: the cursor's exemption is what #389
+        // removed, so a loop that filtered any kind out would be the shape of
+        // the defect rather than a test of the fix.
+        assert_eq!(RecordKind::ALL.len(), 6, "the loop must cover every kind");
+        for kind in RecordKind::ALL {
             assert_eq!(
                 kind.on_disk_len(),
-                NONCE_LEN + LEN_PREFIX + kind.capacity() + TAG_LEN
+                NONCE_LEN + LEN_PREFIX + kind.capacity() + TAG_LEN,
+                "{kind:?} is not a sealed record's width on disk"
             );
         }
+        // The cursor's own width, written out: eight bytes of page number no
+        // longer make an eight-byte file.
+        assert_eq!(
+            RecordKind::ReceiveCursor.on_disk_len(),
+            NONCE_LEN + LEN_PREFIX + RECEIVE_CURSOR_LEN + TAG_LEN
+        );
+        assert_eq!(RecordKind::ReceiveCursor.on_disk_len(), 40);
     }
 
     #[test]
@@ -3099,9 +3107,8 @@ mod tests {
 
     /// A correspondence kind handed to the profile guard is refused.
     ///
-    /// The unsealed kind is the sharp end: [`RecordKind::ReceiveCursor`] takes
-    /// `write_record`'s unsealed branch, so without this it would write
-    /// **plaintext** at the store root.
+    /// A correspondence record written here would land at the store root under
+    /// the profile AAD, where no reader of a correspondence's records looks.
     #[test]
     fn a_correspondence_kind_is_refused_by_the_profile_guard() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3675,8 +3682,8 @@ mod tests {
     ///
     /// **The kinds do not cost the same, which is the whole reason the event
     /// carries one.** A blocked [`RecordKind::Provisional`] erasure leaves
-    /// `ss0` on disk; [`RecordKind::ReceiveCursor`] is unsealed and has no
-    /// secret behind it. `an_unrepairable_erasure_is_a_distinct_error_carrying_its_trust_event`
+    /// `ss0` on disk; [`RecordKind::ReceiveCursor`] holds one page number.
+    /// `an_unrepairable_erasure_is_a_distinct_error_carrying_its_trust_event`
     /// pins one kind, which a hardcoded `RecordKind::Outbox` at the raise site
     /// would satisfy; this pins every kind, so it cannot be.
     #[cfg(unix)]
@@ -3717,13 +3724,9 @@ mod tests {
             let dir = tmp.path().join("dm").join(l.dir_name());
             let path = dir.join(kind.file_name());
 
-            // An unsealed kind is exactly its capacity; a sealed one is padded,
-            // so a short body is legal and keeps the fixture cheap.
-            let body = if kind.is_sealed() {
-                payload(kind.capacity().min(64))
-            } else {
-                payload(kind.capacity())
-            };
+            // Every kind is padded, so a short body is legal for all of them and
+            // keeps the fixture cheap.
+            let body = payload(kind.capacity().min(64));
             s.critical_section::<_, DmStoreError>(&l, |g| g.replace(kind, &body))
                 .unwrap();
 
@@ -3939,32 +3942,56 @@ mod tests {
         }
     }
 
+    /// The cursor takes the ordinary bucket rules, both ends.
+    ///
+    /// Before #389 it took neither: unsealed it carried no length prefix, so the
+    /// store had to demand exactly [`RECEIVE_CURSOR_LEN`] and a shorter payload
+    /// was an error. Sealed, a shorter one is padded and recovered exactly like
+    /// any other kind, and only an over-long one is refused. What still requires
+    /// eight bytes is `crate::dm::persist`, which decodes them —
+    /// `the_cursor_is_eight_sealed_bytes` there is that half.
     #[test]
-    fn the_unsealed_cursor_demands_its_exact_size() {
+    fn a_short_cursor_payload_round_trips_and_an_over_long_one_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path());
         let l = label(5);
 
-        // Positive control: the exact size works.
+        // Positive control: the full width works.
         s.critical_section::<_, DmStoreError>(&l, |g| {
             g.replace(RecordKind::ReceiveCursor, &42u64.to_be_bytes())
         })
         .unwrap();
 
-        for bad in [vec![0u8; 7], vec![0u8; 9]] {
-            let err = s
+        for short in [vec![], vec![0u8; 1], vec![0xEEu8; RECEIVE_CURSOR_LEN - 1]] {
+            let got = s
                 .critical_section::<_, DmStoreError>(&l, |g| {
-                    g.replace(RecordKind::ReceiveCursor, &bad)
+                    g.replace(RecordKind::ReceiveCursor, &short)?;
+                    g.read(RecordKind::ReceiveCursor)
                 })
-                .unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    DmStoreError::UnsealedPayloadNotExact { expected: 8, .. }
-                ),
-                "got {err:?}"
+                .unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(short.as_slice()),
+                "a short cursor payload must come back exactly as it went in"
             );
         }
+
+        let err = s
+            .critical_section::<_, DmStoreError>(&l, |g| {
+                g.replace(RecordKind::ReceiveCursor, &[0u8; RECEIVE_CURSOR_LEN + 1])
+            })
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DmStoreError::PayloadTooLong {
+                    kind: RecordKind::ReceiveCursor,
+                    capacity: RECEIVE_CURSOR_LEN,
+                    actual: 9,
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -4307,9 +4334,10 @@ mod tests {
     /// here can go vacuous.
     ///
     /// The version this replaces asserted `after[ERASURE_SENTINEL.len()..]` was
-    /// all zero. On [`RecordKind::ReceiveCursor`] — 8 bytes against a 32-byte
-    /// sentinel — that is an empty slice and trivially true, so the test passed
-    /// while the cursor was not scrubbed at all. It also never called `delete`,
+    /// all zero. On [`RecordKind::ReceiveCursor`], which was then 8 unsealed
+    /// bytes against a 32-byte sentinel, that is an empty slice and trivially
+    /// true, so the test passed while the cursor was not scrubbed at all. It
+    /// also never called `delete`,
     /// despite its name; that half is now
     /// `delete_reaches_the_scrub_for_every_kind`.
     #[test]
@@ -4321,13 +4349,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let s = store(tmp.path());
             let l = label(63);
-            // `ReceiveCursor` is unsealed and takes an exact-width payload; the
-            // sealed kinds take any length up to their capacity.
-            let body: &[u8] = if kind == RecordKind::ReceiveCursor {
-                &[0xA5; RECEIVE_CURSOR_LEN]
-            } else {
-                b"secret"
-            };
+            let body: &[u8] = b"secret";
             s.critical_section::<_, DmStoreError>(&l, |g| g.replace(kind, body))
                 .unwrap();
 
@@ -4391,11 +4413,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let s = store(tmp.path());
             let l = label(65);
-            let body: &[u8] = if kind == RecordKind::ReceiveCursor {
-                &[0xA5; RECEIVE_CURSOR_LEN]
-            } else {
-                b"secret"
-            };
+            let body: &[u8] = b"secret";
             s.critical_section::<_, DmStoreError>(&l, |g| g.replace(kind, body))
                 .unwrap();
 
@@ -4548,22 +4566,222 @@ mod tests {
         );
     }
 
+    /// The cursor's value is not on the disk, and the value the store hands back
+    /// is not whatever the disk happens to hold (#389).
+    ///
+    /// Two halves, because one alone would pass on a broken store. Absence of
+    /// the plaintext is checked against the *file's whole bytes* rather than a
+    /// prefix, so a cursor written verbatim anywhere in the record fails. And a
+    /// decoy planted in the clear — the exact file the store used to write —
+    /// must not read back as a cursor, which is what shows the value is being
+    /// recovered from the seal and not from the bytes.
     #[test]
-    fn the_cursor_is_stored_unsealed_and_verbatim() {
+    fn the_cursor_is_sealed_at_rest_and_a_clear_one_is_not_read() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path());
         let l = label(15);
-        let bytes = 1234u64.to_be_bytes();
+        let page = 0x0102_0304_0506_0708u64;
+        let bytes = page.to_be_bytes();
+        let path = tmp.path().join("dm").join(l.dir_name()).join("cursor.bin");
 
         s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::ReceiveCursor, &bytes))
             .unwrap();
 
-        let raw =
-            std::fs::read(tmp.path().join("dm").join(l.dir_name()).join("cursor.bin")).unwrap();
+        let raw = std::fs::read(&path).unwrap();
         assert_eq!(
-            raw,
-            bytes.to_vec(),
-            "the cursor is documented as not secret and is stored as it is"
+            raw.len(),
+            RecordKind::ReceiveCursor.on_disk_len(),
+            "the record is not a sealed record's width"
+        );
+        // Positive control on the search itself, run over a buffer of the same
+        // width with the value planted at the worst place to find it — the last
+        // eight bytes. Without this the negative below could be a windowing bug
+        // that can never match anything.
+        let mut planted = raw.clone();
+        let tail = planted.len() - RECEIVE_CURSOR_LEN;
+        planted[tail..].copy_from_slice(&bytes);
+        assert!(
+            planted.windows(RECEIVE_CURSOR_LEN).any(|w| w == bytes),
+            "the search cannot find a needle that is there"
+        );
+
+        assert!(
+            !raw.windows(RECEIVE_CURSOR_LEN).any(|w| w == bytes),
+            "the cursor's value is on disk in the clear"
+        );
+        // The store still returns it, so the assertion above is about the disk
+        // and not about a write that never happened.
+        assert_eq!(
+            s.read_unlocked(&l, RecordKind::ReceiveCursor)
+                .unwrap()
+                .as_deref(),
+            Some(&bytes[..])
+        );
+
+        // A decoy in the clear: exactly the eight bytes the store wrote before
+        // #389, in exactly the place it wrote them.
+        let decoy = 9_999u64.to_be_bytes();
+        std::fs::write(&path, decoy).unwrap();
+        let err = s
+            .read_unlocked(&l, RecordKind::ReceiveCursor)
+            .expect_err("a clear cursor must not read as a cursor");
+        assert!(
+            matches!(
+                err,
+                DmStoreError::WrongFileLen {
+                    kind: RecordKind::ReceiveCursor,
+                    expected,
+                    actual: RECEIVE_CURSOR_LEN,
+                } if expected == RecordKind::ReceiveCursor.on_disk_len()
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// Two writes of the *same* cursor value are two different records.
+    ///
+    /// **The cursor is where a nonce repeat would land first.** It is the
+    /// store's highest-frequency write and its payload is eight bytes with almost
+    /// no entropy, so a fixed nonce under one key leaks the XOR of two page
+    /// numbers directly and, worse, makes the file byte-identical whenever the
+    /// value is — turning "did this correspondence advance?" back into something
+    /// readable without a key, which is the whole disclosure #389 closed.
+    ///
+    /// Stated over the nonce prefix *and* over the whole record: the prefix is
+    /// what a constant-nonce mutation changes, and the whole record is what a
+    /// mutation reusing a *drawn* nonce for a second write would change. Neither
+    /// alone is enough.
+    #[test]
+    fn two_writes_of_one_cursor_value_are_two_different_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(19);
+        let same = 77u64.to_be_bytes();
+        let path = tmp.path().join("dm").join(l.dir_name()).join("cursor.bin");
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..4 {
+            s.critical_section::<_, DmStoreError>(&l, |g| {
+                g.replace(RecordKind::ReceiveCursor, &same)
+            })
+            .unwrap();
+            let raw = std::fs::read(&path).unwrap();
+            assert_eq!(
+                raw.len(),
+                RecordKind::ReceiveCursor.on_disk_len(),
+                "the record is not a sealed record's width"
+            );
+            seen.push(raw);
+        }
+        assert_eq!(seen.len(), 4, "the loop must have written four records");
+
+        for (i, a) in seen.iter().enumerate() {
+            for b in seen.iter().skip(i + 1) {
+                assert_ne!(
+                    a[..NONCE_LEN],
+                    b[..NONCE_LEN],
+                    "two writes of one value drew the same nonce"
+                );
+                assert_ne!(a, b, "two writes of one value are byte-identical on disk");
+            }
+        }
+
+        // Positive control: the value really is the same each time, so the
+        // differences above are the nonce and not a changing payload.
+        assert_eq!(
+            s.read_unlocked(&l, RecordKind::ReceiveCursor)
+                .unwrap()
+                .as_deref(),
+            Some(&same[..])
+        );
+    }
+
+    /// Reopening the store reads the same cursor back.
+    ///
+    /// `round_trip_per_kind` writes and reads through one `DmStore`, which holds
+    /// the derived key in memory for the whole test. This one drops that store
+    /// and derives the key again from the at-rest secret, so what it pins is that
+    /// the key is a pure function of that secret rather than anything a single
+    /// open happened to hold.
+    ///
+    /// **What kills it, and what does not.** Zero-filling the sealed payload kills
+    /// this and twenty other tests, so it evidences nothing about this one. The
+    /// faithful control is an ephemeral per-open key — mixing random bytes into
+    /// `derive_store_key`'s HKDF info — which kills exactly five tests: this one
+    /// and four about profile records and the orphan sweep, none of which touches
+    /// the cursor. That is the class this test is the cursor's member of.
+    #[test]
+    fn a_sealed_cursor_survives_reopening_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = label(16);
+        let bytes = 4_242u64.to_be_bytes();
+
+        {
+            let s = store(tmp.path());
+            s.critical_section::<_, DmStoreError>(&l, |g| {
+                g.replace(RecordKind::ReceiveCursor, &bytes)
+            })
+            .unwrap();
+        }
+
+        let reopened = store(tmp.path());
+        assert_eq!(
+            reopened
+                .read_unlocked(&l, RecordKind::ReceiveCursor)
+                .unwrap()
+                .as_deref(),
+            Some(&bytes[..]),
+            "the cursor did not survive a reopen"
+        );
+    }
+
+    /// A sealed cursor copied into another correspondence's directory does not
+    /// open there.
+    ///
+    /// The AAD binds the correspondence label as well as the kind, so the seal
+    /// is what stops a cursor being moved between correspondences — the same
+    /// property every other kind has had, and the one the plaintext cursor had
+    /// none of: before #389 the same eight bytes were valid in any directory.
+    #[test]
+    fn a_sealed_cursor_does_not_open_in_another_correspondence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let mine = label(17);
+        let theirs = label(18);
+
+        s.critical_section::<_, DmStoreError>(&mine, |g| {
+            g.replace(RecordKind::ReceiveCursor, &7u64.to_be_bytes())
+        })
+        .unwrap();
+        // The other correspondence exists and holds a cursor of its own, so the
+        // copy below overwrites a real record rather than creating a directory.
+        s.critical_section::<_, DmStoreError>(&theirs, |g| {
+            g.replace(RecordKind::ReceiveCursor, &1u64.to_be_bytes())
+        })
+        .unwrap();
+
+        let dir = |l: &CorrespondenceLabel| tmp.path().join("dm").join(l.dir_name());
+        let lifted = std::fs::read(dir(&mine).join("cursor.bin")).unwrap();
+
+        // Positive control: it opens where it was sealed.
+        assert!(
+            s.read_unlocked(&mine, RecordKind::ReceiveCursor)
+                .unwrap()
+                .is_some()
+        );
+
+        std::fs::write(dir(&theirs).join("cursor.bin"), &lifted).unwrap();
+        let err = s
+            .read_unlocked(&theirs, RecordKind::ReceiveCursor)
+            .expect_err("a cursor from another correspondence must not open");
+        assert!(
+            matches!(
+                err,
+                DmStoreError::NotAuthentic {
+                    kind: RecordKind::ReceiveCursor
+                }
+            ),
+            "got {err:?}"
         );
     }
 
@@ -4643,11 +4861,14 @@ mod tests {
     /// A scrubbed **cursor** must read back as an interrupted erase.
     ///
     /// This is the probe the read-side bound had none of, and the gap was not
-    /// cosmetic. `min(32, on_disk_len)` differs from 32 for exactly one kind —
-    /// every sealed kind is `NONCE_LEN + LEN_PREFIX + capacity + TAG_LEN` ≥ 33 —
-    /// so `ReceiveCursor` is the *only* input that can tell a bounded read from
-    /// an unbounded one. Every other `ErasureInterrupted` assertion in the tree
-    /// is on a ≥32-byte kind, which is why reverting `read_record` to
+    /// cosmetic. While the cursor was 8 unsealed bytes it was the *only* input
+    /// that could tell a bounded read from an unbounded one, every other kind
+    /// being `NONCE_LEN + LEN_PREFIX + capacity + TAG_LEN` ≥ 33. Sealing it
+    /// (#389) took that discriminating power away rather than the property, so
+    /// this test now pins the cursor's ordinary behaviour and
+    /// `record_kinds_admit_a_usable_sentinel` is what holds the bound itself.
+    /// Every other `ErasureInterrupted` assertion in the tree
+    /// was on a ≥32-byte kind, which is why reverting `read_record` to
     /// `raw.starts_with(ERASURE_SENTINEL)` left the whole suite green: an 8-byte
     /// file cannot start with 32 bytes, so it fell through to the unsealed arm
     /// and came back as `Ok(Some(..))` — a **valid-looking cursor made of
@@ -4691,13 +4912,62 @@ mod tests {
         );
     }
 
+    /// The truncation itself, driven at widths no [`RecordKind`] has.
+    ///
+    /// Every kind is 40 bytes or more, so `min(32, on_disk_len)` is a no-op over
+    /// the whole enum and deleting it would leave every other test green. This
+    /// drives [`sentinel_for_width`] directly, which is the only fixture that
+    /// reaches the bound at all.
+    #[test]
+    fn the_sentinel_never_exceeds_the_record_it_stamps() {
+        // The bound: widths below the sentinel's own length. A sentinel wider
+        // than the record grows the file, and phase 2's zeroing loop — bounded
+        // by the record's length — never runs.
+        for width in [1usize, 3, RECEIVE_CURSOR_LEN, ERASURE_SENTINEL.len() - 1] {
+            let s = sentinel_for_width(width);
+            assert_eq!(s.len(), width, "a {width}-byte record got a wider stamp");
+            assert_eq!(s, &ERASURE_SENTINEL[..width]);
+        }
+
+        // Positive control: at or above the sentinel's length it is not
+        // truncated, so the assertions above are the bound and not a helper
+        // that returns short for everything.
+        for width in [ERASURE_SENTINEL.len(), 40, 1024] {
+            assert_eq!(
+                sentinel_for_width(width),
+                &ERASURE_SENTINEL[..],
+                "a {width}-byte record must get the whole sentinel"
+            );
+        }
+
+        // And no kind reaches the truncating branch, which is why it needs a
+        // fixture of its own: this is the fact that makes every other assertion
+        // about the bound vacuous.
+        assert_eq!(
+            RecordKind::ALL.len(),
+            6,
+            "the sweep below must not be empty"
+        );
+        assert!(
+            RecordKind::ALL
+                .iter()
+                .all(|k| k.on_disk_len() >= ERASURE_SENTINEL.len()),
+            "a kind is short enough to truncate — fold it back into \
+             record_kinds_admit_a_usable_sentinel"
+        );
+    }
+
     /// The two floors the bounded sentinel must not cross, named in
-    /// [`erasure_sentinel`]'s docs and held here.
+    /// [`erasure_sentinel`]'s docs and held here **over the kinds that exist**.
     ///
     /// The nonce floor is the load-bearing one: phase 1's barrier makes the crash
     /// window safe *because* those bytes land on the AEAD nonce. Shortening the
     /// prefix below `NONCE_LEN` would leave a still-openable record across the
     /// window with nothing anywhere failing.
+    ///
+    /// It does not reach the truncation, which no kind is short enough to
+    /// exercise: `the_sentinel_never_exceeds_the_record_it_stamps` drives that
+    /// against [`sentinel_for_width`] instead.
     #[test]
     fn record_kinds_admit_a_usable_sentinel() {
         for kind in RecordKind::ALL {
@@ -4707,13 +4977,11 @@ mod tests {
                 "{kind:?}: an empty sentinel makes `starts_with` always true, so \
                  every record of this kind would read as an interrupted erase"
             );
-            if kind.is_sealed() {
-                assert!(
-                    sentinel.len() >= NONCE_LEN,
-                    "{kind:?}: the sentinel must cover the AEAD nonce, else a \
-                     crash mid-erase leaves an openable record"
-                );
-            }
+            assert!(
+                sentinel.len() >= NONCE_LEN,
+                "{kind:?}: the sentinel must cover the AEAD nonce, else a \
+                 crash mid-erase leaves an openable record"
+            );
         }
     }
 

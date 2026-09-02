@@ -602,6 +602,8 @@ pub struct DmChannelHealth {
     pub peer_acks_clipped: u64,
     /// Standalone acknowledgement records that did not verify.
     pub peer_acks_unverified: u64,
+    /// Receive-cursor records found unreadable and replaced.
+    pub cursor_records_repaired: u64,
 }
 
 impl std::fmt::Debug for DmChannelHealth {
@@ -613,14 +615,15 @@ impl std::fmt::Debug for DmChannelHealth {
             f,
             ", partial_sweeps: {}, already_consumed: {}, unopenable: {}, \
              peer_pseudonym_unknown: {}, peer_acks_deferred: {}, peer_acks_clipped: {}, \
-             peer_acks_unverified: {} }}",
+             peer_acks_unverified: {}, cursor_records_repaired: {} }}",
             self.partial_sweeps,
             self.already_consumed,
             self.unopenable,
             self.peer_pseudonym_unknown,
             self.peer_acks_deferred,
             self.peer_acks_clipped,
-            self.peer_acks_unverified
+            self.peer_acks_unverified,
+            self.cursor_records_repaired
         )
     }
 }
@@ -705,6 +708,7 @@ impl DmState {
                 peer_acks_deferred,
                 peer_acks_clipped,
                 peer_acks_unverified,
+                cursor_records_repaired,
             } => {
                 self.last_channel_health = Some(DmChannelHealth {
                     with: with.clone(),
@@ -715,6 +719,7 @@ impl DmState {
                     peer_acks_deferred: *peer_acks_deferred,
                     peer_acks_clipped: *peer_acks_clipped,
                     peer_acks_unverified: *peer_acks_unverified,
+                    cursor_records_repaired: *cursor_records_repaired,
                 });
             }
             DmEvent::BlockListUnreadable => {
@@ -3641,6 +3646,7 @@ mod tests {
             peer_acks_deferred: 0,
             peer_acks_clipped: 0,
             peer_acks_unverified: 0,
+            cursor_records_repaired: 0,
         });
         let rendered = format!("{:?}", st.dm_state());
 

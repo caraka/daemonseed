@@ -675,10 +675,27 @@ struct Correspondence {
     /// [`DmPersist::advance_cursor`] refuses to move the stored cursor without.
     ///
     /// **This session's own knowledge, never a number read back from the file.**
-    /// The cursor record is unsealed by design, so a value taken from it and
-    /// handed back as its own bound would be checking an untrusted number
-    /// against itself.
+    /// A value taken from the record and handed back as its own bound would be
+    /// checking a number against itself, and sealing the record (#389) does not
+    /// change that: the seal says the profile's key wrote it, not that the page
+    /// it names was ever read.
     read_through: u64,
+    /// Whether this correspondence's `cursor.bin` was found unreadable at seed
+    /// and has not been repaired yet.
+    ///
+    /// **Set here rather than repaired on the spot because a repair is a write,
+    /// and it should be reported.** `seed_from_store` builds correspondences
+    /// inside `DmMachine::new`, which returns a machine and no effects, so a
+    /// repair taken there could never reach a health event. Carried to the next
+    /// tick instead, where the counter moves and
+    /// [`Correspondence::health_event`] surfaces it.
+    ///
+    /// The tick is the right place and the fold is not: a correspondence whose
+    /// record is wrecked has no live channel until it re-establishes, so it may
+    /// never fold a page at all — and the fold's own repair only runs when the
+    /// contiguous prefix moved, which for a correspondence receiving nothing new
+    /// is never.
+    cursor_unreadable: bool,
     /// Positions opened and displayed whose acknowledgement the beyond-prefix
     /// set had no room for, retried at the head of the next fold.
     ///
@@ -795,6 +812,7 @@ struct ChannelCounters {
     peer_acks_deferred: u64,
     peer_acks_clipped: u64,
     peer_acks_unverified: u64,
+    cursor_records_repaired: u64,
 }
 
 impl core::fmt::Debug for Correspondence {
@@ -882,6 +900,7 @@ impl Correspondence {
             peer_acks_deferred: self.health.peer_acks_deferred,
             peer_acks_clipped: self.health.peer_acks_clipped,
             peer_acks_unverified: self.health.peer_acks_unverified,
+            cursor_records_repaired: self.health.cursor_records_repaired,
         }))
     }
 }
@@ -1138,6 +1157,7 @@ impl DmMachine {
                 }
             };
             for index in 0..self.correspondences.len() {
+                out.extend(self.repair_cursor(index));
                 out.extend(self.give_ups(now_ms, index));
                 out.extend(self.due_emissions(now_ms, index));
                 out.extend(self.probe(now_ms, index, block_list.as_ref()));
@@ -1151,6 +1171,53 @@ impl DmMachine {
         // been waiting longest.
         out.extend(self.standalone_acks(now_ms));
         out
+    }
+
+    /// Replace a `cursor.bin` the seed found unreadable, once.
+    ///
+    /// **A record that will not read cannot be written past either**, so without
+    /// this the correspondence carries a wrecked cursor for the life of the
+    /// profile: every session re-reads it, fails, and starts its sweep from page
+    /// zero. Nothing is adopted by replacing it — the stored bytes were never
+    /// decoded — and what lands is this session's own position, which for a
+    /// correspondence that has swept nothing is [`ReceiveCursor::START`]. The
+    /// cost is one rescan, which is the failure this cursor is allowed to have.
+    ///
+    /// Runs here rather than in the fold for two reasons: the fold's repair only
+    /// fires when the contiguous prefix moved, and a correspondence with no live
+    /// channel folds no pages at all.
+    ///
+    /// The flag is cleared on any successful advance, so this is one write per
+    /// wrecked record rather than one per tick. An advance that fails leaves it
+    /// set: the record is still unreadable and the next tick tries again.
+    fn repair_cursor(&mut self, index: usize) -> Vec<DmEffect> {
+        let correspondence = &mut self.correspondences[index];
+        if !correspondence.cursor_unreadable {
+            return Vec::new();
+        }
+        let before = correspondence.health;
+        let page = correspondence
+            .collection
+            .contiguous_through()
+            .map_or(0, |through| position_of(through).page());
+        match self
+            .persist
+            .advance_cursor(&correspondence.label, page, correspondence.read_through)
+        {
+            Ok(advance) => {
+                correspondence.cursor_unreadable = false;
+                if advance.repaired() {
+                    crate::vtrace!("dm driver: an unreadable receive cursor was repaired");
+                    correspondence.health.cursor_records_repaired += 1;
+                }
+            }
+            Err(e) => {
+                crate::vtrace!(
+                    "dm driver: an unreadable receive cursor would not be repaired: {e}"
+                );
+            }
+        }
+        correspondence.health_event(before).into_iter().collect()
     }
 
     /// Step on a completed off-loop operation.
@@ -2166,7 +2233,18 @@ impl DmMachine {
                 reached,
                 correspondence.read_through,
             ) {
-                Ok(_) => {}
+                // A `cursor.bin` that would not read has been replaced with this
+                // session's own page rather than left to wedge the
+                // correspondence for ever. It is counted because an unreadable
+                // record is tampering or corruption either way, and a driver
+                // that repairs one silently reports a healthy channel over a
+                // disk that is not.
+                Ok(advance) if advance.repaired() => {
+                    crate::vtrace!("dm driver: an unreadable receive cursor was repaired");
+                    correspondence.health.cursor_records_repaired += 1;
+                    correspondence.cursor_unreadable = false;
+                }
+                Ok(_) => correspondence.cursor_unreadable = false,
                 Err(e) => crate::vtrace!("dm driver: the receive cursor would not advance: {e}"),
             }
         }
@@ -2880,6 +2958,7 @@ impl DmMachine {
                         channel: Some(channel),
                         collection: collection_accepting_a_knock(),
                         read_through: 0,
+                        cursor_unreadable: false,
                         owed_acks: Vec::new(),
                         offered_this_session: Vec::new(),
                         health: ChannelCounters::default(),
@@ -3440,6 +3519,7 @@ impl DmMachine {
                 channel: Some(channel),
                 collection: Collection::new(),
                 read_through: 0,
+                cursor_unreadable: false,
                 owed_acks: Vec::new(),
                 offered_this_session: Vec::new(),
                 health: ChannelCounters::default(),
@@ -3915,9 +3995,9 @@ fn refused(recipient: &[u8; IDENTITY_PK_LEN], reason: RefusalReason) -> DmEvent 
 /// dropped, and re-establishment has somewhere to land.
 ///
 /// **The persisted cursor is read against a `read_through` of zero, which is
-/// what this session has genuinely swept: nothing.** The cursor record is
-/// unsealed by design, so anything able to write the file chooses that number,
-/// and the bound is the caller's own knowledge or it is not a bound at all. A
+/// what this session has genuinely swept: nothing.** The bound is the caller's
+/// own knowledge or it is not a bound at all — the record's seal (#389) attests
+/// to who wrote the number, never to the number being right. A
 /// stored page above zero is therefore refused rather than believed, and the
 /// collection resumes from the start — a full rescan, which is the failure that
 /// type is allowed to have.
@@ -3947,9 +4027,22 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
                 continue;
             }
         };
+        // **Unreadable and uncorroborated are different answers here, and only
+        // one of them is a fault.** Every stored page above zero is
+        // uncorroborated at a cold start — `read_through` is zero, because this
+        // session has swept nothing — so that is the ordinary case and the
+        // remedy is the rescan this seed already performs. A record that will
+        // not read at all is a fault, and one that cannot be written past
+        // either: it is flagged here for the next tick to replace.
+        let mut cursor_unreadable = false;
         let page = match persist.read_cursor(&label, 0) {
             Ok(Some(cursor)) => cursor.page(),
             Ok(None) => 0,
+            Err(e) if e.is_unreadable_record() => {
+                crate::vtrace!("dm driver: the stored cursor will not read: {e}");
+                cursor_unreadable = true;
+                0
+            }
             Err(e) => {
                 crate::vtrace!("dm driver: the stored cursor was not corroborated: {e}");
                 0
@@ -3964,6 +4057,7 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             channel: None,
             collection: Collection::resuming_from_page(page),
             read_through: 0,
+            cursor_unreadable,
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
@@ -5052,6 +5146,7 @@ mod tests {
             channel: Some(channel),
             collection: Collection::new(),
             read_through: 0,
+            cursor_unreadable: false,
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
@@ -5163,6 +5258,7 @@ mod tests {
             channel: Some(channel),
             collection: Collection::new(),
             read_through: 0,
+            cursor_unreadable: false,
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
@@ -6042,6 +6138,352 @@ mod tests {
         );
     }
 
+    /// A correspondence receiving nothing new still gets its wrecked cursor
+    /// repaired, on the tick, and counted once.
+    ///
+    /// **The gap this closes.** The fold's repair runs only when the contiguous
+    /// prefix moved, and a correspondence whose channel did not survive the
+    /// restart folds no pages at all — so a wrecked record on a quiet
+    /// correspondence stayed wrecked and uncounted for the life of the profile.
+    /// The fixture is a cold start over an existing store, which is the only way
+    /// the seed path runs.
+    #[test]
+    fn a_quiet_correspondence_has_its_wrecked_cursor_repaired_on_the_tick() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        // A cursor record on disk, then wrecked in place.
+        let label_b = b.correspondences[0].label;
+        b.persist
+            .store()
+            .critical_section::<_, daemonseed_core::storage::dm_store::DmStoreError>(
+                &label_b,
+                |g| {
+                    g.replace(
+                        daemonseed_core::storage::dm_store::RecordKind::ReceiveCursor,
+                        &0u64.to_be_bytes(),
+                    )
+                },
+            )
+            .expect("writes a cursor to wreck");
+        let path = dir_b
+            .path()
+            .join("dm")
+            .join(
+                label_b
+                    .as_bytes()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            )
+            .join("cursor.bin");
+        let mut wrecked = std::fs::read(&path).expect("reads");
+        let last = wrecked.len() - 1;
+        wrecked[last] ^= 0xFF;
+        std::fs::write(&path, &wrecked).expect("tampers with the record");
+        drop(b);
+
+        // Cold start over the same store: the seed reads the wrecked record.
+        let mut restarted = machine_as(peer_identity(), &dir_b);
+        assert_eq!(
+            restarted.correspondences.len(),
+            1,
+            "the seed found no correspondence, so nothing below is about a cursor"
+        );
+        // Positive control: nothing has been repaired before the tick, and the
+        // record really is unreadable.
+        assert_eq!(
+            restarted.correspondences[0].health.cursor_records_repaired, 0,
+            "the seed repaired without a tick"
+        );
+        assert!(
+            restarted.persist.read_cursor(&label_b, u64::MAX).is_err(),
+            "the wrecked record still reads"
+        );
+
+        // No page is folded and no channel is live: the tick is the only path.
+        let effects = restarted.on_tick(BASE_MS);
+        assert_eq!(
+            restarted.correspondences[0].health.cursor_records_repaired, 1,
+            "the quiet correspondence's cursor was not repaired"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::ChannelHealth {
+                    cursor_records_repaired: 1,
+                    ..
+                })
+            )),
+            "the repair never reached a health event: {effects:?}"
+        );
+        assert!(
+            restarted.persist.read_cursor(&label_b, u64::MAX).is_ok(),
+            "the record is still unreadable after the repair"
+        );
+        // The cleared flag is what stops the next tick writing again, and the
+        // "counted once" assertion below cannot see it: leaving the flag set
+        // makes the second tick re-read a record that is healthy by then, take
+        // an ordinary advance, and increment nothing — no repair, and no
+        // evidence that one was not attempted.
+        assert!(
+            !restarted.correspondences[0].cursor_unreadable,
+            "the flag survived the repair, so every tick re-reads the record"
+        );
+
+        // Release the doorbell sweep the first tick planned, so the next tick
+        // has something of its own to emit. Without that, "no health event" is
+        // satisfied by a tick that produced nothing at all — which is a tick
+        // that says nothing about repairs.
+        restarted.on_outcome(
+            BASE_MS + 1,
+            DmOutcome::Dht(DhtOutcome {
+                kind: DhtOpKind::SweepDoorbell,
+                tag: OpTag::none(),
+                result: Ok(DhtResult::Doorbell(DoorbellSweep {
+                    slots: Vec::new(),
+                    outcome: crate::SweepOutcome {
+                        attempted: 0,
+                        failed: 0,
+                        found: 0,
+                    },
+                })),
+            }),
+        );
+        let again = restarted.on_tick(BASE_MS + 2);
+        assert!(
+            !again.is_empty(),
+            "the second tick emitted nothing at all, so its lack of a health \
+             event is not evidence about repairs"
+        );
+        assert_eq!(
+            restarted.correspondences[0].health.cursor_records_repaired, 1,
+            "the repair was counted twice"
+        );
+        assert!(
+            !again
+                .iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::ChannelHealth { .. }))),
+            "a second health event fired for a repair that did not happen: {again:?}"
+        );
+    }
+
+    /// A cold start over a healthy cursor that is *ahead* repairs nothing.
+    ///
+    /// **The mirror of the repair, and the one that stops it over-firing.** The
+    /// seed reads with a `read_through` of zero — this session has swept nothing
+    /// — so every stored page above zero comes back as
+    /// `CursorNotCorroborated`. That is the ordinary case for a healthy profile,
+    /// and treating it as a fault would rewrite a good cursor down to `START` on
+    /// every boot, silently costing a full rescan and reporting a repair that
+    /// repaired nothing. Nothing here is wrecked: the record is authentic, its
+    /// number believable once this session has read that far, and the tick must
+    /// leave it exactly as it is.
+    #[test]
+    fn a_cold_start_over_an_uncorroborated_cursor_repairs_nothing() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        // A healthy cursor, genuinely earned: written with its own page as the
+        // corroboration, exactly as a session that had swept that far would.
+        let label_b = b.correspondences[0].label;
+        assert!(
+            b.persist
+                .advance_cursor(&label_b, 9, 9)
+                .expect("advances")
+                .moved(),
+            "the fixture cursor did not advance, so nothing below is about one"
+        );
+        let on_disk = std::fs::read(
+            dir_b
+                .path()
+                .join("dm")
+                .join(
+                    label_b
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                )
+                .join("cursor.bin"),
+        )
+        .expect("reads");
+        drop(b);
+
+        let mut restarted = machine_as(peer_identity(), &dir_b);
+        assert_eq!(restarted.correspondences.len(), 1, "the seed found nothing");
+        // Positive control on the fixture: at a cold start this healthy record
+        // IS refused, and refused as uncorroborated rather than as unreadable —
+        // which is exactly the confusion this test exists to catch.
+        let err = restarted
+            .persist
+            .read_cursor(&label_b, 0)
+            .expect_err("a page above zero cannot be corroborated by a fresh session");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::CursorNotCorroborated { read_through: 0 }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            !restarted.correspondences[0].cursor_unreadable,
+            "an uncorroborated cursor was flagged as unreadable"
+        );
+
+        let effects = restarted.on_tick(BASE_MS);
+        assert_eq!(
+            restarted.correspondences[0].health.cursor_records_repaired, 0,
+            "a healthy cursor was repaired"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::ChannelHealth { .. }))),
+            "a health event fired for a repair that must not have happened: {effects:?}"
+        );
+        assert_eq!(
+            std::fs::read(
+                dir_b
+                    .path()
+                    .join("dm")
+                    .join(
+                        label_b
+                            .as_bytes()
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                    )
+                    .join("cursor.bin"),
+            )
+            .expect("reads"),
+            on_disk,
+            "the record was rewritten"
+        );
+        // And it is still believed by a session that has read that far.
+        assert_eq!(
+            restarted
+                .persist
+                .read_cursor(&label_b, 9)
+                .expect("reads")
+                .map(|c| c.page()),
+            Some(9),
+            "the healthy cursor did not survive the tick"
+        );
+    }
+
+    /// An unreadable `cursor.bin` is repaired on the fold that would advance it,
+    /// counted, and counted once.
+    ///
+    /// **The wedge without it.** The advance reads inside its own critical
+    /// section, so a record that will not read fails the write too: the bad bytes
+    /// stay, and every later session rescans from page zero and finds every frame
+    /// already consumed. Both wreck shapes are driven — a tampered full-width
+    /// record and a clear eight-byte one — because they fail at different checks.
+    #[test]
+    fn an_unreadable_receive_cursor_is_repaired_and_counted_once() {
+        for (name, clear) in [("tampered", false), ("clear eight bytes", true)] {
+            let dir_a = tempfile::tempdir().expect("temp dir A");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let mut a = machine(&dir_a);
+            let b_keys = peer_identity();
+            let mut b = machine_as(peer_identity(), &dir_b);
+            b.persist.provision_block_list().expect("provision");
+            establish_pair(&mut a, &mut b, &b_keys);
+
+            a.on_command(
+                BASE_MS,
+                DmCommand::Send {
+                    to: Box::new(*b_keys.signing.public_key()),
+                    body: "one".into(),
+                },
+            );
+            let label_a = sole_label(&a);
+            let frame = queued_frame(&a, &label_a, 1);
+            let conversation = conversation_of(&b, 0);
+
+            // A cursor record for B's correspondence, then wrecked in place.
+            let label_b = b.correspondences[0].label;
+            b.persist
+                .store()
+                .critical_section::<_, daemonseed_core::storage::dm_store::DmStoreError>(
+                    &label_b,
+                    |g| {
+                        g.replace(
+                            daemonseed_core::storage::dm_store::RecordKind::ReceiveCursor,
+                            &0u64.to_be_bytes(),
+                        )
+                    },
+                )
+                .expect("writes a cursor to wreck");
+            let path = b
+                .persist
+                .store()
+                .root()
+                .join(
+                    label_b
+                        .as_bytes()
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                )
+                .join("cursor.bin");
+            let good = std::fs::read(&path).expect("reads");
+            if clear {
+                std::fs::write(&path, 4_096u64.to_be_bytes()).expect("plants a clear cursor");
+            } else {
+                let mut wrecked = good.clone();
+                let last = wrecked.len() - 1;
+                wrecked[last] ^= 0xFF;
+                std::fs::write(&path, &wrecked).expect("tampers with the record");
+            }
+            // Positive control: the record really is unreadable, so the repair
+            // below is a repair and not a no-op.
+            assert!(
+                b.persist.read_cursor(&label_b, u64::MAX).is_err(),
+                "{name}: the wrecked record still reads"
+            );
+
+            let effects = fold_page(&mut b, conversation, 0, vec![(position_of(1), frame)]);
+            assert_eq!(
+                b.correspondences[0].health.cursor_records_repaired, 1,
+                "{name}: the repair was not counted"
+            );
+            assert!(
+                effects.iter().any(|e| matches!(
+                    e,
+                    DmEffect::Emit(DmEvent::ChannelHealth {
+                        cursor_records_repaired: 1,
+                        ..
+                    })
+                )),
+                "{name}: the repair never reached a health event: {effects:?}"
+            );
+            assert!(
+                b.persist.read_cursor(&label_b, u64::MAX).is_ok(),
+                "{name}: the record is still unreadable"
+            );
+
+            // Counted once: the next fold over a healthy record adds nothing.
+            let before = b.correspondences[0].health.cursor_records_repaired;
+            let _ = fold_page(&mut b, conversation, 0, Vec::new());
+            assert_eq!(
+                b.correspondences[0].health.cursor_records_repaired, before,
+                "{name}: the repair was counted twice"
+            );
+        }
+    }
+
     /// M29. A page outcome that arrives for a correspondence blocked since its
     /// sweep was asked for surfaces nothing and settles nothing.
     ///
@@ -6803,6 +7245,7 @@ mod tests {
             channel: Some(channel),
             collection: Collection::new(),
             read_through: 0,
+            cursor_unreadable: false,
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),

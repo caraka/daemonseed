@@ -258,11 +258,24 @@ modules:
       rather than an absent file. Both guards refuse a kind of the other scope
       with DmStoreError::WrongScope { kind, guard }.
       replace pads to the kind's bucket with CSPRNG filler behind a
-      length prefix carried inside the seal, and refuses an oversized payload;
-      ReceiveCursor is unsealed and must be exactly 8 bytes. A correspondence
+      length prefix carried inside the seal, and refuses an oversized payload.
+      Every RecordKind is sealed, ReceiveCursor included: its capacity is
+      RECEIVE_CURSOR_LEN = 8 and its on_disk_len is NONCE_LEN + LEN_PREFIX + 8 +
+      TAG_LEN. A correspondence
       record's AAD binds the correspondence label and the record kind under
       DM_STORE_AAD; a profile record has no label and binds the kind alone under
-      DM_STORE_PROFILE_AAD. RecordKind::stable_str /
+      DM_STORE_PROFILE_AAD. DmPersist::advance_cursor returns CursorAdvance
+      (moved() -> bool, repaired() -> bool): a cursor.bin that is the wrong
+      width, does not authenticate, holds an interrupted erase, or opens to a
+      payload that is not RECEIVE_CURSOR_LEN bytes is replaced with the caller's
+      own page and reported as repaired(); an environment error and
+      DmPersistError::CursorNotCorroborated propagate. A payload of another
+      length is DmPersistError::CursorPayloadWrongLen.
+      DmPersistError::is_unreadable_record() -> bool says which errors license
+      that replacement: a store error about the record itself, or
+      CursorPayloadWrongLen; an environment error and CursorNotCorroborated are
+      false, the latter because every stored page above zero is uncorroborated at
+      a cold start. RecordKind::stable_str /
       from_stable_str give the persisted string form (resume, provisional,
       outbox, receive-cursor, contact-cache, block-list), distinct from the
       on-disk file name; a string the
@@ -1058,12 +1071,13 @@ modules:
       teardown and yields the cause by value, which TeardownCause being neither
       Clone nor Copy otherwise makes unreachable. restart, ChannelRestart, Teardown
       and ReceiveCursor::advance_to are #[must_use].
-      ReceiveCursor is the receive high-water page number, not secret and not
-      sealed: START is page zero, new(page) refuses a page above paging::MAX_PAGE,
+      ReceiveCursor is the receive high-water page number: START is page zero,
+      new(page) refuses a page above paging::MAX_PAGE,
       to_be_bytes is the at-rest form, and advance_to(page, read_through) ->
       bool refuses to move backwards AND refuses a page past read_through, the
       caller's own knowledge of what it has read. from_be_bytes(bytes,
-      read_through) applies the same ceiling, because the at-rest form is unsealed:
+      read_through) applies the same ceiling: the store's seal attests to the
+      writer, not to the page number, and
       forwards past the truth skips pages permanently, where backwards only costs a
       rescan. It is a sweep starting point, never a correctness input, and is
       distinct from the acknowledgement's contiguous cursor.
@@ -1496,7 +1510,6 @@ modules:
       and kind and refuses a blob moved between slots, and neither layer can
       check the other's fact. Erasure is unlink, not overwrite (#293).
       CorrespondenceLabel is taken as a parameter, never derived here (#288).
-
       Sub-module dm::outbox is the persisted sender-side outbox for one
       direction of one correspondence. Outbox::new(direction: Direction) keys
       OutboxEntry by sequence number over one monotonic space covering the
