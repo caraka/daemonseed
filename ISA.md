@@ -728,6 +728,50 @@ route taken to reach a decision are not recorded here — the git history and `C
   alternate between them to win every round. Closing that needs admission control (limiting how many
   conversations may compete at all), not a sharper ordering rule, and is not decided by this entry.
 
+- **The set of identities a profile refuses lives in a second addressing scope inside the
+  direct-message store, not in a correspondence.** A block names a long-term identity key — the value
+  that names a correspondent across sessions — and the case it exists for is a stranger whose first
+  contact is refused, so there need never have been a correspondence, the established two-party
+  conversation the store's other records each belong to. Every other record is addressed by a
+  correspondence's 32-byte label plus a record kind, so no correspondence directory can hold this
+  one. Three alternatives were available. Keeping one addressing scheme and reserving a label value
+  for the profile is the cheapest-looking and is not implementable: a label is opaque bytes minted
+  from the system random source, the constructor that admits one is total over every 32-byte value,
+  and the store depends on no property of a label beyond distinctness — so a reserved value is a
+  convention nothing can enforce and any caller can supply. Keeping the list beside the store instead
+  gives up the fixed-size padding, authenticated encryption, atomic replacement and cross-process
+  locking the store already performs, or reimplements all four. Storing nothing and recomputing the
+  set means it does not survive a restart, which is the requirement. The scope taken is one file at
+  the store root, padded to the full 512-identity ceiling so its size reports nothing, bound by
+  authenticated encryption to the profile and the record kind with no label in it, under its own
+  lock, and created by every store open — so its presence reports that a profile has a store, never
+  that anyone has been blocked. Two costs are accepted. Every door of both locks must refuse a kind
+  of the other scope, and a caller holding both takes the profile's first, because the two orders
+  deadlock across processes with nothing able to turn it into an error. And every profile pays the
+  ceiling in full — an entry is an ML-DSA-87 public key, so around 1.33 MB whether or not anyone is
+  blocked — which is what buys the constant size.
+
+- **The correspondence holding a given long-term identity key is derived by reading every contact
+  record, never looked up in a stored index.** Three answers were available: an index on disk from
+  key to label, a map built in memory at open, or a scan. The design contract settles the first —
+  `docs/design/direct-messaging.md` § A3.14 admits "No journal, no index, no count" and states that
+  "there is deliberately no invariant whose truth requires two records to have committed together".
+  An index is exactly that second record: it must commit together with the contact record it
+  describes, while the store commits one record at a time by atomic replacement, so the pair is torn
+  by any crash between them. The contact records are therefore the single authority and the mapping
+  is re-derived from them at each call. An in-memory map is refused on separate grounds: it has to be
+  invalidated by every writer, and the store's lock exists because more than one process may hold one
+  store root, so a cached answer widens the ordinary staleness between two calls to the life of the
+  process. One rebuilt at open stays permitted for whenever a measurement says the scan costs
+  something. The cost is that the lookup reads every correspondence rather than one indexed entry.
+  That is affordable because it fires once per opened first-contact request, at the rate strangers
+  arrive, and each correspondence costs one authenticated decryption — an open, not a write, and the
+  budget this store spends carefully is the one writes draw on. Reading them all rather than stopping
+  at the first match is also what makes two correspondences holding one key visible at all: that is
+  an error carrying the count and no label, because nothing on disk forbids the duplicate, answering
+  with the first match would decide by directory order, and a most-recently-seen tiebreak would
+  invent a routing policy the protocol has not decided.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the
