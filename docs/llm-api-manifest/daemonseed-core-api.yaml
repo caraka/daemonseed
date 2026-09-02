@@ -910,13 +910,24 @@ modules:
       the SeenSet only AFTER its proof passes, so the set's memory is bounded by
       what the attacker paid for. AdmissionPolicy::Open ignores the token field
       entirely — never decoded, never verified, never consumed. AdmissionOutcome is
-      Admitted { verified, token_nonce, idempotent } or Dropped(DropReason);
-      drop_reason() reads the step. AdmissionCounters is unconditional and is what
+      Admitted { verified, token_nonce, idempotent, entry_hash } or
+      Dropped(DropReason); drop_reason() reads the step. entry_hash is the step-2
+      value over the admitted entry, carried out because the ct0/sealed split it is
+      taken over is private to the shape gate. AdmissionCounters is unconditional and is what
       makes "the decapsulation was not reached" checkable. SeenSet is per-epoch,
       bounded at SEEN_SET_CAPACITY (1024), with retire(current_fc_epoch) dropping
-      epochs outside the accept window. NOT YET AVAILABLE: where the SpentTokenSet
-      is persisted — dm_store is correspondence-scoped and has no profile-global
-      record kind. Sub-module dm::ratchet is the conversation key schedule:
+      epochs outside the accept window and forget(hash) un-recording one entry —
+      for a caller that ABANDONED an entry's verification, never one that
+      finished it, since admit records a hash as soon as its proof passes and
+      leaving it in would make the entry a Seen drop for ever. The SpentTokenSet is persisted by
+      dm::spent_store at <profile-root>/dm-spent-tokens.bin, sealed under a key
+      derived from the profile passphrase and profile id. read_from(path,
+      passphrase) answers Ok(None) for an absent file and an error for one that
+      is present and will not open — never an empty set, which would silently
+      un-spend every grant it held; write_to(path, set, passphrase, profile_id,
+      argon2) seals and replaces atomically, because a truncated suppression
+      plane is a set of grants that can be spent twice.
+      Sub-module dm::ratchet is the conversation key schedule:
       derive_root(ss0) expands daemonseed/dm/ratchet/root/v2 from the same
       Extract(daemonseed/dm/root/salt/v1, ss0) that yields AR and chan_id;
       advance_root(previous, encapsulated) is Extract(salt=previous_root,
@@ -1037,8 +1048,10 @@ modules:
       first-contact entry, maps to TrustEventKey::DmCorrespondentStateLost, and
       its Display is the one that does not promise messages keep trying. All four
       keys are PersistentNonBlocking, so each reappears at every start and is
-      written to the trust-event audit log. restart, ChannelRestart, Teardown and
-      ReceiveCursor::advance_to are #[must_use].
+      written to the trust-event audit log. Teardown::into_cause() consumes the
+      teardown and yields the cause by value, which TeardownCause being neither
+      Clone nor Copy otherwise makes unreachable. restart, ChannelRestart, Teardown
+      and ReceiveCursor::advance_to are #[must_use].
       ReceiveCursor is the receive high-water page number, not secret and not
       sealed: START is page zero, new(page) refuses a page above paging::MAX_PAGE,
       to_be_bytes is the at-rest form, and advance_to(page, read_through) ->
@@ -1410,10 +1423,23 @@ modules:
       a stored record whose channel roots would not derive. Only the outbox is
       touched; the entry itself is accepted or declined separately and no pending
       frame is migrated onto the new channel.
+      accept_first_contact(VerifiedFirstContact, now_ms) ->
+      Result<(CorrespondenceLabel, Ratchet), DmPersistError> is the acceptor's
+      establishment, the counterpart of PendingHandshake::establish: it mints a
+      label, opens the recipient ratchet over the knock's ss0, and writes the
+      contact record carrying pk_lt, pk_pc and ss0 with both timestamps at now_ms,
+      in one call. The ratchet is built before the record is written, so a module
+      fault leaves the disk untouched. No provisional record is written and no
+      resume record is written — the acceptor has neither.
       read_block_list() -> Result<BlockList, DmPersistError> reads the profile's
       block list through the store's lock-free profile read. An absent record is
-      DmPersistError::BlockListMissing, never an empty list: DmStore::open
-      creates the record, so absence means it was removed. update_block_list(f)
+      DmPersistError::BlockListMissing, never an empty list: DmStore::open creates
+      the record, so absence means it was removed or that open's best-effort
+      creation was skipped — it takes the profile lock with try_acquire and a
+      second opener that finds it held returns with the record still absent.
+      provision_block_list() -> Result<bool, DmPersistError> closes that window: it
+      writes an empty list when there is none, reports whether it wrote, and leaves
+      an existing list — empty or full — exactly as it is. update_block_list(f)
       is read-modify-write inside one profile_critical_section, where f: impl
       FnOnce(&mut BlockList) -> Result<T, DmPersistError> and the call yields T.
       There is no Mutation: the list is written back on every call and spends one

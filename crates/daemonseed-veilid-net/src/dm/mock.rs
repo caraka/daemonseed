@@ -104,11 +104,31 @@ pub(crate) enum MockCall {
 pub(crate) struct MockDht {
     counts: [AtomicU64; 7],
     log: Mutex<Vec<MockCall>>,
+    /// Doorbell sweeps to hand back, oldest first. An exhausted queue yields the
+    /// empty sweep, which is the ordinary state of a doorbell nobody knocked on
+    /// — so a test that queues one sweep sees exactly one, however many times
+    /// the driver's cadence fires.
+    doorbell: Mutex<std::collections::VecDeque<DoorbellSweep>>,
+    /// What `fetch_dm_key_record` answers. `None` is the awaiting-key state.
+    key_record: Mutex<Option<Vec<u8>>>,
+    /// Every doorbell entry written, in call order.
+    ///
+    /// Kept beside the log rather than in it: [`MockCall`] records a
+    /// non-secret projection so two calls can be compared, and a whole entry is
+    /// neither small nor a projection. A knock's bytes are what a recipient
+    /// would actually read, which is what makes an end-to-end oracle possible
+    /// at all — the entry this driver published, admitted by the identity it
+    /// was addressed to.
+    published: Mutex<Vec<(u16, Vec<u8>)>>,
     latency: Duration,
     /// The method whose returned future panics once its latency has elapsed, so
     /// an oracle can drive the shell's join-error path. The call is still counted
     /// and logged: a panic in the seam happens after the request was made.
     panic_on: Option<Method>,
+    /// The method whose returned future yields an error once its latency has
+    /// elapsed. Distinct from `panic_on`: a transport failure is an ordinary
+    /// outcome the driver must handle, a panic is not.
+    fail_on: Option<Method>,
 }
 
 impl MockDht {
@@ -117,9 +137,47 @@ impl MockDht {
         Self {
             counts: Default::default(),
             log: Mutex::new(Vec::new()),
+            doorbell: Mutex::new(std::collections::VecDeque::new()),
+            key_record: Mutex::new(None),
+            published: Mutex::new(Vec::new()),
             latency,
             panic_on: None,
+            fail_on: None,
         }
+    }
+
+    /// A mock whose `method` returns a transport error.
+    pub(crate) fn failing(latency: Duration, method: Method) -> Self {
+        Self {
+            fail_on: Some(method),
+            ..Self::new(latency)
+        }
+    }
+
+    /// The doorbell entries written so far, in call order.
+    pub(crate) fn published(&self) -> Vec<(u16, Vec<u8>)> {
+        self.published.lock().expect("mock published").clone()
+    }
+
+    /// Queue one doorbell sweep for the driver to find.
+    pub(crate) fn queue_doorbell(&self, slots: Vec<(u16, Vec<u8>)>) {
+        let found = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+        self.doorbell
+            .lock()
+            .expect("mock doorbell")
+            .push_back(DoorbellSweep {
+                slots,
+                outcome: SweepOutcome {
+                    attempted: 32,
+                    failed: 0,
+                    found,
+                },
+            });
+    }
+
+    /// Set what a key-record fetch answers.
+    pub(crate) fn set_key_record(&self, bytes: Option<Vec<u8>>) {
+        *self.key_record.lock().expect("mock key record") = bytes;
     }
 
     /// A mock whose `method` panics inside the spawned operation.
@@ -149,6 +207,11 @@ impl MockDht {
     fn panics(&self, method: Method) -> bool {
         self.panic_on == Some(method)
     }
+
+    /// Whether this call is the one scripted to fail.
+    fn fails(&self, method: Method) -> bool {
+        self.fail_on == Some(method)
+    }
 }
 
 /// An empty sweep outcome — nothing attempted, nothing failed, nothing found.
@@ -164,10 +227,15 @@ impl DmDht for MockDht {
         );
         let latency = self.latency;
         let boom = self.panics(Method::FetchKeyRecord);
+        let dud = self.fails(Method::FetchKeyRecord);
+        let record = self.key_record.lock().expect("mock key record").clone();
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
-            Ok(None)
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
+            Ok(record)
         })
     }
 
@@ -187,11 +255,19 @@ impl DmDht for MockDht {
                 dispatch,
             },
         );
+        self.published
+            .lock()
+            .expect("mock published")
+            .push((slot, entry.clone()));
         let latency = self.latency;
         let boom = self.panics(Method::PublishDoorbell);
+        let dud = self.fails(Method::PublishDoorbell);
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
             Ok(())
         })
     }
@@ -203,13 +279,18 @@ impl DmDht for MockDht {
         );
         let latency = self.latency;
         let boom = self.panics(Method::SweepDoorbell);
+        let dud = self.fails(Method::SweepDoorbell);
+        let queued = self.doorbell.lock().expect("mock doorbell").pop_front();
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
-            Ok(DoorbellSweep {
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
+            Ok(queued.unwrap_or(DoorbellSweep {
                 slots: Vec::new(),
                 outcome: empty_outcome(),
-            })
+            }))
         })
     }
 
@@ -227,9 +308,13 @@ impl DmDht for MockDht {
         );
         let latency = self.latency;
         let boom = self.panics(Method::PublishPage);
+        let dud = self.fails(Method::PublishPage);
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
             Ok(())
         })
     }
@@ -246,9 +331,13 @@ impl DmDht for MockDht {
         );
         let latency = self.latency;
         let boom = self.panics(Method::SweepPage);
+        let dud = self.fails(Method::SweepPage);
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
             // A struct literal rather than the transport's own tagging
             // constructor, which is private to `actor`. The tag is still the
             // swept address's own conversation, which is the property a caller
@@ -271,9 +360,13 @@ impl DmDht for MockDht {
         );
         let latency = self.latency;
         let boom = self.panics(Method::PublishAck);
+        let dud = self.fails(Method::PublishAck);
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
             Ok(())
         })
     }
@@ -287,9 +380,13 @@ impl DmDht for MockDht {
         );
         let latency = self.latency;
         let boom = self.panics(Method::FetchAck);
+        let dud = self.fails(Method::FetchAck);
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
             Ok(None)
         })
     }

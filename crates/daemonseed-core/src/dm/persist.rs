@@ -196,6 +196,21 @@ pub enum DmPersistError {
     /// is what says the store needs attention and reveals nothing the caller did
     /// not already supply.
     AmbiguousCorrespondent { matches: usize },
+    /// A correspondence already holds this identity key, so a second
+    /// establishment was refused.
+    ///
+    /// **The refusal is the point, and it is why this is not a warning.**
+    /// Minting a second label for one identity makes that identity
+    /// [`Self::AmbiguousCorrespondent`] on every later lookup, permanently, with
+    /// nothing able to say which of the two is real. The duplicate is refused
+    /// where it would be created rather than diagnosed afterwards, where nothing
+    /// can resolve it.
+    ///
+    /// The label is deliberately absent, for [`Self::AmbiguousCorrespondent`]'s
+    /// reason: it is redacted in `Debug` precisely so it does not reach a log
+    /// through an error. A caller that needs it asks
+    /// [`DmPersist::correspondence_for_pk_lt`], which is where the answer lives.
+    AlreadyEstablished,
     /// A channel root could not be derived from a stored contact record.
     ///
     /// The store read fine; the crypto module or the KDF underneath it did not.
@@ -216,8 +231,9 @@ impl std::fmt::Display for DmPersistError {
             Self::Contact(e) => write!(f, "contact record: {e}"),
             Self::BlockList(e) => write!(f, "block list: {e}"),
             Self::BlockListMissing => f.write_str(
-                "the profile's block-list record is missing; it is created at every store open, \
-                 so its absence means it was removed",
+                "the profile's block-list record is missing; the store creates it at open and \
+                 provision_block_list re-creates it, so its absence means it was removed or \
+                 that open's best-effort creation was skipped",
             ),
             Self::Ratchet(e) => write!(f, "ratchet: {e}"),
             Self::OutboxDirectionMismatch { stored, requested } => write!(
@@ -235,6 +251,10 @@ impl std::fmt::Display for DmPersistError {
                 f,
                 "{matches} correspondences hold the same long-term identity key, \
                  so there is no single correspondence for it"
+            ),
+            Self::AlreadyEstablished => f.write_str(
+                "a correspondence already holds this identity key, so establishing a second \
+                 one was refused",
             ),
             Self::FirstContact(e) => write!(f, "channel roots: {e}"),
         }
@@ -255,7 +275,8 @@ impl std::error::Error for DmPersistError {
             Self::BlockListMissing
             | Self::OutboxDirectionMismatch { .. }
             | Self::CursorNotCorroborated { .. }
-            | Self::AmbiguousCorrespondent { .. } => None,
+            | Self::AmbiguousCorrespondent { .. }
+            | Self::AlreadyEstablished => None,
         }
     }
 }
@@ -1340,6 +1361,41 @@ impl DmPersist {
         }
     }
 
+    /// Write an empty block list, and only if there is none.
+    ///
+    /// **Not the ordinary creator, and it is worth being exact about that.**
+    /// [`DmStore::open`] already brings every profile-level record into
+    /// existence, so on almost every open this finds the record there and
+    /// writes nothing. What it closes is that creation's own documented gap:
+    /// it is best-effort, it takes the profile lock with `try_acquire`, and a
+    /// second opener that finds the lock held returns with the record still
+    /// absent. [`Self::read_block_list`] and [`Self::update_block_list`] both
+    /// refuse an absent record — deliberately, because a revocation list that
+    /// reads as empty when it is missing is silent unblocking — so inside that
+    /// window a client can neither consult nor change its block list, and
+    /// nothing retries until the next open.
+    ///
+    /// **What it costs, stated rather than hidden.** Because it cannot tell
+    /// that window from a record an attacker with the disk deleted, calling it
+    /// re-creates an empty list in both cases. That is the same exposure
+    /// `DmStore::open` already accepts for the same reason, not a new one — but
+    /// a caller that runs it should say what it traded, and
+    /// [`Self::read_block_list`]'s refusal is what makes the removal visible
+    /// in the window before it runs.
+    ///
+    /// Returns whether it wrote. An existing list — empty or full — is left
+    /// exactly as it is, so this can never discard a block.
+    pub fn provision_block_list(&self) -> Result<bool, DmPersistError> {
+        self.store
+            .profile_critical_section(|guard| -> Result<bool, DmPersistError> {
+                if guard.read(RecordKind::BlockList)?.is_some() {
+                    return Ok(false);
+                }
+                guard.replace(RecordKind::BlockList, &BlockList::new().encode()?)?;
+                Ok(true)
+            })
+    }
+
     /// Load the block list, let `f` change it, and write it back — all under the
     /// profile lock.
     ///
@@ -1376,6 +1432,85 @@ impl DmPersist {
                 guard.replace(RecordKind::BlockList, &list.encode()?)?;
                 Ok(out)
             })
+    }
+
+    /// Establish the ACCEPTOR's side of a correspondence from a verified knock.
+    ///
+    /// The counterpart of [`PendingHandshake::establish`], which is the
+    /// INITIATOR's: that one resumes a handshake this side started and erases
+    /// the record it started from; this one has no record to erase, because the
+    /// acceptor's `ss0` arrived inside the entry and reaches the disk for the
+    /// first time here, as the contact record's own field.
+    ///
+    /// **It is one act for the reason `establish` is one act.** Minting the
+    /// label, opening the ratchet and recording who the correspondence is with
+    /// are three steps that are only ever correct together: a label is minted
+    /// from the CSPRNG and cannot be recomputed
+    /// ([`CorrespondenceLabel::mint`]), so a caller that minted one, built a
+    /// ratchet, and then failed to write the contact record would hold a live
+    /// conversation whose `ss0`, `pk_pc` and name exist nowhere but in RAM.
+    /// Offering the three separately is offering that ordering to be got wrong.
+    ///
+    /// **The ratchet is built before the record is written**, matching
+    /// `establish`: a module fault building it leaves the disk untouched, and
+    /// the knock can be accepted again. A failure of the *write* leaves a
+    /// minted label with no record — the correspondence directory may exist and
+    /// hold nothing, which [`Self::correspondence_for_pk_lt`] already skips as
+    /// an ordinary state — and the caller is told, so it may accept again
+    /// rather than carry on with a ratchet nothing remembers.
+    ///
+    /// **Nothing else is written.** The provisional record is the initiator's
+    /// and the acceptor has none; the resume record needs a committed root and
+    /// a sealed re-establishment frame, neither of which exists until the
+    /// channel has actually re-established, so there is nothing here it could
+    /// hold.
+    ///
+    /// **A second establishment for one identity is
+    /// [`DmPersistError::AlreadyEstablished`], not a second label.** The check
+    /// is a `correspondence_for_pk_lt` scan taken first, and it is not
+    /// belt-and-braces: two labels holding one `pk_lt` make every later lookup
+    /// [`DmPersistError::AmbiguousCorrespondent`], which
+    /// [`Self::correspondent_state_lost`] then refuses to act on — so the
+    /// identity is unroutable for the life of the store and nothing can say
+    /// which of the two was real. Refusing costs one scan on a path already
+    /// doing key agreement. It is not a lock: a concurrent writer can establish
+    /// between the scan and the write, which is the same window
+    /// [`Self::correspondence_for_pk_lt`] documents, and the duplicate it
+    /// leaves is detectable where a silently-minted one is not.
+    ///
+    /// `now_ms` stamps both `first_seen_ms` and `last_seen_ms`: the knock is
+    /// the first and so far only sighting.
+    pub fn accept_first_contact(
+        &self,
+        verified: VerifiedFirstContact,
+        now_ms: i64,
+    ) -> Result<(CorrespondenceLabel, Ratchet), DmPersistError> {
+        // A second establishment for one identity is refused HERE, because
+        // afterwards nothing can undo it: two labels holding one `pk_lt` make
+        // every later `correspondence_for_pk_lt` return
+        // `AmbiguousCorrespondent`, which in turn makes
+        // `correspondent_state_lost` refuse to act and leaves the identity
+        // unroutable for the life of the store.
+        if self.correspondence_for_pk_lt(verified.pk_lt())?.is_some() {
+            return Err(DmPersistError::AlreadyEstablished);
+        }
+        // Copied out before `into_ss0` consumes the knock. Each is a public key
+        // rather than a secret; the one secret, `ss0`, is moved.
+        let pk_lt = Box::new(*verified.pk_lt());
+        let pk_pc = Box::new(*verified.pk_pc());
+        let eph_ek = Box::new(*verified.eph_ek());
+        let label = CorrespondenceLabel::mint()?;
+        let ss0 = verified.into_ss0();
+        let ratchet = Ratchet::recipient(&ss0, eph_ek)?;
+        // Seeded, so the record is written whatever the mutator reports — see
+        // `update_contact`. There is nothing to change about a record built
+        // from the knock in the same call.
+        self.update_contact(
+            &label,
+            move || Ok(ContactRecord::new(pk_lt, pk_pc, ss0, now_ms, now_ms)?),
+            |_| Ok(Mutation::Unchanged(())),
+        )?;
+        Ok((label, ratchet))
     }
 }
 
@@ -4761,5 +4896,238 @@ mod tests {
             std::error::Error::source(&err).is_some(),
             "a wrapped first-contact error reported no source"
         );
+    }
+
+    // ---- the acceptor's establishment -------------------------------------
+
+    /// `accept_first_contact` is one act: the correspondence it returns is the
+    /// one `correspondence_for_pk_lt` finds, and the record it wrote carries
+    /// the knock's own keys.
+    ///
+    /// The lookup is the positive control that matters — a call that minted a
+    /// label and built a ratchet without writing anything would return the same
+    /// pair and leave the identity unknown on disk.
+    #[test]
+    fn accepting_a_knock_establishes_a_findable_correspondence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+
+        assert!(
+            p.correspondence_for_pk_lt(&pk(9))
+                .expect("lookup")
+                .is_none(),
+            "the identity is unknown before the accept"
+        );
+
+        let knock = knock(9, ss0());
+        let expected_pk_pc = *knock.pk_pc();
+        let (label, ratchet) = p.accept_first_contact(knock, FIRST_SEEN).expect("accepts");
+
+        assert_eq!(
+            p.correspondence_for_pk_lt(&pk(9)).expect("lookup"),
+            Some(label),
+            "the accepted identity resolves to the label that was returned"
+        );
+        let stored = p.read_contact(&label).expect("read").expect("a record");
+        assert_eq!(stored.pk_lt().as_slice(), pk(9).as_slice());
+        assert_eq!(stored.pk_pc().as_slice(), expected_pk_pc.as_slice());
+        assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
+        assert_eq!(stored.last_seen_ms(), FIRST_SEEN);
+        // The ratchet handed back is over the same `ss0` the record holds: the
+        // record's address root is derived from its stored secret, and the
+        // ratchet's conversation fingerprint is derived from the same value, so
+        // agreement here is agreement about which secret was established.
+        assert!(
+            stored
+                .addresses_same_channel(&derive_channel_roots(&ss0()).expect("roots").ar)
+                .expect("compare"),
+            "the stored record does not address the knock's channel"
+        );
+        assert_eq!(
+            ratchet.ar_fingerprint(),
+            &crate::dm::firstcontact::conversation_binding(&ss0()).expect("binding"),
+            "the ratchet is over a different conversation than the record"
+        );
+    }
+
+    /// The acceptor's establishment writes NO provisional record. That record is
+    /// the initiator's, and one written here would be `ss0` left on disk with
+    /// nothing that ever deletes it.
+    #[test]
+    fn accepting_a_knock_writes_no_provisional_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let (label, _ratchet) = p
+            .accept_first_contact(knock(9, ss0()), FIRST_SEEN)
+            .expect("accepts");
+
+        // Positive control: the contact record IS there, so the assertion below
+        // is not passing against a correspondence that was never established.
+        assert!(
+            p.read_contact(&label).expect("read").is_some(),
+            "the contact record was not written in the first place"
+        );
+        assert!(
+            p.store()
+                .read_unlocked(&label, RecordKind::Provisional)
+                .expect("read")
+                .is_none(),
+            "the acceptor wrote a provisional record"
+        );
+    }
+
+    /// Two accepts of two different identities mint two labels.
+    #[test]
+    fn two_accepts_mint_two_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let mut other = ss0();
+        other[0] ^= 0xFF;
+        let (a, _) = p
+            .accept_first_contact(knock(9, ss0()), FIRST_SEEN)
+            .expect("accepts");
+        let (b, _) = p
+            .accept_first_contact(knock(11, other), FIRST_SEEN)
+            .expect("accepts");
+        assert_ne!(a, b, "each accept minted its own label");
+        assert_eq!(p.store().correspondences().expect("list").len(), 2);
+    }
+
+    /// A second accept for one identity is refused, and the first
+    /// correspondence is still the only one.
+    ///
+    /// The lookup after the refusal is the half that matters: a version that
+    /// minted a second label would also return `Ok`, so asserting only on the
+    /// error would pass against a store that had already been made ambiguous.
+    #[test]
+    fn a_second_accept_for_one_identity_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+
+        let (first, _r) = p
+            .accept_first_contact(knock(9, ss0()), FIRST_SEEN)
+            .expect("the first accept establishes");
+
+        // A genuinely different knock from the same identity — a fresh `ss0`,
+        // so it is not the same entry arriving twice.
+        let mut other = ss0();
+        other[0] ^= 0xFF;
+        let err = p
+            .accept_first_contact(knock(9, other), FIRST_SEEN)
+            .expect_err("the second accept is refused");
+        assert!(
+            matches!(err, DmPersistError::AlreadyEstablished),
+            "wrong refusal: {err:?}"
+        );
+
+        assert_eq!(
+            p.correspondence_for_pk_lt(&pk(9)).expect("lookup"),
+            Some(first),
+            "the identity still resolves to exactly one correspondence"
+        );
+        assert_eq!(
+            p.store().correspondences().expect("list").len(),
+            1,
+            "the refused accept left a second correspondence behind"
+        );
+    }
+
+    /// A write failure inside the accept leaves nothing established.
+    ///
+    /// The store root is made unwritable, so `update_contact`'s replace fails
+    /// while every derivation before it succeeds — which is the ordering the
+    /// method's docs claim, tested rather than asserted.
+    #[test]
+    #[cfg(unix)]
+    fn an_accept_whose_write_fails_establishes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let root = p.store().root().to_path_buf();
+
+        // Positive control: the root is writable, and an accept here would
+        // succeed — asserted by doing one and then undoing the profile.
+        assert!(root.is_dir(), "the store root was never created");
+
+        let mut perms = std::fs::metadata(&root).expect("metadata").permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&root, perms).expect("chmod");
+
+        let result = p.accept_first_contact(knock(9, ss0()), FIRST_SEEN);
+
+        let mut perms = std::fs::metadata(&root).expect("metadata").permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&root, perms).expect("chmod back");
+
+        assert!(result.is_err(), "an unwritable store still accepted");
+        assert_eq!(
+            p.correspondence_for_pk_lt(&pk(9)).expect("lookup"),
+            None,
+            "a failed accept left a correspondence behind"
+        );
+    }
+
+    // ---- block-list provisioning -------------------------------------------
+
+    /// A store that already has its block list is left alone, and one whose
+    /// record is gone gets it back.
+    ///
+    /// The removal is the positive control, and it is the case the call exists
+    /// for: `DmStore::open` creates the record best-effort under
+    /// `try_acquire`, so a second opener racing the first returns with it
+    /// absent, and every consult and change then refuses until something
+    /// re-creates it.
+    #[test]
+    fn provisioning_replaces_a_missing_block_list_and_only_then() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+
+        assert!(
+            p.read_block_list().expect("read").is_empty(),
+            "the store's own open did not create the record"
+        );
+        assert!(
+            !p.provision_block_list().expect("provision"),
+            "provisioning wrote over the record the store had already created"
+        );
+
+        // The record's own file name, spelled out here rather than asked of
+        // the store, so a change to the store's naming fails here instead of
+        // being followed silently.
+        let path = p.store().root().join("block-list.bin");
+        assert!(path.exists(), "the record is not where this test looks");
+        std::fs::remove_file(&path).expect("remove");
+        assert!(
+            matches!(p.read_block_list(), Err(DmPersistError::BlockListMissing)),
+            "removing the file did not make the record absent"
+        );
+
+        assert!(p.provision_block_list().expect("provision"), "it wrote");
+        assert!(p.read_block_list().expect("read").is_empty());
+        assert!(
+            !p.provision_block_list().expect("provision"),
+            "a second provision wrote again"
+        );
+    }
+
+    /// Provisioning never discards a block.
+    #[test]
+    fn provisioning_leaves_an_existing_block_list_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        p.update_block_list(|list| {
+            assert!(list.block(&pk(4)));
+            Ok(())
+        })
+        .expect("block");
+
+        assert!(
+            !p.provision_block_list().expect("provision"),
+            "provisioning wrote over an existing list"
+        );
+        let list = p.read_block_list().expect("read");
+        assert_eq!(list.len(), 1, "the block survived provisioning");
+        assert!(list.is_blocked(&pk(4)));
     }
 }

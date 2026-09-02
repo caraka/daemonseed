@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use daemonseed_core::dm::admission::AdmissionCounters;
 use daemonseed_core::dm::outbox::{Acceptance, DeliveryState};
 use daemonseed_core::dm::pow::ENTRY_HASH_LEN;
 use daemonseed_core::dm::provisional::TeardownCause;
@@ -134,6 +135,22 @@ pub enum DmEvent {
         to: PkLt,
         /// How far the first contact got.
         acceptance: Acceptance,
+        /// Where it stopped.
+        reason: RefusalReason,
+    },
+    /// An accepted request could not be established.
+    ///
+    /// The request is **still held**, so the user may answer it again once
+    /// whatever failed is fixed. An accept that vanished with only a trace
+    /// behind it would leave a request the user answered and a channel that
+    /// never existed, with nothing on screen saying which.
+    AcceptFailed {
+        /// The request that was answered.
+        request: RequestId,
+        /// The knocker's long-term identity key.
+        from: PkLt,
+        /// Why establishment did not happen.
+        reason: AcceptFailure,
     },
     /// A channel was torn down loudly.
     ChannelLost {
@@ -141,15 +158,140 @@ pub enum DmEvent {
         with: PkLt,
         /// Why the channel ended.
         cause: TeardownCause,
+        /// The sequence numbers now
+        /// [`Lifecycle::Undelivered`](daemonseed_core::dm::outbox::Lifecycle::Undelivered)
+        /// and owed to the user.
+        ///
+        /// Carried rather than dropped: these are messages the user believed
+        /// were on their way, and this event is the only place their fate is
+        /// stated. Empty when the queue held nothing pending.
+        surfaced: Vec<u64>,
     },
-    /// Our own doorbell sweep's record health.
+    /// A known correspondent knocked again and this side cannot say which
+    /// direction its own outbox runs in.
+    ///
+    /// **Nothing was touched**, deliberately. Deciding state loss ends every
+    /// pending message on that correspondence irreversibly, and the call that
+    /// does it needs the outbox direction — which lives on the ratchet, which
+    /// this session only holds for correspondences it established itself. A
+    /// guess would end a healthy queue on a coin toss the user cannot see, so
+    /// the queue falls back to the seven-day give-up and the user is told the
+    /// question could not be answered.
+    ChannelDirectionUnknown {
+        /// The correspondent's long-term identity key.
+        with: PkLt,
+    },
+    /// Our own doorbell sweep's record health, and what admission did with it.
     ///
     /// Observability, never "nobody knocked": an empty slot list alone means both
     /// "no knocks" and "every GET errored", and the outcome separates them.
     DoorbellHealth {
         /// The sweep's GET accounting.
         outcome: SweepOutcome,
+        /// Admission's own accounting, accumulated across every sweep so far.
+        ///
+        /// Without it a drop is invisible: every refusal on the doorbell is
+        /// silent by design, so `shape_rejects`, `pow_rejects` and the rest are
+        /// the only statement that entries arrived and were refused rather
+        /// than that nobody knocked.
+        admission: AdmissionCounters,
+        /// Slots this sweep skipped because the held-request list was full.
+        ///
+        /// Per sweep, not cumulative, because it is a statement about *now*:
+        /// non-zero means somebody is knocking and the user has to answer
+        /// something before the driver will look. The knocks are not lost —
+        /// a skipped slot is left unverified and unrecorded, so the sender's
+        /// next re-seed is read normally — but nothing else would say that
+        /// first contact had stopped.
+        pending_full: u64,
     },
+    /// A contact lookup failed during a sweep, so knocks were dropped.
+    ///
+    /// Emitted at most once per sweep. The lookup fails closed — an
+    /// undecodable contact record or an ambiguous identity reads as "already
+    /// known", never as "a stranger" — which means a stranger's knock is
+    /// dropped rather than surfaced, for as long as the store stays that way.
+    /// Without this the drop is permanent and silent.
+    ContactLookupFailed,
+    /// The block list is full, and the identity was not blocked.
+    ///
+    /// The stored list is left exactly as it was — the encode refuses before
+    /// the write — so this is a ceiling reached rather than a list damaged. It
+    /// is an event rather than a panic because the only remedy is the user's:
+    /// nothing here can choose which of 512 blocks to give up.
+    BlockListFull {
+        /// How many identities the refused list would have held.
+        count: usize,
+    },
+    /// The profile's block-list record was absent at startup and was re-created
+    /// empty.
+    ///
+    /// **Loud, not silent.** The store creates the record at every open, so an
+    /// absent one means either that creation was skipped in its documented race
+    /// window or the record was removed — and the second reads as silent
+    /// unblocking. The user is entitled to know their block list may have been
+    /// reset.
+    BlockListProvisioned,
+    /// A consumed invite-token nonce did not reach the disk.
+    ///
+    /// The set in memory is correct for this run; the file is not. A grant
+    /// spent now is redeemable again after a restart, so this is a suppression
+    /// plane that has stopped suppressing and the user has to be told.
+    SpentTokensNotPersisted,
+}
+
+/// Where a first contact stopped.
+///
+/// [`Acceptance`] says how far the write got; this says why it went no
+/// further. They are different questions and folding them loses the second:
+/// an absent key record and a refused doorbell write are both
+/// [`Acceptance::Unconfirmed`], and only one of them is worth retrying now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The recipient publishes no key record, or it has been evicted or wiped.
+    /// The awaiting-key state: nothing was composed, and retrying later may
+    /// well work.
+    NoKeyRecord,
+    /// A key record was there and did not verify against the recipient's own
+    /// identity key.
+    KeyRecordInvalid,
+    /// The key-record fetch or the doorbell write failed on the transport.
+    PublishFailed,
+    /// A local record could not be written, so nothing was published.
+    StoreFailure,
+    /// A correspondence with this identity already exists. First contact is for
+    /// strangers; sending to a correspondent is [`DmCommand::Send`].
+    AlreadyEstablished,
+    /// An introduction to this recipient is already between the command and the
+    /// doorbell write. Never a second [`daemonseed_core::dm::firstcontact::build`]
+    /// for one introduction: each call encapsulates a fresh `ss0`, which the
+    /// recipient reads as the sender having lost their at-rest state.
+    AlreadyInFlight,
+    /// The proof-of-work mint panicked.
+    MintPanicked,
+    /// A spawned task carrying this introduction panicked — a DHT operation
+    /// rather than the mint. Distinct from [`Self::MintPanicked`] because the
+    /// two say different things about what to retry: a mint that panicked will
+    /// panic again on the same input, while a transport task that did is worth
+    /// one more attempt.
+    TaskPanicked,
+    /// The entry could not be composed — a body over the cap, or the mint
+    /// itself refusing.
+    MintFailed,
+    /// A derivation or a keygen failed. A condition of this machine's crypto
+    /// module, not of the recipient or the network.
+    Module,
+}
+
+/// Why an accepted request was not established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptFailure {
+    /// A correspondence with this identity already exists, so a second one was
+    /// refused — see
+    /// [`DmPersistError::AlreadyEstablished`](daemonseed_core::dm::persist::DmPersistError::AlreadyEstablished).
+    AlreadyEstablished,
+    /// The contact record could not be written.
+    StoreFailure,
 }
 
 /// A correspondent's identity key, as a trace line may show it: the marker only.
@@ -229,19 +371,49 @@ impl core::fmt::Debug for DmEvent {
                 redacted_pk(f)?;
                 write!(f, ", seq: {seq}, state: {state:?} }}")
             }
-            DmEvent::Refused { acceptance, .. } => {
+            DmEvent::Refused {
+                acceptance, reason, ..
+            } => {
                 f.write_str("Refused { to: ")?;
                 redacted_pk(f)?;
-                write!(f, ", acceptance: {acceptance:?} }}")
+                write!(f, ", acceptance: {acceptance:?}, reason: {reason:?} }}")
             }
-            DmEvent::ChannelLost { cause, .. } => {
+            DmEvent::AcceptFailed {
+                request, reason, ..
+            } => {
+                write!(f, "AcceptFailed {{ request: {request:?}, from: ")?;
+                redacted_pk(f)?;
+                write!(f, ", reason: {reason:?} }}")
+            }
+            DmEvent::ChannelLost {
+                cause, surfaced, ..
+            } => {
                 f.write_str("ChannelLost { with: ")?;
                 redacted_pk(f)?;
-                write!(f, ", cause: {cause:?} }}")
+                write!(f, ", cause: {cause:?}, surfaced: {surfaced:?} }}")
             }
-            DmEvent::DoorbellHealth { outcome } => {
-                write!(f, "DoorbellHealth {{ outcome: {outcome:?} }}")
+            DmEvent::ChannelDirectionUnknown { .. } => {
+                f.write_str("ChannelDirectionUnknown { with: ")?;
+                redacted_pk(f)?;
+                f.write_str(" }")
             }
+            DmEvent::DoorbellHealth {
+                outcome,
+                admission,
+                pending_full,
+            } => {
+                write!(
+                    f,
+                    "DoorbellHealth {{ outcome: {outcome:?}, admission: {admission:?}, \
+                     pending_full: {pending_full} }}"
+                )
+            }
+            DmEvent::ContactLookupFailed => f.write_str("ContactLookupFailed"),
+            DmEvent::BlockListFull { count } => {
+                write!(f, "BlockListFull {{ count: {count} }}")
+            }
+            DmEvent::BlockListProvisioned => f.write_str("BlockListProvisioned"),
+            DmEvent::SpentTokensNotPersisted => f.write_str("SpentTokensNotPersisted"),
         }
     }
 }

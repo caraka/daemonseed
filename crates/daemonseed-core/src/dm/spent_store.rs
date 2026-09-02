@@ -95,6 +95,16 @@ pub enum SpentStoreError {
     EntropySource(getrandom::Error),
     /// The file was structurally malformed.
     Malformed(&'static str),
+    /// The file could not be read.
+    Io(std::io::Error),
+    /// The file could not be replaced durably.
+    ///
+    /// Carries [`crate::storage::AtomicReplaceError`] whole rather than
+    /// flattening it: its
+    /// three arms differ in **what state the destination is in**, and a caller
+    /// deciding whether the set on disk is the old one, the new one, or
+    /// unknown needs that distinction rather than a rendered string.
+    Replace(crate::storage::AtomicReplaceError),
 }
 
 impl core::fmt::Display for SpentStoreError {
@@ -110,6 +120,8 @@ impl core::fmt::Display for SpentStoreError {
             ),
             SpentStoreError::EntropySource(e) => write!(f, "entropy source: {e}"),
             SpentStoreError::Malformed(m) => write!(f, "malformed spent-token set: {m}"),
+            SpentStoreError::Io(e) => write!(f, "spent-token set io: {e}"),
+            SpentStoreError::Replace(e) => write!(f, "spent-token set replace: {e:?}"),
         }
     }
 }
@@ -210,6 +222,41 @@ pub fn open(bytes: &[u8], passphrase: &str) -> Result<SpentTokenSet, SpentStoreE
     let decoded = SpentTokenSet::decode(&plaintext);
     plaintext.zeroize();
     decoded.ok_or(SpentStoreError::Malformed("bad spent-token body"))
+}
+
+/// Read the sealed set at `path`.
+///
+/// `Ok(None)` is the file being absent, which is the ordinary state of a
+/// profile that has never redeemed an invite. **Every other failure is an
+/// error**, deliberately: a file that is present and will not open is either a
+/// wrong passphrase or tampering, and answering that with an empty set is
+/// silent un-spending — every grant already burnt becomes redeemable again. The
+/// caller decides what to do about it; this will not decide by forgetting.
+pub fn read_from(path: &Path, passphrase: &str) -> Result<Option<SpentTokenSet>, SpentStoreError> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(SpentStoreError::Io(e)),
+    };
+    open(&bytes, passphrase).map(Some)
+}
+
+/// Seal the set and replace the file at `path` durably.
+///
+/// The storage layer's durable replacement, not a plain write: this file
+/// is a suppression plane, and a truncated one is a set of grants that can be
+/// spent twice. A partial write is the one outcome that must not be reachable,
+/// so the bytes land in a temp sibling, are fsynced, and are renamed over the
+/// destination.
+pub fn write_to(
+    path: &Path,
+    set: &SpentTokenSet,
+    passphrase: &str,
+    profile_id: Uuid,
+    argon2: ArgonParams,
+) -> Result<(), SpentStoreError> {
+    let sealed = seal(set, passphrase, profile_id, argon2)?;
+    crate::storage::atomic_file::replace_atomically(path, &sealed).map_err(SpentStoreError::Replace)
 }
 
 /// Two-stage Argon2id + HKDF-SHA-384 key derivation for the spent-token set.

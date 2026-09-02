@@ -130,6 +130,17 @@ pub enum AdmissionOutcome {
         /// a re-sealed retry, or the same knock in the next epoch. The caller must
         /// not re-init a ratchet or surface a second contact request for one.
         idempotent: bool,
+        /// `SHA-384(ct0 ‖ sealed)` over the entry these bytes were, as step 2
+        /// computed it.
+        ///
+        /// **Carried out because it cannot be recomputed from the outside.**
+        /// [`pow::entry_hash`] takes the two halves already split, and the split
+        /// is this module's own shape gate's, which is private precisely so no caller can
+        /// perform it with an unpinned `ct0` width — the ambiguity that would
+        /// let one nonce prove two entries. A recipient naming a request by the
+        /// exact entry it was shown therefore has to be handed the value rather
+        /// than derive it.
+        entry_hash: [u8; ENTRY_HASH_LEN],
     },
     /// Silently dropped, at the named step.
     Dropped(DropReason),
@@ -161,6 +172,7 @@ impl std::fmt::Debug for AdmissionOutcome {
                 .field("verified", &"<VerifiedFirstContact>")
                 .field("token_nonce", &token_nonce.map(|_| "<redacted>"))
                 .field("idempotent", idempotent)
+                .field("entry_hash", &"<redacted>")
                 .finish(),
             Self::Dropped(reason) => f.debug_tuple("Dropped").field(reason).finish(),
         }
@@ -398,6 +410,7 @@ impl<'a> Admitter<'a> {
             verified: Box::new(verified),
             token_nonce: consumed.map(|(nonce, _)| nonce),
             idempotent,
+            entry_hash: h,
         }
     }
 }
@@ -518,6 +531,33 @@ impl SeenSet {
         true
     }
 
+    /// Forget one entry hash, at every epoch that holds it.
+    ///
+    /// **For a caller that ABANDONED an entry's verification, not for one that
+    /// finished it.** The set's contract is "this entry has been processed", and
+    /// `admit` records a hash the moment its proof of work passes — before the
+    /// decapsulation, the body gates and the caller's own `already_known`
+    /// closure have run. A caller whose closure could not answer, and which
+    /// therefore declines to act on the entry at all, has not processed it:
+    /// leaving the hash in would make the entry a `Seen` drop on every later
+    /// sweep, permanently, for a knock nobody ever decided about.
+    ///
+    /// Returns whether anything was removed. **The eviction order is not
+    /// repaired** — the hash stays in its epoch's order queue until it ages out
+    /// — because that queue only bounds memory, and one stale entry in it
+    /// costs one slot of a thousand rather than a wrong answer.
+    ///
+    /// It is not a general undo. Forgetting a hash the caller *did* act on
+    /// re-opens the double-surface this set exists to prevent, so the call site
+    /// has to be one that took no decision.
+    pub fn forget(&mut self, hash: &[u8; ENTRY_HASH_LEN]) -> bool {
+        let mut removed = false;
+        for epoch in self.epochs.values_mut() {
+            removed |= epoch.members.remove(hash);
+        }
+        removed
+    }
+
     /// Drop every epoch outside the accept window for `current_fc_epoch` — that
     /// is, everything before `current - 1`. Returns how many epochs were dropped.
     ///
@@ -636,6 +676,14 @@ mod tests {
         false
     }
 
+    /// The entry hash of `entry`, computed the way step 2 computes it — through
+    /// the same private shape gate, so the halves are split at the one pinned
+    /// width and this is not an independent re-implementation of the split.
+    fn expected_entry_hash(entry: &[u8]) -> [u8; ENTRY_HASH_LEN] {
+        let shape = decode_shape(entry).expect("the fixture entry is well-shaped");
+        pow::entry_hash(&shape.ct0, &shape.sealed).expect("hash")
+    }
+
     // ── The happy path, which is the control for everything below ───────────
 
     /// A well-formed knock at an open-policy recipient is admitted, and the
@@ -653,6 +701,7 @@ mod tests {
             verified,
             token_nonce,
             idempotent,
+            entry_hash,
         } = outcome
         else {
             panic!("expected an admission, got {outcome:?}");
@@ -661,6 +710,14 @@ mod tests {
         assert_eq!(&verified.pk_lt()[..], &s.sender.signing.public_key()[..]);
         assert_eq!(token_nonce, None);
         assert!(!idempotent);
+        // The carried hash is the one step 2 computed over this exact entry —
+        // recomputed here from the same halves the shape gate pinned, so a
+        // field wired to some other value fails rather than merely differing.
+        assert_eq!(
+            entry_hash,
+            expected_entry_hash(&s.entry),
+            "the carried entry hash is not this entry's"
+        );
 
         assert_eq!(a.counters.entry_hashes, 1);
         assert_eq!(a.counters.decap_attempts, 1);
@@ -1898,5 +1955,27 @@ mod tests {
             counters.sig_verifies, 2,
             "no token verification on the idempotent path"
         );
+    }
+
+    /// `forget` un-records one hash and leaves its neighbours alone.
+    ///
+    /// The neighbour is the control: a `forget` that cleared the epoch would
+    /// satisfy the first assertion and silently re-open every other entry.
+    #[test]
+    fn forget_removes_one_hash_and_only_that_one() {
+        let mut seen = SeenSet::new();
+        let a = [1u8; ENTRY_HASH_LEN];
+        let b = [2u8; ENTRY_HASH_LEN];
+        assert!(seen.insert(7, a));
+        assert!(seen.insert(7, b));
+        assert!(
+            seen.contains(&a) && seen.contains(&b),
+            "the fixture is empty"
+        );
+
+        assert!(seen.forget(&a), "forget reported no removal");
+        assert!(!seen.contains(&a), "the hash is still held");
+        assert!(seen.contains(&b), "forget took a neighbour with it");
+        assert!(!seen.forget(&a), "a second forget reported a removal");
     }
 }

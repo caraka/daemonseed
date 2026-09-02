@@ -36,6 +36,15 @@ thiserror = "1"
 # veilid-core — a direct dep adds no new supply-chain surface.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+# Per-contact pseudonym keygen: a fresh ML-DSA seed per introduction. Already
+# in this crate's lock via daemonseed-core.
+getrandom = { workspace = true }
+# The spent-invite-token file's profile-id, in its cleartext header
+# (daemonseed_core::dm::spent_store). Already a workspace dependency.
+uuid = { workspace = true }
+# Zeroizing<String> for the profile passphrase DmDriverParts carries.
+zeroize = { workspace = true }
+
 [dev-dependencies]
 # Named again here purely to switch daemonseed-core's `testing` feature on while
 # building this crate's test targets, so `kats::initialize_module_unsigned_test_binary`

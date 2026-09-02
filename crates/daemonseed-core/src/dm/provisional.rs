@@ -737,6 +737,16 @@ impl Teardown {
         &self.cause
     }
 
+    /// Why the channel ended, by value.
+    ///
+    /// [`TeardownCause`] is deliberately neither [`Clone`] nor [`Copy`] — two
+    /// of its arms own a rendered error — so a caller putting the cause into an
+    /// event it hands onward has to move it out rather than copy it. Consuming,
+    /// because a teardown whose cause has been taken has nothing left to state.
+    pub fn into_cause(self) -> TeardownCause {
+        self.cause
+    }
+
     /// The trust event this teardown must be surfaced as.
     ///
     /// The taxonomy is the loudness. Every key here is

@@ -293,15 +293,50 @@ types:
   - name: DmDriver
     module: daemonseed_veilid_net::dm
     kind: struct
-    description: The DM driver's entry point; `spawn` starts the task and returns its handle plus the event stream. Panics if cfg.idle_tick is zero.
+    description: >-
+      The DM driver's entry point; `spawn` starts the task and returns its handle
+      plus the event stream. On each `cfg.idle_tick` it sweeps its own doorbell and
+      runs every populated slot through daemonseed_core::dm::admission::Admitter,
+      surfacing an admitted stranger's knock as DmEvent::ContactRequest, dropping a
+      blocked one, and routing a known correspondent's to
+      DmPersist::correspondent_state_lost, surfacing DmEvent::ChannelLost. A slot
+      arriving at a full held-request list is skipped BEFORE admission and counted
+      on DoorbellHealth's pending_full, and a slot whose contact lookup failed is
+      left unverified and unrecorded — both are read normally on a later sweep
+      rather than being burnt into the seen set. `spawn` does the one-off work
+      before the task starts — deriving this identity's own doorbell and
+      key-record owner seeds, provisioning the block list, and opening the
+      spent-token set — so neither their failure modes nor Argon2id's cost land on
+      the driver's loop. A panicked spawned job is attributed to what it was
+      doing: a mint or a transport task releases its introduction, a spent-token
+      write poisons the store. Panics if cfg.idle_tick is zero, if cfg.policy is
+      AdmissionPolicy::InviteOnly with no DmDriverParts::spent_tokens, if either
+      owner seed will not derive (a driver without them is permanently deaf), or
+      if the block list cannot be provisioned.
   - name: DmDriverParts
     module: daemonseed_veilid_net::dm
     kind: struct
-    description: "Everything the driver owns, constructed by the frontend and moved in: dht (Arc<D: DmDht>), clock (WallClock), identity (DmIdentity), persist (DmPersist), cfg (DmDriverConfig)."
+    description: "Everything the driver owns, constructed by the frontend and moved in: dht (Arc<D: DmDht>), clock (WallClock), identity (DmIdentity), persist (DmPersist), cfg (DmDriverConfig), spent_tokens (Option<SpentTokenStore>)."
   - name: DmDriverConfig
     module: daemonseed_veilid_net::dm
     kind: struct
-    description: The driver's cadence knobs; `idle_tick` is how long the driver sleeps when nothing else wakes it.
+    description: >-
+      The driver's cadence and admission knobs: `idle_tick` is how long the driver
+      sleeps when nothing else wakes it and how often it sweeps its doorbell,
+      `policy` is the AdmissionPolicy it enforces, `pow_difficulty` is the
+      PowDifficulty it verifies and mints at.
+  - name: SpentTokenStore
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: >-
+      Where a profile's consumed invite-token nonces are sealed: profile_root,
+      passphrase, profile_id, argon2. Absent means the set lives only in memory,
+      which is correct under AdmissionPolicy::Open and refused under
+      AdmissionPolicy::InviteOnly. A stored set that is present and will not open
+      POISONS the store for the life of the driver — never written over, because
+      that would erase every grant it held — and surfaces
+      DmEvent::SpentTokensNotPersisted. Writes run on a blocking thread and only
+      when a nonce was actually consumed or pruned. Its Debug prints no passphrase.
   - name: DmDriverHandle
     module: daemonseed_veilid_net::dm
     kind: struct
@@ -312,7 +347,17 @@ types:
     description: >-
       What a frontend asks the driver to do — FirstContact{recipient,body},
       Send{to,body}, Accept{request}, Decline{request}, Block{pk_lt},
-      Unblock{pk_lt}, Surfaced{to,seqs}, Shutdown. Correspondents are keyed by
+      Unblock{pk_lt}, Surfaced{to,seqs}, Shutdown. FirstContact fetches the
+      recipient's key record, mints the entry off the loop, writes the provisional
+      record and publishes the knock; Accept establishes through
+      DmPersist::accept_first_contact; Decline persists nothing; Block and Unblock
+      write the block list, and a refused 513th entry surfaces as
+      DmEvent::BlockListFull. FirstContact is refused with
+      RefusalReason::AlreadyEstablished when a correspondence with that identity
+      exists and AlreadyInFlight when an introduction to it is already between the
+      command and the doorbell write; a panicked mint refuses it with MintPanicked
+      and a panicked transport task with TaskPanicked. An Accept the store refuses
+      leaves the request held and surfaces AcceptFailed. Correspondents are keyed by
       long-term identity key; requests by RequestId. Shutdown aborts in-flight DHT
       operations. Debug prints variant names, body lengths, and a redacted PkLt.
   - name: DmEvent
@@ -321,10 +366,32 @@ types:
     description: >-
       What the driver tells a frontend — ContactRequest{request,from,body,sent_unix_ms},
       Message{from,seq,body,sent_unix_ms}, Delivery{to,seq,state},
-      Refused{to,acceptance}, ChannelLost{with,cause}, DoorbellHealth{outcome}. Every
-      payload is a daemonseed-core type or a String except DoorbellHealth, which carries
-      this crate's rendezvous::SweepOutcome. Given-up delivery is a DeliveryState on
-      Delivery. Debug redacts as DmCommand's does.
+      Refused{to,acceptance,reason}, AcceptFailed{request,from,reason},
+      ChannelLost{with,cause,surfaced}, ChannelDirectionUnknown{with},
+      DoorbellHealth{outcome,admission,pending_full}, ContactLookupFailed,
+      BlockListFull{count}, BlockListProvisioned, SpentTokensNotPersisted. Refused
+      carries a RefusalReason and AcceptFailed an AcceptFailure; ChannelLost
+      carries the surfaced sequence numbers the user is owed; DoorbellHealth
+      carries admission's running AdmissionCounters plus pending_full, the slots
+      this sweep skipped because the held-request list was full. Every payload is a
+      daemonseed-core type or a String except DoorbellHealth, which carries this
+      crate's rendezvous::SweepOutcome and core's AdmissionCounters. Given-up
+      delivery is a DeliveryState on Delivery. Debug redacts as DmCommand's does.
+  - name: RefusalReason
+    module: daemonseed_veilid_net::dm
+    kind: enum
+    description: >-
+      Where a first contact stopped — NoKeyRecord, KeyRecordInvalid, PublishFailed,
+      StoreFailure, AlreadyEstablished, AlreadyInFlight, MintPanicked, TaskPanicked,
+      MintFailed, Module. Acceptance says how far the write got; this says why it
+      went no further, and folding them loses the second.
+  - name: AcceptFailure
+    module: daemonseed_veilid_net::dm
+    kind: enum
+    description: >-
+      Why an accepted request was not established — AlreadyEstablished or
+      StoreFailure. The request stays held for both, unless the refusal came from
+      inside DmPersist::accept_first_contact, which consumes the knock.
   - name: RequestId
     module: daemonseed_veilid_net::dm
     kind: struct

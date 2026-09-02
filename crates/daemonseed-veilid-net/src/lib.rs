@@ -155,8 +155,9 @@ pub use discovery::{
     route_provenance_input, verify_route_advert, DiscoveryEnvelope, RouteAdvertSigner,
 };
 pub use dm::{
-    spawn_dm_key_record_publish, DmCommand, DmDht, DmDhtFuture, DmDriver, DmDriverConfig,
-    DmDriverHandle, DmDriverParts, DmEvent, DmIdentity, PkLt, RequestId, WallClock,
+    spawn_dm_key_record_publish, AcceptFailure, DmCommand, DmDht, DmDhtFuture, DmDriver,
+    DmDriverConfig, DmDriverHandle, DmDriverParts, DmEvent, DmIdentity, PkLt, RefusalReason,
+    RequestId, SpentTokenStore, WallClock,
 };
 pub use error::{FetchErrorClass, Result, VeilidNetError};
 pub use event::VeilidNetEvent;

@@ -24,9 +24,11 @@ pub(crate) mod mock;
 pub mod seam;
 pub mod types;
 
-pub use driver::{DmDriver, DmDriverConfig, DmDriverHandle, DmDriverParts};
+pub use driver::{DmDriver, DmDriverConfig, DmDriverHandle, DmDriverParts, SpentTokenStore};
 pub use seam::{DmDht, DmDhtFuture};
-pub use types::{DmCommand, DmEvent, DmIdentity, PkLt, RequestId, WallClock};
+pub use types::{
+    AcceptFailure, DmCommand, DmEvent, DmIdentity, PkLt, RefusalReason, RequestId, WallClock,
+};
 
 /// Publish this identity's DM key record, off the caller's loop (ISC-C40, #232).
 ///

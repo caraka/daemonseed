@@ -1791,11 +1791,14 @@ dependencies = [
  "daemonseed-proto",
  "ed25519-dalek 2.2.0",
  "futures-util",
+ "getrandom 0.3.4",
  "oxicrypt-module",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "uuid",
  "veilid-core",
+ "zeroize",
 ]
 
 [[package]]

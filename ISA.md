@@ -794,6 +794,34 @@ route taken to reach a decision are not recorded here — the git history and `C
   the distributed hash table is what a test cannot have, so that is the seam. The cost is one impure
   member in an otherwise pure machine, stated on the type.
 
+- **The acceptor's establishment of a correspondence is one core call beside the initiator's, and it
+  refuses a second establishment for one identity key.** The alternative was to assemble it in the
+  driver from label generation, key-schedule opening and the contact-record write. Assembled there,
+  the three steps can be ordered wrongly, and the refusal of a duplicate sits outside the only place
+  that can enforce it — a second correspondence for one key makes that key ambiguous to every later
+  lookup, permanently. The cost is one more public method on the persistence surface.
+
+- **Consumed invite-token nonces are persisted, not held in memory, under material the front end
+  supplies to the driver; under the open policy nothing is supplied.** In memory alone, an invite
+  already redeemed is redeemable again after a restart, which is the exact property the set exists
+  to deny. A file that is present and will not open poisons writing for the life of the process
+  rather than being overwritten with an empty set. The cost is that the driver's construction
+  carries a passphrase-shaped input when the policy is invite-only.
+
+- **The per-correspondent pseudonym signing key and the peer's verifying key are held in memory
+  beside the ratchet for the life of the process.** The design homes both in the resume record,
+  and that record cannot be written at first establishment because it requires a sealed
+  re-establishment frame that exists only after the channel has re-established once. Persisting them
+  elsewhere would invent a second at-rest home the design does not name. The cost is stated as a
+  limit: a correspondence established in this process does not survive a restart.
+
+- **A first contact to an identity already corresponded with is refused before anything reaches the
+  network; a repeat request whose outbox direction cannot be determined is reported and never acted
+  on.** Treating the first as a fresh introduction would encapsulate a fresh shared secret, which the
+  far end reads as lost state and answers by ending every queued message terminally. Guessing the
+  direction of the second would end a healthy queue on a coin toss. The cost is that a genuine
+  post-restart re-knock from a known correspondent is surfaced to the user rather than resolved.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the

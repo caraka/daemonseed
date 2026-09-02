@@ -26,6 +26,56 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_veilid_net::dm::RefusalReason` / `AcceptFailure` — why a first contact stopped, and why
+  an accepted request was not established. `DmEvent::Refused` carries the first; the new
+  `DmEvent::AcceptFailed { request, from, reason }` carries the second and leaves the request held.
+  (#236)
+- `daemonseed_veilid_net::dm::DmEvent` — `ChannelLost` carries the `surfaced` sequence numbers the
+  user is owed; `DoorbellHealth` carries admission's running `AdmissionCounters`; new variants
+  `ChannelDirectionUnknown`, `ContactLookupFailed`, `BlockListProvisioned` and
+  `SpentTokensNotPersisted`. `DoorbellHealth` also carries `pending_full`, the slots this sweep
+  skipped because the held-request list was full. `RefusalReason::TaskPanicked` is a panicked
+  transport task, distinct from `MintPanicked`. (#236)
+- `daemonseed_core::dm::admission::SeenSet::forget` — un-record one entry hash, for a caller that
+  abandoned an entry's verification rather than finishing it. (#236)
+- `daemonseed_core::dm::persist::DmPersistError::AlreadyEstablished` — `accept_first_contact` refuses a
+  second correspondence for one identity key rather than minting a second label. (#236)
+- `daemonseed_core::dm::spent_store::read_from` / `write_to` — read the sealed spent-token set at a
+  path (`Ok(None)` when absent, an error when present and unopenable) and replace it atomically.
+  `SpentStoreError` gains `Io` and `Replace`. (#236)
+- `daemonseed_veilid_net::dm` — the DM driver's doorbell half. On its cadence the driver sweeps its
+  own doorbell and runs each populated slot through `daemonseed_core::dm::admission::Admitter`;
+  an admitted knock from a stranger is held and surfaced as `DmEvent::ContactRequest`, one from a
+  blocked identity surfaces nothing, and one from a known correspondent reaches
+  `DmPersist::correspondent_state_lost` and surfaces `DmEvent::ChannelLost`. `DmCommand::Accept`
+  establishes the correspondence through `DmPersist::accept_first_contact`; `Decline` drops the held
+  request and writes nothing; `Block` / `Unblock` update the block list, with a refused 513th entry
+  surfacing as the new `DmEvent::BlockListFull { count }`. `DmCommand::FirstContact` fetches the
+  recipient's key record, mints the entry on a blocking thread, then writes the provisional record
+  and publishes the knock; an absent key record publishes nothing and surfaces `DmEvent::Refused`.
+  `DmDriverConfig` gains `policy` and `pow_difficulty`; `DmDriverParts` gains `spent_tokens`, a
+  `SpentTokenStore`. `DmDriver::spawn` derives the identity's own owner seeds, provisions the block
+  list and opens the spent-token set before the task starts, and panics if any of them fails; an
+  invite-only policy with no `spent_tokens` panics likewise. A doorbell sweep retires the seen set
+  and prunes the spent set, drops held requests whose admitting epoch has left the accept window,
+  forgets slots the doorbell no longer holds, and ends before recording anything when the block list
+  will not read. A slot arriving at a full held-request list is skipped before admission rather than
+  discarded after it, and a slot whose contact lookup failed is left unrecorded — both are read
+  normally on a later sweep. A panicked spawned job is attributed to what it was doing: a mint or a
+  transport task releases its introduction, a spent-token write poisons the store. `FirstContact` is refused
+  when a correspondence with that identity already exists or an introduction to it is in flight, and
+  reuses one provisional label per recipient. A spent-token set that will not open poisons the store
+  for the life of the driver rather than being written over. (#236)
+- `daemonseed_veilid_net::dm::SpentTokenStore` — where a profile's consumed invite-token nonces are
+  sealed, by profile root, passphrase, profile id and Argon2id parameters. (#236)
+- `daemonseed_core::dm::persist::DmPersist::accept_first_contact` — mints a correspondence label,
+  opens the recipient ratchet and writes the contact record from a verified knock, in one call.
+  (#236)
+- `daemonseed_core::dm::persist::DmPersist::provision_block_list` — writes an empty block list when
+  the profile has none, and reports whether it wrote. (#236)
+- `daemonseed_core::dm::provisional::Teardown::into_cause` — the teardown's cause, by value. (#236)
+- `daemonseed_core::dm::admission::AdmissionOutcome::Admitted` carries `entry_hash`, the value step 2
+  computed over the admitted entry. (#236)
 - `daemonseed_veilid_net::dm` — the DM driver's seam and harness. `DmDht`, a trait over the seven DM
   DHT operations returning `DmDhtFuture<T>`, implemented for `VeilidNetHandle`. `DmDriver::spawn`
   takes `DmDriverParts` (`dht`, `clock`, `identity`, `persist`, `cfg`) and returns a
