@@ -874,6 +874,26 @@ route taken to reach a decision are not recorded here — the git history and `C
   schedule and the swept slot untouched. The cost is one extra copy of the ephemeral decapsulation
   key, held for the acceptance window and wiped after.
 
+- **The standalone acknowledgement's pending set is keyed on each message's own sent time and is
+  never cleared by a write; it ages out at the sender's give-up.** Clearing on a write would end the
+  cadence after one record and leave a record with no lifetime of its own un-refreshed. Keying on
+  receipt time would restart the window at collection and keep writing past the point the sender
+  has discarded the message. The cost is that a receiver keeps refreshing its acknowledgement, on
+  the tapering cadence, until the oldest pending message reaches the give-up.
+
+- **One acknowledgement budget per driver, oldest pending first when several correspondences are
+  due.** The cap the design sets is client-global; a budget per correspondence would multiply it by
+  the number of correspondences. A written acknowledgement is a distinct outcome from a written
+  page, so a page write cannot advance the cadence. Records are fetched only once the
+  correspondent's pseudonym verifying key is known, because a record fetched earlier could only be
+  discarded.
+
+- **The acceptor settles the initiator's sequence zero at acceptance.** That message arrives by
+  doorbell and never lands on a page, so without this the contiguous prefix never starts and the
+  opening message of every conversation re-seeds to its give-up and is reported undelivered. The
+  cost is one settlement made from the acceptance rather than from a swept slot, which is the one
+  place the two agree by construction.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the

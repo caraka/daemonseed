@@ -628,7 +628,7 @@ async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
             result: dht
                 .publish_dm_ack(address, record)
                 .await
-                .map(|()| DhtResult::Written),
+                .map(|()| DhtResult::AckWritten),
         },
         DhtOp::FetchAck { tag, address } => DhtOutcome {
             tag,
@@ -1074,7 +1074,10 @@ mod tests {
                     record: vec![0u8; 13],
                 },
                 method: Method::PublishAck,
-                shape: |res| matches!(res, DhtResult::Written),
+                // Its own shape, not `Written`: an acknowledgement write
+                // confirms no outbox entry, and what it advances instead is the
+                // receiver's standalone cadence.
+                shape: |res| matches!(res, DhtResult::AckWritten),
             },
             Case {
                 op: DhtOp::FetchAck {
@@ -1955,7 +1958,7 @@ mod tests {
 
     /// The last `ChannelHealth` in `events`, if the driver emitted one.
     #[allow(clippy::type_complexity)]
-    fn last_health(events: &[DmEvent]) -> Option<(u64, u64, u64, u64, u64)> {
+    fn last_health(events: &[DmEvent]) -> Option<(u64, u64, u64, u64, u64, u64, u64)> {
         events.iter().rev().find_map(|e| match e {
             DmEvent::ChannelHealth {
                 partial_sweeps,
@@ -1963,6 +1966,8 @@ mod tests {
                 unopenable,
                 peer_pseudonym_unknown,
                 peer_acks_deferred,
+                peer_acks_clipped,
+                peer_acks_unverified,
                 ..
             } => Some((
                 *partial_sweeps,
@@ -1970,6 +1975,8 @@ mod tests {
                 *unopenable,
                 *peer_pseudonym_unknown,
                 *peer_acks_deferred,
+                *peer_acks_clipped,
+                *peer_acks_unverified,
             )),
             _ => None,
         })
@@ -2193,11 +2200,17 @@ mod tests {
              nothing unopenable"
         );
 
-        let b_ack_health = last_health(&collected).expect("B must report its channel health");
-        assert!(
-            b_ack_health.4 > 0,
-            "A's message must have carried a piggybacked acknowledgement for B to \
-             defer, got {b_ack_health:?}"
+        // **The piggybacked acknowledgement is folded, not deferred.** A's frame
+        // carries A's own collection state, so B has one to merge on the first
+        // message of the conversation; a non-zero `peer_acks_deferred` would mean
+        // the merge was refused, and B settles nothing when that happens. What
+        // the fold then confirms is asserted where a real claim exists —
+        // `an_ack_settles_the_senders_outbox_exactly_once` — because A had
+        // collected nothing at the moment it sealed this one.
+        assert_eq!(
+            last_health(&collected).map_or(0, |h| h.4),
+            0,
+            "B deferred a piggybacked acknowledgement instead of folding it: {collected:?}"
         );
 
         // ── A collects B's ACCEPT and installs the pseudonym ─────────────────
@@ -2257,12 +2270,13 @@ mod tests {
             dht_b.count(Method::PublishPage) >= 2,
             "B must have written both its acceptance and its reply"
         );
-        let a_health = last_health(&a_events).expect("A must report its channel health");
+        // Silence is the healthy state: a `ChannelHealth` fires only when a
+        // counter moves, so a fold that refused nothing emits nothing at all.
         assert_eq!(
-            (a_health.0, a_health.2),
+            last_health(&a_events).map_or((0, 0), |h| (h.0, h.2)),
             (0, 0),
             "A's collection must report no partial sweep and nothing unopenable \
-             once the pseudonym is installed, got {a_health:?}"
+             once the pseudonym is installed: {a_events:?}"
         );
         // And B's own record still holds one correspondence, so the reply went
         // out on the channel rather than establishing a second one.
@@ -3666,5 +3680,305 @@ mod tests {
 
         handle2.send(DmCommand::Shutdown).await.expect("shutdown");
         task2.await.expect("the driver task ends");
+    }
+
+    /// Knock, accept and establish one correspondence between two live drivers,
+    /// leaving A holding B's pseudonym.
+    ///
+    /// The whole path runs for real: A's mint writes the knock into the shared
+    /// record store, B's doorbell sweep finds it, B's accept composes the
+    /// acceptance, B's cadence publishes it, and A's own sweep opens it. Nothing
+    /// below is a fixture.
+    ///
+    /// Returns A's own events from the whole establishment, drained — the
+    /// acceptance's piggyback settles A's knock in that window, so it is the only
+    /// place that confirmation can be observed.
+    #[allow(clippy::too_many_arguments)]
+    async fn establish_between(
+        handle_a: &DmDriverHandle,
+        probe_a: &DmDriverProbe,
+        evt_a: &mut mpsc::Receiver<DmEvent>,
+        evt_b: &mut mpsc::Receiver<DmEvent>,
+        handle_b: &DmDriverHandle,
+        probe_b: &DmDriverProbe,
+        wall: &Arc<AtomicI64>,
+        b_keys: &IdentityKeys,
+    ) -> Vec<DmEvent> {
+        handle_a
+            .send(DmCommand::FirstContact {
+                recipient: Box::new(*b_keys.signing.public_key()),
+                body: "knock knock".into(),
+            })
+            .await
+            .expect("first contact");
+        advance(wall, Duration::from_millis(100)).await;
+        settle_steps(probe_a, 3).await;
+
+        cadence(wall).await;
+        let events = drain(evt_b);
+        let (request, _, _) = only_request(&events);
+        handle_b
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle_steps(probe_b, 3).await;
+        // Two cadences: B's publishes the acceptance, A's sweeps and opens it.
+        cadence(wall).await;
+        cadence(wall).await;
+        drain(evt_a)
+    }
+
+    /// Every sequence reported `ConfirmedCollected` in `events`, ascending and
+    /// with duplicates kept.
+    ///
+    /// **A whole vector rather than a count per sequence**, so one assertion
+    /// fails on a missing confirmation, a repeated one, and a confirmation for a
+    /// sequence that should not have settled. `Composed` and `OnDht` are left out
+    /// because a re-seed ladder repeats them by design, and a test that pinned
+    /// their multiplicity would be pinning the cadence rather than the
+    /// acknowledgement.
+    fn confirmations(events: &[DmEvent]) -> Vec<u64> {
+        let mut seqs: Vec<u64> = deliveries(events)
+            .into_iter()
+            .filter(|(_, state)| *state == DeliveryState::ConfirmedCollected)
+            .map(|(seq, _)| seq)
+            .collect();
+        seqs.sort_unstable();
+        seqs
+    }
+
+    /// T27. The standalone acknowledgement closes the loop: B writes it, A
+    /// fetches it, and A's outbox settles once.
+    ///
+    /// **The one oracle where the acknowledgement itself is nothing's fixture.**
+    /// The record A opens is the record B's own cadence built and published, at
+    /// an address neither side exchanged and both derived, sealed under a key
+    /// that descends from the secret A encapsulated and signed by the pseudonym A
+    /// learned from B's acceptance. A break anywhere from `StandaloneAckCadence`
+    /// through `ack_record::build_encoded` to `Outbox::settle_from_ack` lands
+    /// here.
+    ///
+    /// **Both directions settle, and the acceptor's own sequence zero is the
+    /// harder one.** The acceptance is an ordinary outbox entry: A must collect
+    /// it like any message and acknowledge it like any message, or B re-seeds its
+    /// acceptance to the seven-day give-up and reports the frame that opened the
+    /// conversation undelivered.
+    ///
+    /// Exactly once is the property, not merely once: the fast path reports a
+    /// settled sequence and the tick's owed-surfacing sweep must not report it
+    /// again in the same run.
+    #[tokio::test(start_paused = true)]
+    async fn an_acknowledgement_settles_the_senders_outbox_exactly_once() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let dht_b = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        dht_b.set_key_record(Some(key_record_for(&a_keys)));
+
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+
+        let established = establish_between(
+            &handle_a, &probe_a, &mut evt_a, &mut evt_b, &handle_b, &probe_b, &wall, &b_keys,
+        )
+        .await;
+        // **The knock's own sequence zero, and the only oracle for it.** It is
+        // carried by doorbell and no page will ever hold it, so the acceptor
+        // settles that position at the accept and piggybacks it on the
+        // acceptance. Without that, the contiguous prefix never starts and the
+        // message that opens every conversation is re-seeded to the give-up and
+        // then reported undelivered.
+        assert_eq!(
+            confirmations(&established),
+            vec![0],
+            "A's knock must be confirmed by the acceptance it opened: {established:?}"
+        );
+        let _ = drain(&mut evt_b);
+
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "confirm this".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        // Enough cadences for the whole chain: A publishes, B sweeps and
+        // collects, B's floor fires and writes the record, A fetches it.
+        for _ in 0..6 {
+            cadence(&wall).await;
+        }
+
+        let a_events = drain(&mut evt_a);
+        let b_events = drain(&mut evt_b);
+
+        assert_eq!(
+            messages(&b_events),
+            vec![(1, "confirm this".to_string())],
+            "B must have collected the message the acknowledgement is about: {b_events:?}"
+        );
+        assert!(
+            dht_b.count(Method::PublishAck) >= 1,
+            "B must have written a standalone acknowledgement once its floor fired"
+        );
+        assert!(
+            dht_a.count(Method::FetchAck) >= 1,
+            "A must have asked for the acknowledgement, or the settle below is vacuous"
+        );
+        // Sequence zero is the knock. It is carried by doorbell and no page will
+        // ever hold it, so the acceptor settles that position at the accept —
+        // and this is the only oracle for that. Without it the contiguous prefix
+        // never starts and the message that opens every conversation is
+        // re-seeded to the give-up and then reported undelivered.
+        assert_eq!(
+            confirmations(&a_events),
+            vec![1],
+            "A must report its message collected exactly once: {a_events:?}"
+        );
+        assert_eq!(
+            confirmations(&b_events),
+            vec![0],
+            "B's acceptance is an ordinary outbox entry and must settle like one: \
+             {b_events:?}"
+        );
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+    }
+
+    /// T28. A piggybacked acknowledgement settles the sender's outbox on the
+    /// page fold alone.
+    ///
+    /// **A's acknowledgement seam is scripted to fail for the whole test**, so
+    /// nothing A settles can have come from a fetched record. That is a stronger
+    /// control than counting the fetches: a count of zero would only hold while
+    /// the fetch cadence happened not to have fired, and the property under test
+    /// is that the piggyback needs no fetch at all — a reply carries the
+    /// correspondent's whole collection state, and `on_page` is where it lands.
+    ///
+    /// The sweep count is the positive control: without it, "A settled without
+    /// fetching" is satisfied by a driver that swept nothing and settled nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_piggybacked_acknowledgement_settles_without_a_fetch() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::failing_on(
+            net.clone(),
+            Duration::from_millis(50),
+            Method::FetchAck,
+        ));
+        let dht_b = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        dht_b.set_key_record(Some(key_record_for(&a_keys)));
+
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+
+        let established = establish_between(
+            &handle_a, &probe_a, &mut evt_a, &mut evt_b, &handle_b, &probe_b, &wall, &b_keys,
+        )
+        .await;
+        assert_eq!(
+            confirmations(&established),
+            vec![0],
+            "A's knock must be confirmed by the acceptance it opened: {established:?}"
+        );
+        let _ = drain(&mut evt_b);
+
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "ping".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        for _ in 0..3 {
+            cadence(&wall).await;
+        }
+        assert_eq!(
+            messages(&drain(&mut evt_b)),
+            vec![(1, "ping".to_string())],
+            "B must have collected the message before it can acknowledge it"
+        );
+
+        // B answers rather than writing a standalone record; the reply carries
+        // B's whole collection state inside its own signature.
+        handle_b
+            .send(DmCommand::Send {
+                to: Box::new(*a_keys.signing.public_key()),
+                body: "pong".into(),
+            })
+            .await
+            .expect("B replies");
+        let swept_before = dht_a.count(Method::SweepPage);
+        for _ in 0..3 {
+            cadence(&wall).await;
+        }
+        let a_events = drain(&mut evt_a);
+
+        assert_eq!(
+            messages(&a_events),
+            vec![(1, "pong".to_string())],
+            "A must have opened the reply that carried the acknowledgement: {a_events:?}"
+        );
+        assert!(
+            dht_a.count(Method::SweepPage) > swept_before,
+            "A must have kept sweeping, or the fold below never had bytes to work on"
+        );
+        // **The failing path has to have run.** A fetch count of zero would mean
+        // the scripted failure was never exercised, which makes "no fetch
+        // contributed" true for the wrong reason — the seam was simply never
+        // asked.
+        assert!(
+            dht_a.count(Method::FetchAck) >= 1,
+            "A must actually have asked its acknowledgement seam and been refused, \
+             or the control below proves nothing"
+        );
+        assert_eq!(
+            confirmations(&a_events),
+            vec![1],
+            "the piggybacked acknowledgement must settle A's message exactly once, \
+             with every fetch on A's seam failing: {a_events:?}"
+        );
+        assert_eq!(
+            last_health(&a_events).map_or(0, |h| h.4),
+            0,
+            "A deferred the piggybacked acknowledgement instead of folding it: {a_events:?}"
+        );
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
     }
 }

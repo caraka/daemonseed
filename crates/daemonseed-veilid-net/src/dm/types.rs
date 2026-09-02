@@ -277,13 +277,34 @@ pub enum DmEvent {
         /// unsettled and the next sweep retries it. This counter is what
         /// separates a conversation waiting on its acceptance from an idle one.
         peer_pseudonym_unknown: u64,
-        /// Piggybacked acknowledgements carried by frames this session opened
-        /// and did not fold.
+        /// Peer acknowledgements — piggybacked or standalone — that would not
+        /// merge into this side's retained state.
         ///
-        /// The fold — merge into the retained send-direction state, settle the
-        /// outbox, report the settled sequences — is the acknowledgement slice's.
-        /// Counted here so a dropped claim is visible rather than silent.
+        /// One condition reaches it: the union would exceed the ack's run
+        /// capacity, which
+        /// [`AckState::merge_peer_ack`](daemonseed_core::dm::ack::AckState::merge_peer_ack)
+        /// refuses all-or-nothing rather than truncating. Nothing is settled and
+        /// nothing is lost — the peer re-writes a monotonic statement, so a later
+        /// fold carries everything this one would have — but a rising count says
+        /// the conversation is fragmented enough that confirmations are stalling.
         peer_acks_deferred: u64,
+        /// Peer acknowledgements claiming a sequence number above what this side
+        /// has actually sent, clipped to that ceiling.
+        ///
+        /// **Nothing legitimate produces one**, so this is a peer-misbehaviour
+        /// signal rather than a routine result: a correspondent cannot have
+        /// collected what was never transmitted. The claim is clipped rather than
+        /// refused, so the truthful part of the statement still settles.
+        peer_acks_clipped: u64,
+        /// Standalone acknowledgement records that did not decode or did not
+        /// verify against the correspondent's pseudonym key.
+        ///
+        /// The record's address is derived from the conversation's secret
+        /// address root, so a third party cannot write one — but the fetch is an
+        /// ordinary read of untrusted bytes, and a record that fails here settles
+        /// nothing at all. Counted rather than surfaced: the sender's own re-seed
+        /// ladder and give-up already carry the user-visible consequence.
+        peer_acks_unverified: u64,
     },
     /// A contact lookup failed during a sweep, so knocks were dropped.
     ///
@@ -527,6 +548,8 @@ impl core::fmt::Debug for DmEvent {
                 unopenable,
                 peer_pseudonym_unknown,
                 peer_acks_deferred,
+                peer_acks_clipped,
+                peer_acks_unverified,
                 ..
             } => {
                 f.write_str("ChannelHealth { with: ")?;
@@ -535,7 +558,9 @@ impl core::fmt::Debug for DmEvent {
                     f,
                     ", partial_sweeps: {partial_sweeps}, already_consumed: {already_consumed}, \
                      unopenable: {unopenable}, peer_pseudonym_unknown: {peer_pseudonym_unknown}, \
-                     peer_acks_deferred: {peer_acks_deferred} }}"
+                     peer_acks_deferred: {peer_acks_deferred}, \
+                     peer_acks_clipped: {peer_acks_clipped}, \
+                     peer_acks_unverified: {peer_acks_unverified} }}"
                 )
             }
             DmEvent::ContactLookupFailed => f.write_str("ContactLookupFailed"),

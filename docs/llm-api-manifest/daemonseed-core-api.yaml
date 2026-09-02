@@ -1215,9 +1215,14 @@ modules:
       now_ms earlier than the last grant refuses.
       Sub-module dm::ack_cadence decides when a receiver writes a standalone
       acknowledgement and which conversation takes the allowance next.
-      pending_sent_ms is the declared send time of every message collected and
-      not yet covered by a written acknowledgement, passed whole; give_up_ms is
-      outbox::GIVE_UP_MS in production.
+      pending_sent_ms is the declared send time of every message collected on
+      the acknowledged direction that is still inside the sender's own give-up
+      window, passed whole; give_up_ms is outbox::GIVE_UP_MS in production.
+      Entries age out of that set by the window and are NOT cleared by a written
+      acknowledgement: nothing acknowledges an acknowledgement, and a record on a
+      store with no TTL survives only while its writer keeps rewriting it, so a
+      set cleared on write would terminate the cadence and leave the record
+      un-refreshed.
       oldest_live_pending_ms(now_ms, pending_sent_ms: impl IntoIterator<Item =
       i64>, give_up_ms) -> Option<i64> drops every entry for which now_ms -
       sent_ms >= give_up_ms and returns the smallest that remains; None for an

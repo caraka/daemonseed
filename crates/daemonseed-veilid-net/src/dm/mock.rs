@@ -132,6 +132,16 @@ pub(crate) struct MockNetwork {
     pages: Mutex<BTreeMap<PageKey, Slots>>,
     /// Doorbell records, by the owner seed a sender derives from a public key.
     doorbells: Mutex<BTreeMap<[u8; 32], Slots>>,
+    /// Acknowledgement records, keyed by a digest of the owner seed both ends
+    /// derive — the same treatment [`MockNetwork::pages`] gets, and for the same
+    /// reason: the seed is the conversation's write capability and a map key is
+    /// a plain buffer that outlives every address.
+    ///
+    /// **One record per direction, rewritten in place**, which is what an
+    /// acknowledgement is: current state, not a log. A second write of the same
+    /// direction replaces the first, so a fetch always sees the latest
+    /// statement.
+    acks: Mutex<BTreeMap<AckKey, Vec<u8>>>,
 }
 
 /// One record's populated subkeys: slot index to whatever was last written to
@@ -140,6 +150,9 @@ type Slots = BTreeMap<u16, Vec<u8>>;
 
 /// What [`MockNetwork::pages`] is keyed on: a digest of a page owner seed.
 type PageKey = u64;
+
+/// What [`MockNetwork::acks`] is keyed on: a digest of an ack owner seed.
+type AckKey = u64;
 
 /// Hash one page owner seed into a map key.
 ///
@@ -156,6 +169,15 @@ fn page_key(seed: &[u8; DM_PAGE_OWNER_SEED_LEN]) -> PageKey {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     seed.hash(&mut h);
+    h.finish()
+}
+
+/// Hash one acknowledgement owner seed into a map key, on exactly the terms
+/// [`page_key`] states.
+fn ack_key(address: &DmAckAddress) -> AckKey {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    address.owner_seed().as_bytes().hash(&mut h);
     h.finish()
 }
 
@@ -619,6 +641,13 @@ impl DmDht for MockDht {
         let latency = self.latency;
         let boom = self.panics(Method::PublishAck);
         let dud = self.fails(Method::PublishAck);
+        if !dud && !boom {
+            self.net
+                .acks
+                .lock()
+                .expect("mock acks")
+                .insert(ack_key(&address), record);
+        }
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
@@ -639,13 +668,20 @@ impl DmDht for MockDht {
         let latency = self.latency;
         let boom = self.panics(Method::FetchAck);
         let dud = self.fails(Method::FetchAck);
+        let held = self
+            .net
+            .acks
+            .lock()
+            .expect("mock acks")
+            .get(&ack_key(&address))
+            .cloned();
         Box::pin(async move {
             tokio::time::sleep(latency).await;
             assert!(!boom, "scripted seam panic");
             if dud {
                 return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
             }
-            Ok(None)
+            Ok(held)
         })
     }
 }

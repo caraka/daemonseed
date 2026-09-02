@@ -315,6 +315,31 @@ work lives in the maintainer's own planning notes, not here.
   `chan_id`, the recipient's key-record address, or a salted derivation over
   either. ISC-A-C44. (#288)
 
+- `daemonseed_veilid_net::dm` — the DM driver's acknowledgement half. A receiver holds one
+  `StandaloneAckCadence` per correspondence and one client-global `StandaloneAckBudget`; on each tick
+  every correspondence that wants a write is ordered by `ack_cadence::pick_next`, oldest pending
+  first, and the budget grants at most one. A granted write builds the record with
+  `ack_record::build_encoded` over the collection's own state and publishes it at
+  `DmAckAddress::for_direction` over the receiving direction; the cadence advances on the write's
+  outcome, never on the decision. A refusal's `retry_after_ms` becomes a wake time. The taper is
+  keyed on each collected frame's own `sent_unix_ms`, and a correspondence stops wanting a write once
+  every message it collected has passed the sender's give-up. A sender holds one retained `AckState`
+  per correspondence: piggybacked acknowledgements are folded where the frame is opened, and on each
+  tick a correspondence with unsettled entries and a known pseudonym fetches the peer's record,
+  verifies it with `ack_record::decode_and_verify` and folds that. Each collected frame's asserted
+  send time is clamped to the moment it was collected before it enters the taper's set: a
+  peer-asserted time in the future never ages out of the give-up window, so stored verbatim it
+  terminates no conversation, writes for ever, and takes the client-global allowance from every
+  honest correspondence at once. The set is sorted, deduplicated and capped, dropping the
+  second-newest entry on overflow so the oldest and the newest both survive. Either fold merges under the
+  highest sequence this side has sent, then settles the outbox and emits
+  `DmEvent::Delivery { state: ConfirmedCollected }` for each settled sequence, once per run. Cadence
+  and budget state are not persisted: after a restart the taper restarts from the floor. (#235)
+
+- An acceptor's collection settles the knock's own sequence zero, which arrives by doorbell and no
+  page will ever hold, so the contiguous prefix starts and the initiator's opening message can be
+  confirmed. (#235)
+
 ### Fixed
 
 - Corrected the direct-message outbox record's growth, which retained every entry ever
@@ -407,6 +432,12 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Removed
 
+- `daemonseed_veilid_net::dm::spawn_dm_ack_publish`. The DM driver owns when a standalone
+  acknowledgement is written, and the helper decided nothing about it; no production caller
+  existed. Building and addressing a record remains
+  `daemonseed_core::dm::ack_record::build_encoded` plus `DmAckAddress::for_direction`, and the
+  write remains `VeilidNetHandle::publish_dm_ack`. (#235)
+
 - The default path for `cargo xtask findings-resolved`, which pointed outside the
   repository. The subcommand now requires `--draft <path>`.
 
@@ -424,6 +455,12 @@ work lives in the maintainer's own planning notes, not here.
   path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
+
+- `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` carries `peer_acks_clipped` and
+  `peer_acks_unverified`: a peer acknowledgement claiming a sequence above what this side has sent,
+  and a fetched record that did not decode or did not verify. `peer_acks_deferred` now counts
+  acknowledgements that would not merge into the retained state, where before it counted every
+  piggybacked one the driver did not fold. (#235)
 
 - `daemonseed_veilid_net::dm::DmCommand::Accept` also composes the acceptance and queues it at channel sequence zero, emitting `DmEvent::Delivery { seq: 0, state: Composed }`, and erases any provisional record this side held for the same identity. A refused acceptance emits `DmEvent::Delivery { seq: 0, state: Undelivered }` with a `DmEvent::Refused` naming the reason, and is retried on the idle cadence while the acceptor's sequence zero is unspent, reported once per distinct reason. A record the erase could not reach is retried on later ticks rather than dropped. (#234, #236)
 - A first-contact mint is refused with `RefusalReason::AlreadyEstablished` when a correspondence with that identity already carries the correspondent's pseudonym. (#234, #236)

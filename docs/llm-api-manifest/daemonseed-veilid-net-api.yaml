@@ -144,8 +144,8 @@ modules:
       - daemonseed_veilid_net::route_budget
   - name: daemonseed_veilid_net::dm
     description: >-
-      Direct-messaging helpers and the DM driver. Holds the two spawn helpers both
-      frontend net actors share (spawn_dm_key_record_publish, spawn_dm_ack_publish),
+      Direct-messaging helpers and the DM driver. Holds the one spawn helper both
+      frontend net actors share (spawn_dm_key_record_publish),
       the DmDht seam over the handle's seven DM DHT operations, and DmDriver — a
       command/event task owning a DmPersist, an injected WallClock and the identity
       halves, driving a step machine whose DHT operations run off its loop.
@@ -322,7 +322,31 @@ types:
       the contiguous prefix moved, bounded by the pages this session has swept. A
       correspondence found on disk at startup is listed with no ratchet — a
       ratchet has no at-rest record — so it sweeps nothing and a Send to it is
-      refused with NotEstablishedThisSession. `spawn` does the one-off work
+      refused with NotEstablishedThisSession. The same cadence carries the
+      acknowledgement plane. As a receiver the driver holds one
+      daemonseed_core::dm::ack_cadence::StandaloneAckCadence per correspondence,
+      keyed on the sent_unix_ms each collected frame asserted CLAMPED to the
+      moment it was collected — the field is peer-asserted and otherwise
+      unbounded, and a time in the future never ages out of the give-up window —
+      held as a sorted, deduplicated, capped set that drops its second-newest
+      entry on overflow so the oldest (the taper's key) and the newest (the
+      liveness witness) both survive, and one client-global StandaloneAckBudget; every correspondence that wants a write is
+      ordered by ack_cadence::pick_next, oldest pending first, and the budget grants
+      at most one per tick, a refusal's retry_after_ms becoming a wake time. A grant
+      builds the record with ack_record::build_encoded over Collection::ack and
+      publishes it at DmAckAddress::for_direction over the receiving direction; the
+      cadence advances on the write's outcome, never on the decision to write, and
+      stops wanting one once every message collected has passed the sender's
+      give-up. An acceptor settles the knock's own sequence zero at the accept,
+      because it arrives by doorbell and no page will ever hold it. As a sender the
+      driver holds one retained AckState per correspondence: a piggybacked
+      acknowledgement is folded where the frame is opened, and a correspondence with
+      unsettled entries and a known pseudonym fetches the peer's record on the tick
+      and folds it after ack_record::decode_and_verify. Either fold merges under the
+      highest sequence this side has sent, counting a clip on ChannelHealth, then
+      settles the outbox and reports each settled sequence as
+      Delivery{state: ConfirmedCollected} once per run. Cadence and budget state are
+      not persisted: after a restart the taper restarts from the floor. `spawn` does the one-off work
       before the task starts — deriving this identity's own doorbell and
       key-record owner seeds, provisioning the block list, and opening the
       spent-token set — so neither their failure modes nor Argon2id's cost land on
@@ -411,7 +435,7 @@ types:
       Refused{to,acceptance,reason}, AcceptFailed{request,from,reason},
       ChannelLost{with,cause,surfaced}, ChannelDirectionUnknown{with},
       DoorbellHealth{outcome,admission,pending_full},
-      ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred},
+      ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified},
       ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
       SpentTokensNotPersisted. ChannelHealth is one correspondence's channel-plane
       accounting, cumulative for the session and emitted only when a counter
@@ -420,7 +444,10 @@ types:
       and peer_pseudonym_unknown counts unsettled positions an initiator left
       alone because they sit at a sequence above the acceptance and no pseudonym
       is installed yet — once per sweep that saw them, so a position stuck across
-      four sweeps counts four. Refused covers a channel send as well as
+      four sweeps counts four. peer_acks_deferred counts peer acknowledgements that
+      would not merge into the retained state, peer_acks_clipped counts claims above
+      the highest sequence this side has sent, and peer_acks_unverified counts
+      fetched records that did not decode or did not verify. Refused covers a channel send as well as
       a first contact, and Refused
       carries a RefusalReason and AcceptFailed an AcceptFailure; ChannelLost
       carries the surfaced sequence numbers the user is owed; DoorbellHealth

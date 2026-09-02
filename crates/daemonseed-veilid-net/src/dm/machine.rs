@@ -12,18 +12,28 @@
 //!
 //! ## What is here, and what is not
 //!
-//! This is the **doorbell half**: our own doorbell is swept on the cadence,
-//! every populated slot goes through [`Admitter`] in its documented order, an
-//! admitted knock from a stranger is held until the user answers it, and an
-//! outbound knock is composed, proof-minted off the loop, and published. The
-//! channel plane — sending on an established correspondence, page sweeps,
-//! acknowledgements and the outbox's re-seed cadence — is items 3 and 4, and
-//! nothing here decides any of it.
+//! Three planes, all of them decided here. The **doorbell**: our own doorbell is
+//! swept on the cadence, every populated slot goes through [`Admitter`] in its
+//! documented order, an admitted knock from a stranger is held until the user
+//! answers it, and an outbound knock is composed, proof-minted off the loop and
+//! published. The **channel**: due outbox entries are emitted on their re-seed
+//! ladder, the pages [`Collection::probe_plan`] names are swept, and a frame
+//! that opens and verifies becomes a message. The **acknowledgement**: what this
+//! side collected is written on a tapering standalone cadence under a
+//! client-global allowance, and what the correspondent collected is folded from
+//! its piggyback or its record and settles this side's outbox.
+//!
+//! What is NOT here is anything that reads a clock or touches the DHT. Both
+//! arrive as arguments, which is what makes every decision above checkable by
+//! value.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemonseed_core::dm::ack_record::DmAckAddress;
+use daemonseed_core::dm::ack::{AckState, PeerAck, PeerAckOutcome};
+use daemonseed_core::dm::ack_budget::{AckPermit, StandaloneAckBudget};
+use daemonseed_core::dm::ack_cadence::{self, StandaloneAckCadence};
+use daemonseed_core::dm::ack_record::{self, DmAckAddress};
 use daemonseed_core::dm::admission::{AdmissionCounters, AdmissionOutcome, Admitter, SeenSet};
 use daemonseed_core::dm::block_list::{BlockList, BlockListError};
 use daemonseed_core::dm::collect::Collection;
@@ -35,7 +45,9 @@ use daemonseed_core::dm::firstcontact::{
 use daemonseed_core::dm::frame::{self, AuthorKeys, WORST_CASE_SEALED_FRAME_LEN};
 use daemonseed_core::dm::keyrec::KEM_EK_LEN;
 use daemonseed_core::dm::keyrec::{self, DM_KEYREC_OWNER_SEED_LEN};
-use daemonseed_core::dm::outbox::{DeliveryState, OutboxError, OutboxTarget, SealedFrame};
+use daemonseed_core::dm::outbox::{
+    DeliveryState, OutboxError, OutboxTarget, SealedFrame, GIVE_UP_MS,
+};
 use daemonseed_core::dm::paging::{
     position_of, DmPageAddress, PagePosition, Receiving, Sending, ADDRESS_ROOT_LEN, PAGE_SLOTS,
 };
@@ -63,6 +75,30 @@ use crate::dm::types::{
 /// sweep and surfaces nothing; the sender re-seeds on their own schedule, so a
 /// request refused for room here reappears once the user has cleared some.
 pub(crate) const PENDING_REQUEST_CAP: usize = 64;
+
+/// The sending-direction sequence number the first-contact knock occupies.
+///
+/// The same number as
+/// [`FIRST_RECIPIENT_CHANNEL_SEQ`](daemonseed_core::dm::ratchet::FIRST_RECIPIENT_CHANNEL_SEQ)
+/// and a different fact: that one is the acceptor's first channel *send*, this
+/// is the initiator's knock. They are spelled apart because only one of them is
+/// carried by doorbell, and confusing the two settles a position on the wrong
+/// direction.
+const KNOCK_CHANNEL_SEQ: u64 = 0;
+
+/// How many distinct send times one correspondence's pending set holds.
+///
+/// The set is what the standalone taper is measured against, and a correspondent
+/// decides how many messages go into it — so without a ceiling a flood buys
+/// unbounded memory per conversation, inside one give-up window, from a party who
+/// only has to keep writing.
+///
+/// **The overflow drops the SECOND-NEWEST, so the oldest and the newest both
+/// survive.** The oldest is the taper's key and the newest is what says anything
+/// is still live at all: dropping either would change an answer, where dropping
+/// from the middle only makes the interval more conservative for a while — fewer
+/// writes, which is the fail-safe side of a cadence.
+const PENDING_SENT_CAP: usize = 256;
 
 /// One thing the shell should do as a result of a step.
 ///
@@ -190,10 +226,6 @@ impl core::fmt::Debug for OpTag {
 }
 
 /// One DHT operation, as the machine asks for it.
-//
-// PublishAck and FetchAck are dispatched and oracle-covered but constructed by
-// nothing yet: the acknowledgement slice constructs them.
-#[allow(dead_code)]
 pub(crate) enum DhtOp {
     /// Fetch a correspondent's key record.
     FetchKeyRecord { tag: OpTag, owner_seed: [u8; 32] },
@@ -261,10 +293,6 @@ impl DhtOp {
 }
 
 /// What one completed DHT operation yielded.
-//
-// `Ack` carries a payload the machine matches on but does not yet read: the
-// acknowledgement slice reads it.
-#[allow(dead_code)]
 pub(crate) enum DhtResult {
     /// A key-record fetch; `None` is the awaiting-key state.
     KeyRecord(Option<Vec<u8>>),
@@ -276,6 +304,17 @@ pub(crate) enum DhtResult {
     Page(DmPageSweep),
     /// An acknowledgement fetch; `None` is no confirmation yet.
     Ack(Option<Vec<u8>>),
+    /// An acknowledgement write completed.
+    ///
+    /// **Deliberately not [`Self::Written`]**, which every other write maps to.
+    /// A page or doorbell write confirms the outbox entry its tag names; an
+    /// acknowledgement write has no entry, and what it advances instead is the
+    /// receiver's own standalone cadence. Folding the two would either advance
+    /// the cadence on a page write or leave it un-advanced on its own, and the
+    /// second is the expensive one: a cadence that never records its write
+    /// re-asks on every tick and spends the client-global allowance on one
+    /// conversation.
+    AckWritten,
 }
 
 /// One completed DHT operation, tagged with what asked for it.
@@ -332,7 +371,7 @@ pub(crate) struct MintRequest {
     ///
     /// Handed back on [`MintOutcome`] rather than dropped with the request: it
     /// signs every later frame of this conversation, so a mint that consumed it
-    /// would leave the channel unable to speak the moment item 3 tried.
+    /// would leave the channel unable to speak.
     pub signing_pc: SignKeypair,
     /// The recipient's static encapsulation key, from their verified record.
     pub kem_ek_b: Box<[u8; KEM_EK_LEN]>,
@@ -566,6 +605,54 @@ struct Correspondence {
     offered_this_session: Vec<u64>,
     /// This correspondence's channel-plane accounting, cumulative.
     health: ChannelCounters,
+    /// When this side last wrote a standalone acknowledgement for the receiving
+    /// direction, and whether anything has been collected since.
+    ///
+    /// One per correspondence, against the one client-global
+    /// [`StandaloneAckBudget`] on the machine: this decides whether a
+    /// conversation *wants* a write, the budget decides whether the client can
+    /// afford one, and a write happens only where both agree.
+    ///
+    /// **Not persisted, and that is a recorded limit rather than an
+    /// oversight.** After a restart the taper restarts from the floor, so the
+    /// first tick of a new process writes one acknowledgement per correspondence
+    /// it collected on, spaced by the budget. The cost is bounded write
+    /// allowance; the alternative is a record whose absence would have to be
+    /// distinguished from a conversation that genuinely never wrote one.
+    ack_cadence: StandaloneAckCadence,
+    /// The send times of the messages this session has opened on the receiving
+    /// direction — what the taper measures the sender's give-up from.
+    ///
+    /// **Sorted ascending, deduplicated, and capped at [`PENDING_SENT_CAP`].**
+    /// Sorted so [`Self::prune_pending`] can drop the dead as a prefix rather
+    /// than rewriting the whole vector, and so the cap knows which entries it is
+    /// choosing between; see the constant for which one overflow drops.
+    ///
+    /// **The frame's own asserted send time, clamped to the moment it was
+    /// collected.** [`ack_cadence`](daemonseed_core::dm::ack_cadence) interpolates
+    /// across the sender's window, and the sender measures that window from its
+    /// own compose instant, so `sent_unix_ms` is the only value on the wire that
+    /// tracks it — a receipt time would restart the window at collection. The
+    /// clamp is [`Self::note_pending`]'s and is load-bearing rather than tidy;
+    /// the reasoning is there.
+    ///
+    /// **Entries are never removed on acknowledgement, only aged out.** Nothing
+    /// acknowledges an acknowledgement, so this side never learns its record was
+    /// read; a set cleared on write would terminate the cadence immediately and
+    /// leave the record un-refreshed, which on a store with no TTL is the same
+    /// as never having written it. What bounds the set instead is the give-up:
+    /// [`ack_cadence::oldest_live_pending_ms`] drops anything past its own
+    /// window, and [`Self::prune_pending`] applies the identical rule.
+    pending_sent_ms: Vec<i64>,
+    /// What the correspondent has acknowledged of what THIS side sent — the
+    /// retained own state every peer acknowledgement, piggybacked or standalone,
+    /// is merged into under this side's own ceiling.
+    ///
+    /// Retained rather than rebuilt per fold because a merge is a union: a
+    /// peer's later statement may settle a run this side already holds and say
+    /// nothing about an earlier one, and a fresh state per fold would un-settle
+    /// everything the previous statement carried.
+    own_ack: AckState,
     /// The last refusal [`DmMachine::fire_accept`] reported for this
     /// correspondence, so the tick's retry does not repeat itself.
     ///
@@ -614,6 +701,8 @@ struct ChannelCounters {
     unopenable: u64,
     peer_pseudonym_unknown: u64,
     peer_acks_deferred: u64,
+    peer_acks_clipped: u64,
+    peer_acks_unverified: u64,
 }
 
 impl core::fmt::Debug for Correspondence {
@@ -644,6 +733,49 @@ impl Correspondence {
         }
     }
 
+    /// Record that a frame asserting `sent_unix_ms` was collected at `now_ms`.
+    ///
+    /// **The send time is clamped to `now_ms`, and that is what stops a peer
+    /// pinning the cadence open for ever.** `sent_unix_ms` is peer-asserted and
+    /// signed, which authenticates it as a *statement* and bounds it in no other
+    /// way. A frame claiming a send time in the future never satisfies
+    /// `now_ms - sent_ms >= give_up_ms`, so it never ages out of
+    /// [`Self::prune_pending`] or out of
+    /// [`ack_cadence::oldest_live_pending_ms`]: the conversation never
+    /// terminates, writes for ever, and — because the key is the smallest value —
+    /// wins [`ack_cadence::pick_next`] against every honest correspondence at
+    /// once. Clamping costs nothing on an honest frame and keeps the
+    /// conservative direction for ordinary clock skew, because a send time at
+    /// `now_ms` is the oldest a *live* message can be at collection: it yields
+    /// the ceiling interval, which is the least frequent cadence.
+    ///
+    /// Duplicates are dropped rather than stored: two messages sent in the same
+    /// millisecond are one point on the curve.
+    fn note_pending(&mut self, sent_unix_ms: i64, now_ms: i64) {
+        let sent_ms = sent_unix_ms.min(now_ms);
+        let Err(at) = self.pending_sent_ms.binary_search(&sent_ms) else {
+            return;
+        };
+        self.pending_sent_ms.insert(at, sent_ms);
+        if self.pending_sent_ms.len() > PENDING_SENT_CAP {
+            // The last of the oldest block, so index zero and the final index —
+            // the taper's key and the liveness witness — are both untouched.
+            self.pending_sent_ms.remove(PENDING_SENT_CAP - 1);
+        }
+    }
+
+    /// Drop every pending send time that has passed the sender's own give-up.
+    ///
+    /// The same predicate [`ack_cadence::oldest_live_pending_ms`] filters by, so
+    /// the first entry left is that function's answer. Sorted ascending, so the
+    /// dead are a prefix and the scan stops at the first live one.
+    fn prune_pending(&mut self, now_ms: i64) {
+        let dead = self
+            .pending_sent_ms
+            .partition_point(|&sent_ms| now_ms.saturating_sub(sent_ms) >= GIVE_UP_MS);
+        self.pending_sent_ms.drain(..dead);
+    }
+
     /// Emit this correspondence's accounting if anything moved since `before`.
     fn health_event(&self, before: ChannelCounters) -> Option<DmEffect> {
         if self.health == before {
@@ -656,6 +788,8 @@ impl Correspondence {
             unopenable: self.health.unopenable,
             peer_pseudonym_unknown: self.health.peer_pseudonym_unknown,
             peer_acks_deferred: self.health.peer_acks_deferred,
+            peer_acks_clipped: self.health.peer_acks_clipped,
+            peer_acks_unverified: self.health.peer_acks_unverified,
         }))
     }
 }
@@ -731,6 +865,24 @@ pub(crate) struct DmMachine {
     /// moves here rather than being dropped, and every tick tries again until
     /// the store says the record is gone.
     pending_erase: Vec<(CorrespondenceLabel, ProvisionalContext, u64)>,
+    /// The client-global allowance for standalone acknowledgements.
+    ///
+    /// **One per driver, shared across every correspondence**, which is the
+    /// whole reason the ordering below exists: the ceiling is client-wide, so a
+    /// per-conversation budget would multiply it by the number of contacts a
+    /// stranger can create.
+    ack_budget: StandaloneAckBudget,
+    /// The correspondence that took the last standalone-acknowledgement
+    /// allowance, so [`ack_cadence::pick_next`] can decline to give it two
+    /// rounds running.
+    last_ack_picked: Option<CorrespondenceLabel>,
+    /// When the budget said it would next grant, from the `retry_after_ms` of
+    /// its last refusal.
+    ///
+    /// Folded into [`Self::next_due_ms`] so a driver whose idle cadence is
+    /// slower than the allowance still wakes to write the acknowledgement it was
+    /// refused, rather than deferring it a whole tick.
+    ack_retry_due_ms: Option<i64>,
 }
 
 impl DmMachine {
@@ -765,6 +917,9 @@ impl DmMachine {
             provisionals: Vec::new(),
             correspondences,
             pending_erase: Vec::new(),
+            ack_budget: StandaloneAckBudget::new(),
+            last_ack_picked: None,
+            ack_retry_due_ms: None,
         }
     }
 
@@ -808,7 +963,14 @@ impl DmMachine {
             out.extend(self.give_ups(now_ms, index));
             out.extend(self.due_emissions(now_ms, index));
             out.extend(self.probe(now_ms, index));
+            out.extend(self.ack_fetches(now_ms, index));
         }
+        // **After the per-correspondence pass, and once for all of them**, because
+        // the standalone allowance is client-global: deciding it inside the loop
+        // would hand it to whichever correspondence the store happened to
+        // enumerate first, where `pick_next` gives it to the one whose sender has
+        // been waiting longest.
+        out.extend(self.standalone_acks(now_ms));
         out
     }
 
@@ -872,15 +1034,24 @@ impl DmMachine {
                     self.confirm_written(now_ms, &tag)
                 }
                 Ok(DhtResult::Page(sweep)) => self.on_page(now_ms, &tag, sweep),
-                // The acknowledgement slice reads this.
-                Ok(DhtResult::Ack(_)) => Vec::new(),
+                Ok(DhtResult::Ack(record)) => self.on_peer_ack(now_ms, &tag, record),
+                Ok(DhtResult::AckWritten) => self.on_ack_written(now_ms, &tag),
             },
         }
     }
 
     /// When the shell should next wake the machine if nothing else happens.
+    ///
+    /// The idle cadence, or the moment the standalone-acknowledgement allowance
+    /// renews where that lands sooner. **Only strictly sooner, and only in the
+    /// future**: a deadline already passed would be handed back as a wait of
+    /// zero and spin the shell's loop at the speed of the scheduler.
     pub(crate) fn next_due_ms(&self, now_ms: i64) -> i64 {
-        now_ms.saturating_add(duration_as_ms(self.cfg.idle_tick))
+        let idle = now_ms.saturating_add(duration_as_ms(self.cfg.idle_tick));
+        match self.ack_retry_due_ms {
+            Some(due) if due > now_ms && due < idle => due,
+            _ => idle,
+        }
     }
 
     /// The wall time of the last tick this machine saw, if it has seen one.
@@ -1206,14 +1377,7 @@ impl DmMachine {
     /// schedule does not, and a queued knock still has to be re-seeded and still
     /// has to be given up on.
     fn stored_direction(&self, label: &CorrespondenceLabel, now_ms: i64) -> Option<Direction> {
-        match self.persist.read_outbox(label, now_ms) {
-            Ok(Some(outbox)) => Some(outbox.direction()),
-            Ok(None) => None,
-            Err(e) => {
-                crate::vtrace!("dm driver: the outbox would not read: {e}");
-                None
-            }
-        }
+        stored_direction(&self.persist, label, now_ms)
     }
 
     /// Emit every entry the re-seed ladder says is due, for this correspondence.
@@ -1476,7 +1640,7 @@ impl DmMachine {
     /// Advancing the frontier or the cursor on a partial read walks past
     /// messages that were there, and no later sweep revisits them. So the page
     /// is left exactly as it was and re-planned on the next cadence.
-    fn on_page(&mut self, _now_ms: i64, tag: &OpTag, sweep: DmPageSweep) -> Vec<DmEffect> {
+    fn on_page(&mut self, now_ms: i64, tag: &OpTag, sweep: DmPageSweep) -> Vec<DmEffect> {
         let (Some(conversation), Some(page)) = (tag.conversation, tag.page) else {
             return Vec::new();
         };
@@ -1533,6 +1697,8 @@ impl DmMachine {
         for at in owed {
             if correspondence.collection.collected(at).is_err() {
                 correspondence.owed_acks.push(at);
+            } else {
+                correspondence.ack_cadence.on_collected();
             }
         }
 
@@ -1626,9 +1792,22 @@ impl DmMachine {
                     }
                     if correspondence.collection.collected(at).is_err() {
                         correspondence.owed_acks.push(at);
+                    } else {
+                        // The floor: the first standalone acknowledgement after
+                        // new messages goes whatever the curve says, so a
+                        // conversation that has been quiet for days still
+                        // confirms the message that broke the silence at once.
+                        correspondence.ack_cadence.on_collected();
                     }
-                    if verified.peer_ack.is_some() {
-                        correspondence.health.peer_acks_deferred += 1;
+                    // The frame's own asserted send time, clamped to now; see
+                    // `note_pending` for both halves of why.
+                    correspondence.note_pending(verified.sent_unix_ms, now_ms);
+                    // The piggybacked half of the fold. It takes the identical
+                    // decode-verify-merge path a standalone record takes; only
+                    // what authenticated it differs, and that already happened
+                    // above, inside the open.
+                    if let Some(peer) = verified.peer_ack {
+                        out.extend(fold_peer_ack(persist, correspondence, now_ms, peer));
                     }
                     out.push(DmEffect::Emit(DmEvent::Message {
                         from: Box::new(*correspondence.pk_lt),
@@ -1695,6 +1874,266 @@ impl DmMachine {
                 .as_ref()
                 .is_some_and(|r| r.ar_fingerprint() == conversation)
         })
+    }
+
+    // ---- the channel plane: acknowledging ----------------------------------
+
+    /// Ask this correspondence's correspondent what it has collected of what we
+    /// sent.
+    ///
+    /// **On the existing tick, with no timer of its own.** A fetch is one gated
+    /// GET and costs nothing but a read, so a second cadence would buy a
+    /// confirmation arriving sooner by less than one idle tick at the price of a
+    /// second schedule to reason about.
+    ///
+    /// Skipped where there is nothing outstanding: an outbox whose every entry
+    /// has already been confirmed or given up has no answer a peer could supply,
+    /// and asking anyway would poll for the life of the conversation.
+    ///
+    /// The address is derived from `send_direction`, never from a role: the two
+    /// readings differ by one label, and the other one addresses a record the
+    /// peer never writes, with no error to say why.
+    fn ack_fetches(&self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        let correspondence = &self.correspondences[index];
+        let Some((ratchet, _, channel)) = correspondence.live() else {
+            return Vec::new();
+        };
+        // **Nothing to verify a record against is nothing to fetch.** An
+        // initiator holds no pseudonym for its correspondent until the acceptance
+        // lands, and a record fetched before then could only be discarded — so
+        // the read is skipped rather than spent and thrown away.
+        if correspondence.peer_pk_pc.is_none() {
+            return Vec::new();
+        }
+        let outstanding = match self.persist.read_outbox(&correspondence.label, now_ms) {
+            Ok(Some(outbox)) => outbox.iter().any(|entry| {
+                matches!(
+                    entry.delivery_state(),
+                    DeliveryState::Composed | DeliveryState::OnDht
+                )
+            }),
+            Ok(None) => false,
+            Err(e) => {
+                crate::vtrace!("dm driver: the outbox would not read: {e}");
+                false
+            }
+        };
+        if !outstanding {
+            return Vec::new();
+        }
+        let address =
+            match DmAckAddress::for_direction(&channel.address_root, ratchet.send_direction()) {
+                Ok(address) => address,
+                Err(e) => {
+                    crate::vtrace!("dm driver: ack address derivation failed: {e}");
+                    return Vec::new();
+                }
+            };
+        vec![DmEffect::Dht(DhtOp::FetchAck {
+            tag: OpTag::channel(*ratchet.ar_fingerprint(), None, None),
+            address,
+        })]
+    }
+
+    /// Fold a fetched acknowledgement record.
+    ///
+    /// **`None` is the ordinary state, not a failure.** An unwritten or evicted
+    /// record means the correspondent has confirmed nothing yet, which is what
+    /// every conversation looks like before its first collection; treating it as
+    /// an error would put a transport fault and an absence of confirmation on the
+    /// same footing, and under a fail-safe posture those must stay apart.
+    ///
+    /// The order is decode-and-verify, then merge under this side's own ceiling.
+    /// Nothing between the two may consult the claim: [`PeerAck`] exists to make
+    /// that unspellable, and the ceiling is a required argument on the only road
+    /// in.
+    fn on_peer_ack(&mut self, now_ms: i64, tag: &OpTag, record: Option<Vec<u8>>) -> Vec<DmEffect> {
+        let Some(record) = record else {
+            return Vec::new();
+        };
+        let Some(conversation) = tag.conversation else {
+            return Vec::new();
+        };
+        let Some(index) = self.index_of_conversation(&conversation) else {
+            return Vec::new();
+        };
+        let Self {
+            persist,
+            correspondences,
+            ..
+        } = self;
+        let correspondence = &mut correspondences[index];
+        let before = correspondence.health;
+        let verified = {
+            let Some((ratchet, _, channel)) = correspondence.live() else {
+                return Vec::new();
+            };
+            // The initiator holds no pseudonym for its correspondent until the
+            // acceptance lands, so there is nothing to verify a record against
+            // yet. Not counted: this is a conversation waiting on its
+            // acceptance, which `peer_pseudonym_unknown` already reports from
+            // the sweep that meets it first.
+            let Some(peer_pk_pc) = correspondence.peer_pk_pc.as_deref() else {
+                return Vec::new();
+            };
+            ack_record::decode_and_verify(
+                &record,
+                &channel.chan_id,
+                ratchet.send_direction(),
+                &channel.address_root,
+                peer_pk_pc,
+            )
+        };
+        let peer = match verified {
+            Ok(peer) => peer,
+            Err(e) => {
+                crate::vtrace!("dm driver: a fetched acknowledgement did not verify: {e}");
+                correspondence.health.peer_acks_unverified += 1;
+                return correspondence.health_event(before).into_iter().collect();
+            }
+        };
+        let mut out = fold_peer_ack(persist, correspondence, now_ms, peer);
+        out.extend(correspondence.health_event(before));
+        out
+    }
+
+    /// One standalone acknowledgement write landed: the cadence may advance.
+    ///
+    /// **On the write, never on the decision to write.** A decision the budget
+    /// refused, or a build that failed, must leave the floor raised — otherwise
+    /// the one acknowledgement the floor exists to guarantee after a collection
+    /// is lost, and the sender re-seeds to its give-up for a message that was
+    /// read.
+    fn on_ack_written(&mut self, now_ms: i64, tag: &OpTag) -> Vec<DmEffect> {
+        let Some(conversation) = tag.conversation else {
+            return Vec::new();
+        };
+        let Some(index) = self.index_of_conversation(&conversation) else {
+            return Vec::new();
+        };
+        self.correspondences[index].ack_cadence.on_acked(now_ms);
+        Vec::new()
+    }
+
+    /// Write the standalone acknowledgements this tick's allowance affords.
+    ///
+    /// Three questions in the order the design composes them: a correspondence
+    /// must *want* a write ([`StandaloneAckCadence::is_due`]), the competing set
+    /// must *choose* one ([`ack_cadence::pick_next`], oldest pending first), and
+    /// the client-global [`StandaloneAckBudget`] must *afford* it. The budget's
+    /// answer is final, and a refusal is scheduled rather than polled — its
+    /// `retry_after_ms` becomes a wake time in [`Self::next_due_ms`].
+    ///
+    /// The loop keeps asking while candidates remain, so a grant does not end the
+    /// round: it is the budget that ends it, which is the one place the ceiling
+    /// is enforced.
+    fn standalone_acks(&mut self, now_ms: i64) -> Vec<DmEffect> {
+        // Cleared here, so a stale wake time cannot outlive the refusal that set
+        // it: only a refusal in this same pass may put one back.
+        self.ack_retry_due_ms = None;
+        for correspondence in &mut self.correspondences {
+            correspondence.prune_pending(now_ms);
+        }
+        let mut due: Vec<(CorrespondenceLabel, i64)> = Vec::new();
+        for correspondence in &self.correspondences {
+            if correspondence.live().is_none() {
+                continue;
+            }
+            // **The set is scanned once and the answer reused.** The key is built
+            // with `oldest_live_pending_ms`, never from the raw set — a
+            // conversation whose oldest pending message has passed its own
+            // give-up would otherwise win rounds while being the one conversation
+            // a write cannot help — and `is_due` then asks its question of that
+            // one value, because the oldest live entry is the only member either
+            // answer depends on. Passing the whole set twice would walk it twice
+            // for an identical result.
+            let Some(oldest_ms) = ack_cadence::oldest_live_pending_ms(
+                now_ms,
+                correspondence.pending_sent_ms.iter().copied(),
+                GIVE_UP_MS,
+            ) else {
+                continue;
+            };
+            if !correspondence
+                .ack_cadence
+                .is_due(now_ms, [oldest_ms], GIVE_UP_MS)
+            {
+                continue;
+            }
+            due.push((correspondence.label, oldest_ms));
+        }
+
+        let mut out = Vec::new();
+        while !due.is_empty() {
+            let Some(label) = ack_cadence::pick_next(
+                due.iter().copied(),
+                now_ms,
+                GIVE_UP_MS,
+                self.last_ack_picked.as_ref(),
+            ) else {
+                break;
+            };
+            due.retain(|(candidate, _)| *candidate != label);
+            match self.ack_budget.request(now_ms) {
+                AckPermit::Granted => {
+                    self.last_ack_picked = Some(label);
+                    let Some(index) = self.correspondences.iter().position(|c| c.label == label)
+                    else {
+                        continue;
+                    };
+                    out.extend(self.publish_standalone_ack(index));
+                }
+                AckPermit::Refused { retry_after_ms } => {
+                    self.ack_retry_due_ms = Some(now_ms.saturating_add(retry_after_ms));
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Build and address one correspondence's standalone acknowledgement.
+    ///
+    /// `recv_direction`, because the record acknowledges the messages this side
+    /// *collected*: the party collecting `a2b` writes the `a2b` record. Signed
+    /// under the conversation's pseudonym key, which is the same key that signs
+    /// every frame here and never the long-term identity key.
+    ///
+    /// A build or derivation failure spends the allowance and writes nothing.
+    /// That is the conservative side: the alternative is releasing the allowance
+    /// on a path that has already failed once, which turns a module fault into a
+    /// retry loop against the client-wide ceiling.
+    fn publish_standalone_ack(&self, index: usize) -> Vec<DmEffect> {
+        let correspondence = &self.correspondences[index];
+        let Some((ratchet, signing_pc, channel)) = correspondence.live() else {
+            return Vec::new();
+        };
+        let direction = ratchet.recv_direction();
+        let record = match ack_record::build_encoded(
+            correspondence.collection.ack(),
+            &channel.chan_id,
+            direction,
+            &channel.address_root,
+            signing_pc,
+        ) {
+            Ok(record) => record,
+            Err(e) => {
+                crate::vtrace!("dm driver: the acknowledgement record would not build: {e}");
+                return Vec::new();
+            }
+        };
+        let address = match DmAckAddress::for_direction(&channel.address_root, direction) {
+            Ok(address) => address,
+            Err(e) => {
+                crate::vtrace!("dm driver: ack address derivation failed: {e}");
+                return Vec::new();
+            }
+        };
+        vec![DmEffect::Dht(DhtOp::PublishAck {
+            tag: OpTag::channel(*ratchet.ar_fingerprint(), None, None),
+            address,
+            record,
+        })]
     }
 
     // ---- the inbound half --------------------------------------------------
@@ -2079,11 +2518,14 @@ impl DmMachine {
                         signing_pc: Some(signing_pc),
                         peer_pk_pc: Some(peer_pk_pc),
                         channel: Some(channel),
-                        collection: Collection::new(),
+                        collection: collection_accepting_a_knock(),
                         read_through: 0,
                         owed_acks: Vec::new(),
                         offered_this_session: Vec::new(),
                         health: ChannelCounters::default(),
+                        ack_cadence: StandaloneAckCadence::new(),
+                        pending_sent_ms: Vec::new(),
+                        own_ack: AckState::new(),
                         last_accept_refusal: None,
                         // The acceptor holds no provisional record: it was
                         // never the one waiting on a reply.
@@ -2591,6 +3033,9 @@ impl DmMachine {
                 owed_acks: Vec::new(),
                 offered_this_session: Vec::new(),
                 health: ChannelCounters::default(),
+                ack_cadence: StandaloneAckCadence::new(),
+                pending_sent_ms: Vec::new(),
+                own_ack: AckState::new(),
                 last_accept_refusal: None,
                 provisional: Some((recipient_keyrec_addr, fc_epoch)),
             });
@@ -2607,7 +3052,7 @@ impl DmMachine {
             .persist
             .update_outbox(&label, direction, now_ms, |outbox| {
                 outbox.enqueue_sealed(
-                    0,
+                    KNOCK_CHANNEL_SEQ,
                     OutboxTarget::Doorbell { slot },
                     now_ms,
                     SealedFrame::new(entry.clone()),
@@ -2653,8 +3098,9 @@ impl DmMachine {
     /// live epoch — a record opens only under the context it was sealed with,
     /// so a record that opens IS this recipient's. A record older than the
     /// accept window will not open and a new label is minted, which is the
-    /// bound this leaves: the give-up window is item 4's and is longer than the
-    /// epoch window.
+    /// bound this leaves: the outbox's seven-day give-up window is longer than
+    /// the first-contact epoch window, so a knock still being re-seeded can
+    /// outlive the record that names where its provisional state lives.
     fn provisional_label(
         &mut self,
         recipient: &PkLt,
@@ -2761,6 +3207,182 @@ impl DmMachine {
 /// statement about the store or the ciphertext at this moment, not about
 /// whether the record exists, so the handle is kept and the next call tries
 /// again.
+/// The direction the stored outbox was written for, or `None` when there is no
+/// record and so nothing to drive.
+///
+/// Free rather than a method because the acknowledgement fold runs with the
+/// machine destructured — it holds `&DmPersist` and one `&mut Correspondence`,
+/// and cannot also hold `&self`.
+fn stored_direction(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    now_ms: i64,
+) -> Option<Direction> {
+    match persist.read_outbox(label, now_ms) {
+        Ok(Some(outbox)) => Some(outbox.direction()),
+        Ok(None) => None,
+        Err(e) => {
+            crate::vtrace!("dm driver: the outbox would not read: {e}");
+            None
+        }
+    }
+}
+
+/// Merge one verified peer acknowledgement into this correspondence's retained
+/// own state, then settle the outbox against the union.
+///
+/// **The one fold, reached from both paths.** A piggybacked acknowledgement and
+/// a fetched standalone record differ only in what authenticated them — this
+/// frame's `msg_sig` or the record's own signature — and by the time either
+/// reaches here it is a verified [`PeerAck`] and nothing else. Two folds would be
+/// two places for the ceiling to be forgotten.
+///
+/// **The state is retained, not rebuilt.** A merge is a union: a later statement
+/// may settle a run this side already holds and say nothing about an earlier one,
+/// so a fresh state per fold would un-settle everything the previous one carried.
+///
+/// The ceiling is the highest sequence this side has actually transmitted. A peer
+/// cannot have collected what was never sent, so a claim above it is clipped —
+/// never refused, which would discard the truthful low half with the impossible
+/// high half — and counted as the misbehaviour signal it is.
+fn fold_peer_ack(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    now_ms: i64,
+    peer: PeerAck,
+) -> Vec<DmEffect> {
+    // `next_send_seq` is the number the NEXT send would take, so the highest
+    // actually spent is one below it; a chain that has sent nothing has no
+    // ceiling at all, which clips a peer's whole claim away.
+    //
+    // **This is the highest SEALED, which can sit one above the highest
+    // ENQUEUED.** `send` steps the ratchet and then asks the outbox, so a seal
+    // whose enqueue was refused for room leaves the ceiling naming a sequence
+    // that was never queued and will never be transmitted. Nothing observable
+    // follows: a peer cannot settle an entry that does not exist, and the entry
+    // that would occupy that sequence is exactly the one the refusal means will
+    // never be written. It is one above the tightest ceiling available, and
+    // tighter would mean reading the outbox on the fold path for no change in
+    // any answer.
+    let highest_sent = correspondence
+        .ratchet
+        .as_ref()
+        .and_then(|ratchet| ratchet.next_send_seq().checked_sub(1));
+    match correspondence.own_ack.merge_peer_ack(peer, highest_sent) {
+        Ok(PeerAckOutcome::WithinCeiling) => {}
+        Ok(PeerAckOutcome::ClippedToCeiling { .. }) => {
+            correspondence.health.peer_acks_clipped += 1;
+        }
+        // All-or-nothing, so `own_ack` is untouched and nothing is lost: the
+        // peer's statement is monotonic and re-written, so a later fold carries
+        // everything this one would have.
+        Err(e) => {
+            crate::vtrace!("dm driver: a peer acknowledgement would not merge: {e}");
+            correspondence.health.peer_acks_deferred += 1;
+            return Vec::new();
+        }
+    }
+    settle_from_own_ack(persist, correspondence, now_ms)
+}
+
+/// Confirm every outbox entry the retained own state now settles, and report
+/// each one to the front end.
+///
+/// [`Outbox::settle_from_ack`] moves an entry out of
+/// [`Lifecycle::AwaitingCollection`](daemonseed_core::dm::outbox::Lifecycle) as
+/// it confirms it and skips every entry past its give-up, so a sequence is
+/// reported here exactly once and a message this sender abandoned can never be
+/// confirmed by a late acknowledgement that walks over it.
+///
+/// The state is read back from the entry rather than named as a constant: the
+/// entry is what the front end is being told about, and a hard-coded state would
+/// keep reporting one after a future transition stopped producing it.
+fn settle_from_own_ack(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    now_ms: i64,
+) -> Vec<DmEffect> {
+    let label = correspondence.label;
+    let Some(direction) = stored_direction(persist, &label, now_ms) else {
+        return Vec::new();
+    };
+    // Cloned because the closure needs the state while `update_outbox` holds the
+    // record's own lock, and the borrow checker cannot see that the two are
+    // disjoint.
+    let ack = correspondence.own_ack.clone();
+    let settled = persist.update_outbox(&label, direction, now_ms, |outbox| {
+        let settled = outbox.settle_from_ack(&ack, now_ms);
+        let states: Vec<(u64, DeliveryState)> = settled
+            .iter()
+            .filter_map(|&seq| outbox.entry(seq).map(|entry| (seq, entry.delivery_state())))
+            .collect();
+        Ok(if settled.is_empty() {
+            Mutation::Unchanged(states)
+        } else {
+            Mutation::Changed(states)
+        })
+    });
+    let states = match settled {
+        Ok(states) => states,
+        Err(e) => {
+            crate::vtrace!("dm driver: the acknowledgement would not settle: {e}");
+            return Vec::new();
+        }
+    };
+    states
+        .into_iter()
+        .map(|(seq, state)| {
+            // Recorded as offered, on the same terms a give-up is: the entry's
+            // durable surfacing stays owed until `DmCommand::Surfaced` answers
+            // it, and this only stops the tick's own re-offer repeating what the
+            // fast path has already said. A restart before the answer offers it
+            // again, which is the #279 direction.
+            correspondence.offered_this_session.push(seq);
+            DmEffect::Emit(DmEvent::Delivery {
+                to: Box::new(*correspondence.pk_lt),
+                seq,
+                state,
+            })
+        })
+        .collect()
+}
+
+/// The acceptor's receiving collection, with the knock already settled.
+///
+/// **The knock arrived, and nothing else will ever say so.** The initiator queues
+/// its first-contact entry at sequence zero of the sending direction and re-seeds
+/// it until acknowledged — that is what makes a re-seed re-emit identical bytes —
+/// but it was carried by doorbell, and no page in the receiving stream will ever
+/// hold it. A collection that waits for a page therefore never settles position
+/// zero: the contiguous prefix never starts, every acknowledgement this side
+/// writes is a run set with a permanent hole under it, and the opening message of
+/// every conversation is re-seeded to the seven-day give-up and then reported
+/// undelivered for a message the user read and answered.
+///
+/// Settling it here is what the outbox note at the knock's enqueue means by *"the
+/// knock shares the channel's sequence space so the contiguous prefix can confirm
+/// the opening message"*.
+///
+/// A refusal is unreachable — the beyond-prefix set of a fresh collection has room
+/// for one position by construction — and is traced rather than propagated so the
+/// accept, which has already established the channel, is not undone by it.
+///
+/// ⚠️ **The resume path must re-apply this, and does not yet.** `seed_from_store`
+/// rebuilds a correspondence with a fresh [`AckState`], so a restart loses the
+/// settled knock position exactly as it loses the rest of the collection. It is
+/// unreachable today for an unrelated reason — a resumed correspondence has no
+/// key schedule, so it opens nothing and acknowledges nothing — which is why it
+/// is named here rather than fixed: whatever restores a live correspondence
+/// across a restart has to restore this position with it, or the first
+/// acknowledgement written after a restart re-opens the hole under the prefix.
+fn collection_accepting_a_knock() -> Collection {
+    let mut collection = Collection::new();
+    if let Err(e) = collection.collected(position_of(KNOCK_CHANNEL_SEQ)) {
+        crate::vtrace!("dm driver: the knock's own position would not settle: {e}");
+    }
+    collection
+}
+
 fn erase_provisional(persist: &DmPersist, correspondence: &mut Correspondence) {
     let Some((keyrec_addr, fc_epoch)) = correspondence.provisional else {
         return;
@@ -2918,6 +3540,9 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            ack_cadence: StandaloneAckCadence::new(),
+            pending_sent_ms: Vec::new(),
+            own_ack: AckState::new(),
             last_accept_refusal: None,
             // A correspondence on disk is one that was established; nothing
             // provisional survives it.
@@ -3926,6 +4551,9 @@ mod tests {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            ack_cadence: StandaloneAckCadence::new(),
+            pending_sent_ms: Vec::new(),
+            own_ack: AckState::new(),
             last_accept_refusal: None,
             provisional: None,
         });
@@ -4034,6 +4662,9 @@ mod tests {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            ack_cadence: StandaloneAckCadence::new(),
+            pending_sent_ms: Vec::new(),
+            own_ack: AckState::new(),
             last_accept_refusal: None,
             provisional: None,
         });
@@ -4658,6 +5289,9 @@ mod tests {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            ack_cadence: StandaloneAckCadence::new(),
+            pending_sent_ms: Vec::new(),
+            own_ack: AckState::new(),
             last_accept_refusal: None,
             provisional: None,
         });
@@ -4747,5 +5381,948 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    // ---- the acknowledgement plane ----------------------------------------
+
+    /// A third identity, distinct from `keys()` and `peer_identity()`, so a
+    /// receiver can hold two correspondences competing for one allowance.
+    fn third_identity() -> IdentityKeys {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        derive_identity_keys(
+            &Mnemonic::from_phrase(TEST_MNEMONIC).expect("mnemonic"),
+            Identity::Device {
+                uuid: uuid::Uuid::from_bytes([0x2Au8; 16]),
+            },
+        )
+        .expect("third identity")
+    }
+
+    /// Fold one page into `m` at a named instant, as a completed sweep.
+    ///
+    /// [`fold_page`] pins the clock at [`BASE_MS`]; the cadence tests need the
+    /// fold and the ticks that follow it to sit on one timeline.
+    fn fold_page_at(
+        m: &mut DmMachine,
+        now_ms: i64,
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        page: u64,
+        slots: Vec<(PagePosition, Vec<u8>)>,
+    ) -> Vec<DmEffect> {
+        let found = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+        m.on_page(
+            now_ms,
+            &OpTag::channel(conversation, None, Some(page)),
+            DmPageSweep {
+                conversation,
+                slots,
+                outcome: crate::SweepOutcome {
+                    attempted: u32::from(PAGE_SLOTS),
+                    failed: 0,
+                    found,
+                },
+            },
+        )
+    }
+
+    /// Knock, accept, and carry the acceptance back, so both machines hold a
+    /// live correspondence and each knows the other's pseudonym.
+    ///
+    /// Nothing is faked: the entry is `firstcontact::build`'s, the acceptance is
+    /// the frame `fire_accept` queued, and A installs the pseudonym by opening
+    /// it. The initiator half matters here — every acknowledgement A fetches is
+    /// verified against a key only the acceptance carries, so a fixture that
+    /// stopped at the accept would exercise the "not yet knowable" arm and
+    /// nothing else.
+    ///
+    /// `b` must have been provisioned already; two calls against one acceptor
+    /// share it.
+    fn establish_pair(a: &mut DmMachine, b: &mut DmMachine, b_keys: &IdentityKeys) {
+        let entry = knock_as_initiator(a, b_keys);
+        let out = b.on_doorbell(BASE_MS, sweep_of(vec![entry]));
+        let request = out
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("B was not offered the knock");
+        b.on_command(BASE_MS, DmCommand::Accept { request });
+        let index = b.correspondences.len() - 1;
+        let label_b = b.correspondences[index].label;
+        let acceptance = queued_frame_at(b, &label_b, 0, BASE_MS);
+        let conversation = conversation_of(a, 0);
+        let out = fold_page_at(
+            a,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(0), acceptance)],
+        );
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_some(),
+            "the acceptance did not install a pseudonym: {out:?}"
+        );
+    }
+
+    /// One outbox entry's delivery state, read from the record.
+    fn outbox_state(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        seq: u64,
+        now_ms: i64,
+    ) -> DeliveryState {
+        m.persist
+            .read_outbox(label, now_ms)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .entry(seq)
+            .unwrap_or_else(|| panic!("sequence {seq} is queued"))
+            .delivery_state()
+    }
+
+    /// The bytes of one queued outbox entry, read at a named instant.
+    ///
+    /// [`queued_frame`] pins the read at [`BASE_MS`]; an entry composed later
+    /// than that is refused as composed in the future, which is the store
+    /// correctly declining to read a record against a clock behind it.
+    fn queued_frame_at(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        seq: u64,
+        now_ms: i64,
+    ) -> Vec<u8> {
+        m.persist
+            .read_outbox(label, now_ms)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .entry(seq)
+            .unwrap_or_else(|| panic!("sequence {seq} is queued"))
+            .frame()
+            .expect("the entry holds its bytes")
+            .to_vec()
+    }
+
+    /// The initiator's conversation fingerprint.
+    fn conversation_of(m: &DmMachine, index: usize) -> [u8; AR_FINGERPRINT_LEN] {
+        *m.correspondences[index]
+            .ratchet
+            .as_ref()
+            .expect("a live ratchet")
+            .ar_fingerprint()
+    }
+
+    /// The conversations named by every `PublishAck` in a batch of effects.
+    fn ack_publishes(effects: &[DmEffect]) -> Vec<[u8; AR_FINGERPRINT_LEN]> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::PublishAck { tag, .. }) => tag.conversation,
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The delivery states reported in a batch of effects, as `(seq, state)`.
+    fn deliveries_in(effects: &[DmEffect]) -> Vec<(u64, DeliveryState)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Delivery { seq, state, .. }) => Some((*seq, *state)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Tell `m` that the standalone acknowledgement it asked to write landed.
+    fn ack_written(m: &mut DmMachine, now_ms: i64, conversation: [u8; AR_FINGERPRINT_LEN]) {
+        m.on_outcome(
+            now_ms,
+            DmOutcome::Dht(DhtOutcome {
+                tag: OpTag::channel(conversation, None, None),
+                result: Ok(DhtResult::AckWritten),
+            }),
+        );
+    }
+
+    /// Hand `m` one fetched acknowledgement record for `conversation`.
+    fn ack_fetched(
+        m: &mut DmMachine,
+        now_ms: i64,
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        record: Vec<u8>,
+    ) -> Vec<DmEffect> {
+        m.on_outcome(
+            now_ms,
+            DmOutcome::Dht(DhtOutcome {
+                tag: OpTag::channel(conversation, None, None),
+                result: Ok(DhtResult::Ack(Some(record))),
+            }),
+        )
+    }
+
+    /// Build one acknowledgement record the way `other` would publish it for the
+    /// messages it received, over the sequence numbers `settled` names.
+    ///
+    /// The keys and roots are the far machine's own, so the only thing a test
+    /// chooses is the claim — which is what makes an over-claim distinguishable
+    /// from a forgery: this signs correctly and lies, and `forged_ack_record`
+    /// signs wrongly.
+    fn ack_record_from(other: &DmMachine, index: usize, settled: &[u64]) -> Vec<u8> {
+        let correspondence = &other.correspondences[index];
+        let (ratchet, signing_pc, channel) = correspondence.live().expect("a live correspondence");
+        let mut state = AckState::new();
+        for &seq in settled {
+            state.collect(seq).expect("the claim fits");
+        }
+        ack_record::build_encoded(
+            &state,
+            &channel.chan_id,
+            ratchet.recv_direction(),
+            &channel.address_root,
+            signing_pc,
+        )
+        .expect("the record builds")
+    }
+
+    /// The same record, signed under a pseudonym that is not the
+    /// correspondent's.
+    fn forged_ack_record(other: &DmMachine, index: usize, settled: &[u64]) -> Vec<u8> {
+        let correspondence = &other.correspondences[index];
+        let (ratchet, _, channel) = correspondence.live().expect("a live correspondence");
+        let mut state = AckState::new();
+        for &seq in settled {
+            state.collect(seq).expect("the claim fits");
+        }
+        let impostor = mint_pseudonym().expect("an impostor's pseudonym");
+        ack_record::build_encoded(
+            &state,
+            &channel.chan_id,
+            ratchet.recv_direction(),
+            &channel.address_root,
+            &impostor,
+        )
+        .expect("the record builds")
+    }
+
+    /// M26. The standalone cadence accelerates toward the sender's give-up and
+    /// stops at it.
+    ///
+    /// **The measurement is a count per third of the window, not a predicted
+    /// instant.** Asserting "due at exactly t" would re-derive
+    /// [`ack_cadence::standalone_interval_ms`] inside the test and pass on any
+    /// bug the two shared; counting how many acknowledgements a fixed march of
+    /// the clock produces in each third measures the curve's *shape* against
+    /// nothing but the clock. A taper replaced by any constant interval gives
+    /// the three thirds equal counts, which is what the control below turns on.
+    ///
+    /// The floor is the first count: B has collected new messages, so the first
+    /// acknowledgement goes whatever the curve says.
+    ///
+    /// Past the give-up the count is zero — not small, zero. The sender discards
+    /// an acknowledgement arriving after its own give-up by construction, so a
+    /// write spent there is spent into a void.
+    #[test]
+    fn the_standalone_cadence_accelerates_and_stops_at_the_give_up() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        // A's first channel message, composed at BASE_MS: the one pending
+        // message the whole taper is measured against.
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "the message under the taper".into(),
+            },
+        );
+        let label_a = sole_label(&a);
+        let frame = queued_frame(&a, &label_a, 1);
+        let conversation = conversation_of(&b, 0);
+        let folded = fold_page_at(
+            &mut b,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(1), frame)],
+        );
+        assert_eq!(
+            messages_in(&folded).len(),
+            1,
+            "the fixture must actually have collected a message: {folded:?}"
+        );
+        assert_eq!(
+            b.correspondences[0].pending_sent_ms,
+            vec![BASE_MS],
+            "the taper must be keyed on the frame's own asserted send time"
+        );
+
+        // A fixed march of the clock, one tick every half hour, from the compose
+        // instant to a whole window past it.
+        const STEP_MS: i64 = 30 * 60 * 1000;
+        let third = GIVE_UP_MS / 3;
+        let mut counts = [0u64; 3];
+        let mut after_give_up = 0u64;
+        let mut now = BASE_MS;
+        while now <= BASE_MS + GIVE_UP_MS + third {
+            // The cadence step directly, not the whole tick: `on_tick` also
+            // sweeps give-ups, re-emits the outbox and plans probes, and three
+            // hundred rounds of that is minutes of sealed-record churn saying
+            // nothing about the curve. That `on_tick` reaches this at all is
+            // pinned by `one_allowance_serves_the_older_pending_first_and_defers_the_other`
+            // and by the driver's own round-trip oracle.
+            let effects = b.standalone_acks(now);
+            let published = ack_publishes(&effects);
+            for conversation in &published {
+                // On the write, never on the decision: the cadence advances only
+                // because the record landed.
+                ack_written(&mut b, now, *conversation);
+            }
+            let written = published.len() as u64;
+            let age = now - BASE_MS;
+            if age >= GIVE_UP_MS {
+                after_give_up += written;
+            } else {
+                counts[usize::try_from(age / third).unwrap_or(2).min(2)] += written;
+            }
+            now += STEP_MS;
+        }
+
+        assert!(
+            counts[0] >= 1,
+            "the floor must fire once new messages have been collected: {counts:?}"
+        );
+        assert!(
+            counts[0] < counts[1],
+            "the taper must write more often as the sender's window closes: {counts:?}"
+        );
+        assert!(
+            counts[1] < counts[2],
+            "the taper must keep accelerating into the last third: {counts:?}"
+        );
+        // The exact shape, pinned. The curve is deterministic — no jitter, no
+        // randomness — so these are a measurement and not a range: any constant
+        // interval flattens them to three equal numbers.
+        assert_eq!(
+            counts,
+            [3, 5, 24],
+            "the taper's shape moved. These are recomputable rather than merely \
+             recorded: the interval is linear from MIN_INTERVAL_MS (60 s) at the \
+             give-up to MAX_INTERVAL_MS (24 h) a whole window before it, a write \
+             is due once that interval has elapsed since the last one, the clock \
+             is sampled every {STEP_MS} ms across GIVE_UP_MS ({GIVE_UP_MS} ms), \
+             and each count is the writes falling in one third of that window"
+        );
+        assert_eq!(
+            after_give_up, 0,
+            "an acknowledgement was written past the sender's give-up: {counts:?}"
+        );
+        // The terminus is a set that emptied itself, not a flag: every send time
+        // aged out of the window, so nothing is left for a write to help.
+        assert!(
+            b.correspondences[0].pending_sent_ms.is_empty(),
+            "the pending set must age out with the sender's window, leaving: {:?}",
+            b.correspondences[0].pending_sent_ms
+        );
+    }
+
+    /// M27. One allowance, two conversations: the older pending goes first and
+    /// the other is told when to come back.
+    ///
+    /// The ceiling is client-wide, so the two questions are separate and both
+    /// have to hold: [`ack_cadence::pick_next`] decides *which* conversation the
+    /// round belongs to, and [`StandaloneAckBudget`] decides how many rounds
+    /// there are. Dropping the budget gives two writes in one tick, which is the
+    /// breach the budget exists to close.
+    #[test]
+    fn one_allowance_serves_the_older_pending_first_and_defers_the_other() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_c = tempfile::tempdir().expect("temp dir C");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        let mut a = machine(&dir_a);
+        let mut c = machine_as(third_identity(), &dir_c);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        establish_pair(&mut c, &mut b, &b_keys);
+        assert_eq!(
+            b.correspondences.len(),
+            2,
+            "the fixture needs two correspondences competing for one allowance"
+        );
+
+        // The two messages are composed a full minute apart, so "older" is not a
+        // tie the iteration order could decide.
+        const GAP_MS: i64 = 60_000;
+        let older = BASE_MS;
+        let newer = BASE_MS + GAP_MS;
+        for (sender, at) in [(&mut a, older), (&mut c, newer)] {
+            sender.on_command(
+                at,
+                DmCommand::Send {
+                    to: Box::new(*b_keys.signing.public_key()),
+                    body: "one each".into(),
+                },
+            );
+        }
+        let older_conversation = conversation_of(&a, 0);
+        let newer_conversation = conversation_of(&c, 0);
+        for (sender, conversation, at) in [
+            (&a, older_conversation, older),
+            (&c, newer_conversation, newer),
+        ] {
+            let label = sole_label(sender);
+            let frame = queued_frame_at(sender, &label, 1, newer);
+            let folded = fold_page_at(&mut b, at, conversation, 0, vec![(position_of(1), frame)]);
+            assert_eq!(
+                messages_in(&folded).len(),
+                1,
+                "each fixture message must have been collected: {folded:?}"
+            );
+        }
+
+        // ── one tick, one write ──────────────────────────────────────────────
+        let tick = newer + 1;
+        let effects = b.on_tick(tick);
+        let published = ack_publishes(&effects);
+        assert_eq!(
+            published.len(),
+            1,
+            "the client-global allowance granted more than one write in a tick: {published:?}"
+        );
+        assert_eq!(
+            published[0], older_conversation,
+            "the round must go to the conversation whose sender has waited longest"
+        );
+        assert_eq!(
+            b.ack_retry_due_ms,
+            Some(tick + daemonseed_core::dm::ack_budget::STANDALONE_ACK_MIN_INTERVAL_MS),
+            "the refusal must be scheduled rather than polled"
+        );
+        // The fold into the wake time is only visible where the idle cadence is
+        // slower than the allowance; at the default 30 s tick the idle deadline
+        // is already the sooner of the two.
+        let slow = tick + 300_000;
+        b.cfg.idle_tick = Duration::from_secs(300);
+        assert_eq!(
+            b.next_due_ms(tick),
+            tick + daemonseed_core::dm::ack_budget::STANDALONE_ACK_MIN_INTERVAL_MS,
+            "a driver slower than the allowance must wake for the deferred write"
+        );
+        assert!(slow > b.next_due_ms(tick), "the fold must shorten the wait");
+        b.cfg.idle_tick = Duration::from_secs(30);
+        ack_written(&mut b, tick, published[0]);
+
+        // ── the winner does not take two rounds running ──────────────────────
+        //
+        // **The older conversation is made due again on purpose.** Its key is
+        // still the oldest — its sender has been waiting longest, and collecting
+        // a second message does not change that — so oldest-first alone would
+        // hand it the next round too, and the round after, for as long as it
+        // keeps writing. What stops it is the previous winner being remembered,
+        // and nothing else: a client-global allowance handed to whoever claims
+        // the oldest message is an ordering a hostile contact wins by choosing an
+        // integer.
+        a.on_command(
+            tick,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "and another".into(),
+            },
+        );
+        let label_a = sole_label(&a);
+        let second = queued_frame_at(&a, &label_a, 2, tick);
+        let folded = fold_page_at(
+            &mut b,
+            tick,
+            older_conversation,
+            0,
+            vec![(position_of(2), second)],
+        );
+        assert_eq!(
+            messages_in(&folded).len(),
+            1,
+            "the older conversation must be due again, or the skip below is vacuous: {folded:?}"
+        );
+
+        // ── the allowance renews, and the deferred conversation takes it ──────
+        let later = tick + daemonseed_core::dm::ack_budget::STANDALONE_ACK_MIN_INTERVAL_MS;
+        let effects = b.on_tick(later);
+        let published = ack_publishes(&effects);
+        assert_eq!(
+            published,
+            vec![newer_conversation],
+            "the deferred conversation must take the next allowance, even against \
+             an older one that has just collected again"
+        );
+    }
+
+    /// M28. A peer acknowledgement claiming more than we sent is clipped to the
+    /// ceiling, counted, and settles nothing above it.
+    ///
+    /// A correspondent cannot have collected what was never transmitted, so the
+    /// claim is a misbehaviour signal rather than a routine result. It is clipped
+    /// and not refused: refusing would discard the truthful low half along with
+    /// the impossible high half, and a peer's high-water is monotonic, so the
+    /// refusal would be permanent rather than a retry.
+    #[test]
+    fn an_over_claiming_acknowledgement_is_clipped_counted_and_settles_to_the_ceiling() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        for body in ["one", "two"] {
+            a.on_command(
+                BASE_MS,
+                DmCommand::Send {
+                    to: Box::new(*b_keys.signing.public_key()),
+                    body: body.into(),
+                },
+            );
+        }
+        // The knock at zero plus two channel messages: the highest sequence this
+        // side has actually put on the wire is two.
+        assert_eq!(
+            a.only_next_send_seq(),
+            Some(3),
+            "the fixture must have spent sequences zero to two"
+        );
+
+        let conversation = conversation_of(&a, 0);
+        // The knock at zero is already confirmed: the acceptance piggybacked the
+        // acceptor's own state, which settles it. Stated so its absence below
+        // reads as *already settled* rather than as a claim that did not land.
+        let label_a = sole_label(&a);
+        assert_eq!(
+            outbox_state(&a, &label_a, 0, BASE_MS),
+            DeliveryState::ConfirmedCollected,
+            "the acceptance's piggyback must already have confirmed the knock"
+        );
+
+        let record = ack_record_from(&b, 0, &[0, 1, 2, 3, 4, 5]);
+        let effects = ack_fetched(&mut a, BASE_MS, conversation, record);
+
+        let mut settled = deliveries_in(&effects);
+        settled.sort_unstable_by_key(|(seq, _)| *seq);
+        assert_eq!(
+            settled,
+            vec![
+                (1, DeliveryState::ConfirmedCollected),
+                (2, DeliveryState::ConfirmedCollected),
+            ],
+            "the claim must settle up to the ceiling and no further: {effects:?}"
+        );
+        assert_eq!(
+            a.correspondences[0].health.peer_acks_clipped, 1,
+            "an over-claim must be counted as the misbehaviour signal it is"
+        );
+        assert_eq!(
+            a.correspondences[0].health.peer_acks_deferred, 0,
+            "a clip is not a refused merge"
+        );
+
+        // ── the clipped-away claim was not retained ──────────────────────────
+        //
+        // **Absent from one event list is not the same as not settled.** The
+        // merge is a union into retained state, so a claim taken whole rather
+        // than clipped would sit there silently and confirm sequence three the
+        // moment this side sent it — against a statement the peer made before
+        // the message existed. So a third message is sent and a SECOND record is
+        // folded, this one claiming nothing above the original ceiling: if the
+        // clip held, sequence three is still where the send left it.
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "three".into(),
+            },
+        );
+        let narrow = ack_record_from(&b, 0, &[0, 1]);
+        let effects = ack_fetched(&mut a, BASE_MS, conversation, narrow);
+        assert_eq!(
+            deliveries_in(&effects),
+            Vec::new(),
+            "a record claiming nothing new must settle nothing: {effects:?}"
+        );
+        assert_eq!(
+            outbox_state(&a, &label_a, 3, BASE_MS),
+            DeliveryState::Composed,
+            "the sequence the first record claimed above the ceiling must be \
+             where the send left it — no write has been confirmed for it, so \
+             `Composed` rather than `OnDht` is its state in a machine with no \
+             transport"
+        );
+    }
+
+    /// M29. A standalone record signed by the wrong pseudonym settles nothing.
+    ///
+    /// The record's address descends from the conversation's secret address root,
+    /// so a third party cannot write one — but the fetch is still a read of
+    /// untrusted bytes, and the signature is the only thing that separates the
+    /// correspondent's statement from anybody else's. It fails closed: nothing is
+    /// merged, nothing is settled, and the outbox keeps re-seeding.
+    ///
+    /// The honest record is fetched afterwards on the same fixture, which is the
+    /// positive control: without it, "nothing settled" is satisfied by a driver
+    /// that folds no record at all.
+    #[test]
+    fn a_standalone_record_signed_by_the_wrong_pseudonym_settles_nothing() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "one".into(),
+            },
+        );
+        let conversation = conversation_of(&a, 0);
+
+        let effects = ack_fetched(
+            &mut a,
+            BASE_MS,
+            conversation,
+            forged_ack_record(&b, 0, &[0, 1]),
+        );
+        assert_eq!(
+            deliveries_in(&effects),
+            Vec::new(),
+            "a record that did not verify settled an outbox entry: {effects:?}"
+        );
+        assert_eq!(
+            a.correspondences[0].health.peer_acks_unverified, 1,
+            "a record that did not verify must be counted"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::ChannelHealth {
+                    peer_acks_unverified: 1,
+                    ..
+                })
+            )),
+            "the count must reach the front end: {effects:?}"
+        );
+
+        // The positive control: the same fixture, the same claim, a signature
+        // that verifies. Sequence zero is already confirmed by the acceptance's
+        // own piggyback, so sequence one is what this settles.
+        let effects = ack_fetched(
+            &mut a,
+            BASE_MS,
+            conversation,
+            ack_record_from(&b, 0, &[0, 1]),
+        );
+        assert_eq!(
+            deliveries_in(&effects),
+            vec![(1, DeliveryState::ConfirmedCollected)],
+            "the same fixture must settle under a record that DOES verify: {effects:?}"
+        );
+    }
+
+    /// M30. The give-up beats a late acknowledgement.
+    ///
+    /// A message past its seven-day window is `Undelivered`, and `Undelivered` is
+    /// terminal: an acknowledgement arriving afterwards settles nothing, whether
+    /// or not the sweep has already run. Reporting *collected* for a message this
+    /// sender abandoned is the one failure the fail-safe posture forbids
+    /// outright, so the event list is asserted whole rather than searched for the
+    /// state that should be there.
+    #[test]
+    fn a_late_acknowledgement_cannot_settle_a_given_up_message() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "nobody read this".into(),
+            },
+        );
+        let conversation = conversation_of(&a, 0);
+
+        let past = BASE_MS + GIVE_UP_MS;
+        let mut given_up = deliveries_in(&a.on_tick(past));
+        given_up.sort_unstable_by_key(|(seq, _)| *seq);
+        // Sequence zero is the knock; the acceptance's own piggyback confirmed
+        // it at establishment and this run has already said so, so the tick
+        // reports only the message under test.
+        assert_eq!(
+            given_up,
+            vec![(1, DeliveryState::Undelivered)],
+            "the message nobody read must be reported undelivered at the give-up"
+        );
+
+        let effects = ack_fetched(&mut a, past, conversation, ack_record_from(&b, 0, &[0, 1]));
+        assert_eq!(
+            deliveries_in(&effects),
+            Vec::new(),
+            "a late acknowledgement settled a message this sender gave up on: {effects:?}"
+        );
+    }
+
+    /// M31. Each of the two gates holds the give-up rule on its own.
+    ///
+    /// `Outbox::settle_from_ack` refuses a given-up entry twice over — by
+    /// lifecycle and by the clock — and M30 runs them together, so it passes
+    /// while either one is intact. These two fixtures separate them, because
+    /// there is a real window in which only one applies and the ordering of two
+    /// unrelated calls is not something the truth of a delivery indicator should
+    /// depend on.
+    ///
+    /// **Before the sweep, only the clock gate applies.** A give-up is a swept
+    /// transition, so between the seventh day and the next tick the entry is past
+    /// its window and still `AwaitingCollection` — exactly the window in which
+    /// the receiver may legitimately abandon that position and write an ack that
+    /// says *settled*.
+    ///
+    /// **After a settle, only the lifecycle gate applies.** A confirmed entry is
+    /// inside its window and terminal, and a record re-fetched on the next tick
+    /// carries the identical claim; a second confirmation for one message is a
+    /// front end told twice.
+    #[test]
+    fn each_give_up_gate_refuses_a_late_acknowledgement_on_its_own() {
+        // ── the clock gate alone: past the window, before any sweep ──────────
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "nobody read this either".into(),
+            },
+        );
+        let conversation = conversation_of(&a, 0);
+        let label_a = sole_label(&a);
+        let past = BASE_MS + GIVE_UP_MS;
+        assert_eq!(
+            outbox_state(&a, &label_a, 1, past),
+            DeliveryState::Composed,
+            "the fixture must reach the give-up with the entry still live, or the \
+             lifecycle gate is doing this work instead"
+        );
+        let effects = ack_fetched(&mut a, past, conversation, ack_record_from(&b, 0, &[0, 1]));
+        assert_eq!(
+            deliveries_in(&effects),
+            Vec::new(),
+            "an entry past its window must not settle before the sweep has run: {effects:?}"
+        );
+
+        // ── the lifecycle gate alone: settled, inside the window ─────────────
+        let dir_c = tempfile::tempdir().expect("temp dir C");
+        let dir_d = tempfile::tempdir().expect("temp dir D");
+        let mut c = machine(&dir_c);
+        let mut d = machine_as(peer_identity(), &dir_d);
+        d.persist.provision_block_list().expect("provision");
+        establish_pair(&mut c, &mut d, &b_keys);
+        c.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "read in time".into(),
+            },
+        );
+        let conversation = conversation_of(&c, 0);
+        let effects = ack_fetched(
+            &mut c,
+            BASE_MS,
+            conversation,
+            ack_record_from(&d, 0, &[0, 1]),
+        );
+        assert_eq!(
+            deliveries_in(&effects),
+            vec![(1, DeliveryState::ConfirmedCollected)],
+            "the fixture must actually settle once, or the re-fetch below is vacuous: {effects:?}"
+        );
+        let effects = ack_fetched(
+            &mut c,
+            BASE_MS,
+            conversation,
+            ack_record_from(&d, 0, &[0, 1]),
+        );
+        assert_eq!(
+            deliveries_in(&effects),
+            Vec::new(),
+            "the same claim, re-fetched on the next tick, confirmed a message \
+             twice: {effects:?}"
+        );
+    }
+
+    /// M32. A record from another conversation settles nothing.
+    ///
+    /// **A replay across conversations, and every layer refuses it.** The record
+    /// is genuine — this acceptor built and signed it — but for a different
+    /// correspondent: its address root derives a different sealing key, its
+    /// `chan_id` is bound in the AAD and in the signature preimage, and its
+    /// pseudonym is a fresh key minted per contact. So it fails at the AEAD
+    /// before any signature is examined, which is the layer a reader reaches
+    /// first.
+    ///
+    /// The honest record afterwards is the positive control: without it,
+    /// "nothing settled" is satisfied by a fixture that folds nothing at all.
+    #[test]
+    fn a_record_from_another_conversation_settles_nothing() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_c = tempfile::tempdir().expect("temp dir C");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        let mut a = machine(&dir_a);
+        let mut c = machine_as(third_identity(), &dir_c);
+        establish_pair(&mut a, &mut b, &b_keys);
+        establish_pair(&mut c, &mut b, &b_keys);
+        assert_eq!(
+            b.correspondences.len(),
+            2,
+            "the fixture needs the acceptor to hold two conversations"
+        );
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "meant for A".into(),
+            },
+        );
+        let conversation = conversation_of(&a, 0);
+
+        // The acceptor's record for its OTHER correspondent, handed to A.
+        let elsewhere = ack_record_from(&b, 1, &[0, 1]);
+        let effects = ack_fetched(&mut a, BASE_MS, conversation, elsewhere);
+        assert_eq!(
+            deliveries_in(&effects),
+            Vec::new(),
+            "a record built for another conversation settled an entry: {effects:?}"
+        );
+        assert_eq!(
+            a.correspondences[0].health.peer_acks_unverified, 1,
+            "a record that will not open must be counted"
+        );
+
+        let effects = ack_fetched(
+            &mut a,
+            BASE_MS,
+            conversation,
+            ack_record_from(&b, 0, &[0, 1]),
+        );
+        assert_eq!(
+            deliveries_in(&effects),
+            vec![(1, DeliveryState::ConfirmedCollected)],
+            "the same fixture must settle under this conversation's own record: {effects:?}"
+        );
+    }
+
+    /// M33. A send time in the future cannot pin the cadence open.
+    ///
+    /// `sent_unix_ms` is peer-asserted and signed, which authenticates it as a
+    /// statement and bounds it in no other way. Stored verbatim, a time in the
+    /// future never satisfies `now_ms - sent_ms >= give_up_ms`, so the entry
+    /// never ages out: the conversation never terminates, writes a standalone
+    /// acknowledgement for ever against a sender that gave up years ago, and —
+    /// because the ordering key is the smallest value — takes the client-global
+    /// allowance from every honest correspondence while doing it.
+    ///
+    /// The clamp is what closes it, and the give-up is the observable: past the
+    /// window there must be no write at all.
+    #[test]
+    fn a_send_time_in_the_future_still_ages_out_of_the_pending_set() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        // Ten years ahead of the collector's clock, asserted by a frame that is
+        // otherwise entirely well formed and opens normally.
+        const TEN_YEARS_MS: i64 = 10 * 365 * 24 * 60 * 60 * 1000;
+        let ahead = BASE_MS + TEN_YEARS_MS;
+        a.on_command(
+            ahead,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "from the future".into(),
+            },
+        );
+        let label_a = sole_label(&a);
+        let frame = queued_frame_at(&a, &label_a, 1, ahead);
+        let conversation = conversation_of(&b, 0);
+        let folded = fold_page_at(
+            &mut b,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(1), frame)],
+        );
+        assert_eq!(
+            messages_in(&folded),
+            vec!["from the future".to_string()],
+            "the fixture must have collected the frame, or nothing is pending: {folded:?}"
+        );
+        // **No assertion on the clamped value here, deliberately.** The clamp is
+        // asserted by its consequence below: a shape check at this point would
+        // fail first under any mutation and leave the thing that actually
+        // matters — that the cadence stops — untested.
+
+        // A march past the give-up, at the same half-hour step the taper test
+        // uses, counting only what is written after the window has closed.
+        const STEP_MS: i64 = 30 * 60 * 1000;
+        let mut written_before = 0u64;
+        let mut written_after = 0u64;
+        let mut now = BASE_MS;
+        while now <= BASE_MS + GIVE_UP_MS + STEP_MS * 4 {
+            let effects = b.standalone_acks(now);
+            let published = ack_publishes(&effects);
+            for conversation in &published {
+                ack_written(&mut b, now, *conversation);
+            }
+            if now - BASE_MS >= GIVE_UP_MS {
+                written_after += published.len() as u64;
+            } else {
+                written_before += published.len() as u64;
+            }
+            now += STEP_MS;
+        }
+        assert!(
+            written_before >= 1,
+            "the fixture must have acknowledged the message while it was live, \
+             or the silence afterwards is silence about nothing"
+        );
+        assert_eq!(
+            written_after, 0,
+            "a peer-asserted future send time kept the cadence writing past the \
+             sender's own give-up"
+        );
+        assert!(
+            b.correspondences[0].pending_sent_ms.is_empty(),
+            "the clamped entry must age out with the window, leaving: {:?}",
+            b.correspondences[0].pending_sent_ms
+        );
     }
 }
