@@ -968,6 +968,23 @@ each exactly once (`test result: ok. 1 passed`, 1221 s). The criteria named abov
 each is closed against its own text; the oracle is evidence for them, not a closing pass. Nothing is
 rendered yet: the front ends fold `DmEvent` into state and send no `DmCommand` but shutdown.
 
+**ISC-C40's reader clause is enforced where the driver reads a key record, and what that protects
+is narrower than the path.** The DM driver holds one `KeyRecordCache` per correspondent, keyed by
+the correspondent's long-term identity key, and `on_key_record` admits every fetched record through
+it — so an authentic pre-rotation record is refused as `RefusalReason::KeyRecordRollback` rather
+than sealed to, an equal version is accepted as a re-fetch, and a higher one advances the bound.
+**The bound can only fire on a second introduction to the same identity inside one process:**
+`start_introduction` refuses an identity already in flight and one already holding a correspondence
+on disk, so a first introduction is always a cold read and a completed one never fetches again. The bound is the driver process's own: a key record
+is fetched before any correspondence exists to hold one at rest, and the contact record's five
+fixed-width fields are the store's whole bucket for that kind, so the cold reader stays the accepted
+rollback residual ISC-A-C23 names. Pinned by
+`a_replayed_older_key_record_is_refused_and_the_bound_holds`,
+`a_higher_version_advances_the_bound_and_the_old_one_is_then_refused`,
+`a_fresh_correspondent_is_accepted_at_any_version` and
+`the_bound_is_this_sessions_and_a_restart_takes_the_older_record_again`, each with the byte-level
+`accept_encoded_refuses_a_replayed_older_record` under it.
+
 **Felt-tested for real, 2026-08-28: `two_node_dm_ack.rs`'s live oracle passed against the public
 Veilid network on an attach-capable host** — `an_acknowledgement_published_by_one_node_merges_at_the_other`,
 39.12s, collect-with-gaps → publish → fetch from the far end → verify → merge under a ceiling, all

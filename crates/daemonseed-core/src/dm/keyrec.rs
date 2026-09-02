@@ -368,6 +368,13 @@ pub fn build_encoded(
 /// step — the read counterpart of [`build_encoded`], so a caller handling raw DHT
 /// bytes never needs prost either. A record that does not decode is rejected the
 /// same way a record that does not verify is: fail closed.
+///
+/// **This is the bound-free twin: it checks the signature and nothing else.** A
+/// production read goes through [`KeyRecordCache::accept_encoded`], which runs
+/// the same verification and then refuses a `version` below the highest already
+/// verified for that identity. Reach for this one only where there is no bound
+/// to keep — a one-shot check of a record's authenticity, with nothing sealed to
+/// the key it carries.
 pub fn decode_and_verify(
     bytes: &[u8],
     identity_pubkey: &[u8; ml_dsa::PK_LEN],
@@ -485,6 +492,25 @@ impl KeyRecordCache {
         // "assigned Some, therefore Some" invariant is structural rather than
         // asserted — a later edit cannot open a gap between the two.
         Ok(&*self.current.insert(verified))
+    }
+
+    /// Decode `bytes` and offer the record to [`Self::accept`] — the byte-level
+    /// counterpart of [`decode_and_verify`].
+    ///
+    /// The rollback bound has to sit on the path that *fetches*, and that path
+    /// holds raw DHT bytes. Without this the caller would decode for itself,
+    /// which means a prost dependency in every reader for the sake of one line —
+    /// the thing [`decode_and_verify`] exists to avoid. Bytes that do not decode
+    /// are rejected exactly as a record that does not verify is, and the cache
+    /// is left untouched either way.
+    pub fn accept_encoded(
+        &mut self,
+        bytes: &[u8],
+        identity_pubkey: &[u8; ml_dsa::PK_LEN],
+    ) -> Result<&VerifiedKeyRecord, DmKeyRecordError> {
+        use prost::Message as _;
+        let record = wire::DmKeyRecord::decode(bytes).map_err(|_| DmKeyRecordError::Malformed)?;
+        self.accept(&record, identity_pubkey)
     }
 }
 
@@ -747,6 +773,40 @@ mod tests {
         let mut cache = KeyRecordCache::new();
         cache.accept(&old, a.signing.public_key()).unwrap();
         assert_eq!(cache.version(), Some(1));
+    }
+
+    /// The byte-level entry point enforces the same bound as
+    /// [`KeyRecordCache::accept`], because the path that fetches a record holds
+    /// nothing but bytes — a bound only the decoded form could enforce would not
+    /// be reachable from where the rollback happens.
+    #[test]
+    fn accept_encoded_refuses_a_replayed_older_record() {
+        let a = alice();
+        let pk = a.signing.public_key();
+        let v2 = build_encoded(&a.signing, a.kem.encapsulation_key(), 2, false).unwrap();
+        let v3 = build_encoded(&a.signing, a.kem.encapsulation_key(), 3, false).unwrap();
+
+        let mut cache = KeyRecordCache::new();
+        assert_eq!(cache.accept_encoded(&v3, pk).unwrap().version, 3);
+        assert_eq!(
+            cache.accept_encoded(&v2, pk),
+            Err(DmKeyRecordError::VersionRegression {
+                cached: 3,
+                offered: 2
+            })
+        );
+        assert_eq!(
+            cache.version(),
+            Some(3),
+            "a refused record must not regress"
+        );
+
+        // Bytes that do not decode take the same path and leave the bound alone.
+        assert_eq!(
+            cache.accept_encoded(&[0xffu8; 64], pk),
+            Err(DmKeyRecordError::Malformed)
+        );
+        assert_eq!(cache.version(), Some(3));
     }
 
     // ── fc_epoch ─────────────────────────────────────────────────────────────

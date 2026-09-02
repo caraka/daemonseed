@@ -44,7 +44,9 @@ use daemonseed_core::dm::firstcontact::{
 };
 use daemonseed_core::dm::frame::{self, AuthorKeys, WORST_CASE_SEALED_FRAME_LEN};
 use daemonseed_core::dm::keyrec::KEM_EK_LEN;
-use daemonseed_core::dm::keyrec::{self, DM_KEYREC_OWNER_SEED_LEN};
+use daemonseed_core::dm::keyrec::{
+    self, DmKeyRecordError, KeyRecordCache, DM_KEYREC_OWNER_SEED_LEN,
+};
 use daemonseed_core::dm::outbox::{
     DeliveryState, OutboxError, OutboxTarget, SealedFrame, GIVE_UP_MS,
 };
@@ -989,6 +991,32 @@ pub(crate) struct DmMachine {
     /// does not schedule anything of its own, so the longest a knock can sit
     /// unread is one whole sweep plus one tick.
     sweeping_doorbell: bool,
+    /// The highest key-record version verified for each identity, keyed by the
+    /// identity's own long-term key — the design's M1 rollback bound.
+    ///
+    /// The record is world-writable, so anyone can plant an *authentic* record
+    /// the owner signed before a rotation. The bound is what refuses it: a
+    /// version below the highest already verified for that identity never
+    /// becomes the key an introduction is sealed to.
+    ///
+    /// **Session-scoped for alpha, and that is a scope rather than a
+    /// requirement.** The design ratifies the rule — *"Readers cache highest
+    /// verified `version`, never regress"* — and accepts the cold reader, one
+    /// with no cached version at all, as the alpha residual; a restart is one of
+    /// those readers, so the bound this holds dies with the process. Making it
+    /// durable is a later change, not a blocked one: its entry point is
+    /// [`KeyRecordCache::from_verified`], and its shape is a profile-scoped
+    /// record of capped per-identity entries, as
+    /// [`RecordKind::BlockList`](daemonseed_core::storage::dm_store::RecordKind)
+    /// already is. It is not the contact record: that is written at
+    /// establishment, and a key record is fetched before a correspondence
+    /// exists. Held per identity rather than per correspondence for the same
+    /// reason — the bound has to exist before the correspondence does.
+    ///
+    /// One entry per identity whose record has been *verified*, so it grows
+    /// only with introductions the user asked for, exactly as `provisionals`
+    /// does.
+    key_records: Vec<(PkLt, KeyRecordCache)>,
     /// The receiving pages whose sweep is in flight, by conversation and page.
     ///
     /// Keyed per page rather than per conversation because the probe plan is
@@ -1033,6 +1061,7 @@ impl DmMachine {
             last_ack_picked: None,
             ack_retry_due_ms: None,
             sweeping_doorbell: false,
+            key_records: Vec::new(),
             sweeping_pages: std::collections::BTreeSet::new(),
         }
     }
@@ -3179,8 +3208,36 @@ impl DmMachine {
                 RefusalReason::NoKeyRecord,
             ))];
         };
-        let verified = match keyrec::decode_and_verify(&bytes, &recipient) {
-            Ok(v) => v,
+        // **Verified THROUGH the session's bound, never beside it.** A record
+        // that verifies is not yet a record to use: the address is world-
+        // writable, so an authentic pre-rotation blob can be replayed into it,
+        // and only the highest version already verified for this identity tells
+        // the two apart. The bound is written here, on the fetch, because this
+        // is the only place a key record is read.
+        //
+        // **The bound is carried in a detached cache and written back only where
+        // a record verified.** An entry is the record of a verified fetch, so
+        // creating one first would leave an empty entry behind for every
+        // malformed or forged blob served at that address — a list anyone able
+        // to write the record could grow without holding a key. A refused fetch
+        // touches nothing.
+        let mut cache = self
+            .key_records
+            .iter()
+            .find(|(pk, _)| pk.as_slice() == recipient.as_slice())
+            .map(|(_, held)| held.clone())
+            .unwrap_or_default();
+        let kem_ek_b = match cache.accept_encoded(&bytes, &recipient) {
+            Ok(v) => v.kem_ek.clone(),
+            Err(DmKeyRecordError::VersionRegression { cached, offered }) => {
+                crate::vtrace!(
+                    "dm driver: key record rolled back, cached {cached} offered {offered}"
+                );
+                return vec![DmEffect::Emit(refused(
+                    &recipient,
+                    RefusalReason::KeyRecordRollback,
+                ))];
+            }
             Err(e) => {
                 crate::vtrace!("dm driver: key record did not verify: {e}");
                 return vec![DmEffect::Emit(refused(
@@ -3189,6 +3246,7 @@ impl DmMachine {
                 ))];
             }
         };
+        self.remember_key_record_bound(&recipient, cache);
         let signing_pc = match mint_pseudonym() {
             Ok(k) => k,
             Err(e) => {
@@ -3209,7 +3267,7 @@ impl DmMachine {
                 recipient,
                 signing_lt: self.identity.signing.clone(),
                 signing_pc,
-                kem_ek_b: verified.kem_ek,
+                kem_ek_b,
                 recipient_keyrec_addr,
                 fc_epoch: keyrec::fc_epoch(unix_secs(now_ms)),
                 sent_unix_ms: now_ms,
@@ -3493,6 +3551,23 @@ impl DmMachine {
                 .minting
                 .iter()
                 .any(|pk| pk.as_slice() == recipient.as_slice())
+    }
+
+    /// Store the bound a verified fetch established for one identity.
+    ///
+    /// Called only where a record verified, so an entry always means "a record
+    /// for this identity has been verified in this process". A cache holds no
+    /// identity binding of its own, so the entry and the pubkey every `accept`
+    /// was checked against are keyed the same way.
+    fn remember_key_record_bound(&mut self, of: &[u8; IDENTITY_PK_LEN], cache: KeyRecordCache) {
+        match self
+            .key_records
+            .iter_mut()
+            .find(|(pk, _)| pk.as_slice() == of.as_slice())
+        {
+            Some((_, held)) => *held = cache,
+            None => self.key_records.push((Box::new(*of), cache)),
+        }
     }
 
     /// Drop an in-flight introduction and tell the front end it did not
@@ -3998,6 +4073,19 @@ mod tests {
             Identity::Primary,
         )
         .expect("identity")
+    }
+
+    /// A second correspondent, so a test can tell a per-identity bound from a
+    /// shared one.
+    fn other_peer_identity() -> IdentityKeys {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        derive_identity_keys(
+            &Mnemonic::from_phrase(TEST_MNEMONIC).expect("mnemonic"),
+            Identity::Device {
+                uuid: uuid::Uuid::from_bytes([0x3Bu8; 16]),
+            },
+        )
+        .expect("second peer identity")
     }
 
     /// A machine over a scratch store, with the derivations the shell would
@@ -5262,6 +5350,368 @@ mod tests {
                 _ => None,
             })
             .expect("the mint did not publish a knock")
+    }
+
+    /// What the driver did with a fetched key record.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Fetched {
+        /// Verified, adopted, and the introduction went on to mint.
+        Adopted,
+        /// Refused, carrying the reason the front end was told.
+        Refused(RefusalReason),
+    }
+
+    /// The rollback bound this session holds for `peer`, if it holds one.
+    fn bound(m: &DmMachine, peer: &IdentityKeys) -> Option<u64> {
+        m.key_records
+            .iter()
+            .find(|(pk, _)| pk.as_slice() == peer.signing.public_key().as_slice())
+            .and_then(|(_, cache)| cache.version())
+    }
+
+    /// Serve one key record at `version` for `peer` and say what the driver did
+    /// with it, leaving the machine able to fetch that identity again.
+    ///
+    /// The introduction carries a body over `DM_BODY_CAP`, so the mint a
+    /// verified record starts refuses and the introduction is dropped with
+    /// nothing written. That is what makes a second fetch reachable:
+    /// `start_introduction` refuses an identity already in flight and one
+    /// already holding a correspondence on disk, so a completed first contact
+    /// never fetches again. The bound is written on the fetch, before the mint
+    /// is asked for, so it is recorded either way.
+    fn fetch_key_record(m: &mut DmMachine, peer: &IdentityKeys, version: u64) -> Fetched {
+        let pk_lt: PkLt = Box::new(*peer.signing.public_key());
+        let out = m.on_command(
+            BASE_MS,
+            DmCommand::FirstContact {
+                recipient: pk_lt.clone(),
+                body: "x".repeat(firstcontact::DM_BODY_CAP + 1),
+            },
+        );
+        assert!(
+            matches!(&out[..], [DmEffect::Dht(DhtOp::FetchKeyRecord { .. })]),
+            "the introduction did not ask for a key record: {out:?}"
+        );
+        let record = keyrec::build_encoded(
+            &peer.signing,
+            peer.kem.encapsulation_key(),
+            version,
+            keyrec::DM_KEY_RECORD_INVITE_ONLY,
+        )
+        .expect("key record");
+        let mut out = m.on_key_record(BASE_MS, pk_lt, Some(record));
+        assert_eq!(out.len(), 1, "one fetch, one outcome: {out:?}");
+        match out.remove(0) {
+            DmEffect::Compute(ComputeJob::MintFirstContact(request)) => {
+                let out = m.on_mint(BASE_MS, run_mint(*request));
+                assert!(!out.is_empty(), "the mint said nothing at all");
+                assert!(
+                    out.iter().any(|e| matches!(
+                        e,
+                        DmEffect::Emit(DmEvent::Refused {
+                            reason: RefusalReason::MintFailed,
+                            ..
+                        })
+                    )),
+                    "the over-cap body did not stop the mint: {out:?}"
+                );
+                Fetched::Adopted
+            }
+            DmEffect::Emit(DmEvent::Refused { reason, .. }) => Fetched::Refused(reason),
+            other => panic!("the fetch was neither minted nor refused: {other:?}"),
+        }
+    }
+
+    /// Design M1. A replayed pre-rotation record is authentic and is refused
+    /// anyway, and the version the session verified stays where it was.
+    #[test]
+    fn a_replayed_older_key_record_is_refused_and_the_bound_holds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let peer = peer_identity();
+
+        assert_eq!(fetch_key_record(&mut m, &peer, 3), Fetched::Adopted);
+        assert_eq!(bound(&m, &peer), Some(3));
+
+        assert_eq!(
+            fetch_key_record(&mut m, &peer, 2),
+            Fetched::Refused(RefusalReason::KeyRecordRollback),
+            "an older authentic record must not be sealed to"
+        );
+        assert_eq!(
+            bound(&m, &peer),
+            Some(3),
+            "a refused record must not move the bound"
+        );
+    }
+
+    /// A reader with no bound takes what it is served — the accepted M1
+    /// residual — and version zero is an ordinary first sighting rather than a
+    /// missing one.
+    ///
+    /// The second half is what makes the first half mean anything: having
+    /// adopted zero, the machine bounds from zero. "Never verified" and
+    /// "verified version zero" have to stay distinguishable, or a bound read as
+    /// `unwrap_or(0)` would refuse the very record this adopts.
+    #[test]
+    fn a_cold_reader_adopts_version_zero_and_then_bounds_from_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let peer = peer_identity();
+        assert!(
+            m.key_records.is_empty(),
+            "a fresh machine must hold no bound at all"
+        );
+
+        assert_eq!(fetch_key_record(&mut m, &peer, 0), Fetched::Adopted);
+        assert_eq!(m.key_records.len(), 1, "one identity, one bound");
+        assert_eq!(bound(&m, &peer), Some(0));
+
+        assert_eq!(fetch_key_record(&mut m, &peer, 1), Fetched::Adopted);
+        assert_eq!(bound(&m, &peer), Some(1));
+        assert_eq!(
+            fetch_key_record(&mut m, &peer, 0),
+            Fetched::Refused(RefusalReason::KeyRecordRollback),
+            "a bound of zero is a bound, not an absent one"
+        );
+        assert_eq!(bound(&m, &peer), Some(1));
+    }
+
+    /// One cache per correspondent, and the key is the whole of what makes it
+    /// so: a `KeyRecordCache` holds no identity binding of its own, so a lookup
+    /// that ignored the key would let one correspondent's rotation set the floor
+    /// for everyone — refusing strangers whose records are perfectly good and
+    /// leaking, through the refusal, that some other identity has rotated.
+    #[test]
+    fn each_correspondent_carries_its_own_bound() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let first = peer_identity();
+        let second = other_peer_identity();
+        assert_ne!(
+            first.signing.public_key().as_slice(),
+            second.signing.public_key().as_slice(),
+            "the fixture is one identity twice, so it can prove nothing about keying"
+        );
+
+        assert_eq!(fetch_key_record(&mut m, &first, 5), Fetched::Adopted);
+        assert_eq!(m.key_records.len(), 1);
+
+        // The second identity's first record is its own cold read. The first
+        // identity's higher bound must not reach across to it.
+        assert_eq!(fetch_key_record(&mut m, &second, 2), Fetched::Adopted);
+        assert_eq!(m.key_records.len(), 2, "two identities, two bounds");
+        assert_eq!(bound(&m, &first), Some(5));
+        assert_eq!(bound(&m, &second), Some(2));
+
+        // And each refuses against its own floor, not the other's.
+        assert_eq!(
+            fetch_key_record(&mut m, &second, 1),
+            Fetched::Refused(RefusalReason::KeyRecordRollback)
+        );
+        assert_eq!(
+            fetch_key_record(&mut m, &first, 4),
+            Fetched::Refused(RefusalReason::KeyRecordRollback)
+        );
+        assert_eq!(bound(&m, &first), Some(5));
+        assert_eq!(bound(&m, &second), Some(2));
+    }
+
+    /// A rotation is what the bound exists to protect: the higher version is
+    /// adopted, and the version that was good a moment ago is refused from then
+    /// on.
+    #[test]
+    fn a_higher_version_advances_the_bound_and_the_old_one_is_then_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let peer = peer_identity();
+
+        assert_eq!(fetch_key_record(&mut m, &peer, 3), Fetched::Adopted);
+        assert_eq!(bound(&m, &peer), Some(3));
+        assert_eq!(fetch_key_record(&mut m, &peer, 4), Fetched::Adopted);
+        assert_eq!(bound(&m, &peer), Some(4));
+
+        assert_eq!(
+            fetch_key_record(&mut m, &peer, 3),
+            Fetched::Refused(RefusalReason::KeyRecordRollback),
+            "the version the rotation replaced must not come back"
+        );
+        assert_eq!(bound(&m, &peer), Some(4));
+    }
+
+    /// **The bound is this session's, and the residual that leaves is pinned
+    /// here rather than implied.** The design's key-record section says readers
+    /// "cache highest verified `version`, never regress (rollback M1 = a cold
+    /// reader accepts an old authentic record; residual accepted for alpha)" —
+    /// a restarted client is one of those cold readers, so the record its
+    /// previous session refused is adopted without complaint. Nothing at rest
+    /// carries the bound: the key record is fetched before a correspondence
+    /// exists to hold it, and the contact record's five fixed-width fields are
+    /// the store's whole bucket for that kind.
+    #[test]
+    fn the_bound_is_this_sessions_and_a_restart_takes_the_older_record_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let peer = peer_identity();
+
+        let mut first = machine(&dir);
+        assert_eq!(fetch_key_record(&mut first, &peer, 3), Fetched::Adopted);
+        assert_eq!(
+            fetch_key_record(&mut first, &peer, 2),
+            Fetched::Refused(RefusalReason::KeyRecordRollback)
+        );
+        drop(first);
+
+        let mut restarted = machine(&dir);
+        assert!(
+            restarted.key_records.is_empty(),
+            "a restarted machine must hold no bound"
+        );
+        assert_eq!(
+            fetch_key_record(&mut restarted, &peer, 2),
+            Fetched::Adopted,
+            "the bound is session-scoped: a restart reads as a cold reader"
+        );
+        assert_eq!(bound(&restarted, &peer), Some(2));
+    }
+
+    /// Ask for an introduction and serve bytes that verify against nothing.
+    ///
+    /// The address is world-writable, so this is an ordinary input rather than
+    /// an exceptional one: anyone at all can write the record.
+    fn serve_unverifiable_key_record(m: &mut DmMachine, peer: &IdentityKeys) -> RefusalReason {
+        let pk_lt: PkLt = Box::new(*peer.signing.public_key());
+        let out = m.on_command(
+            BASE_MS,
+            DmCommand::FirstContact {
+                recipient: pk_lt.clone(),
+                body: "knock".into(),
+            },
+        );
+        assert!(
+            matches!(&out[..], [DmEffect::Dht(DhtOp::FetchKeyRecord { .. })]),
+            "the introduction did not ask for a key record: {out:?}"
+        );
+        let mut out = m.on_key_record(BASE_MS, pk_lt, Some(vec![0xffu8; 64]));
+        assert_eq!(out.len(), 1, "one fetch, one outcome: {out:?}");
+        match out.remove(0) {
+            DmEffect::Emit(DmEvent::Refused { reason, .. }) => reason,
+            other => panic!("unverifiable bytes were not refused: {other:?}"),
+        }
+    }
+
+    /// A fetch that verifies nothing leaves no bound behind.
+    ///
+    /// An entry is the record of a *verified* record, and the address anyone can
+    /// write to is the same one this reads — so an entry created before the
+    /// bytes were checked would be a list any stranger could grow, one identity
+    /// per address they choose to write.
+    #[test]
+    fn a_fetch_that_does_not_verify_leaves_no_bound() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let peer = peer_identity();
+
+        assert_eq!(
+            serve_unverifiable_key_record(&mut m, &peer),
+            RefusalReason::KeyRecordInvalid
+        );
+        assert_eq!(
+            m.key_records.len(),
+            0,
+            "an unverifiable fetch must leave no bound"
+        );
+
+        // A record that does verify leaves exactly one entry, and a later bad
+        // fetch neither duplicates it nor disturbs what it holds.
+        assert_eq!(fetch_key_record(&mut m, &peer, 3), Fetched::Adopted);
+        assert_eq!(m.key_records.len(), 1, "one identity, one entry");
+        assert_eq!(
+            serve_unverifiable_key_record(&mut m, &peer),
+            RefusalReason::KeyRecordInvalid
+        );
+        assert_eq!(m.key_records.len(), 1, "a refused fetch must add no entry");
+        assert_eq!(
+            bound(&m, &peer),
+            Some(3),
+            "a refused fetch must not move the bound"
+        );
+    }
+
+    /// A record that is not there refuses as the awaiting-key state, leaves no
+    /// bound, and leaves the recipient introducible again.
+    ///
+    /// Absence is expected rather than exceptional — the record is retained by
+    /// capacity only, so an owner offline long enough is evicted — and each half
+    /// matters on its own: a bound recorded for an unanswered fetch would be a
+    /// floor derived from nothing, and an introduction left in flight would
+    /// refuse the user's retry as a duplicate of an attempt that already ended.
+    #[test]
+    fn a_missing_key_record_refuses_and_leaves_the_recipient_introducible() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let peer = peer_identity();
+        let pk_lt: PkLt = Box::new(*peer.signing.public_key());
+
+        let out = m.on_command(
+            BASE_MS,
+            DmCommand::FirstContact {
+                recipient: pk_lt.clone(),
+                body: "knock".into(),
+            },
+        );
+        assert!(
+            matches!(&out[..], [DmEffect::Dht(DhtOp::FetchKeyRecord { .. })]),
+            "the introduction did not ask for a key record: {out:?}"
+        );
+
+        let mut out = m.on_key_record(BASE_MS, pk_lt.clone(), None);
+        assert_eq!(out.len(), 1, "one fetch, one outcome: {out:?}");
+        match out.remove(0) {
+            DmEffect::Emit(DmEvent::Refused { reason, .. }) => assert_eq!(
+                reason,
+                RefusalReason::NoKeyRecord,
+                "an absent record is the awaiting-key state, not a bad one"
+            ),
+            other => panic!("an absent record was not refused: {other:?}"),
+        }
+        assert_eq!(
+            m.key_records.len(),
+            0,
+            "an unanswered fetch must leave no bound"
+        );
+
+        // The retry is a fresh introduction, not a duplicate of one still held.
+        let out = m.on_command(
+            BASE_MS,
+            DmCommand::FirstContact {
+                recipient: pk_lt,
+                body: "knock".into(),
+            },
+        );
+        assert!(
+            matches!(&out[..], [DmEffect::Dht(DhtOp::FetchKeyRecord { .. })]),
+            "a retry after an unanswered fetch must fetch again: {out:?}"
+        );
+    }
+
+    /// A re-fetch of the same version is the ordinary case, not a rollback: the
+    /// owner re-seeds the identical record against eviction on a slow schedule,
+    /// so refusing it would refuse the record's own keep-alive.
+    #[test]
+    fn an_equal_version_re_fetch_is_adopted_and_the_bound_is_unmoved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let peer = peer_identity();
+
+        assert_eq!(fetch_key_record(&mut m, &peer, 3), Fetched::Adopted);
+        assert_eq!(bound(&m, &peer), Some(3));
+        assert_eq!(
+            fetch_key_record(&mut m, &peer, 3),
+            Fetched::Adopted,
+            "a re-seed of the version already held must not read as a rollback"
+        );
+        assert_eq!(bound(&m, &peer), Some(3));
+        assert_eq!(m.key_records.len(), 1, "one identity, one entry");
     }
 
     /// M22. An initiator that has not yet seen the acceptance still sweeps.

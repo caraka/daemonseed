@@ -823,7 +823,10 @@ modules:
       world-writable (a world-derivable address implies a world-derivable
       owner), so forgery is impossible but erasure and rollback are not:
       KeyRecordCache::accept keeps the highest verified version and returns
-      VersionRegression on an older one. fc_epoch(now_unix_secs) and
+      VersionRegression on an older one, and accept_encoded(bytes,
+      identity_pubkey) is its byte-level form for a caller holding fetched bytes,
+      Malformed on bytes that do not decode. One cache per correspondent: the
+      cache holds no identity binding of its own. fc_epoch(now_unix_secs) and
       fc_epoch_is_current(offered, current) derive the first-contact anti-replay
       epoch from the wall clock on both sides; it is published nowhere.
       DmKeyRecordError separates Signing (local, carries the cause) from

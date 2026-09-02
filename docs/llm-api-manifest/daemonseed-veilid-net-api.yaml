@@ -477,11 +477,14 @@ types:
     module: daemonseed_veilid_net::dm
     kind: enum
     description: >-
-      Where a send stopped — NoKeyRecord, KeyRecordInvalid, PublishFailed,
-      StoreFailure, AlreadyEstablished, AlreadyInFlight, MintPanicked, TaskPanicked,
-      MintFailed, Module, OutboxFull{needed}, NotEstablishedThisSession,
-      BodyTooLarge, SealFailed. The first ten are first-contact refusals and the
-      last four channel-send ones. Acceptance says how far the write got; this
+      Where a send stopped — NoKeyRecord, KeyRecordInvalid, KeyRecordRollback,
+      PublishFailed, StoreFailure, AlreadyEstablished, AlreadyInFlight,
+      MintPanicked, TaskPanicked, MintFailed, Module, OutboxFull{needed},
+      NotEstablishedThisSession, BodyTooLarge, SealFailed. The first eleven are
+      first-contact refusals and the last four channel-send ones.
+      KeyRecordRollback is an authentic record naming a version below the highest
+      already verified for that identity this session; KeyRecordInvalid is one
+      that does not verify at all. Acceptance says how far the write got; this
       says why it went no further, and folding them loses the second.
   - name: AcceptFailure
     module: daemonseed_veilid_net::dm

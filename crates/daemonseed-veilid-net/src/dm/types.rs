@@ -369,6 +369,17 @@ pub enum RefusalReason {
     /// A key record was there and did not verify against the recipient's own
     /// identity key.
     KeyRecordInvalid,
+    /// A key record was there, verified, and named a `version` below the highest
+    /// already verified for that identity — the rollback the design's M1 names.
+    ///
+    /// **Authentic and refused anyway**, which is the whole of the signal: the
+    /// record is world-writable, so an old blob the owner really did sign can be
+    /// replayed over a newer one. Sealing to it would encapsulate to a key its
+    /// owner has rotated away from. Distinct from
+    /// [`Self::KeyRecordInvalid`] because it says something different about the
+    /// correspondent — not that their record is broken, but that someone is
+    /// writing to their address.
+    KeyRecordRollback,
     /// The key-record fetch or the doorbell write failed on the transport.
     PublishFailed,
     /// A local record could not be written, so nothing was published.

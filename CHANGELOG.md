@@ -499,6 +499,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- The DM driver verifies a fetched key record through a per-correspondent `daemonseed_core::dm::keyrec::KeyRecordCache` keyed by the correspondent's long-term identity key, so a record naming a `version` below the highest already verified for that identity is refused with the new `RefusalReason::KeyRecordRollback` instead of being sealed to (design M1); an equal version is accepted as a re-fetch and a higher one advances the bound, which is held for the life of the driver and not persisted. `daemonseed_core::dm::keyrec::KeyRecordCache::accept_encoded` decodes and admits raw fetched bytes in one step.
+
 - `daemonseed_tui::net::NetCommand` derives `Debug` only and `daemonseed_tui::net::NetEvent`
   derives `Debug` and `Clone` only: `DmCommand` is not `Clone` and `DmEvent` has no equality.
   (#339)
