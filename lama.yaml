@@ -102,7 +102,7 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-gui-api.yaml"
 
   - name: daemonseed-veilid-net
-    purpose: "Veilid transport layer — the AppSession replacement the GUI/TUI drive behind their `veilid` feature. An identity-bound Veilid node (VeilidNet::start) driven through a command-channel handle (VeilidNetHandle): sealed 1:1 messaging over a private route; circles + lobby / public rooms over a shared-owner DFLT DHT rendezvous (append-ring fan-out + backlog sweep + re-sweep recovery); public-share discovery via an anti-swap SIGNED route advert on the lobby rendezvous (DiscoveryEnvelope + verify_route_advert); and public-share content transfer owner-on-demand over app_call, fragment-reassembled and SHA-384-verified per chunk. Moves only opaque cot-sealed bytes (ISC-A-S2). Presence / announcements are Phase 4."
+    purpose: "Veilid transport layer — the AppSession replacement the GUI/TUI drive behind their `veilid` feature. An identity-bound Veilid node (VeilidNet::start) driven through a command-channel handle (VeilidNetHandle): sealed 1:1 messaging over a private route; circles + lobby / public rooms over a shared-owner DFLT DHT rendezvous (append-ring fan-out + backlog sweep + re-sweep recovery); public-share discovery via an anti-swap SIGNED route advert on the lobby rendezvous (DiscoveryEnvelope + verify_route_advert); and public-share content transfer owner-on-demand over app_call, fragment-reassembled and SHA-384-verified per chunk. The direct-messaging driver (daemonseed_veilid_net::dm) runs beside the actor: a DmDht seam over the DHT operations, a pure state machine, and the task the front ends spawn, exchanging DmCommand / DmEvent with them while sweeping key records, doorbell, channel pages and acknowledgement records. Moves only opaque cot-sealed bytes (ISC-A-S2). Presence / announcements are Phase 4."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-veilid-net-api.yaml"
@@ -292,6 +292,69 @@ capabilities:
       - daemonseed_core::circle::message
       - daemonseed_core::cot
     iscs: [C8, C9, A-C8, S4, A-S2, C15, C17]
+
+  - category: "Direct messaging (core surface)"
+    summary: >-
+      Direct messaging between two identities over DHT records. `keyrec`
+      builds and verifies the published key record (world-derivable owner,
+      inner-signed, monotonic version). `doorbell` is the world-writable
+      32-slot record where `firstcontact` entries land; `admission` verifies
+      each in a fixed order over `pow` and the one-time invite tokens of
+      `token` and `spent_store`. A conversation runs on `paging`'s 16-slot
+      per-page records under a conversation-derived owner, carrying
+      `frame`-sealed messages keyed by `ratchet`, a two-directional
+      post-quantum double ratchet with a bounded skipped-key cache. `outbox`
+      holds unacknowledged sends; `ack`, `ack_record`, `ack_budget` and
+      `ack_cadence` carry the high-water acknowledgement, its record and the
+      standalone-write allowance; `collect` plans inbound sweeps. `resume`
+      re-establishes after a reconnect; `provisional`, `contact_cache` and
+      `block_list` hold per-correspondent state; `domain` fixes the label
+      namespace; `persist` is the at-rest DM store.
+    crate: daemonseed-core
+    modules:
+      - daemonseed_core::dm::ack
+      - daemonseed_core::dm::ack_budget
+      - daemonseed_core::dm::ack_cadence
+      - daemonseed_core::dm::ack_record
+      - daemonseed_core::dm::admission
+      - daemonseed_core::dm::block_list
+      - daemonseed_core::dm::collect
+      - daemonseed_core::dm::contact_cache
+      - daemonseed_core::dm::domain
+      - daemonseed_core::dm::doorbell
+      - daemonseed_core::dm::firstcontact
+      - daemonseed_core::dm::frame
+      - daemonseed_core::dm::keyrec
+      - daemonseed_core::dm::outbox
+      - daemonseed_core::dm::paging
+      - daemonseed_core::dm::persist
+      - daemonseed_core::dm::pow
+      - daemonseed_core::dm::provisional
+      - daemonseed_core::dm::ratchet
+      - daemonseed_core::dm::resume
+      - daemonseed_core::dm::spent_store
+      - daemonseed_core::dm::token
+    iscs: [C38, C39, C40, C41, C42, C43, C44, C45, C46, C100, A-C20, A-C21, A-C22, A-C23, A-C24, A-C25, A-C44, A-C45]
+
+  - category: "Direct-messaging driver (transport)"
+    summary: >-
+      The transport half of direct messaging. `seam` is the `DmDht` trait over
+      the seven DHT operations the driver performs, implemented by
+      `VeilidNetHandle` and by a counting mock. Behind it a pure state machine
+      takes the wall time its caller read and returns the effects to run.
+      `driver` is the async task the front ends spawn beside the net actor: it
+      steps the machine on an idle tick, on commands and on completed
+      operations, runs each operation off its loop, and forwards the machine's
+      events. At most one sweep of any record is in flight. `types` holds the
+      crossing vocabulary: `DmCommand` in, `DmEvent` out, `DmIdentity`,
+      `PkLt`, `RequestId`, `RefusalReason`, `AcceptFailure` and the
+      `WallClock` seam.
+    crate: daemonseed-veilid-net
+    modules:
+      - daemonseed_veilid_net::dm::driver
+      - daemonseed_veilid_net::dm::seam
+      - daemonseed_veilid_net::dm::types
+    iscs: [C39, C40, C41, C42, C43, C45, A-C21, A-C24]
 
   - category: "Wire schema (proto)"
     summary: >-
