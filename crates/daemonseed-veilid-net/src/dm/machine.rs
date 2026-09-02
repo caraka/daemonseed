@@ -118,7 +118,7 @@ pub(crate) enum DmEffect {
 impl core::fmt::Debug for DmEffect {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            DmEffect::Dht(op) => write!(f, "Dht({})", op.kind()),
+            DmEffect::Dht(op) => write!(f, "Dht({})", op.kind().name()),
             DmEffect::Emit(event) => write!(f, "Emit({event:?})"),
             DmEffect::Compute(ComputeJob::MintFirstContact(_)) => {
                 f.write_str("Compute(MintFirstContact)")
@@ -260,26 +260,57 @@ pub(crate) enum DhtOp {
     FetchAck { tag: OpTag, address: DmAckAddress },
 }
 
-impl DhtOp {
-    /// This operation's kind, for a trace line that carries no payload.
-    pub(crate) fn kind(&self) -> &'static str {
+/// Which of the seven operations an outcome came from.
+///
+/// **A tag cannot answer this and is not meant to.** A tag names what the
+/// operation belongs to — a conversation, an introduction — and a doorbell sweep
+/// belongs to neither, so it is tagged with nothing at all. An `Err` carrying
+/// only that tag is indistinguishable from every other untagged failure, which
+/// is exactly the case where the machine has to know a sweep is no longer in
+/// flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DhtOpKind {
+    FetchKeyRecord,
+    PublishDoorbell,
+    SweepDoorbell,
+    PublishPage,
+    SweepPage,
+    PublishAck,
+    FetchAck,
+}
+
+impl DhtOpKind {
+    /// This kind's name, for a trace line that carries no payload.
+    pub(crate) fn name(self) -> &'static str {
         match self {
-            DhtOp::FetchKeyRecord { .. } => "FetchKeyRecord",
-            DhtOp::PublishDoorbell { .. } => "PublishDoorbell",
-            DhtOp::SweepDoorbell { .. } => "SweepDoorbell",
-            DhtOp::PublishPage { .. } => "PublishPage",
-            DhtOp::SweepPage { .. } => "SweepPage",
-            DhtOp::PublishAck { .. } => "PublishAck",
-            DhtOp::FetchAck { .. } => "FetchAck",
+            DhtOpKind::FetchKeyRecord => "FetchKeyRecord",
+            DhtOpKind::PublishDoorbell => "PublishDoorbell",
+            DhtOpKind::SweepDoorbell => "SweepDoorbell",
+            DhtOpKind::PublishPage => "PublishPage",
+            DhtOpKind::SweepPage => "SweepPage",
+            DhtOpKind::PublishAck => "PublishAck",
+            DhtOpKind::FetchAck => "FetchAck",
+        }
+    }
+}
+
+impl DhtOp {
+    /// This operation's kind.
+    pub(crate) fn kind(&self) -> DhtOpKind {
+        match self {
+            DhtOp::FetchKeyRecord { .. } => DhtOpKind::FetchKeyRecord,
+            DhtOp::PublishDoorbell { .. } => DhtOpKind::PublishDoorbell,
+            DhtOp::SweepDoorbell { .. } => DhtOpKind::SweepDoorbell,
+            DhtOp::PublishPage { .. } => DhtOpKind::PublishPage,
+            DhtOp::SweepPage { .. } => DhtOpKind::SweepPage,
+            DhtOp::PublishAck { .. } => DhtOpKind::PublishAck,
+            DhtOp::FetchAck { .. } => DhtOpKind::FetchAck,
         }
     }
 
-    /// The introduction this operation belongs to, where it has one.
-    ///
-    /// The shell reads it before spawning, so a task that panics can still be
-    /// traced back to the introduction it was carrying.
-    pub(crate) fn introduction(&self) -> Option<PkLt> {
-        let tag = match self {
+    /// The tag this operation carries.
+    fn tag(&self) -> &OpTag {
+        match self {
             DhtOp::FetchKeyRecord { tag, .. }
             | DhtOp::PublishDoorbell { tag, .. }
             | DhtOp::SweepDoorbell { tag, .. }
@@ -287,8 +318,40 @@ impl DhtOp {
             | DhtOp::SweepPage { tag, .. }
             | DhtOp::PublishAck { tag, .. }
             | DhtOp::FetchAck { tag, .. } => tag,
+        }
+    }
+
+    /// What the shell should record about this operation before spawning it, so
+    /// a task that panics can still release whatever the machine is holding for
+    /// it.
+    ///
+    /// **The sweep is decided first, and the introduction takes whatever it does
+    /// not claim.** Testing the introduction first would be correct only for as
+    /// long as no sweep ever carries one — true today, since an introduction's
+    /// operations are a key-record fetch and a doorbell write — and the day one
+    /// did, the record slot it was holding would leak with nothing reporting it.
+    ///
+    /// A page sweep whose tag is missing its conversation or its page names no
+    /// slot to release, so it **falls through** to the introduction rather than
+    /// to nothing: ordering the two must not make either case narrower than it
+    /// was, and a partial tag is exactly where that is easy to do by accident.
+    pub(crate) fn panicked_job(&self) -> Option<PanickedJob> {
+        let sweep = match self {
+            DhtOp::SweepDoorbell { .. } => Some(PanickedJob::DoorbellSweep),
+            DhtOp::SweepPage { tag, .. } => match (tag.conversation, tag.page) {
+                (Some(conversation), Some(page)) => {
+                    Some(PanickedJob::PageSweep { conversation, page })
+                }
+                _ => None,
+            },
+            _ => None,
         };
-        tag.introduction.as_ref().map(|pk| Box::new(**pk))
+        sweep.or_else(|| {
+            self.tag()
+                .introduction
+                .as_ref()
+                .map(|pk| PanickedJob::Dht(Box::new(**pk)))
+        })
     }
 }
 
@@ -319,6 +382,15 @@ pub(crate) enum DhtResult {
 
 /// One completed DHT operation, tagged with what asked for it.
 pub(crate) struct DhtOutcome {
+    /// Which operation produced it.
+    ///
+    /// **Carried rather than recovered from the result**, because the failure
+    /// paths have no result to recover it from: an `Err` is one error type for
+    /// all seven operations, and the doorbell sweep's tag names nothing. A sweep
+    /// the machine cannot recognise on its way back is a sweep it goes on
+    /// believing is in flight, and a record whose sweep is permanently in flight
+    /// is a record this driver never reads again.
+    pub kind: DhtOpKind,
     /// The tag the machine attached to the operation.
     pub tag: OpTag,
     /// The operation's result.
@@ -470,6 +542,17 @@ pub(crate) enum PanickedJob {
     Dht(PkLt),
     /// The spent-token write.
     SpentSave,
+    /// A sweep of our own doorbell.
+    ///
+    /// The machine holds one sweep of a record at a time, so a dead sweep whose
+    /// death nothing reports leaves the doorbell recorded as in flight for the
+    /// life of the driver — which is a driver that never hears another knock.
+    DoorbellSweep,
+    /// A sweep of one receiving page, by the conversation and page it addressed.
+    PageSweep {
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        page: u64,
+    },
 }
 
 impl core::fmt::Debug for PanickedJob {
@@ -478,6 +561,12 @@ impl core::fmt::Debug for PanickedJob {
             PanickedJob::Mint(_) => f.write_str("Mint(PkLt(..))"),
             PanickedJob::Dht(_) => f.write_str("Dht(PkLt(..))"),
             PanickedJob::SpentSave => f.write_str("SpentSave"),
+            PanickedJob::DoorbellSweep => f.write_str("DoorbellSweep"),
+            // The conversation fingerprint names a correspondence; only the page
+            // is shown, on the terms `OpTag`'s own rendering states.
+            PanickedJob::PageSweep { page, .. } => {
+                write!(f, "PageSweep {{ conversation: \"<AR>\", page: {page} }}")
+            }
         }
     }
 }
@@ -485,6 +574,7 @@ impl core::fmt::Debug for PanickedJob {
 impl core::fmt::Debug for DhtOutcome {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DhtOutcome")
+            .field("kind", &self.kind)
             .field("tag", &self.tag)
             .field("ok", &self.result.is_ok())
             .finish()
@@ -883,6 +973,28 @@ pub(crate) struct DmMachine {
     /// slower than the allowance still wakes to write the acknowledgement it was
     /// refused, rather than deferring it a whole tick.
     ack_retry_due_ms: Option<i64>,
+    /// Whether a sweep of our own doorbell is in flight.
+    ///
+    /// **A cadence is not a rate limit.** The tick asks for a sweep every
+    /// interval; nothing about the interval bounds how long one sweep takes. A
+    /// doorbell sweep reads every subkey of the record, and on a real
+    /// distributed hash table each of those is a network round trip — so a sweep
+    /// routinely outlives several ticks, and a driver that emitted one per tick
+    /// regardless would hold a dozen sweeps of the SAME record open at once,
+    /// every one of them competing for the same read permits and slowing the
+    /// others down. One at a time is not a throttle bolted on; it is the only
+    /// number of sweeps of one record that has ever been useful.
+    ///
+    /// What it costs is bounded and small: a sweep that lands between two ticks
+    /// does not schedule anything of its own, so the longest a knock can sit
+    /// unread is one whole sweep plus one tick.
+    sweeping_doorbell: bool,
+    /// The receiving pages whose sweep is in flight, by conversation and page.
+    ///
+    /// Keyed per page rather than per conversation because the probe plan is
+    /// per page: two different pages of one conversation are two different
+    /// records, and holding one open says nothing about the other.
+    sweeping_pages: std::collections::BTreeSet<([u8; AR_FINGERPRINT_LEN], u64)>,
 }
 
 impl DmMachine {
@@ -920,6 +1032,8 @@ impl DmMachine {
             ack_budget: StandaloneAckBudget::new(),
             last_ack_picked: None,
             ack_retry_due_ms: None,
+            sweeping_doorbell: false,
+            sweeping_pages: std::collections::BTreeSet::new(),
         }
     }
 
@@ -953,12 +1067,21 @@ impl DmMachine {
     /// sweep is the ordinary state; the sweep's own accounting rides out on
     /// [`DmEvent::DoorbellHealth`], because an empty slot list alone means both
     /// "nobody knocked" and "every GET errored".
+    ///
+    /// **A tick whose previous sweep has not come back asks for nothing.** See
+    /// [`Self::sweeping_doorbell`]: the cadence says how often to look, not how
+    /// many looks may be open at once, and the answer to the second question is
+    /// one.
     pub(crate) fn on_tick(&mut self, now_ms: i64) -> Vec<DmEffect> {
         self.last_tick_ms = Some(now_ms);
-        let mut out = vec![DmEffect::Dht(DhtOp::SweepDoorbell {
-            tag: OpTag::none(),
-            owner_seed: self.doorbell_owner,
-        })];
+        let mut out = Vec::new();
+        if !self.sweeping_doorbell {
+            self.sweeping_doorbell = true;
+            out.push(DmEffect::Dht(DhtOp::SweepDoorbell {
+                tag: OpTag::none(),
+                owner_seed: self.doorbell_owner,
+            }));
+        }
         for index in 0..self.correspondences.len() {
             out.extend(self.give_ups(now_ms, index));
             out.extend(self.due_emissions(now_ms, index));
@@ -1002,41 +1125,91 @@ impl DmMachine {
                     self.spent.poisoned = true;
                     vec![DmEffect::Emit(DmEvent::SpentTokensNotPersisted)]
                 }
+                // A dead sweep yields nothing, so the only thing to do about it
+                // is stop waiting on it. Left in flight it is the expensive
+                // failure the flag exists to prevent, running the other way: not
+                // a stack of sweeps of one record but none of them, for ever.
+                Some(PanickedJob::DoorbellSweep) => {
+                    self.sweeping_doorbell = false;
+                    Vec::new()
+                }
+                Some(PanickedJob::PageSweep { conversation, page }) => {
+                    self.sweeping_pages.remove(&(conversation, page));
+                    Vec::new()
+                }
                 None => Vec::new(),
             },
-            DmOutcome::Dht(DhtOutcome { tag, result }) => match result {
-                Err(e) => {
-                    crate::vtrace!("dm driver: operation failed: {e}");
-                    // An introduction whose fetch or write failed on the
-                    // transport is refused rather than left in flight: the
-                    // front end may ask again, and a silently retained
-                    // introduction would refuse that second ask as a duplicate.
-                    match tag.introduction {
-                        Some(recipient) => {
-                            self.refuse_introduction(&recipient, RefusalReason::PublishFailed)
+            DmOutcome::Dht(DhtOutcome { kind, tag, result }) => {
+                // **Before the result is handed on, and on the success and
+                // failure paths alike.** A sweep that came back is a sweep no
+                // longer in flight whatever it came back with, and doing this
+                // inside the `Ok` arms alone would leave a transport failure
+                // holding the record shut.
+                self.release_sweep(kind, &tag);
+                match result {
+                    Err(e) => {
+                        crate::vtrace!("dm driver: operation failed: {e}");
+                        // An introduction whose fetch or write failed on the
+                        // transport is refused rather than left in flight: the
+                        // front end may ask again, and a silently retained
+                        // introduction would refuse that second ask as a duplicate.
+                        match tag.introduction {
+                            Some(recipient) => {
+                                self.refuse_introduction(&recipient, RefusalReason::PublishFailed)
+                            }
+                            None => Vec::new(),
                         }
+                    }
+                    Ok(DhtResult::Doorbell(sweep)) => self.on_doorbell(now_ms, sweep),
+                    Ok(DhtResult::KeyRecord(record)) => match tag.introduction {
+                        Some(recipient) => self.on_key_record(now_ms, recipient, record),
                         None => Vec::new(),
+                    },
+                    Ok(DhtResult::Written) => {
+                        // The doorbell write landed, so the introduction is no
+                        // longer in flight and a later `FirstContact` to this
+                        // recipient is a new one rather than a duplicate.
+                        if let Some(recipient) = tag.introduction.as_ref() {
+                            self.minting
+                                .retain(|pk| pk.as_slice() != recipient.as_slice());
+                        }
+                        self.confirm_written(now_ms, &tag)
                     }
+                    Ok(DhtResult::Page(sweep)) => self.on_page(now_ms, &tag, sweep),
+                    Ok(DhtResult::Ack(record)) => self.on_peer_ack(now_ms, &tag, record),
+                    Ok(DhtResult::AckWritten) => self.on_ack_written(now_ms, &tag),
                 }
-                Ok(DhtResult::Doorbell(sweep)) => self.on_doorbell(now_ms, sweep),
-                Ok(DhtResult::KeyRecord(record)) => match tag.introduction {
-                    Some(recipient) => self.on_key_record(now_ms, recipient, record),
-                    None => Vec::new(),
-                },
-                Ok(DhtResult::Written) => {
-                    // The doorbell write landed, so the introduction is no
-                    // longer in flight and a later `FirstContact` to this
-                    // recipient is a new one rather than a duplicate.
-                    if let Some(recipient) = tag.introduction.as_ref() {
-                        self.minting
-                            .retain(|pk| pk.as_slice() != recipient.as_slice());
-                    }
-                    self.confirm_written(now_ms, &tag)
+            }
+        }
+    }
+
+    /// Record that a sweep is no longer in flight.
+    ///
+    /// Keyed on the operation's own kind rather than on the shape of its result,
+    /// which is what makes it work on the failure path: an `Err` is the same
+    /// type for every operation, and the doorbell sweep's tag names nothing at
+    /// all.
+    fn release_sweep(&mut self, kind: DhtOpKind, tag: &OpTag) {
+        match kind {
+            DhtOpKind::SweepDoorbell => self.sweeping_doorbell = false,
+            DhtOpKind::SweepPage => {
+                // Every page sweep is tagged with both, by `probe`, which is the
+                // only thing that emits one — and a tag missing either names no
+                // key to release, so the slot would be held for ever with
+                // nothing reporting it.
+                debug_assert!(
+                    tag.conversation.is_some() && tag.page.is_some(),
+                    "a page sweep must be tagged with its conversation and page"
+                );
+                if let (Some(conversation), Some(page)) = (tag.conversation, tag.page) {
+                    self.sweeping_pages.remove(&(conversation, page));
                 }
-                Ok(DhtResult::Page(sweep)) => self.on_page(now_ms, &tag, sweep),
-                Ok(DhtResult::Ack(record)) => self.on_peer_ack(now_ms, &tag, record),
-                Ok(DhtResult::AckWritten) => self.on_ack_written(now_ms, &tag),
-            },
+            }
+            DhtOpKind::FetchKeyRecord
+            | DhtOpKind::PublishDoorbell
+            | DhtOpKind::PublishPage
+            | DhtOpKind::PublishAck
+            | DhtOpKind::FetchAck => {}
         }
     }
 
@@ -1554,8 +1727,20 @@ impl DmMachine {
     }
 
     /// Ask the collection which receiving pages to sweep now.
+    ///
+    /// **A page whose sweep is still in flight is skipped**, on the terms
+    /// [`Self::sweeping_doorbell`] states: one sweep of one record at a time.
+    /// The plan is still consumed — [`Collection::probe_plan`] records itself as
+    /// issued whatever the caller does with it — which is the behaviour wanted
+    /// here: the sweep already open will deliver the page, so a second plan for
+    /// it inside one cadence would buy nothing.
     fn probe(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
-        let correspondence = &mut self.correspondences[index];
+        let Self {
+            correspondences,
+            sweeping_pages,
+            ..
+        } = self;
+        let correspondence = &mut correspondences[index];
         if correspondence.live().is_none() {
             return Vec::new();
         }
@@ -1575,11 +1760,19 @@ impl DmMachine {
         let conversation = *ratchet.ar_fingerprint();
         let mut out = Vec::new();
         for page in plan {
+            if sweeping_pages.contains(&(conversation, page)) {
+                continue;
+            }
             match DmPageAddress::receiving(&channel.address_root, ratchet, page) {
-                Ok(address) => out.push(DmEffect::Dht(DhtOp::SweepPage {
-                    tag: OpTag::channel(conversation, None, Some(page)),
-                    address,
-                })),
+                Ok(address) => {
+                    sweeping_pages.insert((conversation, page));
+                    out.push(DmEffect::Dht(DhtOp::SweepPage {
+                        tag: OpTag::channel(conversation, None, Some(page)),
+                        address,
+                    }));
+                }
+                // Recorded as in flight only where an address was derived: a
+                // page whose sweep was never asked for is not one to wait on.
                 Err(e) => crate::vtrace!("dm driver: receiving address derivation failed: {e}"),
             }
         }
@@ -4897,6 +5090,131 @@ mod tests {
         );
     }
 
+    /// The pages a batch of effects asked to sweep, in emission order.
+    fn swept_pages(effects: &[DmEffect]) -> Vec<u64> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::SweepPage { tag, .. }) => tag.page,
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One page sweep's outcome, as the shell would hand it back.
+    fn page_outcome(
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        page: u64,
+        result: crate::Result<DhtResult>,
+    ) -> DmOutcome {
+        DmOutcome::Dht(DhtOutcome {
+            kind: DhtOpKind::SweepPage,
+            tag: OpTag::channel(conversation, None, Some(page)),
+            result,
+        })
+    }
+
+    /// A complete sweep of a page nothing has been written to.
+    fn empty_page(conversation: [u8; AR_FINGERPRINT_LEN]) -> DhtResult {
+        DhtResult::Page(DmPageSweep {
+            conversation,
+            slots: Vec::new(),
+            outcome: crate::SweepOutcome {
+                attempted: u32::from(PAGE_SLOTS),
+                failed: 0,
+                found: 0,
+            },
+        })
+    }
+
+    /// M22b. A page whose sweep is still in flight is not asked for again, and
+    /// the sweep's outcome releases it however it ended.
+    ///
+    /// **The cadence is not a rate limit.** A page sweep is one read per subkey
+    /// of the record, so on a real distributed hash table it routinely outlives
+    /// several cadences — and a probe that planned the same page on every one of
+    /// them would hold a stack of sweeps of one record open at once, each
+    /// competing with the others for the same read permits.
+    ///
+    /// The first plan is the positive control: without it "the second plan asked
+    /// for nothing" is satisfied by a probe that never planned anything at all.
+    #[test]
+    fn a_page_sweep_in_flight_is_not_asked_for_twice() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let _ = knock_as_initiator(&mut m, &peer_identity());
+        let conversation = conversation_of(&m, 0);
+
+        let first = swept_pages(&m.probe(BASE_MS, 0));
+        assert_eq!(
+            first,
+            vec![0, 1],
+            "the watched pair must be planned, or every assertion below is vacuous"
+        );
+
+        // The cadence has elapsed, so the plan is issued again — and every page
+        // in it is one this machine is already waiting on.
+        let second = swept_pages(&m.probe(BASE_MS + PROBE_MS, 0));
+        assert!(
+            second.is_empty(),
+            "a page already being swept must not be swept again: {second:?}"
+        );
+
+        // ── a sweep that came back releases its page ─────────────────────────
+        m.on_outcome(
+            BASE_MS + PROBE_MS,
+            page_outcome(conversation, 0, Ok(empty_page(conversation))),
+        );
+        let third = swept_pages(&m.probe(BASE_MS + 2 * PROBE_MS, 0));
+        assert_eq!(
+            third,
+            vec![0],
+            "the page whose sweep landed must be planned again, and only it"
+        );
+
+        // ── so does one that failed ──────────────────────────────────────────
+        //
+        // The expensive direction: a transport failure that left the slot held
+        // would make this machine permanently deaf on page one, and nothing
+        // about it would look wrong.
+        m.on_outcome(
+            BASE_MS + 2 * PROBE_MS,
+            page_outcome(
+                conversation,
+                1,
+                Err(crate::VeilidNetError::Actor("no route".into())),
+            ),
+        );
+        let fourth = swept_pages(&m.probe(BASE_MS + 3 * PROBE_MS, 0));
+        assert_eq!(
+            fourth,
+            vec![1],
+            "a failed sweep must release its page: {fourth:?}"
+        );
+
+        // ── and so does a sweep whose task died ──────────────────────────────
+        //
+        // The third way, and the only one that produces no outcome at all, which
+        // is why the shell records the page at spawn.
+        m.on_outcome(
+            BASE_MS + 3 * PROBE_MS,
+            DmOutcome::Panicked {
+                job: Some(PanickedJob::PageSweep {
+                    conversation,
+                    page: 0,
+                }),
+            },
+        );
+        let fifth = swept_pages(&m.probe(BASE_MS + 4 * PROBE_MS, 0));
+        assert_eq!(
+            fifth,
+            vec![0],
+            "a panicked sweep must release its page: {fifth:?}"
+        );
+    }
+
     /// M23. The initiator's provisional record survives the mint and every
     /// unverified frame, and is erased by a verified acceptance — nothing
     /// earlier.
@@ -5327,20 +5645,7 @@ mod tests {
         page: u64,
         slots: Vec<(PagePosition, Vec<u8>)>,
     ) -> Vec<DmEffect> {
-        let found = u32::try_from(slots.len()).unwrap_or(u32::MAX);
-        m.on_page(
-            BASE_MS,
-            &OpTag::channel(conversation, None, Some(page)),
-            DmPageSweep {
-                conversation,
-                slots,
-                outcome: crate::SweepOutcome {
-                    attempted: u32::from(PAGE_SLOTS),
-                    failed: 0,
-                    found,
-                },
-            },
-        )
+        fold_page_at(m, BASE_MS, conversation, page, slots)
     }
 
     /// The bytes of one queued outbox entry.
@@ -5410,18 +5715,25 @@ mod tests {
         slots: Vec<(PagePosition, Vec<u8>)>,
     ) -> Vec<DmEffect> {
         let found = u32::try_from(slots.len()).unwrap_or(u32::MAX);
-        m.on_page(
+        // Through `on_outcome` rather than straight into `on_page`, because that
+        // is the only path that releases the page's in-flight slot: a fixture
+        // calling the fold directly would leave every page it delivered recorded
+        // as still being swept, and the ticks after it would plan nothing.
+        m.on_outcome(
             now_ms,
-            &OpTag::channel(conversation, None, Some(page)),
-            DmPageSweep {
-                conversation,
-                slots,
-                outcome: crate::SweepOutcome {
-                    attempted: u32::from(PAGE_SLOTS),
-                    failed: 0,
-                    found,
-                },
-            },
+            DmOutcome::Dht(DhtOutcome {
+                kind: DhtOpKind::SweepPage,
+                tag: OpTag::channel(conversation, None, Some(page)),
+                result: Ok(DhtResult::Page(DmPageSweep {
+                    conversation,
+                    slots,
+                    outcome: crate::SweepOutcome {
+                        attempted: u32::from(PAGE_SLOTS),
+                        failed: 0,
+                        found,
+                    },
+                })),
+            }),
         )
     }
 
@@ -5539,6 +5851,7 @@ mod tests {
         m.on_outcome(
             now_ms,
             DmOutcome::Dht(DhtOutcome {
+                kind: DhtOpKind::PublishAck,
                 tag: OpTag::channel(conversation, None, None),
                 result: Ok(DhtResult::AckWritten),
             }),
@@ -5555,6 +5868,7 @@ mod tests {
         m.on_outcome(
             now_ms,
             DmOutcome::Dht(DhtOutcome {
+                kind: DhtOpKind::FetchAck,
                 tag: OpTag::channel(conversation, None, None),
                 result: Ok(DhtResult::Ack(Some(record))),
             }),

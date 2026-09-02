@@ -653,11 +653,15 @@ async fn apply<D: DmDht>(
         match effect {
             DmEffect::Dht(op) => {
                 probe.ops_started.fetch_add(1, Ordering::SeqCst);
-                let introduction = op.introduction();
+                // Read before the op moves into the task, and recorded for every
+                // job that leaves state behind rather than for introductions
+                // alone: a sweep the machine is holding open is released by its
+                // outcome, and a panic produces no outcome.
+                let job = op.panicked_job();
                 let dht = dht.clone();
                 let handle = inflight.spawn(async move { DmOutcome::Dht(dispatch(dht, op).await) });
-                if let Some(pk) = introduction {
-                    jobs.insert(handle.id(), PanickedJob::Dht(pk));
+                if let Some(job) = job {
+                    jobs.insert(handle.id(), job);
                 }
             }
             // `spawn_blocking`, never `spawn`: the proof of work inside a mint
@@ -694,9 +698,15 @@ async fn apply<D: DmDht>(
 }
 
 /// Run one operation against the seam and tag its result.
+///
+/// The kind is stamped here, from the op itself, rather than inferred later from
+/// the result: two of the seven are sweeps the machine is holding a slot open
+/// for, and on the failure path a result says only that something went wrong.
 async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
+    let kind = op.kind();
     match op {
         DhtOp::FetchKeyRecord { tag, owner_seed } => DhtOutcome {
+            kind,
             tag,
             result: dht
                 .fetch_dm_key_record(owner_seed)
@@ -710,6 +720,7 @@ async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
             entry,
             dispatch,
         } => DhtOutcome {
+            kind,
             tag,
             result: dht
                 .publish_doorbell_entry(owner_seed, slot, entry, dispatch)
@@ -717,6 +728,7 @@ async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
                 .map(|()| DhtResult::Written),
         },
         DhtOp::SweepDoorbell { tag, owner_seed } => DhtOutcome {
+            kind,
             tag,
             result: dht
                 .sweep_doorbell(owner_seed)
@@ -728,6 +740,7 @@ async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
             address,
             frame,
         } => DhtOutcome {
+            kind,
             tag,
             result: dht
                 .publish_dm_page(address, frame)
@@ -735,6 +748,7 @@ async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
                 .map(|()| DhtResult::Written),
         },
         DhtOp::SweepPage { tag, address } => DhtOutcome {
+            kind,
             tag,
             result: dht.sweep_dm_page(address).await.map(DhtResult::Page),
         },
@@ -743,6 +757,7 @@ async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
             address,
             record,
         } => DhtOutcome {
+            kind,
             tag,
             result: dht
                 .publish_dm_ack(address, record)
@@ -750,6 +765,7 @@ async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
                 .map(|()| DhtResult::AckWritten),
         },
         DhtOp::FetchAck { tag, address } => DhtOutcome {
+            kind,
             tag,
             result: dht.fetch_dm_ack(address).await.map(DhtResult::Ack),
         },
@@ -965,6 +981,251 @@ mod tests {
         assert!(evt_rx.recv().await.is_none(), "the event channel closes");
     }
 
+    /// A sweep latency longer than the cadence, so a sweep is still open when the
+    /// next tick fires. Chosen against [`IDLE_TICK`]: one and a half ticks, so
+    /// the sweep started at the first tick lands between the second and the
+    /// third.
+    const SLOW_SWEEP: Duration = Duration::from_secs(45);
+
+    /// Run to a hundred seconds of virtual time in five-second steps.
+    ///
+    /// Stepped rather than jumped: a single advance past several deadlines
+    /// leaves the order the loop observed them in up to the scheduler, and the
+    /// whole claim here is about what happened between two of them.
+    async fn run_to_a_hundred_seconds(wall: &Arc<AtomicI64>) {
+        for _ in 0..20 {
+            advance(wall, Duration::from_secs(5)).await;
+        }
+    }
+
+    /// T1e. A tick whose doorbell sweep is still in flight asks for nothing.
+    ///
+    /// **The cadence says how often to look, not how many looks may be open at
+    /// once.** A doorbell sweep is one read per subkey of the record, so on a
+    /// real distributed hash table it takes far longer than a tick — and a
+    /// driver that emitted one per tick regardless would hold a stack of sweeps
+    /// of the same record open, every one of them competing with the others for
+    /// the same read permits and making all of them slower.
+    ///
+    /// Three ticks land inside the window and two sweeps come out of them: the
+    /// first tick sweeps, the second is suppressed because that sweep is still
+    /// open, and the third sweeps because it has since landed. `ticks == 3` is
+    /// the positive control — without it "two sweeps" is satisfied by a loop
+    /// that woke twice. The control in the other direction is T1, which runs the
+    /// same cadence against a sweep that returns in milliseconds and sees one
+    /// sweep per tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_doorbell_sweep_in_flight_suppresses_the_next_tick() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::new(SLOW_SWEEP));
+        let probe = Arc::new(DmDriverProbe::new());
+        let (handle, mut evt_rx, task) =
+            DmDriver::spawn_with_probe(parts(&dir, &wall, dht.clone()), probe.clone());
+
+        run_to_a_hundred_seconds(&wall).await;
+
+        assert_eq!(
+            probe.ticks.load(Ordering::SeqCst),
+            3,
+            "the loop must have woken three times, or two sweeps proves nothing"
+        );
+        assert_eq!(
+            dht.count(Method::SweepDoorbell),
+            2,
+            "three ticks over a sweep that outlives one of them must ask twice"
+        );
+        assert_eq!(
+            probe.ops_started.load(Ordering::SeqCst),
+            2,
+            "the suppressed tick must not have spawned anything either"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
+        // One health report, from the one sweep that finished inside the window.
+        let events = drain(&mut evt_rx);
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one sweep completed inside the window: {events:?}"
+        );
+    }
+
+    /// T1e-mirror. Only a doorbell SWEEP releases the doorbell's slot — a
+    /// doorbell WRITE completing does not.
+    ///
+    /// **The mirror control on T1e, and it is the half a suppression test cannot
+    /// see.** T1e proves the slot is held; it says nothing about what may release
+    /// it, and a release keyed one variant too wide passes every assertion T1e
+    /// makes. The two doorbell operations are the pair most easily confused —
+    /// they name the same record and differ only in direction — so this drives a
+    /// real first contact, whose key-record fetch and doorbell write both
+    /// complete while the slow sweep started at the first tick is still open, and
+    /// asserts the sweep count is unmoved by either.
+    ///
+    /// Only the sweep is slowed. An introduction is a chain of hops, and one
+    /// running at sweep speed would not finish inside the window at all — which
+    /// would make this pass for the wrong reason.
+    #[tokio::test(start_paused = true)]
+    async fn a_doorbell_write_does_not_release_the_sweep_slot() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
+        dht.slow(Method::SweepDoorbell, SLOW_SWEEP);
+        let peer = peer_keys();
+        dht.set_key_record(Some(key_record_for(&peer)));
+        let probe = Arc::new(DmDriverProbe::new());
+        let (handle, mut evt_rx, task) =
+            DmDriver::spawn_with_probe(parts(&dir, &wall, dht.clone()), probe.clone());
+
+        // The first tick, which starts the sweep that outlives the next two.
+        advance(&wall, IDLE_TICK).await;
+        assert_eq!(dht.count(Method::SweepDoorbell), 1, "the sweep started");
+
+        // A whole first contact, inside that sweep's flight: fetch, mint, write.
+        handle
+            .send(DmCommand::FirstContact {
+                recipient: Box::new(*peer.signing.public_key()),
+                body: "knock knock".into(),
+            })
+            .await
+            .expect("first contact");
+        // Five steps: the tick that started the sweep, the command, the key
+        // record, the mint, and the write's own outcome coming back. The second
+        // advance is not decoration — `settle_steps` releases the runtime's
+        // thread for the blocking mint but does not move virtual time, so the
+        // mock's latency on the write needs its own advance before the fifth
+        // step can happen. Without it the fourth step is the mint's join and the
+        // write is still asleep, which is the case this control exists to rule
+        // out.
+        advance(&wall, Duration::from_millis(100)).await;
+        settle_steps(&probe, 4).await;
+        advance(&wall, Duration::from_millis(100)).await;
+        settle_steps(&probe, 5).await;
+
+        // **The fixture is only the case it was written for if those outcomes
+        // have actually landed while the sweep is still open.** A driver that
+        // had not yet written anything would satisfy every count below for the
+        // wrong reason.
+        assert_eq!(
+            dht.count(Method::PublishDoorbell),
+            1,
+            "the knock must have been written inside the sweep's flight"
+        );
+        assert_eq!(
+            dht.count(Method::SweepDoorbell),
+            1,
+            "the sweep must still be the only one, and still open"
+        );
+        assert!(
+            probe.ops_completed.load(Ordering::SeqCst) >= 3,
+            "the fetch, the mint and the write must all have come back, or the \
+             write's outcome was never offered to the release path"
+        );
+
+        // On to a hundred seconds. Same shape as T1e: the second tick is
+        // suppressed and the third sweeps, so two sweeps — unless the write that
+        // landed between them released the slot.
+        for _ in 0..14 {
+            advance(&wall, Duration::from_secs(5)).await;
+        }
+
+        assert_eq!(
+            probe.ticks.load(Ordering::SeqCst),
+            3,
+            "the loop woke thrice"
+        );
+        assert_eq!(
+            dht.count(Method::SweepDoorbell),
+            2,
+            "a doorbell write completing must not release the sweep's slot"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
+        drain(&mut evt_rx);
+    }
+
+    /// T1f. A doorbell sweep that failed on the transport releases the slot.
+    ///
+    /// The expensive direction of T1e. A sweep held open for ever is a driver
+    /// that never reads its own doorbell again — permanently deaf, with nothing
+    /// about it looking wrong — so every way a sweep can end has to release it,
+    /// and a transport failure carries no result to recognise it by.
+    ///
+    /// No event is the second half of the claim: a failed sweep reports no
+    /// record health, so an event here would mean the sweep succeeded and the
+    /// failure path was never exercised.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_doorbell_sweep_releases_the_next_tick() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::failing(SLOW_SWEEP, Method::SweepDoorbell));
+        let probe = Arc::new(DmDriverProbe::new());
+        let (handle, mut evt_rx, task) =
+            DmDriver::spawn_with_probe(parts(&dir, &wall, dht.clone()), probe.clone());
+
+        run_to_a_hundred_seconds(&wall).await;
+
+        assert_eq!(
+            probe.ticks.load(Ordering::SeqCst),
+            3,
+            "the loop woke thrice"
+        );
+        assert_eq!(
+            dht.count(Method::SweepDoorbell),
+            2,
+            "the tick after a failed sweep must sweep again"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
+        let events = drain(&mut evt_rx);
+        assert!(
+            events.is_empty(),
+            "a failed sweep reports no record health, so the failure path did not run: {events:?}"
+        );
+    }
+
+    /// T1g. A doorbell sweep whose task panicked releases the slot.
+    ///
+    /// The third and last way a sweep can end, and the only one that produces no
+    /// outcome at all — which is why the shell records what the task was doing
+    /// before it spawns it. `ops_panicked == 1` is the positive control: without
+    /// it the second sweep is satisfied by a mock that never panicked.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicked_doorbell_sweep_releases_the_next_tick() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::panicking(SLOW_SWEEP, Method::SweepDoorbell));
+        let probe = Arc::new(DmDriverProbe::new());
+        let (handle, mut evt_rx, task) =
+            DmDriver::spawn_with_probe(parts(&dir, &wall, dht.clone()), probe.clone());
+
+        run_to_a_hundred_seconds(&wall).await;
+
+        assert_eq!(
+            probe.ticks.load(Ordering::SeqCst),
+            3,
+            "the loop woke thrice"
+        );
+        assert_eq!(
+            probe.ops_panicked.load(Ordering::SeqCst),
+            1,
+            "the sweep must actually have panicked"
+        );
+        assert_eq!(
+            dht.count(Method::SweepDoorbell),
+            2,
+            "the tick after a panicked sweep must sweep again"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        assert!(evt_rx.recv().await.is_none(), "the event channel closes");
+        task.await.expect("the driver task ends");
+    }
+
     /// T1b. A command wakeup does not restart the idle timer.
     ///
     /// The deadline is anchored on the last tick, so a driver kept busy still
@@ -1109,6 +1370,10 @@ mod tests {
         );
     }
 
+    /// How many variants [`DhtOp`] has. Its own count, never borrowed from
+    /// something that merely has the same one today.
+    const DHT_OP_VARIANTS: usize = 7;
+
     /// Every [`DhtOp`] variant, as an index. Exhaustive by construction: a new
     /// variant fails to compile here rather than silently escaping the dispatch
     /// oracle below.
@@ -1213,7 +1478,7 @@ mod tests {
         covered.dedup();
         assert_eq!(
             covered.len(),
-            Method::ALL.len(),
+            DHT_OP_VARIANTS,
             "every DhtOp variant is covered exactly once"
         );
 
@@ -1227,6 +1492,147 @@ mod tests {
                 assert_eq!(dht.count(other), expected, "{method:?} called {other:?}");
             }
         }
+    }
+
+    /// T2c. Every op the shell must be able to release after a panic records
+    /// what it was.
+    ///
+    /// The shell reads this **before** spawning, because a panicked task returns
+    /// no outcome and the map is the only route from a dead task back to the
+    /// state the machine is holding for it. Exhaustive over [`DhtOp`] by
+    /// construction, on [`op_index`]: an eighth operation fails to compile here
+    /// rather than silently escaping with no recorded job.
+    #[test]
+    fn every_op_records_what_a_panic_would_have_to_release() {
+        /// Whether the job an op records is the one it must.
+        type Wants = fn(Option<PanickedJob>) -> bool;
+
+        let r = ratchet();
+        let conversation = [7u8; AR_FINGERPRINT_LEN];
+        let cases: Vec<(DhtOp, Wants)> = vec![
+            (
+                DhtOp::FetchKeyRecord {
+                    tag: OpTag {
+                        introduction: Some(Box::new(*peer_keys().signing.public_key())),
+                        ..tag()
+                    },
+                    owner_seed: [1u8; 32],
+                },
+                |job| matches!(job, Some(PanickedJob::Dht(_))),
+            ),
+            (
+                DhtOp::PublishDoorbell {
+                    tag: tag(),
+                    owner_seed: [2u8; 32],
+                    slot: 5,
+                    entry: vec![0u8; 9],
+                    dispatch: DoorbellDispatch::FirstSend,
+                },
+                |job| job.is_none(),
+            ),
+            (
+                DhtOp::SweepDoorbell {
+                    tag: tag(),
+                    owner_seed: [2u8; 32],
+                },
+                |job| matches!(job, Some(PanickedJob::DoorbellSweep)),
+            ),
+            (
+                DhtOp::PublishPage {
+                    tag: tag(),
+                    address: sending_address(&r),
+                    frame: vec![0u8; 11],
+                },
+                |job| job.is_none(),
+            ),
+            (
+                DhtOp::SweepPage {
+                    tag: OpTag {
+                        conversation: Some(conversation),
+                        page: Some(3),
+                        ..tag()
+                    },
+                    address: receiving_address(&r),
+                },
+                |job| matches!(job, Some(PanickedJob::PageSweep { page: 3, .. })),
+            ),
+            (
+                DhtOp::PublishAck {
+                    tag: tag(),
+                    address: ack_address(Direction::AToB),
+                    record: vec![0u8; 13],
+                },
+                |job| job.is_none(),
+            ),
+            (
+                DhtOp::FetchAck {
+                    tag: tag(),
+                    address: ack_address(Direction::BToA),
+                },
+                |job| job.is_none(),
+            ),
+        ];
+
+        // The subject is `DhtOp`'s own arity. `Method` happens to have seven
+        // variants too, and borrowing its count would let a case go missing the
+        // day the two stop matching.
+        let mut covered: Vec<usize> = cases.iter().map(|(op, _)| op_index(op)).collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(
+            covered.len(),
+            DHT_OP_VARIANTS,
+            "every DhtOp variant is covered exactly once"
+        );
+
+        for (op, wants) in cases {
+            let kind = op.kind();
+            let job = op.panicked_job();
+            assert!(
+                wants(job),
+                "{} recorded the wrong panicked job",
+                kind.name()
+            );
+        }
+
+        // A sweep is decided by its kind, never by its tag. The other way round
+        // is correct only while no sweep carries an introduction, and the day one
+        // did it would report the introduction and leave the record's slot held
+        // for ever — with nothing else in the driver ever looking at that slot.
+        let tagged_sweep = DhtOp::SweepDoorbell {
+            tag: OpTag {
+                introduction: Some(Box::new(*peer_keys().signing.public_key())),
+                ..tag()
+            },
+            owner_seed: [2u8; 32],
+        };
+        assert!(
+            matches!(
+                tagged_sweep.panicked_job(),
+                Some(PanickedJob::DoorbellSweep)
+            ),
+            "a sweep carrying an introduction must still release the record"
+        );
+
+        // The other side of that ordering: a page sweep whose tag names no slot
+        // to release must fall through to the introduction rather than to
+        // nothing, or deciding the kind first would have made this case narrower
+        // than testing the tag first did.
+        let untagged_page_sweep = DhtOp::SweepPage {
+            tag: OpTag {
+                conversation: Some([7u8; AR_FINGERPRINT_LEN]),
+                introduction: Some(Box::new(*peer_keys().signing.public_key())),
+                ..tag()
+            },
+            address: receiving_address(&r),
+        };
+        assert!(
+            matches!(
+                untagged_page_sweep.panicked_job(),
+                Some(PanickedJob::Dht(_))
+            ),
+            "a sweep with no releasable slot must fall through to its introduction"
+        );
     }
 
     /// T3. The machine sees the injected clock, not the system one.
@@ -3845,6 +4251,88 @@ mod tests {
         cadence(wall).await;
         cadence(wall).await;
         drain(evt_a)
+    }
+
+    /// T23c. A page whose sweep is still in flight is not swept again by the
+    /// running driver.
+    ///
+    /// The machine-level test pins `probe`'s decision; this pins the loop that
+    /// calls it. A page sweep reads all sixteen subkeys of a record, so on a real
+    /// distributed hash table it outlives a tick exactly as the doorbell sweep
+    /// does, and the shell has no idea a sweep it spawned is still running.
+    ///
+    /// **The seam is slowed only after the correspondence is live**, because
+    /// establishing one is itself a chain of hops over that seam — the knock, the
+    /// sweep that finds it, the acceptance, the sweep that opens it — and a seam
+    /// slow enough to make the case would never get through them.
+    ///
+    /// The plan is the watched pair, so three ticks would ask for six sweeps
+    /// without the guard. With it the second tick's plan is wholly in flight and
+    /// asks for none, leaving four.
+    #[tokio::test(start_paused = true)]
+    async fn a_page_sweep_in_flight_is_not_asked_for_twice_by_the_driver() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let dht_b = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        dht_b.set_key_record(Some(key_record_for(&a_keys)));
+
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+
+        establish_between(
+            &handle_a, &probe_a, &mut evt_a, &mut evt_b, &handle_b, &probe_b, &wall, &b_keys,
+        )
+        .await;
+
+        // The case under test starts here.
+        dht_b.slow(Method::SweepPage, SLOW_SWEEP);
+        let swept_before = dht_b.count(Method::SweepPage);
+        let ticks_before = probe_b.ticks.load(Ordering::SeqCst);
+
+        for _ in 0..20 {
+            advance(&wall, Duration::from_secs(5)).await;
+        }
+
+        assert_eq!(
+            probe_b.ticks.load(Ordering::SeqCst) - ticks_before,
+            3,
+            "three ticks must have landed in the window, or the count below \
+             proves nothing"
+        );
+        assert_eq!(
+            dht_b.count(Method::SweepPage) - swept_before,
+            4,
+            "three ticks over sweeps that outlive one of them must ask for the \
+             watched pair twice, not three times"
+        );
+
+        handle_a
+            .send(DmCommand::Shutdown)
+            .await
+            .expect("shutdown A");
+        handle_b
+            .send(DmCommand::Shutdown)
+            .await
+            .expect("shutdown B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+        drain(&mut evt_a);
+        drain(&mut evt_b);
     }
 
     /// Every sequence reported `ConfirmedCollected` in `events`, ascending and

@@ -209,6 +209,15 @@ pub(crate) struct MockDht {
     /// was addressed to.
     published: Mutex<Vec<(u16, Vec<u8>)>>,
     latency: Duration,
+    /// Per-method latency overrides, and settable after construction.
+    ///
+    /// **A fixture usually has to be built at one latency and exercised at
+    /// another.** A conversation only exists after a knock, an acceptance and a
+    /// sweep that opens it, so a seam slow enough to make a sweep outlive a tick
+    /// is a seam no fixture can be established over — the establishment is
+    /// itself a chain of those hops. Setting the override once the correspondence
+    /// is live keeps the setup short and the case under test faithful.
+    slow: Mutex<BTreeMap<usize, Duration>>,
     /// The method whose returned future panics once its latency has elapsed, so
     /// an oracle can drive the shell's join-error path. The call is still counted
     /// and logged: a panic in the seam happens after the request was made.
@@ -259,6 +268,7 @@ impl MockDht {
             key_record: Mutex::new(None),
             published: Mutex::new(Vec::new()),
             latency,
+            slow: Mutex::new(BTreeMap::new()),
             panic_on: None,
             fail_on: None,
             partial_sweeps: false,
@@ -359,6 +369,25 @@ impl MockDht {
         }
     }
 
+    /// Make `method` take `latency` from now on, leaving every other method at
+    /// the mock's own.
+    pub(crate) fn slow(&self, method: Method, latency: Duration) {
+        self.slow
+            .lock()
+            .expect("mock slow")
+            .insert(method.index(), latency);
+    }
+
+    /// What one call to `method` takes: its override, or the mock's own latency.
+    fn latency_for(&self, method: Method) -> Duration {
+        self.slow
+            .lock()
+            .expect("mock slow")
+            .get(&method.index())
+            .copied()
+            .unwrap_or(self.latency)
+    }
+
     /// How many times `method` has been called.
     pub(crate) fn count(&self, method: Method) -> u64 {
         self.counts[method.index()].load(Ordering::SeqCst)
@@ -396,7 +425,7 @@ impl DmDht for MockDht {
             Method::FetchKeyRecord,
             MockCall::FetchKeyRecord { owner_seed },
         );
-        let latency = self.latency;
+        let latency = self.latency_for(Method::FetchKeyRecord);
         let boom = self.panics(Method::FetchKeyRecord);
         let dud = self.fails(Method::FetchKeyRecord);
         let record = self.key_record.lock().expect("mock key record").clone();
@@ -430,7 +459,7 @@ impl DmDht for MockDht {
             .lock()
             .expect("mock published")
             .push((slot, entry.clone()));
-        let latency = self.latency;
+        let latency = self.latency_for(Method::PublishDoorbell);
         let boom = self.panics(Method::PublishDoorbell);
         let dud = self.fails(Method::PublishDoorbell);
         if !dud && !boom {
@@ -457,7 +486,7 @@ impl DmDht for MockDht {
             Method::SweepDoorbell,
             MockCall::SweepDoorbell { owner_seed },
         );
-        let latency = self.latency;
+        let latency = self.latency_for(Method::SweepDoorbell);
         let boom = self.panics(Method::SweepDoorbell);
         let dud = self.fails(Method::SweepDoorbell);
         // A scripted sweep first, then the shared record. The queue is how a
@@ -511,7 +540,7 @@ impl DmDht for MockDht {
                 frame_len: frame.len(),
             },
         );
-        let latency = self.latency;
+        let latency = self.latency_for(Method::PublishPage);
         let boom = self.panics(Method::PublishPage);
         let dud = self.fails(Method::PublishPage);
         // Written at call time, like the counters, and before the scripted
@@ -558,7 +587,7 @@ impl DmDht for MockDht {
                 direction: address.direction(),
             },
         );
-        let latency = self.latency;
+        let latency = self.latency_for(Method::SweepPage);
         let boom = self.panics(Method::SweepPage);
         let dud = self.fails(Method::SweepPage);
         let held = address.with_owner_seed(|seed| {
@@ -638,7 +667,7 @@ impl DmDht for MockDht {
                 record_len: record.len(),
             },
         );
-        let latency = self.latency;
+        let latency = self.latency_for(Method::PublishAck);
         let boom = self.panics(Method::PublishAck);
         let dud = self.fails(Method::PublishAck);
         if !dud && !boom {
@@ -665,7 +694,7 @@ impl DmDht for MockDht {
                 direction: address.direction(),
             },
         );
-        let latency = self.latency;
+        let latency = self.latency_for(Method::FetchAck);
         let boom = self.panics(Method::FetchAck);
         let dud = self.fails(Method::FetchAck);
         let held = self
