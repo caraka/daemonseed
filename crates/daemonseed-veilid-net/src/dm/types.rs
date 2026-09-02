@@ -15,6 +15,7 @@ use daemonseed_core::dm::provisional::TeardownCause;
 use daemonseed_core::identity::keys::{
     DmDoorbellSlotSecret, KemKeypair, SignKeypair, IDENTITY_PK_LEN,
 };
+use daemonseed_core::trust_events::TrustEventKey;
 
 use crate::SweepOutcome;
 
@@ -163,6 +164,32 @@ pub enum DmEvent {
         with: PkLt,
         /// Why the channel ended.
         cause: TeardownCause,
+        /// The classed trust event this teardown is raised as, from
+        /// [`Teardown::event`](daemonseed_core::dm::provisional::Teardown::event).
+        ///
+        /// **Carried here rather than derived by the receiver**, and that is the
+        /// whole reason the field exists: ISC-A-C12 forbids a client skipping a
+        /// teardown's audit entry, and a key a front end has to go and fetch is a
+        /// key a front end can forget. Pairing it with the event means a fold
+        /// cannot reach the teardown without also being handed what the taxonomy
+        /// owes for it — the same argument
+        /// [`TrustEventScope`](daemonseed_core::trust_events::TrustEventScope)
+        /// records for the record-kind it refuses to be separated from.
+        ///
+        /// `cause` stays beside it because they answer different questions: this
+        /// is what the audit log and the affordance class are keyed on, `cause`
+        /// is what the user is told in words.
+        ///
+        /// **The pairing guards one cause, because only one reaches this
+        /// event.** `Teardown::correspondent_state_lost` is the sole teardown
+        /// that arrives here, so the field's only value is
+        /// [`TrustEventKey::DmCorrespondentStateLost`]. The other three causes —
+        /// `NoProvisionalRecord`, `RecordUnusable`, `StoreUnreadable` — are
+        /// produced by the introduce-probe and erase paths, which turn them into
+        /// a refusal or a trace: they have no route to a client at all, so this
+        /// field cannot be what makes them loud, and no driver-level test pins
+        /// their cause-to-key mapping. Core pins that mapping, per cause.
+        event: TrustEventKey,
         /// The sequence numbers now
         /// [`Lifecycle::Undelivered`](daemonseed_core::dm::outbox::Lifecycle::Undelivered)
         /// and owed to the user.
@@ -544,11 +571,19 @@ impl core::fmt::Debug for DmEvent {
                 write!(f, ", reason: {reason:?} }}")
             }
             DmEvent::ChannelLost {
-                cause, surfaced, ..
+                cause,
+                event,
+                surfaced,
+                ..
             } => {
                 f.write_str("ChannelLost { with: ")?;
                 redacted_pk(f)?;
-                write!(f, ", cause: {cause:?}, surfaced: {surfaced:?} }}")
+                // The key names a kind of ending, never a correspondent, so it
+                // is printable where the identity above is not (ISC-C28).
+                write!(
+                    f,
+                    ", cause: {cause:?}, event: {event:?}, surfaced: {surfaced:?} }}"
+                )
             }
             DmEvent::ChannelDirectionUnknown { .. } => {
                 f.write_str("ChannelDirectionUnknown { with: ")?;

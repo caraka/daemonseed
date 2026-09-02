@@ -329,7 +329,7 @@ public_types:
       - "fn discovered_peers(&self) -> &[(String, String)]  # M12 Servers-pane introducer candidates (server-id, address); no keys (ISC-S6 / ISC-C22 / ISC-A-C19)"
       - "fn take_pending_introducer_refresh(&mut self) -> bool  # drained into NetCommand::RefreshIntroducer"
       - "fn on_net_event(&mut self, event: NetEvent)"
-      - "fn dm_state(&self) -> &DmState  # #339 — what the DM driver has told this session; folded by on_net_event from NetEvent::Dm, rendered nowhere"
+      - "fn dm_state(&self) -> &DmState  # #339 — what the DM driver has told this session; folded by on_net_event from NetEvent::Dm, rendered nowhere. A DmEvent::ChannelLost also routes its carried TrustEventKey through fold_trust_event, so the teardown lands in trust_log at its ISC-C28 class"
       - "fn dm_session_keys(&self) -> Option<DmSessionKeys>  # #339 — one derive_identity_keys call yielding the signing keypair, the FULL KEM keypair, the doorbell slot secret and the profile at-rest key, for the DM driver the net actor spawns beside itself; None with no unlocked profile"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen

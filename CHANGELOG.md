@@ -499,6 +499,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed_veilid_net::dm::DmEvent::ChannelLost` carries `event: daemonseed_core::trust_events::TrustEventKey`, the key `daemonseed_core::dm::provisional::Teardown::event` classes the teardown's cause under (design note 686 — loud teardown). `daemonseed_tui::app::App::on_net_event` folds it into the trust-event audit log and raises its ISC-C28 persistent-non-blocking affordance; `daemonseed_gui::state::GuiState` gains a `TrustEventLog` and `GuiState::on_dm_event` appends to it only, the GUI having no affordance surface. The entry carries the key, the wall clock and no correspondent.
+
 - The DM driver verifies a fetched key record through a per-correspondent `daemonseed_core::dm::keyrec::KeyRecordCache` keyed by the correspondent's long-term identity key, so a record naming a `version` below the highest already verified for that identity is refused with the new `RefusalReason::KeyRecordRollback` instead of being sealed to (design M1); an equal version is accepted as a re-fetch and a higher one advances the bound, which is held for the life of the driver and not persisted. `daemonseed_core::dm::keyrec::KeyRecordCache::accept_encoded` decodes and admits raw fetched bytes in one step.
 
 - `daemonseed_tui::net::NetCommand` derives `Debug` only and `daemonseed_tui::net::NetEvent`

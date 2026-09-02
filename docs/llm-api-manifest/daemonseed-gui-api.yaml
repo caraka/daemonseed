@@ -59,8 +59,10 @@ library:
 # actor spawns beside itself (the actor's own state keeps only the public
 # encapsulation key), `NetCommand::Dm(DmCommand)` is forwarded to that driver by
 # `NetHandle::dm`, and `NetEvent::Dm(Arc<DmEvent>)` folds into `GuiState::dm` via
-# `GuiState::on_dm_event`; nothing is rendered from it. This manifest grows only if the GUI ever exposes reusable library
-# components.
+# `GuiState::on_dm_event`; nothing is rendered from it. A `DmEvent::ChannelLost`
+# additionally appends its carried `TrustEventKey` to `GuiState::trust_log`, the
+# ISC-C28 audit log. This manifest grows only if the GUI ever exposes reusable
+# library components.
 modules: []
 public_types: []
 public_functions: []

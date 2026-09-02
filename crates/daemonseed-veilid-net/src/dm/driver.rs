@@ -2383,19 +2383,118 @@ mod tests {
                 DmEvent::ChannelLost {
                     with,
                     cause,
+                    event,
                     surfaced,
-                } => Some((with.to_vec(), format!("{cause:?}"), surfaced.clone())),
+                } => Some((
+                    with.to_vec(),
+                    format!("{cause:?}"),
+                    surfaced.clone(),
+                    *event,
+                )),
                 _ => None,
             })
             .collect();
         assert_eq!(lost.len(), 1, "expected one ChannelLost, got {events:?}");
         assert_eq!(lost[0].0.as_slice(), peer.signing.public_key().as_slice());
         assert_eq!(lost[0].1, "CorrespondentStateLost");
+        // The loss and its classed trust event travel together: a front end
+        // cannot read one without the other (ISC-C28 / ISC-A-C12).
+        assert_eq!(
+            lost[0].3,
+            daemonseed_core::trust_events::TrustEventKey::DmCorrespondentStateLost
+        );
         assert!(
             !events
                 .iter()
                 .any(|e| matches!(e, DmEvent::ContactRequest { .. })),
             "a known correspondent's re-knock surfaced a second request"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
+    }
+
+    /// T12b. A torn-down channel raises its classed trust event on the path a
+    /// front end actually sees, and raises it once per process lifetime.
+    ///
+    /// The knock that loses the channel is queued three times. The doorbell's
+    /// per-epoch seen-set answers the repeats, so the teardown is reached once
+    /// however often the entry is swept — which is the claim ISC-A-C12 needs:
+    /// not "one entry produced one event", but "reaching the teardown again
+    /// produces no second one". Driven through the doorbell and the `Accept`
+    /// command rather than by calling `Teardown::event` here, so the assertion
+    /// is about what the driver emits and not about what core can compute.
+    ///
+    /// **The bound is this process, and it does not survive a restart.** The
+    /// seen set is in memory and retired with its epoch, and
+    /// `correspondent_state_lost` neither rebinds the address root nor drops the
+    /// correspondence — so a driver restarted inside the same first-contact
+    /// epoch, with the entry still live on the doorbell, re-admits it and raises
+    /// the event again. The audit log has no dedupe of its own either
+    /// (`TrustEventLog::append` records every non-transient event it is given);
+    /// only the TUI's `persistent` affordance list collapses the repeat.
+    #[tokio::test(start_paused = true)]
+    async fn a_torn_down_channel_raises_its_trust_event_exactly_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
+        let peer = peer_keys();
+        let pc = pseudonym(0x21);
+        let lost_knock = knock_from(&peer, &pc, "again");
+        dht.queue_doorbell(vec![(7, knock_from(&peer, &pc, "first"))]);
+        dht.queue_doorbell(vec![(7, lost_knock.clone())]);
+        dht.queue_doorbell(vec![(7, lost_knock.clone())]);
+        dht.queue_doorbell(vec![(7, lost_knock)]);
+        let probe = Arc::new(DmDriverProbe::new());
+        let (handle, mut evt_rx, task) =
+            DmDriver::spawn_with_probe(parts(&dir, &wall, dht), probe.clone());
+
+        advance(&wall, IDLE_TICK).await;
+        advance(&wall, Duration::from_secs(1)).await;
+        let (request, _, _) = only_request(&drain(&mut evt_rx));
+        handle
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle().await;
+
+        let mut swept = 0;
+        let mut raised = Vec::new();
+        for _ in 0..3 {
+            advance(&wall, IDLE_TICK).await;
+            advance(&wall, Duration::from_secs(1)).await;
+            for e in drain(&mut evt_rx) {
+                match e {
+                    DmEvent::ChannelLost { event, .. } => raised.push(event),
+                    DmEvent::DoorbellHealth { outcome, .. } if outcome.attempted > 0 => {
+                        swept += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // The DRIVER swept three times, counted from its own health reports.
+        // Counting loop iterations instead would not be a control at all: the
+        // `advance` calls could be deleted and the count would still read three,
+        // leaving the idempotence assertion below to pass on a driver that never
+        // re-read the doorbell.
+        assert_eq!(swept, 3, "the re-delivery sweeps did not run");
+
+        assert_eq!(raised.len(), 1, "expected one teardown, got {raised:?}");
+        // The cause-to-key mapping itself is core's, pinned there against every
+        // cause; this asserts the driver hands over the key that mapping gives
+        // for the cause this path produces.
+        assert_eq!(
+            raised[0],
+            daemonseed_core::trust_events::TrustEventKey::DmCorrespondentStateLost
+        );
+        // Loud is the taxonomy's word: persistent-non-blocking reappears at
+        // every start and is written to the audit log, and ISC-A-C12 forbids
+        // suppressing either. A transient key would be droppable by the log
+        // itself, which is the silence this event exists to end.
+        assert_eq!(
+            daemonseed_core::trust_events::class_of(raised[0]),
+            daemonseed_core::trust_events::TrustEventClass::PersistentNonBlocking
         );
 
         handle.send(DmCommand::Shutdown).await.expect("shutdown");

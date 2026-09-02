@@ -2752,6 +2752,13 @@ impl DmMachine {
                 teardown, outcome, ..
             }) => vec![DmEffect::Emit(DmEvent::ChannelLost {
                 with: Box::new(*knock.pk_lt()),
+                // The taxonomy's key is what makes this ending loud rather than
+                // a line in a trace (ISC-C28, `docs/design/direct-messaging.md`
+                // — loud teardown). Both fields read the same `cause`, and
+                // `into_cause` consumes the teardown, so this ordering is the
+                // compiler's rather than a convention to keep: written the other
+                // way round it does not build.
+                event: teardown.event(),
                 cause: teardown.into_cause(),
                 // The sequences the user is owed. Dropping them would leave
                 // this event saying a channel ended and nothing saying which

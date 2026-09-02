@@ -965,8 +965,38 @@ paged channel (ISC-C42) and the established-contact channel (ISC-C43) run throug
 oracle `two_node_dm_driver.rs` passed against the public Veilid network on an attach-capable host:
 first contact, acceptance, one message in each direction, and both outboxes confirmed-collected,
 each exactly once (`test result: ok. 1 passed`, 1221 s). The criteria named above stay open until
-each is closed against its own text; the oracle is evidence for them, not a closing pass. Nothing is
-rendered yet: the front ends fold `DmEvent` into state and send no `DmCommand` but shutdown.
+each is closed against its own text; the oracle is evidence for them, not a closing pass. The front
+ends send no `DmCommand` but shutdown. The GUI renders nothing from `DmEvent` at all; the TUI
+renders nothing from it either, except the teardown affordance below.
+
+**A torn-down DM channel is raised as its classed trust event, and the event cannot be separated
+from the loss.** `DmEvent::ChannelLost` carries the `TrustEventKey` that `Teardown::event` assigns
+its cause, read at the single site in `DmMachine` that emits the loss — so there is no path that
+emits `ChannelLost` without the key the taxonomy owes for it. (The introduce-probe and erase paths
+in the same module hold a `Teardown` too, but report a refusal or a trace rather than a loss.)
+**Once per process lifetime, not once per correspondence:** the doorbell's seen set is in memory and
+epoch-retired, and `correspondent_state_lost` neither rebinds the address root nor drops the
+correspondence, so a driver restart inside the same first-contact epoch with the entry still live
+re-admits it and emits a second `ChannelLost` and a second audit entry. `App::persistent` dedupes
+the TUI affordance; `TrustEventLog::append` does not dedupe the log.
+Both front ends write it to the ISC-C28 audit log, asymmetrically: the TUI's `fold_trust_event`
+writes the log *and* raises the persistent-non-blocking affordance, while the GUI appends to a
+`TrustEventLog` it now holds and raises nothing, having no affordance surface to raise it on. The entry carries the key and the wall clock and nothing naming the
+correspondent, which is what ISC-C28's scope rule and ISC-A-C1 require of it. **`ChannelLost` has
+only ever carried one key**: `correspondent_state_lost` is the only teardown that reaches it, so
+`DmCorrespondentStateLost` is the only value the field takes. The other three causes —
+`NoProvisionalRecord`, `RecordUnusable`, `StoreUnreadable` — arise on the introduce-probe and erase
+paths, which turn them into a refusal or a trace and give them no route to a client, so no
+driver-level test pins their cause-to-key mapping; core pins it, per cause. Pinned by
+`a_torn_down_channel_raises_its_trust_event_exactly_once` (the driver's public path: the knock that
+loses the channel is re-delivered twice more and still raises one event, within the one process),
+`a_re_knock_from_a_known_correspondent_is_channel_lost` (the loss and the key arrive together),
+`dm_channel_lost_is_audit_logged_at_its_class` (TUI) and `dm_channel_lost_is_audit_logged` (GUI).
+The cause-to-key mapping itself stays pinned in core, per cause, by
+`an_established_channel_is_torn_down_loudly`, `an_unusable_record_strands_the_handshake_loudly` and
+`an_unreadable_store_does_not_declare_the_handshake_lost`. ISC-C28 and ISC-A-C12 stay open: only the
+DM teardown keys are wired this way, the GUI draws nothing from its log, and neither front end
+persists it yet.
 
 **ISC-C40's reader clause is enforced where the driver reads a key record, and what that protects
 is narrower than the path.** The DM driver holds one `KeyRecordCache` per correspondent, keyed by

@@ -23,6 +23,7 @@ use daemonseed_core::dm::admission::AdmissionCounters;
 use daemonseed_core::dm::keyrec::KemEncapsulationKey;
 use daemonseed_core::dm::outbox::{Acceptance, DeliveryState};
 use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
+use daemonseed_core::trust_events::{TrustEventLog, TrustEventScope};
 use daemonseed_veilid_net::SweepOutcome;
 use daemonseed_veilid_net::dm::{DmEvent, PENDING_REQUEST_CAP, PkLt, RefusalReason, RequestId};
 
@@ -769,6 +770,16 @@ pub struct GuiState {
     /// [`GuiState::on_dm_event`] and rendered nowhere yet: no interface draws
     /// it.
     dm: DmState,
+    /// The ISC-C28 trust-event audit log: bounded, in-memory, and the sink every
+    /// classed event this session raises is written to.
+    ///
+    /// **It exists here because ISC-A-C12 makes the entry non-optional**, not
+    /// because something draws it — no interface does yet, exactly as with `dm`
+    /// above. A teardown that arrived with nowhere to be recorded would be the
+    /// silent loss the loud-teardown design (`docs/design/direct-messaging.md`)
+    /// was written to end, so the log lands before the affordance rather than
+    /// after it.
+    trust_log: TrustEventLog,
 }
 
 impl GuiState {
@@ -801,6 +812,7 @@ impl GuiState {
             my_shares: Vec::new(),
             announcements_on_screen: AnnouncementsView::default(),
             dm: DmState::default(),
+            trust_log: TrustEventLog::default(),
         }
     }
 
@@ -911,8 +923,23 @@ impl GuiState {
         &self.dm
     }
 
+    /// The ISC-C28 trust-event audit log. Read-only; the writes are
+    /// [`Self::on_dm_event`]'s.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn trust_log(&self) -> &TrustEventLog {
+        &self.trust_log
+    }
+
     /// (#339) Fold one DM driver event. Renders nothing: no interface draws it.
+    ///
+    /// A torn-down channel is the one event that leaves a record beyond `dm`:
+    /// it arrives carrying its classed key, and ISC-A-C12 forbids skipping the
+    /// audit entry the taxonomy owes it.
     pub fn on_dm_event(&mut self, event: &DmEvent) {
+        if let DmEvent::ChannelLost { event: key, .. } = event {
+            self.trust_log
+                .append(TrustEventScope::bare(*key).observed_at(now_unix_ms(), None, None));
+        }
         self.dm.fold(event);
     }
 
@@ -1569,6 +1596,7 @@ impl GuiState {
             my_shares: Vec::new(),
             announcements_on_screen: AnnouncementsView::default(),
             dm: DmState::default(),
+            trust_log: TrustEventLog::default(),
         }
     }
 }
@@ -3425,6 +3453,49 @@ mod tests {
         assert_eq!(refusal.to, dm_pk(7));
         assert_eq!(refusal.acceptance, Acceptance::Unconfirmed);
         assert_eq!(refusal.reason, RefusalReason::NoKeyRecord);
+    }
+
+    /// A torn-down channel reaches the trust-event audit log, carrying the key
+    /// the driver classed it under and nothing that names the correspondent.
+    ///
+    /// The front-end half of the loud teardown: ISC-A-C12 forbids the client
+    /// skipping the entry, and this fold is the only thing between the driver's
+    /// classed key and the log. The undelivered queue is asserted alongside it,
+    /// so a fold that logged the event and dropped the sequences would fail.
+    #[test]
+    fn dm_channel_lost_is_audit_logged() {
+        let mut st = GuiState::lobby_only();
+        assert_eq!(st.trust_log().len(), 0, "the fixture starts empty");
+
+        st.on_dm_event(&DmEvent::ChannelLost {
+            with: dm_pk(9),
+            cause: daemonseed_core::dm::provisional::TeardownCause::CorrespondentStateLost,
+            event: daemonseed_core::trust_events::TrustEventKey::DmCorrespondentStateLost,
+            surfaced: vec![4, 5],
+        });
+
+        let entries = st.trust_log().entries();
+        assert_eq!(entries.len(), 1, "the teardown was not logged");
+        assert_eq!(
+            entries[0].key,
+            daemonseed_core::trust_events::TrustEventKey::DmCorrespondentStateLost
+        );
+        // ISC-C28 keeps the correspondence out of the log: the key is the whole
+        // statement, and every scope field stays empty rather than being filled
+        // with something that would join into a recently-contacted set.
+        assert!(entries[0].server_id.is_none());
+        assert!(entries[0].suite_id.is_none());
+        assert!(entries[0].record_kind.is_none());
+        assert!(entries[0].timestamp_unix_ms > 0, "the entry has no clock");
+
+        assert_eq!(
+            st.dm_state()
+                .correspondences
+                .get(&dm_pk(9))
+                .expect("correspondence folded")
+                .undelivered,
+            vec![4, 5]
+        );
     }
 
     /// #339: a `ContactRequest` adds exactly ONE row, a re-surfaced request

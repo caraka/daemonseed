@@ -1933,7 +1933,17 @@ impl App {
             // (#339) DM driver events fold into `dm` and touch no other state.
             // No interface renders them yet, so the
             // screen is byte-identical before and after one is folded.
-            NetEvent::Dm(ref event) => self.dm.fold(event),
+            //
+            // The exception is a torn-down channel, which is raised loudly:
+            // the driver hands the classed key over on the event itself and
+            // ISC-A-C12 forbids dropping it here, so it goes to the same audit
+            // log and the same affordance class as every other trust event.
+            NetEvent::Dm(ref event) => {
+                if let DmEvent::ChannelLost { event: key, .. } = &**event {
+                    self.fold_trust_event(TrustEventScope::bare(*key), None);
+                }
+                self.dm.fold(event);
+            }
             NetEvent::Connected {
                 server,
                 version,
@@ -9110,6 +9120,60 @@ mod tests {
         assert_eq!(refusal.to, dm_pk(7));
         assert_eq!(refusal.acceptance, Acceptance::Unconfirmed);
         assert_eq!(refusal.reason, RefusalReason::NoKeyRecord);
+    }
+
+    /// A torn-down channel reaches the trust-event audit log — the same sink
+    /// every other trust event lands in — and surfaces at its assigned class.
+    ///
+    /// This is the front-end half of the loud teardown: the driver classes the
+    /// ending, and ISC-A-C12 forbids the client dropping it on the way to the
+    /// log. The undelivered sequences still land in `dm`, so the two folds are
+    /// asserted together — a change that routed the event and lost the queue
+    /// would otherwise pass.
+    #[test]
+    fn dm_channel_lost_is_audit_logged_at_its_class() {
+        let mut app = App::new();
+        assert_eq!(app.trust_log().len(), 0, "the fixture starts empty");
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::ChannelLost {
+            with: dm_pk(9),
+            cause: daemonseed_core::dm::provisional::TeardownCause::CorrespondentStateLost,
+            event: TrustEventKey::DmCorrespondentStateLost,
+            surfaced: vec![4, 5],
+        })));
+
+        let entries = app.trust_log().entries();
+        assert_eq!(entries.len(), 1, "the teardown was not logged");
+        assert_eq!(entries[0].key, TrustEventKey::DmCorrespondentStateLost);
+        // ISC-C28 keeps a correspondent out of the log entirely, so the entry
+        // carries no scope at all — the key is the whole statement. Asserted
+        // rather than assumed: a fold that reached for `with` to give the entry
+        // context would build the recently-contacted set ISC-A-C1 forbids.
+        assert!(entries[0].server_id.is_none());
+        assert!(entries[0].suite_id.is_none());
+        assert!(entries[0].record_kind.is_none());
+        assert!(entries[0].timestamp_unix_ms > 0, "the entry has no clock");
+
+        // And it surfaces, rather than only being written down.
+        assert_eq!(
+            class_of(TrustEventKey::DmCorrespondentStateLost),
+            TrustEventClass::PersistentNonBlocking
+        );
+        assert_eq!(app.persistent.len(), 1, "the affordance did not surface");
+        assert_eq!(
+            app.persistent[0].key,
+            TrustEventKey::DmCorrespondentStateLost
+        );
+
+        // The queue the user is owed still folded.
+        assert_eq!(
+            app.dm_state()
+                .correspondences
+                .get(&dm_pk(9))
+                .expect("correspondence folded")
+                .undelivered,
+            vec![4, 5]
+        );
     }
 
     /// #339: a `ContactRequest` adds exactly ONE row, and a re-surfaced request

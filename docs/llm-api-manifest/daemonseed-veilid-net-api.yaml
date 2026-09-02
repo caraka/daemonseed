@@ -445,7 +445,7 @@ types:
       What the driver tells a frontend — ContactRequest{request,from,body,sent_unix_ms},
       Message{from,seq,body,sent_unix_ms}, Delivery{to,seq,state},
       Refused{to,acceptance,reason}, AcceptFailed{request,from,reason},
-      ChannelLost{with,cause,surfaced}, ChannelDirectionUnknown{with},
+      ChannelLost{with,cause,event,surfaced}, ChannelDirectionUnknown{with},
       DoorbellHealth{outcome,admission,pending_full},
       ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified},
       ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
@@ -467,7 +467,9 @@ types:
       fetched records that did not decode or did not verify. Refused covers a channel send as well as
       a first contact, and Refused
       carries a RefusalReason and AcceptFailed an AcceptFailure; ChannelLost
-      carries the surfaced sequence numbers the user is owed; DoorbellHealth
+      carries the surfaced sequence numbers the user is owed and the
+      daemonseed_core::trust_events::TrustEventKey the teardown is classed under
+      (Teardown::event, ISC-C28) for the front end to write to its audit log; DoorbellHealth
       carries admission's running AdmissionCounters plus pending_full, the slots
       this sweep skipped because the held-request list was full. Every payload is a
       daemonseed-core type or a String except DoorbellHealth, which carries this
