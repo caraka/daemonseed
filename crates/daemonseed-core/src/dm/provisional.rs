@@ -999,6 +999,11 @@ mod tests {
     }
 
     fn ephemeral() -> (Box<[u8; ml_kem::EK_LEN]>, Box<[u8; ml_kem::DK_LEN]>) {
+        // `keygen` refuses while the module is still self-testing, and a narrow
+        // multi-threaded filter can start this helper before any test that
+        // initialises. `key()` is not on every fixture's path, so the init
+        // belongs to each entry point that reaches the crypto module.
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let (ek, dk) = ml_kem::keygen(&[0x33u8; ml_kem::SEED_LEN], &[0x44u8; ml_kem::SEED_LEN])
             .expect("keygen");
         (Box::new(ek), Box::new(dk))
@@ -1006,6 +1011,7 @@ mod tests {
 
     /// A second, unrelated keypair — the mismatched half.
     fn other_ephemeral() -> (Box<[u8; ml_kem::EK_LEN]>, Box<[u8; ml_kem::DK_LEN]>) {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let (ek, dk) = ml_kem::keygen(&[0x55u8; ml_kem::SEED_LEN], &[0x66u8; ml_kem::SEED_LEN])
             .expect("keygen");
         (Box::new(ek), Box::new(dk))
