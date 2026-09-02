@@ -772,6 +772,28 @@ route taken to reach a decision are not recorded here — the git history and `C
   with the first match would decide by directory order, and a most-recently-seen tiebreak would
   invent a routing policy the protocol has not decided.
 
+- **The direct-message driver reaches the distributed hash table through one trait of seven
+  operations whose signatures are the network handle's own.** Two shapes were refused. Two traits,
+  one for the doorbell and one for the channel, would thread a second generic through the driver, its
+  shell and its test double for a separation the test double already gives by counting each operation
+  on its own. Narrowed signatures would take a conversation or a page number where the handle takes an
+  address, and a page or acknowledgement address carries the conversation's write capability as a
+  zeroizing secret that cannot be copied, so a narrowed method could only be honoured by copying that
+  secret out. The key-record publish is not a member: both front ends start that write when they
+  connect, and a second entry point would give one write two owners. The cost is that a caller must
+  hold the address types the handle holds, which is the point.
+
+- **The driver's decisions are pure steps over a wall-clock value the caller reads, and the async
+  shell owns nothing but the awaits.** Cadence timers inside one task were the alternative and would
+  have put ordering between a command, a completed operation and a due cadence behind racing timers
+  instead of returning it as a value. Every cadence the direct-message modules define takes a
+  persisted wall value, so the clock is an injected unix-millisecond reader alongside the runtime's
+  paused test clock, which moves monotonic instants only and cannot drive a give-up measured in days.
+  The machine holds the direct-message store directly rather than behind the seam: the store's
+  mutation calls are made at the site of the mutation and every test has a temporary directory, while
+  the distributed hash table is what a test cannot have, so that is the seam. The cost is one impure
+  member in an otherwise pure machine, stated on the type.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the

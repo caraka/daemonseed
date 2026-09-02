@@ -76,6 +76,9 @@ impl core::fmt::Display for KeyDerivationError {
 
 impl std::error::Error for KeyDerivationError {}
 
+/// Width of a long-term identity public key, in bytes (ML-DSA-87, FIPS 204).
+pub const IDENTITY_PK_LEN: usize = ml_dsa::PK_LEN;
+
 /// ML-DSA-87 signing keypair derived for an [`Identity`].
 ///
 /// The secret key zeroes on drop. The public key is non-secret.

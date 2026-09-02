@@ -142,6 +142,18 @@ modules:
     depends_on:
       - daemonseed_veilid_net::error
       - daemonseed_veilid_net::route_budget
+  - name: daemonseed_veilid_net::dm
+    description: >-
+      Direct-messaging helpers and the DM driver. Holds the two spawn helpers both
+      frontend net actors share (spawn_dm_key_record_publish, spawn_dm_ack_publish),
+      the DmDht seam over the handle's seven DM DHT operations, and DmDriver — a
+      command/event task owning a DmPersist, an injected WallClock and the identity
+      halves, driving a step machine whose DHT operations run off its loop.
+    no_std: false
+    depends_on:
+      - daemonseed_veilid_net::actor
+      - daemonseed_veilid_net::error
+      - daemonseed_veilid_net::rendezvous
 
 # ─────────────────────────────────────────────────────────────────────
 # Types
@@ -265,6 +277,70 @@ types:
     module: daemonseed_veilid_net::aimd
     kind: struct
     description: A bounded additive-increase/multiplicative-decrease concurrency window (floor..ceiling).
+  - name: DmDht
+    module: daemonseed_veilid_net::dm
+    kind: trait
+    description: >-
+      The seam over the seven DM DHT operations the driver performs —
+      fetch_dm_key_record, publish_doorbell_entry, sweep_doorbell, publish_dm_page,
+      sweep_dm_page, publish_dm_ack, fetch_dm_ack. Signatures are VeilidNetHandle's;
+      the address types are taken by value. Bounds are Send + Sync + 'static.
+      VeilidNetHandle implements it. publish_dm_key_record is not a member.
+  - name: DmDhtFuture
+    module: daemonseed_veilid_net::dm
+    kind: type_alias
+    description: "Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>> — what one DmDht call returns."
+  - name: DmDriver
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: The DM driver's entry point; `spawn` starts the task and returns its handle plus the event stream. Panics if cfg.idle_tick is zero.
+  - name: DmDriverParts
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: "Everything the driver owns, constructed by the frontend and moved in: dht (Arc<D: DmDht>), clock (WallClock), identity (DmIdentity), persist (DmPersist), cfg (DmDriverConfig)."
+  - name: DmDriverConfig
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: The driver's cadence knobs; `idle_tick` is how long the driver sleeps when nothing else wakes it.
+  - name: DmDriverHandle
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: Cloneable handle onto a running driver; `send` queues one DmCommand. Dropping the last one ends the driver and closes the event stream.
+  - name: DmCommand
+    module: daemonseed_veilid_net::dm
+    kind: enum
+    description: >-
+      What a frontend asks the driver to do — FirstContact{recipient,body},
+      Send{to,body}, Accept{request}, Decline{request}, Block{pk_lt},
+      Unblock{pk_lt}, Surfaced{to,seqs}, Shutdown. Correspondents are keyed by
+      long-term identity key; requests by RequestId. Shutdown aborts in-flight DHT
+      operations. Debug prints variant names, body lengths, and a redacted PkLt.
+  - name: DmEvent
+    module: daemonseed_veilid_net::dm
+    kind: enum
+    description: >-
+      What the driver tells a frontend — ContactRequest{request,from,body,sent_unix_ms},
+      Message{from,seq,body,sent_unix_ms}, Delivery{to,seq,state},
+      Refused{to,acceptance}, ChannelLost{with,cause}, DoorbellHealth{outcome}. Every
+      payload is a daemonseed-core type or a String except DoorbellHealth, which carries
+      this crate's rendezvous::SweepOutcome. Given-up delivery is a DeliveryState on
+      Delivery. Debug redacts as DmCommand's does.
+  - name: RequestId
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: A pending contact request — the doorbell slot it arrived in plus the entry hash, which pins the exact entry across an overwrite of that slot.
+  - name: PkLt
+    module: daemonseed_veilid_net::dm
+    kind: type_alias
+    description: "Box<[u8; IDENTITY_PK_LEN]> — a correspondent's long-term identity key."
+  - name: DmIdentity
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: "The identity halves the driver needs: signing (Arc<SignKeypair>), kem (the full KemKeypair, decapsulation half included), doorbell_slot_secret. Its Debug prints no key material."
+  - name: WallClock
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: "Unix milliseconds, injected as Arc<dyn Fn() -> i64 + Send + Sync>. `system()` reads SystemTime; `from_fn(f)` reads whatever f returns; `now_ms()` samples it. Debug prints a fixed marker and does not call the closure."
   - name: DmPageSweep
     module: daemonseed_veilid_net::actor
     kind: struct
@@ -770,6 +846,64 @@ functions:
     returns:
       type: "Result<DoorbellSweep>"
       description: DoorbellSweep { slots, outcome } — the populated slots as (slot, unverified sealed bytes) pairs, and the sweep outcome (attempted / found / failed).
+  # ── dm: the DM driver ────────────────────────────────────────────────
+  - name: DmDriver::spawn
+    module: daemonseed_veilid_net::dm
+    description: Spawn the DM driver over the parts the frontend constructed and return its handle plus the event stream. The driver wakes on cfg.idle_tick and ends when the last handle drops or a Shutdown command arrives, aborting in-flight DHT operations. Panics if cfg.idle_tick is zero.
+    signature: "pub fn spawn<D: DmDht>(parts: DmDriverParts<D>) -> (DmDriverHandle, mpsc::Receiver<DmEvent>)"
+    parameters:
+      - name: parts
+        type: "DmDriverParts<D>"
+        direction: in
+        description: The seam, clock, identity, store and cadence knobs, moved into the driver.
+    returns:
+      type: "(DmDriverHandle, mpsc::Receiver<DmEvent>)"
+      description: The command handle and the event stream. The stream yields None once the driver has stopped.
+
+  - name: DmDriverHandle::send
+    module: daemonseed_veilid_net::dm
+    description: Queue one command for the driver. A full queue applies backpressure to the caller; the call fails only once the driver has stopped.
+    signature: "pub async fn send(&self, cmd: DmCommand) -> Result<()>"
+    parameters:
+      - name: cmd
+        type: DmCommand
+        direction: in
+        description: The command to queue.
+    returns:
+      type: "Result<()>"
+      description: Ok once queued; VeilidNetError::Actor once the driver has stopped.
+
+  - name: WallClock::system
+    module: daemonseed_veilid_net::dm
+    description: The production clock — SystemTime::now() since the unix epoch, in milliseconds. A pre-epoch system clock reads as 0.
+    signature: "pub fn system() -> Self"
+    parameters: []
+    returns:
+      type: WallClock
+      description: A clock reading the system time.
+
+  - name: WallClock::from_fn
+    module: daemonseed_veilid_net::dm
+    description: A clock reading whatever the closure returns, in unix milliseconds.
+    signature: "pub fn from_fn(f: impl Fn() -> i64 + Send + Sync + 'static) -> Self"
+    parameters:
+      - name: f
+        type: "impl Fn() -> i64 + Send + Sync + 'static"
+        direction: in
+        description: The source of unix milliseconds.
+    returns:
+      type: WallClock
+      description: A clock reading f.
+
+  - name: WallClock::now_ms
+    module: daemonseed_veilid_net::dm
+    description: The current time, in unix milliseconds.
+    signature: "pub fn now_ms(&self) -> i64"
+    parameters: []
+    returns:
+      type: i64
+      description: Unix milliseconds.
+
   - name: VeilidNetHandle::publish_presence
     module: daemonseed_veilid_net::actor
     description: Publish a sealed member-presence beacon to a per-member current-state slot on the presence sibling rendezvous record; a re-beacon overwrites the same slot (last-writer-wins). The presence record is distinct from the chat rendezvous, so a beacon never evicts chat backlog. member_pubkey owns the stable-slot-id encoding (member_slot_id, hex) so all callers agree. The slot count is bounded (SUBKEY_COUNT), so at unbounded membership two members can slot-share (a bounded, self-healing degradation). The app net actor holds the keys and runs the emit/ingest/reap loop; a receiver subscribes via subscribe_room on the same presence owner seed.

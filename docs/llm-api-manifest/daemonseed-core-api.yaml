@@ -7788,6 +7788,12 @@ constants:
     value: "32"
     description: "ML-DSA-87 seed length (FIPS 204 §5.1); the raw seed a server persists."
 
+  - name: IDENTITY_PK_LEN
+    module: daemonseed_core::identity::keys
+    type: usize
+    value: "ml_dsa::PK_LEN"
+    description: "Width of a long-term identity public key in bytes (ML-DSA-87, FIPS 204); the length SignKeypair::public_key returns."
+
   - name: CHANNEL_BINDING_LABEL
     module: daemonseed_core::identity_proof
     type: "&[u8]"

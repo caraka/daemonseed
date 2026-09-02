@@ -26,6 +26,17 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_veilid_net::dm` — the DM driver's seam and harness. `DmDht`, a trait over the seven DM
+  DHT operations returning `DmDhtFuture<T>`, implemented for `VeilidNetHandle`. `DmDriver::spawn`
+  takes `DmDriverParts` (`dht`, `clock`, `identity`, `persist`, `cfg`) and returns a
+  `DmDriverHandle` plus an `mpsc::Receiver<DmEvent>`; the driver wakes on `cfg.idle_tick`, performs
+  no DHT operation, and ends on `DmCommand::Shutdown` or on the last handle dropping, aborting
+  whatever is in flight. A zero `idle_tick` panics at construction. Adds `DmCommand`, `DmEvent`,
+  `RequestId`, `PkLt`, `DmIdentity`, `DmDriverConfig`, and `WallClock` (unix milliseconds injected
+  as a closure). `DmCommand` and `DmEvent` redact message bodies and identity keys in `Debug`.
+  `dm.rs` becomes `dm/mod.rs` with `seam`, `types`, `machine` and `driver` siblings. (#235, #236)
+- `daemonseed_core::identity::keys::IDENTITY_PK_LEN` — the width of a long-term identity public key
+  in bytes.
 - `daemonseed_core::dm::persist` — `DmPersist::correspondent_state_lost`, which answers an opened
   first-contact entry against what is stored and stops that correspondence's outbox where the entry
   means the correspondent lost their at-rest state. `StateLoss::NoCorrespondence` for an identity no

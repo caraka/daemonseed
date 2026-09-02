@@ -17,6 +17,17 @@ use daemonseed_core::identity::keys::SignKeypair;
 
 use crate::actor::VeilidNetHandle;
 
+pub mod driver;
+pub(crate) mod machine;
+#[cfg(test)]
+pub(crate) mod mock;
+pub mod seam;
+pub mod types;
+
+pub use driver::{DmDriver, DmDriverConfig, DmDriverHandle, DmDriverParts};
+pub use seam::{DmDht, DmDhtFuture};
+pub use types::{DmCommand, DmEvent, DmIdentity, PkLt, RequestId, WallClock};
+
 /// Publish this identity's DM key record, off the caller's loop (ISC-C40, #232).
 ///
 /// Signs `{version, kem_ek, invite_only}` under the stable identity key and writes
