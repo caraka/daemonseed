@@ -182,7 +182,46 @@ impl DmDriverHandle {
             .await
             .map_err(|_| VeilidNetError::Actor("dm driver stopped".into()))
     }
+
+    /// Queue one command without ever waiting.
+    ///
+    /// For a caller that must not block: [`Self::send`] applies backpressure to
+    /// its caller, which is right for a UI thread and wrong for a shared actor
+    /// loop, where a driver busy enough to fill its queue would stall chat,
+    /// shares and presence along with the DM command. The command is DROPPED on
+    /// [`DmTrySendError::Full`] rather than retried — a re-send would have to be
+    /// held somewhere, and the only place is the loop this call exists to keep
+    /// free.
+    pub fn try_send(&self, cmd: DmCommand) -> core::result::Result<(), DmTrySendError> {
+        self.cmd_tx.try_send(cmd).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => DmTrySendError::Full,
+            mpsc::error::TrySendError::Closed(_) => DmTrySendError::Stopped,
+        })
+    }
 }
+
+/// Why [`DmDriverHandle::try_send`] did not queue a command.
+///
+/// The command is gone in both cases; they differ in what the caller should do
+/// about the HANDLE, which is nothing for `Full` and drop-it for `Stopped`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmTrySendError {
+    /// The driver's queue is full. It is still running.
+    Full,
+    /// The driver has stopped; this handle reaches nothing.
+    Stopped,
+}
+
+impl core::fmt::Display for DmTrySendError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Full => f.write_str("the dm driver's command queue is full"),
+            Self::Stopped => f.write_str("the dm driver has stopped"),
+        }
+    }
+}
+
+impl std::error::Error for DmTrySendError {}
 
 /// Counters the shell bumps so an oracle can prove the loop ran.
 ///
@@ -246,7 +285,12 @@ impl DmDriverProbe {
 pub struct DmDriver;
 
 impl DmDriver {
-    /// Spawn the driver and return the handle plus the event stream.
+    /// Spawn the driver and return the handle plus the event stream, panicking on
+    /// any startup condition [`Self::try_spawn`] would report.
+    ///
+    /// For a caller that must survive a bad profile — a front-end net actor, whose
+    /// other work is unrelated to DM — use [`Self::try_spawn`] instead. This one is
+    /// for tests and for callers whose whole purpose is the driver.
     ///
     /// # Panics
     ///
@@ -270,6 +314,29 @@ impl DmDriver {
     pub fn spawn<D: DmDht>(parts: DmDriverParts<D>) -> (DmDriverHandle, mpsc::Receiver<DmEvent>) {
         let (handle, events, _task) = Self::spawn_with_probe(parts, Arc::new(DmDriverProbe::new()));
         (handle, events)
+    }
+
+    /// Spawn the driver, reporting the startup conditions [`Self::spawn`] panics on.
+    ///
+    /// The three fallible steps all run on the CALLER's thread before the task
+    /// exists — two owner-seed derivations and the block-list provision — and the
+    /// last of them touches the disk. A profile directory that is read-only, full,
+    /// or holding an unreadable store therefore fails here, and a caller doing
+    /// other work must not die of it: a front-end net actor serves chat, shares
+    /// and presence, none of which need a DM driver.
+    ///
+    /// # Panics
+    ///
+    /// On the two *wiring* mistakes [`Self::spawn`] documents — a zero
+    /// `cfg.idle_tick`, and [`AdmissionPolicy::InviteOnly`] with no
+    /// `parts.spent_tokens`. Neither is a state a caller could recover from by
+    /// handling an error, and both are decided by the code that built `parts`.
+    pub fn try_spawn<D: DmDht>(
+        parts: DmDriverParts<D>,
+    ) -> core::result::Result<(DmDriverHandle, mpsc::Receiver<DmEvent>), DmSpawnError> {
+        let (handle, events, _task) =
+            Self::try_spawn_seeded(parts, Arc::new(DmDriverProbe::new()), Vec::new())?;
+        Ok((handle, events))
     }
 
     /// Spawn the driver against a caller-held probe, returning the task as well.
@@ -301,6 +368,23 @@ impl DmDriver {
         mpsc::Receiver<DmEvent>,
         tokio::task::JoinHandle<()>,
     ) {
+        Self::try_spawn_seeded(parts, probe, seed).expect("the driver must start")
+    }
+
+    /// [`Self::spawn_seeded`], reporting rather than panicking on the three
+    /// fallible startup steps. The one place they are performed.
+    pub(crate) fn try_spawn_seeded<D: DmDht>(
+        parts: DmDriverParts<D>,
+        probe: Arc<DmDriverProbe>,
+        seed: Vec<DmEffect>,
+    ) -> core::result::Result<
+        (
+            DmDriverHandle,
+            mpsc::Receiver<DmEvent>,
+            tokio::task::JoinHandle<()>,
+        ),
+        DmSpawnError,
+    > {
         assert!(
             !parts.cfg.idle_tick.is_zero(),
             "DmDriverConfig::idle_tick must be non-zero"
@@ -316,17 +400,17 @@ impl DmDriver {
         // key derivation.
         let public = parts.identity.signing.public_key();
         let doorbell_owner = *daemonseed_core::dm::doorbell::derive_owner_seed(public)
-            .expect("this identity's doorbell owner seed must derive")
+            .map_err(DmSpawnError::DoorbellOwnerSeed)?
             .as_bytes();
         let keyrec_addr = *daemonseed_core::dm::keyrec::derive_owner_seed(public)
-            .expect("this identity's key-record owner seed must derive")
+            .map_err(DmSpawnError::KeyRecordOwnerSeed)?
             .as_bytes();
 
         let mut startup = seed;
         let provisioned = parts
             .persist
             .provision_block_list()
-            .expect("the profile's block list must be provisionable");
+            .map_err(DmSpawnError::BlockList)?;
         if provisioned {
             // Loud: the store creates this record at every open, so having had
             // to write it means either that creation was skipped in its
@@ -372,9 +456,44 @@ impl DmDriver {
                 spent,
             },
         ));
-        (DmDriverHandle { cmd_tx }, evt_rx, task)
+        Ok((DmDriverHandle { cmd_tx }, evt_rx, task))
     }
 }
+
+/// Why a driver did not start.
+///
+/// Every variant is a condition of THIS machine — its crypto module or its
+/// profile directory — never of a peer or the network, and none is transient in
+/// a way a retry on the next tick would clear. A caller that has other work
+/// carries on without a driver; a caller that is only the driver panics
+/// ([`DmDriver::spawn`]).
+#[derive(Debug)]
+pub enum DmSpawnError {
+    /// This identity's doorbell owner seed would not derive, so the driver could
+    /// not sweep its own doorbell and would be permanently deaf.
+    DoorbellOwnerSeed(daemonseed_core::dm::doorbell::DmDoorbellError),
+    /// This identity's key-record owner seed would not derive, so no knock could
+    /// be addressed and no key record found.
+    KeyRecordOwnerSeed(daemonseed_core::dm::keyrec::DmKeyRecordError),
+    /// The profile's block list could not be provisioned. Every consult and every
+    /// change refuses an absent record, so a driver started anyway could neither
+    /// honour a block nor record one.
+    BlockList(daemonseed_core::dm::persist::DmPersistError),
+}
+
+impl core::fmt::Display for DmSpawnError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::DoorbellOwnerSeed(e) => write!(f, "doorbell owner seed would not derive: {e}"),
+            Self::KeyRecordOwnerSeed(e) => {
+                write!(f, "key-record owner seed would not derive: {e}")
+            }
+            Self::BlockList(e) => write!(f, "block list would not provision: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DmSpawnError {}
 
 /// What the shell worked out before the driver task started.
 struct Prepared {

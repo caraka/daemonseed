@@ -150,8 +150,25 @@ modules:
       server-ids only to skip already-configured peers, then emit the merged
       candidate set as one IntroducerSnapshot; discovery never writes the trust set,
       so a discovered peer is a candidate the user must explicitly promote, never
-      auto-trusted, and the response carries no key material).
-      Events: Connected/ConnectFailed, CircleJoined ({ circle_id: u64, label:
+      auto-trusted, and the response carries no key material),
+      Dm(DmCommand) (#339 — one command for the DM driver spawned beside the
+      actor at connect, forwarded verbatim to the driver's DmDriverHandle via
+      try_send, never send, which would park the loop on a full queue; dropped
+      when no driver is running and when its queue is full. NetHandle::dm(cmd) is
+      the UI-side wrapper, so a DM command shares one ordering with the connect
+      that spawns the driver). Connect additionally carries dm_session_keys
+      (Option<Box<DmSessionKeys>>) — the full KEM keypair, the doorbell slot
+      secret and the profile at-rest key, moved into DmDriverParts and held
+      nowhere else; the actor's own state keeps only the public encapsulation
+      key, and the box keeps the secret bytes moving by pointer. The driver is
+      started with DmDriver::try_spawn, so a profile it cannot open costs the
+      driver and not the actor; it is shut down on the next Connect, on
+      GracefulClose, and when the command channel closes.
+      NetCommand derives Debug only (#339): DmCommand is not Clone.
+      Events: Dm(Arc<DmEvent>) (#339 — one DM driver event, forwarded verbatim
+      by the actor and folded into App's DmState; Arc because DmEvent is not
+      Clone, and NetEvent derives Debug + Clone only because DmEvent has no
+      equality), Connected/ConnectFailed, CircleJoined ({ circle_id: u64, label:
       String, entropy: String } — the added circle's stable id + client-local
       label, plus the canonicalized entropy echoed back in-process so the app can
       pair a rejoin to its persisted PersistedCircle without ordering assumptions
@@ -312,6 +329,8 @@ public_types:
       - "fn discovered_peers(&self) -> &[(String, String)]  # M12 Servers-pane introducer candidates (server-id, address); no keys (ISC-S6 / ISC-C22 / ISC-A-C19)"
       - "fn take_pending_introducer_refresh(&mut self) -> bool  # drained into NetCommand::RefreshIntroducer"
       - "fn on_net_event(&mut self, event: NetEvent)"
+      - "fn dm_state(&self) -> &DmState  # #339 — what the DM driver has told this session; folded by on_net_event from NetEvent::Dm, rendered nowhere"
+      - "fn dm_session_keys(&self) -> Option<DmSessionKeys>  # #339 — one derive_identity_keys call yielding the signing keypair, the FULL KEM keypair, the doorbell slot secret and the profile at-rest key, for the DM driver the net actor spawns beside itself; None with no unlocked profile"
       - "fn on_key(&mut self, key: KeyEvent)"
   - name: daemonseed_tui::app::Screen
     kind: enum
@@ -350,6 +369,27 @@ public_types:
     kind: enum
     description: "Indexer state as seen by the TUI (ISC-20 / A-C7): Idle (no share root configured), Indexing { seen, total: Option<u64> } (cold/incremental scan running), Ready { entries }. The status line at the top of the My-shares pane reflects this; transitions never gate user input."
     variants: [Idle, "Indexing { seen, total }", "Ready { entries }"]
+  - name: daemonseed_tui::app::DmState
+    kind: struct
+    description: "(#339) The DM state one session has accumulated from daemonseed_veilid_net::dm::DmEvent, folded by App::on_net_event from NetEvent::Dm: requests (Vec<DmContactRequest> — pending contact requests keyed by RequestId; a re-surfaced request replaces its row), correspondences (BTreeMap<PkLt, DmCorrespondence> — per-correspondent deliveries: BTreeMap<u64, DeliveryState> plus undelivered: Vec<u64> from a loud teardown), last_refusal (Option<DmRefusal> — to, acceptance, reason), last_doorbell_health (Option<DmDoorbellHealth> — outcome, admission, pending_full), last_channel_health (Option<DmChannelHealth> — the seven per-correspondence channel counters). RAM-only; the driver's DmPersist store is the durable half. Nothing is rendered from it."
+  - name: daemonseed_tui::app::DmContactRequest
+    kind: struct
+    description: "(#339) A pending contact request as the user would answer it: request (RequestId — the doorbell slot plus the entry hash), from (PkLt), body, sent_unix_ms."
+  - name: daemonseed_tui::app::DmCorrespondence
+    kind: struct
+    description: "(#339) One correspondence's delivery ledger: deliveries (BTreeMap<u64, DeliveryState>, newest state per sequence number) and undelivered (Vec<u64>, sequence numbers a loud teardown surfaced)."
+  - name: daemonseed_tui::app::DmRefusal
+    kind: struct
+    description: "(#339) The last refusal, held whole: to (PkLt), acceptance (Acceptance — how far the send got), reason (RefusalReason — where it stopped)."
+  - name: daemonseed_tui::app::DmDoorbellHealth
+    kind: struct
+    description: "(#339) The last DmEvent::DoorbellHealth, flattened: outcome (SweepOutcome), admission (AdmissionCounters), pending_full (u64 — slots this sweep skipped because the held-request list was full)."
+  - name: daemonseed_tui::app::DmChannelHealth
+    kind: struct
+    description: "(#339) The last DmEvent::ChannelHealth, flattened: with (PkLt) plus partial_sweeps, already_consumed, unopenable, peer_pseudonym_unknown, peer_acks_deferred, peer_acks_clipped, peer_acks_unverified (all u64)."
+  - name: daemonseed_tui::net::DmSessionKeys
+    kind: struct
+    description: "(#339) The secret DM halves NetCommand::Connect carries to the DM driver, never to the net actor: signing (Arc<SignKeypair>), kem (the full KemKeypair, decapsulation half included), doorbell_slot_secret (DmDoorbellSlotSecret), at_rest_key (Zeroizing<[u8; AEAD_KEY_LEN]> — the profile key DmPersist::open uses). Debug prints no field. Not Clone: KemKeypair is ZeroizeOnDrop with no constructor, and the driver takes it by value — which is why NetCommand is Debug-only."
   - name: daemonseed_tui::net::ShareManifestEntry
     kind: struct
     description: "One file in an A1 fetch-preview (NetEvent::FetchManifest, M16 — ISC-C66): rel_path (the sharer-advertised relative path) + size (bytes) + chunk_count (u32 — how many 1 MiB CHUNK_SIZE chunks the file spans, manifest chunks.len(), 0 for an empty file; the app sums it over the selected files to seed the chunk-granular gauge before the net actor's first FetchProgress). Carries no chunk addresses — those stay in the net actor; the overlay shows names + sizes only and confirms by manifest-row index (the A2 selective-fetch hook)."

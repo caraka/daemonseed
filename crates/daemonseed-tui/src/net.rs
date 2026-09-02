@@ -33,13 +33,17 @@ use std::sync::Arc;
 
 use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::dm::keyrec::KemEncapsulationKey;
-use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
+use daemonseed_core::identity::keys::{
+    DmDoorbellSlotSecret, KemKeypair, ShareRootIkm, SignKeypair,
+};
 use daemonseed_core::share_catalog::ShareListing;
 use daemonseed_core::storage::fetched::FetchedShare;
-use daemonseed_core::storage::seeds::IndexKey;
+use daemonseed_core::storage::seeds::{AEAD_KEY_LEN, IndexKey};
 use daemonseed_core::trust_events::TrustEventKey;
 use daemonseed_proto::v1 as wire;
+use daemonseed_veilid_net::dm::{DmCommand, DmEvent};
 use tokio::sync::mpsc;
+use zeroize::Zeroizing;
 
 use crate::app::{DeprecationWarningRow, IndexerStatus, LocalShareRow, PublicPostRow};
 
@@ -75,8 +79,44 @@ impl std::fmt::Debug for StableKemEncapsulationKey {
     }
 }
 
+/// (#339) The secret halves the DM driver needs, derived once at connect and
+/// carried to the driver — **not** to the net actor.
+///
+/// The driver is a task spawned *beside* the actor rather than inside it, so
+/// this material never enters the actor's own state: the actor moves it straight
+/// into [`daemonseed_veilid_net::dm::DmDriverParts`] and keeps no copy. That is
+/// what lets the `stable_kem_encapsulation_key` doc above keep saying the
+/// decapsulation key does not reach the net actor.
+///
+/// Moved rather than cloned: [`KemKeypair`] is `!Clone` (`ZeroizeOnDrop`, with no
+/// constructor that would rebuild one) and the driver needs it by value, which is
+/// the reason [`NetCommand`] gives up its `Clone` derive.
+pub struct DmSessionKeys {
+    /// The long-term signing keypair, shared with the actor's own copy.
+    pub signing: Arc<SignKeypair>,
+    /// The full identity KEM keypair, decapsulation half included: opening a
+    /// knock needs it, and only the driver ever holds it.
+    pub kem: KemKeypair,
+    /// The mnemonic-rooted secret selecting this identity's doorbell slot.
+    pub doorbell_slot_secret: DmDoorbellSlotSecret,
+    /// The profile's at-rest AEAD key, which the DM record store opens under.
+    pub at_rest_key: Zeroizing<[u8; AEAD_KEY_LEN]>,
+}
+
+impl std::fmt::Debug for DmSessionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Three of the four fields are secret; none is projected.
+        f.debug_struct("DmSessionKeys").finish_non_exhaustive()
+    }
+}
+
 /// A command from the UI to the network actor.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is intentionally NOT derived (#339): [`NetCommand::Dm`] carries a
+/// [`DmCommand`], which is deliberately not `Clone` — a DM command names a
+/// correspondent and carries a plaintext body, and the driver consumes it by
+/// value. Nothing sends a command twice, so the derive was never load-bearing.
+#[derive(Debug)]
 pub enum NetCommand {
     /// Open a connection to `server_id` at `address`, in the given trust mode
     /// (C22), running TLS + APP_HELLO + identity-proof to Authenticated and
@@ -107,6 +147,15 @@ pub enum NetCommand {
         /// reachable for direct messages. `None` on the ephemeral / no-profile path:
         /// no persistent key means genuinely not DM-reachable.
         stable_kem_encapsulation_key: Option<StableKemEncapsulationKey>,
+        /// (#339) the secret DM halves for the driver spawned beside the actor at
+        /// this connect — the full KEM keypair, the doorbell slot secret, and the
+        /// profile at-rest key its record store opens under. Moved into
+        /// `DmDriverParts` and kept nowhere else; the actor's own state never
+        /// holds any of it. Boxed so the secret bytes move by pointer at each
+        /// hop rather than being memcpy'd through the command enum. `None` on the ephemeral / no-profile path, and
+        /// without it no driver is spawned: no persistent identity means
+        /// genuinely not DM-reachable.
+        dm_session_keys: Option<Box<DmSessionKeys>>,
         /// (download-subsystem redesign, step 8b-2 / DL-ISC-20) the unlocked
         /// profile's on-disk ROOT — the client's own trusted state dir (where
         /// `seeds.blob` / `share-index.redb` live). The actor holds it so a verified
@@ -357,6 +406,14 @@ pub enum NetCommand {
     /// the local serve task, emitting `NetEvent::PublishStopped`. No-op for an
     /// unknown id.
     UnpublishShare { share_id: String },
+    /// (#339) One command for the DM driver spawned beside the actor at connect.
+    ///
+    /// The actor forwards it verbatim to the driver's own handle and folds
+    /// nothing: every DM decision belongs to the driver, and a command arriving
+    /// while no driver is running is dropped rather than queued — a driver only
+    /// exists between a connect and the disconnect that shuts it down, and a
+    /// command held across that gap would act on a session the user has left.
+    Dm(DmCommand),
 }
 
 /// (download-subsystem redesign, step 6 / DL-ISC-8) The kind of selection root a
@@ -401,9 +458,15 @@ pub struct ShareManifestEntry {
 /// `Vec<ShareListing>` and the prost-generated message type only
 /// implements `PartialEq`. Tests use `assert_eq!` (which only needs PartialEq);
 /// equality on raw wire types is well-defined for the strings/integers they
-/// carry but not for arbitrary embedded prost values, so `PartialEq` is the
-/// correct ceiling.
-#[derive(Debug, Clone, PartialEq)]
+/// carry but not for arbitrary embedded prost values.
+///
+/// `PartialEq` went the same way in #339, for the same reason one rung down:
+/// [`NetEvent::Dm`] carries a [`DmEvent`], which has no equality of its own —
+/// it holds message plaintext and a correspondent's identity key, and comparing
+/// two of them is not an operation the front end has any use for. Nothing
+/// compared whole events; the assertions that exist match a variant and compare
+/// its fields.
+#[derive(Debug, Clone)]
 pub enum NetEvent {
     /// The connection reached Authenticated (ISC-47).
     Connected {
@@ -655,6 +718,12 @@ pub enum NetEvent {
     /// A published share stopped being served (D, M15): the user unpublished it,
     /// the serve stream ended (peer/relay closed), or the session dropped.
     PublishStopped { share_id: String },
+    /// (#339) One event from the DM driver, forwarded verbatim by the actor.
+    ///
+    /// `Arc` because [`DmEvent`] is not `Clone` — a message body and a 2592-byte
+    /// identity key are not things to copy per fold — while [`NetEvent`] is. The
+    /// app reads through the `Arc` and clones only the fields it keeps.
+    Dm(Arc<DmEvent>),
 }
 
 /// Owns the network thread and the command/event channels. Held by the binary
@@ -713,6 +782,16 @@ impl NetHandle {
     /// inspect or drop.
     pub fn send(&self, cmd: NetCommand) -> Result<(), Box<NetCommand>> {
         self.cmd_tx.send(cmd).map_err(|e| Box::new(e.0))
+    }
+
+    /// (#339) Queue one [`DmCommand`] for the driver, through the actor loop.
+    ///
+    /// It travels the same channel as every other command rather than reaching
+    /// the driver's handle directly, so the UI keeps one ordering against the
+    /// connect that spawned the driver — a DM command sent before it exists is
+    /// dropped by the actor rather than racing the spawn.
+    pub fn dm(&self, cmd: DmCommand) -> Result<(), Box<NetCommand>> {
+        self.send(NetCommand::Dm(cmd))
     }
 
     /// Drain all currently-available events without blocking. Called once per
@@ -777,7 +856,11 @@ mod tests {
         let f = NetEvent::ConnectFailed {
             message: "boom".to_owned(),
         };
-        assert_ne!(c, f);
+        // #339: `NetEvent` gave up its `PartialEq` when it took a `DmEvent`, so
+        // a variant is separated by matching it, which is what every consumer
+        // does anyway.
+        assert!(matches!(c, NetEvent::Connected { .. }));
+        assert!(matches!(f, NetEvent::ConnectFailed { .. }));
     }
 
     #[test]

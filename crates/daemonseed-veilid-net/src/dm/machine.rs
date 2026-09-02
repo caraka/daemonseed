@@ -74,7 +74,7 @@ use crate::dm::types::{
 /// unanswered stranger can make us hold. Past it a knock is dropped at the
 /// sweep and surfaces nothing; the sender re-seeds on their own schedule, so a
 /// request refused for room here reappears once the user has cleared some.
-pub(crate) const PENDING_REQUEST_CAP: usize = 64;
+pub const PENDING_REQUEST_CAP: usize = 64;
 
 /// The sending-direction sequence number the first-contact knock occupies.
 ///

@@ -2480,8 +2480,12 @@ types:
       Result<(SealingKey, IndexKey), BlobError> (M14 — both session keys from one
       Argon2id run; used at first-start so the share index key is free), and
       seal(&Seeds) -> Result<Vec<u8>, BlobError> (re-seal under the active
-      write-suite using the cached key, no Argon2id). Debug renders
-      "SealingKey(<redacted>)".
+      write-suite using the cached key, no Argon2id), and to_bytes() ->
+      Zeroizing<[u8; AEAD_KEY_LEN]> (#339 — the raw key for a record store that
+      takes it by reference rather than through this type, currently
+      DmPersist::open; wrapped rather than bare so the copy wipes itself without
+      each caller remembering to).
+      Debug renders "SealingKey(<redacted>)".
 
   - name: IndexKey
     module: daemonseed_core::storage::seeds

@@ -1381,6 +1381,19 @@ impl SealingKey {
         seal_with_key(seeds, &self.0, Registry::default_write_suite())
     }
 
+    /// The raw at-rest key, for the record stores that take it by reference
+    /// rather than through this type — currently
+    /// [`DmPersist::open`](crate::dm::persist::DmPersist::open), which protects
+    /// the DM records under the same profile key as the at-rest blob.
+    ///
+    /// Returned inside [`Zeroizing`] rather than bare: a copy of the session's
+    /// most sensitive secret must not depend on each caller remembering to wipe
+    /// it. Exposing it at all is what keeps the DM store on the profile's own
+    /// key instead of inventing a second derivation for it.
+    pub fn to_bytes(&self) -> Zeroizing<[u8; AEAD_KEY_LEN]> {
+        Zeroizing::new(*self.0)
+    }
+
     /// Derive BOTH session keys — the at-rest [`SealingKey`] and the share-index
     /// [`IndexKey`] — from a single Argon2id run (M14). The index key falls out
     /// of the same high-entropy intermediate as the at-rest key via a second

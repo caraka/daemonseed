@@ -225,6 +225,11 @@ fn run(
             let stable_kem_encapsulation_key = app
                 .stable_kem_encapsulation_key()
                 .map(|k| daemonseed_tui::net::StableKemEncapsulationKey(std::sync::Arc::new(k)));
+            // (#339) Derive the DM driver's own halves — the FULL KEM keypair,
+            // the doorbell slot secret and the profile at-rest key — for the
+            // driver the actor spawns beside itself. `None` before Unlock or on
+            // the ephemeral path, where no driver is spawned.
+            let dm_session_keys = app.dm_session_keys();
             let _ = net.send(NetCommand::Connect {
                 server_id: req.server_id,
                 address: req.address,
@@ -232,6 +237,7 @@ fn run(
                 stable_signing_key,
                 stable_share_root_ikm,
                 stable_kem_encapsulation_key,
+                dm_session_keys,
                 // (step 8b-2 / DL-ISC-20) Hand the profile root to the actor so a
                 // verified resume anchors each fetch's manifest digest in the
                 // client's own trusted state (not the co-resident downloads root).

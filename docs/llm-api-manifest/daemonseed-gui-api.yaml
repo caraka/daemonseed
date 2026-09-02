@@ -53,7 +53,13 @@ library:
 # `daemonseed_gui::share_browser` (Slint-free, unit-tested public-share browse-tree
 # model: reconcile-by-share_id listing, lazy per-share manifest load, flatten-with-
 # depth render rows, and fetch-target resolution for right-click download). None is a
-# published API. This manifest grows only if the GUI ever exposes reusable library
+# published API. (#339) `net` additionally carries the DM contract:
+# `NetCommand::Connect{ dm_session_keys: Option<DmSessionKeys> }` moves the full KEM
+# keypair, the doorbell slot secret and the profile at-rest key to the DM driver the
+# actor spawns beside itself (the actor's own state keeps only the public
+# encapsulation key), `NetCommand::Dm(DmCommand)` is forwarded to that driver by
+# `NetHandle::dm`, and `NetEvent::Dm(Arc<DmEvent>)` folds into `GuiState::dm` via
+# `GuiState::on_dm_event`; nothing is rendered from it. This manifest grows only if the GUI ever exposes reusable library
 # components.
 modules: []
 public_types: []

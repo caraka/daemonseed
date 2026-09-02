@@ -26,6 +26,42 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_tui::net` / `daemonseed_gui::net` — the front-end DM contract. `NetCommand::Connect`
+  carries `dm_session_keys: Option<DmSessionKeys>` (the full identity KEM keypair, the doorbell slot
+  secret and the profile at-rest key); the net actor moves it into `DmDriverParts` and spawns a
+  `DmDriver` beside itself, one per connect, sending `DmCommand::Shutdown` to any prior driver and to
+  the current one when the command channel closes. `NetCommand::Dm(DmCommand)` is forwarded to that
+  driver through `DmDriverHandle::try_send`, and `NetHandle::dm(cmd)` is the UI-side wrapper; a
+  command arriving with no driver running, or with a full one, is dropped rather than awaited.
+  `NetEvent::Dm(Arc<DmEvent>)` carries the driver's events back. The driver runs
+  `AdmissionPolicy::Open` with `PowDifficulty::PRODUCTION`, a 30-second idle tick, no spent-token
+  store, and a `DmPersist` opened at `<profile root>/dm` under the profile's at-rest key. It is
+  started with `DmDriver::try_spawn` and shut down on the next `Connect` — reached whether or not
+  the transport came up — on `NetCommand::GracefulClose`, and when the command channel closes.
+  Partial (#339): the refusal reaches the front end's state, not yet the user. (#232, #339)
+- `daemonseed_tui::app::DmState` and `daemonseed_gui::state::DmState` — the DM state a session
+  accumulates from `DmEvent`: held contact requests, per-correspondence delivery states and
+  undelivered sequence numbers, the last refusal, and the last doorbell and channel health reports.
+  Folded by `App::on_net_event` and `GuiState::on_dm_event`; nothing is rendered from it. The
+  held-request list is capped at `PENDING_REQUEST_CAP`, oldest dropped, because no event retires a
+  request. `Debug` prints body lengths and redacted identity keys, as `DmEvent`'s own does. Partial
+  (#339). (#339)
+- `daemonseed_tui::app::App::dm_session_keys` / `dm_state`, `daemonseed_gui::state::GuiState::dm_session_keys`
+  / `dm_state` / `on_dm_event`, and `daemonseed_gui::profile::Profile::dm_session_keys`. (#339)
+- `daemonseed_core::storage::seeds::SealingKey::to_bytes` — the raw at-rest key as a
+  `Zeroizing<[u8; AEAD_KEY_LEN]>`, for a record store that takes it by reference rather than through
+  the type. (#339)
+- `daemonseed_veilid_net::dm::DmDriver::try_spawn` and `DmSpawnError` — the startup conditions
+  `DmDriver::spawn` panics on, reported instead. The three fallible steps — both owner-seed
+  derivations and the block-list provision — run on the caller's thread, so a read-only or full
+  profile directory would otherwise kill a caller that has other work. `spawn` remains the panicking
+  wrapper. (#339)
+- `daemonseed_veilid_net::dm::DmDriverHandle::try_send` and `DmTrySendError` — queue one command
+  without waiting. `send` applies backpressure to its caller, which is wrong for a shared actor loop
+  where a full DM queue would stall every other command. (#339)
+- `daemonseed_veilid_net::dm::PENDING_REQUEST_CAP` — the driver's held-request bound, made public so
+  a front end's own list is bounded by the same number rather than a second one. (#339)
+
 - `daemonseed_core::dm::frame::seal_accept(outbound, chan_id, signing_pc, signing_lt, recipient_hash, sent_unix_ms, ack)` — the acceptor's ACCEPT: an ordinary channel frame at the acceptor's sequence zero with an empty body, carrying `pk_pc` and `bind_lt` in the sealed body. (#234, #236)
 - `daemonseed_core::dm::frame::ParsedFrame::open_accept(key, chan_id, dir, found_at, recipient_hash, peer_pk_lt) -> VerifiedAccept` — opens that frame with no prior pseudonym, verifying `bind_lt` under the peer's long-term key. `VerifiedAccept { frame, peer_pk_pc }`. (#234, #236)
 - `daemonseed_core::dm::frame::DmFrameError` — `Binding`, `MissingBinding`, `PseudonymMismatch` and `NotAccept { seq }`. (#234, #236)
@@ -462,6 +498,10 @@ work lives in the maintainer's own planning notes, not here.
   path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
+
+- `daemonseed_tui::net::NetCommand` derives `Debug` only and `daemonseed_tui::net::NetEvent`
+  derives `Debug` and `Clone` only: `DmCommand` is not `Clone` and `DmEvent` has no equality.
+  (#339)
 
 - `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` carries `peer_acks_clipped` and
   `peer_acks_unverified`: a peer acknowledgement claiming a sequence above what this side has sent,

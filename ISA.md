@@ -894,6 +894,22 @@ route taken to reach a decision are not recorded here — the git history and `C
   cost is one settlement made from the acceptance rather than from a swept slot, which is the one
   place the two agree by construction.
 
+- **The direct-message driver runs as a task beside each front end's network actor, receiving the
+  identity's KEM keypair, its doorbell slot secret and the profile's at-rest key as one moved value
+  on the connect command; the actor's own state keeps only public material.** The alternative,
+  deriving a second key for the message store so the at-rest key never leaves the profile layer, is
+  a cryptographic design choice this change refuses to make on its own. The cost is that the
+  decapsulation half of the KEM keypair now lives in a second task's memory for the life of the
+  connection, which is the custody question the design leaves open.
+
+- **The front ends receive driver events behind a shared pointer and hold no interface for them
+  yet.** The driver's event type is deliberately not cloneable; wrapping it keeps the front-end
+  event type cloneable without copying message bodies. The state fold is tested by asserting the
+  rendered screen is byte-identical before and after a message event, so the interface that
+  eventually renders it starts from a state that is already correct. The cost is a parts-building
+  helper and a state type duplicated across the two front ends until they move to the shared home
+  the network crate names for them.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the

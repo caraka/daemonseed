@@ -14,15 +14,19 @@
 //! it stays Slint-free and network-free. Materialized circles are RAM-only and
 //! gone on relaunch — config persistence is a separate milestone.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::dm::admission::AdmissionCounters;
 use daemonseed_core::dm::keyrec::KemEncapsulationKey;
+use daemonseed_core::dm::outbox::{Acceptance, DeliveryState};
 use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
+use daemonseed_veilid_net::SweepOutcome;
+use daemonseed_veilid_net::dm::{DmEvent, PENDING_REQUEST_CAP, PkLt, RefusalReason, RequestId};
 
-use crate::net::RosterEntry;
+use crate::net::{DmSessionKeys, RosterEntry};
 use daemonseed_core::passphrase::strength::{self, DicewareError};
 
 use crate::profile::Profile;
@@ -427,6 +431,287 @@ pub struct CircleState {
     pub roster: Vec<RosterEntry>,
 }
 
+/// (#339) One correspondence's delivery ledger, as the driver has reported it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DmCorrespondence {
+    /// The last state reported per sequence number, newest wins.
+    ///
+    /// A map rather than a list because `Delivery` is a *replacement*: a seq
+    /// climbs `Composed → OnDht → ConfirmedCollected` and the UI shows where it
+    /// is now, never the path it took.
+    pub deliveries: BTreeMap<u64, DeliveryState>,
+    /// Sequence numbers a loud teardown left undelivered, in arrival order.
+    pub undelivered: Vec<u64>,
+}
+
+/// (#339) The DM state one session has accumulated from [`DmEvent`]s.
+///
+/// Deliberately a *record of what was said*, not a model of the conversation:
+/// the driver owns every DM decision, and this holds only what a surface would
+/// need to draw. Nothing here is persisted — the driver's own store is the
+/// durable half, and a restart re-derives this from a fresh session's events.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct DmState {
+    /// Contact requests the driver has surfaced, keyed by [`RequestId`] — a
+    /// `Vec` because `RequestId` is neither `Hash` nor `Ord`.
+    ///
+    /// **Capped at [`PENDING_REQUEST_CAP`], the driver's own held-request
+    /// bound, and the oldest row is dropped to make room.** Nothing removes a
+    /// row otherwise: there is no accept or decline event, so a request answered
+    /// by the user stays here until an interface exists to retire it, and without
+    /// the cap the list would grow for the life of the session. The driver
+    /// cannot hold more than this many at once, so a longer list here would
+    /// hold requests the driver has already forgotten.
+    ///
+    /// A repeat of a request already held replaces it rather than adding a
+    /// second row: the driver re-surfaces an unanswered knock on every sweep.
+    pub requests: Vec<DmContactRequest>,
+    /// Correspondences this session has heard about, keyed by the
+    /// correspondent's long-term identity key.
+    pub correspondences: BTreeMap<PkLt, DmCorrespondence>,
+    /// The last refusal, whole: who it was for, how far it got, and why it
+    /// stopped. One slot, because a refusal is a thing the user is told once.
+    pub last_refusal: Option<DmRefusal>,
+    /// The last doorbell-health report — the sweep's GET accounting, admission's
+    /// cumulative counters, and the slots this sweep skipped.
+    pub last_doorbell_health: Option<DmDoorbellHealth>,
+    /// The last per-correspondence channel-health report.
+    pub last_channel_health: Option<DmChannelHealth>,
+}
+
+/// A correspondent's identity key, as a trace line may show it: the marker only.
+/// The key itself is 2592 bytes and names a person. Mirrors the redaction
+/// `daemonseed_veilid_net::dm::DmEvent` applies to the same values.
+fn redacted_pk(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("PkLt(..)")
+}
+
+impl std::fmt::Debug for DmState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written because the derive would print every `PkLt` map key in
+        // full — the same 2592 bytes naming a person that `DmEvent`'s own
+        // `Debug` redacts, arriving here by a different route.
+        f.debug_struct("DmState")
+            .field("requests", &self.requests)
+            .field("correspondences", &self.correspondences.len())
+            .field("last_refusal", &self.last_refusal)
+            .field("last_doorbell_health", &self.last_doorbell_health)
+            .field("last_channel_health", &self.last_channel_health)
+            .finish()
+    }
+}
+
+/// (#339) A pending contact request as the user would answer it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DmContactRequest {
+    /// The request the accept / decline names.
+    pub request: RequestId,
+    /// The knocker's long-term identity key.
+    pub from: PkLt,
+    /// The first message body.
+    pub body: String,
+    /// When the knocker says it was sent, in unix milliseconds.
+    pub sent_unix_ms: i64,
+}
+
+impl std::fmt::Debug for DmContactRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The body is a stranger's plaintext message and `from` names a person:
+        // a trace line is the last place either belongs. Length and marker only,
+        // exactly as `DmEvent::ContactRequest` prints them.
+        write!(f, "DmContactRequest {{ request: {:?}, from: ", self.request)?;
+        redacted_pk(f)?;
+        write!(
+            f,
+            ", body_len: {}, sent_unix_ms: {} }}",
+            self.body.len(),
+            self.sent_unix_ms
+        )
+    }
+}
+
+/// (#339) The last refusal, held whole so a surface can say why.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DmRefusal {
+    /// The intended recipient.
+    pub to: PkLt,
+    /// How far the send got.
+    pub acceptance: Acceptance,
+    /// Where it stopped.
+    pub reason: RefusalReason,
+}
+
+impl std::fmt::Debug for DmRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DmRefusal { to: ")?;
+        redacted_pk(f)?;
+        write!(
+            f,
+            ", acceptance: {:?}, reason: {:?} }}",
+            self.acceptance, self.reason
+        )
+    }
+}
+
+/// (#339) The last [`DmEvent::DoorbellHealth`], flattened.
+///
+/// Derives `Debug`: every field is a counter about this side's own sweep, and
+/// none of them names a correspondent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmDoorbellHealth {
+    /// The sweep's GET accounting.
+    pub outcome: SweepOutcome,
+    /// Admission's cumulative accounting.
+    pub admission: AdmissionCounters,
+    /// Slots this sweep skipped because the held-request list was full.
+    pub pending_full: u64,
+}
+
+/// (#339) The last [`DmEvent::ChannelHealth`], flattened.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DmChannelHealth {
+    /// The correspondent the counters belong to.
+    pub with: PkLt,
+    /// Sweeps refused because the transport did not read every slot.
+    pub partial_sweeps: u64,
+    /// Frames whose ratchet position was already consumed.
+    pub already_consumed: u64,
+    /// Frames that did not open or did not verify.
+    pub unopenable: u64,
+    /// Unsettled positions left alone for want of the peer's pseudonym key.
+    pub peer_pseudonym_unknown: u64,
+    /// Peer acknowledgements that would not merge.
+    pub peer_acks_deferred: u64,
+    /// Peer acknowledgements clipped to what this side has actually sent.
+    pub peer_acks_clipped: u64,
+    /// Standalone acknowledgement records that did not verify.
+    pub peer_acks_unverified: u64,
+}
+
+impl std::fmt::Debug for DmChannelHealth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The counters are harmless; `with` is a person's identity key.
+        f.write_str("DmChannelHealth { with: ")?;
+        redacted_pk(f)?;
+        write!(
+            f,
+            ", partial_sweeps: {}, already_consumed: {}, unopenable: {}, \
+             peer_pseudonym_unknown: {}, peer_acks_deferred: {}, peer_acks_clipped: {}, \
+             peer_acks_unverified: {} }}",
+            self.partial_sweeps,
+            self.already_consumed,
+            self.unopenable,
+            self.peer_pseudonym_unknown,
+            self.peer_acks_deferred,
+            self.peer_acks_clipped,
+            self.peer_acks_unverified
+        )
+    }
+}
+
+impl DmState {
+    /// Fold one driver event.
+    ///
+    /// Observability-only variants ([`DmEvent::ContactLookupFailed`],
+    /// [`DmEvent::BlockListFull`] and the rest) are accepted and dropped: no
+    /// interface renders them yet, and inventing state for them here would be
+    /// state no reader could check.
+    fn fold(&mut self, event: &DmEvent) {
+        match event {
+            DmEvent::ContactRequest {
+                request,
+                from,
+                body,
+                sent_unix_ms,
+            } => {
+                let row = DmContactRequest {
+                    request: request.clone(),
+                    from: from.clone(),
+                    body: body.clone(),
+                    sent_unix_ms: *sent_unix_ms,
+                };
+                match self.requests.iter_mut().find(|r| r.request == *request) {
+                    Some(existing) => *existing = row,
+                    None => {
+                        // The driver holds at most this many, so a longer list
+                        // here would show requests it has already forgotten.
+                        // Oldest out, because the newest knock is the one the
+                        // user has not seen.
+                        if self.requests.len() >= PENDING_REQUEST_CAP {
+                            self.requests.remove(0);
+                        }
+                        self.requests.push(row);
+                    }
+                }
+            }
+            DmEvent::Delivery { to, seq, state } => {
+                self.correspondences
+                    .entry(to.clone())
+                    .or_default()
+                    .deliveries
+                    .insert(*seq, *state);
+            }
+            DmEvent::Refused {
+                to,
+                acceptance,
+                reason,
+            } => {
+                self.last_refusal = Some(DmRefusal {
+                    to: to.clone(),
+                    acceptance: *acceptance,
+                    reason: *reason,
+                });
+            }
+            DmEvent::ChannelLost { with, surfaced, .. } => {
+                let c = self.correspondences.entry(with.clone()).or_default();
+                c.undelivered.extend(surfaced.iter().copied());
+            }
+            DmEvent::DoorbellHealth {
+                outcome,
+                admission,
+                pending_full,
+            } => {
+                self.last_doorbell_health = Some(DmDoorbellHealth {
+                    outcome: *outcome,
+                    admission: *admission,
+                    pending_full: *pending_full,
+                });
+            }
+            DmEvent::ChannelHealth {
+                with,
+                partial_sweeps,
+                already_consumed,
+                unopenable,
+                peer_pseudonym_unknown,
+                peer_acks_deferred,
+                peer_acks_clipped,
+                peer_acks_unverified,
+            } => {
+                self.last_channel_health = Some(DmChannelHealth {
+                    with: with.clone(),
+                    partial_sweeps: *partial_sweeps,
+                    already_consumed: *already_consumed,
+                    unopenable: *unopenable,
+                    peer_pseudonym_unknown: *peer_pseudonym_unknown,
+                    peer_acks_deferred: *peer_acks_deferred,
+                    peer_acks_clipped: *peer_acks_clipped,
+                    peer_acks_unverified: *peer_acks_unverified,
+                });
+            }
+            // Nothing a fold could add and no interface that renders them: an
+            // accepted request stays held by the driver, a message has no view,
+            // and the rest are counters the driver already keeps.
+            DmEvent::Message { .. }
+            | DmEvent::AcceptFailed { .. }
+            | DmEvent::ChannelDirectionUnknown { .. }
+            | DmEvent::ContactLookupFailed
+            | DmEvent::BlockListFull { .. }
+            | DmEvent::BlockListProvisioned
+            | DmEvent::SpentTokensNotPersisted => {}
+        }
+    }
+}
+
 /// First circle id handed out (0 is reserved/unused so a missing id is obvious).
 const FIRST_CIRCLE_ID: u64 = 1;
 
@@ -456,6 +741,10 @@ pub struct GuiState {
     /// subsequent event covers. Retaining it lets the tab-open handler mark exactly
     /// what is displayed as seen, independent of whether any event arrives.
     announcements_on_screen: AnnouncementsView,
+    /// (#339) What the DM driver has told this session. Folded by
+    /// [`GuiState::on_dm_event`] and rendered nowhere yet: no interface draws
+    /// it.
+    dm: DmState,
 }
 
 impl GuiState {
@@ -487,6 +776,7 @@ impl GuiState {
             profile: None,
             my_shares: Vec::new(),
             announcements_on_screen: AnnouncementsView::default(),
+            dm: DmState::default(),
         }
     }
 
@@ -581,6 +871,25 @@ impl GuiState {
         self.profile
             .as_ref()
             .and_then(|p| p.stable_kem_encapsulation_key().ok())
+    }
+
+    /// (#339) Derive the secret DM halves for the driver this connect will spawn.
+    /// `None` on the ephemeral / no-profile path, or if derivation fails — each of
+    /// which means this session is not DM-reachable and no driver is spawned.
+    pub fn dm_session_keys(&self) -> Option<Box<DmSessionKeys>> {
+        self.profile.as_ref().and_then(|p| p.dm_session_keys().ok())
+    }
+
+    /// (#339) What the DM driver has told this session. Read-only; the fold is
+    /// [`Self::on_dm_event`]'s.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn dm_state(&self) -> &DmState {
+        &self.dm
+    }
+
+    /// (#339) Fold one DM driver event. Renders nothing: no interface draws it.
+    pub fn on_dm_event(&mut self, event: &DmEvent) {
+        self.dm.fold(event);
     }
 
     /// (#229) Record the announcements/MOTD view now rendered in the pane.
@@ -1235,6 +1544,7 @@ impl GuiState {
             profile: None,
             my_shares: Vec::new(),
             announcements_on_screen: AnnouncementsView::default(),
+            dm: DmState::default(),
         }
     }
 }
@@ -3057,5 +3367,203 @@ mod tests {
             }],
         );
         assert!(st.active_roster().is_empty());
+    }
+
+    // ── #339: DM driver events fold into DmState and drive no UI ──
+
+    /// A distinct 2592-byte identity key, so two correspondents are separable.
+    fn dm_pk(tag: u8) -> PkLt {
+        Box::new([tag; daemonseed_core::identity::keys::IDENTITY_PK_LEN])
+    }
+
+    fn dm_request(slot: u16, tag: u8) -> RequestId {
+        RequestId {
+            slot,
+            entry_hash: [tag; daemonseed_core::dm::pow::ENTRY_HASH_LEN],
+        }
+    }
+
+    /// #339: a `Refused` reaches `DmState` whole — recipient, acceptance and
+    /// reason. The refusal is the one DM outcome the user must be told about,
+    /// no interface draws it yet, so this field IS the delivery.
+    #[test]
+    fn dm_refused_event_lands_in_dm_state() {
+        let mut st = GuiState::lobby_only();
+        assert!(st.dm_state().last_refusal.is_none());
+
+        st.on_dm_event(&DmEvent::Refused {
+            to: dm_pk(7),
+            acceptance: Acceptance::Unconfirmed,
+            reason: RefusalReason::NoKeyRecord,
+        });
+
+        let refusal = st.dm_state().last_refusal.as_ref().expect("refusal folded");
+        assert_eq!(refusal.to, dm_pk(7));
+        assert_eq!(refusal.acceptance, Acceptance::Unconfirmed);
+        assert_eq!(refusal.reason, RefusalReason::NoKeyRecord);
+    }
+
+    /// #339: a `ContactRequest` adds exactly ONE row, a re-surfaced request
+    /// replaces it, and a different request is its own row.
+    #[test]
+    fn dm_contact_request_adds_exactly_one_request() {
+        let mut st = GuiState::lobby_only();
+        assert_eq!(st.dm_state().requests.len(), 0);
+
+        let event = |body: &str| DmEvent::ContactRequest {
+            request: dm_request(3, 9),
+            from: dm_pk(1),
+            body: body.to_owned(),
+            sent_unix_ms: 1_700_000_000_000,
+        };
+        st.on_dm_event(&event("hello"));
+        assert_eq!(st.dm_state().requests.len(), 1);
+
+        st.on_dm_event(&event("hello again"));
+        assert_eq!(st.dm_state().requests.len(), 1);
+        let held = &st.dm_state().requests[0];
+        assert_eq!(held.request, dm_request(3, 9));
+        assert_eq!(held.from, dm_pk(1));
+        assert_eq!(held.body, "hello again");
+
+        st.on_dm_event(&DmEvent::ContactRequest {
+            request: dm_request(4, 9),
+            from: dm_pk(2),
+            body: "someone else".to_owned(),
+            sent_unix_ms: 1_700_000_001_000,
+        });
+        assert_eq!(st.dm_state().requests.len(), 2);
+    }
+
+    /// Everything `GuiState` exposes to the view layer, in one comparable value.
+    ///
+    /// `circles` is the `Debug` rendering of every [`CircleState`] rather than a
+    /// hand-picked field or two: `CircleState` is not `Clone` (it holds a
+    /// zeroizing circle key) so it cannot be snapshotted by value, but its derived
+    /// `Debug` covers every field it has — so a field added later lands in this
+    /// comparison without anyone remembering to add it. A hand-picked triple is
+    /// exactly what a new visible field would slip past.
+    #[derive(Debug, PartialEq)]
+    struct VisibleState {
+        active: usize,
+        circles: String,
+        roster: Vec<RosterEntry>,
+        announcements: AnnouncementsView,
+    }
+
+    fn visible_state(st: &GuiState) -> VisibleState {
+        VisibleState {
+            active: st.active(),
+            circles: format!("{:?}", st.metas()),
+            roster: st.active_roster().to_vec(),
+            announcements: st.announcements_on_screen.clone(),
+        }
+    }
+
+    /// #339: NO UI. Folding DM events changes nothing the view layer reads — no
+    /// interface renders them, and this is what catches a fold reaching into the
+    /// visible layer early.
+    #[test]
+    fn dm_events_change_no_visible_state() {
+        let mut st = GuiState::demo();
+        let before = visible_state(&st);
+        assert!(
+            !st.metas().is_empty(),
+            "the fixture must have circles for the snapshot to mean anything"
+        );
+
+        st.on_dm_event(&DmEvent::ContactRequest {
+            request: dm_request(1, 2),
+            from: dm_pk(3),
+            body: "knock".to_owned(),
+            sent_unix_ms: 1_700_000_000_000,
+        });
+        st.on_dm_event(&DmEvent::Refused {
+            to: dm_pk(3),
+            acceptance: Acceptance::Unconfirmed,
+            reason: RefusalReason::PublishFailed,
+        });
+        st.on_dm_event(&DmEvent::DoorbellHealth {
+            outcome: SweepOutcome::default(),
+            admission: AdmissionCounters::default(),
+            pending_full: 3,
+        });
+
+        // The fold really happened — otherwise this proves only that three
+        // no-ops leave the view alone.
+        assert_eq!(st.dm_state().requests.len(), 1);
+        assert!(st.dm_state().last_refusal.is_some());
+        assert!(st.dm_state().last_doorbell_health.is_some());
+
+        assert_eq!(
+            visible_state(&st),
+            before,
+            "a DM fold changed visible state"
+        );
+    }
+
+    /// #339: the held-request list is bounded by the driver's own cap. Without it
+    /// the fold has no removal path at all — there is no accept or decline event —
+    /// so a long session accumulates every knock it was ever told about,
+    /// including ones the driver has already dropped.
+    #[test]
+    fn dm_requests_are_capped_at_the_drivers_own_bound() {
+        let mut st = GuiState::lobby_only();
+        for i in 0..(PENDING_REQUEST_CAP as u16 + 10) {
+            st.on_dm_event(&DmEvent::ContactRequest {
+                request: dm_request(i, (i % 251) as u8),
+                from: dm_pk(1),
+                body: format!("knock {i}"),
+                sent_unix_ms: 1_700_000_000_000 + i as i64,
+            });
+        }
+        assert_eq!(st.dm_state().requests.len(), PENDING_REQUEST_CAP);
+        assert_eq!(
+            st.dm_state().requests.last().expect("non-empty").body,
+            format!("knock {}", PENDING_REQUEST_CAP + 9)
+        );
+    }
+
+    /// #339: `Debug` on the DM state redacts what core's own `DmEvent::Debug`
+    /// redacts. A trace line is the last place a stranger's plaintext message or
+    /// a 2592-byte key naming a person belongs, and these types reach `Debug` by
+    /// a different route than the event they were folded from.
+    #[test]
+    fn dm_state_debug_redacts_bodies_and_keys() {
+        let mut st = GuiState::lobby_only();
+        st.on_dm_event(&DmEvent::ContactRequest {
+            request: dm_request(1, 2),
+            from: dm_pk(0xAB),
+            body: "meet me at the docks".to_owned(),
+            sent_unix_ms: 1,
+        });
+        st.on_dm_event(&DmEvent::ChannelHealth {
+            with: dm_pk(0xAB),
+            partial_sweeps: 1,
+            already_consumed: 0,
+            unopenable: 0,
+            peer_pseudonym_unknown: 0,
+            peer_acks_deferred: 0,
+            peer_acks_clipped: 0,
+            peer_acks_unverified: 0,
+        });
+        let rendered = format!("{:?}", st.dm_state());
+
+        assert!(
+            !rendered.contains("meet me at the docks"),
+            "the body reached a Debug line: {rendered}"
+        );
+        assert!(
+            rendered.contains("body_len: 20"),
+            "the length should still be there: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171, 171"),
+            "the identity key reached a Debug line: {rendered}"
+        );
+        assert!(
+            rendered.contains("PkLt(..)"),
+            "expected the marker: {rendered}"
+        );
     }
 }

@@ -34,9 +34,13 @@ use crate::state::AnnouncementsView;
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::dm::keyrec::KemEncapsulationKey;
 use daemonseed_core::handle::{DisplayMode, Handle};
-use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
+use daemonseed_core::identity::keys::{
+    DmDoorbellSlotSecret, KemKeypair, ShareRootIkm, SignKeypair,
+};
 use daemonseed_core::presence::{LiveMember, PresenceChange};
 use daemonseed_core::share_catalog::ShareListing;
+use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
+use daemonseed_veilid_net::dm::{DmCommand, DmEvent};
 use tokio::sync::mpsc;
 
 /// The wire-facing name for an auto-republished share (M16 restore path, #41):
@@ -56,6 +60,36 @@ pub(crate) fn republish_name(root: &Path, persisted: Option<&str>) -> String {
     root.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "share".to_owned())
+}
+
+/// (#339) The secret halves the DM driver needs, derived once at connect and
+/// carried to the driver — **not** to the net actor.
+///
+/// The driver is a task spawned *beside* the actor rather than inside it, so this
+/// material never enters the actor's own state: the actor moves it straight into
+/// [`daemonseed_veilid_net::dm::DmDriverParts`] and keeps no copy. That is what
+/// lets the `stable_kem_encapsulation_key` doc below keep saying the
+/// decapsulation key does not reach the net actor.
+///
+/// Moved rather than cloned: [`KemKeypair`] is `!Clone` (`ZeroizeOnDrop`, with no
+/// constructor that would rebuild one) and the driver needs it by value.
+pub struct DmSessionKeys {
+    /// The long-term signing keypair.
+    pub signing: std::sync::Arc<SignKeypair>,
+    /// The full identity KEM keypair, decapsulation half included: opening a
+    /// knock needs it, and only the driver ever holds it.
+    pub kem: KemKeypair,
+    /// The mnemonic-rooted secret selecting this identity's doorbell slot.
+    pub doorbell_slot_secret: DmDoorbellSlotSecret,
+    /// The profile's at-rest AEAD key, which the DM record store opens under.
+    pub at_rest_key: zeroize::Zeroizing<[u8; AEAD_KEY_LEN]>,
+}
+
+impl std::fmt::Debug for DmSessionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Three of the four fields are secret; none is projected.
+        f.debug_struct("DmSessionKeys").finish_non_exhaustive()
+    }
 }
 
 /// A command from the UI thread to the network actor. Fire-and-forget: the UI
@@ -110,6 +144,14 @@ pub enum NetCommand {
         /// DM-reachable, which is the honest state for an identity with no
         /// persistent key.
         stable_kem_encapsulation_key: Option<KemEncapsulationKey>,
+        /// (#339) the secret DM halves for the driver spawned beside the actor at
+        /// this connect — the full KEM keypair, the doorbell slot secret, and the
+        /// profile at-rest key its record store opens under. Moved into
+        /// `DmDriverParts` and kept nowhere else; the actor's own state never
+        /// holds any of it. Boxed so the secret bytes move by pointer at each
+        /// hop rather than being memcpy'd through the command enum. `None` on the ephemeral / no-profile path, and
+        /// without it no driver is spawned.
+        dm_session_keys: Option<Box<DmSessionKeys>>,
         /// (download-subsystem redesign, step 8b / DL-ISC-20) the unlocked profile's
         /// on-disk ROOT — the client's own trusted state dir. The actor holds it so a
         /// verified resume can anchor each fetch's confirmed-manifest digest in
@@ -239,6 +281,15 @@ pub enum NetCommand {
         /// folder subtree. Drives `veilid_net::selection_roots`.
         root_kind: RootKind,
     },
+    /// (#339) One command for the DM driver spawned beside the actor at connect.
+    ///
+    /// The actor forwards it verbatim to the driver's own handle and folds
+    /// nothing: every DM decision belongs to the driver, and a command arriving
+    /// while no driver is running is dropped rather than queued — a driver only
+    /// exists between a connect and the disconnect that shuts it down, and a
+    /// command held across that gap would act on a session the user has left.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Dm(DmCommand),
 }
 
 /// (download-subsystem redesign, step 5 / DL-ISC-8) The kind of selection root a
@@ -403,6 +454,12 @@ pub enum NetEvent {
     },
     /// A fetch failed (timeout, hash mismatch, I/O); partial files are deleted.
     FetchError { message: String },
+    /// (#339) One event from the DM driver, forwarded verbatim by the actor.
+    ///
+    /// `Arc` because [`DmEvent`] is not `Clone` — a message body and a 2592-byte
+    /// identity key are not things to copy per fold — while [`NetEvent`] is. The
+    /// state layer reads through the `Arc` and clones only the fields it keeps.
+    Dm(std::sync::Arc<DmEvent>),
 }
 
 /// One file in an A1 fetch-preview ([`NetEvent::FetchManifest`]): the file's
@@ -492,6 +549,22 @@ impl NetHandle {
     #[allow(clippy::result_large_err)]
     pub fn send(&self, cmd: NetCommand) -> Result<(), NetCommand> {
         self.cmd_tx.send(cmd).map_err(|e| e.0)
+    }
+
+    /// (#339) Queue one [`DmCommand`] for the driver, through the actor loop.
+    ///
+    /// It travels the same channel as every other command rather than reaching
+    /// the driver's handle directly, so the UI keeps one ordering against the
+    /// connect that spawned the driver — a DM command sent before it exists is
+    /// dropped by the actor rather than racing the spawn.
+    ///
+    /// Bounces the whole command back on `Err` and carries `send`'s
+    /// `result_large_err` allowance for the same reason: the payload is never
+    /// inspected, so boxing it buys nothing.
+    #[allow(clippy::result_large_err)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn dm(&self, cmd: DmCommand) -> Result<(), NetCommand> {
+        self.send(NetCommand::Dm(cmd))
     }
 
     /// A `Send + Clone` handle to the command channel, for code that must dispatch a
@@ -1081,5 +1154,51 @@ mod tests {
                 "a#1"
             ));
         }
+    }
+
+    /// #339: `NetHandle::dm` puts the driver command on the ONE command channel,
+    /// verbatim, so a DM command cannot overtake the connect that spawns the
+    /// driver.
+    ///
+    /// Read off the receiving end rather than off a value this test built: an
+    /// assertion that only matches a locally constructed `NetCommand::Dm` is true
+    /// of the enum and says nothing about what `dm` did with its argument.
+    #[test]
+    fn net_handle_dm_puts_the_command_on_the_channel() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (_evt_tx, evt_rx) = mpsc::unbounded_channel();
+        let handle = NetHandle {
+            cmd_tx,
+            evt_rx,
+            _thread: std::thread::spawn(|| {}),
+        };
+
+        let request = daemonseed_veilid_net::dm::RequestId {
+            slot: 17,
+            entry_hash: [0x2b; daemonseed_core::dm::pow::ENTRY_HASH_LEN],
+        };
+        assert!(
+            handle
+                .dm(DmCommand::Accept {
+                    request: request.clone()
+                })
+                .is_ok(),
+            "the channel accepts the command"
+        );
+
+        match cmd_rx
+            .try_recv()
+            .expect("a command reached the actor's end")
+        {
+            NetCommand::Dm(DmCommand::Accept { request: got }) => {
+                assert_eq!(got.slot, request.slot);
+                assert_eq!(got.entry_hash, request.entry_hash);
+            }
+            _ => panic!("the channel carried something other than the DM command"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "exactly one command, not a duplicate"
+        );
     }
 }

@@ -84,7 +84,10 @@ use daemonseed_core::circle::key::{CircleKey, derive_circle_veilid_owner_seed, d
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::dm::admission::AdmissionPolicy;
 use daemonseed_core::dm::keyrec::{self as dm_keyrec, KemEncapsulationKey};
+use daemonseed_core::dm::persist::DmPersist;
+use daemonseed_core::dm::pow::PowDifficulty;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_heartbeat};
 use daemonseed_core::identity::keys::{Identity, ShareRootIkm, SignKeypair, derive_identity_keys};
@@ -115,6 +118,10 @@ use daemonseed_core::storage::fetched::{
     wrapper_folder,
 };
 use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
+use daemonseed_veilid_net::dm::{
+    DmCommand, DmDht, DmDriver, DmDriverConfig, DmDriverHandle, DmDriverParts, DmEvent, DmIdentity,
+    DmTrySendError, WallClock,
+};
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::{
     CLOSE_FLUSH_FLOOR, CLOSE_PREFLUSH_BUDGET, DiscoveryEnvelope, FetchErrorClass, OwnerSeed,
@@ -125,7 +132,9 @@ use daemonseed_veilid_net::{
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::app::IndexerStatus;
-use crate::net::{NetCommand, NetEvent, RootKind, ShareManifestEntry, resolve_share_folder};
+use crate::net::{
+    DmSessionKeys, NetCommand, NetEvent, RootKind, ShareManifestEntry, resolve_share_folder,
+};
 
 /// Reported for [`NetEvent::Connected::version`]: the Veilid transport carries
 /// no negotiated wire version (unlike the relay's APP_HELLO handshake), so we
@@ -345,6 +354,9 @@ pub async fn veilid_net_actor(
 ) {
     let mut net: Option<VeilidNetHandle> = None;
     let mut ev_rx: Option<UnboundedReceiver<VeilidNetEvent>> = None;
+    // (#339) The DM driver spawned beside this actor at each connect. `None`
+    // before the first connect, on the ephemeral path, and after the driver ends.
+    let mut dm: Option<DmSession> = None;
     let mut circles: Vec<VeilidCircle> = Vec::new();
     let mut shares = ShareState::new();
     // Monotonic id handed out at join — mirrors the relay actor's `next_circle_id`.
@@ -423,8 +435,22 @@ pub async fn veilid_net_actor(
                 handle_command(
                     cmd, &evt_tx, &mut net, &mut ev_rx, &mut circles,
                     &mut next_circle_id, &mut my_handle, &mut shares, &fetch_outcome_tx,
-                    &confirm_outcome_tx,
+                    &confirm_outcome_tx, &mut dm,
                 ).await;
+            }
+            // (#339) Forward one DM driver event to the UI. The actor folds
+            // nothing: `App` owns the DM state, exactly as it owns every other
+            // event's. A `None` means the driver has ended — its handle reaches
+            // nothing after that, so drop the session rather than re-polling a
+            // closed receiver every loop iteration.
+            dm_event = recv_dm(&mut dm), if dm.is_some() => {
+                match dm_event {
+                    Some(event) => { let _ = evt_tx.send(NetEvent::Dm(Arc::new(event))); }
+                    None => {
+                        dm = None;
+                        daemonseed_veilid_net::vtrace!("tui dm: driver ended");
+                    }
+                }
             }
             // (#180 §RS-2, CRSH-ISC-8/19) Fold a spawned fetch's generation-tagged outcome
             // on-loop: render the manifest / mark Unresolved / record the imported route. A
@@ -634,6 +660,9 @@ pub async fn veilid_net_actor(
         // iteration (superseded advert + no in-flight fetch), off the loop.
         drain_route_releases(&mut shares, &net);
     }
+    // (#339) The UI side dropped the command channel, so the session is over:
+    // stop the driver rather than leaving it sweeping a doorbell nobody reads.
+    shutdown_dm(&mut dm);
 }
 
 /// (#180 §RS-3, CRSH-ISC-10) Release, off the loop, every imported route the in-use guard
@@ -663,6 +692,126 @@ async fn recv_opt(ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>) -> Opti
     ev_rx.as_mut().unwrap().recv().await
 }
 
+/// (#339) How long the DM driver sleeps when nothing wakes it — also its
+/// doorbell sweep cadence, since an idle tick is when the sweep is planned.
+///
+/// Thirty seconds is the driver's own oracle cadence, and it is the interval a
+/// first contact waits on: a knock lands in a slot, and nothing tells the
+/// recipient it is there except the next sweep.
+const DM_IDLE_TICK: Duration = Duration::from_secs(30);
+
+/// (#339) The DM driver spawned beside this actor for the current connection.
+///
+/// It is a separate task, not part of the actor: the actor forwards commands to
+/// `handle` and drains `events` on its own `select!` arm, and holds none of the
+/// driver's key material. One per connect — a reconnect shuts the old one down
+/// and spawns a fresh driver, because a driver whose `Shutdown` has run has
+/// ended and its handle no longer reaches anything.
+struct DmSession {
+    handle: DmDriverHandle,
+    events: tokio::sync::mpsc::Receiver<DmEvent>,
+}
+
+/// Await the DM driver's next event. The `if dm.is_some()` guard on the select
+/// arm ensures this is only polled when `Some`, so the `unwrap` holds — the same
+/// shape as [`recv_opt`].
+async fn recv_dm(dm: &mut Option<DmSession>) -> Option<DmEvent> {
+    dm.as_mut().unwrap().events.recv().await
+}
+
+/// (#339) Build the driver's parts from what this session already holds.
+///
+/// Generic over the DHT seam so a construction test can build the parts against
+/// a stand-in: `VeilidNetHandle` cannot be constructed without attaching to the
+/// network, and what this function decides — the store root, the identity halves,
+/// the policy — has nothing to do with which seam it is handed.
+///
+/// `Err` names what was missing, for a trace line — every case is "this session
+/// is not DM-reachable", never a fault: an ephemeral session has no profile root
+/// and no derived keys, and a DM store that will not open is a disk condition the
+/// user finds out about through the shares path first.
+///
+/// `spent_tokens` is `None` because the policy is [`AdmissionPolicy::Open`],
+/// under which the invite-token field is never decoded and there is no consumed
+/// nonce to lose across a restart. The pairing the driver refuses —
+/// `InviteOnly` with no store — is therefore not reachable from here.
+fn dm_driver_parts<D: DmDht>(
+    dht: Arc<D>,
+    keys: DmSessionKeys,
+    profile_root: &std::path::Path,
+) -> Result<DmDriverParts<D>, String> {
+    let persist = DmPersist::open(profile_root.join("dm"), &keys.at_rest_key)
+        .map_err(|e| format!("dm store: {e}"))?;
+    Ok(DmDriverParts {
+        dht,
+        clock: WallClock::system(),
+        identity: DmIdentity {
+            signing: keys.signing,
+            kem: keys.kem,
+            doorbell_slot_secret: keys.doorbell_slot_secret,
+        },
+        persist,
+        cfg: DmDriverConfig {
+            idle_tick: DM_IDLE_TICK,
+            policy: AdmissionPolicy::Open,
+            pow_difficulty: PowDifficulty::PRODUCTION,
+        },
+        spent_tokens: None,
+    })
+}
+
+/// (#339) Shut the current driver down, if there is one, and drop its handle.
+///
+/// Best-effort and non-blocking: a driver that has already ended refuses the
+/// command, which is the state this call was trying to reach, and dropping the
+/// last handle ends one that is merely busy.
+fn shutdown_dm(dm: &mut Option<DmSession>) {
+    if let Some(session) = dm.take() {
+        // Never awaited: a full queue would park the whole actor, and dropping
+        // the handle — which this does — ends the driver anyway. The command is
+        // the polite path, not the only one.
+        let _ = session.handle.try_send(DmCommand::Shutdown);
+    }
+}
+
+/// (#339) Spawn a driver for this connection, replacing any prior one.
+///
+/// Silent when the session has no DM material or no profile root — an ephemeral
+/// session is genuinely not DM-reachable, and there is nothing to tell the user.
+fn spawn_dm_driver<D: DmDht>(
+    dm: &mut Option<DmSession>,
+    dht: Option<Arc<D>>,
+    keys: Option<Box<DmSessionKeys>>,
+    profile_root: Option<&std::path::Path>,
+) {
+    // Unconditional, and BEFORE the early return: a reconnect whose transport
+    // never came up would otherwise leave the previous connection's driver
+    // running, sweeping a doorbell for a session the user has left.
+    shutdown_dm(dm);
+    let (Some(dht), Some(keys), Some(root)) = (dht, keys, profile_root) else {
+        return;
+    };
+    let parts = match dm_driver_parts(dht, *keys, root) {
+        Ok(parts) => parts,
+        Err(why) => {
+            daemonseed_veilid_net::vtrace!("tui dm: driver not spawned ({why})");
+            return;
+        }
+    };
+    // `try_spawn`, never `spawn`: the fallible startup steps run on THIS thread,
+    // and a read-only or full profile directory must cost the DM driver, not the
+    // actor that also serves chat, shares and presence.
+    match DmDriver::try_spawn(parts) {
+        Ok((handle, events)) => {
+            *dm = Some(DmSession { handle, events });
+            daemonseed_veilid_net::vtrace!("tui dm: driver spawned");
+        }
+        Err(why) => {
+            daemonseed_veilid_net::vtrace!("tui dm: driver not spawned ({why})");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     cmd: NetCommand,
@@ -679,12 +828,16 @@ async fn handle_command(
     // (#197, CRSH-ISC-29) Where a spawned `ConfirmFetch` download reports its terminal
     // outcome for on-loop folding — the download never blocks this command loop either.
     confirm_outcome_tx: &UnboundedSender<ConfirmOutcome>,
+    // (#339) The DM driver beside this actor: replaced on each Connect, and the
+    // destination every `NetCommand::Dm` is forwarded to.
+    dm: &mut Option<DmSession>,
 ) {
     match cmd {
         NetCommand::Connect {
             stable_signing_key,
             stable_share_root_ikm,
             stable_kem_encapsulation_key,
+            dm_session_keys,
             profile_root,
             self_handle,
             ..
@@ -698,8 +851,9 @@ async fn handle_command(
             // publish derives a receiver-verifiable share_id from the same identity.
             shares.share_root_ikm = stable_share_root_ikm.map(Arc::new);
             // (#232) Capture the KEM encapsulation key so this session can publish
-            // its DM key record. Public material — the decapsulation key never
-            // reaches the net actor.
+            // its DM key record. Public material — the decapsulation key goes to
+            // the DM driver spawned beside this actor (#339), never into the
+            // actor's own state.
             shares.kem_ek = stable_kem_encapsulation_key.map(|k| k.0);
             // (step 8b-2 / DL-ISC-20) Hold the profile root for the session so a
             // verified resume anchors each fetch's manifest digest in the client's
@@ -734,7 +888,41 @@ async fn handle_command(
                     );
                 }
             }
+            // (#339) Spawn the DM driver for this connection. It takes the secret
+            // halves and the profile's DM records; a prior driver (this is a
+            // reconnect) is shut down first — one ended driver cannot serve a new
+            // session. OUTSIDE the connected branch on purpose: a reconnect whose
+            // transport never came up must still stop the previous connection's
+            // driver, and the call is a no-op beyond that when there is no
+            // transport to hand it.
+            spawn_dm_driver(
+                dm,
+                net.as_ref().map(|h| Arc::new(h.clone())),
+                dm_session_keys,
+                shares.profile_root.as_deref(),
+            );
         }
+        // (#339) Forward one command to the driver. Dropped when no driver is
+        // running: a DM command outside a connection has nowhere to go, and
+        // queueing it would act on a session the user has already left.
+        NetCommand::Dm(dm_cmd) => match dm.as_ref() {
+            // `try_send`, never `send`: the driver's queue is bounded, and
+            // awaiting a full one would park this loop — and with it chat,
+            // shares and presence — behind a DM command.
+            Some(session) => match session.handle.try_send(dm_cmd) {
+                Ok(()) => {}
+                Err(DmTrySendError::Full) => {
+                    daemonseed_veilid_net::vtrace!("tui dm: driver queue full, command dropped");
+                }
+                Err(DmTrySendError::Stopped) => {
+                    daemonseed_veilid_net::vtrace!("tui dm: driver stopped, command dropped");
+                    *dm = None;
+                }
+            },
+            None => {
+                daemonseed_veilid_net::vtrace!("tui dm: no driver, command dropped");
+            }
+        },
         NetCommand::JoinCircle { phrase } => {
             join_circle(&phrase, evt_tx, net, circles, next_circle_id).await;
         }
@@ -846,6 +1034,10 @@ async fn handle_command(
             });
         }
         NetCommand::GracefulClose { ack } => {
+            // (#339) The DM driver goes down with the transport it rides. Without
+            // this it would outlive the close, sweeping a doorbell over a
+            // connection the user has ended.
+            shutdown_dm(dm);
             // Every step below is bounded, and the bounds compose inside
             // GRACEFUL_CLOSE_BUDGET (see its carve-up). Nothing here may await a DHT
             // write unbounded: the binary blocks on this ack, so a stalled leave would
@@ -3135,6 +3327,7 @@ fn apply_discovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daemonseed_veilid_net::dm::{DmDhtFuture, DmSpawnError};
     use daemonseed_veilid_net::route_provenance_input;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -4591,5 +4784,460 @@ mod tests {
         let mut shares = ShareState::new(); // lobby = None
         let (evt_tx, _evt_rx) = unbounded_channel();
         assert!(!apply_discovery(&mut shares, &evt_tx, b"not-an-envelope"));
+    }
+
+    // ── #339: the DM driver's parts, built from what a session already holds ──
+
+    /// A seam that answers nothing. `dm_driver_parts` performs no DHT operation —
+    /// it opens a store and assembles a struct — so a stand-in that refuses every
+    /// call is the honest fixture: if the helper ever grew a network round-trip,
+    /// this would fail rather than quietly succeed against a live handle.
+    struct RefusingDht;
+
+    impl RefusingDht {
+        fn refuse<T: Send + 'static>() -> daemonseed_veilid_net::dm::DmDhtFuture<T> {
+            Box::pin(async { Err(VeilidNetError::Actor("no dht in this test".into())) })
+        }
+    }
+
+    impl DmDht for RefusingDht {
+        fn fetch_dm_key_record(&self, _: [u8; 32]) -> DmDhtFuture<Option<Vec<u8>>> {
+            Self::refuse()
+        }
+        fn publish_doorbell_entry(
+            &self,
+            _: [u8; 32],
+            _: u16,
+            _: Vec<u8>,
+            _: daemonseed_veilid_net::actor::DoorbellDispatch,
+        ) -> DmDhtFuture<()> {
+            Self::refuse()
+        }
+        fn sweep_doorbell(
+            &self,
+            _: [u8; 32],
+        ) -> DmDhtFuture<daemonseed_veilid_net::actor::DoorbellSweep> {
+            Self::refuse()
+        }
+        fn publish_dm_page(
+            &self,
+            _: daemonseed_core::dm::paging::DmPageAddress<daemonseed_core::dm::paging::Sending>,
+            _: Vec<u8>,
+        ) -> DmDhtFuture<()> {
+            Self::refuse()
+        }
+        fn sweep_dm_page(
+            &self,
+            _: daemonseed_core::dm::paging::DmPageAddress<daemonseed_core::dm::paging::Receiving>,
+        ) -> DmDhtFuture<daemonseed_veilid_net::actor::DmPageSweep> {
+            Self::refuse()
+        }
+        fn publish_dm_ack(
+            &self,
+            _: daemonseed_core::dm::ack_record::DmAckAddress,
+            _: Vec<u8>,
+        ) -> DmDhtFuture<()> {
+            Self::refuse()
+        }
+        fn fetch_dm_ack(
+            &self,
+            _: daemonseed_core::dm::ack_record::DmAckAddress,
+        ) -> DmDhtFuture<Option<Vec<u8>>> {
+            Self::refuse()
+        }
+    }
+
+    /// #339: the DM material a session hands the driver, as a fixture builds it.
+    fn dm_test_keys(identity: daemonseed_core::identity::keys::IdentityKeys) -> DmSessionKeys {
+        DmSessionKeys {
+            signing: Arc::new(identity.signing),
+            kem: identity.kem,
+            doorbell_slot_secret: identity.dm_doorbell_slot_secret,
+            at_rest_key: zeroize::Zeroizing::new([0x5a; 32]),
+        }
+    }
+
+    fn dm_test_identity() -> daemonseed_core::identity::keys::IdentityKeys {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let mnemonic = Mnemonic::generate().expect("mnemonic");
+        derive_identity_keys(&mnemonic, Identity::Primary).expect("identity derives")
+    }
+
+    /// #339: the parts a connect builds carry THIS identity's signing key and a
+    /// store at EXACTLY this profile's DM root — the two bindings a mis-wired
+    /// connect would break silently, one by driving the driver under the wrong
+    /// identity and the other by writing a second profile's records into this
+    /// one's dir.
+    #[test]
+    fn dm_driver_parts_bind_the_identity_and_the_profile_root() {
+        let identity = dm_test_identity();
+        let expected_pk = *identity.signing.public_key();
+
+        let profile = tempfile::tempdir().expect("tempdir");
+        let parts = dm_driver_parts(
+            Arc::new(RefusingDht),
+            dm_test_keys(identity),
+            profile.path(),
+        )
+        .expect("parts build against a fresh profile root");
+
+        assert_eq!(
+            parts.identity.signing.public_key(),
+            &expected_pk,
+            "the driver runs under the profile's own identity"
+        );
+        assert_eq!(
+            parts.persist.store().root(),
+            profile.path().join("dm"),
+            "the DM store is the profile's own dm/ dir, not merely somewhere under it"
+        );
+        assert!(parts.persist.store().root().is_dir());
+        // Open policy: no spent-token store, and none is needed — the driver
+        // would panic at spawn on the InviteOnly pairing instead.
+        assert!(parts.spent_tokens.is_none());
+        assert_eq!(parts.cfg.policy, AdmissionPolicy::Open);
+    }
+
+    /// #339: the store is opened under the AT-REST KEY the session handed over,
+    /// not under any key at all. Proven the only way a key can be: a record
+    /// written under one key does not read under another.
+    ///
+    /// Without this, `at_rest_key` could be a constant and every other assertion
+    /// in this file would still pass.
+    #[test]
+    fn dm_driver_parts_open_the_store_under_the_given_key() {
+        let identity = dm_test_identity();
+        let profile = tempfile::tempdir().expect("tempdir");
+
+        let mut keys = dm_test_keys(identity);
+        keys.at_rest_key = zeroize::Zeroizing::new([0xa1; 32]);
+        let parts = dm_driver_parts(Arc::new(RefusingDht), keys, profile.path()).expect("parts");
+        parts
+            .persist
+            .provision_block_list()
+            .expect("the block list writes under the session's key");
+        parts
+            .persist
+            .read_block_list()
+            .expect("and reads back under the same key");
+        drop(parts);
+
+        // The same root, a different key: the record is there and will not open.
+        let wrong = DmPersist::open(profile.path().join("dm"), &[0xb2; 32])
+            .expect("the store itself opens — only the records are keyed");
+        assert!(
+            wrong.read_block_list().is_err(),
+            "a record written under the session key must not read under another"
+        );
+    }
+
+    /// #339: a profile whose block-list record cannot be read fails the SPAWN,
+    /// on the caller's thread — and the caller is the net actor. `try_spawn`
+    /// reports it; `spawn` would panic and take chat, shares and presence with it.
+    #[test]
+    fn dm_driver_try_spawn_reports_an_unreadable_block_list() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let identity = dm_test_identity();
+        let profile = tempfile::tempdir().expect("tempdir");
+        let parts = dm_driver_parts(
+            Arc::new(RefusingDht),
+            dm_test_keys(identity),
+            profile.path(),
+        )
+        .expect("parts");
+
+        // Make the block-list record unreadable. Positive control FIRST: without
+        // it a chmod that did nothing (running as root, an exotic filesystem)
+        // would leave this test asserting that a healthy profile spawns, which
+        // it would, and the failure path would go untested.
+        let root = parts.persist.store().root().to_path_buf();
+        let mut sealed = 0usize;
+        for entry in std::fs::read_dir(&root).expect("the store root is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_file() {
+                let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+                perms.set_mode(0o000);
+                std::fs::set_permissions(&path, perms).expect("chmod");
+                sealed += 1;
+            }
+        }
+        assert!(
+            sealed > 0,
+            "the fixture sealed no record, so it proves nothing"
+        );
+        assert!(
+            parts.persist.read_block_list().is_err(),
+            "the fixture did not actually make the record unreadable"
+        );
+
+        match DmDriver::try_spawn(parts) {
+            Err(DmSpawnError::BlockList(_)) => {}
+            Err(other) => panic!("wrong failure: {other}"),
+            Ok(_) => panic!("a driver started against an unreadable block list"),
+        }
+
+        // Restore so the tempdir can be removed.
+        for entry in std::fs::read_dir(&root).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_file() {
+                let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+        }
+    }
+
+    /// #339: the actor's DM slot, over a connection's whole life — spawned once,
+    /// replaced by the next connect, emptied by shutdown, and never spawned at
+    /// all when the transport did not come up.
+    #[tokio::test]
+    async fn dm_session_slot_follows_the_connection() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let mut dm: Option<DmSession> = None;
+
+        // No transport: nothing spawns, and nothing panics.
+        spawn_dm_driver(
+            &mut dm,
+            None::<Arc<RefusingDht>>,
+            Some(Box::new(dm_test_keys(dm_test_identity()))),
+            Some(profile.path()),
+        );
+        assert!(dm.is_none(), "no transport, no driver");
+
+        // A DM command with no driver is dropped, not panicked on.
+        assert!(dm.is_none());
+
+        // Connect: one driver.
+        spawn_dm_driver(
+            &mut dm,
+            Some(Arc::new(RefusingDht)),
+            Some(Box::new(dm_test_keys(dm_test_identity()))),
+            Some(profile.path()),
+        );
+        assert!(
+            dm.is_some(),
+            "a connect with keys and a root spawns a driver"
+        );
+
+        // A second connect REPLACES it — the old driver has been told to stop,
+        // and a stopped driver's handle reaches nothing.
+        spawn_dm_driver(
+            &mut dm,
+            Some(Arc::new(RefusingDht)),
+            Some(Box::new(dm_test_keys(dm_test_identity()))),
+            Some(profile.path()),
+        );
+        assert!(dm.is_some(), "a reconnect leaves a live driver, not none");
+
+        // A reconnect whose transport never came up still stops the old driver.
+        spawn_dm_driver(
+            &mut dm,
+            None::<Arc<RefusingDht>>,
+            Some(Box::new(dm_test_keys(dm_test_identity()))),
+            Some(profile.path()),
+        );
+        assert!(
+            dm.is_none(),
+            "a failed reconnect must not leave the previous driver running"
+        );
+
+        // And shutdown empties the slot.
+        spawn_dm_driver(
+            &mut dm,
+            Some(Arc::new(RefusingDht)),
+            Some(Box::new(dm_test_keys(dm_test_identity()))),
+            Some(profile.path()),
+        );
+        assert!(dm.is_some());
+        shutdown_dm(&mut dm);
+        assert!(dm.is_none(), "shutdown_dm leaves the slot empty");
+    }
+
+    /// #339: `GracefulClose` takes the DM driver down with the transport. The
+    /// close already acks with no transport, so the ack is the proof the arm ran
+    /// to completion with the shutdown as its first statement.
+    #[tokio::test]
+    async fn graceful_close_shuts_the_dm_driver_down() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let mut dm: Option<DmSession> = None;
+        spawn_dm_driver(
+            &mut dm,
+            Some(Arc::new(RefusingDht)),
+            Some(Box::new(dm_test_keys(dm_test_identity()))),
+            Some(profile.path()),
+        );
+        assert!(dm.is_some(), "the fixture must have a driver to shut down");
+
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let (fetch_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_tx, _confirm_rx) = unbounded_channel();
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let mut net = None;
+        let mut ev_rx = None;
+        let mut circles = Vec::new();
+        let mut next_circle_id = 0u64;
+        let mut my_handle = None;
+        let mut shares = ShareState::new();
+
+        handle_command(
+            NetCommand::GracefulClose { ack: ack_tx },
+            &evt_tx,
+            &mut net,
+            &mut ev_rx,
+            &mut circles,
+            &mut next_circle_id,
+            &mut my_handle,
+            &mut shares,
+            &fetch_tx,
+            &confirm_tx,
+            &mut dm,
+        )
+        .await;
+
+        assert!(dm.is_none(), "GracefulClose left the driver running");
+        assert!(ack_rx.recv().is_ok(), "the close must still ack");
+    }
+
+    /// #339: a DM command with no driver is dropped, and the command arm returns
+    /// normally rather than panicking or parking.
+    #[tokio::test]
+    async fn a_dm_command_with_no_driver_is_dropped() {
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let (fetch_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_tx, _confirm_rx) = unbounded_channel();
+        let mut net = None;
+        let mut ev_rx = None;
+        let mut circles = Vec::new();
+        let mut next_circle_id = 0u64;
+        let mut my_handle = None;
+        let mut shares = ShareState::new();
+        let mut dm: Option<DmSession> = None;
+
+        handle_command(
+            NetCommand::Dm(DmCommand::Shutdown),
+            &evt_tx,
+            &mut net,
+            &mut ev_rx,
+            &mut circles,
+            &mut next_circle_id,
+            &mut my_handle,
+            &mut shares,
+            &fetch_tx,
+            &confirm_tx,
+            &mut dm,
+        )
+        .await;
+
+        assert!(dm.is_none());
+    }
+
+    /// Seal every record file under a profile's DM root so the store's own reads
+    /// fail. Returns the root, for restoring afterwards.
+    fn seal_dm_records(profile_root: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let root = profile_root.join("dm");
+        let mut sealed = 0usize;
+        for entry in std::fs::read_dir(&root).expect("the store root is readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_file() {
+                let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+                perms.set_mode(0o000);
+                std::fs::set_permissions(&path, perms).expect("chmod");
+                sealed += 1;
+            }
+        }
+        assert!(
+            sealed > 0,
+            "the fixture sealed no record, so it proves nothing"
+        );
+        root
+    }
+
+    fn unseal_dm_records(root: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        for entry in std::fs::read_dir(root).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_file() {
+                let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&path, perms);
+            }
+        }
+    }
+
+    /// #339: the ACTOR's spawn path survives a profile the driver cannot start
+    /// against. The failure runs on the caller's thread, and the caller here also
+    /// serves chat, shares and presence — so `spawn_dm_driver` must trace and
+    /// leave the slot empty, never panic.
+    ///
+    /// Distinct from the `try_spawn` test above, which drives the driver's own
+    /// entry point: this one drives the front end's, which is where a `spawn`
+    /// would actually kill something.
+    #[tokio::test]
+    async fn a_profile_the_driver_cannot_start_against_does_not_kill_the_actor() {
+        let profile = tempfile::tempdir().expect("tempdir");
+
+        // Create the store, then seal its records.
+        let first = dm_driver_parts(
+            Arc::new(RefusingDht),
+            dm_test_keys(dm_test_identity()),
+            profile.path(),
+        )
+        .expect("the first open creates the store");
+        drop(first);
+        let root = seal_dm_records(profile.path());
+
+        // Positive control: the parts still BUILD against the sealed profile, so
+        // the failure this test cares about is the spawn's, not the open's. If
+        // this ever stops holding, the test below would pass for the wrong
+        // reason and this assertion is what says so.
+        let parts = dm_driver_parts(
+            Arc::new(RefusingDht),
+            dm_test_keys(dm_test_identity()),
+            profile.path(),
+        );
+        let parts_built = parts.is_ok();
+        drop(parts);
+        assert!(
+            parts_built,
+            "the fixture no longer reaches the spawn — it now fails at the store open"
+        );
+
+        let mut dm: Option<DmSession> = None;
+        spawn_dm_driver(
+            &mut dm,
+            Some(Arc::new(RefusingDht)),
+            Some(Box::new(dm_test_keys(dm_test_identity()))),
+            Some(profile.path()),
+        );
+        assert!(dm.is_none(), "no driver, as expected");
+
+        // The actor is still here: it went on to handle the next command.
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let (fetch_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_tx, _confirm_rx) = unbounded_channel();
+        let mut net = None;
+        let mut ev_rx = None;
+        let mut circles = Vec::new();
+        let mut next_circle_id = 0u64;
+        let mut my_handle = None;
+        let mut shares = ShareState::new();
+        handle_command(
+            NetCommand::Dm(DmCommand::Shutdown),
+            &evt_tx,
+            &mut net,
+            &mut ev_rx,
+            &mut circles,
+            &mut next_circle_id,
+            &mut my_handle,
+            &mut shares,
+            &fetch_tx,
+            &confirm_tx,
+            &mut dm,
+        )
+        .await;
+
+        unseal_dm_records(&root);
     }
 }

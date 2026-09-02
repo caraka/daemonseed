@@ -21,6 +21,7 @@
 
 use std::path::PathBuf;
 
+use crate::net::DmSessionKeys;
 use daemonseed_core::dm::keyrec::KemEncapsulationKey;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::identity::keys::{
@@ -119,6 +120,24 @@ impl Profile {
     pub fn stable_kem_encapsulation_key(&self) -> Result<KemEncapsulationKey, KeyDerivationError> {
         derive_identity_keys(&self.seeds.mnemonic, Identity::Primary)
             .map(|k| Box::new(*k.kem.encapsulation_key()))
+    }
+
+    /// (#339) Derive the secret DM halves for the driver a connect will spawn:
+    /// the signing keypair, the FULL identity KEM keypair, the doorbell slot
+    /// secret, and this profile's at-rest key.
+    ///
+    /// One `derive_identity_keys` call rather than three, because the KEM keypair
+    /// is `!Clone` and has to be moved out whole. The decapsulation key leaves
+    /// this method — the one caller is the connect path, which hands it to the
+    /// driver task and to nothing else; the net actor still never sees it.
+    pub fn dm_session_keys(&self) -> Result<Box<DmSessionKeys>, KeyDerivationError> {
+        let keys = derive_identity_keys(&self.seeds.mnemonic, Identity::Primary)?;
+        Ok(Box::new(DmSessionKeys {
+            signing: std::sync::Arc::new(keys.signing),
+            kem: keys.kem,
+            doorbell_slot_secret: keys.dm_doorbell_slot_secret,
+            at_rest_key: self.seal_key.to_bytes(),
+        }))
     }
 
     /// Circles recorded in the blob (canonical phrase + label) — the rejoin set.
@@ -304,5 +323,81 @@ impl Profile {
             .seal(&self.seeds)
             .map_err(|e| format!("re-seal failed: {e}"))?;
         write_seeds_blob(&self.root, &bytes).map_err(|e| format!("write seeds.blob failed: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use daemonseed_core::bootstrap::BootstrapAnchor;
+    use daemonseed_core::first_start::FirstStart;
+    use daemonseed_core::profile::config::ArgonParams;
+
+    /// #339: the material handed to the driver is THIS profile's — the same
+    /// identity behind the signing key, the doorbell secret from the same
+    /// derivation, and the profile's own at-rest key.
+    ///
+    /// The doorbell secret and the at-rest key are the two halves nothing else
+    /// checks: the first decides which slot a knock is written to, so a wrong one
+    /// is silently unreachable rather than broken, and the second decides whether
+    /// the DM records open at all.
+    #[test]
+    fn dm_session_keys_bind_the_identity_and_the_profile_key() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let sealed = FirstStart::new()
+            .initialize("correct horse battery staple table mountain", fast)
+            .expect("first start");
+        let phrase = sealed.display_phrase();
+        let materials = sealed
+            .verify_round_trip(&phrase)
+            .expect("round trip")
+            .finalize(
+                Some("alice".to_owned()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_owned(),
+                    address: "127.0.0.1:443".to_owned(),
+                },
+            )
+            .expect("finalize")
+            .into_session_materials();
+        // Captured before `from_materials` consumes them.
+        let seal_key = materials.seal_key.clone();
+
+        let profile =
+            Profile::from_materials(materials, PathBuf::from("/nonexistent-in-this-test"));
+        let keys = profile
+            .dm_session_keys()
+            .expect("an unlocked profile has DM keys");
+
+        // Re-derive independently of the code under test.
+        let mnemonic = daemonseed_core::identity::mnemonic::Mnemonic::from_phrase(&phrase)
+            .expect("the enrolled phrase parses");
+        let expected = derive_identity_keys(&mnemonic, Identity::Primary).expect("identity");
+
+        assert_eq!(
+            keys.signing.public_key(),
+            expected.signing.public_key(),
+            "the driver signs as this profile"
+        );
+        assert_eq!(
+            keys.kem.encapsulation_key(),
+            expected.kem.encapsulation_key(),
+            "and opens knocks with this profile's KEM keypair"
+        );
+        assert_eq!(
+            keys.doorbell_slot_secret.as_bytes(),
+            expected.dm_doorbell_slot_secret.as_bytes(),
+            "a wrong doorbell secret is silently unreachable, never loudly broken"
+        );
+        assert_eq!(
+            *keys.at_rest_key,
+            *seal_key.to_bytes(),
+            "the DM store opens under the profile's own at-rest key"
+        );
     }
 }

@@ -485,6 +485,15 @@ types:
     module: daemonseed_veilid_net::dm
     kind: struct
     description: "The identity halves the driver needs: signing (Arc<SignKeypair>), kem (the full KemKeypair, decapsulation half included), doorbell_slot_secret. Its Debug prints no key material."
+  - name: daemonseed_veilid_net::dm::DmSpawnError
+    kind: enum
+    description: "(#339) Why a driver did not start: DoorbellOwnerSeed(DmDoorbellError), KeyRecordOwnerSeed(DmKeyRecordError), BlockList(DmPersistError). Every variant is a condition of this machine — its crypto module or its profile directory — and none is transient. DmDriver::try_spawn(parts) -> Result<(DmDriverHandle, mpsc::Receiver<DmEvent>), DmSpawnError> reports them; DmDriver::spawn stays the panicking wrapper, for tests and for callers whose whole purpose is the driver. The three fallible steps run on the CALLER's thread, so a front-end net actor — which also serves chat, shares and presence — uses try_spawn."
+  - name: daemonseed_veilid_net::dm::DmTrySendError
+    kind: enum
+    description: "(#339) Why DmDriverHandle::try_send did not queue a command: Full (the driver is running, its 64-slot queue is not draining) or Stopped (the handle reaches nothing). The command is dropped in both cases; they differ in what the caller should do about the handle. try_send exists for a shared actor loop, where awaiting DmDriverHandle::send on a full queue would stall every other command behind a DM one."
+  - name: daemonseed_veilid_net::dm::PENDING_REQUEST_CAP
+    kind: const
+    description: "(#339, was crate-private) How many contact requests the driver holds at once (64). Public so a front end's own held-request list can be bounded by the same number rather than a second one that could disagree."
   - name: WallClock
     module: daemonseed_veilid_net::dm
     kind: struct

@@ -19,7 +19,11 @@ pub(crate) mod mock;
 pub mod seam;
 pub mod types;
 
-pub use driver::{DmDriver, DmDriverConfig, DmDriverHandle, DmDriverParts, SpentTokenStore};
+pub use driver::{
+    DmDriver, DmDriverConfig, DmDriverHandle, DmDriverParts, DmSpawnError, DmTrySendError,
+    SpentTokenStore,
+};
+pub use machine::PENDING_REQUEST_CAP;
 pub use seam::{DmDht, DmDhtFuture};
 pub use types::{
     AcceptFailure, DmCommand, DmEvent, DmIdentity, PkLt, RefusalReason, RequestId, WallClock,
