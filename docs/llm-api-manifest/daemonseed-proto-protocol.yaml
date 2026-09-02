@@ -1372,6 +1372,22 @@ functions:
           lp(gen_be)||lp(chain_base_be)||lp(eph_ct); an absent eph_ct binds as
           lp(&[]). Mandatory and always verified: page owner-write authority is
           symmetric, so the address does not establish authorship.
+      - name: pk_pc
+        type: bytes
+        tag: 6
+        description: >-
+          The acceptor's per-contact pseudonym key, exactly 2592 bytes. Present
+          only on the acceptance — the acceptor's channel sequence zero — and
+          empty on every other frame. Not bound in msg_sig's preimage; msg_sig
+          is verified under this key on the acceptance.
+      - name: bind_lt
+        type: bytes
+        tag: 7
+        description: >-
+          ML-DSA-87 signature, exactly 4627 bytes, under the acceptor's
+          long-term key over daemonseed/dm/bind/lt/v1 || lp(pk_lt) || lp(pk_pc).
+          Present exactly when pk_pc is, verified against the long-term key the
+          initiator knocked at.
 
   - name: KeySelector
     module: dm

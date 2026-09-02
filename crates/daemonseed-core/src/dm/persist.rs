@@ -1585,12 +1585,20 @@ pub enum StoredChannelRestart<'a> {
 /// A provisional record that is on disk and open in memory, and the only path
 /// this module offers from one to a [`Ratchet`].
 ///
-/// **This type is how establishment and erasure are kept inseparable.** It owns
-/// the record and exposes no way to take it out: the two borrowing accessors
-/// hand back what a resuming handshake needs and nothing else, and the one
-/// consuming method — [`Self::establish`] — builds the ratchet *and* deletes the
-/// record. There is no ordering for a caller to get wrong and no second call to
-/// forget, because there is no second call.
+/// **This type is how the erasure is kept attached to the act that licenses
+/// it.** It owns the record and exposes no way to take it out: the borrowing
+/// accessors hand back what a resuming handshake needs and nothing else, and the
+/// only consuming method is [`Self::commit`], which deletes.
+///
+/// **The act being paired is the PEER BEING VERIFIED, not a ratchet being
+/// opened**, and the split into [`Self::ratchet`] and [`Self::commit`] is what
+/// says so. An initiator derives its ratchet the moment it knocks — the opening
+/// burst hangs off the first-contact secret and waits on nothing — but it cannot
+/// verify the acceptor until the acceptance lands, and across that window the
+/// record is the only at-rest home for `ss0` and the opening ephemeral. Deleting
+/// at the derivation would strand the channel on a restart in exactly the window
+/// the record exists for. [`Self::establish`] remains the pair, for the caller
+/// whose two moments are one.
 ///
 /// **What that does and does not cover, stated exactly.**
 /// [`ProvisionalRecord::open`] and `ProvisionalRecord::into_ratchet` are public
@@ -1663,20 +1671,69 @@ impl PendingHandshake<'_> {
     /// lost record rather than an unreadable store, so the caller is told the
     /// handshake is gone instead of being told to keep waiting for it.
     pub fn establish(self) -> Result<Ratchet, DmPersistError> {
+        // The CONSUMING derivation, deliberately, rather than
+        // [`Self::ratchet`] followed by [`Self::commit`]: a caller whose two
+        // moments are one has no window to keep the record for, so it takes the
+        // path that leaves no second copy of the decapsulation key.
         let Self {
             persist,
             correspondence,
             record,
         } = self;
         let ratchet = record.into_ratchet()?;
-        persist
-            .store
-            .critical_section(&correspondence, |guard| -> Result<(), DmPersistError> {
-                guard.delete(RecordKind::Provisional)?;
-                Ok(())
-            })?;
+        erase(persist, correspondence)?;
         Ok(ratchet)
     }
+
+    /// Derive the ratchet and leave the record exactly where it is.
+    ///
+    /// **The half of [`Self::establish`] that is safe to take early.** An
+    /// initiator holds a ratchet from the moment it knocks — its opening burst
+    /// hangs off the first-contact secret and waits on nothing — but it cannot
+    /// verify the acceptor until the acceptance lands, and until then the record
+    /// is the only thing that could resume the handshake across a restart. So
+    /// the derivation moves here and the erasure stays in [`Self::commit`],
+    /// which the caller runs when the acceptance verifies.
+    ///
+    /// **This does not weaken the pairing [`Self::establish`] exists to
+    /// enforce**, because the two halves are still the only things this type
+    /// offers and `#[must_use]` still refuses a handshake that is neither
+    /// committed nor dropped. What it does is move the act being paired: no
+    /// longer "a ratchet was opened" but "the peer was verified". A caller that
+    /// derives and never commits leaves `ss0` on disk exactly as one that
+    /// established and never deleted would have — and that is the *resumable*
+    /// state the design asks for in this window, not a leak, because the
+    /// acceptance has not happened yet.
+    pub fn ratchet(&self) -> Result<Ratchet, DmPersistError> {
+        Ok(self.record.to_ratchet()?)
+    }
+
+    /// Erase the record, and nothing else.
+    ///
+    /// The moment the conversation stops being resumable from disk, which is the
+    /// moment it no longer needs to be: the peer is verified, the ratchet is in
+    /// hand, and `ss0` — which roots `RK0` — has no further use. Every word of
+    /// [`Self::establish`]'s note on the crash window applies here unchanged; it
+    /// is the same critical section.
+    pub fn commit(self) -> Result<(), DmPersistError> {
+        let Self {
+            persist,
+            correspondence,
+            ..
+        } = self;
+        erase(persist, correspondence)
+    }
+}
+
+/// The critical section both endings share, so the two cannot drift into
+/// deleting different things.
+fn erase(persist: &DmPersist, correspondence: CorrespondenceLabel) -> Result<(), DmPersistError> {
+    persist
+        .store
+        .critical_section(&correspondence, |guard| -> Result<(), DmPersistError> {
+            guard.delete(RecordKind::Provisional)?;
+            Ok(())
+        })
 }
 
 #[cfg(test)]
@@ -1816,6 +1873,197 @@ mod tests {
             }
             StoredChannelRestart::HandshakeResumes(_) => {
                 panic!("an established channel resumed its own handshake")
+            }
+        }
+    }
+
+    /// **The split's first half: deriving a ratchet leaves the record where it
+    /// is.** The initiator holds one from the moment it knocks and cannot
+    /// verify its correspondent until the acceptance lands, so consuming here
+    /// would strand the channel on any restart inside that window — the exact
+    /// window `{ss0, the opening ephemeral DK}` is persisted for.
+    ///
+    /// Read three ways, the same three
+    /// `establishment_erases_the_provisional_record` reads, so the two tests
+    /// are each other's control: whatever one asserts is present, the other
+    /// asserts is gone.
+    #[test]
+    fn a_derived_ratchet_leaves_the_record_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(20);
+
+        p.save_provisional(&l, &ctx(), &record()).expect("saves");
+        let path = record_path(&p, &l, "provisional.bin");
+
+        let fingerprint = match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::HandshakeResumes(pending) => {
+                let r = pending.ratchet().expect("derives a ratchet");
+                // The `PendingHandshake` drops here, uncommitted.
+                *r.ar_fingerprint()
+            }
+            StoredChannelRestart::TornDown(t) => panic!("a saved record must resume: {t}"),
+        };
+
+        assert!(path.exists(), "the record file was erased by a derivation");
+        assert!(
+            p.store()
+                .read_unlocked(&l, RecordKind::Provisional)
+                .expect("reads")
+                .is_some(),
+            "the store no longer holds a record a derivation was not to touch"
+        );
+        // The reading that matters to a restarting client: it resumes, and
+        // resumes into the SAME conversation. A record that opened into a
+        // different one would satisfy every assertion above.
+        match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::HandshakeResumes(pending) => {
+                let again = pending.ratchet().expect("derives again");
+                assert_eq!(
+                    again.ar_fingerprint(),
+                    &fingerprint,
+                    "the resumed handshake opened a different conversation"
+                );
+            }
+            StoredChannelRestart::TornDown(t) => {
+                panic!("an underived record must still resume: {t}")
+            }
+        }
+
+        // **And the derived ratchet holds a WORKING decapsulation key.** The
+        // fingerprint above is a hash of `ss0` and says nothing at all about
+        // `eph_dk` — a derivation that handed the ratchet an all-zero copy, or
+        // a copy zeroized a line too early, would pass every assertion so far
+        // and then fail to open the acceptor's very first frame, which is the
+        // one thing this window exists to make possible. So the far end is
+        // built for real and its first frame is driven through.
+        let derived = match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::HandshakeResumes(pending) => {
+                pending.ratchet().expect("derives once more")
+            }
+            StoredChannelRestart::TornDown(t) => panic!("must resume: {t}"),
+        };
+        let recipient_ek = record();
+        let mut far = Ratchet::recipient(&ss0(), Box::new(*recipient_ek.eph_ek()))
+            .expect("the acceptor's ratchet");
+        let outbound = far.send_next().expect("the acceptor's first key");
+        assert!(
+            outbound.eph_ct.is_some(),
+            "the acceptor's first frame must carry the ciphertext this decapsulates"
+        );
+        let mut derived = derived;
+        let opened = derived
+            .receive(
+                &outbound.header,
+                outbound.eph_ct.as_deref(),
+                &outbound.eph_ek,
+                |key| Ok::<_, ()>(*key.as_bytes()),
+            )
+            .expect("the derived ratchet accepts the position")
+            .expect("the closure cannot fail");
+        assert_eq!(
+            opened,
+            *outbound.key.as_bytes(),
+            "the derived ratchet decapsulated to a different message key, so the \
+             copied decapsulation key is not the record's"
+        );
+    }
+
+    /// `establish()` is exactly `ratchet()` followed by `commit()`.
+    ///
+    /// **Two implementations of one act, so they can drift.** `establish` takes
+    /// the consuming derivation and its own erase; the split takes the
+    /// borrowing one and `commit`. If those ever produced different ratchets,
+    /// or erased differently, a caller's choice between them would change
+    /// behaviour — and nothing else in this module would notice, because each
+    /// is tested only against itself.
+    #[test]
+    fn establish_is_the_derivation_and_the_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let (split, whole) = (label(22), label(23));
+
+        p.save_provisional(&split, &ctx(), &record())
+            .expect("saves");
+        p.save_provisional(&whole, &ctx(), &record())
+            .expect("saves");
+
+        let by_split = match p.restart_channel(&split, &ctx()) {
+            StoredChannelRestart::HandshakeResumes(pending) => {
+                let r = pending.ratchet().expect("derives");
+                match p.restart_channel(&split, &ctx()) {
+                    StoredChannelRestart::HandshakeResumes(again) => {
+                        again.commit().expect("commits")
+                    }
+                    StoredChannelRestart::TornDown(t) => panic!("must still resume: {t}"),
+                }
+                r
+            }
+            StoredChannelRestart::TornDown(t) => panic!("must resume: {t}"),
+        };
+        let by_whole = match p.restart_channel(&whole, &ctx()) {
+            StoredChannelRestart::HandshakeResumes(pending) => {
+                pending.establish().expect("establishes")
+            }
+            StoredChannelRestart::TornDown(t) => panic!("must resume: {t}"),
+        };
+
+        assert_eq!(
+            by_split.ar_fingerprint(),
+            by_whole.ar_fingerprint(),
+            "the two endings opened different conversations"
+        );
+        assert_eq!(
+            by_split.next_send_seq(),
+            by_whole.next_send_seq(),
+            "the two endings opened chains at different positions"
+        );
+        for (name, l) in [("the split", split), ("establish", whole)] {
+            assert!(
+                !record_path(&p, &l, "provisional.bin").exists(),
+                "{name} left the record on disk"
+            );
+        }
+    }
+
+    /// **The split's second half: committing erases, and needs no ratchet.**
+    /// The act the erasure is paired with is the peer being verified, and by
+    /// then the ratchet is long since in hand — so `commit` takes no
+    /// derivation, and a caller that never derived can still erase.
+    #[test]
+    fn commit_erases_the_record_without_a_ratchet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(21);
+
+        p.save_provisional(&l, &ctx(), &record()).expect("saves");
+        let path = record_path(&p, &l, "provisional.bin");
+        assert!(
+            path.exists(),
+            "the record was not written in the first place"
+        );
+
+        match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::HandshakeResumes(pending) => {
+                pending.commit().expect("commits");
+            }
+            StoredChannelRestart::TornDown(t) => panic!("a saved record must resume: {t}"),
+        }
+
+        assert!(!path.exists(), "the record file survived the commit");
+        assert!(
+            p.store()
+                .read_unlocked(&l, RecordKind::Provisional)
+                .expect("reads")
+                .is_none(),
+            "ss0 is still readable from the store after the commit"
+        );
+        match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::TornDown(t) => {
+                assert_eq!(t.cause(), &TeardownCause::NoProvisionalRecord);
+            }
+            StoredChannelRestart::HandshakeResumes(_) => {
+                panic!("a committed handshake resumed itself")
             }
         }
     }

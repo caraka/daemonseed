@@ -26,6 +26,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_core::dm::frame::seal_accept(outbound, chan_id, signing_pc, signing_lt, recipient_hash, sent_unix_ms, ack)` — the acceptor's ACCEPT: an ordinary channel frame at the acceptor's sequence zero with an empty body, carrying `pk_pc` and `bind_lt` in the sealed body. (#234, #236)
+- `daemonseed_core::dm::frame::ParsedFrame::open_accept(key, chan_id, dir, found_at, recipient_hash, peer_pk_lt) -> VerifiedAccept` — opens that frame with no prior pseudonym, verifying `bind_lt` under the peer's long-term key. `VerifiedAccept { frame, peer_pk_pc }`. (#234, #236)
+- `daemonseed_core::dm::frame::DmFrameError` — `Binding`, `MissingBinding`, `PseudonymMismatch` and `NotAccept { seq }`. (#234, #236)
+- `daemonseed_core::dm::persist::PendingHandshake::ratchet()` / `commit()` — derive the initiator's ratchet without erasing the provisional record, and erase it. `establish()` remains the pair. (#234, #236)
+- `DmChannelBody.pk_pc` (tag 6) and `DmChannelBody.bind_lt` (tag 7) — the acceptor's pseudonym key and its long-term binding, empty on every other frame. Wire-visible, MINOR. (#234, #236)
 - `daemonseed_veilid_net::dm::RefusalReason` / `AcceptFailure` — why a first contact stopped, and why
   an accepted request was not established. `DmEvent::Refused` carries the first; the new
   `DmEvent::AcceptFailed { request, from, reason }` carries the second and leaves the request held.
@@ -420,6 +425,12 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed_veilid_net::dm::DmCommand::Accept` also composes the acceptance and queues it at channel sequence zero, emitting `DmEvent::Delivery { seq: 0, state: Composed }`, and erases any provisional record this side held for the same identity. A refused acceptance emits `DmEvent::Delivery { seq: 0, state: Undelivered }` with a `DmEvent::Refused` naming the reason, and is retried on the idle cadence while the acceptor's sequence zero is unspent, reported once per distinct reason. A record the erase could not reach is retried on later ticks rather than dropped. (#234, #236)
+- A first-contact mint is refused with `RefusalReason::AlreadyEstablished` when a correspondence with that identity already carries the correspondent's pseudonym. (#234, #236)
+- `DmEvent::ChannelHealth`'s `peer_pseudonym_unknown` counts unsettled positions an initiator left alone, once per sweep that saw them, rather than sweeps skipped. (#234, #236)
+- `daemonseed_core::dm::frame::ParsedFrame::open` verifies a carried `pk_pc` against the author key it was given, before the authorship signature: a different key is `PseudonymMismatch`, and a carried binding that does not verify under the author's long-term key is `Binding`. A body carrying neither field takes the path it took before. (#234, #236)
+- The DM driver's initiator sweeps before it knows its correspondent's pseudonym, opens the acceptance at the acceptor's sequence zero, installs `pk_pc`, and erases the provisional record in the same act. Frames at later sequences are left unsettled and counted `peer_pseudonym_unknown` until then. (#234, #236)
+- The DM driver's initiator keeps its provisional record from the mint until a verified acceptance, rather than consuming it at the mint. (#234, #236)
 - `daemonseed_veilid_net::dm::DmCommand::Send` sends on an established channel: the outbox is priced
   before the ratchet steps, the frame is sealed with the collection's acknowledgement piggybacked,
   and `DmEvent::Delivery { state: Composed }` reports the queued sequence. A full outbox is

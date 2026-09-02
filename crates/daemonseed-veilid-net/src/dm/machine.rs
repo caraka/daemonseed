@@ -43,8 +43,8 @@ use daemonseed_core::dm::persist::{
     DmPersist, DmPersistError, Mutation, StateLoss, StoredChannelRestart,
 };
 use daemonseed_core::dm::pow;
-use daemonseed_core::dm::provisional::RecordContext;
-use daemonseed_core::dm::ratchet::{Direction, Ratchet, RatchetError};
+use daemonseed_core::dm::provisional::{RecordContext, TeardownCause};
+use daemonseed_core::dm::ratchet::{Direction, Ratchet, RatchetError, FIRST_RECIPIENT_CHANNEL_SEQ};
 use daemonseed_core::dm::token::SpentTokenSet;
 use daemonseed_core::identity::keys::{SignKeypair, IDENTITY_PK_LEN, ML_DSA_SEED_LEN};
 use daemonseed_core::storage::dm_store::CorrespondenceLabel;
@@ -515,13 +515,24 @@ struct Correspondence {
     /// The correspondent's pseudonym — what every frame they send is verified
     /// against.
     ///
-    /// Known from the knock on the acceptor's side. **`None` on the initiator's
-    /// side and there is no path that fills it in**, which is a gap in the build
-    /// rather than a step not yet taken: a channel frame carries no pseudonym
-    /// key, and the resume record that homes the pair (A4.8 / A9.2) cannot be
-    /// written until the channel has re-established once. An initiator therefore
-    /// cannot verify authorship on anything it sweeps, so it does not sweep, and
-    /// says so on [`DmEvent::ChannelHealth`]'s `peer_pseudonym_unknown`.
+    /// Known from the knock on the acceptor's side, and from the ACCEPT on the
+    /// initiator's — **the acceptor's first channel frame, at its sequence
+    /// zero, whose sealed body carries the pseudonym and the long-term identity
+    /// binding that vouches for it** (`frame::seal_accept`,
+    /// [`ParsedFrame::open_accept`]).
+    ///
+    /// `None` on the initiator's side until that frame lands, which is a real
+    /// state rather than a gap: an initiator can send from the moment it knocks
+    /// — its opening burst hangs off the first-contact secret — but it can
+    /// verify nothing before the acceptance, so a frame it sweeps at any later
+    /// sequence is left unsettled and counted on
+    /// [`DmEvent::ChannelHealth`]'s `peer_pseudonym_unknown` until the ACCEPT
+    /// arrives and the next sweep retries it.
+    ///
+    /// **Still in-memory only.** The at-rest home for the pseudonym pair is the
+    /// resume record (A4.8 / A9.2), which cannot be written before the channel
+    /// has re-established once, so a restart loses this exactly as it loses the
+    /// ratchet — one event, not two.
     peer_pk_pc: Option<Box<[u8; IDENTITY_PK_LEN]>>,
     /// The conversation's address root and channel id, derived from `ss0` at
     /// establishment. `None` alongside a `None` ratchet, and for the same
@@ -555,7 +566,34 @@ struct Correspondence {
     offered_this_session: Vec<u64>,
     /// This correspondence's channel-plane accounting, cumulative.
     health: ChannelCounters,
+    /// The last refusal [`DmMachine::fire_accept`] reported for this
+    /// correspondence, so the tick's retry does not repeat itself.
+    ///
+    /// `None` once an acceptance is composed, so a conversation that fails,
+    /// recovers and fails the same way again reports both times.
+    last_accept_refusal: Option<RefusalReason>,
+    /// The context this correspondence's provisional record was sealed under,
+    /// while that record is still on disk.
+    ///
+    /// **The initiator holds its record until the ACCEPT verifies**, because
+    /// `{ss0, the opening ephemeral DK}` is the only at-rest state that could
+    /// resume the handshake across a restart in that window, and without the
+    /// ephemeral DK this side cannot decapsulate the acceptor's first
+    /// generation ciphertext. Erasing it is the act a verified ACCEPT licenses:
+    /// [`PendingHandshake::commit`].
+    ///
+    /// The context has to be carried because a record opens only under the one
+    /// it was sealed with — its AAD binds `fc_epoch`, and an acceptance may
+    /// land in a later epoch than the knock did, so the current epoch is not
+    /// the right key. `None` on the acceptor's side, which never writes one, and
+    /// after the erasure.
+    provisional: Option<(ProvisionalContext, u64)>,
 }
+
+/// The recipient key-record address half of a
+/// [`RecordContext`], owned rather than borrowed so a correspondence can hold
+/// it across ticks.
+type ProvisionalContext = [u8; DM_KEYREC_OWNER_SEED_LEN];
 
 /// The conversation's two derived roots, held together because they are derived
 /// together and are meaningless apart.
@@ -682,6 +720,17 @@ pub(crate) struct DmMachine {
     provisionals: Vec<(PkLt, CorrespondenceLabel)>,
     /// Correspondences established this session.
     correspondences: Vec<Correspondence>,
+    /// Provisional records whose erasure was attempted and did not succeed,
+    /// under the label and context they were written beneath.
+    ///
+    /// **These have no correspondence to hang from any more.** A mutual knock
+    /// re-points this side's entry at the label the acceptance established, so
+    /// a record left behind under the OLD label is unreachable from the entry
+    /// that used to name it — and the record is the conversation's opening
+    /// secret, kept out of a `Vec` only by having been deleted. So the handle
+    /// moves here rather than being dropped, and every tick tries again until
+    /// the store says the record is gone.
+    pending_erase: Vec<(CorrespondenceLabel, ProvisionalContext, u64)>,
 }
 
 impl DmMachine {
@@ -715,6 +764,7 @@ impl DmMachine {
             minting: Vec::new(),
             provisionals: Vec::new(),
             correspondences,
+            pending_erase: Vec::new(),
         }
     }
 
@@ -1103,20 +1153,21 @@ impl DmMachine {
             .update_outbox(&label, direction, now_ms, |outbox| {
                 let swept = outbox.sweep_give_ups(now_ms);
                 // The full owed list, never only what the sweep moved: an entry
-                // owed by a previous run's give-up is owed just the same, and
-                // one whose entry has since gone from the map is owed too — it
-                // is reported with the state a given-up entry has, because that
-                // is the only ending that reaches `owed_surfacings` without an
-                // entry behind it.
+                // owed by a previous run's give-up is owed just the same.
+                //
+                // **Every owed sequence still has its entry**, which is why
+                // there is no fallback state here. `Outbox::owed_surfacings`
+                // reads the live entry map for `Surfacing::Owed`, and
+                // `Outbox::prune` removes only entries whose surfacing is
+                // `Surfacing::Clear` — so an entry cannot be pruned while it is
+                // owed, and a sequence that reaches this map has an entry
+                // behind it by construction. A `map_or` default here would be a
+                // state no path produces, and it would read as a delivery
+                // verdict rather than as the dead branch it is.
                 let owed: Vec<(u64, DeliveryState)> = outbox
                     .owed_surfacings()
                     .into_iter()
-                    .map(|seq| {
-                        let state = outbox
-                            .entry(seq)
-                            .map_or(DeliveryState::Undelivered, |e| e.delivery_state());
-                        (seq, state)
-                    })
+                    .filter_map(|seq| outbox.entry(seq).map(|e| (seq, e.delivery_state())))
                     .collect();
                 Ok(if swept.is_empty() {
                     Mutation::Unchanged(owed)
@@ -1181,6 +1232,57 @@ impl DmMachine {
     /// no page to write to, and such an entry is left un-emitted rather than
     /// having its backoff advanced for a write that cannot happen.
     fn due_emissions(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        self.retry_pending_erases();
+        // **A refused acceptance is retried here, and nowhere else.**
+        // `fire_accept` runs once, inside the accept, and every one of its
+        // refusals is recoverable — a full outbox drains, a store fault
+        // clears. Without a retry the acceptor keeps a conversation the
+        // initiator can write to and can never read, permanently and silently,
+        // because the acceptance is the only frame that carries this side's
+        // pseudonym and nothing else carries it.
+        //
+        // **The condition is the unspent sequence, not a missing entry.**
+        // `fire_accept` spends sequence zero before it can fail on anything but
+        // the outbox ask, so an acceptor whose chain is still at zero is one
+        // whose acceptance was never composed. An entry-absence test would fire
+        // again after a give-up pruned the entry and re-compose at a sequence
+        // number the peer has already been shown.
+        if let Some((ratchet, _, _)) = self.correspondences[index].live() {
+            if ratchet.send_direction() == Direction::BToA
+                && ratchet.next_send_seq() == FIRST_RECIPIENT_CHANNEL_SEQ
+            {
+                let retried = self.fire_accept(now_ms, index);
+                let mut out = retried;
+                out.extend(self.due_emissions_only(now_ms, index));
+                return out;
+            }
+        }
+        self.due_emissions_only(now_ms, index)
+    }
+
+    /// Try again to erase every provisional record a previous attempt could
+    /// not reach.
+    ///
+    /// Cheap and idempotent: the list is empty on every tick but the ones
+    /// following a store fault, and a record the store now says is absent
+    /// leaves the list for good. Runs on the tick rather than at the failure,
+    /// because the failure is by definition a moment the store could not be
+    /// written.
+    fn retry_pending_erases(&mut self) {
+        if self.pending_erase.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_erase);
+        self.pending_erase = pending
+            .into_iter()
+            .filter(|(label, keyrec_addr, fc_epoch)| {
+                !erase_record(&self.persist, label, keyrec_addr, *fc_epoch)
+            })
+            .collect();
+    }
+
+    /// The emission scan proper, without the acceptance retry above it.
+    fn due_emissions_only(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
         let label = self.correspondences[index].label;
         let Some(direction) = self.stored_direction(&label, now_ms) else {
             return Vec::new();
@@ -1299,11 +1401,10 @@ impl DmMachine {
         let Some(plan) = correspondence.collection.probe_plan(probe_ms(now_ms)) else {
             return Vec::new();
         };
-        let before = correspondence.health;
-        if correspondence.peer_pk_pc.is_none() {
-            correspondence.health.peer_pseudonym_unknown += 1;
-            return correspondence.health_event(before).into_iter().collect();
-        }
+        // **An initiator that has not yet seen the acceptance still sweeps**,
+        // because the acceptance itself arrives by sweep: it is an ordinary
+        // channel frame at the acceptor's sequence zero. What it cannot do is
+        // open anything later than that, which `on_page` decides per slot.
         let Some((ratchet, _, channel)) = correspondence.live() else {
             return Vec::new();
         };
@@ -1442,6 +1543,7 @@ impl DmMachine {
                 return Vec::new();
             }
         };
+        let peer_pk_lt: PkLt = Box::new(*correspondence.pk_lt);
         for at in observation.unsettled {
             let Some(encoded) = bytes.get(&at) else {
                 continue;
@@ -1454,31 +1556,74 @@ impl DmMachine {
                     continue;
                 }
             };
+            // **Before the acceptance, only the acceptance can be opened.** An
+            // initiator holds no pseudonym for its correspondent until the
+            // ACCEPT lands, so a frame at any later sequence is refused as
+            // *pending* — the slot is left unsettled, nothing is offered to the
+            // ratchet, and the sweep after the acceptance retries it. Counted,
+            // not silent: `peer_pseudonym_unknown` is what says a conversation
+            // is waiting on its acceptance rather than idle.
+            let accepting = correspondence.peer_pk_pc.is_none();
+            if accepting && at.seq() != FIRST_RECIPIENT_CHANNEL_SEQ {
+                correspondence.health.peer_pseudonym_unknown += 1;
+                continue;
+            }
             // `break`, never `return`: messages already opened from earlier
             // slots of this same page are in `out`, and the cursor advance and
             // the health event below are owed whatever stopped the loop.
-            let (Some(ratchet), Some(peer_pk_pc), Some(channel)) = (
+            let (Some(ratchet), Some(channel)) = (
                 correspondence.ratchet.as_mut(),
-                correspondence.peer_pk_pc.as_ref(),
                 correspondence.channel.as_ref(),
             ) else {
                 break;
-            };
-            let author = AuthorKeys {
-                pc: peer_pk_pc,
-                lt: &correspondence.pk_lt,
             };
             let direction = ratchet.recv_direction();
             // Nested on purpose: the outer result is the ratchet's verdict on
             // the position and the inner one this frame's own authentication.
             // The ratchet commits nothing when the inner one fails, so a frame
-            // that does not authenticate has not spent its key.
-            let opened =
+            // that does not authenticate has not spent its key — which is what
+            // makes a forged acceptance cost one refused open rather than a
+            // conversation.
+            let opened = if accepting {
                 ratchet.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |key| {
-                    parsed.open(key, &channel.chan_id, direction, at, &recipient, author)
-                });
+                    parsed
+                        .open_accept(
+                            key,
+                            &channel.chan_id,
+                            direction,
+                            at,
+                            &recipient,
+                            &peer_pk_lt,
+                        )
+                        .map(|accepted| (accepted.frame, Some(accepted.peer_pk_pc)))
+                })
+            } else {
+                let author = AuthorKeys {
+                    pc: correspondence
+                        .peer_pk_pc
+                        .as_ref()
+                        .expect("the pseudonym is known on this branch"),
+                    lt: &peer_pk_lt,
+                };
+                ratchet.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |key| {
+                    parsed
+                        .open(key, &channel.chan_id, direction, at, &recipient, author)
+                        .map(|verified| (verified, None))
+                })
+            };
             match opened {
-                Ok(Ok(verified)) => {
+                Ok(Ok((verified, installed))) => {
+                    // **One act: install the pseudonym, and erase the record
+                    // that existed only until it arrived.** Past this point the
+                    // conversation is verifiable and `ss0` — which roots `RK0`
+                    // — has no further use, so keeping it would be the
+                    // forward-secrecy claim inverted. It runs only here,
+                    // after a verified acceptance: a failed open leaves the
+                    // ratchet, the record and the slot exactly as they were.
+                    if let Some(pk_pc) = installed {
+                        correspondence.peer_pk_pc = Some(pk_pc);
+                        erase_provisional(persist, correspondence);
+                    }
                     if correspondence.collection.collected(at).is_err() {
                         correspondence.owed_acks.push(at);
                     }
@@ -1841,6 +1986,9 @@ impl DmMachine {
         };
         let held = self.pending.remove(index);
         let pk_lt: PkLt = Box::new(*held.knock.pk_lt());
+        // Copied before the box is moved into the correspondence: the
+        // acceptance below has to find the entry it just recorded.
+        let pk_lt_for_accept: [u8; IDENTITY_PK_LEN] = *pk_lt;
         let peer_pk_pc = Box::new(*held.knock.pk_pc());
         // Copied out before the knock is consumed. Both are derivations of
         // `ss0`, which `accept_first_contact` moves, so this is the last point
@@ -1888,12 +2036,41 @@ impl DmMachine {
                 // sends and sweeps would use different halves of the same
                 // conversation.
                 if let Some(index) = self.index_of(&pk_lt) {
-                    let existing = &mut self.correspondences[index];
+                    // **The record this side was holding is erased FIRST, under
+                    // the label it was written beneath.** A mutual knock leaves
+                    // this side holding a provisional record from its own
+                    // introduction; accepting THEIR knock establishes the
+                    // conversation by a different route, so that record's
+                    // window is over. It has to go before the label is
+                    // overwritten: the record lives under the old label, and
+                    // the context that addresses it would name a directory this
+                    // entry no longer points at — leaving `{ss0, the opening
+                    // ephemeral DK}` on disk with nothing able to reach it.
+                    //
+                    // Erasing it also means the acceptance path below cannot
+                    // strand it: `on_page` erases only when it installs a
+                    // pseudonym, and this branch has just installed one.
+                    let (persist, correspondences) = (&self.persist, &mut self.correspondences);
+                    let old_label = correspondences[index].label;
+                    erase_provisional(persist, &mut correspondences[index]);
+                    // **What the erase could not reach is carried out, not
+                    // dropped.** The entry is about to name a different label,
+                    // so a handle left on it would address the wrong directory
+                    // — but the record still exists, and the context is the
+                    // only thing that can ever open it again. It moves to the
+                    // machine's retry list, keyed on the label it was written
+                    // under, and every tick tries again.
+                    let leftover = correspondences[index].provisional.take();
+                    let existing = &mut correspondences[index];
                     existing.label = label;
                     existing.ratchet = Some(ratchet);
                     existing.signing_pc = Some(signing_pc);
                     existing.peer_pk_pc = Some(peer_pk_pc);
                     existing.channel = Some(channel);
+                    existing.provisional = None;
+                    if let Some((keyrec_addr, fc_epoch)) = leftover {
+                        self.pending_erase.push((old_label, keyrec_addr, fc_epoch));
+                    }
                 } else {
                     self.correspondences.push(Correspondence {
                         pk_lt,
@@ -1907,9 +2084,22 @@ impl DmMachine {
                         owed_acks: Vec::new(),
                         offered_this_session: Vec::new(),
                         health: ChannelCounters::default(),
+                        last_accept_refusal: None,
+                        // The acceptor holds no provisional record: it was
+                        // never the one waiting on a reply.
+                        provisional: None,
                     });
                 }
-                Vec::new()
+                // **The acceptance fires here, in the same call**, because the
+                // design's ACCEPT is not a message the user composes — it is
+                // what tells the initiator which pseudonym to verify against,
+                // and until it lands the initiator can read nothing this side
+                // writes. Waiting for the first typed reply would leave a
+                // conversation the initiator can send into and never hear from.
+                let index = self
+                    .index_of(&pk_lt_for_accept)
+                    .expect("the correspondence was just recorded");
+                self.fire_accept(now_ms, index)
             }
             // Past the consuming call. The knock is gone, so the request
             // cannot be re-held — the user is told, and re-establishing needs
@@ -1927,6 +2117,163 @@ impl DmMachine {
                 })]
             }
         }
+    }
+
+    /// Compose and queue the ACCEPT for a correspondence just established as
+    /// the acceptor.
+    ///
+    /// **The frozen design fires this the instant the user accepts, not when
+    /// they first type.** The acceptance is what carries this side's pseudonym
+    /// and its long-term binding to the initiator; until it lands, the
+    /// initiator holds a channel it can write to and cannot read, because a
+    /// channel frame carries no pseudonym key and page owner-write authority is
+    /// symmetric. So it is queued here, in the same call as the establishment,
+    /// and from that point it is an outbox entry like any other — re-seeded on
+    /// the ladder, given up on at the same seven days.
+    ///
+    /// **The order is the one [`Self::send`] documents, and for the same
+    /// reason.** The outbox is asked for room BEFORE [`Ratchet::send_next`]
+    /// takes its irreversible step, so a full record refuses while sequence
+    /// zero is still unspent. Past the step there is no way back: the sequence
+    /// is burnt, there is no second acceptance path, and the initiator
+    /// stays unable to verify until the reconnect legs (A3 / A4) exist. That is
+    /// reported as a refusal rather than swallowed.
+    /// Compose the acceptance, and report a refusal only when it is NEWS.
+    ///
+    /// **The retry runs every tick, so an unchanged refusal would be emitted
+    /// every tick too** — a full outbox that stays full would fill the front
+    /// end's event stream with the identical pair for as long as it takes to
+    /// drain, which is exactly the condition under which a user is least able
+    /// to read it. The last reason is remembered per correspondence and a
+    /// repeat is silent; a *different* reason is a genuinely new fact and is
+    /// emitted.
+    ///
+    /// Cleared on success, so a conversation that fails, recovers, and fails
+    /// the same way again says so both times.
+    fn fire_accept(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        match self.compose_accept(now_ms, index) {
+            Ok(out) => {
+                self.correspondences[index].last_accept_refusal = None;
+                out
+            }
+            Err(reason) => {
+                if self.correspondences[index].last_accept_refusal == Some(reason) {
+                    return Vec::new();
+                }
+                self.correspondences[index].last_accept_refusal = Some(reason);
+                let to = *self.correspondences[index].pk_lt;
+                accept_refused(&to, reason)
+            }
+        }
+    }
+
+    fn compose_accept(
+        &mut self,
+        now_ms: i64,
+        index: usize,
+    ) -> Result<Vec<DmEffect>, RefusalReason> {
+        let label = self.correspondences[index].label;
+        let to: PkLt = Box::new(*self.correspondences[index].pk_lt);
+        let Some((ratchet, _, _)) = self.correspondences[index].live() else {
+            crate::vtrace!("dm driver: the acceptance has no key schedule to send on");
+            return Err(RefusalReason::NotEstablishedThisSession);
+        };
+        let direction = ratchet.send_direction();
+        let next_seq = ratchet.next_send_seq();
+
+        // The ask, priced exactly as a send's is: no caller can know a frame's
+        // real length before sealing it, so the worst case is what is reserved.
+        let asked = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                Ok(Mutation::Unchanged(outbox.room_for(
+                    next_seq,
+                    OutboxTarget::ChannelPage,
+                    WORST_CASE_SEALED_FRAME_LEN,
+                )))
+            });
+        match asked {
+            Ok(Ok(())) => {}
+            Ok(Err(OutboxError::Full { needed, .. })) => {
+                return Err(RefusalReason::OutboxFull { needed });
+            }
+            Ok(Err(e)) => {
+                crate::vtrace!("dm driver: the outbox refused the acceptance: {e}");
+                return Err(RefusalReason::StoreFailure);
+            }
+            Err(e) => {
+                crate::vtrace!("dm driver: the outbox could not be read for the acceptance: {e}");
+                return Err(RefusalReason::StoreFailure);
+            }
+        }
+
+        let Self {
+            identity,
+            persist,
+            correspondences,
+            ..
+        } = self;
+        let correspondence = &mut correspondences[index];
+        let recipient = match recipient_hash(&correspondence.pk_lt) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::vtrace!("dm driver: recipient hash failed for the acceptance: {e}");
+                return Err(RefusalReason::Module);
+            }
+        };
+        let (Some(ratchet), Some(signing_pc), Some(channel)) = (
+            correspondence.ratchet.as_mut(),
+            correspondence.signing_pc.as_ref(),
+            correspondence.channel.as_ref(),
+        ) else {
+            return Err(RefusalReason::NotEstablishedThisSession);
+        };
+        // Past this line a sequence number has been spent.
+        let outbound = match ratchet.send_next() {
+            Ok(o) => o,
+            Err(e) => {
+                crate::vtrace!("dm driver: the ratchet refused the acceptance key: {e}");
+                return Err(RefusalReason::SealFailed);
+            }
+        };
+        let seq = outbound.header.seq;
+        debug_assert_eq!(
+            seq, FIRST_RECIPIENT_CHANNEL_SEQ,
+            "the acceptance is the acceptor's first channel write"
+        );
+        let sealed = match frame::seal_accept(
+            outbound,
+            &channel.chan_id,
+            signing_pc,
+            &identity.signing,
+            &recipient,
+            now_ms,
+            Some(correspondence.collection.ack()),
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                crate::vtrace!("dm driver: the acceptance would not seal: {e}");
+                return Err(RefusalReason::SealFailed);
+            }
+        };
+        let queued = persist.update_outbox(&label, direction, now_ms, |outbox| {
+            outbox.enqueue_sealed(
+                seq,
+                OutboxTarget::ChannelPage,
+                now_ms,
+                SealedFrame::new(sealed),
+            )?;
+            Ok(Mutation::Changed(()))
+        });
+        if let Err(e) = queued {
+            crate::vtrace!("dm driver: the acceptance sealed and could not be queued: {e}");
+            return Err(RefusalReason::StoreFailure);
+        }
+        Ok(vec![DmEffect::Emit(DmEvent::Delivery {
+            to,
+            seq,
+            state: DeliveryState::Composed,
+        })])
     }
 
     /// Put a request back on the held list and say why it was not established.
@@ -2101,6 +2448,29 @@ impl DmMachine {
                 return self.refuse_introduction(&recipient, RefusalReason::MintFailed);
             }
         };
+        // **A conversation already established with this identity is never
+        // overwritten by a mint, and the case that reaches here is the mutual
+        // knock.** Each side knocks before either answers; this side then
+        // accepts THEIR knock while its own introduction is still between the
+        // key record and the mint. The accept established the correspondence
+        // and installed their pseudonym; letting the mint land on top of it
+        // would replace the label, the ratchet and the channel roots of a live
+        // conversation, and re-point the entry at a provisional record whose
+        // erasure `on_page` can no longer reach — it erases only when it
+        // installs a pseudonym, and one is installed already. Refused before
+        // anything is written, so no record is created to strand.
+        //
+        // `peer_pk_pc.is_some()` is the test rather than `ratchet.is_some()`,
+        // because a second mint after a failed knock is legitimate: it reuses
+        // the same label, overwrites the same record, and that entry has no
+        // pseudonym for its correspondent.
+        if self
+            .index_of(&recipient)
+            .is_some_and(|i| self.correspondences[i].peer_pk_pc.is_some())
+        {
+            crate::vtrace!("dm driver: this identity is already established; the mint is dropped");
+            return self.refuse_introduction(&recipient, RefusalReason::AlreadyEstablished);
+        }
         // **One provisional label per recipient, never one per attempt.** A
         // second label is a second correspondence directory holding a live
         // `ss0` that nothing will ever establish or erase, so the label is
@@ -2154,16 +2524,17 @@ impl DmMachine {
                 return self.refuse_introduction(&recipient, RefusalReason::Module);
             }
         };
-        // **The initiator's ratchet opens here, from the record just written, and
-        // the record is erased in the same act.** The initiator's opening burst
-        // hangs from the first-contact secret directly — nothing about it waits
-        // on the correspondent — so a channel send is possible from this moment,
-        // and `PendingHandshake::establish` is the only public road from a stored
-        // record to a key schedule. What it costs is the resumption that record
-        // existed for: after this the handshake cannot be resumed from disk.
-        // That cost is already paid regardless, because the pseudonym below has
-        // nowhere at rest to live either (see `Correspondence`), so a restart
-        // before re-establishment loses this channel either way.
+        // **The initiator's ratchet opens here, and the record STAYS.** The
+        // opening burst hangs from the first-contact secret directly — nothing
+        // about it waits on the correspondent — so a channel send is possible
+        // from this moment. What is *not* possible yet is verifying the
+        // correspondent, and the frozen design keeps `{ss0, the opening
+        // ephemeral DK}` on disk for exactly that window: without the ephemeral
+        // DK this side cannot decapsulate the acceptor's first generation
+        // ciphertext, so consuming the record here would strand the channel on
+        // any restart before the acceptance lands. `PendingHandshake::ratchet`
+        // derives without erasing; the erasure is `commit`, and it runs in
+        // `on_page` the moment an ACCEPT verifies.
         let ratchet = match self.persist.restart_channel(
             &label,
             &RecordContext {
@@ -2171,7 +2542,9 @@ impl DmMachine {
                 fc_epoch,
             },
         ) {
-            StoredChannelRestart::HandshakeResumes(pending) => match pending.establish() {
+            StoredChannelRestart::HandshakeResumes(pending) => match pending.ratchet() {
+                // The `PendingHandshake` drops here, uncommitted and
+                // deliberately: the record it names is the thing being kept.
                 Ok(ratchet) => ratchet,
                 Err(e) => {
                     crate::vtrace!("dm driver: the initiator's ratchet would not open: {e}");
@@ -2191,26 +2564,26 @@ impl DmMachine {
         self.provisionals
             .retain(|(pk, _)| pk.as_slice() != recipient.as_slice());
 
-        // **The correspondence is recorded BEFORE the enqueue, and the order is
-        // not cosmetic.** Establishment has already consumed the provisional
-        // record, so the key schedule in hand is the only copy there is: a
-        // fallible step taken before it is stored would, on failure, return with
-        // the record gone and the ratchet dropped — a correspondence that can
-        // never be spoken on and never be resumed.
+        // **The correspondence is recorded BEFORE the enqueue**, so a fallible
+        // step cannot return with the ratchet dropped and the correspondence
+        // unrecorded — a channel nothing could speak on. The provisional
+        // context rides with it, because the record it names is still on disk
+        // and only this side knows the epoch it was sealed under.
         if let Some(index) = self.index_of(&recipient) {
             let existing = &mut self.correspondences[index];
             existing.label = label;
             existing.ratchet = Some(ratchet);
             existing.signing_pc = Some(signing_pc);
             existing.channel = Some(channel);
+            existing.provisional = Some((recipient_keyrec_addr, fc_epoch));
         } else {
             self.correspondences.push(Correspondence {
                 pk_lt: Box::new(*recipient),
                 label,
                 ratchet: Some(ratchet),
                 signing_pc: Some(signing_pc),
-                // No frame carries the acceptor's pseudonym and no record homes
-                // it yet, so this side cannot verify a reply. See the field.
+                // Filled in by the acceptor's ACCEPT, which is the only frame
+                // that carries a pseudonym. See the field.
                 peer_pk_pc: None,
                 channel: Some(channel),
                 collection: Collection::new(),
@@ -2218,6 +2591,8 @@ impl DmMachine {
                 owed_acks: Vec::new(),
                 offered_this_session: Vec::new(),
                 health: ChannelCounters::default(),
+                last_accept_refusal: None,
+                provisional: Some((recipient_keyrec_addr, fc_epoch)),
             });
         }
 
@@ -2370,6 +2745,104 @@ impl DmMachine {
 /// emission of this introduction has been confirmed, which is true of every
 /// path here — nothing reaches this function after a confirmed doorbell write.
 /// `reason` is the part that varies and the part a front end acts on.
+/// Erase this correspondence's provisional record, if it still holds one, and
+/// forget the handle only once the record is actually gone.
+///
+/// **The take is conditional, and that is the whole of it.** The context is the
+/// only handle to the record: it names the epoch the record was sealed under,
+/// and a record opens under no other. Clearing it on a failed erase would leave
+/// `{ss0, the opening ephemeral DK}` on disk with nothing left that could ever
+/// address it again — a transient store fault turned into a permanent leak of
+/// the secret that roots `RK0`.
+///
+/// So the handle is dropped on exactly two outcomes: the delete succeeded, or
+/// the store says there is no record there
+/// ([`TeardownCause::NoProvisionalRecord`]). Every other teardown cause is a
+/// statement about the store or the ciphertext at this moment, not about
+/// whether the record exists, so the handle is kept and the next call tries
+/// again.
+fn erase_provisional(persist: &DmPersist, correspondence: &mut Correspondence) {
+    let Some((keyrec_addr, fc_epoch)) = correspondence.provisional else {
+        return;
+    };
+    if erase_record(persist, &correspondence.label, &keyrec_addr, fc_epoch) {
+        correspondence.provisional = None;
+    }
+}
+
+/// Erase one provisional record, and say whether it is now gone.
+///
+/// **The return value is the whole interface**, because the caller's only
+/// correct reaction to a failure is to keep the handle. The context names the
+/// epoch the record was sealed under and a record opens under no other, so a
+/// handle dropped on a failed erase leaves `{ss0, the opening ephemeral DK}` on
+/// disk with nothing left that could ever address it — a transient store fault
+/// turned into a permanent leak of the secret that roots `RK0`.
+///
+/// `true` on exactly two outcomes: the delete succeeded, or the store says
+/// there is no record there. Every other teardown cause is a statement about
+/// the store or the ciphertext at this moment, not about whether the record
+/// exists.
+fn erase_record(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    keyrec_addr: &ProvisionalContext,
+    fc_epoch: u64,
+) -> bool {
+    let ctx = RecordContext {
+        recipient_keyrec_addr: keyrec_addr,
+        fc_epoch,
+    };
+    match persist.restart_channel(label, &ctx) {
+        StoredChannelRestart::HandshakeResumes(pending) => match pending.commit() {
+            Ok(()) => true,
+            Err(e) => {
+                crate::vtrace!("dm driver: the provisional record would not erase: {e}");
+                false
+            }
+        },
+        StoredChannelRestart::TornDown(teardown) => match teardown.cause() {
+            // Gone. Nothing to erase and nothing to retry.
+            TeardownCause::NoProvisionalRecord => true,
+            // The store could not be read, the ciphertext did not open, or the
+            // correspondent's state was lost. None of those says the record is
+            // absent, so the caller keeps its handle.
+            cause => {
+                crate::vtrace!(
+                    "dm driver: the provisional record would not open to erase: {cause:?}"
+                );
+                false
+            }
+        },
+    }
+}
+
+/// The two events one refused acceptance owes a front end.
+///
+/// **A delivery state AND a reason, because they answer different questions.**
+/// A successful acceptance reports `Delivery { seq: 0, Composed }`, so a failed
+/// one that said nothing on the delivery plane would leave sequence zero
+/// looking as though it had never been attempted — the one position whose
+/// absence the initiator cannot recover from. And a bare delivery state would
+/// drop [`RefusalReason::OutboxFull`]'s `needed`, which is the only thing here a
+/// user can act on.
+///
+/// The acceptance is a channel frame, so [`DmEvent::Refused`] is the documented
+/// event for it — "a first contact, or a channel send" — and the reason says
+/// which plane it belongs to. It is retried on the next tick from
+/// `DmMachine::due_emissions`; this pair is the statement of the current
+/// attempt, not a final verdict.
+fn accept_refused(recipient: &[u8; IDENTITY_PK_LEN], reason: RefusalReason) -> Vec<DmEffect> {
+    vec![
+        DmEffect::Emit(DmEvent::Delivery {
+            to: Box::new(*recipient),
+            seq: FIRST_RECIPIENT_CHANNEL_SEQ,
+            state: DeliveryState::Undelivered,
+        }),
+        DmEffect::Emit(refused(recipient, reason)),
+    ]
+}
+
 fn refused(recipient: &[u8; IDENTITY_PK_LEN], reason: RefusalReason) -> DmEvent {
     DmEvent::Refused {
         to: Box::new(*recipient),
@@ -2445,6 +2918,10 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            last_accept_refusal: None,
+            // A correspondence on disk is one that was established; nothing
+            // provisional survives it.
+            provisional: None,
         });
     }
     out
@@ -3287,5 +3764,988 @@ mod tests {
                 .any(|e| matches!(e, DmEffect::Emit(DmEvent::ContactRequest { .. }))),
             "the deferred knock never came back: {effects:?}"
         );
+    }
+
+    // ---- the acceptance ---------------------------------------------------
+
+    /// A machine over a scratch store for a NAMED identity, so two of them can
+    /// face each other in one test without a driver or a transport.
+    fn machine_as(k: IdentityKeys, dir: &tempfile::TempDir) -> DmMachine {
+        let persist = DmPersist::open(dir.path().join("dm"), &AT_REST).expect("persist");
+        let doorbell_owner = *doorbell::derive_owner_seed(k.signing.public_key())
+            .expect("doorbell")
+            .as_bytes();
+        let keyrec_addr = *keyrec::derive_owner_seed(k.signing.public_key())
+            .expect("keyrec")
+            .as_bytes();
+        DmMachine::new(
+            DmIdentity {
+                signing: Arc::new(k.signing),
+                kem: k.kem,
+                doorbell_slot_secret: k.dm_doorbell_slot_secret,
+            },
+            persist,
+            DmDriverConfig {
+                idle_tick: Duration::from_secs(30),
+                policy: AdmissionPolicy::Open,
+                pow_difficulty: pow::PowDifficulty::reduced_for_test(4),
+            },
+            doorbell_owner,
+            keyrec_addr,
+            SpentTokens {
+                set: SpentTokenSet::new(),
+                store: None,
+                poisoned: false,
+            },
+        )
+    }
+
+    /// The one correspondence label in a machine's store.
+    fn sole_label(m: &DmMachine) -> CorrespondenceLabel {
+        let labels = m.persist.store().correspondences().expect("list");
+        assert_eq!(labels.len(), 1, "expected exactly one correspondence");
+        labels[0]
+    }
+
+    /// A second identity, distinct from `keys()`, for the far end.
+    fn peer_identity() -> IdentityKeys {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        derive_identity_keys(
+            &Mnemonic::from_phrase(TEST_MNEMONIC).expect("mnemonic"),
+            Identity::Device {
+                uuid: uuid::Uuid::from_bytes([0x7Cu8; 16]),
+            },
+        )
+        .expect("peer identity")
+    }
+
+    /// M20. Accepting a knock queues the acceptance at sequence zero, on the
+    /// channel, in the same call.
+    ///
+    /// **The design fires this on acceptance, not on the first typed reply.**
+    /// Until it lands the initiator holds a channel it can write to and cannot
+    /// read — a channel frame carries no pseudonym key — so an acceptance that
+    /// waited for a message would leave every silent acceptor invisible.
+    ///
+    /// The spent sequence number is the second half: seq 0 is the acceptor's
+    /// first and only opening position, so a queued entry that did not come
+    /// from a real ratchet step would leave the chain able to mint it twice.
+    #[test]
+    fn accepting_a_knock_queues_the_accept_at_sequence_zero() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        m.persist.provision_block_list().expect("provision");
+        let epoch = keyrec::fc_epoch(unix_secs(BASE_MS));
+
+        let effects = m.surface(BASE_MS, epoch, 1, hash(41), fake_knock(41), false);
+        let DmEffect::Emit(DmEvent::ContactRequest { request, .. }) = &effects[0] else {
+            panic!("the knock did not surface: {effects:?}");
+        };
+        let request = request.clone();
+
+        let out = m.on_command(BASE_MS, DmCommand::Accept { request });
+        let composed: Vec<u64> = out
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Delivery {
+                    seq,
+                    state: DeliveryState::Composed,
+                    ..
+                }) => Some(*seq),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            composed,
+            vec![0],
+            "accepting must compose exactly sequence zero, got {out:?}"
+        );
+
+        let label = sole_label(&m);
+        let outbox = m
+            .persist
+            .read_outbox(&label, BASE_MS)
+            .expect("the outbox reads")
+            .expect("the acceptance is queued");
+        assert_eq!(
+            outbox.direction(),
+            Direction::BToA,
+            "the acceptance travels on the acceptor's own direction"
+        );
+        let entry = outbox.entry(0).expect("sequence zero is queued");
+        assert_eq!(
+            entry.target(),
+            OutboxTarget::ChannelPage,
+            "the acceptance is a channel frame, not a doorbell entry"
+        );
+        // The bytes are a real frame at sequence zero — not a placeholder that
+        // would satisfy every assertion above.
+        let parsed = frame::parse(entry.frame().expect("the entry holds its bytes"))
+            .expect("the queued acceptance parses as a channel frame");
+        assert_eq!(parsed.header().seq, 0);
+        assert_eq!(
+            m.only_next_send_seq(),
+            Some(1),
+            "sequence zero must have been spent by a real ratchet step"
+        );
+    }
+
+    /// M21. A full outbox refuses the acceptance BEFORE the sequence number is
+    /// spent.
+    ///
+    /// `Ratchet::send_next` has no step backwards, so a refusal taken after it
+    /// burns the acceptor's only opening position: sequence zero would be gone,
+    /// the initiator would never learn the pseudonym, and there is no
+    /// second acceptance path. The unspent cursor afterwards is the whole
+    /// assertion — the refusal event alone is satisfied by a machine that
+    /// refused *after* stepping.
+    #[test]
+    fn a_full_outbox_refuses_the_accept_before_the_sequence_is_spent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let knock = fake_knock(42);
+        let pk_lt: PkLt = Box::new(*knock.pk_lt());
+        let peer_pk_pc = Box::new(*knock.pk_pc());
+        let channel = ChannelRoots {
+            address_root: knock.roots().ar,
+            chan_id: knock.roots().chan_id,
+        };
+        let (label, ratchet) = m
+            .persist
+            .accept_first_contact(*knock, BASE_MS)
+            .expect("the establish succeeds");
+        m.correspondences.push(Correspondence {
+            pk_lt,
+            label,
+            ratchet: Some(ratchet),
+            signing_pc: Some(mint_pseudonym().expect("pseudonym")),
+            peer_pk_pc: Some(peer_pk_pc),
+            channel: Some(channel),
+            collection: Collection::new(),
+            read_through: 0,
+            owed_acks: Vec::new(),
+            offered_this_session: Vec::new(),
+            health: ChannelCounters::default(),
+            last_accept_refusal: None,
+            provisional: None,
+        });
+        assert_eq!(
+            m.only_next_send_seq(),
+            Some(0),
+            "the acceptor's first channel position is zero"
+        );
+
+        // Filled from outside, at positions well above zero, so the refusal is
+        // about capacity rather than about the sequence space.
+        let mut filled = 0u64;
+        for seq in 100..1_000u64 {
+            let wrote = m
+                .persist
+                .update_outbox(&label, Direction::BToA, BASE_MS, |outbox| {
+                    Ok(Mutation::Changed(
+                        outbox
+                            .enqueue_sealed(
+                                seq,
+                                OutboxTarget::ChannelPage,
+                                BASE_MS,
+                                SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]),
+                            )
+                            .is_ok(),
+                    ))
+                });
+            match wrote {
+                Ok(true) => filled += 1,
+                _ => break,
+            }
+        }
+        assert!(filled > 50, "the record took only {filled} entries to fill");
+
+        let out = m.fire_accept(BASE_MS, 0);
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::Refused {
+                    reason: RefusalReason::OutboxFull { .. },
+                    ..
+                })
+            )),
+            "a full outbox must refuse the acceptance and say so, got {out:?}"
+        );
+        assert_eq!(
+            m.only_next_send_seq(),
+            Some(0),
+            "the acceptance was refused after the ratchet had already stepped"
+        );
+
+        // **The same refusal, again, is silent.** The retry runs on every tick,
+        // so a full record that stays full would otherwise repeat this pair for
+        // as long as it takes to drain.
+        assert!(
+            m.fire_accept(BASE_MS, 0).is_empty(),
+            "an unchanged refusal was reported twice"
+        );
+
+        // Sequence zero stays unspent, so the tick's retry keeps the
+        // conversation recoverable — see
+        // `an_uncomposed_acceptance_is_composed_by_the_next_tick`.
+        let _ = &label;
+    }
+
+    /// M28. An acceptance that was never composed is composed by the next tick,
+    /// exactly once.
+    ///
+    /// **`fire_accept` runs once, inside the accept, and every one of its
+    /// refusals is recoverable.** Without a retry an acceptor whose store was
+    /// briefly full keeps a conversation the initiator can write to and can
+    /// never read, permanently and silently — the acceptance is the only frame
+    /// carrying this side's pseudonym.
+    ///
+    /// **The condition is the unspent sequence, and the second tick is what
+    /// pins it.** A retry keyed on the outbox ENTRY being absent would fire
+    /// again the moment a give-up pruned it, composing a second acceptance at a
+    /// sequence the peer has already been shown — so the second tick must find
+    /// nothing to do, with the sequence now at one.
+    #[test]
+    fn an_uncomposed_acceptance_is_composed_by_the_next_tick() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let knock = fake_knock(45);
+        let pk_lt: PkLt = Box::new(*knock.pk_lt());
+        let peer_pk_pc = Box::new(*knock.pk_pc());
+        let channel = ChannelRoots {
+            address_root: knock.roots().ar,
+            chan_id: knock.roots().chan_id,
+        };
+        let (label, ratchet) = m
+            .persist
+            .accept_first_contact(*knock, BASE_MS)
+            .expect("the establish succeeds");
+        // Established, and its acceptance never composed — the state a refused
+        // `fire_accept` leaves behind.
+        m.correspondences.push(Correspondence {
+            pk_lt,
+            label,
+            ratchet: Some(ratchet),
+            signing_pc: Some(mint_pseudonym().expect("pseudonym")),
+            peer_pk_pc: Some(peer_pk_pc),
+            channel: Some(channel),
+            collection: Collection::new(),
+            read_through: 0,
+            owed_acks: Vec::new(),
+            offered_this_session: Vec::new(),
+            health: ChannelCounters::default(),
+            last_accept_refusal: None,
+            provisional: None,
+        });
+        assert_eq!(
+            m.only_next_send_seq(),
+            Some(0),
+            "the fixture must start with the acceptance uncomposed"
+        );
+
+        let out = m.due_emissions(BASE_MS, 0);
+        assert_eq!(
+            m.only_next_send_seq(),
+            Some(1),
+            "the tick did not compose the deferred acceptance: {out:?}"
+        );
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::Delivery {
+                    seq: 0,
+                    state: DeliveryState::Composed,
+                    ..
+                })
+            )),
+            "the retry composed silently: {out:?}"
+        );
+        let queued = m
+            .persist
+            .read_outbox(&label, BASE_MS)
+            .expect("the outbox reads")
+            .expect("the outbox exists");
+        assert_eq!(
+            queued
+                .entry(0)
+                .expect("the acceptance is queued at sequence zero")
+                .target(),
+            OutboxTarget::ChannelPage
+        );
+
+        let again = m.due_emissions(BASE_MS, 0);
+        assert_eq!(
+            m.only_next_send_seq(),
+            Some(1),
+            "a second tick composed a second acceptance: {again:?}"
+        );
+        assert!(
+            !again.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::Delivery {
+                    seq: 0,
+                    state: DeliveryState::Composed,
+                    ..
+                })
+            )),
+            "a second tick re-announced the acceptance: {again:?}"
+        );
+    }
+
+    /// M27. A provisional record the accept could not erase is erased on a
+    /// later tick.
+    ///
+    /// **The handle is the only thing that can ever open the record again.** It
+    /// names the epoch the record was sealed under, and a record opens under no
+    /// other — so dropping it on a failed erase leaves the conversation's
+    /// opening secret on disk permanently, from what may have been a moment's
+    /// store fault. The mutual-knock branch re-points the entry at a different
+    /// label, so the handle cannot simply stay on the correspondence either; it
+    /// moves to the machine's retry list, keyed on the label it was written
+    /// under.
+    ///
+    /// The fault here is real rather than mocked: the record's own bytes are
+    /// corrupted, which is exactly `TeardownCause::RecordUnusable` — a
+    /// statement about the ciphertext at this moment, not about whether the
+    /// record exists. Restoring them is the store recovering.
+    #[test]
+    fn a_record_the_erase_could_not_reach_is_erased_on_a_later_tick() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let a_keys = keys();
+        let b_keys = peer_identity();
+        let mut a = machine(&dir_a);
+        let mut b = machine_as(peer_identity(), &dir_b);
+        a.persist.provision_block_list().expect("provision A");
+        b.persist.provision_block_list().expect("provision B");
+
+        let _a_knock = knock_as_initiator(&mut a, &b_keys);
+        let b_knock = knock_as_initiator(&mut b, &a_keys);
+        let files = provisional_files(&a);
+        assert_eq!(files.len(), 1, "A must hold exactly one record to corrupt");
+        let path = files[0].clone();
+        let healthy = std::fs::read(&path).expect("the record reads");
+
+        // The transient fault: the ciphertext no longer opens.
+        let mut broken = healthy.clone();
+        let last = broken.len() - 1;
+        broken[last] ^= 0xFF;
+        std::fs::write(&path, &broken).expect("the record writes");
+
+        // A accepts B's knock, which is where the erase is attempted.
+        let out = a.on_doorbell(BASE_MS, sweep_of(vec![(b_knock.0, b_knock.1)]));
+        let request = out
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("A was not offered B's knock");
+        a.on_command(BASE_MS, DmCommand::Accept { request });
+
+        assert_eq!(
+            a.pending_erase.len(),
+            1,
+            "a record the erase could not reach was forgotten instead of queued"
+        );
+        assert!(
+            path.exists(),
+            "the fixture did not leave a record to retry against"
+        );
+        assert!(
+            a.correspondences[0].provisional.is_none(),
+            "the handle must have moved off the entry, whose label has changed"
+        );
+
+        // The store recovers, and the next tick finishes the job.
+        std::fs::write(&path, &healthy).expect("the record is restored");
+        a.due_emissions(BASE_MS, 0);
+        assert!(
+            a.pending_erase.is_empty(),
+            "the retry did not clear the record it was holding"
+        );
+        assert!(
+            !has_provisional(&a),
+            "the conversation's opening secret is still on disk"
+        );
+    }
+
+    /// Every `provisional.bin` under a machine's store root.
+    fn provisional_files(m: &DmMachine) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(m.persist.store().root())
+            .expect("the store root reads")
+            .filter_map(|e| {
+                let p = e.expect("a directory entry").path().join("provisional.bin");
+                p.exists().then_some(p)
+            })
+            .collect()
+    }
+
+    /// Drive one machine through the whole outbound first-contact path, up to
+    /// and including the mint, and hand back the knock it published.
+    ///
+    /// Nothing is faked: the key record is the one the far identity would
+    /// publish, the entry is `firstcontact::build`'s, and the correspondence
+    /// left behind is a genuine initiator with no pseudonym for its
+    /// correspondent — which is the state every test below is about.
+    fn knock_as_initiator(a: &mut DmMachine, peer: &IdentityKeys) -> (u16, Vec<u8>) {
+        let pk_lt: PkLt = Box::new(*peer.signing.public_key());
+        let out = a.on_command(
+            BASE_MS,
+            DmCommand::FirstContact {
+                recipient: pk_lt.clone(),
+                body: "knock".into(),
+            },
+        );
+        assert!(
+            matches!(&out[..], [DmEffect::Dht(DhtOp::FetchKeyRecord { .. })]),
+            "the introduction did not ask for a key record: {out:?}"
+        );
+        let record = keyrec::build_encoded(
+            &peer.signing,
+            peer.kem.encapsulation_key(),
+            keyrec::DM_KEY_RECORD_VERSION,
+            keyrec::DM_KEY_RECORD_INVITE_ONLY,
+        )
+        .expect("key record");
+        let mut out = a.on_key_record(BASE_MS, pk_lt, Some(record));
+        assert_eq!(out.len(), 1, "the key record did not start a mint: {out:?}");
+        let DmEffect::Compute(ComputeJob::MintFirstContact(request)) = out.remove(0) else {
+            panic!("the key record did not start a mint");
+        };
+        let out = a.on_mint(BASE_MS, run_mint(*request));
+        out.iter()
+            .find_map(|e| match e {
+                DmEffect::Dht(DhtOp::PublishDoorbell { entry, slot, .. }) => {
+                    Some((*slot, entry.clone()))
+                }
+                _ => None,
+            })
+            .expect("the mint did not publish a knock")
+    }
+
+    /// M22. An initiator that has not yet seen the acceptance still sweeps.
+    ///
+    /// The acceptance arrives BY sweep — it is an ordinary channel frame at the
+    /// acceptor's sequence zero — so a probe that refused to plan while the
+    /// pseudonym was unknown would be waiting for something only the sweep can
+    /// deliver. The `SweepPage` effect is the whole assertion; the correspondence
+    /// underneath it has `peer_pk_pc: None`, which is the state that used to
+    /// suppress it.
+    #[test]
+    fn an_initiator_sweeps_before_it_knows_the_pseudonym() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let _ = knock_as_initiator(&mut m, &peer_identity());
+        // The state under test: a live correspondence whose correspondent has
+        // not yet said which key to verify against.
+        assert!(
+            m.correspondences[0].peer_pk_pc.is_none(),
+            "a fresh initiator must not already hold a pseudonym"
+        );
+
+        let out = m.probe(BASE_MS, 0);
+        let swept: Vec<u64> = out
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::SweepPage { tag, .. }) => tag.page,
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !swept.is_empty(),
+            "an initiator awaiting its acceptance must still sweep, got {out:?}"
+        );
+        assert!(
+            swept.contains(&0),
+            "the acceptance sits on page zero, so page zero must be planned: {swept:?}"
+        );
+        assert!(
+            m.correspondences[0].peer_pk_pc.is_none(),
+            "the fixture stopped being the case it was written for"
+        );
+    }
+
+    /// M23. The initiator's provisional record survives the mint and every
+    /// unverified frame, and is erased by a verified acceptance — nothing
+    /// earlier.
+    ///
+    /// **This is the timing the frozen design names, and it is easy to get
+    /// wrong.** `{ss0, the opening ephemeral DK}` is what a restart in the
+    /// knock-to-acceptance window resumes from, and without the ephemeral DK
+    /// this side cannot decapsulate the acceptor's first generation ciphertext
+    /// — so consuming the record at the mint strands the channel over exactly
+    /// the interval the record exists for.
+    ///
+    /// Three readings, in order, each one the control on the next: after the
+    /// mint the handshake still resumes; after a frame that does NOT verify it
+    /// still resumes; after the real acceptance it does not. Without the middle
+    /// one, "erased by the acceptance" is satisfied by anything at all arriving.
+    #[test]
+    fn a_knock_leaves_the_provisional_record_until_the_accept_opens() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        let b_pk_lt: PkLt = Box::new(*b_keys.signing.public_key());
+
+        // ── A knocks ──────────────────────────────────────────────────────
+        let entry = knock_as_initiator(&mut a, &b_keys);
+        let _ = &b_pk_lt;
+
+        let label_a = sole_label(&a);
+        let ctx_a = a.correspondences[0]
+            .provisional
+            .expect("the initiator must be holding its record's context");
+        let resumes = |a: &DmMachine| {
+            matches!(
+                a.persist.restart_channel(
+                    &label_a,
+                    &RecordContext {
+                        recipient_keyrec_addr: &ctx_a.0,
+                        fc_epoch: ctx_a.1,
+                    },
+                ),
+                StoredChannelRestart::HandshakeResumes(_)
+            )
+        };
+        assert!(
+            resumes(&a),
+            "the mint consumed the record the acceptance window needs"
+        );
+
+        let conversation = *a.correspondences[0]
+            .ratchet
+            .as_ref()
+            .expect("A's ratchet")
+            .ar_fingerprint();
+
+        // ── B admits the knock and accepts, which composes the acceptance ──
+        let out = b.on_doorbell(BASE_MS, sweep_of(vec![(entry.0, entry.1)]));
+        let request = out
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("B was not offered the knock");
+        b.on_command(BASE_MS, DmCommand::Accept { request });
+        let label_b = sole_label(&b);
+        let accept_bytes = queued_frame(&b, &label_b, 0);
+
+        // ── a FORGED acceptance reaches the open path and changes nothing ──
+        //
+        // B's real acceptance with one byte of its seal flipped: it parses, the
+        // ratchet accepts the position, and the AEAD refuses it inside the
+        // closure. That is the only shape on which "the record was not erased"
+        // is a claim about the commit rather than about `parse` — random bytes
+        // never get that far.
+        let forged = fold_page(
+            &mut a,
+            conversation,
+            0,
+            vec![(position_of(0), tampered(&accept_bytes))],
+        );
+        assert!(
+            messages_in(&forged).is_empty(),
+            "a forged acceptance produced a message: {forged:?}"
+        );
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_none(),
+            "a forged acceptance installed a pseudonym"
+        );
+        assert!(
+            resumes(&a),
+            "a forged acceptance erased the record only a verified one may erase"
+        );
+        assert!(
+            a.correspondences[0].provisional.is_some(),
+            "a forged acceptance dropped the handle to the record"
+        );
+
+        // ── A collects the real one, installs, and erases the record ──────
+        // The slot the forgery occupied was left unsettled, which is what lets
+        // the genuine frame be offered at the same position afterwards.
+        let out = fold_page(
+            &mut a,
+            conversation,
+            0,
+            vec![(position_of(0), accept_bytes.clone())],
+        );
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_some(),
+            "the acceptance did not install a pseudonym: {out:?}"
+        );
+        assert_eq!(
+            messages_in(&out),
+            vec![String::new()],
+            "the acceptance must surface once, with an empty body: {out:?}"
+        );
+        assert!(
+            !resumes(&a),
+            "the provisional record survived a verified acceptance"
+        );
+        assert!(
+            a.correspondences[0].provisional.is_none(),
+            "the correspondence still names a record that is gone"
+        );
+
+        // ── the sender re-seeds it, and nothing happens twice ─────────────
+        //
+        // A sender re-seeds until acknowledged, so these exact bytes come back
+        // on every sweep. **The settled set is what stops them, not the
+        // ratchet**: `Collection::observe_page` filters a position it has
+        // already settled out of the unsettled list, so the frame is never
+        // offered to the ratchet a second time and `already_consumed` does NOT
+        // move — the counter that would move if the filter were removed. And
+        // the erase is not re-attempted, because the handle is already gone.
+        let consumed_before = a.correspondences[0].health.already_consumed;
+        let again = fold_page(
+            &mut a,
+            conversation,
+            0,
+            vec![(position_of(0), accept_bytes)],
+        );
+        assert!(
+            messages_in(&again).is_empty(),
+            "the acceptance surfaced twice under a re-seed: {again:?}"
+        );
+        assert!(
+            !again
+                .iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::Refused { .. }))),
+            "a re-seeded acceptance was refused: {again:?}"
+        );
+        assert_eq!(
+            a.correspondences[0].health.already_consumed, consumed_before,
+            "the settled set must filter the re-seed before the ratchet sees it"
+        );
+        assert!(
+            a.correspondences[0].provisional.is_none(),
+            "a re-seed re-armed the record handle"
+        );
+        assert!(!resumes(&a), "a re-seed resurrected the record");
+    }
+
+    /// M24. Before the acceptance, a frame at any later sequence is left
+    /// unsettled and counted — never opened, never abandoned.
+    ///
+    /// **The branch this covers had no test.** An initiator holds no pseudonym
+    /// until the acceptance lands, so B's ordinary reply at sequence one is
+    /// unverifiable when it arrives: page owner-write authority is symmetric,
+    /// so opening it would be trusting bytes anyone able to write the page
+    /// could have put there. It is left in place for the sweep after the
+    /// acceptance.
+    ///
+    /// **The second fold is the positive control, and it is what makes the
+    /// first assertion mean "not yet" rather than "never".** Without it a
+    /// machine that discarded the frame outright, or one that settled the slot,
+    /// would pass — and the message would be lost with nothing saying so.
+    #[test]
+    fn a_reply_before_the_acceptance_is_left_unsettled_and_counted() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+
+        let entry = knock_as_initiator(&mut a, &b_keys);
+        let conversation = *a.correspondences[0]
+            .ratchet
+            .as_ref()
+            .expect("A's ratchet")
+            .ar_fingerprint();
+
+        let out = b.on_doorbell(BASE_MS, sweep_of(vec![(entry.0, entry.1)]));
+        let request = out
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("B was not offered the knock");
+        b.on_command(BASE_MS, DmCommand::Accept { request });
+        b.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*a.identity.signing.public_key()),
+                body: "before you know me".into(),
+            },
+        );
+        let label_b = sole_label(&b);
+        let accept_bytes = queued_frame(&b, &label_b, 0);
+        let reply_bytes = queued_frame(&b, &label_b, 1);
+
+        // ── the reply alone, with no pseudonym installed ──────────────────
+        let before = a.correspondences[0].health.peer_pseudonym_unknown;
+        let out = fold_page(
+            &mut a,
+            conversation,
+            0,
+            vec![(position_of(1), reply_bytes.clone())],
+        );
+        assert!(
+            messages_in(&out).is_empty(),
+            "a frame this side cannot verify was opened anyway: {out:?}"
+        );
+        assert_eq!(
+            a.correspondences[0].health.peer_pseudonym_unknown,
+            before + 1,
+            "the refusal must be counted once for the position it left alone"
+        );
+        assert_eq!(
+            a.correspondences[0].health.unopenable, 0,
+            "a frame refused as pending is not a frame that failed to open"
+        );
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_none(),
+            "the fixture stopped being the case it was written for"
+        );
+
+        // ── the acceptance lands, then the same frame is offered again ────
+        let out = fold_page(
+            &mut a,
+            conversation,
+            0,
+            vec![(position_of(0), accept_bytes)],
+        );
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_some(),
+            "the acceptance did not install a pseudonym: {out:?}"
+        );
+        let out = fold_page(&mut a, conversation, 0, vec![(position_of(1), reply_bytes)]);
+        assert_eq!(
+            messages_in(&out),
+            vec!["before you know me".to_string()],
+            "the slot the refusal left unsettled was not retried: {out:?}"
+        );
+    }
+
+    /// M25. A mutual knock leaves no provisional record behind, on either side.
+    ///
+    /// **Two ways in and one conversation.** Each side knocks the other before
+    /// either has answered, so each holds a provisional record from its own
+    /// introduction AND accepts the other's knock. Two things could strand
+    /// `{ss0, the opening ephemeral DK}` on disk: the accept overwriting the
+    /// entry's label while its record still lives under the old one, and a
+    /// mint landing on top of a correspondence a pseudonym is already installed
+    /// for — after which `on_page`'s erase, which runs only when it installs
+    /// one, can never reach it.
+    ///
+    /// The record is the conversation's opening secret; `ss0` roots `RK0`, and
+    /// erasing it is the premise under which the steady-state ratchet is never
+    /// persisted at all. One left behind is that claim inverted, permanently
+    /// and silently.
+    #[test]
+    fn a_mutual_knock_leaves_no_provisional_record_on_either_side() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let a_keys = keys();
+        let b_keys = peer_identity();
+        let mut a = machine(&dir_a);
+        let mut b = machine_as(peer_identity(), &dir_b);
+        a.persist.provision_block_list().expect("provision A");
+        b.persist.provision_block_list().expect("provision B");
+
+        // Both knock, neither has answered.
+        let a_knock = knock_as_initiator(&mut a, &b_keys);
+        let b_knock = knock_as_initiator(&mut b, &a_keys);
+        assert!(
+            has_provisional(&a) && has_provisional(&b),
+            "the fixture must start with a record on each side"
+        );
+
+        // Both accept, each other's.
+        for (m, knock) in [(&mut a, b_knock), (&mut b, a_knock)] {
+            let out = m.on_doorbell(BASE_MS, sweep_of(vec![(knock.0, knock.1)]));
+            let request = out
+                .iter()
+                .find_map(|e| match e {
+                    DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => {
+                        Some(request.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the knock was not offered");
+            m.on_command(BASE_MS, DmCommand::Accept { request });
+        }
+
+        for (name, m) in [("A", &a), ("B", &b)] {
+            assert_eq!(
+                m.correspondence_count(),
+                1,
+                "{name} holds more than one entry for one identity"
+            );
+            assert!(
+                m.correspondences[0].provisional.is_none(),
+                "{name} still names a provisional record after accepting"
+            );
+            assert!(
+                m.correspondences[0].peer_pk_pc.is_some(),
+                "{name} did not install the pseudonym its accept carried"
+            );
+            assert!(
+                !has_provisional(m),
+                "{name} left the conversation's opening secret on disk"
+            );
+        }
+    }
+
+    /// Whether any correspondence directory in this machine's store still holds
+    /// a provisional record.
+    ///
+    /// **Asked of the store, not of the correspondence.** The strand this
+    /// guards against is precisely a record whose in-memory handle was
+    /// overwritten, so a machine that forgot the record entirely would pass an
+    /// in-memory check while the file sat there.
+    fn has_provisional(m: &DmMachine) -> bool {
+        m.persist
+            .store()
+            .correspondences()
+            .expect("list")
+            .into_iter()
+            .any(|l| {
+                m.persist
+                    .store()
+                    .read_unlocked(
+                        &l,
+                        daemonseed_core::storage::dm_store::RecordKind::Provisional,
+                    )
+                    .expect("read")
+                    .is_some()
+            })
+    }
+
+    /// M26. `fire_accept` reports every refusal it takes; none of them return
+    /// silently.
+    ///
+    /// A refusal that returned `Vec::new()` would leave the front end with a
+    /// conversation it believes was accepted and an initiator that can never
+    /// verify it — the acceptance is the only frame carrying this side's
+    /// pseudonym. The two post-`send_next` paths (a seal fault, and an enqueue
+    /// the ask had already approved) are unreachable from a single-writer test
+    /// by construction, and are the class `send` documents: they need a second
+    /// writer to fill the record between the ask and the enqueue.
+    #[test]
+    fn a_refused_acceptance_is_always_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let knock = fake_knock(44);
+        let pk_lt: PkLt = Box::new(*knock.pk_lt());
+        let peer_pk_pc = Box::new(*knock.pk_pc());
+        let channel = ChannelRoots {
+            address_root: knock.roots().ar,
+            chan_id: knock.roots().chan_id,
+        };
+        let (label, _ratchet) = m
+            .persist
+            .accept_first_contact(*knock, BASE_MS)
+            .expect("the establish succeeds");
+        // No ratchet: the correspondence exists and cannot be spoken on, which
+        // is the state a restart leaves behind.
+        m.correspondences.push(Correspondence {
+            pk_lt,
+            label,
+            ratchet: None,
+            signing_pc: None,
+            peer_pk_pc: Some(peer_pk_pc),
+            channel: Some(channel),
+            collection: Collection::new(),
+            read_through: 0,
+            owed_acks: Vec::new(),
+            offered_this_session: Vec::new(),
+            health: ChannelCounters::default(),
+            last_accept_refusal: None,
+            provisional: None,
+        });
+
+        let out = m.fire_accept(BASE_MS, 0);
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::Delivery {
+                    seq: 0,
+                    state: DeliveryState::Undelivered,
+                    ..
+                })
+            )),
+            "a refused acceptance must say sequence zero did not go: {out:?}"
+        );
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::Refused {
+                    reason: RefusalReason::NotEstablishedThisSession,
+                    ..
+                })
+            )),
+            "a refused acceptance must say why: {out:?}"
+        );
+    }
+
+    /// Fold one page into `m`, as a completed sweep of the slots given.
+    fn fold_page(
+        m: &mut DmMachine,
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        page: u64,
+        slots: Vec<(PagePosition, Vec<u8>)>,
+    ) -> Vec<DmEffect> {
+        let found = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+        m.on_page(
+            BASE_MS,
+            &OpTag::channel(conversation, None, Some(page)),
+            DmPageSweep {
+                conversation,
+                slots,
+                outcome: crate::SweepOutcome {
+                    attempted: u32::from(PAGE_SLOTS),
+                    failed: 0,
+                    found,
+                },
+            },
+        )
+    }
+
+    /// The bytes of one queued outbox entry.
+    fn queued_frame(m: &DmMachine, label: &CorrespondenceLabel, seq: u64) -> Vec<u8> {
+        m.persist
+            .read_outbox(label, BASE_MS)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .entry(seq)
+            .unwrap_or_else(|| panic!("sequence {seq} is queued"))
+            .frame()
+            .expect("the entry holds its bytes")
+            .to_vec()
+    }
+
+    /// A frame whose SEAL has been tampered with, one byte deep.
+    ///
+    /// **Not garbage, and the difference is the whole point of using it.**
+    /// Random bytes fail `frame::parse` and never reach the ratchet or
+    /// `open_accept` at all, so a test built on them says nothing about what
+    /// happens on the open path. This still parses — the clear header is
+    /// untouched — so the ratchet accepts the position, the closure runs, and
+    /// the AEAD is what refuses it. That is the path a forged acceptance takes,
+    /// and the only one on which "nothing was committed" can be observed.
+    fn tampered(bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        let last = out.len() - 1;
+        out[last] ^= 0xFF;
+        out
+    }
+
+    /// The message bodies in a batch of effects.
+    fn messages_in(effects: &[DmEffect]) -> Vec<String> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Message { body, .. }) => Some(body.clone()),
+                _ => None,
+            })
+            .collect()
     }
 }

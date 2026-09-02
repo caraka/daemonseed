@@ -50,8 +50,8 @@
 //! ## Whose record this is
 //!
 //! The initiator's. § v5 (V4-2) names it verbatim — `{ss0, A's opening ephemeral
-//! DK}` — and `ProvisionalRecord::into_ratchet` is the one construction path
-//! from it. The recipient's half of § v4 4.1 (`PK_pc_A`, the peer pseudonym it
+//! DK}` — and `ProvisionalRecord::into_ratchet` / `ProvisionalRecord::to_ratchet`
+//! are the construction paths from it. The recipient's half of § v4 4.1 (`PK_pc_A`, the peer pseudonym it
 //! must verify frames against) is **not** here and is not recomputable from
 //! `ss0`; its home is the ISC-C44 contact cache, which holds "long-term +
 //! pseudonym pubkeys" per contact.
@@ -390,7 +390,15 @@ fn tags_match(a: &[u8; BINDING_TAG_LEN], b: &[u8; BINDING_TAG_LEN]) -> bool {
 ///
 /// One type serves both, which is the point: the triple a store must keep is
 /// exactly the triple [`Ratchet::initiator`] consumes, so there is no shape to
-/// translate between and no moment where a second copy of `eph_dk` exists (#255).
+/// translate between (#255).
+///
+/// **Two derivations, and only one of them is copy-free.**
+/// `Self::into_ratchet` consumes the record and moves both ephemeral halves
+/// straight through, so no second copy of `eph_dk` ever exists. `Self::to_ratchet`
+/// borrows, and therefore copies the decapsulation key — the price of a ratchet
+/// that exists *while* the record still has to. Which one a caller gets is
+/// decided by [`crate::dm::persist::PendingHandshake`], on whether the peer has
+/// been verified yet.
 ///
 /// **No `Drop` of its own**, and that is load-bearing rather than an oversight.
 /// A container `Drop` forbids moving fields *out*, which is what forced a caller
@@ -490,11 +498,16 @@ impl ProvisionalRecord {
     /// Establishing a channel is the moment the stored record must stop
     /// existing, because `ss0` roots `RK0` and its erasure is the whole
     /// forward-secrecy premise for trimming the ratchet. That pairing is
-    /// enforced by [`crate::dm::persist::PendingHandshake::establish`], which
-    /// owns the record and performs both. Leaving this public would leave a
+    /// enforced by [`crate::dm::persist::PendingHandshake`], which owns the
+    /// record: whichever derivation a caller takes, the delete is that type's
+    /// [`commit`](crate::dm::persist::PendingHandshake::commit) — reached
+    /// directly, or through
+    /// [`establish`](crate::dm::persist::PendingHandshake::establish), which is
+    /// the two acts in one call. Leaving either derivation public would leave a
     /// second door: anyone holding the sealed bytes and the key could build a
     /// ratchet and never delete, and the invariant would be a convention rather
-    /// than a property. Outside this crate, `establish` is the only way in.
+    /// than a property. Outside this crate, `PendingHandshake` is the only way
+    /// in.
     pub(crate) fn into_ratchet(self) -> Result<Ratchet, RatchetError> {
         // `ss0` is borrowed while the other two fields move out. That is only
         // legal because this type has no container `Drop` — the exact restriction
@@ -505,6 +518,39 @@ impl ProvisionalRecord {
             eph_dk,
         } = self;
         Ratchet::initiator(&ss0, eph_ek, eph_dk)
+    }
+
+    /// Derive the conversation's ratchet WITHOUT consuming the record.
+    ///
+    /// **The borrowing sibling of [`Self::into_ratchet`], and it exists for one
+    /// window only.** An initiator can send its opening burst the moment it has
+    /// knocked, but it cannot verify the acceptor until the acceptance arrives
+    /// — so between those two moments it needs a ratchet *and* still needs the
+    /// record, which is the only at-rest home for `ss0` and the opening
+    /// ephemeral. Consuming the record at the first of those moments strands
+    /// the channel across a restart in the window the record exists for.
+    ///
+    /// **The cost is a second live copy of `eph_dk`, and the copy is made
+    /// zeroizing.** The ratchet takes the decapsulation key by value, so a
+    /// borrowing derivation has to copy it out —
+    /// [`EphemeralDecapKey::as_bytes`]'s own contract is that callers must not
+    /// copy into a non-zeroizing buffer, and `Box::new(*key.as_bytes())` does
+    /// exactly that: the dereference materialises 3168 secret bytes in a
+    /// temporary that has no destructor and is never wiped. So the bytes land
+    /// in a named local, are boxed, and the local is zeroized — the
+    /// `derive_boxed_seed` idiom. The surviving copy lives inside the ratchet
+    /// and is bounded by the same window:
+    /// [`crate::dm::persist::PendingHandshake::commit`] erases the record the
+    /// instant the acceptance verifies. `ss0` is only borrowed.
+    pub(crate) fn to_ratchet(&self) -> Result<Ratchet, RatchetError> {
+        let mut dk = *self.eph_dk.as_bytes();
+        let boxed = Box::new(dk);
+        dk.zeroize();
+        Ratchet::initiator(
+            &self.ss0,
+            self.eph_ek.clone(),
+            EphemeralDecapKey::new(boxed),
+        )
     }
 
     /// Seal the record for rest, bound to the channel `ctx` names.

@@ -75,7 +75,9 @@ use daemonseed_proto::v1 as wire;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::dm::ack::{AckError, AckState, PeerAck};
-use crate::dm::firstcontact::{DM_BODY_CAP, RECIPIENT_HASH_LEN, ROOT_LEN, msg_sig_input};
+use crate::dm::firstcontact::{
+    DM_BODY_CAP, RECIPIENT_HASH_LEN, ROOT_LEN, bind_lt_input, msg_sig_input,
+};
 use crate::dm::paging::PagePosition;
 use crate::dm::ratchet::{Direction, FrameHeader, MessageKey, Outbound};
 use crate::dm::{LEN_PREFIX, domain, push_lp};
@@ -213,6 +215,33 @@ pub enum DmFrameError {
     /// acknowledgement was written by the peer that holds the message key —
     /// the same non-conforming-peer class as [`Self::TooLarge`].
     PiggybackedAck(AckError),
+    /// The pseudonym binding carried in the body did not verify under the
+    /// long-term key this conversation was opened against.
+    ///
+    /// Uniform in exactly the way [`Self::Signature`] is: a forged signature, a
+    /// binding over some other pseudonym and a binding by some other identity
+    /// are one verdict, because distinguishing them would say which half of the
+    /// forgery was closest.
+    Binding,
+    /// [`ParsedFrame::open_accept`] was given a frame carrying no binding at
+    /// all — the ordinary-frame shape, at the position an ACCEPT occupies.
+    ///
+    /// Distinct from [`Self::Binding`] on purpose. An absent binding is a peer
+    /// that replied without accepting, which is a protocol state; a binding
+    /// that does not verify is an attack. Collapsing them would report the
+    /// first as tampering.
+    MissingBinding,
+    /// A frame carries a pseudonym key other than the one already installed for
+    /// this conversation.
+    ///
+    /// Checked BEFORE the authorship signature, so a second pseudonym is
+    /// refused as a pinning violation rather than as a signature that happens
+    /// not to verify under the installed key.
+    PseudonymMismatch,
+    /// [`ParsedFrame::open_accept`] was asked to open a position an ACCEPT
+    /// cannot occupy: any sequence but the acceptor's zero, or the initiator's
+    /// own direction.
+    NotAccept { seq: u64 },
     /// The OS entropy source failed while drawing a nonce.
     EntropySource,
 }
@@ -238,6 +267,14 @@ impl std::fmt::Display for DmFrameError {
             Self::TooLarge { got, max } => write!(f, "frame is {got} bytes, cap is {max}"),
             Self::PiggybackedAck(e) => {
                 write!(f, "the piggybacked acknowledgement did not decode: {e}")
+            }
+            Self::Binding => write!(f, "the pseudonym binding did not verify"),
+            Self::MissingBinding => write!(f, "the frame carries no pseudonym binding"),
+            Self::PseudonymMismatch => {
+                write!(f, "the frame carries a different pseudonym key")
+            }
+            Self::NotAccept { seq } => {
+                write!(f, "sequence {seq} is not where an acceptance can sit")
             }
             Self::EntropySource => write!(f, "the entropy source failed"),
         }
@@ -404,6 +441,8 @@ fn ack_fields_encoded_len(high_water: Option<u64>, beyond: &[u8]) -> usize {
         msg_sig: Vec::new(),
         ack_high_water: high_water,
         ack_beyond: beyond.to_vec(),
+        pk_pc: Vec::new(),
+        bind_lt: Vec::new(),
     }
     .encoded_len()
 }
@@ -492,6 +531,101 @@ pub fn seal(
     body: &str,
     ack: Option<&AckState>,
 ) -> Result<Vec<u8>, DmFrameError> {
+    seal_bound(
+        outbound,
+        chan_id,
+        signing_pc,
+        pk_lt,
+        recipient_hash,
+        sent_unix_ms,
+        body,
+        ack,
+        None,
+    )
+}
+
+/// The acceptor's ACCEPT: an ordinary channel frame at the acceptor's sequence
+/// zero, carrying its pseudonym key and that key's long-term binding inside the
+/// seal.
+///
+/// **Not a new wire message and not a new frame kind.** It is
+/// [`seal`]'s output with two more sealed fields, signed under the identical
+/// [`frame_sig_input`] preimage under [`FRAME_KIND_CHANNEL`], so a receiver that
+/// never looks at the two fields opens it as any other frame. What it adds is
+/// the one thing a channel frame otherwise cannot carry: page owner-write
+/// authority is symmetric and the ratchet is keyed off a secret both ends hold,
+/// so an initiator that has never seen the acceptor's pseudonym has nothing to
+/// verify authorship against. This frame is where it arrives.
+///
+/// **The body is empty, and that is the design's shape rather than a
+/// simplification.** The acceptance fires the instant the user accepts, whether
+/// or not they have composed anything, so it takes no body parameter — a reply
+/// with content is an ordinary [`seal`] at the next sequence number.
+///
+/// `signing_lt` is the acceptor's own long-term identity keypair, used here and
+/// only here: `bind_lt` is signed under it, exactly as a first-contact entry's
+/// is in the other direction, under the same
+/// [`crate::dm::domain::DM_BIND_LT`] domain. The public half never goes on the
+/// wire — the initiator already holds it, because it is the key it knocked at.
+pub fn seal_accept(
+    outbound: Outbound,
+    chan_id: &[u8; ROOT_LEN],
+    signing_pc: &SignKeypair,
+    signing_lt: &SignKeypair,
+    recipient_hash: &[u8; RECIPIENT_HASH_LEN],
+    sent_unix_ms: i64,
+    ack: Option<&AckState>,
+) -> Result<Vec<u8>, DmFrameError> {
+    debug_assert_eq!(
+        outbound.direction,
+        Direction::BToA,
+        "an acceptance travels on the acceptor's own sending direction"
+    );
+    debug_assert_eq!(
+        outbound.header.seq,
+        crate::dm::ratchet::FIRST_RECIPIENT_CHANNEL_SEQ,
+        "an acceptance is the first thing the acceptor writes to the channel"
+    );
+    let pk_pc = *signing_pc.public_key();
+    let pk_lt = *signing_lt.public_key();
+    let bind_lt = signing_lt
+        .sign(&bind_lt_input(&pk_lt, &pk_pc))
+        .map_err(DmFrameError::Signing)?;
+    seal_bound(
+        outbound,
+        chan_id,
+        signing_pc,
+        &pk_lt,
+        recipient_hash,
+        sent_unix_ms,
+        "",
+        ack,
+        Some(PseudonymBinding {
+            pk_pc: &pk_pc,
+            bind_lt: &bind_lt,
+        }),
+    )
+}
+
+/// The two sealed fields an ACCEPT adds, kept together so neither can be
+/// written without the other.
+struct PseudonymBinding<'a> {
+    pk_pc: &'a [u8; ml_dsa::PK_LEN],
+    bind_lt: &'a [u8; ml_dsa::SIG_LEN],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn seal_bound(
+    outbound: Outbound,
+    chan_id: &[u8; ROOT_LEN],
+    signing_pc: &SignKeypair,
+    pk_lt: &[u8; ml_dsa::PK_LEN],
+    recipient_hash: &[u8; RECIPIENT_HASH_LEN],
+    sent_unix_ms: i64,
+    body: &str,
+    ack: Option<&AckState>,
+    binding: Option<PseudonymBinding<'_>>,
+) -> Result<Vec<u8>, DmFrameError> {
     if body.len() > DM_BODY_CAP {
         return Err(DmFrameError::TooLarge {
             got: body.len(),
@@ -539,6 +673,17 @@ pub fn seal(
         msg_sig: msg_sig.to_vec(),
         ack_high_water,
         ack_beyond,
+        // Empty on every ordinary frame, so prost omits both fields and an
+        // ordinary body's encoding is byte-identical to what it was before
+        // they existed.
+        pk_pc: binding
+            .as_ref()
+            .map(|b| b.pk_pc.to_vec())
+            .unwrap_or_default(),
+        bind_lt: binding
+            .as_ref()
+            .map(|b| b.bind_lt.to_vec())
+            .unwrap_or_default(),
     };
     let mut encoded = plain.encode_to_vec();
     plain.body.zeroize();
@@ -729,8 +874,139 @@ impl ParsedFrame {
         })
     }
 
+    /// Open and verify an ACCEPT: the acceptor's first frame, whose sealed body
+    /// carries the pseudonym key every later frame of this conversation is
+    /// verified against.
+    ///
+    /// **This is the only entry point that does not already know
+    /// `author.pc`.** Every other open takes the pseudonym as a parameter,
+    /// because both ends learned it at first contact — except the initiator,
+    /// which never sees the acceptor's. So the key arrives here, inside the
+    /// seal, and the two questions that make trusting it sound are asked in
+    /// order:
+    ///
+    /// 1. **Is this the position an acceptance can occupy?** The acceptor's
+    ///    sequence zero on the acceptor's own direction, and nothing else —
+    ///    [`DmFrameError::NotAccept`] otherwise. The position is `found_at`'s,
+    ///    i.e. the collector's own knowledge, never the frame's claim, so a
+    ///    frame cannot nominate itself as an acceptance.
+    /// 2. **Did the identity we knocked at vouch for this pseudonym?**
+    ///    `bind_lt` is verified under `peer_pk_lt` — a key this side already
+    ///    holds and did not learn from the frame — over the same
+    ///    [`bind_lt_input`] preimage a first-contact entry carries in the other
+    ///    direction. Without that step the sealed pseudonym would be
+    ///    self-asserted by whoever holds the message key.
+    ///
+    /// Only then is the frame verified as an ordinary frame, under the carried
+    /// pseudonym, so `msg_sig` proves possession of the key just installed.
+    ///
+    /// A failure here commits nothing: the caller runs this as
+    /// [`crate::dm::ratchet::Ratchet::receive`]'s closure, which restores the
+    /// ratchet when the closure returns `Err`, so a forged acceptance costs one
+    /// refused open and no key.
+    pub fn open_accept(
+        &self,
+        key: &MessageKey,
+        chan_id: &[u8; ROOT_LEN],
+        dir: Direction,
+        found_at: PagePosition,
+        recipient_hash: &[u8; RECIPIENT_HASH_LEN],
+        peer_pk_lt: &[u8; ml_dsa::PK_LEN],
+    ) -> Result<VerifiedAccept, DmFrameError> {
+        if dir != Direction::BToA
+            || found_at.seq() != crate::dm::ratchet::FIRST_RECIPIENT_CHANNEL_SEQ
+        {
+            return Err(DmFrameError::NotAccept {
+                seq: found_at.seq(),
+            });
+        }
+        if found_at.seq() != self.header.seq {
+            return Err(DmFrameError::Misplaced {
+                declared: self.header.seq,
+                found_at: found_at.seq(),
+            });
+        }
+
+        let mut plaintext = open_envelope(
+            &aes_key(key)?,
+            &frame_aad(chan_id, dir, &self.header, &self.eph_ek, self.eph_ct()),
+            &self.sealed,
+        )?;
+        let decoded = crate::dm::unpad(&plaintext)
+            .ok_or(DmFrameError::Malformed)
+            .and_then(|encoded| {
+                wire::DmChannelBody::decode(encoded).map_err(|_| DmFrameError::Malformed)
+            });
+        plaintext.zeroize();
+        let mut body = decoded?;
+
+        // Every path below holds the peer's cleartext, so each one clears it
+        // before returning — the same discipline [`Self::open`] keeps, and for
+        // the same reason: a key-holding peer can reach all of them.
+        let outcome = self.verified_binding(&body, chan_id, dir, recipient_hash, peer_pk_lt);
+        let pk_pc = match outcome {
+            Ok(pk_pc) => pk_pc,
+            Err(e) => {
+                body.body.zeroize();
+                return Err(e);
+            }
+        };
+        let peer_ack = match piggybacked_ack(&body) {
+            Ok(ack) => ack,
+            Err(e) => {
+                body.body.zeroize();
+                return Err(e);
+            }
+        };
+
+        Ok(VerifiedAccept {
+            frame: VerifiedFrame {
+                seq: self.header.seq,
+                sent_unix_ms: body.sent_unix_ms,
+                body: body.body,
+                peer_ack,
+            },
+            peer_pk_pc: pk_pc,
+        })
+    }
+
+    /// The binding half of [`Self::open_accept`], split out so every error path
+    /// above it clears the plaintext in one place.
+    fn verified_binding(
+        &self,
+        body: &wire::DmChannelBody,
+        chan_id: &[u8; ROOT_LEN],
+        dir: Direction,
+        recipient_hash: &[u8; RECIPIENT_HASH_LEN],
+        peer_pk_lt: &[u8; ml_dsa::PK_LEN],
+    ) -> Result<Box<[u8; ml_dsa::PK_LEN]>, DmFrameError> {
+        if body.pk_pc.is_empty() && body.bind_lt.is_empty() {
+            return Err(DmFrameError::MissingBinding);
+        }
+        let pk_pc: Box<[u8; ml_dsa::PK_LEN]> = Box::new(exact("pk_pc", &body.pk_pc)?);
+        // **The binding signature is NOT checked here.** [`Self::verify`] below
+        // checks it, under an author whose `pc` is the key just read out and
+        // whose `lt` is `peer_pk_lt` — the same signature over the same
+        // preimage under the same key. Doing it twice would be two
+        // authenticating paths for one statement, which is how a claim gets
+        // read off the path that was not checked. This function's job is to say
+        // *which key* the frame is claiming; whether the claim holds is one
+        // check, in one place, on every frame that carries the fields.
+        self.verify(
+            body,
+            chan_id,
+            dir,
+            recipient_hash,
+            AuthorKeys {
+                pc: &pk_pc,
+                lt: peer_pk_lt,
+            },
+        )?;
+        Ok(pk_pc)
+    }
+
     /// The post-decryption half of [`Self::open`]: the body cap a non-conforming
-    /// peer can exceed, and the authorship signature.
+    /// peer can exceed, the pseudonym pinning, and the authorship signature.
     fn verify(
         &self,
         body: &wire::DmChannelBody,
@@ -746,6 +1022,22 @@ impl ParsedFrame {
                 got: body.body.len(),
                 max: DM_BODY_CAP,
             });
+        }
+        // **Pinning, and it runs before the signature.** A body that carries a
+        // pseudonym key at all must carry the one already in hand: a peer that
+        // rotated its pseudonym mid-conversation would otherwise present a
+        // frame that verifies perfectly under a key nobody vouched for. Refused
+        // here as a pinning violation rather than left to fail as a signature,
+        // because the two say different things. A body carrying no key — every
+        // ordinary frame — takes the path it always took, byte for byte.
+        if !body.pk_pc.is_empty() || !body.bind_lt.is_empty() {
+            let pk_pc: [u8; ml_dsa::PK_LEN] = exact("pk_pc", &body.pk_pc)?;
+            if pk_pc.as_slice() != author.pc.as_slice() {
+                return Err(DmFrameError::PseudonymMismatch);
+            }
+            let bind_lt: [u8; ml_dsa::SIG_LEN] = exact("bind_lt", &body.bind_lt)?;
+            verify_signature(author.lt, &bind_lt_input(author.lt, &pk_pc), &bind_lt)
+                .map_err(|_| DmFrameError::Binding)?;
         }
         let msg_sig: [u8; ml_dsa::SIG_LEN] = exact("msg_sig", &body.msg_sig)?;
 
@@ -860,12 +1152,43 @@ pub struct VerifiedFrame {
     pub peer_ack: Option<PeerAck>,
 }
 
+/// A verified ACCEPT: the frame, plus the pseudonym key it installed.
+///
+/// Only constructible via [`ParsedFrame::open_accept`], so holding one is the
+/// proof that the identity this conversation was opened against vouched for
+/// that key — not merely that some key arrived.
+///
+/// Not `Clone`, `PartialEq` or `Eq`, inherited from [`VerifiedFrame`] and for
+/// that type's stated reason.
+pub struct VerifiedAccept {
+    /// The frame itself, verified under the pseudonym below.
+    pub frame: VerifiedFrame,
+    /// The acceptor's per-contact pseudonym key, bound to the long-term
+    /// identity the initiator knocked at.
+    pub peer_pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
+}
+
+/// Hand-written: the pseudonym is a public key rather than a secret, but the
+/// frame it arrives with carries the peer's cleartext, and a derived `Debug`
+/// would print it.
+impl std::fmt::Debug for VerifiedAccept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedAccept")
+            .field("seq", &self.frame.seq)
+            .field("sent_unix_ms", &self.frame.sent_unix_ms)
+            .field("body_len", &self.frame.body.len())
+            .field("has_peer_ack", &self.frame.peer_ack.is_some())
+            .field("peer_pk_pc", &"<installed>")
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dm::firstcontact::{FRAME_KIND_FIRST_CONTACT, recipient_hash};
     use crate::dm::paging::{PAGE_SLOTS, position_of};
-    use crate::dm::ratchet::{EphemeralDecapKey, Ratchet, Role};
+    use crate::dm::ratchet::{EphemeralDecapKey, FIRST_RECIPIENT_CHANNEL_SEQ, Ratchet, Role};
     use crate::identity::keys::{Identity, IdentityKeys, derive_identity_keys};
     use crate::identity::mnemonic::Mnemonic;
     use oxicrypt_sha::sha384;
@@ -970,6 +1293,14 @@ mod tests {
         a: IdentityKeys,
         b: IdentityKeys,
         a_pc: IdentityKeys,
+        /// The acceptor's per-contact pseudonym — what its ACCEPT carries and
+        /// every later frame of its direction is verified against.
+        ///
+        /// **Distinct from `b.signing`, and that is load-bearing.** `bind_lt`
+        /// is a signature by the long-term key over the pseudonym; if the two
+        /// were one key the preimage would be `lp(k) || lp(k)` and a mutant
+        /// that verified the binding against the wrong one of them would pass.
+        b_pc: SignKeypair,
         init: Ratchet,
         recip: Ratchet,
     }
@@ -985,9 +1316,18 @@ mod tests {
             // The per-contact pseudonym is a random key in production; a second
             // derived identity stands in for it here.
             a_pc: keys(PHRASE_B),
+            b_pc: pseudonym(0xB1),
             init,
             recip,
         }
+    }
+
+    /// A standalone signing key, for the per-contact pseudonyms and for the
+    /// third-party keys the forgery tests sign under.
+    fn pseudonym(tag: u8) -> SignKeypair {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        SignKeypair::from_ml_dsa_seed(&[tag; crate::identity::keys::ML_DSA_SEED_LEN])
+            .expect("pseudonym keygen")
     }
 
     /// A sequence number whose page, slot and sequence are three DIFFERENT
@@ -1078,6 +1418,99 @@ mod tests {
 
         fn recv(&mut self, bytes: &[u8]) -> Result<VerifiedFrame, DmFrameError> {
             self.recv_raw(bytes).unwrap()
+        }
+
+        /// The acceptor's ACCEPT: its first channel write, at sequence zero,
+        /// carrying `b_pc` and that key's binding under `b.signing`.
+        fn accept(&mut self, ack: Option<&AckState>) -> (Vec<u8>, MessageKey) {
+            let out = self.recip.send_next().expect("the acceptor's chain steps");
+            assert_eq!(out.header.seq, FIRST_RECIPIENT_CHANNEL_SEQ);
+            let key = out.key.clone();
+            let bytes = seal_accept(
+                out,
+                &[1u8; ROOT_LEN],
+                &self.b_pc,
+                &self.b.signing,
+                &recipient_hash(self.a.signing.public_key()).unwrap(),
+                SENT,
+                ack,
+            )
+            .expect("the acceptance seals");
+            (bytes, key)
+        }
+
+        /// An ORDINARY frame from the acceptor, at whatever sequence its chain
+        /// is up to — the shape every reply after the acceptance takes.
+        fn b_send(&mut self, body: &str) -> (Vec<u8>, MessageKey, u64) {
+            let out = self.recip.send_next().expect("the acceptor's chain steps");
+            let key = out.key.clone();
+            let seq = out.header.seq;
+            let bytes = seal(
+                out,
+                &[1u8; ROOT_LEN],
+                &self.b_pc,
+                self.b.signing.public_key(),
+                &recipient_hash(self.a.signing.public_key()).unwrap(),
+                SENT,
+                body,
+                None,
+            )
+            .expect("the reply seals");
+            (bytes, key, seq)
+        }
+
+        /// The hash the acceptor addresses its frames to — the initiator's.
+        fn to_a(&self) -> [u8; RECIPIENT_HASH_LEN] {
+            recipient_hash(self.a.signing.public_key()).unwrap()
+        }
+
+        /// Re-seal one of the acceptor's frames under the same honest key with
+        /// its decoded body edited.
+        ///
+        /// The only way to reach a field that lives inside the seal: a body a
+        /// key-holding peer composes is exactly what an attack on the binding
+        /// has to produce, and no public API will compose one.
+        fn reseal(&self, bytes: &[u8], key: &MessageKey, edit: BodyMutation) -> Vec<u8> {
+            let parsed = parse(bytes).expect("the honest frame parses");
+            let mut plaintext = open_envelope(
+                &aes_key(key).unwrap(),
+                &frame_aad(
+                    &[1u8; ROOT_LEN],
+                    Direction::BToA,
+                    &parsed.header,
+                    &parsed.eph_ek,
+                    parsed.eph_ct(),
+                ),
+                &parsed.sealed,
+            )
+            .expect("the honest frame opens");
+            let encoded = crate::dm::unpad(&plaintext).expect("padded").to_vec();
+            plaintext.zeroize();
+            let mut body = wire::DmChannelBody::decode(&encoded[..]).expect("decodes");
+            edit(&mut body);
+            let padded =
+                crate::dm::pad_to_bucket(&body.encode_to_vec(), PAD_BUCKETS).expect("fits");
+            let sealed = seal_envelope(
+                &aes_key(key).unwrap(),
+                &frame_aad(
+                    &[1u8; ROOT_LEN],
+                    Direction::BToA,
+                    &parsed.header,
+                    &parsed.eph_ek,
+                    parsed.eph_ct(),
+                ),
+                &padded,
+            )
+            .expect("re-seals");
+            wire::DmChannelFrame {
+                ratchet_gen: parsed.header.generation,
+                chain_base: parsed.header.chain_base,
+                seq: parsed.header.seq,
+                eph_ek: parsed.eph_ek.to_vec(),
+                eph_ct: parsed.eph_ct().map(|c| c.to_vec()).unwrap_or_default(),
+                sealed,
+            }
+            .encode_to_vec()
         }
     }
 
@@ -1857,6 +2290,44 @@ mod tests {
                 .open(&key, &[1u8; ROOT_LEN], dir, at, &rcpt, author)
                 .is_err()
         );
+
+        // **`msg_sig` is mandatory on the ACCEPTANCE too, and it is bound to
+        // the key the acceptance CARRIES.** This is the one frame whose author
+        // key is not known in advance, so the binding could be satisfied while
+        // the authorship signature was somebody else's: a genuine binding over
+        // a pseudonym, spliced onto a frame signed by a different one, would
+        // install a key its holder never proved possession of. The signature is
+        // what refuses it, and it refuses it as a signature failure — the
+        // binding above verified.
+        let mut q = pair();
+        let (accept, accept_key) = q.accept(None);
+        let other_pc = pseudonym(0xD7);
+        let other_pk = *other_pc.public_key();
+        let genuine_bind =
+            q.b.signing
+                .sign(&bind_lt_input(q.b.signing.public_key(), &other_pk))
+                .unwrap();
+        let swapped = q.reseal(
+            &accept,
+            &accept_key,
+            Box::new(move |b: &mut wire::DmChannelBody| {
+                b.pk_pc = other_pk.to_vec();
+                b.bind_lt = genuine_bind.to_vec();
+            }),
+        );
+        let verdict = parse(&swapped).unwrap().open_accept(
+            &accept_key,
+            &[1u8; ROOT_LEN],
+            Direction::BToA,
+            position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+            &q.to_a(),
+            q.b.signing.public_key(),
+        );
+        assert!(
+            matches!(verdict, Err(DmFrameError::Signature)),
+            "an acceptance signed under a key other than the one it carries must \
+             fail the authorship signature, got {verdict:?}"
+        );
     }
 
     /// Padding hides the message length: two different bodies in the same bucket
@@ -1937,6 +2408,43 @@ mod tests {
             WORST_CASE_SEALED_FRAME_LEN,
             "the measured worst-case frame moved; re-check OUTBOX_CAPACITY's headroom"
         );
+
+        // The ACCEPT is measured here too, because it is the one frame shape
+        // whose size is not a function of its body: an empty body plus a
+        // 2592-byte pseudonym and a 4627-byte binding lands it on the TOP rung
+        // regardless. That is what would silently move if either field grew, so
+        // it is pinned against the ladder rather than left to the body cap.
+        let mut q = pair();
+        let (accept, accept_key) = q.accept(None);
+        assert!(
+            accept.len() <= WORST_CASE_SEALED_FRAME_LEN,
+            "an acceptance is {} bytes against the measured worst case of \
+             {WORST_CASE_SEALED_FRAME_LEN}",
+            accept.len()
+        );
+
+        // Which rung, measured rather than inferred from the frame's length —
+        // a frame carries protobuf and ephemeral overhead the rung does not.
+        // An empty ORDINARY frame from the same chain is the control: it holds
+        // the same overhead and lands on the SMALLER rung, so the difference
+        // between the two sealed fields is exactly one step of the ladder.
+        let (plain, _, _) = q.b_send("");
+        let accept_sealed = parse(&accept).unwrap().sealed.len();
+        let plain_sealed = parse(&plain).unwrap().sealed.len();
+        assert_eq!(
+            accept_sealed - plain_sealed,
+            PAD_BUCKETS[1] - PAD_BUCKETS[0],
+            "an acceptance must sit one rung above an empty ordinary frame — \
+             {accept_sealed} against {plain_sealed}"
+        );
+        // ...and the control that the smaller of the two really is the smaller
+        // rung, without which the difference above is satisfied by both frames
+        // moving together.
+        assert!(
+            plain_sealed > PAD_BUCKETS[0] && plain_sealed < PAD_BUCKETS[1],
+            "an empty ordinary frame must sit on the 8192 rung, got {plain_sealed}"
+        );
+        let _ = accept_key;
     }
 
     /// A peer is not obliged to respect our compose-time body cap — it is the
@@ -1983,6 +2491,8 @@ mod tests {
             msg_sig: msg_sig.to_vec(),
             ack_high_water: None,
             ack_beyond: Vec::new(),
+            pk_pc: Vec::new(),
+            bind_lt: Vec::new(),
         }
         .encode_to_vec();
         let padded = crate::dm::pad_to_bucket(&encoded, PAD_BUCKETS).unwrap();
@@ -2060,6 +2570,63 @@ mod tests {
 
         // The position was not consumed, so the honest frame still arrives.
         assert_eq!(p.recv(&bytes).unwrap().body, "honest");
+
+        // **The same discipline on the ACCEPTANCE path**, which is a separate
+        // seam: `open_accept` runs as the closure of the INITIATOR's ratchet,
+        // and a forged acceptance must cost one refused open rather than the
+        // key that opens the real one. Without this, a forgery would consume
+        // sequence zero and the genuine acceptance behind it would come back as
+        // `AlreadyConsumed` — a conversation permanently unable to verify its
+        // correspondent, from one frame anybody able to write the page can
+        // plant.
+        let mut q = pair();
+        let (accept, key) = q.accept(None);
+        let stranger = pseudonym(0xC3);
+        let forged_sig = stranger
+            .sign(&bind_lt_input(stranger.public_key(), q.b_pc.public_key()))
+            .unwrap();
+        let forged = q.reseal(
+            &accept,
+            &key,
+            Box::new(move |b: &mut wire::DmChannelBody| b.bind_lt = forged_sig.to_vec()),
+        );
+        let rcpt = q.to_a();
+        let pk_lt_b = *q.b.signing.public_key();
+        let dir = q.init.recv_direction();
+        let at = position_of(FIRST_RECIPIENT_CHANNEL_SEQ);
+        let before = (q.init.generation(), q.init.losses());
+
+        let parsed = parse(&forged).unwrap();
+        let outcome = q
+            .init
+            .receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |k| {
+                parsed.open_accept(k, &[1u8; ROOT_LEN], dir, at, &rcpt, &pk_lt_b)
+            })
+            .expect("the ratchet accepts the position");
+        assert!(
+            matches!(outcome, Err(DmFrameError::Binding)),
+            "a forged acceptance must fail inside the closure, got {outcome:?}"
+        );
+        assert_eq!(
+            (q.init.generation(), q.init.losses()),
+            before,
+            "a forged acceptance must not move the initiator's ratchet"
+        );
+
+        // And the genuine acceptance, through the same seam, still installs.
+        let honest = parse(&accept).unwrap();
+        let installed = q
+            .init
+            .receive(honest.header(), honest.eph_ct(), honest.eph_ek(), |k| {
+                honest.open_accept(k, &[1u8; ROOT_LEN], dir, at, &rcpt, &pk_lt_b)
+            })
+            .expect("the ratchet accepts the position")
+            .expect("the honest acceptance opens");
+        assert_eq!(
+            installed.peer_pk_pc.as_slice(),
+            q.b_pc.public_key().as_slice(),
+            "the key sequence zero was holding must still be reachable"
+        );
     }
 
     /// A peer that signs one sequence number and writes the bytes into another
@@ -2501,6 +3068,8 @@ mod tests {
             msg_sig: Vec::new(),
             ack_high_water,
             ack_beyond: ack_beyond.to_vec(),
+            pk_pc: Vec::new(),
+            bind_lt: Vec::new(),
         };
 
         assert!(piggybacked_ack(&body(None, &[])).unwrap().is_none());
@@ -2698,5 +3267,500 @@ mod tests {
             !ours.is_settled(9),
             "a position we never sent must not become settled because a peer said so"
         );
+    }
+
+    // ---- the ACCEPT frame -------------------------------------------------
+    //
+    // The acceptor's first channel write. Every test below drives the real
+    // `seal_accept` → `parse` → `open_accept` path; nothing hands the initiator
+    // a pseudonym it did not read out of a frame.
+
+    /// T1. An initiator that holds only the long-term key it knocked at opens
+    /// the acceptance, gets the pseudonym, and can then open the acceptor's
+    /// ordinary frames with it.
+    ///
+    /// **The second half is what makes the first mean anything.** Installing a
+    /// key that nothing later verifies against would be satisfied by returning
+    /// any 2592 bytes. The reply at the next sequence is opened through the
+    /// ordinary `open`, under the installed key, with no binding fields in
+    /// sight — which is the steady state the acceptance exists to reach.
+    #[test]
+    fn an_accept_opens_with_no_prior_pseudonym_and_installs_it() {
+        let mut p = pair();
+        let (bytes, key) = p.accept(None);
+        let rcpt = p.to_a();
+        let parsed = parse(&bytes).unwrap();
+
+        let accepted = parsed
+            .open_accept(
+                &key,
+                &[1u8; ROOT_LEN],
+                Direction::BToA,
+                position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                &rcpt,
+                p.b.signing.public_key(),
+            )
+            .expect("the acceptance opens under the long-term key alone");
+        assert_eq!(
+            accepted.peer_pk_pc.as_slice(),
+            p.b_pc.public_key().as_slice(),
+            "the installed key must be the acceptor's pseudonym"
+        );
+        assert_eq!(accepted.frame.seq, FIRST_RECIPIENT_CHANNEL_SEQ);
+        assert_eq!(accepted.frame.body, "", "an acceptance carries no body");
+
+        // And the steady state: the acceptor's next frame is an ordinary one,
+        // opened under the key just installed.
+        let installed = accepted.peer_pk_pc;
+        let (reply, reply_key, seq) = p.b_send("and a reply");
+        assert_eq!(seq, FIRST_RECIPIENT_CHANNEL_SEQ + 1);
+        let verified = parse(&reply)
+            .unwrap()
+            .open(
+                &reply_key,
+                &[1u8; ROOT_LEN],
+                Direction::BToA,
+                position_of(seq),
+                &rcpt,
+                AuthorKeys {
+                    pc: &installed,
+                    lt: p.b.signing.public_key(),
+                },
+            )
+            .expect("the reply opens under the installed pseudonym");
+        assert_eq!(verified.body, "and a reply");
+    }
+
+    /// T2. A forged binding is refused, in both directions a forgery can point,
+    /// and the ratchet is left where it was.
+    ///
+    /// Two distinct forgeries, because they fail for different reasons and a
+    /// check that caught only one would look identical here:
+    ///
+    /// 1. A binding signed by some OTHER long-term key over the honest
+    ///    pseudonym — the attacker vouching for a key nobody asked them about.
+    /// 2. A genuine binding by the honest long-term key over a DIFFERENT
+    ///    pseudonym, spliced onto this frame. The signature is real; it just
+    ///    does not say what this frame claims it says.
+    ///
+    /// The second is the one a check that verified `bind_lt` without binding it
+    /// to the carried `pk_pc` would let through.
+    #[test]
+    fn a_forged_accept_binding_is_refused() {
+        let mut p = pair();
+        let (bytes, key) = p.accept(None);
+        let rcpt = p.to_a();
+        let before = (p.init.generation(), p.init.losses());
+
+        let stranger = pseudonym(0xC3);
+        let other_pc = pseudonym(0xD7);
+        let honest_pc = *p.b_pc.public_key();
+        let stranger_over_honest = stranger
+            .sign(&bind_lt_input(stranger.public_key(), &honest_pc))
+            .unwrap();
+        let honest_over_other =
+            p.b.signing
+                .sign(&bind_lt_input(
+                    p.b.signing.public_key(),
+                    other_pc.public_key(),
+                ))
+                .unwrap();
+
+        for (name, forged) in [
+            ("a binding by a third identity", stranger_over_honest),
+            ("a genuine binding over another key", honest_over_other),
+        ] {
+            let sig = forged;
+            let tampered = p.reseal(
+                &bytes,
+                &key,
+                Box::new(move |b: &mut wire::DmChannelBody| b.bind_lt = sig.to_vec()),
+            );
+            let verdict = parse(&tampered).unwrap().open_accept(
+                &key,
+                &[1u8; ROOT_LEN],
+                Direction::BToA,
+                position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                &rcpt,
+                p.b.signing.public_key(),
+            );
+            assert!(
+                matches!(verdict, Err(DmFrameError::Binding)),
+                "{name} must be refused as a binding failure, got {verdict:?}"
+            );
+        }
+        assert_eq!(
+            (p.init.generation(), p.init.losses()),
+            before,
+            "a refused acceptance must not move the initiator's ratchet"
+        );
+
+        // The control on the whole fixture: the UNforged acceptance still
+        // opens. Without it every assertion above is satisfied by an
+        // `open_accept` that refuses everything.
+        assert!(
+            parse(&bytes)
+                .unwrap()
+                .open_accept(
+                    &key,
+                    &[1u8; ROOT_LEN],
+                    Direction::BToA,
+                    position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                    &rcpt,
+                    p.b.signing.public_key(),
+                )
+                .is_ok(),
+            "the honest acceptance must still open, or the refusals prove nothing"
+        );
+    }
+
+    /// T3. Once a pseudonym is installed, a frame carrying a DIFFERENT one is
+    /// refused — and refused as a pinning violation, before any signature is
+    /// looked at.
+    ///
+    /// The rotation an attacker wants is not a forged signature: it is a second
+    /// key, correctly signed under itself, presented as though the conversation
+    /// had moved on. `msg_sig` cannot catch that on its own, because a frame
+    /// signed under the new key verifies perfectly against the new key.
+    #[test]
+    fn a_second_accept_with_a_different_pseudonym_is_refused() {
+        let mut p = pair();
+        let (accept_bytes, accept_key) = p.accept(None);
+        let rcpt = p.to_a();
+        let installed = parse(&accept_bytes)
+            .unwrap()
+            .open_accept(
+                &accept_key,
+                &[1u8; ROOT_LEN],
+                Direction::BToA,
+                position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                &rcpt,
+                p.b.signing.public_key(),
+            )
+            .expect("the first acceptance opens")
+            .peer_pk_pc;
+
+        // A second frame carrying a second pseudonym, bound genuinely by the
+        // same long-term identity — so nothing about it is forged.
+        let rotated = pseudonym(0xE9);
+        let rotated_pk = *rotated.public_key();
+        let rotated_bind =
+            p.b.signing
+                .sign(&bind_lt_input(p.b.signing.public_key(), &rotated_pk))
+                .unwrap();
+        let (reply, reply_key, seq) = p.b_send("rotated under you");
+        let tampered = p.reseal(
+            &reply,
+            &reply_key,
+            Box::new(move |b: &mut wire::DmChannelBody| {
+                b.pk_pc = rotated_pk.to_vec();
+                b.bind_lt = rotated_bind.to_vec();
+            }),
+        );
+
+        let verdict = parse(&tampered).unwrap().open(
+            &reply_key,
+            &[1u8; ROOT_LEN],
+            Direction::BToA,
+            position_of(seq),
+            &rcpt,
+            AuthorKeys {
+                pc: &installed,
+                lt: p.b.signing.public_key(),
+            },
+        );
+        assert!(
+            matches!(verdict, Err(DmFrameError::PseudonymMismatch)),
+            "a rotated pseudonym must be refused as a pinning violation, got {verdict:?}"
+        );
+    }
+
+    /// T4. A reply that is not an acceptance is refused as unverifiable, never
+    /// quietly accepted.
+    ///
+    /// Three shapes, one for each way a frame can fail to be an acceptance, and
+    /// the errors are deliberately different: an ordinary body at the right
+    /// position carries no binding at all (a peer that replied without
+    /// accepting), while the wrong sequence and the wrong direction are not
+    /// positions an acceptance can occupy at all.
+    #[test]
+    fn a_reply_before_any_accept_is_refused_not_accepted() {
+        let mut p = pair();
+        // An ordinary frame at the acceptor's sequence zero: the acceptor
+        // composed a message instead of accepting.
+        let out = p.recip.send_next().unwrap();
+        assert_eq!(out.header.seq, FIRST_RECIPIENT_CHANNEL_SEQ);
+        let key = out.key.clone();
+        let rcpt = p.to_a();
+        let plain = seal(
+            out,
+            &[1u8; ROOT_LEN],
+            &p.b_pc,
+            p.b.signing.public_key(),
+            &rcpt,
+            SENT,
+            "no acceptance here",
+            None,
+        )
+        .unwrap();
+        let parsed = parse(&plain).unwrap();
+        assert!(
+            matches!(
+                parsed.open_accept(
+                    &key,
+                    &[1u8; ROOT_LEN],
+                    Direction::BToA,
+                    position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                    &rcpt,
+                    p.b.signing.public_key(),
+                ),
+                Err(DmFrameError::MissingBinding)
+            ),
+            "an ordinary body at sequence zero must be refused as unverifiable"
+        );
+        // ...and the wrong direction, on the same bytes.
+        assert!(matches!(
+            parsed.open_accept(
+                &key,
+                &[1u8; ROOT_LEN],
+                Direction::AToB,
+                position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                &rcpt,
+                p.b.signing.public_key(),
+            ),
+            Err(DmFrameError::NotAccept { seq: 0 })
+        ));
+
+        // A genuine acceptance body, presented at sequence one.
+        let (later, later_key, seq) = p.b_send("later");
+        assert_eq!(seq, FIRST_RECIPIENT_CHANNEL_SEQ + 1);
+        assert!(matches!(
+            parse(&later).unwrap().open_accept(
+                &later_key,
+                &[1u8; ROOT_LEN],
+                Direction::BToA,
+                position_of(seq),
+                &rcpt,
+                p.b.signing.public_key(),
+            ),
+            Err(DmFrameError::NotAccept { seq: 1 })
+        ));
+
+        // **HALF a binding is not a binding, and neither half alone may be
+        // skipped.** The presence test is `pk_pc` non-empty OR `bind_lt`
+        // non-empty, and the reason it is `||` rather than `&&` is exactly
+        // these two shapes: under `&&` a body carrying a pseudonym with NO
+        // binding takes the never-carried-one path, the check that would
+        // demand the binding never runs, and `msg_sig` — which the sender
+        // signs under whatever key it also wrote into `pk_pc` — then verifies
+        // against it. That installs a pseudonym nobody vouched for. Both
+        // one-sided shapes are refused, through BOTH doors, because `open` and
+        // `open_accept` reach the check by different routes.
+        let mut q = pair();
+        let (accept, accept_key) = q.accept(None);
+        let honest_pc = *q.b_pc.public_key();
+        let to_a = q.to_a();
+        for (name, edit) in [
+            (
+                "a pseudonym with no binding",
+                Box::new(|b: &mut wire::DmChannelBody| b.bind_lt = Vec::new()) as BodyMutation,
+            ),
+            (
+                "a binding over no pseudonym",
+                Box::new(|b: &mut wire::DmChannelBody| b.pk_pc = Vec::new()) as BodyMutation,
+            ),
+        ] {
+            let half = q.reseal(&accept, &accept_key, edit);
+            let parsed = parse(&half).expect("a half-bound body still parses");
+
+            let by_accept = parsed.open_accept(
+                &accept_key,
+                &[1u8; ROOT_LEN],
+                Direction::BToA,
+                position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                &to_a,
+                q.b.signing.public_key(),
+            );
+            assert!(
+                matches!(
+                    by_accept,
+                    Err(DmFrameError::FieldLength { actual: 0, .. })
+                        | Err(DmFrameError::MissingBinding)
+                ),
+                "{name} must be refused by open_accept, got {by_accept:?}"
+            );
+
+            let by_open = parsed.open(
+                &accept_key,
+                &[1u8; ROOT_LEN],
+                Direction::BToA,
+                position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                &to_a,
+                AuthorKeys {
+                    pc: &honest_pc,
+                    lt: q.b.signing.public_key(),
+                },
+            );
+            assert!(
+                matches!(by_open, Err(DmFrameError::FieldLength { actual: 0, .. })),
+                "{name} must be refused by open, got {by_open:?}"
+            );
+        }
+
+        // The control on both loops: the UNedited acceptance still opens
+        // through both doors, so the refusals above are about the missing half
+        // and not about the fixture.
+        let parsed = parse(&accept).unwrap();
+        assert!(
+            parsed
+                .open_accept(
+                    &accept_key,
+                    &[1u8; ROOT_LEN],
+                    Direction::BToA,
+                    position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                    &to_a,
+                    q.b.signing.public_key(),
+                )
+                .is_ok(),
+            "the whole acceptance must still open"
+        );
+        assert!(
+            parsed
+                .open(
+                    &accept_key,
+                    &[1u8; ROOT_LEN],
+                    Direction::BToA,
+                    position_of(FIRST_RECIPIENT_CHANNEL_SEQ),
+                    &to_a,
+                    AuthorKeys {
+                        pc: &honest_pc,
+                        lt: q.b.signing.public_key(),
+                    },
+                )
+                .is_ok(),
+            "the whole acceptance must also open through the ordinary door"
+        );
+    }
+
+    /// T5. An ordinary frame carries neither binding field, and the check that
+    /// reads them fires only when they are there.
+    ///
+    /// The mutation is the half that matters. "Both fields are empty" alone is
+    /// satisfied by an `open` that never looks at them — so the same frame is
+    /// re-sealed with a garbage `bind_lt` and must now be refused, which is
+    /// only possible if the presence test is what gates the check.
+    #[test]
+    fn the_binding_fields_are_absent_on_an_ordinary_frame() {
+        let mut p = pair();
+        let (bytes, key) = p.send_keyed("an ordinary message");
+        let parsed = parse(&bytes).unwrap();
+        let dir = p.recip.recv_direction();
+        let rcpt = recipient_hash(p.b.signing.public_key()).unwrap();
+        let author = AuthorKeys {
+            pc: p.a_pc.signing.public_key(),
+            lt: p.a.signing.public_key(),
+        };
+        let at = position_of(parsed.header().seq);
+
+        // The body an ordinary `seal` produced carries neither field.
+        let verified = parsed
+            .open(&key, &[1u8; ROOT_LEN], dir, at, &rcpt, author)
+            .expect("an ordinary frame opens");
+        assert_eq!(verified.body, "an ordinary message");
+        let mut plaintext = open_envelope(
+            &aes_key(&key).unwrap(),
+            &frame_aad(
+                &[1u8; ROOT_LEN],
+                dir,
+                parsed.header(),
+                parsed.eph_ek(),
+                parsed.eph_ct(),
+            ),
+            &parsed.sealed,
+        )
+        .unwrap();
+        let encoded = crate::dm::unpad(&plaintext).unwrap().to_vec();
+        plaintext.zeroize();
+        let mut decoded = wire::DmChannelBody::decode(&encoded[..]).unwrap();
+        assert!(decoded.pk_pc.is_empty(), "pk_pc must be absent");
+        assert!(decoded.bind_lt.is_empty(), "bind_lt must be absent");
+
+        // The mutation: a garbage binding on the same ordinary frame. The check
+        // must now fire, which proves the emptiness above is what skipped it.
+        decoded.pk_pc = p.a_pc.signing.public_key().to_vec();
+        decoded.bind_lt = vec![0xAA; ml_dsa::SIG_LEN];
+        let padded = crate::dm::pad_to_bucket(&decoded.encode_to_vec(), PAD_BUCKETS).unwrap();
+        let sealed = seal_envelope(
+            &aes_key(&key).unwrap(),
+            &frame_aad(
+                &[1u8; ROOT_LEN],
+                dir,
+                parsed.header(),
+                parsed.eph_ek(),
+                parsed.eph_ct(),
+            ),
+            &padded,
+        )
+        .unwrap();
+        let tampered = wire::DmChannelFrame {
+            ratchet_gen: parsed.header().generation,
+            chain_base: parsed.header().chain_base,
+            seq: parsed.header().seq,
+            eph_ek: parsed.eph_ek().to_vec(),
+            eph_ct: parsed.eph_ct().map(|c| c.to_vec()).unwrap_or_default(),
+            sealed,
+        }
+        .encode_to_vec();
+        let verdict =
+            parse(&tampered)
+                .unwrap()
+                .open(&key, &[1u8; ROOT_LEN], dir, at, &rcpt, author);
+        assert!(
+            matches!(verdict, Err(DmFrameError::Binding)),
+            "a non-empty binding on an ordinary frame must be checked, got {verdict:?}"
+        );
+    }
+
+    /// T6. A frame that re-states the binding already installed opens.
+    ///
+    /// The pinning check refuses a DIFFERENT key, not a repeated one. A peer
+    /// that carried its binding on more than the acceptance would otherwise be
+    /// cut off after its first frame — and this is the assertion that would
+    /// fail if the check were written as "any binding after the first is a
+    /// violation".
+    #[test]
+    fn a_reused_binding_is_idempotent_under_open() {
+        let mut p = pair();
+        let honest_pc = *p.b_pc.public_key();
+        let honest_bind =
+            p.b.signing
+                .sign(&bind_lt_input(p.b.signing.public_key(), &honest_pc))
+                .unwrap();
+        let rcpt = p.to_a();
+        let (reply, reply_key, seq) = p.b_send("stated again");
+        let restated = p.reseal(
+            &reply,
+            &reply_key,
+            Box::new(move |b: &mut wire::DmChannelBody| {
+                b.pk_pc = honest_pc.to_vec();
+                b.bind_lt = honest_bind.to_vec();
+            }),
+        );
+
+        let verified = parse(&restated)
+            .unwrap()
+            .open(
+                &reply_key,
+                &[1u8; ROOT_LEN],
+                Direction::BToA,
+                position_of(seq),
+                &rcpt,
+                AuthorKeys {
+                    pc: &honest_pc,
+                    lt: p.b.signing.public_key(),
+                },
+            )
+            .expect("a frame restating the installed binding must open");
+        assert_eq!(verified.body, "stated again");
     }
 }

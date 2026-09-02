@@ -256,14 +256,26 @@ pub enum DmEvent {
         /// ordinary input — the correspondent's own writes are what the
         /// authorship signature separates from everybody else's.
         unopenable: u64,
-        /// Sweeps skipped because the correspondent's pseudonym key is not
-        /// known here, so nothing found could be verified.
+        /// Unsettled positions left alone, once each per sweep that saw them,
+        /// because the correspondent's pseudonym key is not known here yet.
+        ///
+        /// **Per observation, not per distinct frame.** A position refused this
+        /// way stays unsettled by design, so the next sweep of that page offers
+        /// it again and counts it again: one stuck frame across four sweeps is
+        /// four. That is the useful reading — the counter is a rate, and a
+        /// rising one says how much traffic is waiting on an acceptance that
+        /// has not arrived, where a de-duplicated count would flatten a
+        /// conversation stalled for an hour into the same number as one stalled
+        /// for a second.
         ///
         /// The acceptor learns the initiator's pseudonym from the knock; the
-        /// initiator learns nothing of the acceptor's, because no frame carries
-        /// it and the resume record that homes it (A4.8 / A9.2) cannot be
-        /// written until the channel has re-established once. So an initiator
-        /// does not sweep at all, and this counter is the only statement of it.
+        /// initiator learns the acceptor's from the acceptance — the acceptor's
+        /// channel sequence zero, whose sealed body carries the key and the
+        /// long-term binding that vouches for it. An initiator therefore sweeps
+        /// from the start, opens that one position, and refuses everything
+        /// above it as *pending* until the acceptance lands: the slot is left
+        /// unsettled and the next sweep retries it. This counter is what
+        /// separates a conversation waiting on its acceptance from an idle one.
         peer_pseudonym_unknown: u64,
         /// Piggybacked acknowledgements carried by frames this session opened
         /// and did not fold.

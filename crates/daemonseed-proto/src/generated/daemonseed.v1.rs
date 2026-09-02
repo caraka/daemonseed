@@ -982,6 +982,20 @@ pub struct DmChannelBody {
     /// no second signature rides with it.
     #[prost(bytes = "vec", tag = "5")]
     pub ack_beyond: ::prost::alloc::vec::Vec<u8>,
+    /// The acceptor's per-contact pseudonym key, exactly 2592 bytes. Present only
+    /// on the acceptor's ACCEPT — the frame at its sequence zero, the first thing
+    /// written to the channel itself — and empty on every other frame. It is the
+    /// key the initiator verifies every later frame of this conversation against;
+    /// nothing else on the channel carries a pseudonym.
+    #[prost(bytes = "vec", tag = "6")]
+    pub pk_pc: ::prost::alloc::vec::Vec<u8>,
+    /// ML-DSA-87 signature, exactly 4627 bytes, under the acceptor's LONG-TERM key
+    /// over the `daemonseed/dm/bind/lt/v1` preimage `lp(pk_lt) || lp(pk_pc)` — the
+    /// same statement and the same domain a first-contact entry carries in the
+    /// other direction. Present exactly when `pk_pc` is, and verified against the
+    /// long-term key the initiator knocked at.
+    #[prost(bytes = "vec", tag = "7")]
+    pub bind_lt: ::prost::alloc::vec::Vec<u8>,
 }
 /// Which key an initiator encapsulated `ss0` to when opening a conversation.
 ///

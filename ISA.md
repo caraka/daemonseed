@@ -858,6 +858,22 @@ route taken to reach a decision are not recorded here — the git history and `C
   a guessed key. A piggybacked acknowledgement inside a received frame is counted and not yet
   folded into the outbox.
 
+- **The acceptor's first reply is an ordinary channel frame whose sealed body carries the
+  acceptor's pseudonym verifying key and its long-term binding.** A distinct frame kind was refused:
+  it needs a second signature preimage and breaks the known-answer tests for nothing a co-hosting
+  node cannot already read off the frame's position. The binding reuses the long-term-binding
+  domain, symmetric with the initiator's first-contact entry, because the conversation, direction
+  and sequence are already bound by the message signature; a new label would bind them twice. The
+  cost is two optional fields on every channel frame, empty except at the acceptor's sequence zero.
+
+- **The initiator establishes its key schedule on a verified acceptance, not when it composes its
+  first contact.** The handshake record therefore survives the window between composing and
+  acceptance, which is the window a re-establishment after a restart needs. Deriving the key
+  schedule from the record without consuming it, and committing separately, is what lets the
+  acceptance be opened before anything is erased; a failed open leaves the record, the derived
+  schedule and the swept slot untouched. The cost is one extra copy of the ephemeral decapsulation
+  key, held for the acceptance window and wiped after.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the

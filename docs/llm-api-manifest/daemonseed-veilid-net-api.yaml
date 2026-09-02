@@ -368,8 +368,22 @@ types:
       Send{to,body}, Accept{request}, Decline{request}, Block{pk_lt},
       Unblock{pk_lt}, Surfaced{to,seqs}, Shutdown. FirstContact fetches the
       recipient's key record, mints the entry off the loop, writes the provisional
-      record and publishes the knock; Accept establishes through
-      DmPersist::accept_first_contact; Decline persists nothing; Block and Unblock
+      record and publishes the knock, keeping that record until a verified
+      acceptance; Accept establishes through
+      DmPersist::accept_first_contact and, in the same call, seals the acceptance
+      with frame::seal_accept and queues it at channel sequence zero, reported as
+      Delivery{seq: 0, state: Composed}; a full outbox refuses it with
+      RefusalReason::OutboxFull{needed} before the sequence is spent.
+      A refused acceptance emits Delivery{seq: 0, state: Undelivered} plus a
+      Refused naming the reason, emitted once per distinct reason, and is
+      retried on the idle cadence while the acceptor's sequence zero is unspent.
+      A provisional record the erase could not reach is retried on later ticks
+      rather than dropped. Accept also erases any provisional
+      record this side held for the same identity, and a mint is refused with
+      RefusalReason::AlreadyEstablished when the correspondence already carries
+      the correspondent's pseudonym — together these are what a mutual knock
+      needs so no provisional record is stranded.
+      Decline persists nothing; Block and Unblock
       write the block list, and a refused 513th entry surfaces as
       DmEvent::BlockListFull. Send seals on an established channel: the outbox is
       priced against frame::WORST_CASE_SEALED_FRAME_LEN before the ratchet steps,
@@ -403,8 +417,10 @@ types:
       accounting, cumulative for the session and emitted only when a counter
       moves; already_consumed is reachable only through the TooManyRuns retry
       path, since a settled position is filtered out before the ratchet sees it,
-      and peer_pseudonym_unknown says an initiator swept nothing because no frame
-      carries the acceptor's pseudonym. Refused covers a channel send as well as
+      and peer_pseudonym_unknown counts unsettled positions an initiator left
+      alone because they sit at a sequence above the acceptance and no pseudonym
+      is installed yet — once per sweep that saw them, so a position stuck across
+      four sweeps counts four. Refused covers a channel send as well as
       a first contact, and Refused
       carries a RefusalReason and AcceptFailed an AcceptFailure; ChannelLost
       carries the surfaced sequence numbers the user is owed; DoorbellHealth

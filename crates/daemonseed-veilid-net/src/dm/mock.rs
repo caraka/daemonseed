@@ -8,8 +8,10 @@
 //!
 //! The log records **non-secret projections only**. An address carries the
 //! conversation's write capability as a zeroizing seed, and
-//! `DmPageAddress::with_owner_seed` is the one way to reach it; nothing here calls
-//! it, so a recorded call can be compared without a secret leaving the address.
+//! `DmPageAddress::with_owner_seed` is the one way to reach it. The two calls
+//! that do reach it — the page store's writer and its reader — hash the seed
+//! inside the closure and key [`MockNetwork`] on the digest, so the seed never
+//! leaves the address and no [`MockCall`] carries one.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use daemonseed_core::dm::ack_record::DmAckAddress;
+use daemonseed_core::dm::doorbell::DOORBELL_SLOTS;
 use daemonseed_core::dm::paging::{
     DmPageAddress, PagePosition, Receiving, Sending, DM_PAGE_OWNER_SEED_LEN, PAGE_SLOTS,
 };
@@ -111,15 +114,22 @@ pub(crate) enum MockCall {
 /// is not distinguishable from the first, and a sweep after either returns one
 /// entry rather than two.
 ///
-/// Pages are keyed by the record-owner seed both ends derive, which is the only
-/// thing that identifies one record to two parties who never exchange an
-/// address. It is reached through `DmPageAddress::with_owner_seed` and stays
-/// inside this map: nothing puts it in [`MockCall`], so the log is still a
-/// non-secret projection.
+/// Pages are keyed by a digest of the record-owner seed both ends derive, which
+/// is the only thing that identifies one record to two parties who never
+/// exchange an address. The seed is reached through
+/// `DmPageAddress::with_owner_seed` and hashed inside that closure, so no plain
+/// copy of it outlives the call and nothing puts one in [`MockCall`].
 #[derive(Default)]
 pub(crate) struct MockNetwork {
-    /// Page records, by the owner seed both ends derive.
-    pages: Mutex<BTreeMap<[u8; DM_PAGE_OWNER_SEED_LEN], Slots>>,
+    /// Page records, keyed by a digest of the owner seed both ends derive.
+    ///
+    /// **The digest rather than the seed, because the seed is a zeroizing
+    /// secret.** `DmPageAddress::with_owner_seed` hands it out under a closure
+    /// precisely so it is not copied into a plain buffer, and a `BTreeMap` key
+    /// is exactly such a buffer — it outlives every address, is never wiped,
+    /// and is the conversation's write capability. Hashing inside the closure
+    /// keeps the copy to a value that opens nothing. See [`page_key`].
+    pages: Mutex<BTreeMap<PageKey, Slots>>,
     /// Doorbell records, by the owner seed a sender derives from a public key.
     doorbells: Mutex<BTreeMap<[u8; 32], Slots>>,
 }
@@ -127,6 +137,27 @@ pub(crate) struct MockNetwork {
 /// One record's populated subkeys: slot index to whatever was last written to
 /// it.
 type Slots = BTreeMap<u16, Vec<u8>>;
+
+/// What [`MockNetwork::pages`] is keyed on: a digest of a page owner seed.
+type PageKey = u64;
+
+/// Hash one page owner seed into a map key.
+///
+/// **A non-cryptographic hash is the right tool here and the reason is what it
+/// is NOT used for.** Nothing reads this key back as a secret, derives from it,
+/// or presents it as evidence — it exists so two addresses over one record land
+/// in the same bucket. The property needed is that distinct seeds land in
+/// distinct buckets, and `DefaultHasher` is deterministic within a process with
+/// fixed keys, so an oracle holding a handful of conversations is nowhere near
+/// a collision. The property deliberately NOT claimed is preimage resistance:
+/// this is a test double, and a seed that must not be recoverable is one that
+/// should not have been copied at all — which is the point of hashing it.
+fn page_key(seed: &[u8; DM_PAGE_OWNER_SEED_LEN]) -> PageKey {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut h);
+    h.finish()
+}
 
 impl MockNetwork {
     /// A network nobody has written to.
@@ -286,7 +317,7 @@ impl MockDht {
             .push_back(DoorbellSweep {
                 slots,
                 outcome: SweepOutcome {
-                    attempted: 32,
+                    attempted: u32::from(DOORBELL_SLOTS),
                     failed: 0,
                     found,
                 },
@@ -426,7 +457,7 @@ impl DmDht for MockDht {
                 DoorbellSweep {
                     slots,
                     outcome: SweepOutcome {
-                        attempted: 32,
+                        attempted: u32::from(DOORBELL_SLOTS),
                         failed: 0,
                         found,
                     },
@@ -479,7 +510,7 @@ impl DmDht for MockDht {
                     .pages
                     .lock()
                     .expect("mock pages")
-                    .entry(*seed)
+                    .entry(page_key(seed))
                     .or_default()
                     .insert(at.slot(), frame.clone());
             });
@@ -513,7 +544,7 @@ impl DmDht for MockDht {
                 .pages
                 .lock()
                 .expect("mock pages")
-                .get(seed)
+                .get(&page_key(seed))
                 .cloned()
                 .unwrap_or_default()
         });

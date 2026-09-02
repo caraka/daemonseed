@@ -1698,12 +1698,18 @@ mod tests {
         let labels = store.store().correspondences().expect("list");
         assert_eq!(labels.len(), 1, "one correspondence was established");
 
-        // **The provisional record was written and then consumed.** It is the
-        // only public road from a stored record to a key schedule, and taking it
-        // deletes the record in the same act — so its absence here is the
-        // evidence that the initiator's ratchet opened, and a driver that
-        // skipped the persist would have had nothing to open and would have
-        // refused instead.
+        // **The provisional record was written and SURVIVES the mint.** The
+        // frozen design keeps `{ss0, the opening ephemeral DK}` on disk until
+        // the acceptance is processed, because without the ephemeral DK this
+        // side cannot decapsulate the acceptor's first generation ciphertext —
+        // so consuming it here would strand the channel on any restart in the
+        // knock-to-acceptance window. Its erasure is a verified acceptance's
+        // job and is asserted where that happens
+        // (`two_drivers_carry_a_round_trip_end_to_end_exactly_once`).
+        //
+        // Its PRESENCE is still the evidence the persist ran: a driver that
+        // skipped it would have had nothing to derive a ratchet from and would
+        // have refused rather than published.
         assert!(
             store
                 .store()
@@ -1712,8 +1718,8 @@ mod tests {
                     daemonseed_core::storage::dm_store::RecordKind::Provisional
                 )
                 .expect("read")
-                .is_none(),
-            "the provisional record outlived the establishment that consumes it"
+                .is_some(),
+            "the mint consumed the record the acceptance window needs"
         );
 
         // Sequence zero is in the outbox, carrying the bytes that were
@@ -2026,13 +2032,16 @@ mod tests {
     /// count is what separates "the re-seed was seen and skipped" from "the
     /// re-sweep never happened".
     ///
-    /// **The reply direction is asserted as the gap it is.** A channel frame
-    /// carries no pseudonym key and nothing else transmits one, so an initiator
-    /// cannot verify a reply and does not sweep for it. That is stated here
-    /// rather than left out, so the day a pseudonym does reach the initiator
-    /// this test fails and says which assertion to change.
+    /// **Both directions, and the reply direction is the harder one.** A
+    /// channel frame carries no pseudonym key, so A cannot verify anything B
+    /// writes until B's ACCEPT — the acceptor's own sequence zero, whose sealed
+    /// body carries `PK_pc_B` and its long-term binding — reaches A by sweep.
+    /// The round trip below is therefore not symmetric: A→B needs only the
+    /// knock; B→A needs the acceptance to have landed, been verified against
+    /// the key A knocked at, and installed. Every step of that runs here for
+    /// real.
     #[tokio::test(start_paused = true)]
-    async fn two_drivers_carry_one_message_end_to_end_exactly_once() {
+    async fn two_drivers_carry_a_round_trip_end_to_end_exactly_once() {
         let dir_a = tempfile::tempdir().expect("temp dir A");
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let wall = Arc::new(AtomicI64::new(BASE_MS));
@@ -2048,6 +2057,7 @@ mod tests {
 
         let probe_a = Arc::new(DmDriverProbe::new());
         let probe_b = Arc::new(DmDriverProbe::new());
+        let store_a = DmPersist::open(dir_a.path().join("dm"), &AT_REST).expect("persist A");
         let store_b = DmPersist::open(dir_b.path().join("dm"), &AT_REST).expect("persist B");
         let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
             parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
@@ -2072,6 +2082,24 @@ mod tests {
             dht_a.count(Method::PublishDoorbell),
             1,
             "A must have written the knock into the shared store"
+        );
+        // **A's provisional record survives its own knock.** The context is
+        // proven correct by the fact that it resumes here, which is what makes
+        // the same read after the acceptance mean something.
+        let label_a = only_label(&store_a);
+        let keyrec_addr = *keyrec::derive_owner_seed(b_keys.signing.public_key())
+            .expect("keyrec seed")
+            .as_bytes();
+        let ctx_a = daemonseed_core::dm::provisional::RecordContext {
+            recipient_keyrec_addr: &keyrec_addr,
+            fc_epoch: keyrec::fc_epoch(u64::try_from(BASE_MS / 1000).unwrap_or(0)),
+        };
+        assert!(
+            matches!(
+                store_a.restart_channel(&label_a, &ctx_a),
+                daemonseed_core::dm::persist::StoredChannelRestart::HandshakeResumes(_)
+            ),
+            "A consumed the record the acceptance window needs"
         );
 
         // ── B sweeps its doorbell and is offered the request ─────────────────
@@ -2165,7 +2193,50 @@ mod tests {
              nothing unopenable"
         );
 
-        // ── B replies, and A cannot verify it ────────────────────────────────
+        let b_ack_health = last_health(&collected).expect("B must report its channel health");
+        assert!(
+            b_ack_health.4 > 0,
+            "A's message must have carried a piggybacked acknowledgement for B to \
+             defer, got {b_ack_health:?}"
+        );
+
+        // ── A collects B's ACCEPT and installs the pseudonym ─────────────────
+        //
+        // **Nothing here was sent by a command.** B's acceptance was composed
+        // by the accept above, published by B's own cadence, and swept by A's
+        // — so what A opens is the frame B's `seal_accept` wrote, under a key
+        // A's ratchet derived, verified against the long-term key A knocked at
+        // and nothing else. It surfaces as a message at sequence zero with an
+        // empty body, which is the acceptance's shape.
+        for _ in 0..3 {
+            cadence(&wall).await;
+        }
+        let accepted = drain(&mut evt_a);
+        assert_eq!(
+            messages(&accepted),
+            vec![(0, String::new())],
+            "A must collect B's acceptance at sequence zero: {accepted:?}"
+        );
+        assert!(
+            dht_a.count(Method::SweepPage) >= 1,
+            "A must actually have swept, or the acceptance above is vacuous"
+        );
+        // **The record the acceptance window existed for is gone**, and only
+        // now — the same read resumed before the knock's reply arrived.
+        assert!(
+            matches!(
+                store_a.restart_channel(&label_a, &ctx_a),
+                daemonseed_core::dm::persist::StoredChannelRestart::TornDown(_)
+            ),
+            "A's provisional record survived a verified acceptance"
+        );
+
+        // ── B replies, and A can now verify it ───────────────────────────────
+        //
+        // The other half of the round trip, and the half that was unreachable
+        // before the acceptance: A verifies this frame under the pseudonym it
+        // just installed, so a break anywhere from `seal_accept` through
+        // `open_accept` to the pinned `open` lands here.
         handle_b
             .send(DmCommand::Send {
                 to: Box::new(*a_keys.signing.public_key()),
@@ -2179,24 +2250,19 @@ mod tests {
         let a_events = drain(&mut evt_a);
         assert_eq!(
             messages(&a_events),
-            Vec::new(),
-            "A opened a frame it has no key to verify: {a_events:?}"
+            vec![(1, "and a reply".to_string())],
+            "A must recover exactly B's reply, once, with its exact body: {a_events:?}"
         );
-        let b_ack_health = last_health(&collected).expect("B must report its channel health");
         assert!(
-            b_ack_health.4 > 0,
-            "A's message must have carried a piggybacked acknowledgement for B to \
-             defer, got {b_ack_health:?}"
+            dht_b.count(Method::PublishPage) >= 2,
+            "B must have written both its acceptance and its reply"
         );
         let a_health = last_health(&a_events).expect("A must report its channel health");
-        assert!(
-            a_health.3 > 0,
-            "A must say why it swept nothing — the acceptor's pseudonym never \
-             reaches it — got {a_health:?}"
-        );
-        assert!(
-            dht_b.count(Method::PublishPage) >= 1,
-            "B's reply must actually have been written, or A's silence proves nothing"
+        assert_eq!(
+            (a_health.0, a_health.2),
+            (0, 0),
+            "A's collection must report no partial sweep and nothing unopenable \
+             once the pseudonym is installed, got {a_health:?}"
         );
         // And B's own record still holds one correspondence, so the reply went
         // out on the channel rather than establishing a second one.
@@ -2691,10 +2757,14 @@ mod tests {
         .await;
         cadence(&wall).await;
         let events = drain(&mut evt_b);
+        // **Two entries, not one.** Sequence zero is the acceptance the accept
+        // itself queued, and sequence one is the message sent above; B's page
+        // writes never land, so both cross the window. An acceptance is an
+        // outbox entry like any other and gives up on the same ladder.
         assert_eq!(
             undelivered(&events),
-            vec![0],
-            "the acceptor's first channel message crossed the window: {events:?}"
+            vec![0, 1],
+            "the acceptor's acceptance and first message crossed the window: {events:?}"
         );
 
         // Still owed in the record: the user has not answered yet.
@@ -2704,7 +2774,7 @@ mod tests {
                 .expect("the outbox reads")
                 .expect("the outbox exists")
                 .owed_surfacings(),
-            vec![0],
+            vec![0, 1],
             "the sweep cleared the durable flag before the user was told (#279)"
         );
 
@@ -2736,7 +2806,7 @@ mod tests {
         let restarted = drain(&mut evt_b2);
         assert_eq!(
             undelivered(&restarted),
-            vec![0],
+            vec![0, 1],
             "a crash between the give-up and the user seeing it lost the \
              notification: {restarted:?}"
         );
@@ -2745,7 +2815,7 @@ mod tests {
         handle_b2
             .send(DmCommand::Surfaced {
                 to: Box::new(*a_keys.signing.public_key()),
-                seqs: vec![0],
+                seqs: vec![0, 1],
             })
             .await
             .expect("surfaced");

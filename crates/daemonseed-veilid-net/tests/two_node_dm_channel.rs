@@ -544,3 +544,299 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
         second_at.slot()
     );
 }
+
+/// The acceptor's ACCEPT over the real network: B's first reply installs its
+/// pseudonym at the initiator, and every later frame of B's direction opens
+/// under it (#236).
+///
+/// ## What this reaches that no in-process test does
+///
+/// The initiator's whole problem is that it holds nothing to verify B against:
+/// a channel frame carries no pseudonym key, page owner-write authority is
+/// symmetric, and the message key comes from a secret both ends share. The
+/// ACCEPT is the one frame that closes that, and it closes it *through the
+/// wire* — so the properties this oracle can see and a unit test cannot are:
+///
+/// 1. **The acceptance occupies the acceptor's sequence zero, and `open_accept`
+///    is given the position the bytes were READ from.** Locally the caller
+///    passes its own value back to itself; here the position is reconstructed
+///    on the far side of a real sweep, so an implementation that trusted the
+///    frame's own claim about which position it occupies fails.
+/// 2. **The pseudonym A installs is the one B's `seal_accept` wrote**, verified
+///    against the long-term key A knocked at and against nothing that travelled
+///    with the frame. B's later frame then opens under it through the ordinary
+///    `open`, which is the steady state the acceptance exists to reach — and is
+///    the assertion that fails if a pseudonym were installed without being
+///    bound.
+/// 3. **A flipped byte anywhere in the binding fails the AEAD, not the binding
+///    check.** Both fields live INSIDE the seal, so tampering on the wire never
+///    reaches `verify_signature` at all. That is asserted as `Aead` rather than
+///    `Binding` deliberately: an implementation that carried either field in the
+///    clear would report `Binding` here and pass a test that only asked for "an
+///    error".
+///
+/// Run with `--ignored`; it attaches to the public Veilid network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "attaches to the public Veilid network; opt-in, run with --ignored"]
+async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
+    use daemonseed_core::dm::ratchet::FIRST_RECIPIENT_CHANNEL_SEQ;
+
+    daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
+
+    let base = std::env::temp_dir().join("daemonseed-veilid-net-dm-accept-it");
+    let _ = std::fs::remove_dir_all(&base);
+
+    // Alice knocked; Bob was knocked at. `bob_pc` is the per-contact pseudonym
+    // the acceptance carries — deliberately NOT Bob's long-term key, because
+    // `bind_lt` is a signature BY the long-term key OVER the pseudonym and a
+    // build that had collapsed the two would sign `lp(k) || lp(k)` and pass.
+    let alice = identity();
+    let bob = identity();
+    let bob_pc = identity();
+
+    let ss0 = fresh_ss0();
+    let opening_eph = identity();
+    let roots_a = derive_channel_roots(&ss0).expect("A derives the channel roots");
+    let roots_b = derive_channel_roots(&ss0).expect("B derives the channel roots");
+    assert_eq!(roots_a.ar, roots_b.ar);
+
+    let mut ratchet_a = Ratchet::initiator(
+        &ss0,
+        Box::new(*opening_eph.kem.encapsulation_key()),
+        EphemeralDecapKey::new(Box::new(*opening_eph.kem.decapsulation_key())),
+    )
+    .expect("A opens the ratchet as initiator");
+    let mut ratchet_b = Ratchet::recipient(&ss0, Box::new(*opening_eph.kem.encapsulation_key()))
+        .expect("B opens the ratchet as recipient");
+    assert_eq!(ratchet_a.role(), Role::Initiator);
+    assert_eq!(ratchet_b.role(), Role::Recipient);
+    // The acceptance travels on B's sending direction, which is A's receiving
+    // one — the reverse of the sibling oracle above, and the direction nothing
+    // in this crate had exercised end to end.
+    let dir = ratchet_b.send_direction();
+    assert_eq!(
+        dir,
+        ratchet_a.recv_direction(),
+        "B's sending direction and A's receiving direction are the same stream"
+    );
+
+    let (node_a, _rx_a) = VeilidNet::start(node_config(":5178", &base.join("A")))
+        .await
+        .expect("start A");
+    let (node_b, _rx_b) = VeilidNet::start(node_config(":5179", &base.join("B")))
+        .await
+        .expect("start B");
+    node_a
+        .attach_and_wait(180)
+        .await
+        .expect("A public-internet-ready");
+    node_b
+        .attach_and_wait(180)
+        .await
+        .expect("B public-internet-ready");
+
+    // ── B accepts, and publishes the acceptance at its sequence zero ─────────
+    let rcpt_a = recipient_hash(alice.signing.public_key()).expect("recipient hash");
+    let accept_out = ratchet_b.send_next().expect("B mints its opening key");
+    let accept_seq = accept_out.header.seq;
+    assert_eq!(
+        accept_seq, FIRST_RECIPIENT_CHANNEL_SEQ,
+        "the acceptance is the first thing the acceptor writes to the channel"
+    );
+    let accept_at = paging::position_of(accept_seq);
+    let accept_bytes = frame::seal_accept(
+        accept_out,
+        &roots_b.chan_id,
+        &bob_pc.signing,
+        &bob.signing,
+        &rcpt_a,
+        SENT,
+        None,
+    )
+    .expect("B seals its acceptance");
+    node_b
+        .publish_dm_page(
+            DmPageAddress::sending(&roots_b.ar, &ratchet_b, accept_at)
+                .expect("B derives its sending page address"),
+            accept_bytes.clone(),
+        )
+        .await
+        .expect("B publishes the acceptance into its slot");
+
+    // ── B's next frame is an ORDINARY one, published on the same page ────────
+    // Composed now so the whole exchange is on the wire before A sweeps: what A
+    // must show is that the second frame is unopenable until the first has been
+    // opened, not that the second arrived late.
+    let reply_out = ratchet_b.send_next().expect("B mints its second key");
+    let reply_seq = reply_out.header.seq;
+    let reply_at = paging::position_of(reply_seq);
+    assert_eq!(
+        reply_at.page(),
+        accept_at.page(),
+        "both frames must share a page, or A would need two sweeps"
+    );
+    let reply_bytes = frame::seal(
+        reply_out,
+        &roots_b.chan_id,
+        &bob_pc.signing,
+        bob.signing.public_key(),
+        &rcpt_a,
+        SENT,
+        BODY_SECOND,
+        None,
+    )
+    .expect("B seals its reply");
+    node_b
+        .publish_dm_page(
+            DmPageAddress::sending(&roots_b.ar, &ratchet_b, reply_at)
+                .expect("B derives its sending page address"),
+            reply_bytes,
+        )
+        .await
+        .expect("B publishes its reply into its slot");
+
+    // ── A sweeps the page it derived for itself ──────────────────────────────
+    let page = accept_at.page();
+    let addr_a = || {
+        DmPageAddress::receiving(&roots_a.ar, &ratchet_a, page)
+            .expect("A derives its receiving page address")
+    };
+    let mut swept: Vec<(PagePosition, Vec<u8>)> = Vec::new();
+    for attempt in 0..30 {
+        match node_a.sweep_dm_page(addr_a()).await {
+            Ok(sweep) => {
+                eprintln!(
+                    "attempt {attempt}: {} slot(s) back, outcome {:?}",
+                    sweep.slots.len(),
+                    sweep.outcome
+                );
+                if sweep.slots.len() == 2 {
+                    swept = sweep.slots;
+                    break;
+                }
+            }
+            Err(e) => eprintln!("attempt {attempt}: sweep error {e}, retrying"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+    assert_eq!(
+        swept.len(),
+        2,
+        "both of B's frames must survive to the wire and come back"
+    );
+    let by_position: BTreeMap<PagePosition, Vec<u8>> = swept.into_iter().collect();
+    let accept_read = by_position
+        .get(&accept_at)
+        .expect("the acceptance came back from the slot it was written to");
+    let reply_read = by_position
+        .get(&reply_at)
+        .expect("the reply came back from the slot it was written to");
+
+    // ── a flipped byte in the binding fails the AEAD, inside the seal ────────
+    // `pk_pc` and `bind_lt` live INSIDE the seal, so nothing on the wire can
+    // reach the binding check. Asserted as `Aead` rather than as any error: an
+    // implementation that carried either field in the clear would report
+    // `Binding` here, which is exactly the leak this assertion is watching for.
+    let mut flipped = accept_read.clone();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 0xFF;
+    let parsed_flipped =
+        frame::parse(&flipped).expect("an edited body still parses; only the AEAD may reject it");
+    let before = (ratchet_a.generation(), ratchet_a.losses());
+    let refused = ratchet_a
+        .receive(
+            parsed_flipped.header(),
+            parsed_flipped.eph_ct(),
+            parsed_flipped.eph_ek(),
+            |key| {
+                parsed_flipped.open_accept(
+                    key,
+                    &roots_a.chan_id,
+                    dir,
+                    accept_at,
+                    &rcpt_a,
+                    bob.signing.public_key(),
+                )
+            },
+        )
+        .expect("the ratchet accepts the position — the header was not touched");
+    assert!(
+        matches!(refused, Err(DmFrameError::Aead)),
+        "a flipped byte must fail the AEAD before the binding is ever read: {refused:?}"
+    );
+    assert_eq!(
+        (ratchet_a.generation(), ratchet_a.losses()),
+        before,
+        "a refused acceptance must leave the initiator's ratchet exactly where it was"
+    );
+
+    // ── A opens the acceptance and installs the pseudonym ────────────────────
+    let parsed_accept = frame::parse(accept_read).expect("the acceptance parses");
+    let accepted = ratchet_a
+        .receive(
+            parsed_accept.header(),
+            parsed_accept.eph_ct(),
+            parsed_accept.eph_ek(),
+            |key| {
+                parsed_accept.open_accept(
+                    key,
+                    &roots_a.chan_id,
+                    dir,
+                    accept_at,
+                    &rcpt_a,
+                    bob.signing.public_key(),
+                )
+            },
+        )
+        .expect("the ratchet accepts the position")
+        .expect("the acceptance opens under the long-term key A knocked at");
+    assert_eq!(
+        accepted.peer_pk_pc.as_slice(),
+        bob_pc.signing.public_key().as_slice(),
+        "A must install the pseudonym B's acceptance carried, and no other key"
+    );
+    assert_eq!(accepted.frame.seq, accept_seq);
+    assert_eq!(
+        accepted.frame.body, "",
+        "an acceptance carries no body of its own"
+    );
+
+    // ── and B's ordinary reply opens under the installed key ─────────────────
+    // The steady state, and the half that makes the installation mean anything:
+    // any 2592 bytes would satisfy the assertion above.
+    let installed = accepted.peer_pk_pc;
+    let parsed_reply = frame::parse(reply_read).expect("the reply parses");
+    let opened = ratchet_a
+        .receive(
+            parsed_reply.header(),
+            parsed_reply.eph_ct(),
+            parsed_reply.eph_ek(),
+            |key| {
+                parsed_reply.open(
+                    key,
+                    &roots_a.chan_id,
+                    dir,
+                    reply_at,
+                    &rcpt_a,
+                    AuthorKeys {
+                        pc: &installed,
+                        lt: bob.signing.public_key(),
+                    },
+                )
+            },
+        )
+        .expect("the ratchet accepts the position")
+        .expect("B's reply opens under the pseudonym its acceptance installed");
+    assert_eq!(
+        opened.body, BODY_SECOND,
+        "the plaintext A recovered must be the one B sent"
+    );
+    assert_eq!(opened.seq, reply_seq);
+
+    eprintln!(
+        "ISC-C42 live oracle: seal_accept -> page slot {} -> the wire -> sweep -> \
+         open_accept -> install -> open slot {} OK",
+        accept_at.slot(),
+        reply_at.slot()
+    );
+}

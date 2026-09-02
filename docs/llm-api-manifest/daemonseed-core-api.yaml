@@ -996,11 +996,11 @@ modules:
       Sub-module dm::provisional holds what does survive a restart.
       ProvisionalRecord is the pre-establishment handshake record, the initiator's
       {ss0, eph_ek, eph_dk}; new(Zeroizing<[u8; SS0_LEN]>, eph_ek, eph_dk) refuses
-      halves that are not a keypair. address_root() recomputes AR from ss0 and
-      into_ratchet() is pub(crate) — outside the crate, dm::persist's
-      PendingHandshake::establish is the only path from a record to a ratchet,
-      because establishing is the moment the record must be deleted. It consumes
-      the record into Ratchet::initiator, which re-derives
+      halves that are not a keypair. address_root() recomputes AR from ss0;
+      into_ratchet() (consuming, no second copy of eph_dk) and to_ratchet()
+      (borrowing, and therefore copying eph_dk) are both pub(crate) — outside
+      the crate, dm::persist's PendingHandshake is the only path from a record
+      to a ratchet. Both go through Ratchet::initiator, which re-derives
       the root — so neither AR nor RK nor chan_id is stored, and no byte
       constructor for RootKey exists at any visibility. chan_id is not returned
       with AR; a caller needing it calls firstcontact::derive_channel_roots.
@@ -1123,7 +1123,7 @@ modules:
       with the declared seq — the collector is the only holder of both facts. Clear on the wire:
       ratchet_gen, chain_base, seq, eph_ek, eph_ct — what a receiver needs before
       it can derive a key. Sealed: sent_unix_ms, body, msg_sig, ack_high_water,
-      ack_beyond. Every clear field
+      ack_beyond, pk_pc, bind_lt. Every clear field
       is bound in the AAD (daemonseed/dm/msg/aad/v4 || lp of each) and again in
       msg_sig, which is frame_sig_input(chan_id, dir, header, eph_ek, eph_ct,
       recipient_hash, AuthorKeys, sent_unix_ms, body, ack_high_water,
@@ -1147,6 +1147,25 @@ modules:
       and the rung never varies with whether one is piggybacked.
       MAX_FRAME_LEN (32768) is the dflt(16) subkey cap, held as an
       invariant by the body cap and the ladder rather than a runtime check.
+      seal_accept(outbound, chan_id, signing_pc, signing_lt, recipient_hash,
+      sent_unix_ms, ack) is the acceptor's ACCEPT: seal's output with an empty
+      body plus pk_pc = signing_pc's public key and bind_lt =
+      signing_lt.sign(firstcontact::bind_lt_input(pk_lt, pk_pc)), under the
+      unchanged frame kind "msg" and the unchanged msg_sig preimage; it lands on
+      the 16384 rung. ParsedFrame::open_accept(key, chan_id, dir, found_at,
+      recipient_hash, peer_pk_lt) -> VerifiedAccept { frame: VerifiedFrame,
+      peer_pk_pc: Box<[u8; PK_LEN]> } opens it with no prior pseudonym: it
+      requires dir == BToA and found_at.seq() ==
+      ratchet::FIRST_RECIPIENT_CHANNEL_SEQ (else NotAccept{seq}), requires both
+      binding fields present and length-exact (else MissingBinding or
+      FieldLength), verifies bind_lt under peer_pk_lt (else Binding), then runs
+      the ordinary verification under the carried pk_pc. open applies the same
+      binding check to any frame whose fields are non-empty, before the
+      authorship signature: a key other than the AuthorKeys.pc it was given is
+      PseudonymMismatch, and a binding that does not verify under AuthorKeys.lt
+      is Binding. A body with both fields empty takes the pre-existing path.
+      VerifiedAccept is not Clone / PartialEq / Eq and renders no body in
+      Debug.
       Sub-module dm::contact_cache is the per-correspondence contact record,
       stored as RecordKind::ContactCache. ContactRecord holds the
       correspondent's long-term public key, its pseudonym public key, ss0, and
@@ -1348,11 +1367,14 @@ modules:
       at_rest_key. restart_channel(label, ctx) -> StoredChannelRestart is
       HandshakeResumes(PendingHandshake) or TornDown(Teardown), and asks through
       the store's lock-free read so probing an unknown channel creates nothing.
-      PendingHandshake owns the record, lends eph_ek/address_root, and its one
-      consuming method establish() builds the ratchet AND deletes the record —
-      the pairing that makes ss0 actually erased; the ratchet is built first so
-      a failed delete returns an error rather than a ratchet, leaving the call a
-      safe retry. update_outbox(label, direction, now_ms, f) and
+      PendingHandshake owns the record, lends eph_ek/address_root, and offers
+      three endings: ratchet() derives a Ratchet and leaves the record on disk,
+      for the window between an initiator's knock and the acceptance that
+      verifies its correspondent; commit() consumes the handshake and deletes
+      the record; establish() is the pair, and builds the ratchet first so a
+      failed delete returns an error rather than a ratchet, leaving the call a
+      safe retry. It is must_use: a resumed handshake that is neither committed
+      nor dropped leaves ss0 on disk. update_outbox(label, direction, now_ms, f) and
       advance_cursor(label, page, read_through) are read-modify-write inside one
       critical_section; there is no load-then-save pair to lose an update. f
       returns Mutation<T>, which is Changed(T) or Unchanged(T) and is must_use;
