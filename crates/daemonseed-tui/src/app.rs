@@ -1135,6 +1135,17 @@ pub struct DmState {
     pub last_doorbell_health: Option<DmDoorbellHealth>,
     /// The last per-correspondence channel-health report.
     pub last_channel_health: Option<DmChannelHealth>,
+    /// How many idle ticks could not read the profile's block-list record.
+    ///
+    /// **Counted rather than dropped, because it is an alarm and not a
+    /// counter the driver keeps.** Every other observability-only event has a
+    /// second symptom somewhere — a refusal, a health counter, a request that
+    /// does not arrive. This one's whole symptom is silence: the channel plane
+    /// fails closed while the record is unreadable, so every conversation stops
+    /// collecting and nothing else says why. Nothing renders it yet; a surface
+    /// that wants to warn has the number here rather than having to re-derive
+    /// it from an absence.
+    pub block_list_unreadable_ticks: u64,
 }
 
 /// A correspondent's identity key, as a trace line may show it: the marker only.
@@ -1155,6 +1166,10 @@ impl std::fmt::Debug for DmState {
             .field("last_refusal", &self.last_refusal)
             .field("last_doorbell_health", &self.last_doorbell_health)
             .field("last_channel_health", &self.last_channel_health)
+            .field(
+                "block_list_unreadable_ticks",
+                &self.block_list_unreadable_ticks,
+            )
             .finish()
     }
 }
@@ -1273,7 +1288,10 @@ impl DmState {
     /// Observability-only variants ([`DmEvent::ContactLookupFailed`],
     /// [`DmEvent::BlockListFull`] and the rest) are accepted and dropped: no
     /// interface renders them yet, and inventing state for them here would be
-    /// state no reader could check.
+    /// state no reader could check. [`DmEvent::BlockListUnreadable`] is the
+    /// exception and is counted: it is an alarm whose only other symptom is a
+    /// channel plane that has gone quiet, so dropping it leaves nothing to
+    /// check at all.
     fn fold(&mut self, event: &DmEvent) {
         match event {
             DmEvent::ContactRequest {
@@ -1356,9 +1374,15 @@ impl DmState {
                     peer_acks_unverified: *peer_acks_unverified,
                 });
             }
+            DmEvent::BlockListUnreadable => {
+                self.block_list_unreadable_ticks =
+                    self.block_list_unreadable_ticks.saturating_add(1);
+            }
             // Nothing a fold could add and no interface that renders them: an
             // accepted request stays held by the driver, a message has no view,
-            // and the rest are counters the driver already keeps.
+            // and the rest are counters the driver already keeps. The one event
+            // that is an alarm rather than a counter — `BlockListUnreadable`,
+            // whose only other symptom is silence — is folded above instead.
             DmEvent::Message { .. }
             | DmEvent::AcceptFailed { .. }
             | DmEvent::ChannelDirectionUnknown { .. }

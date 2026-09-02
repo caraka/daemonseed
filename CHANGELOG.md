@@ -541,6 +541,7 @@ work lives in the maintainer's own planning notes, not here.
   record. (#236)
 - `daemonseed_veilid_net::dm::DmEvent::Refused` covers a channel send as well as a first contact.
   (#236)
+- The DM driver stops sweeping a blocked correspondent's channel and fetching its acknowledgement record from the next idle tick, and folds neither a page outcome nor an acknowledgement that arrives for a correspondent blocked since it was asked for, settling nothing it drops; after an unblock the next tick asks again and re-collects from the outcome it returns. An unreadable block list sweeps, fetches and folds nothing and emits `DmEvent::BlockListUnreadable` once for the tick. A block the store refuses leaves the held request from that identity on screen. Sends to a blocked identity are unchanged, and the correspondence, its channel and its outbox are left standing; an entry queued for a blocked correspondent therefore re-seeds to the seven-day give-up and is then surfaced `Undelivered` even where that correspondent collected it, the acknowledgement saying so being one of the reads the block stops. (#390)
 
 - `VeilidNetHandle::subscribe_room`, `resweep_rendezvous`, `repair_rendezvous` and
   `rendezvous_record_key` take a `RendezvousOwner` in place of a raw `[u8; 32]` owner

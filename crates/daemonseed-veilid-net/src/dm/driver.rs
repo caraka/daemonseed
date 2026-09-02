@@ -4335,6 +4335,216 @@ mod tests {
         drain(&mut evt_b);
     }
 
+    /// T23d. Two live drivers: B blocks A mid-conversation, A keeps sending, and
+    /// nothing A sends reaches B's front end until B unblocks.
+    ///
+    /// **The machine-level tests pin the decision; this pins the whole loop**,
+    /// over a real record store, a real ratchet and A's real publishes — so the
+    /// message B does not surface is one that genuinely reached the record B
+    /// would have swept.
+    ///
+    /// Three controls, and none of the assertions means anything without them:
+    /// the first message surfaces, so the second one's silence is the block and
+    /// not a broken conversation; A's publish count rises across the blocked
+    /// window, so the silence is B refusing to read rather than A failing to
+    /// write; and B's sweep count does not, so the block reaches the plane it is
+    /// supposed to. The unblocked collection at the end is what shows the
+    /// message was dropped rather than consumed.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_stops_a_live_conversation_and_an_unblock_resumes_it() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let dht_b = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        dht_b.set_key_record(Some(key_record_for(&a_keys)));
+
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+
+        establish_between(
+            &handle_a, &probe_a, &mut evt_a, &mut evt_b, &handle_b, &probe_b, &wall, &b_keys,
+        )
+        .await;
+
+        // ── the control: an unblocked A is heard ─────────────────────────────
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "before the block".into(),
+            })
+            .await
+            .expect("A sends");
+        for _ in 0..3 {
+            cadence(&wall).await;
+        }
+        assert_eq!(
+            messages(&drain(&mut evt_b)),
+            vec![(1, "before the block".to_string())],
+            "B did not collect the message that precedes the block"
+        );
+
+        // ── B blocks A, and A goes on sending ────────────────────────────────
+        handle_b
+            .send(DmCommand::Block {
+                pk_lt: Box::new(*a_keys.signing.public_key()),
+            })
+            .await
+            .expect("block");
+        settle().await;
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "after the block".into(),
+            })
+            .await
+            .expect("A sends again");
+
+        let published_before = dht_a.count(Method::PublishPage);
+        let swept_before = dht_b.count(Method::SweepPage);
+        let fetched_before = dht_b.count(Method::FetchAck);
+        assert!(
+            fetched_before > 0,
+            "B was not fetching acknowledgements before the block, so the count \
+             below would hold for the wrong reason"
+        );
+        for _ in 0..8 {
+            cadence(&wall).await;
+        }
+        let blocked_window = drain(&mut evt_b);
+        assert_eq!(
+            messages(&blocked_window),
+            Vec::new(),
+            "a blocked correspondent's message reached the front end: {blocked_window:?}"
+        );
+        // The acknowledgement plane, from B's own side: B has messages of its
+        // own outstanding with A, so a fetch would have been asked for and its
+        // record folded, reporting a blocked party's collection.
+        assert_eq!(
+            confirmations(&blocked_window),
+            Vec::<u64>::new(),
+            "a blocked correspondent's acknowledgement settled B's outbox: {blocked_window:?}"
+        );
+        assert_eq!(
+            dht_b.count(Method::FetchAck),
+            fetched_before,
+            "B fetched a blocked correspondent's acknowledgement record"
+        );
+        assert!(
+            dht_a.count(Method::PublishPage) > published_before,
+            "A never wrote the message the block is supposed to hide, so the \
+             silence above proves nothing"
+        );
+        assert_eq!(
+            dht_b.count(Method::SweepPage),
+            swept_before,
+            "B swept a blocked correspondent's channel"
+        );
+
+        // ── a block landing while a sweep is in flight ───────────────────────
+        //
+        // **The sweep-time refusal cannot reach this case**, and an ordinary
+        // cadence cannot produce it: a sweep at the mock's own latency completes
+        // inside the tick that asked for it, so a block always lands with nothing
+        // outstanding. Slowing the page sweep past one tick is what opens the
+        // window the driver meets on a real distributed hash table, where a sweep
+        // routinely outlives several.
+        //
+        // The mock reads the record when the sweep STARTS and sleeps afterwards,
+        // so `slots_served` rising says the sweep now in flight read a POPULATED
+        // slot — not, on its own, that the slot is the unsurfaced frame. It
+        // stands in for that here because the mock serves the whole page map in
+        // one sweep and the only frame on B's receiving page that B has not
+        // already settled is A's second message. Without it, "nothing surfaced"
+        // is satisfied by a sweep that read an empty page.
+        dht_b.slow(Method::SweepPage, SLOW_SWEEP);
+        handle_b
+            .send(DmCommand::Unblock {
+                pk_lt: Box::new(*a_keys.signing.public_key()),
+            })
+            .await
+            .expect("unblock for the in-flight case");
+        settle().await;
+        let served_before = dht_b.slots_served();
+        let mut carrying = false;
+        for _ in 0..12 {
+            advance(&wall, Duration::from_secs(5)).await;
+            if dht_b.slots_served() > served_before {
+                carrying = true;
+                break;
+            }
+        }
+        assert!(
+            carrying,
+            "no sweep of B's ever read A's frame, so the drop below proves nothing"
+        );
+        // In flight now, and blocked before it lands.
+        let completed_before = probe_b.ops_completed.load(Ordering::SeqCst);
+        handle_b
+            .send(DmCommand::Block {
+                pk_lt: Box::new(*a_keys.signing.public_key()),
+            })
+            .await
+            .expect("block mid-sweep");
+        settle().await;
+        for _ in 0..12 {
+            advance(&wall, Duration::from_secs(5)).await;
+        }
+        // **The sweep has to have come back inside this window.** A sweep takes
+        // `SLOW_SWEEP` and the window is sixty virtual seconds, so the margin is
+        // real but not large — and an operation still in flight produces no
+        // events at all, which is indistinguishable from one whose frames were
+        // dropped.
+        assert!(
+            probe_b.ops_completed.load(Ordering::SeqCst) > completed_before,
+            "no operation of B's completed in the window, so the sweep that was \
+             in flight may simply not have landed yet"
+        );
+        let in_flight = drain(&mut evt_b);
+        assert_eq!(
+            messages(&in_flight),
+            Vec::new(),
+            "a sweep in flight when the block landed surfaced its frames: {in_flight:?}"
+        );
+
+        // ── unblocked: the same message, from the record it was left in ──────
+        dht_b.slow(Method::SweepPage, Duration::from_millis(50));
+        handle_b
+            .send(DmCommand::Unblock {
+                pk_lt: Box::new(*a_keys.signing.public_key()),
+            })
+            .await
+            .expect("unblock");
+        settle().await;
+        for _ in 0..4 {
+            cadence(&wall).await;
+        }
+        assert_eq!(
+            messages(&drain(&mut evt_b)),
+            vec![(2, "after the block".to_string())],
+            "the message written during the block was lost rather than deferred"
+        );
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+        drain(&mut evt_a);
+    }
+
     /// Every sequence reported `ConfirmedCollected` in `events`, ascending and
     /// with duplicates kept.
     ///

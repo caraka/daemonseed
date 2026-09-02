@@ -308,7 +308,13 @@ types:
       published at DmPageAddress::sending, a landed write is confirmed, entries
       past the seven-day window are surfaced as Delivery{state: Undelivered} and
       recorded surfaced in the same write, and the pages Collection::probe_plan
-      names are swept at DmPageAddress::receiving. A sweep counts as complete
+      names are swept at DmPageAddress::receiving. No page is swept for a
+      correspondent BlockList::suppresses_channel names and no acknowledgement
+      record is fetched for one; a page outcome or an acknowledgement record for a
+      correspondent blocked after its operation was asked for folds nothing and
+      settles nothing; and an unreadable block list sweeps, fetches and folds
+      nothing on the channel plane, emitting DmEvent::BlockListUnreadable once for
+      the tick. A sweep counts as complete
       only when nothing failed AND the transport attempted either no subkey (an
       absent record) or every subkey the record holds; anything else folds
       nothing and advances nothing. A give-up is offered without clearing the
@@ -409,7 +415,13 @@ types:
       needs so no provisional record is stranded.
       Decline persists nothing; Block and Unblock
       write the block list, and a refused 513th entry surfaces as
-      DmEvent::BlockListFull. Send seals on an established channel: the outbox is
+      DmEvent::BlockListFull, which leaves both the stored list and any held
+      request from that identity as they were. A block that is stored drops a held
+      request from that identity and stops the next idle tick sweeping that
+      identity's channel and fetching its acknowledgement record, leaving the
+      correspondence, its channel and its outbox in place; Unblock resumes both at
+      the next tick. Sends to a blocked identity, and acknowledgements written for
+      one, are unchanged. Send seals on an established channel: the outbox is
       priced against frame::WORST_CASE_SEALED_FRAME_LEN before the ratchet steps,
       the frame carries the collection's acknowledgement piggybacked, and the
       queued sequence is reported as Delivery{state: Composed}. Surfaced clears
@@ -437,7 +449,12 @@ types:
       DoorbellHealth{outcome,admission,pending_full},
       ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified},
       ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
-      SpentTokensNotPersisted. ChannelHealth is one correspondence's channel-plane
+      BlockListUnreadable, SpentTokensNotPersisted. BlockListUnreadable says the
+      profile's block-list record would not read on an idle tick, so no
+      correspondent's channel was swept and no acknowledgement was fetched;
+      emitted at most once per tick, and only on a tick whose correspondence list
+      is non-empty — the gate is that list, not whether any correspondence holds a
+      live channel. ChannelHealth is one correspondence's channel-plane
       accounting, cumulative for the session and emitted only when a counter
       moves; already_consumed is reachable only through the TooManyRuns retry
       path, since a settled position is filtered out before the ratchet sees it,

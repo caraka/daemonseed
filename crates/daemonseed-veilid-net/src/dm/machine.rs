@@ -1072,6 +1072,18 @@ impl DmMachine {
     /// [`Self::sweeping_doorbell`]: the cadence says how often to look, not how
     /// many looks may be open at once, and the answer to the second question is
     /// one.
+    ///
+    /// **The block list is read once for the whole tick, and only where
+    /// something can ask it.** Every correspondence tests the same list against
+    /// its own correspondent, and one tick is one instant, so a second read
+    /// inside the loop could not return a different answer; a tick with no
+    /// correspondences never touches the store at all.
+    ///
+    /// The reads in [`Self::on_page`] and [`Self::on_peer_ack`] are a different
+    /// question, not a repeat of this one: an outcome arrives on a later tick
+    /// than the one that asked for it, so the list has to be re-read at the
+    /// moment the bytes are folded to catch a block taken while the operation
+    /// was in flight. That one is priced per outcome, which is what it is worth.
     pub(crate) fn on_tick(&mut self, now_ms: i64) -> Vec<DmEffect> {
         self.last_tick_ms = Some(now_ms);
         let mut out = Vec::new();
@@ -1082,11 +1094,26 @@ impl DmMachine {
                 owner_seed: self.doorbell_owner,
             }));
         }
-        for index in 0..self.correspondences.len() {
-            out.extend(self.give_ups(now_ms, index));
-            out.extend(self.due_emissions(now_ms, index));
-            out.extend(self.probe(now_ms, index));
-            out.extend(self.ack_fetches(now_ms, index));
+        if !self.correspondences.is_empty() {
+            // `None` is the fail-closed answer, on the doorbell plane's own
+            // terms: a list that cannot be read must not be read as "nobody is
+            // blocked", so nothing is swept until it can be.
+            let block_list = match self.persist.read_block_list() {
+                Ok(list) => Some(list),
+                Err(e) => {
+                    crate::vtrace!("dm driver: block list unreadable, sweeping no channel: {e}");
+                    // Once per tick, by construction: the read is one call per
+                    // tick and this is its only failure path.
+                    out.push(DmEffect::Emit(DmEvent::BlockListUnreadable));
+                    None
+                }
+            };
+            for index in 0..self.correspondences.len() {
+                out.extend(self.give_ups(now_ms, index));
+                out.extend(self.due_emissions(now_ms, index));
+                out.extend(self.probe(now_ms, index, block_list.as_ref()));
+                out.extend(self.ack_fetches(now_ms, index, block_list.as_ref()));
+            }
         }
         // **After the per-correspondence pass, and once for all of them**, because
         // the standalone allowance is client-global: deciding it inside the loop
@@ -1734,7 +1761,46 @@ impl DmMachine {
     /// issued whatever the caller does with it — which is the behaviour wanted
     /// here: the sweep already open will deliver the page, so a second plan for
     /// it inside one cadence would buy nothing.
-    fn probe(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+    ///
+    /// **A blocked correspondent's channel is not swept**, which is the channel
+    /// plane of the block list. The design of record states both planes in one
+    /// line: *"The block list (re-cut ISC-C46) drops a blocked sender's doorbell
+    /// entries at sweep (matched on the sealed `sender_pubkey_hash`) and stops
+    /// sweeping their outbox. Silent and unilateral; the blocked sender's view
+    /// is byte-identical to 'never came online' …"*
+    /// (`docs/design/direct-messaging.md`). Suppression is therefore READING
+    /// only, and the split runs along that word. **Reads stop:** this planner,
+    /// [`Self::ack_fetches`], and the two fold paths that meet an outcome after
+    /// the block ([`Self::on_page`], [`Self::on_peer_ack`]). **Writes do not:**
+    /// [`Self::due_emissions`] keeps publishing queued entries on their existing
+    /// schedule and [`Self::standalone_acks`] keeps writing acknowledgements for
+    /// what was collected before the block, because the design line governs what
+    /// a blocked correspondent's records get *read* and says nothing about what
+    /// this side publishes.
+    ///
+    /// **What that split costs, stated because nothing else states it.** An
+    /// entry queued for a blocked correspondent goes on re-seeding to the
+    /// seven-day give-up and is then surfaced `DeliveryState::Undelivered` —
+    /// even where the correspondent collected it and wrote the acknowledgement
+    /// saying so, because that acknowledgement is one of the reads the block
+    /// stops. The report is wrong about the message and right about this side's
+    /// knowledge; it is bounded by the give-up, and it is the price of leaving
+    /// writes alone rather than an oversight.
+    ///
+    /// `block_list` is `None` where the list could not be read, and nothing is
+    /// swept in that case: `on_doorbell` fails closed for the same reason, and a
+    /// plane that answered "nobody is blocked" to an unreadable revocation list
+    /// would silently unblock everyone.
+    ///
+    /// **Asked before the cadence is spent**, so a block leaves the collection's
+    /// probe schedule exactly where it was and an unblock resumes on the next
+    /// tick rather than after a skipped cadence.
+    fn probe(
+        &mut self,
+        now_ms: i64,
+        index: usize,
+        block_list: Option<&BlockList>,
+    ) -> Vec<DmEffect> {
         let Self {
             correspondences,
             sweeping_pages,
@@ -1742,6 +1808,12 @@ impl DmMachine {
         } = self;
         let correspondence = &mut correspondences[index];
         if correspondence.live().is_none() {
+            return Vec::new();
+        }
+        let Some(block_list) = block_list else {
+            return Vec::new();
+        };
+        if block_list.suppresses_channel(&correspondence.pk_lt) {
             return Vec::new();
         }
         // The cadence is consumed whether or not the sweep can proceed, so a
@@ -1840,6 +1912,26 @@ impl DmMachine {
         let Some(index) = self.index_of_conversation(&conversation) else {
             return Vec::new();
         };
+        // **The sweep-time check cannot carry this on its own.** A sweep is
+        // planned on one tick and its outcome arrives on a later one, so a block
+        // landing inside that window would otherwise surface exactly the
+        // messages it was meant to stop — once for every sweep already in
+        // flight, which is the moment a user reaches for the block.
+        //
+        // The frames are dropped and nothing is settled: no position is offered
+        // to the collection, no acknowledgement is owed, no cursor advances. The
+        // record is the sender's and is still there, so an unblock re-collects
+        // this page rather than having walked past it.
+        match self.persist.read_block_list() {
+            Ok(list) if list.suppresses_channel(&self.correspondences[index].pk_lt) => {
+                return Vec::new();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::vtrace!("dm driver: block list unreadable, folding no page: {e}");
+                return Vec::new();
+            }
+        }
         let Self {
             identity,
             persist,
@@ -2086,11 +2178,35 @@ impl DmMachine {
     /// The address is derived from `send_direction`, never from a role: the two
     /// readings differ by one label, and the other one addresses a record the
     /// peer never writes, with no error to say why.
-    fn ack_fetches(&self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+    ///
+    /// **A blocked correspondent's record is not fetched**, on the terms
+    /// [`Self::probe`] states: an acknowledgement is a read of their record, and
+    /// folding one reports a blocked party's collection. `block_list` carries the
+    /// tick's one read of the list — `None` where it could not be read, which
+    /// fetches nothing, fail-closed for [`Self::probe`]'s reason.
+    fn ack_fetches(
+        &self,
+        now_ms: i64,
+        index: usize,
+        block_list: Option<&BlockList>,
+    ) -> Vec<DmEffect> {
         let correspondence = &self.correspondences[index];
         let Some((ratchet, _, channel)) = correspondence.live() else {
             return Vec::new();
         };
+        // **A blocked correspondent's acknowledgement record is one of their
+        // records**, so the same suppression [`Self::probe`] applies to their
+        // pages applies here: the design stops reading a blocked correspondent,
+        // and a fetched acknowledgement is a read that surfaces
+        // `DeliveryState::ConfirmedCollected` for a party the user has refused.
+        // `None` — an unreadable list — fetches nothing, on the fail-closed
+        // terms stated there.
+        let Some(block_list) = block_list else {
+            return Vec::new();
+        };
+        if block_list.suppresses_channel(&correspondence.pk_lt) {
+            return Vec::new();
+        }
         // **Nothing to verify a record against is nothing to fetch.** An
         // initiator holds no pseudonym for its correspondent until the acceptance
         // lands, and a record fetched before then could only be discarded — so
@@ -2150,6 +2266,21 @@ impl DmMachine {
         let Some(index) = self.index_of_conversation(&conversation) else {
             return Vec::new();
         };
+        // Re-asked here for [`Self::on_page`]'s reason: the fetch was decided on
+        // an earlier tick, and a record folded now would settle this side's
+        // outbox and surface `ConfirmedCollected` for an identity blocked since.
+        // The record is left unfolded rather than refused, so an unblock folds
+        // it on the next fetch.
+        match self.persist.read_block_list() {
+            Ok(list) if list.suppresses_channel(&self.correspondences[index].pk_lt) => {
+                return Vec::new();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::vtrace!("dm driver: block list unreadable, folding no acknowledgement: {e}");
+                return Vec::new();
+            }
+        }
         let Self {
             persist,
             correspondences,
@@ -2923,6 +3054,21 @@ impl DmMachine {
     }
 
     /// Block or unblock one identity on both suppression planes.
+    ///
+    /// **The stored list is the whole of the state, and an established
+    /// correspondence is left standing.** Blocking writes one record; the next
+    /// tick reads it and stops sweeping that correspondent's pages
+    /// ([`Self::probe`]), and unblocking resumes them on the tick after it. The
+    /// channel is not torn down, the ratchet is not stepped, the outbox is not
+    /// touched and the contact cache keeps its row — the design suppresses
+    /// *reading* a blocked correspondent, not the record of the correspondence,
+    /// so a block is reversible with nothing to rebuild.
+    ///
+    /// The one thing it changes beyond the list is what is already on screen: a
+    /// held request from that identity is dropped, because a block is meant to
+    /// take effect on the request in front of the user and not only on the next
+    /// one to arrive. That drop is conditional on the write having landed — a
+    /// refused one leaves both the list and the held request as they were.
     fn set_blocked(&mut self, pk_lt: &PkLt, blocked: bool) -> Vec<DmEffect> {
         let result = self.persist.update_block_list(|list: &mut BlockList| {
             if blocked {
@@ -2933,7 +3079,20 @@ impl DmMachine {
             Ok(())
         });
         let out = match result {
-            Ok(()) => Vec::new(),
+            Ok(()) => {
+                if blocked {
+                    // **Inside the `Ok` arm, because the list is what makes the
+                    // drop correct.** A refused write leaves the identity
+                    // unblocked, and dropping its held request anyway would
+                    // discard a request that is still legitimate — until a
+                    // restart or a fresh entry, since its entry hash is already
+                    // in the seen set and the sender's re-seed would be read as
+                    // `Seen` rather than surfaced again.
+                    self.pending
+                        .retain(|held| held.knock.pk_lt().as_slice() != pk_lt.as_slice());
+                }
+                Vec::new()
+            }
             // The 513th identity. The stored 512 are left exactly as they were
             // — `BlockList::encode` refuses before the replace — so this is a
             // ceiling reached, not a list damaged, and the user is the only one
@@ -2946,13 +3105,6 @@ impl DmMachine {
                 Vec::new()
             }
         };
-        if blocked {
-            // A held request from a blocked identity is dropped: the block is
-            // meant to take effect on what is already on screen, not only on
-            // what arrives next.
-            self.pending
-                .retain(|held| held.knock.pk_lt().as_slice() != pk_lt.as_slice());
-        }
         out
     }
 
@@ -3984,6 +4136,70 @@ mod tests {
             m.pending_count(),
             1,
             "the block dropped the wrong number of requests"
+        );
+    }
+
+    /// M2b. A block the store refused leaves the held request on screen.
+    ///
+    /// **The drop and the write stand or fall together.** A refused write leaves
+    /// the identity unblocked, so a request dropped anyway is a request the user
+    /// never answered and will not be shown again until a restart or a fresh
+    /// entry: its entry hash is already in the seen set, so the sender's next
+    /// re-seed reads as `Seen` rather than surfacing, and that set is in memory —
+    /// a restart inside the accept window clears it and the same re-seed
+    /// surfaces. The successful case is `blocking_drops_a_held_request`; this is
+    /// the other arm of the same branch.
+    #[test]
+    fn a_refused_block_keeps_the_held_request() {
+        use daemonseed_core::dm::block_list::BLOCK_LIST_MAX_ENTRIES;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        m.persist.provision_block_list().expect("provision");
+        m.persist
+            .update_block_list(|list| {
+                for i in 0..BLOCK_LIST_MAX_ENTRIES {
+                    let mut key = vec![0u8; IDENTITY_PK_LEN].into_boxed_slice();
+                    key[0] = (i >> 8) as u8;
+                    key[1] = (i & 0xFF) as u8;
+                    let key: Box<[u8; IDENTITY_PK_LEN]> =
+                        key.try_into().expect("allocated at PK_LEN");
+                    assert!(list.block(&key), "fixture key {i} was a duplicate");
+                }
+                Ok(())
+            })
+            .expect("fill");
+
+        let epoch = keyrec::fc_epoch(unix_secs(BASE_MS));
+        let knock = fake_knock(3);
+        let pk_lt: PkLt = Box::new(*knock.pk_lt());
+        m.surface(BASE_MS, epoch, 1, hash(3), knock, false);
+        assert_eq!(m.pending_count(), 1, "the request is not there to be kept");
+
+        let effects = m.on_command(
+            BASE_MS,
+            DmCommand::Block {
+                pk_lt: pk_lt.clone(),
+            },
+        );
+        assert!(
+            matches!(
+                &effects[..],
+                [DmEffect::Emit(DmEvent::BlockListFull { .. })]
+            ),
+            "the fixture's list was not full, so the refusal below never happened: {effects:?}"
+        );
+        assert!(
+            !m.persist
+                .read_block_list()
+                .expect("read")
+                .is_blocked(&pk_lt),
+            "the refused block was stored anyway"
+        );
+        assert_eq!(
+            m.pending_count(),
+            1,
+            "a refused block dropped the held request it did not block"
         );
     }
 
@@ -5068,7 +5284,8 @@ mod tests {
             "a fresh initiator must not already hold a pseudonym"
         );
 
-        let out = m.probe(BASE_MS, 0);
+        let list = stored_block_list(&m);
+        let out = m.probe(BASE_MS, 0, Some(&list));
         let swept: Vec<u64> = out
             .iter()
             .filter_map(|e| match e {
@@ -5088,6 +5305,28 @@ mod tests {
             m.correspondences[0].peer_pk_pc.is_none(),
             "the fixture stopped being the case it was written for"
         );
+    }
+
+    /// The block list a tick would hand [`DmMachine::probe`], read from the
+    /// store the machine is actually using.
+    fn stored_block_list(m: &DmMachine) -> BlockList {
+        m.persist.read_block_list().expect("the block list reads")
+    }
+
+    /// The path of the profile's block-list record.
+    ///
+    /// The name is `RecordKind::BlockList`'s and that accessor is crate-private
+    /// to `daemonseed-core`, so it is spelled out here — with the file asserted
+    /// present, which is what makes a rename fail this rather than silently
+    /// turning "unreadable" into "the path was wrong".
+    fn block_list_record(m: &DmMachine) -> std::path::PathBuf {
+        let path = m.persist.store().root().join("block-list.bin");
+        assert!(
+            path.exists(),
+            "the block-list record is not at {}",
+            path.display()
+        );
+        path
     }
 
     /// The pages a batch of effects asked to sweep, in emission order.
@@ -5146,8 +5385,9 @@ mod tests {
         let mut m = machine(&dir);
         let _ = knock_as_initiator(&mut m, &peer_identity());
         let conversation = conversation_of(&m, 0);
+        let list = stored_block_list(&m);
 
-        let first = swept_pages(&m.probe(BASE_MS, 0));
+        let first = swept_pages(&m.probe(BASE_MS, 0, Some(&list)));
         assert_eq!(
             first,
             vec![0, 1],
@@ -5156,7 +5396,7 @@ mod tests {
 
         // The cadence has elapsed, so the plan is issued again — and every page
         // in it is one this machine is already waiting on.
-        let second = swept_pages(&m.probe(BASE_MS + PROBE_MS, 0));
+        let second = swept_pages(&m.probe(BASE_MS + PROBE_MS, 0, Some(&list)));
         assert!(
             second.is_empty(),
             "a page already being swept must not be swept again: {second:?}"
@@ -5167,7 +5407,7 @@ mod tests {
             BASE_MS + PROBE_MS,
             page_outcome(conversation, 0, Ok(empty_page(conversation))),
         );
-        let third = swept_pages(&m.probe(BASE_MS + 2 * PROBE_MS, 0));
+        let third = swept_pages(&m.probe(BASE_MS + 2 * PROBE_MS, 0, Some(&list)));
         assert_eq!(
             third,
             vec![0],
@@ -5187,7 +5427,7 @@ mod tests {
                 Err(crate::VeilidNetError::Actor("no route".into())),
             ),
         );
-        let fourth = swept_pages(&m.probe(BASE_MS + 3 * PROBE_MS, 0));
+        let fourth = swept_pages(&m.probe(BASE_MS + 3 * PROBE_MS, 0, Some(&list)));
         assert_eq!(
             fourth,
             vec![1],
@@ -5207,11 +5447,513 @@ mod tests {
                 }),
             },
         );
-        let fifth = swept_pages(&m.probe(BASE_MS + 4 * PROBE_MS, 0));
+        let fifth = swept_pages(&m.probe(BASE_MS + 4 * PROBE_MS, 0, Some(&list)));
         assert_eq!(
             fifth,
             vec![0],
             "a panicked sweep must release its page: {fifth:?}"
+        );
+    }
+
+    /// The conversation and page of every sweep a batch of effects asked for.
+    fn swept_channels(effects: &[DmEffect]) -> Vec<([u8; AR_FINGERPRINT_LEN], u64)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::SweepPage { tag, .. }) => Some((tag.conversation?, tag.page?)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Hand back an empty outcome for every sweep in `swept`, so the pages are
+    /// no longer in flight and the next tick may plan them again.
+    fn release_sweeps(m: &mut DmMachine, swept: &[([u8; AR_FINGERPRINT_LEN], u64)], now_ms: i64) {
+        for (conversation, page) in swept {
+            m.on_outcome(
+                now_ms,
+                page_outcome(*conversation, *page, Ok(empty_page(*conversation))),
+            );
+        }
+    }
+
+    /// M28. A blocked correspondent's channel stops being swept at the next
+    /// tick, and an unblock resumes it at the tick after.
+    ///
+    /// **The second correspondence is the mirror control**, and without it the
+    /// whole assertion is satisfied by a machine that stopped sweeping
+    /// everything — which is exactly what the fail-closed path does when the
+    /// list cannot be read. One blocked and one not, in one tick, separates
+    /// suppression from silence.
+    ///
+    /// Nothing is torn down: the block writes one record and the tick reads it,
+    /// so the resumption below needs no re-establishment, no second knock and no
+    /// state the block had to keep.
+    #[test]
+    fn a_blocked_correspondence_is_not_swept_and_an_unblock_resumes_it() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_c = tempfile::tempdir().expect("temp dir C");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        let mut a = machine(&dir_a);
+        let mut c = machine_as(third_identity(), &dir_c);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        establish_pair(&mut c, &mut b, &b_keys);
+        assert_eq!(
+            b.correspondences.len(),
+            2,
+            "the fixture needs one correspondence to block and one to leave alone"
+        );
+        let blocked_pk = *keys().signing.public_key();
+        assert_eq!(
+            b.correspondences[0].pk_lt.as_slice(),
+            blocked_pk.as_slice(),
+            "the fixture's correspondences are not in the order the assertions read them"
+        );
+        let blocked = conversation_of(&b, 0);
+        let allowed = conversation_of(&b, 1);
+
+        // ── the control: both are swept while nobody is blocked ──────────────
+        let first = swept_channels(&b.on_tick(BASE_MS));
+        assert!(
+            first
+                .iter()
+                .any(|(conversation, _)| *conversation == blocked),
+            "the correspondence about to be blocked was not swept to begin with: {first:?}"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|(conversation, _)| *conversation == allowed),
+            "the control correspondence was not swept to begin with: {first:?}"
+        );
+        release_sweeps(&mut b, &first, BASE_MS);
+
+        // ── blocked ──────────────────────────────────────────────────────────
+        b.on_command(
+            BASE_MS,
+            DmCommand::Block {
+                pk_lt: Box::new(blocked_pk),
+            },
+        );
+        let second = swept_channels(&b.on_tick(BASE_MS + PROBE_MS));
+        // Vacuous on its own if `second` is empty — the `allowed` assertion
+        // below is what makes this one mean "one correspondence, not the plane".
+        assert!(
+            !second
+                .iter()
+                .any(|(conversation, _)| *conversation == blocked),
+            "a blocked correspondent's channel was still swept: {second:?}"
+        );
+        assert!(
+            second
+                .iter()
+                .any(|(conversation, _)| *conversation == allowed),
+            "the block silenced the whole channel plane instead of one \
+             correspondence: {second:?}"
+        );
+        // The correspondence is still there, whole: the design blocks reading,
+        // not the record.
+        assert_eq!(
+            b.correspondences.len(),
+            2,
+            "the block tore a correspondence down"
+        );
+        assert!(
+            b.correspondences[0].live().is_some(),
+            "the block tore the blocked correspondence's channel down"
+        );
+        release_sweeps(&mut b, &second, BASE_MS + PROBE_MS);
+
+        // ── unblocked ────────────────────────────────────────────────────────
+        b.on_command(
+            BASE_MS + PROBE_MS,
+            DmCommand::Unblock {
+                pk_lt: Box::new(blocked_pk),
+            },
+        );
+        let third = swept_channels(&b.on_tick(BASE_MS + 2 * PROBE_MS));
+        assert!(
+            third
+                .iter()
+                .any(|(conversation, _)| *conversation == blocked),
+            "an unblocked correspondent's channel was not swept again: {third:?}"
+        );
+    }
+
+    /// M29. A page outcome that arrives for a correspondence blocked since its
+    /// sweep was asked for surfaces nothing and settles nothing.
+    ///
+    /// **The sweep-time check cannot cover this**, and the window is the one a
+    /// user is most likely to be inside: a block landing between the plan and
+    /// its outcome would otherwise surface the messages it was meant to stop.
+    ///
+    /// Settling nothing is the second half and the one with a consequence. A
+    /// dropped position that had been settled would be lost for good — the
+    /// collection never revisits a settled position — so the unblocked fold at
+    /// the end is what proves the frames were only dropped. The first fold is
+    /// the control: without it, "no message" is satisfied by a fixture whose
+    /// frame never opened at all.
+    #[test]
+    fn a_page_arriving_after_a_block_surfaces_nothing_and_settles_nothing() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "read after the block".into(),
+            },
+        );
+        let label_a = sole_label(&a);
+        let frame = queued_frame(&a, &label_a, 1);
+        let conversation = conversation_of(&b, 0);
+        let blocked_pk = *keys().signing.public_key();
+
+        b.on_command(
+            BASE_MS,
+            DmCommand::Block {
+                pk_lt: Box::new(blocked_pk),
+            },
+        );
+        let settled_before = b.correspondences[0].collection.contiguous_through();
+        let dropped = fold_page(
+            &mut b,
+            conversation,
+            0,
+            vec![(position_of(1), frame.clone())],
+        );
+        assert!(
+            messages_in(&dropped).is_empty(),
+            "a blocked correspondent's page surfaced a message: {dropped:?}"
+        );
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            settled_before,
+            "the dropped page settled a position, so an unblock can never \
+             re-collect it"
+        );
+        assert!(
+            b.correspondences[0].owed_acks.is_empty(),
+            "the dropped page owed an acknowledgement for a message nobody saw"
+        );
+
+        // ── unblocked: the same bytes, from the same record ──────────────────
+        b.on_command(
+            BASE_MS,
+            DmCommand::Unblock {
+                pk_lt: Box::new(blocked_pk),
+            },
+        );
+        let surfaced = fold_page(&mut b, conversation, 0, vec![(position_of(1), frame)]);
+        assert_eq!(
+            messages_in(&surfaced),
+            vec!["read after the block".to_string()],
+            "the unblocked fold did not recover the message the block dropped: \
+             {surfaced:?}"
+        );
+    }
+
+    /// M30. An unreadable block list sweeps no channel at all.
+    ///
+    /// The doorbell plane already fails closed here, for the reason that governs
+    /// both: a revocation list read as "nobody is blocked" is silent unblocking.
+    /// The channel plane costs the same to get wrong and is the plane a block
+    /// lands on for an established correspondent.
+    ///
+    /// The first tick is the positive control, and the store read afterwards is
+    /// the second: without them, "no sweeps" is satisfied by a fixture that had
+    /// no live correspondence and by a record that was never actually broken.
+    #[test]
+    fn an_unreadable_block_list_sweeps_no_channel() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        let readable = b.on_tick(BASE_MS);
+        let first = swept_channels(&readable);
+        assert!(
+            !first.is_empty(),
+            "the fixture swept nothing while its list was readable, so the \
+             assertion below would hold for the wrong reason"
+        );
+        assert!(
+            !ack_fetches_in(&readable).is_empty(),
+            "the fixture asked for no acknowledgement while its list was \
+             readable, so the fetch assertion below would hold for the wrong \
+             reason: {readable:?}"
+        );
+        release_sweeps(&mut b, &first, BASE_MS);
+
+        let record = block_list_record(&b);
+        std::fs::remove_file(&record).expect("remove the block-list record");
+        assert!(
+            b.persist.read_block_list().is_err(),
+            "removing the record did not make the list unreadable"
+        );
+
+        let effects = b.on_tick(BASE_MS + PROBE_MS);
+        let second = swept_channels(&effects);
+        assert!(
+            second.is_empty(),
+            "an unreadable block list swept a channel anyway: {second:?}"
+        );
+        assert!(
+            ack_fetches_in(&effects).is_empty(),
+            "an unreadable block list fetched an acknowledgement anyway: {effects:?}"
+        );
+        // Exactly one, not at least one: a blind plane has to be reported, and a
+        // report per correspondence would grow with the contact list.
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|e| matches!(e, DmEffect::Emit(DmEvent::BlockListUnreadable)))
+                .count(),
+            1,
+            "a tick that could not read its block list must say so once: {effects:?}"
+        );
+    }
+
+    /// The conversations named by every acknowledgement fetch in a batch of
+    /// effects.
+    fn ack_fetches_in(effects: &[DmEffect]) -> Vec<[u8; AR_FINGERPRINT_LEN]> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::FetchAck { tag, .. }) => tag.conversation,
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M31. A blocked correspondent's acknowledgement record is neither fetched
+    /// nor folded.
+    ///
+    /// **An acknowledgement is a read of their record**, so the plane the design
+    /// closes covers it: folding one settles this side's outbox and reports
+    /// `ConfirmedCollected` for a party the user has refused. The record arriving
+    /// anyway is the in-flight case — the fetch was decided a tick before the
+    /// block — and it is dropped rather than refused, so the unfolded claim is
+    /// still good after an unblock.
+    ///
+    /// The tick before the block is the control on the fetch, and the fold after
+    /// the unblock is the control on the drop: without them, "nothing was
+    /// fetched" holds for a conversation with nothing outstanding and "nothing
+    /// settled" holds for a record that never verified.
+    #[test]
+    fn a_blocked_correspondents_acknowledgement_is_not_fetched_or_folded() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "the message the acknowledgement would settle".into(),
+            },
+        );
+        let conversation = conversation_of(&a, 0);
+        let blocked_pk = *b_keys.signing.public_key();
+        let label_a = sole_label(&a);
+
+        // ── the control: an outstanding entry is asked about ─────────────────
+        let first = a.on_tick(BASE_MS);
+        assert_eq!(
+            ack_fetches_in(&first),
+            vec![conversation],
+            "the fixture asked for no acknowledgement to begin with: {first:?}"
+        );
+        release_sweeps(&mut a, &swept_channels(&first), BASE_MS);
+
+        // ── blocked: nothing is asked for ────────────────────────────────────
+        a.on_command(
+            BASE_MS,
+            DmCommand::Block {
+                pk_lt: Box::new(blocked_pk),
+            },
+        );
+        let second = a.on_tick(BASE_MS + PROBE_MS);
+        assert!(
+            ack_fetches_in(&second).is_empty(),
+            "a blocked correspondent's acknowledgement record was fetched: {second:?}"
+        );
+
+        // ── and one that arrives anyway settles nothing ──────────────────────
+        let record = ack_record_from(&b, 0, &[1]);
+        let dropped = ack_fetched(&mut a, BASE_MS + PROBE_MS, conversation, record.clone());
+        assert!(
+            !deliveries_in(&dropped)
+                .iter()
+                .any(|(_, state)| *state == DeliveryState::ConfirmedCollected),
+            "a blocked correspondent's acknowledgement was folded: {dropped:?}"
+        );
+        assert_ne!(
+            outbox_state(&a, &label_a, 1, BASE_MS + PROBE_MS),
+            DeliveryState::ConfirmedCollected,
+            "the dropped acknowledgement settled the outbox anyway"
+        );
+
+        // ── unblocked: the same record, folded ───────────────────────────────
+        a.on_command(
+            BASE_MS + PROBE_MS,
+            DmCommand::Unblock {
+                pk_lt: Box::new(blocked_pk),
+            },
+        );
+        let folded = ack_fetched(&mut a, BASE_MS + PROBE_MS, conversation, record);
+        assert!(
+            deliveries_in(&folded)
+                .iter()
+                .any(|(seq, state)| *seq == 1 && *state == DeliveryState::ConfirmedCollected),
+            "the unblocked fold did not settle the sequence the block deferred: {folded:?}"
+        );
+    }
+
+    /// M32. An unreadable block list folds no page.
+    ///
+    /// The sweep-time refusal and this one are separate branches: a page whose
+    /// sweep was planned while the list was readable still arrives, and folding
+    /// it would read a record the plane has just been forbidden to read. The
+    /// repaired fold at the end is the control on both halves — it shows the
+    /// frame was dropped rather than settled, and that the fixture's frame opens
+    /// at all.
+    #[test]
+    fn an_unreadable_block_list_folds_no_page() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "folded only once the list reads".into(),
+            },
+        );
+        let label_a = sole_label(&a);
+        let frame = queued_frame(&a, &label_a, 1);
+        let conversation = conversation_of(&b, 0);
+
+        let record = block_list_record(&b);
+        let healthy = record.with_extension("held");
+        std::fs::copy(&record, &healthy).expect("keep the healthy record");
+        std::fs::remove_file(&record).expect("remove the block-list record");
+        assert!(
+            b.persist.read_block_list().is_err(),
+            "removing the record did not make the list unreadable"
+        );
+
+        let settled_before = b.correspondences[0].collection.contiguous_through();
+        let dropped = fold_page(
+            &mut b,
+            conversation,
+            0,
+            vec![(position_of(1), frame.clone())],
+        );
+        assert!(
+            messages_in(&dropped).is_empty(),
+            "a page folded while the block list was unreadable: {dropped:?}"
+        );
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            settled_before,
+            "the dropped page settled a position the fold never surfaced"
+        );
+
+        // Repaired, and the same bytes fold.
+        std::fs::rename(&healthy, &record).expect("repair the record");
+        let surfaced = fold_page(&mut b, conversation, 0, vec![(position_of(1), frame)]);
+        assert_eq!(
+            messages_in(&surfaced),
+            vec!["folded only once the list reads".to_string()],
+            "the repaired fold did not recover the message: {surfaced:?}"
+        );
+    }
+
+    /// M33. An unreadable block list folds no acknowledgement.
+    ///
+    /// The sibling of `an_unreadable_block_list_folds_no_page` on the other fold
+    /// path, and a separate branch from the fetch refusal: a fetch decided while
+    /// the list was readable still returns, and folding what it returns would
+    /// settle this side's outbox off a read the plane has just been forbidden to
+    /// make. The repaired fold is the control on both halves — it shows the
+    /// record was dropped rather than consumed, and that the fixture's record
+    /// verifies at all.
+    #[test]
+    fn an_unreadable_block_list_folds_no_acknowledgement() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "settled only once the list reads".into(),
+            },
+        );
+        let label_a = sole_label(&a);
+        let conversation = conversation_of(&a, 0);
+        let record = ack_record_from(&b, 0, &[1]);
+
+        let stored = block_list_record(&a);
+        let healthy = stored.with_extension("held");
+        std::fs::copy(&stored, &healthy).expect("keep the healthy record");
+        std::fs::remove_file(&stored).expect("remove the block-list record");
+        assert!(
+            a.persist.read_block_list().is_err(),
+            "removing the record did not make the list unreadable"
+        );
+
+        let dropped = ack_fetched(&mut a, BASE_MS, conversation, record.clone());
+        assert!(
+            !deliveries_in(&dropped)
+                .iter()
+                .any(|(_, state)| *state == DeliveryState::ConfirmedCollected),
+            "an acknowledgement folded while the block list was unreadable: {dropped:?}"
+        );
+        assert_ne!(
+            outbox_state(&a, &label_a, 1, BASE_MS),
+            DeliveryState::ConfirmedCollected,
+            "the dropped acknowledgement settled the outbox anyway"
+        );
+
+        // Repaired, and the same record folds.
+        std::fs::rename(&healthy, &stored).expect("repair the record");
+        let folded = ack_fetched(&mut a, BASE_MS, conversation, record);
+        assert!(
+            deliveries_in(&folded)
+                .iter()
+                .any(|(seq, state)| *seq == 1 && *state == DeliveryState::ConfirmedCollected),
+            "the repaired fold did not settle the sequence: {folded:?}"
         );
     }
 

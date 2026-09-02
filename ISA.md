@@ -986,6 +986,30 @@ left as built** — #253 draws the line at an *advancing frontier* silently manu
 records as a side effect of ordinary cadence; the ack record, like the key record, is one fixed
 address per (conversation, direction), the case #253's own text names as fine to leave alone.
 
+**The block list's channel plane is wired and pinned, and ISC-C46 stays open.** The driver reads the
+stored list once per idle tick and plans no page sweep for a suppressed correspondent, and re-checks
+it when a page outcome or an acknowledgement record lands, so a block taken while an operation was
+in flight drops what it returns without settling anything. The acknowledgement plane is gated with
+the sweep: a blocked correspondent's record is neither fetched nor folded. A tick that cannot read
+the list sweeps, fetches and folds nothing and says so once through `DmEvent::BlockListUnreadable`,
+which both front ends accept and drop —
+`a_blocked_correspondence_is_not_swept_and_an_unblock_resumes_it`,
+`a_page_arriving_after_a_block_surfaces_nothing_and_settles_nothing`,
+`an_unreadable_block_list_sweeps_no_channel`,
+`an_unreadable_block_list_folds_no_page`,
+`an_unreadable_block_list_folds_no_acknowledgement`,
+`a_blocked_correspondents_acknowledgement_is_not_fetched_or_folded`,
+`a_refused_block_keeps_the_held_request` (machine) and
+`a_block_stops_a_live_conversation_and_an_unblock_resumes_it` (two live drivers over one record
+store), each with a second correspondence or an earlier message as its control. What the criterion
+still asks for beyond this is its *byte-identical to "never came online"* clause: this side's own
+outbox re-seeds and acknowledgement writes to a blocked identity continue, so a blocked
+correspondent holding an unacknowledged conversation can still observe that this side is running —
+and the same split costs this side an accurate delivery report, since an entry queued for a blocked
+correspondent re-seeds to the seven-day give-up and is surfaced `Undelivered` even where that
+correspondent collected it, the acknowledgement that would have settled it being one of the reads
+the block stops. Both are bounded and deliberate under "the block stops reads, not writes".
+
 **The gate that runs on every commit.** `cargo fmt --all --check`, `cargo clippy --workspace
 --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo xtask check-proto`, plus the
 judgment gate that the commit's documentation is already true. `cargo xtask release-gate` runs the

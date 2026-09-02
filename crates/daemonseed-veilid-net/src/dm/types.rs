@@ -333,6 +333,19 @@ pub enum DmEvent {
     /// unblocking. The user is entitled to know their block list may have been
     /// reset.
     BlockListProvisioned,
+    /// The profile's block-list record could not be read on an idle tick, so no
+    /// correspondent's channel was swept and no acknowledgement was fetched.
+    ///
+    /// **The channel plane is blind, not quiet, and the two look identical from
+    /// outside.** The plane fails closed — an unreadable revocation list must
+    /// not read as "nobody is blocked" — so every established conversation
+    /// stops collecting until the record can be read, and without this the only
+    /// symptom is messages that never arrive. Emitted at most once per idle
+    /// tick, and only on a tick whose correspondence list is non-empty — the
+    /// gate is that list, not whether any of them holds a live channel, so a
+    /// session whose every correspondence is awaiting its acceptance still
+    /// reports the blindness.
+    BlockListUnreadable,
     /// A consumed invite-token nonce did not reach the disk.
     ///
     /// The set in memory is correct for this run; the file is not. A grant
@@ -568,6 +581,7 @@ impl core::fmt::Debug for DmEvent {
                 write!(f, "BlockListFull {{ count: {count} }}")
             }
             DmEvent::BlockListProvisioned => f.write_str("BlockListProvisioned"),
+            DmEvent::BlockListUnreadable => f.write_str("BlockListUnreadable"),
             DmEvent::SpentTokensNotPersisted => f.write_str("SpentTokensNotPersisted"),
         }
     }
