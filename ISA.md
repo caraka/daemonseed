@@ -958,12 +958,15 @@ git log; this records only shifts in what "done" means.
 Evidence that criteria hold, recorded as current state rather than as history. The mechanized
 authority is `cargo xtask isc-coverage`; this section records what that authority does *not* settle.
 
-**The DM acknowledgement record, its piggyback path, and the standalone-ack cadence policy
-(ISC-C39, ISC-A-C21) are built, unit-tested and mutation-tested in isolation; nothing yet calls
-them in production.** No GUI/TUI wiring exists, and no live loop connects the cadence policy's
-decisions to an actual network write — matching how `PublishDmPage`/`SweepDmPage`/
-`PublishDoorbellEntry` already sit in `daemonseed-veilid-net` with zero front-end callers. The
-criteria these pieces support remain open until that integration lands.
+**The DM driver (`daemonseed_veilid_net::dm`) calls every DM module in production, and both front
+ends spawn it beside their net actor on connect.** The acknowledgement record, its piggyback path
+and the standalone cadence (ISC-C39, ISC-A-C21), the doorbell and first-contact path (ISC-C41), the
+paged channel (ISC-C42) and the established-contact channel (ISC-C43) run through it. The two-node
+oracle `two_node_dm_driver.rs` passed against the public Veilid network on an attach-capable host:
+first contact, acceptance, one message in each direction, and both outboxes confirmed-collected,
+each exactly once (`test result: ok. 1 passed`, 1221 s). The criteria named above stay open until
+each is closed against its own text; the oracle is evidence for them, not a closing pass. Nothing is
+rendered yet: the front ends fold `DmEvent` into state and send no `DmCommand` but shutdown.
 
 **Felt-tested for real, 2026-08-28: `two_node_dm_ack.rs`'s live oracle passed against the public
 Veilid network on an attach-capable host** — `an_acknowledgement_published_by_one_node_merges_at_the_other`,
