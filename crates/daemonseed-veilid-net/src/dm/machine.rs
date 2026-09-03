@@ -6562,8 +6562,8 @@ mod tests {
     /// acceptor's sequence zero — so a probe that refused to plan while the
     /// pseudonym was unknown would be waiting for something only the sweep can
     /// deliver. The `SweepPage` effect is the whole assertion; the correspondence
-    /// underneath it has `peer_pk_pc: None`, which is the state that used to
-    /// suppress it.
+    /// underneath it has `peer_pk_pc: None`, the state a pseudonym-gated probe
+    /// would refuse to plan in.
     #[test]
     fn an_initiator_sweeps_before_it_knows_the_pseudonym() {
         let dir = tempfile::tempdir().expect("temp dir");
