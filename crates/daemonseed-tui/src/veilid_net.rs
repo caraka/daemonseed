@@ -4832,6 +4832,12 @@ mod tests {
         ) -> DmDhtFuture<daemonseed_veilid_net::actor::DmPageSweep> {
             Self::refuse()
         }
+        fn close_dm_page(
+            &self,
+            _: daemonseed_veilid_net::actor::DmPageRecord,
+        ) -> DmDhtFuture<bool> {
+            Self::refuse()
+        }
         fn publish_dm_ack(
             &self,
             _: daemonseed_core::dm::ack_record::DmAckAddress,

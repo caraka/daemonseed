@@ -777,6 +777,31 @@ impl<I: Eq + std::hash::Hash + Clone> BoundedRing<I> {
         self.order.remove(pos)
     }
 
+    /// Drop `id` from the ring if it is present and **nobody is holding it**,
+    /// answering whether it was.
+    ///
+    /// The counterpart to [`Self::evictable`] for a close the caller asked for by
+    /// name rather than one the capacity forced. It applies the identical live-borrow
+    /// rule — a leased id is refused, never closed — so an explicit close cannot
+    /// reach a record an in-flight operation is reading, which is the one thing the
+    /// bound is not allowed to do.
+    ///
+    /// `false` for an id nobody opened, which is the ordinary answer for a page whose
+    /// every open was of the *other* direction's record, and for one the capacity
+    /// already evicted.
+    fn take_unleased(&mut self, id: &I) -> bool {
+        if self.live.contains_key(id) {
+            return false;
+        }
+        match self.order.iter().position(|held| held == id) {
+            Some(pos) => {
+                self.order.remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// How many ids the ring holds. Test-only: production reads the ring exclusively
     /// through [`open_page_bounded`], and a size accessor is exactly the sort of
     /// handle that lets a caller start making its own eviction decisions.
@@ -962,6 +987,60 @@ where
         close(evicted).await;
     }
     Ok(Some((handle, lease)))
+}
+
+/// Close one page record **by name**, because its holder says it is finished with
+/// it — the driver-signalled counterpart to [`open_page_bounded`]'s
+/// capacity-forced eviction. Answers whether a record was actually closed.
+///
+/// The capacity bound reclaims records because too many are open; this reclaims one
+/// because nothing will ask for it again. They are the same act on the same two
+/// structures and differ only in what chose the victim, so this reuses every rule
+/// the eviction path established rather than restating any of them:
+///
+/// - **A leased id is refused, never closed.** [`BoundedRing::take_unleased`]
+///   applies the identical live-borrow test [`BoundedRing::evictable`] does, so a
+///   caller cannot close a record a sweep or a publish is parked inside — the
+///   failure that turns an in-flight sweep's remaining GETs into `outcome.failed`.
+/// - **Choosing and removing are one critical section**, ring lock outside cache
+///   lock, matching the order [`open_page_bounded`] takes and never the reverse.
+/// - **The close runs under the record's own serialization lock**, so it cannot kill
+///   a session a concurrent opener has just established for the same id.
+///
+/// **A refusal is silent and the record simply stays open.** The caller has already
+/// decided it is done with the page, so there is nothing to retry against: what a
+/// refusal means is that some operation is still using the record, and the capacity
+/// bound remains the backstop that will reclaim it later. Answering rather than
+/// erroring is what lets a caller count reclaimed records without treating "busy"
+/// as a fault.
+pub async fn close_page_now<I, K, CloseFut>(
+    cache: &Mutex<HashMap<I, K>>,
+    ring: &Mutex<BoundedRing<I>>,
+    id: &I,
+    lock_for: impl FnOnce(I) -> Arc<tokio::sync::Mutex<()>>,
+    close: impl FnOnce(K) -> CloseFut,
+) -> bool
+where
+    I: Eq + std::hash::Hash + Clone,
+    CloseFut: std::future::Future<Output = ()>,
+{
+    let taken = {
+        let mut ring = ring.lock().unwrap_or_else(|e| e.into_inner());
+        if !ring.take_unleased(id) {
+            return false;
+        }
+        cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id)
+    };
+    // Dropped from the ring but absent from the cache: the id was recorded by an
+    // open whose entry something else has since removed. Nothing to close, and the
+    // ring is now consistent with the cache, which is the state this wanted.
+    let Some(handle) = taken else {
+        return false;
+    };
+    let closing = lock_for(id.clone());
+    let _closing_guard = closing.lock().await;
+    close(handle).await;
+    true
 }
 
 /// Per-rendezvous-record serialization lock: one async mutex per record, keyed by
@@ -1929,6 +2008,113 @@ mod tests {
             opens.load(Ordering::SeqCst),
             before + 1,
             "a re-open of an evicted page opens; a hit here would serve a closed record"
+        );
+    }
+
+    /// Close one page by name through the real path, with the same stand-ins
+    /// [`open_page`] uses.
+    async fn close_page(
+        cache: &Mutex<HashMap<u32, u32>>,
+        ring: &Mutex<BoundedRing<u32>>,
+        locks: &TestRecordLocks,
+        id: u32,
+        closed: &Mutex<Vec<u32>>,
+    ) -> bool {
+        close_page_now(
+            cache,
+            ring,
+            &id,
+            |closing: u32| test_lock(locks, closing),
+            |handle: u32| async move {
+                closed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(handle);
+            },
+        )
+        .await
+    }
+
+    /// A page closed by name is released; one somebody is holding is refused.
+    ///
+    /// The driver-signalled half of #252. A close asked for by name reaches a page
+    /// the capacity bound would not have chosen — it is neither the oldest nor over
+    /// any bound — so the only thing standing between it and a record in use is the
+    /// live-borrow test, which is why that is the half pinned here.
+    ///
+    /// Three claims, and the first two are controls for the third: an unleased page
+    /// closes and leaves the cache, a leased one is refused and does NOT, and the
+    /// refused page closes once its lease drops. Without the last, "refused" is
+    /// indistinguishable from a close path that never works.
+    #[tokio::test]
+    async fn a_page_closed_by_name_is_released_unless_somebody_holds_it() {
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        const CAP: usize = 8;
+
+        open_page_and_release(&cache, &ring, &locks, 1, CAP, &opens, &closed).await;
+        let held = open_page(&cache, &ring, &locks, 2, CAP, &opens, &closed)
+            .await
+            .expect("page two opens");
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            2,
+            "both pages must be open, or neither close below means anything"
+        );
+
+        assert!(
+            close_page(&cache, &ring, &locks, 1, &closed).await,
+            "an unleased page must be released when its holder asks"
+        );
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![100],
+            "the record must be CLOSED, not merely dropped from the cache — the map \
+             entry is the cheap half"
+        );
+        assert!(!cache.lock().unwrap().contains_key(&1));
+        assert_eq!(ring.lock().unwrap().len(), 1, "the ring drops it too");
+
+        assert!(
+            !close_page(&cache, &ring, &locks, 2, &closed).await,
+            "a page somebody is holding must be refused: closing a record mid-sweep \
+             turns its remaining reads into failures"
+        );
+        assert!(
+            cache.lock().unwrap().contains_key(&2),
+            "a refused close must leave the entry exactly where it was"
+        );
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![100],
+            "a refused close must not have closed anything"
+        );
+
+        // The lease drops, so the same ask now succeeds — which is what makes the
+        // refusal a deferral rather than a page that can never be reclaimed.
+        drop(held);
+        assert!(
+            close_page(&cache, &ring, &locks, 2, &closed).await,
+            "a page whose holder is done must be releasable"
+        );
+        assert_eq!(*closed.lock().unwrap(), vec![100, 200]);
+
+        // A page nobody opened answers false and closes nothing, which is what a
+        // caller counting reclaimed records has to be able to tell apart.
+        assert!(
+            !close_page(&cache, &ring, &locks, 7, &closed).await,
+            "a page nobody opened releases no record"
+        );
+        assert_eq!(*closed.lock().unwrap(), vec![100, 200]);
+
+        // **The unknown-id arm, asserted on the ring directly.** Through
+        // `close_page_now` it is masked: an id the ring does not hold is also an id
+        // the cache does not hold, so inverting this answer still returns false at
+        // the cache miss one line later, and the assertion above passes either way.
+        // The ring is what has to be right — a `true` here would drop nothing and
+        // report that it had.
+        assert!(
+            !ring.lock().unwrap().take_unleased(&9),
+            "an id the ring never held is not something to take"
         );
     }
 

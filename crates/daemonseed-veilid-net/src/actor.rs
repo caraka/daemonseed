@@ -16,6 +16,7 @@ use veilid_core::{
 
 use daemonseed_core::dm::ack_record::DmAckAddress;
 use daemonseed_core::dm::paging::{DmPageAddress, PagePosition, Receiving, Sending};
+use daemonseed_core::dm::ratchet::Direction;
 use daemonseed_core::public_room::PublicRoomKey;
 use daemonseed_core::share_envelope::ManifestEntry;
 use daemonseed_core::share_serve::ChunkSource;
@@ -237,6 +238,81 @@ impl DmPageSweep {
             conversation: *address.conversation(),
             slots,
             outcome,
+        }
+    }
+}
+
+/// One page record, either direction, for the one operation that does not care
+/// which direction it is (#252).
+///
+/// **A direction-erasing carrier, and nothing else.** Every other page operation is
+/// direction-typed on purpose — publishing to the stream we receive on, or sweeping
+/// the one we send on, are the silent faults the typed `PublishDmPage` and
+/// `SweepDmPage` commands make unrepresentable — and this does not weaken that: a
+/// close is not an operation *on* the record's contents at all, so there is no wrong
+/// direction to close. What identifies the record is the owner seed, and the seed is
+/// what the two variants have in common.
+///
+/// The alternatives were a generic parameter, which the actor's command enum cannot
+/// carry, and a second command, which would give the close two dispatch sites for one
+/// act.
+///
+/// Carries the whole [`DmPageAddress`] rather than an owner seed copied out of one,
+/// for the reason every DM command does (#244): under Veilid the page owner seed is
+/// the conversation's write capability, and it travels boxed, redacted and
+/// zeroize-on-drop or it does not travel.
+pub enum DmPageRecord {
+    /// A page of the stream this end sends on.
+    Sending(DmPageAddress<Sending>),
+    /// A page of the stream this end receives on.
+    Receiving(DmPageAddress<Receiving>),
+}
+
+impl DmPageRecord {
+    /// Run one operation against this record's owner seed — the erased half of
+    /// [`DmPageAddress::with_owner_seed`], on exactly its terms.
+    pub fn with_owner_seed<T>(
+        &self,
+        f: impl FnOnce(&[u8; daemonseed_core::dm::paging::DM_PAGE_OWNER_SEED_LEN]) -> T,
+    ) -> T {
+        match self {
+            DmPageRecord::Sending(address) => address.with_owner_seed(f),
+            DmPageRecord::Receiving(address) => address.with_owner_seed(f),
+        }
+    }
+
+    /// Which page this record holds.
+    pub fn page(&self) -> u64 {
+        match self {
+            DmPageRecord::Sending(address) => address.page(),
+            DmPageRecord::Receiving(address) => address.page(),
+        }
+    }
+
+    /// The conversation this record belongs to — a hash, not a capability.
+    pub fn conversation(&self) -> &[u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN] {
+        match self {
+            DmPageRecord::Sending(address) => address.conversation(),
+            DmPageRecord::Receiving(address) => address.conversation(),
+        }
+    }
+
+    /// The absolute direction the record was derived for.
+    pub fn direction(&self) -> Direction {
+        match self {
+            DmPageRecord::Sending(address) => address.direction(),
+            DmPageRecord::Receiving(address) => address.direction(),
+        }
+    }
+}
+
+impl core::fmt::Debug for DmPageRecord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Delegated, so the seed renders through its own redacted `Debug`
+        // (ISC-A-C1) rather than through anything written here.
+        match self {
+            DmPageRecord::Sending(address) => write!(f, "Sending({address:?})"),
+            DmPageRecord::Receiving(address) => write!(f, "Receiving({address:?})"),
         }
     }
 }
@@ -473,6 +549,21 @@ enum Command {
     SweepDmPage {
         address: DmPageAddress<Receiving>,
         reply: oneshot::Sender<Result<DmPageSweep>>,
+    },
+    /// Give one channel page's record back: drop it from the open cache and close
+    /// the DHT record (#252).
+    ///
+    /// Answers whether a record was actually closed. `false` is the ordinary state
+    /// of a page nobody opened, one the cache's own capacity bound already reclaimed,
+    /// and one an operation is still holding — see `rendezvous::close_page_now`,
+    /// which refuses a leased record rather than closing it under its user.
+    ///
+    /// Direction-erased ([`DmPageRecord`]) where every other page command is
+    /// direction-typed: a close acts on the record, not on its contents, so there is
+    /// no wrong direction for one.
+    CloseDmPage {
+        address: DmPageRecord,
+        reply: oneshot::Sender<Result<bool>>,
     },
     // ── Direct messaging (#233) ──
     /// Write one first-contact entry into `slot` of the `dflt(32)` doorbell record
@@ -967,6 +1058,36 @@ impl VeilidNetHandle {
     /// rebuilt from borrowed bytes without reintroducing the copy (#244).
     pub async fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> Result<DmPageSweep> {
         self.send(|reply| Command::SweepDmPage { address, reply })
+            .await?
+    }
+
+    /// Close one channel page's record, answering whether one was actually closed.
+    ///
+    /// **The reclamation path for the one record family whose count grows with
+    /// message volume** (#252). Every other family this engine serves is bounded by
+    /// peers — one rendezvous record per circle, one key record and one doorbell per
+    /// correspondent — so opening once and never closing is a constant per peer. A
+    /// page owner seed is new every `PAGE_SLOTS` messages, per direction, per
+    /// conversation, so the same policy over pages is a count that only rises.
+    ///
+    /// **Ask for this only when the caller will not address the page again.** It is
+    /// the caller's own signal that decides that — a receiving page the collection
+    /// has settled through and moved past, a sending page the correspondent has
+    /// acknowledged every position of, every page of a conversation being torn down.
+    /// Nothing here can tell; the record is opened again by the ordinary open path
+    /// if a later plan does name it, at the cost of one open.
+    ///
+    /// `Ok(false)` is not a failure. It is the answer for a page nobody opened, one
+    /// the cache's capacity bound already reclaimed, and one an in-flight sweep or
+    /// publish is still holding — the last of which is refused rather than closed,
+    /// because closing a record mid-sweep turns its remaining reads into
+    /// `outcome.failed`, the signal a collector is told to read as record ill-health.
+    ///
+    /// Takes the record by value for the reason [`Self::publish_dm_page`] does: the
+    /// owner seed inside is the conversation's write capability and must be moved,
+    /// never copied out (#244).
+    pub async fn close_dm_page(&self, address: DmPageRecord) -> Result<bool> {
+        self.send(|reply| Command::CloseDmPage { address, reply })
             .await?
     }
 
@@ -1825,6 +1946,23 @@ async fn actor_loop(
                     )
                     .await;
                     // A dropped receiver (caller gave up / shutting down) is benign.
+                    let _ = reply.send(r);
+                });
+            }
+            Command::CloseDmPage { address, reply } => {
+                // Spawned for the reason the sweep beside it is: the close takes the
+                // record's own serialization lock, which a concurrent publish to that
+                // page holds across its open AND its write, so awaiting this on the
+                // command loop would park every other command behind one page's write
+                // (the #154 failure mode). Nothing waits on the answer either — the
+                // caller reads it to count what it reclaimed.
+                let rc = rc.clone();
+                let opened = opened.clone();
+                let page_recency = page_recency.clone();
+                let record_locks = record_locks.clone();
+                tokio::spawn(async move {
+                    let r =
+                        close_dm_page(&rc, &opened, &page_recency, &record_locks, &address).await;
                     let _ = reply.send(r);
                 });
             }
@@ -3028,6 +3166,35 @@ async fn fetch_dm_ack(
 /// (`ISA.md` ISC-C100; sizing in `docs/design/direct-messaging.md` DRAFT v6).
 const DM_PAGE_SHAPE: rendezvous::RecordShape = rendezvous::RecordShape::DM_PAGE;
 
+/// The open-cache id of one page record — the single derivation the opener and the
+/// closer both go through (#252).
+///
+/// **A page is opened in one place and closed in another, and the two must name the
+/// same id.** `o_cnt` is part of the record address, so a closer that derived its id
+/// under a different shape would remove no cache entry, close no record, and report
+/// nothing — the same silent-disagreement class `dm_page_open` exists to rule out
+/// between publish and sweep, reached through the close instead. One function is
+/// what makes that unrepresentable rather than reviewed.
+fn dm_page_cache_id(owner: &KeyPair) -> rendezvous::CachedRecordId {
+    rendezvous::cached_record_id(&owner.key(), DM_PAGE_SHAPE)
+}
+
+/// The open-cache id of the record one [`DmPageRecord`] names — the whole of the
+/// closer's derivation, in a function a test can call.
+///
+/// **The closer and its test share one derivation, and that is the point.**
+/// `close_dm_page` needs a live `RoutingContext` to reach `close_dht_record`, so a
+/// test cannot call it; a test that re-derives the id the way the closer does proves
+/// only that it agrees with itself. Everything the closer decides about *which
+/// record* lives here instead, where a test can reach it and a mutation to it fails.
+///
+/// Borrows the seed to derive, exactly as the publish path does: the keypair carries
+/// it and the binding drops with the call (#244).
+fn dm_page_record_id(address: &DmPageRecord) -> Result<rendezvous::CachedRecordId> {
+    let owner = address.with_owner_seed(identity::rendezvous_owner_keypair)?;
+    Ok(dm_page_cache_id(&owner))
+}
+
 /// Refuse a page record whose subkey count is not the page slot count, **in both
 /// directions** (#254).
 ///
@@ -3230,12 +3397,13 @@ async fn dm_page_open<'r>(
     owner: &KeyPair,
     if_absent: IfAbsent,
 ) -> Result<Option<OpenPage<'r>>> {
-    // Bound ONCE, and every use below goes through this binding. The two modes must
+    // Bound ONCE, and both open modes below go through this binding: they must
     // address the same record or they are two open sites wearing one name, and a
-    // local makes that unrepresentable rather than merely reviewed — the cache id and
-    // both opens cannot drift apart without editing this line.
+    // local makes that unrepresentable rather than merely reviewed.
     let shape = DM_PAGE_SHAPE;
-    let id = rendezvous::cached_record_id(&owner.key(), shape);
+    // The id comes from the shared derivation rather than from `shape`, because the
+    // closer has to compute the same one and cannot reach a local in this body.
+    let id = dm_page_cache_id(owner);
     rendezvous::open_page_bounded(
         opened,
         page_recency,
@@ -3483,6 +3651,52 @@ async fn sweep_dm_page(
     // placement is unit-testable — see `dm_page_place_swept`.
     let found = dm_page_place_swept(address, raw)?;
     Ok(DmPageSweep::for_address(address, found, outcome))
+}
+
+/// Give one channel page's record back: drop the open-cache entry and close the DHT
+/// record (#252). Answers whether a record was actually closed.
+///
+/// **The counterpart to [`dm_page_open`], and it addresses the record the same way
+/// or it addresses a different one.** `o_cnt` is part of the record address, so the
+/// id here must be the one the opener cached under — which is why both go through
+/// [`dm_page_cache_id`] rather than each deriving one. A close that computed a
+/// different id would remove nothing, close nothing, and report success.
+///
+/// The lease check, the ring-then-cache lock order and the close-under-the-record's-
+/// own-lock discipline all live in `rendezvous::close_page_now`, which is the same
+/// code path the capacity bound's eviction takes; this function is the derivation
+/// that names the record and nothing more. It issues no gated DHT operation —
+/// `close_dht_record` releases a local session — so it takes no permit, exactly as
+/// the eviction close inside `dm_page_open` does not.
+async fn close_dm_page(
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    page_recency: &rendezvous::DmPageRecency,
+    record_locks: &rendezvous::RecordLocks,
+    address: &DmPageRecord,
+) -> Result<bool> {
+    let id = dm_page_record_id(address)?;
+    let closed = rendezvous::close_page_now(
+        opened,
+        page_recency,
+        &id,
+        |closing: rendezvous::CachedRecordId| rendezvous::record_lock(record_locks, &closing.0),
+        // Best-effort, exactly as the eviction and repair closes are: releasing a
+        // session veilid has already collected is a benign race, and the local entry
+        // is gone either way.
+        |handle: rendezvous::RendezvousHandle| async move {
+            if let Err(e) = rc.close_dht_record(handle.into_key()).await {
+                crate::vtrace!("close_dm_page: close_dht_record failed ({e})");
+            }
+        },
+    )
+    .await;
+    crate::vtrace!(
+        "close_dm_page: page={} direction={:?} closed={closed}",
+        address.page(),
+        address.direction()
+    );
+    Ok(closed)
 }
 
 /// The DM doorbell's schema: `dflt(32)`, one subkey per knock slot.
@@ -5107,6 +5321,136 @@ mod tests {
         .expect("open a recipient ratchet")
     }
 
+    /// A page record opened through the bounded path is handed back by the close
+    /// path's own derivation, and a second close of it answers `false`.
+    ///
+    /// **The close path had no behavioural oracle at all — only a source-text
+    /// needle**, which can say the closer calls the shared derivation and can say
+    /// nothing about whether the id it produces is the one the record was cached
+    /// under. Two things are pinned here, and they fail to different mutations.
+    ///
+    /// The derivation is checked against an INDEPENDENT expectation built in this
+    /// test from `DM_PAGE_SHAPE`, so a `dm_page_cache_id` that reached for another
+    /// family's shape fails here — and would not fail a test that merely compared
+    /// the closer's id to the opener's, since both read the same function.
+    ///
+    /// The removal is then exercised over a real [`rendezvous::OpenCache`]-shaped
+    /// map and a real ring, with the id rebuilt from a SECOND, independently
+    /// constructed address for the same page: that is what the production closer
+    /// does, since the address it is handed is never the one the open used. The
+    /// veilid handle is a stand-in — `rc.close_dht_record` needs a live node, and
+    /// what is untestable without one is the network call, not the bookkeeping this
+    /// asserts.
+    #[tokio::test]
+    async fn a_page_is_closed_under_the_id_it_was_opened_with() {
+        let ratchet = page_ratchet();
+        let root = page_address_root();
+        let record = DmPageRecord::Receiving(
+            paging::DmPageAddress::receiving(&root, &ratchet, PAGE_FIXTURE_PAGE)
+                .expect("a receiving address"),
+        );
+        let id = dm_page_record_id(&record).expect("the closer's derivation");
+
+        // The derivation, against an expectation this test builds itself rather than
+        // against the function under test.
+        let owner = record
+            .with_owner_seed(identity::rendezvous_owner_keypair)
+            .expect("the owner keypair derives");
+        assert_eq!(
+            id,
+            rendezvous::cached_record_id(&owner.key(), DM_PAGE_SHAPE),
+            "a page's cache id is its owner's public key under the PAGE shape; any \
+             other shape names a different record, so the close would remove nothing \
+             and report success"
+        );
+
+        let cache: Mutex<HashMap<rendezvous::CachedRecordId, u32>> = Mutex::new(HashMap::new());
+        let ring: Mutex<rendezvous::BoundedRing<rendezvous::CachedRecordId>> =
+            Mutex::new(rendezvous::BoundedRing::new());
+        let locks: Mutex<HashMap<rendezvous::CachedRecordId, Arc<tokio::sync::Mutex<()>>>> =
+            Mutex::new(HashMap::new());
+        let closed: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        let lock_for = |id: rendezvous::CachedRecordId| {
+            locks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(id)
+                .or_default()
+                .clone()
+        };
+
+        let opened = rendezvous::open_page_bounded(
+            &cache,
+            &ring,
+            &id,
+            rendezvous::DM_PAGE_CACHE_CAPACITY,
+            async { Ok(Some(77u32)) },
+            lock_for,
+            |_: u32| async {},
+        )
+        .await
+        .expect("the open succeeds");
+        drop(opened);
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            1,
+            "the record must be cached before the close, or nothing below means \
+             anything"
+        );
+
+        // A SECOND record for the same page, derived afresh through the closer's own
+        // derivation — which is what a close is always handed. Neither address is
+        // `Clone`, and the seed inside is a zeroizing secret, so re-deriving is the
+        // only way to name the record twice.
+        let again = DmPageRecord::Receiving(
+            paging::DmPageAddress::receiving(&root, &ratchet, PAGE_FIXTURE_PAGE)
+                .expect("a second receiving address"),
+        );
+        let closing_id = dm_page_record_id(&again).expect("the closer's derivation, again");
+
+        assert!(
+            rendezvous::close_page_now(&cache, &ring, &closing_id, lock_for, |handle: u32| {
+                let closed = &closed;
+                async move {
+                    closed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(handle);
+                }
+            },)
+            .await,
+            "the record opened above must be the one the close reaches"
+        );
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![77],
+            "the record must be CLOSED, not merely dropped from the cache"
+        );
+        assert!(
+            cache.lock().unwrap().is_empty(),
+            "and the cache entry must be gone"
+        );
+
+        assert!(
+            !rendezvous::close_page_now(&cache, &ring, &closing_id, lock_for, |handle: u32| {
+                let closed = &closed;
+                async move {
+                    closed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(handle);
+                }
+            },)
+            .await,
+            "a second close of the same page releases nothing"
+        );
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![77],
+            "and closes nothing a second time"
+        );
+    }
+
     /// The `ss0` the page fixtures share — the ratchet and the address root must
     /// come from the same one, or the derivation refuses them (#270).
     const PAGE_FIXTURE_SS0: [u8; 32] = [0x5c; 32];
@@ -5740,12 +6084,41 @@ mod tests {
         let shape: String = ["DM_PAGE", "_SHAPE"].concat();
         assert_eq!(
             prod.matches(shape.as_str()).count(),
-            2,
-            "the page shape must be named exactly twice outside the tests: its own \
-             definition, and the single binding inside the one opener that the cache \
-             id and both open modes are all built from. A third naming is a second \
-             open site, which is how publish and sweep come to address different \
-             records"
+            3,
+            "the page shape must be named exactly three times outside the tests: its \
+             own definition, the single binding inside the one opener that both open \
+             modes are built from, and the one id derivation the opener and the \
+             closer share. A fourth naming is a second open site, which is how \
+             publish and sweep come to address different records"
+        );
+
+        // The third naming arrived with the close path (#252) and is an ID
+        // derivation, not an open. A closer must name the record the opener cached
+        // it under — a different `o_cnt` removes no entry, closes no record and
+        // reports success — so it goes through `dm_page_cache_id` rather than
+        // deriving its own. This pins that: a shape named inside the closer's body
+        // is a second derivation, and the count above would not catch it because the
+        // count cannot tell an id derivation from an open.
+        // Newline-anchored: `VeilidNetHandle::close_dm_page` is an indented `pub
+        // async fn` of the same name and comes first in the file, so an unanchored
+        // needle finds the handle method instead — a body with no shape in it, which
+        // would satisfy the assertion below whatever the closer does.
+        let closer_start = prod
+            .find("\nasync fn close_dm_page")
+            .expect("the closer's definition moved");
+        let closer_body = &prod[closer_start..];
+        let closer_body = &closer_body[..closer_body
+            .find("\n}\n")
+            .expect("the closer's closing brace moved")];
+        // Fragmented like every other needle here, so this test's own source cannot
+        // satisfy the count it is asserting about the production half.
+        let shape_needle: String = ["_", "SHAPE"].concat();
+        assert_eq!(
+            closer_body.matches(shape_needle.as_str()).count(),
+            0,
+            "the closer's body must name NO shape constant — its id comes from the \
+             shared derivation the opener uses, and a shape named here is a second \
+             one that can drift from it"
         );
 
         // The count was 3 until #253 gave the opener a second mode (create for the
@@ -5887,12 +6260,12 @@ mod tests {
                  — a local literal drifts from the constant the doc reasons about",
             ),
             (
-                ["cached_record", "_id("].concat(),
-                "the cache id is derived ONCE and that one binding is what both the \
-                 cache and the ring are keyed on. A second derivation is free to name \
-                 another shape — the ISC-C100 failure by a third door, and one the \
-                 shape count cannot see because a different family's constant does \
-                 not carry this one's suffix",
+                ["dm_page_cache", "_id("].concat(),
+                "the cache id is derived ONCE, through the shared derivation, and \
+                 that one binding is what both the cache and the ring are keyed on. \
+                 A second derivation is free to name another shape — the ISC-C100 \
+                 failure by a third door, and one the shape count cannot see because \
+                 a different family's constant does not carry this one's suffix",
             ),
             (
                 ["record", "_lock("].concat(),
@@ -5917,6 +6290,34 @@ mod tests {
         ] {
             assert_eq!(opener_body.matches(needle.as_str()).count(), 1, "{why}");
         }
+
+        // The shared derivation is where `cached_record_id` moved to when the close
+        // path arrived (#252), and it must name it exactly once for the same reason
+        // the opener used to: an id derived twice can be derived under two shapes.
+        // Counted inside that function rather than across the file, because other
+        // record families derive their own ids and this says nothing about theirs.
+        let derive: String = ["fn dm_page_cache", "_id("].concat();
+        let derive_start = prod.find(derive.as_str()).expect("the derivation moved");
+        let derive_body = &prod[derive_start..];
+        let derive_body = &derive_body[..derive_body
+            .find("\n}\n")
+            .expect("the derivation's closing brace moved")];
+        assert_eq!(
+            derive_body
+                .matches(["cached_record", "_id("].concat().as_str())
+                .count(),
+            1,
+            "the shared page-id derivation must build exactly one id"
+        );
+        // And it is shared: the opener and the closer, and nothing else. A third
+        // caller is a page path that has not been reasoned about here.
+        assert_eq!(
+            prod.matches(["dm_page_cache", "_id("].concat().as_str())
+                .count(),
+            3,
+            "the page cache id is derived in one function, called by the opener and \
+             by the record-id derivation the closer goes through, and by nothing else"
+        );
     }
 
     // ── Direct messaging (#233): the doorbell transport ───────────────────

@@ -1280,7 +1280,13 @@ modules:
       idempotent; abandon additionally advances the prefix past it. After
       abandon(seq), is_settled(seq) is true. is_settled(seq) is true inside the
       prefix or inside a run and false otherwise, including for unknown positions;
-      it reports settled, not collected. merge_own_ack(other) is a monotonic union
+      it reports settled, not collected. settled_pages_below() -> u64 is the first
+      paging page this state has not settled through: the page of the first unsettled
+      position, 0 while the prefix is empty, and one past paging::MAX_PAGE when the
+      prefix covers the whole sequence space. It counts abandon(seq) alongside
+      collect(seq), and the give-up it counts is the HOLDER's own: a party applies
+      it to the state it keeps about its own sends, and nothing on the wire carries a
+      correspondent's give-up. merge_own_ack(other) is a monotonic union
       for an ack this party itself published: the prefix never regresses and no
       settled position is cleared. merge_peer_ack(other: PeerAck, highest_sent:
       Option<u64>) -> Result<PeerAckOutcome, AckError> is that union with the peer's
@@ -1370,7 +1376,16 @@ modules:
       past it. An AckError::TooManyRuns refusal from collected is dropped, not
       retained: the position stays unsettled and observe_page offers it again,
       and the caller retains it and calls collected again once capacity frees.
-      watched() -> [u64; 2] is the current and next page. probe_plan(now_ms: u64)
+      watched() -> [u64; WATCHED_PAGES] is the current and next page, WATCHED_PAGES
+      (2) being the window's width. retired_below() -> u64 is the lowest page any
+      future plan can name — the lesser of watched()[0] and
+      AckState::settled_pages_below() — so every page below it is settled through and
+      out of the watched window, and a transport holding one record per page may
+      release those. **The receiving side has no abandon signal**: no record carries
+      the sender's give-up, so Collection::abandoned has no production caller and a
+      permanently lost position holds this number at its page for the life of the
+      conversation — those pages stay open until the transport's own cache bound
+      reclaims them. probe_plan(now_ms: u64)
       -> Option<Vec<u64>> is that pair followed by up to MAX_BACKFILL_PAGES (2)
       pages holding a hole, oldest first, deduplicated — the pages outstanding()
       witnesses, then the pages from the cursor to the frontier; the bound counts

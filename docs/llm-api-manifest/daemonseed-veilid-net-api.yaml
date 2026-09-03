@@ -281,11 +281,12 @@ types:
     module: daemonseed_veilid_net::dm
     kind: trait
     description: >-
-      The seam over the seven DM DHT operations the driver performs —
+      The seam over the eight DM DHT operations the driver performs —
       fetch_dm_key_record, publish_doorbell_entry, sweep_doorbell, publish_dm_page,
-      sweep_dm_page, publish_dm_ack, fetch_dm_ack. Signatures are VeilidNetHandle's;
-      the address types are taken by value. Bounds are Send + Sync + 'static.
-      VeilidNetHandle implements it. publish_dm_key_record is not a member.
+      sweep_dm_page, close_dm_page, publish_dm_ack, fetch_dm_ack. Signatures are
+      VeilidNetHandle's; the address types are taken by value. Bounds are
+      Send + Sync + 'static. VeilidNetHandle implements it. publish_dm_key_record is
+      not a member.
   - name: DmDhtFuture
     module: daemonseed_veilid_net::dm
     kind: type_alias
@@ -540,6 +541,16 @@ types:
       alone means both "nobody has written to this page" and "all sixteen GETs
       errored", and `rendezvous.rs` names surfacing `failed` separately as the
       enabling signal for consumer-side session-health tracking (CRSH-ISC-1).
+  - name: DmPageRecord
+    module: daemonseed_veilid_net::actor
+    kind: enum
+    description: >-
+      One channel page record, either direction: `Sending(DmPageAddress<Sending>)` or
+      `Receiving(DmPageAddress<Receiving>)`. The argument of
+      `VeilidNetHandle::close_dm_page`, which is the one page operation that does not
+      depend on direction — a close acts on the record, not on its contents. Exposes
+      `with_owner_seed`, `page`, `conversation` and `direction`, each delegating to the
+      address it wraps, so the owner seed stays boxed, redacted and zeroize-on-drop.
   - name: DoorbellDispatch
     module: daemonseed_veilid_net::actor
     kind: enum
@@ -953,6 +964,31 @@ functions:
     returns:
       type: "Result<DmPageSweep>"
       description: DmPageSweep { conversation, slots, outcome } — the AR fingerprint naming the correspondence, the populated slots as (PagePosition, unverified bytes) pairs, and the sweep outcome (attempted / found / failed).
+  - name: VeilidNetHandle::close_dm_page
+    module: daemonseed_veilid_net::actor
+    description: >-
+      Give one DM channel page's DHT record back: drop it from the session open cache
+      and close the record. DM channel pages are the one record family whose count
+      grows with message volume rather than with peers — a new page owner seed every
+      paging::PAGE_SLOTS messages, per direction, per conversation — so a page is
+      released when its holder will not address it again. Answers whether a record was
+      actually closed. Ok(false) is a page nobody opened, one the open cache's own
+      capacity bound (rendezvous::DM_PAGE_CACHE_CAPACITY) already reclaimed, and one an
+      operation is still holding: a leased record is refused rather than closed, because
+      closing mid-sweep turns the remaining GETs into SweepOutcome failed. The record's
+      contents are untouched — a closed page named again is opened again by the ordinary
+      open path and sweeps back what it held. Direction-erased, unlike publish_dm_page
+      and sweep_dm_page: a close acts on the record, not on its contents. Spawned off
+      the command loop; issues no gated DHT operation and takes no permit.
+    signature: "pub async fn close_dm_page(&self, address: DmPageRecord) -> Result<bool>"
+    parameters:
+      - name: address
+        type: DmPageRecord
+        direction: in
+        description: The page record, as DmPageRecord::Sending(DmPageAddress<Sending>) or DmPageRecord::Receiving(DmPageAddress<Receiving>). Taken by value for the reason publish_dm_page gives — it holds a boxed, redacted, zeroize-on-drop owner seed that is neither Clone nor constructible outside daemonseed_core::dm::paging. Any slot of the page derives the same record; the owner seed is a function of the address root, the direction and the page.
+    returns:
+      type: "Result<bool>"
+      description: true when a record was released, false when the cache held none or an in-flight operation still holds it.
   - name: VeilidNetHandle::publish_doorbell_entry
     module: daemonseed_veilid_net::actor
     description: >-

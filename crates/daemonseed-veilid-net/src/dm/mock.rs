@@ -25,11 +25,11 @@ use daemonseed_core::dm::paging::{
 };
 use daemonseed_core::dm::ratchet::Direction;
 
-use crate::actor::{DmPageSweep, DoorbellDispatch, DoorbellSweep};
+use crate::actor::{DmPageRecord, DmPageSweep, DoorbellDispatch, DoorbellSweep};
 use crate::dm::seam::{DmDht, DmDhtFuture};
 use crate::SweepOutcome;
 
-/// The seven seam methods, in trait order, as counter indices.
+/// The eight seam methods, in trait order, as counter indices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Method {
     FetchKeyRecord,
@@ -39,12 +39,13 @@ pub(crate) enum Method {
     SweepPage,
     PublishAck,
     FetchAck,
+    ClosePage,
 }
 
 impl Method {
     /// Every method, so an oracle can assert over the whole set rather than over
     /// the ones it remembered to name.
-    pub(crate) const ALL: [Method; 7] = [
+    pub(crate) const ALL: [Method; 8] = [
         Method::FetchKeyRecord,
         Method::PublishDoorbell,
         Method::SweepDoorbell,
@@ -52,6 +53,7 @@ impl Method {
         Method::SweepPage,
         Method::PublishAck,
         Method::FetchAck,
+        Method::ClosePage,
     ];
 
     fn index(self) -> usize {
@@ -63,6 +65,7 @@ impl Method {
             Method::SweepPage => 4,
             Method::PublishAck => 5,
             Method::FetchAck => 6,
+            Method::ClosePage => 7,
         }
     }
 }
@@ -104,6 +107,17 @@ pub(crate) enum MockCall {
     },
     /// An acknowledgement fetch.
     FetchAck { direction: Direction },
+    /// A page record handed back, by the page it named and whether the mock was
+    /// holding one to hand back.
+    ClosePage {
+        conversation: [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+        page: u64,
+        direction: Direction,
+        /// Whether a record was actually released — `false` for a page this mock
+        /// never opened, matching what the transport answers for one the cache
+        /// does not hold.
+        closed: bool,
+    },
 }
 
 /// The records two mocks share, so one driver's write is another's sweep.
@@ -186,11 +200,27 @@ impl MockNetwork {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
+
+    /// What one slot of the record `address` names holds, if anything.
+    ///
+    /// **The record's own state, independent of who has it open.** Closing a
+    /// record releases a handle on it and erases nothing, so an oracle for that
+    /// property has to be able to read the record while nobody holds it — which
+    /// no seam method can do, since every one of them opens.
+    pub(crate) fn slot_bytes(&self, address: &DmPageRecord, slot: u16) -> Option<Vec<u8>> {
+        address.with_owner_seed(|seed| {
+            self.pages
+                .lock()
+                .expect("mock pages")
+                .get(&page_key(seed))
+                .and_then(|slots| slots.get(&slot).cloned())
+        })
+    }
 }
 
 /// A counting [`DmDht`] with an injected latency.
 pub(crate) struct MockDht {
-    counts: [AtomicU64; 7],
+    counts: [AtomicU64; 8],
     log: Mutex<Vec<MockCall>>,
     /// Doorbell sweeps to hand back, oldest first. An exhausted queue yields the
     /// empty sweep, which is the ordinary state of a doorbell nobody knocked on
@@ -250,6 +280,43 @@ pub(crate) struct MockDht {
     /// on the same [`MockNetwork`], which is what makes a two-driver oracle
     /// possible; private to this mock otherwise.
     net: Arc<MockNetwork>,
+    /// The page records this mock is holding open — every distinct page a publish
+    /// or a sweep has addressed, less every one a close has handed back.
+    ///
+    /// **A model of the transport's open cache, and it has to be a SET.** The
+    /// production path opens a page once per session and serves every later
+    /// operation on it from the cache, so a count of calls says nothing about how
+    /// many records are open: sixteen writes to one page are one record. What a
+    /// bound is about is the cardinality of *distinct* pages held, which is what
+    /// this holds and `count(Method::ClosePage)` alone cannot answer.
+    ///
+    /// Keyed per direction as well as per page, because the two directions of one
+    /// page number are two owner seeds and therefore two records.
+    open_pages: Mutex<std::collections::BTreeSet<OpenPageKey>>,
+}
+
+/// What [`MockDht::open_pages`] is keyed on: conversation, direction, page.
+///
+/// The direction rides as a byte because [`Direction`] is deliberately a bare
+/// two-variant enum with no ordering — a key needs one, and mapping it here keeps
+/// the ordering out of the wire type where it would mean nothing.
+type OpenPageKey = (
+    [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+    u8,
+    u64,
+);
+
+/// The key one page record is held under.
+fn open_page_key(
+    conversation: [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+    direction: Direction,
+    page: u64,
+) -> OpenPageKey {
+    let d = match direction {
+        Direction::AToB => 0,
+        Direction::BToA => 1,
+    };
+    (conversation, d, page)
 }
 
 impl MockDht {
@@ -276,6 +343,7 @@ impl MockDht {
             slots_served: AtomicU64::new(0),
             published_pages: Mutex::new(Vec::new()),
             net,
+            open_pages: Mutex::new(std::collections::BTreeSet::new()),
         }
     }
 
@@ -325,6 +393,42 @@ impl MockDht {
     /// Populated slots handed back by page sweeps so far.
     pub(crate) fn slots_served(&self) -> u64 {
         self.slots_served.load(Ordering::SeqCst)
+    }
+
+    /// How many distinct page records this mock is currently holding open —
+    /// opens minus closes, not calls minus calls. See [`MockDht::open_pages`].
+    pub(crate) fn open_page_count(&self) -> usize {
+        self.open_pages.lock().expect("mock open pages").len()
+    }
+
+    /// Record that a page record is open, if it was not already.
+    fn hold_page(
+        &self,
+        conversation: [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+        direction: Direction,
+        page: u64,
+    ) {
+        self.open_pages
+            .lock()
+            .expect("mock open pages")
+            .insert(open_page_key(conversation, direction, page));
+    }
+
+    /// Hand one page record back, answering whether one was being held.
+    ///
+    /// `false` for a page nothing ever opened is the transport's own answer for a
+    /// cache that does not hold the id, so an oracle counting reclaimed records
+    /// counts the same thing on both sides of the seam.
+    fn release_page(
+        &self,
+        conversation: [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+        direction: Direction,
+        page: u64,
+    ) -> bool {
+        self.open_pages
+            .lock()
+            .expect("mock open pages")
+            .remove(&open_page_key(conversation, direction, page))
     }
 
     /// Every page frame written, in call order.
@@ -555,6 +659,10 @@ impl DmDht for MockDht {
             .lock()
             .expect("mock published pages")
             .push((at, frame.clone()));
+        // Held at call time, like the counters and unlike the record write below:
+        // production opens the record before it can discover the write failed, so a
+        // scripted failure still leaves a record open.
+        self.hold_page(*address.conversation(), address.direction(), at.page());
         if !dud && !boom {
             address.with_owner_seed(|seed| {
                 self.net
@@ -587,6 +695,7 @@ impl DmDht for MockDht {
                 direction: address.direction(),
             },
         );
+        self.hold_page(conversation, address.direction(), page);
         let latency = self.latency_for(Method::SweepPage);
         let boom = self.panics(Method::SweepPage);
         let dud = self.fails(Method::SweepPage);
@@ -656,6 +765,42 @@ impl DmDht for MockDht {
                 slots,
                 outcome,
             })
+        })
+    }
+
+    fn close_dm_page(&self, address: DmPageRecord) -> DmDhtFuture<bool> {
+        let conversation = *address.conversation();
+        let page = address.page();
+        let direction = address.direction();
+        // Released at call time for the reason every counter is bumped there: the
+        // record is given back when the call is made, not when its future is polled,
+        // so an oracle can read the held count without driving anything.
+        //
+        // **The record's CONTENTS survive.** Closing releases this end's handle on a
+        // record and erases nothing on the network, so the shared `net.pages` entry
+        // is deliberately untouched — a page closed and later re-opened must sweep
+        // back exactly what it held, which is the accepted cost the driver's close
+        // signal is written against.
+        let closed = self.release_page(conversation, direction, page);
+        self.record(
+            Method::ClosePage,
+            MockCall::ClosePage {
+                conversation,
+                page,
+                direction,
+                closed,
+            },
+        );
+        let latency = self.latency_for(Method::ClosePage);
+        let boom = self.panics(Method::ClosePage);
+        let dud = self.fails(Method::ClosePage);
+        Box::pin(async move {
+            tokio::time::sleep(latency).await;
+            assert!(!boom, "scripted seam panic");
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
+            Ok(closed)
         })
     }
 

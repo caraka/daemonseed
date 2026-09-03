@@ -1098,6 +1098,45 @@ red tree.
   injected write sink, which decide ordering, cadence, and independence but say nothing about
   behaviour against a live DHT.
 
+**DM page records are released on the driver's own settlement signal, so the count of open page
+records does not grow with a conversation's length (#252).** ISC-C42's paging is the one record
+family whose cardinality is per-message rather than per-peer, and the driver now hands a page back
+on three signals: a receiving page below both the watched window and the first unsettled position
+(`Collection::retired_below`), a sending page every position of which the correspondent has settled
+(`AckState::settled_pages_below`), and every page of a conversation torn down. A page whose sweep or
+publish is in flight is skipped rather than closed — the write side counts its in-flight writes,
+because one tick puts up to `PAGE_SLOTS` of them on one record — and a torn-down conversation is
+recorded as such, which is what actually stops a later plan or write naming the records the teardown
+released: a teardown leaves the ratchet and channel roots in place and every planner reads exactly
+those, so sweeps, page writes, acknowledgement fetches and acknowledgement writes are each gated on
+that record — the acknowledgement cadence at its candidate scan, before the client-global permit is
+spent, and the teardown drops the pending set that would otherwise carry the oldest key for a week. A page an operation was holding at teardown is skipped there and handed back when that
+operation's outcome lands, which is the last signal a dead conversation produces. The
+transport's own capacity bound (`rendezvous::DM_PAGE_CACHE_CAPACITY`) remains the backstop for a page
+a close does not reach. **The receiving side has no give-up signal and the record-lock map is
+untouched, both deliberately.** The design's prefix-advance-on-give-up rule needs the receiver to
+learn that the sender abandoned a position, and no record carries that — an acknowledgement and a
+frame's piggyback both carry only the receiver's own `high_water` and runs — so a permanently lost
+inbound position pins its conversation's receiving pages until the capacity bound reclaims them, and
+`Collection::abandoned` still has no production caller. `rendezvous::RecordLocks` entries are never
+removed: an entry can only be dropped safely when no task holds a clone of its `Arc`, and a second
+lock created for a record another task is already serializing on would under-serialize it — the
+CRSH-ISC-3 invariant. This change reclaims the open cache and the page ring, which are the two
+structures that hold a record open. A closed page a later plan names again is re-opened by the
+ordinary open path at the cost of one open; the record's contents are untouched by a close. Pinned by
+`the_open_page_count_stays_at_the_watched_window_across_a_long_conversation` (a conversation
+spanning four distinct pages ends holding the watched window and nothing more),
+`a_page_with_a_sweep_in_flight_is_not_closed_until_the_outcome_lands`,
+`a_torn_down_channel_hands_back_every_page_of_its_conversation` and
+`a_closed_page_named_again_is_re_opened_with_its_contents_intact`,
+`a_given_up_sending_page_is_handed_back`, `a_panicked_page_write_releases_the_page_it_was_holding`
+, `a_torn_down_conversation_plans_nothing_more`,
+`a_page_in_flight_at_teardown_is_handed_back_when_its_outcome_lands`,
+`a_peer_acknowledgement_hands_back_the_sending_page_it_finishes`,
+`a_page_with_a_publish_in_flight_is_not_closed_until_the_outcome_lands` and
+`a_page_is_closed_under_the_id_it_was_opened_with`. ISC-C42 stays open: this bounds the record count
+and settles nothing else in its text.
+
 **Anti-criteria are verified by negative fixtures**, each of which must be shown to fail before its
 guard lands: replay, clock skew, counter rollback, handle mismatch, forged provenance, a forged share
 identifier on both the announce and withdraw paths, and an outsider key against a room seal.

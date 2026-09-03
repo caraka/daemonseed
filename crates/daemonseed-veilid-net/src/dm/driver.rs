@@ -700,9 +700,10 @@ async fn apply<D: DmDht>(
 /// Run one operation against the seam and tag its result.
 ///
 /// The kind is stamped here, from the op itself, rather than inferred later from
-/// the result: two of the seven are sweeps the machine is holding a slot open
-/// for, and on the failure path a result says only that something went wrong.
-async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
+/// the result: three of the eight hold a slot the machine must release — the two
+/// sweeps and the page write — and on the failure path a result says only that
+/// something went wrong.
+pub(crate) async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
     let kind = op.kind();
     match op {
         DhtOp::FetchKeyRecord { tag, owner_seed } => DhtOutcome {
@@ -752,6 +753,11 @@ async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
             tag,
             result: dht.sweep_dm_page(address).await.map(DhtResult::Page),
         },
+        DhtOp::ClosePage { tag, address } => DhtOutcome {
+            kind,
+            tag,
+            result: dht.close_dm_page(address).await.map(DhtResult::Closed),
+        },
         DhtOp::PublishAck {
             tag,
             address,
@@ -794,7 +800,7 @@ mod tests {
     use daemonseed_core::dm::keyrec;
     use daemonseed_core::identity::keys::{IdentityKeys, SignKeypair, ML_DSA_SEED_LEN};
 
-    use crate::actor::{DoorbellDispatch, VeilidNetHandle};
+    use crate::actor::{DmPageRecord, DoorbellDispatch, VeilidNetHandle};
     use crate::dm::machine::{duration_as_ms, OpTag};
     use crate::dm::mock::{Method, MockCall, MockDht};
     use crate::dm::types::RefusalReason;
@@ -1308,8 +1314,17 @@ mod tests {
         dht.fetch_dm_ack(ack_address(Direction::BToA))
             .await
             .expect("fetch ack");
+        // The page written above is one this mock is now holding, so the close is
+        // asked on a record that exists and answers `true`. Asking it on an
+        // unopened page would count the call and prove nothing about the release.
+        assert!(
+            dht.close_dm_page(DmPageRecord::Sending(sending_address(&r)))
+                .await
+                .expect("close page"),
+            "the page published above must be the one handed back"
+        );
 
-        assert_eq!(Method::ALL.len(), 7, "the seam has seven methods");
+        assert_eq!(Method::ALL.len(), 8, "the seam has eight methods");
         for method in Method::ALL {
             assert_eq!(dht.count(method), 1, "{method:?} counted once");
         }
@@ -1368,11 +1383,86 @@ mod tests {
                 direction: Direction::BToA
             }
         );
+        assert_eq!(
+            log[7],
+            MockCall::ClosePage {
+                conversation,
+                page: 0,
+                direction: send_dir,
+                closed: true,
+            }
+        );
+    }
+
+    /// T2d. A page record handed back and named again is simply opened again, and
+    /// what it holds is unchanged.
+    ///
+    /// **This pins the accepted cost of the close path (#252), not a bug.** A
+    /// close releases this end's handle on a record; it erases nothing on the
+    /// network. Nothing forbids a later plan naming a page that was closed — an
+    /// out-of-order arrival cannot cause it, since the positions were settled, but
+    /// a restart re-derives a collection from its stored cursor and probes from
+    /// there. What the design accepts is one open; what it must NOT be is a page
+    /// that comes back empty, which would be a conversation silently losing
+    /// messages with no error on any surface.
+    ///
+    /// The record is read from the network directly rather than through a sweep,
+    /// because the claim is about the record while NOBODY holds it open and every
+    /// seam method opens one. The state before the close is the control: without
+    /// it, "the bytes are still there afterwards" is satisfied by a fixture that
+    /// never wrote them.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_page_named_again_is_re_opened_with_its_contents_intact() {
+        let net = crate::dm::mock::MockNetwork::new();
+        let dht = Arc::new(MockDht::on(net.clone(), Duration::from_millis(1)));
+        let r = ratchet();
+        let slot = sending_address(&r).at().slot();
+        let record = DmPageRecord::Sending(sending_address(&r));
+        let frame = vec![0xA5u8; 24];
+
+        dht.publish_dm_page(sending_address(&r), frame.clone())
+            .await
+            .expect("the page is written");
+        assert_eq!(dht.open_page_count(), 1, "the write opened the record");
+        assert_eq!(
+            net.slot_bytes(&record, slot).as_ref(),
+            Some(&frame),
+            "the record must hold the frame before the close, or nothing below \
+             means anything"
+        );
+
+        assert!(
+            dht.close_dm_page(DmPageRecord::Sending(sending_address(&r)))
+                .await
+                .expect("the close"),
+            "the record the write opened must be the one handed back"
+        );
+        assert_eq!(
+            dht.open_page_count(),
+            0,
+            "the close must have released the record, not merely been counted"
+        );
+        assert_eq!(
+            net.slot_bytes(&record, slot).as_ref(),
+            Some(&frame),
+            "a closed record must keep what it held: a close releases a handle and \
+             erases nothing"
+        );
+
+        dht.publish_dm_page(sending_address(&r), frame.clone())
+            .await
+            .expect("the page is written again");
+        assert_eq!(
+            dht.open_page_count(),
+            1,
+            "a page named again must be opened again — that one open is the \
+             accepted cost of the bound"
+        );
     }
 
     /// How many variants [`DhtOp`] has. Its own count, never borrowed from
     /// something that merely has the same one today.
-    const DHT_OP_VARIANTS: usize = 7;
+    const DHT_OP_VARIANTS: usize = 8;
 
     /// Every [`DhtOp`] variant, as an index. Exhaustive by construction: a new
     /// variant fails to compile here rather than silently escaping the dispatch
@@ -1386,13 +1476,14 @@ mod tests {
             DhtOp::SweepPage { .. } => 4,
             DhtOp::PublishAck { .. } => 5,
             DhtOp::FetchAck { .. } => 6,
+            DhtOp::ClosePage { .. } => 7,
         }
     }
 
     /// T2b. `dispatch` routes every op to its own seam method and shapes the
     /// result to match.
     ///
-    /// The routing is seven near-identical arms, which is exactly the shape a
+    /// The routing is eight near-identical arms, which is exactly the shape a
     /// copy-paste slip survives in: a `SweepPage` arm calling `sweep_doorbell`
     /// compiles, returns `Ok`, and is invisible everywhere else.
     #[tokio::test(start_paused = true)]
@@ -1471,6 +1562,16 @@ mod tests {
                 method: Method::FetchAck,
                 shape: |res| matches!(res, DhtResult::Ack(None)),
             },
+            Case {
+                op: DhtOp::ClosePage {
+                    tag: tag(),
+                    address: DmPageRecord::Receiving(receiving_address(&r)),
+                },
+                method: Method::ClosePage,
+                // `false`: nothing opened this page in this mock, which is the
+                // transport's own answer for an id the cache does not hold.
+                shape: |res| matches!(res, DhtResult::Closed(false)),
+            },
         ];
 
         let mut covered: Vec<usize> = cases.iter().map(|c| op_index(&c.op)).collect();
@@ -1538,6 +1639,22 @@ mod tests {
                 |job| matches!(job, Some(PanickedJob::DoorbellSweep)),
             ),
             (
+                // A page write holds `publishing_pages` until its outcome lands, so
+                // a panicked one has a slot to release exactly as a sweep does.
+                DhtOp::PublishPage {
+                    tag: OpTag {
+                        conversation: Some(conversation),
+                        page: Some(5),
+                        ..tag()
+                    },
+                    address: sending_address(&r),
+                    frame: vec![0u8; 11],
+                },
+                |job| matches!(job, Some(PanickedJob::PagePublish { page: 5, .. })),
+            ),
+            (
+                // And one whose tag names no page releases nothing rather than
+                // guessing — the same fall-through the sweep side is pinned for.
                 DhtOp::PublishPage {
                     tag: tag(),
                     address: sending_address(&r),
@@ -1571,9 +1688,22 @@ mod tests {
                 },
                 |job| job.is_none(),
             ),
+            (
+                // A close holds no slot of its own — it is what releases one — so a
+                // panicked close leaves the machine holding nothing for it.
+                DhtOp::ClosePage {
+                    tag: OpTag {
+                        conversation: Some(conversation),
+                        page: Some(3),
+                        ..tag()
+                    },
+                    address: DmPageRecord::Sending(sending_address(&r)),
+                },
+                |job| job.is_none(),
+            ),
         ];
 
-        // The subject is `DhtOp`'s own arity. `Method` happens to have seven
+        // The subject is `DhtOp`'s own arity. `Method` happens to have eight
         // variants too, and borrowing its count would let a case go missing the
         // day the two stop matching.
         let mut covered: Vec<usize> = cases.iter().map(|(op, _)| op_index(op)).collect();
@@ -2473,6 +2603,25 @@ mod tests {
                 }
             }
         }
+        // **One more window before counting.** The teardown makes the driver hand its
+        // page records back (#252), so the tick that raises the loss also spawns
+        // closes, and their outcomes sit ahead of the last doorbell sweep's in the
+        // loop's queue — the sweep is issued inside the final iteration and its
+        // outcome, which carries the health report counted below, lands after that
+        // iteration's drain. Without this the count reads two, which looks exactly
+        // like a sweep that never ran. What is counted is unchanged: the driver's own
+        // reports, not loop iterations.
+        advance(&wall, Duration::from_secs(1)).await;
+        for e in drain(&mut evt_rx) {
+            match e {
+                DmEvent::ChannelLost { event, .. } => raised.push(event),
+                DmEvent::DoorbellHealth { outcome, .. } if outcome.attempted > 0 => {
+                    swept += 1;
+                }
+                _ => {}
+            }
+        }
+
         // The DRIVER swept three times, counted from its own health reports.
         // Counting loop iterations instead would not be a control at all: the
         // `advance` calls could be deleted and the count would still read three,

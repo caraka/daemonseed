@@ -625,6 +625,37 @@ impl AckState {
         self.high_water
     }
 
+    /// The first page this state has **not** settled through: every page strictly
+    /// below it holds nothing but settled positions.
+    ///
+    /// Settled, not collected, on exactly the terms [`Self::is_settled`] states —
+    /// [`Self::abandon`] settles a position the sender gave up on, and this counts
+    /// it. That is the answer a page holder wants: a given-up position is one
+    /// nothing will ever ask about again, so a page made entirely of them is as
+    /// finished as a page that was fully read.
+    ///
+    /// **The give-up that reaches this is the holder's OWN**, applied to the state
+    /// it keeps about its own sends. A receiver has no route to the sender's
+    /// give-up: the wire carries only the receiver's own `high_water` and runs, so
+    /// nothing arrives saying a position was abandoned. See
+    /// [`crate::dm::collect::Collection::retired_below`].
+    ///
+    /// Zero while the prefix is empty, which keeps a caller from retiring a page
+    /// the conversation has not reached. A prefix covering the whole sequence
+    /// space answers one above [`crate::dm::paging::MAX_PAGE`], the value no page can
+    /// hold.
+    pub fn settled_pages_below(&self) -> u64 {
+        match self.high_water {
+            // The first unsettled position is one above the prefix, and its page
+            // is the lowest page still holding something unsettled.
+            Some(h) => match h.checked_add(1) {
+                Some(next) => crate::dm::paging::position_of(next).page(),
+                None => crate::dm::paging::MAX_PAGE.saturating_add(1),
+            },
+            None => 0,
+        }
+    }
+
     /// How many runs sit beyond the prefix. Zero for a conversation collecting in
     /// order — everything folds into the prefix as it arrives — and bounded by
     /// [`MAX_ACK_RUNS`].
@@ -1925,5 +1956,103 @@ mod tests {
                 "a verifier would rebuild a different preimage"
             );
         }
+    }
+
+    /// `settled_pages_below` is the first page NOT settled through, and the
+    /// distinction from "the page the prefix sits on" is the whole of it.
+    ///
+    /// **The failure this pins is an off-by-one that retires a live page.** A
+    /// prefix in the middle of a page leaves the positions above it unsettled, so
+    /// the page is not finished and a caller releasing every page below the answer
+    /// must not be handed that page's own number. Reading the prefix's page and
+    /// adding one gives exactly that, and agrees with the correct answer on every
+    /// page-boundary case — so a test that only checks boundaries cannot see it.
+    /// The mid-page rows below are what separate the two.
+    #[test]
+    fn settled_pages_below_is_the_first_page_holding_an_unsettled_position() {
+        let slots = u64::from(crate::dm::paging::PAGE_SLOTS);
+
+        // An empty prefix settles no page. Zero rather than `None` because the
+        // caller's question is "how many pages below this may I release", and the
+        // answer for a conversation that has settled nothing is none of them.
+        assert_eq!(AckState::new().settled_pages_below(), 0);
+
+        for (high_water, want, why) in [
+            (
+                0u64,
+                0u64,
+                "one position of page zero settled leaves fifteen unsettled",
+            ),
+            (
+                slots / 2,
+                0,
+                "a prefix in the MIDDLE of page zero finishes no page",
+            ),
+            (
+                slots - 2,
+                0,
+                "and neither does one position short of the page's end",
+            ),
+            (
+                slots - 1,
+                1,
+                "the LAST position of page zero is what finishes it",
+            ),
+            (
+                slots,
+                1,
+                "the first position of page one finishes page zero only",
+            ),
+            (
+                2 * slots - 1,
+                2,
+                "and the last position of page one finishes page one",
+            ),
+        ] {
+            let mut ack = AckState::new();
+            for seq in 0..=high_water {
+                ack.collect(seq).expect("the prefix fits");
+            }
+            assert_eq!(
+                ack.high_water(),
+                Some(high_water),
+                "the fixture must have built the prefix it names"
+            );
+            assert_eq!(ack.settled_pages_below(), want, "{why}");
+        }
+    }
+
+    /// A position the sender gave up on settles the page exactly as a collected one
+    /// does — which is what keeps a page finished under permanent loss.
+    ///
+    /// [`AckState::abandon`] and [`AckState::collect`] are the same transition, so
+    /// this is not a second rule; it is the one place the *consequence* for a page
+    /// holder is visible. Without it a single unrecoverable position holds the
+    /// answer at its page for the life of the conversation.
+    ///
+    /// The mixed run is the control: a page finished by give-ups alone would not
+    /// show that the two settle into one prefix.
+    #[test]
+    fn a_given_up_position_settles_its_page_like_a_collected_one() {
+        let slots = u64::from(crate::dm::paging::PAGE_SLOTS);
+        let mut ack = AckState::new();
+        for seq in 0..slots {
+            if seq % 2 == 0 {
+                ack.collect(seq).expect("the prefix fits");
+            } else {
+                ack.abandon(seq).expect("the prefix fits");
+            }
+        }
+        assert_eq!(
+            ack.high_water(),
+            Some(slots - 1),
+            "collected and given-up positions must build ONE prefix"
+        );
+        assert_eq!(
+            ack.settled_pages_below(),
+            1,
+            "a page made of collected and given-up positions is as finished as one \
+             that was wholly read"
+        );
     }
 }

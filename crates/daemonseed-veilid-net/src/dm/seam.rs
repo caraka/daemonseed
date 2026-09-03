@@ -10,7 +10,7 @@ use std::pin::Pin;
 use daemonseed_core::dm::ack_record::DmAckAddress;
 use daemonseed_core::dm::paging::{DmPageAddress, Receiving, Sending};
 
-use crate::actor::{DmPageSweep, DoorbellDispatch, DoorbellSweep, VeilidNetHandle};
+use crate::actor::{DmPageRecord, DmPageSweep, DoorbellDispatch, DoorbellSweep, VeilidNetHandle};
 use crate::Result;
 
 /// The future one [`DmDht`] call returns: owns its inputs and is `'static`, so the
@@ -51,6 +51,10 @@ pub trait DmDht: Send + Sync + 'static {
 
     /// Sweep one receiving page; empty is the ordinary state of an unwritten page.
     fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> DmDhtFuture<DmPageSweep>;
+
+    /// Give one channel page's record back; `Ok(false)` is a page nobody opened,
+    /// one already reclaimed, or one an operation is still holding.
+    fn close_dm_page(&self, address: DmPageRecord) -> DmDhtFuture<bool>;
 
     /// Publish one direction's acknowledgement record.
     fn publish_dm_ack(&self, address: DmAckAddress, record: Vec<u8>) -> DmDhtFuture<()>;
@@ -94,6 +98,11 @@ impl DmDht for VeilidNetHandle {
     fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> DmDhtFuture<DmPageSweep> {
         let h = self.clone();
         Box::pin(async move { h.sweep_dm_page(address).await })
+    }
+
+    fn close_dm_page(&self, address: DmPageRecord) -> DmDhtFuture<bool> {
+        let h = self.clone();
+        Box::pin(async move { h.close_dm_page(address).await })
     }
 
     fn publish_dm_ack(&self, address: DmAckAddress, record: Vec<u8>) -> DmDhtFuture<()> {

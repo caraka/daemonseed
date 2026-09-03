@@ -123,6 +123,14 @@ pub const PROBE_INTERVAL_MS: u64 = 30_000;
 /// position and a page whose every frame failed to open settles nothing.
 pub const MAX_BACKFILL_PAGES: usize = 2;
 
+/// How wide the watched window is — how many pages [`Collection::watched`] names.
+///
+/// Two: the current page and the next one, for the speculative-contiguous reason
+/// that method states. It is the **return type's own length**, so a caller
+/// reasoning about how many page records a settled conversation keeps open reads
+/// the same number the window is built from rather than a copy of it.
+pub const WATCHED_PAGES: usize = 2;
+
 /// Anything that can go wrong folding a swept page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CollectError {
@@ -379,9 +387,50 @@ impl Collection {
     /// Clock-free and cadence-free — a watch is standing, not periodic. The
     /// current page is the frontier, or page zero before any page has been
     /// reached.
-    pub fn watched(&self) -> [u64; 2] {
+    pub fn watched(&self) -> [u64; WATCHED_PAGES] {
         let current = self.frontier.unwrap_or(0);
         [current, current.saturating_add(1)]
+    }
+
+    /// The lowest page any future plan of this collection can still name: every
+    /// page strictly below it is settled through **and** out of the watched
+    /// window, so nothing here will ever ask for it again.
+    ///
+    /// Both halves are needed and neither implies the other. A page can be fully
+    /// settled and still be the watched current page — the cursor reaching the
+    /// last position of page `p` leaves the frontier at `p`, which
+    /// [`Self::watched`] still holds — and a page can be below the frontier while
+    /// [`Self::outstanding`] or the cursor-to-frontier span still name it as
+    /// backfill. Taking the lower of the two is what makes this an answer about
+    /// [`Self::probe_plan`] rather than about either pointer alone: a hole
+    /// witnessed or unwitnessed lives at or above the first unsettled position,
+    /// and the watched pair lives at or above the frontier.
+    ///
+    /// **A permanent hole pins this number, and nothing in the protocol lifts it.**
+    /// The prefix-advance-on-give-up rule the design states for the receiver —
+    /// *"the receiver advances its contiguous cursor past a message the sender has
+    /// abandoned at the 7-day give-up"* — needs a signal that the sender gave up,
+    /// and the wire carries none: an acknowledgement record and a frame's piggyback
+    /// both carry only `high_water` and the beyond-prefix runs, which is the
+    /// RECEIVER's statement about the sender's direction. Nothing travels the other
+    /// way saying *I abandoned this position*. [`Self::abandoned`] therefore has no
+    /// production caller, and a position that is never recoverable holds this number
+    /// at that page for the life of the conversation — so its pages stay open and
+    /// the transport's own capacity bound is what reclaims them. Wiring it needs a
+    /// wire field that does not exist; the design records it as a live obligation,
+    /// not a resolved one.
+    ///
+    /// **What a caller may do with it, and what it costs.** A transport holding
+    /// one open record per page may release every page below this number. That
+    /// release is not permanent: nothing here forbids the frontier or a later
+    /// probe plan naming such a page again — an out-of-order arrival cannot,
+    /// since the positions are settled, but a *restart* re-derives a collection
+    /// from its stored cursor and probes from there. A released page named again
+    /// is simply opened again by the ordinary open path, at the cost of one open.
+    /// That cost is the accepted price of a bounded handle count; see
+    /// `daemonseed-veilid-net`'s page-close path.
+    pub fn retired_below(&self) -> u64 {
+        self.watched()[0].min(self.ack.settled_pages_below())
     }
 
     /// The pages to sweep now, or `None` when the cadence has not elapsed.
