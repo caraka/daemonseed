@@ -523,7 +523,24 @@ impl DmPersist {
                 Ok(())
             })
     }
+}
 
+/// Whether a restart decision may also tidy the store on its way past.
+///
+/// A named pair rather than a `bool`, because the two call sites differ in what
+/// the caller is *doing* — establishing this correspondence, or asking about it
+/// — and a bare `true` at a call site says nothing about which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cleaning {
+    /// Delete a lingering provisional record found beside a resume record. For a
+    /// caller acting on this correspondence.
+    Perform,
+    /// Touch nothing. For a caller asking a question about a correspondence it
+    /// may have no other business with.
+    Skip,
+}
+
+impl DmPersist {
     /// Decide what a channel does at startup, from what its store holds (#243).
     ///
     /// The call site [`crate::dm::provisional::restart`] was written for. The
@@ -578,6 +595,110 @@ impl DmPersist {
         correspondence: &CorrespondenceLabel,
         ctx: &RecordContext<'_>,
     ) -> StoredChannelRestart<'_> {
+        self.restart_channel_with(correspondence, ctx, Cleaning::Perform)
+    }
+
+    /// The same question, asked of a correspondence the caller is **not** acting
+    /// on, and answered without writing anything.
+    ///
+    /// **A lookup must not delete.** [`Self::restart_channel`] cleans a lingering
+    /// provisional record on its way past, which is right for a caller that is
+    /// about to establish or resume *this* correspondence and wrong for one
+    /// walking the store asking "is this the one?". `DmMachine::provisional_label`
+    /// is that caller: it scans every stored correspondence looking for the
+    /// recipient's, so the cleaning version writes to every correspondence it
+    /// walks past that holds a readable resume record — deleting a record
+    /// belonging to a conversation the caller named nothing about.
+    ///
+    /// **Stated precisely, because the obvious stronger claim is false.** The
+    /// scan matches only [`StoredChannelRestart::HandshakeResumes`], and a
+    /// correspondence in the crash window answers
+    /// [`StoredChannelRestart::Established`] — the resume record is read first —
+    /// so it is skipped whether or not the cleaning runs. The deletion therefore
+    /// does *not* cause a missed match or a wrongly minted label. What it does
+    /// is write, unasked, to correspondences the caller is not acting on.
+    ///
+    /// It also takes **no lock at all**, where the cleaning version takes one per
+    /// correspondence that has a resume record. Both reads here are unlocked, so
+    /// a scan across the store costs nothing beyond the reads and creates no
+    /// correspondence directory (#253).
+    ///
+    /// The cleaning is not skipped, only moved: it stays with the callers that
+    /// know they are establishing, and [`Self::sweep_lingering_provisionals`] is
+    /// what closes the crash window across the store. Without that sweep this
+    /// method would trade a destructive lookup for an `ss0` that nothing ever
+    /// scrubs, which is the worse of the two.
+    ///
+    /// ⚠️ **A peek still hands back a handle that can write.** The
+    /// [`StoredChannelRestart::HandshakeResumes`] arm carries a
+    /// [`PendingHandshake`], whose `establish` / `commit` endings write and
+    /// erase. Nothing in the type prevents it; a caller that is only asking must
+    /// drop it.
+    pub fn peek_channel_restart(
+        &self,
+        correspondence: &CorrespondenceLabel,
+        ctx: &RecordContext<'_>,
+    ) -> StoredChannelRestart<'_> {
+        self.restart_channel_with(correspondence, ctx, Cleaning::Skip)
+    }
+
+    /// Delete every provisional record left beside a readable resume record,
+    /// across the whole store. Returns how many were deleted.
+    ///
+    /// **This is where the A4.8 crash window is actually closed.** A crash
+    /// between `commit_resume` and its best-effort erase leaves a provisional
+    /// record holding `ss0` — which roots `RK0`, and so every message key the
+    /// ratchet believes it deleted — beside the resume record that supersedes
+    /// it. [`Self::restart_channel`] cleans one such record when a caller
+    /// happens to ask about that correspondence, and no caller asks about a
+    /// correspondence it is not already acting on, so on its own it leaves the
+    /// record for as long as nothing touches that conversation.
+    ///
+    /// A sweep is the right shape and a lookup is not: this is called by
+    /// something rebuilding *every* correspondence, so deleting a record for
+    /// each is the job rather than a side effect. It is also the reason
+    /// [`Self::peek_channel_restart`] can decline to clean without losing
+    /// anything.
+    ///
+    /// **Best-effort per correspondence, and deliberately so.** A store that
+    /// will not enumerate returns the error, because then nothing was swept and
+    /// the caller should know; a single correspondence that will not read is
+    /// skipped and counted out, because one unreadable record must not stop the
+    /// others being scrubbed.
+    pub fn sweep_lingering_provisionals(&self) -> Result<usize, DmPersistError> {
+        let mut cleaned = 0;
+        for correspondence in self.store.correspondences()? {
+            let Ok(Some(bytes)) = self
+                .store
+                .read_unlocked(&correspondence, RecordKind::Resume)
+            else {
+                continue;
+            };
+            if ResumeRecord::decode(&Zeroizing::new(bytes)).is_err() {
+                continue;
+            }
+            // Under the lock, and re-reading inside it: the record may have been
+            // deleted between the read above and here, which `clean_lingering_provisional`
+            // already treats as nothing to do.
+            let before = self
+                .store
+                .read_unlocked(&correspondence, RecordKind::Provisional);
+            self.clean_lingering_provisional(&correspondence);
+            if matches!(before, Ok(Some(_))) {
+                cleaned += 1;
+            }
+        }
+        Ok(cleaned)
+    }
+
+    /// One body for both, so the two can never answer the same question
+    /// differently. Only the cleaning differs.
+    fn restart_channel_with(
+        &self,
+        correspondence: &CorrespondenceLabel,
+        ctx: &RecordContext<'_>,
+        cleaning: Cleaning,
+    ) -> StoredChannelRestart<'_> {
         // A4.8's read order. Unlocked like the read below it and for the same
         // reason: asking every channel this question under the lock would create
         // a correspondence directory per channel (#253).
@@ -587,7 +708,10 @@ impl DmPersist {
                 // `read_resume` notes at the same decode.
                 return match ResumeRecord::decode(&Zeroizing::new(bytes)) {
                     Ok(record) => {
-                        self.clean_lingering_provisional(correspondence);
+                        match cleaning {
+                            Cleaning::Perform => self.clean_lingering_provisional(correspondence),
+                            Cleaning::Skip => {}
+                        }
                         StoredChannelRestart::Established(Box::new(record))
                     }
                     Err(e) => self.decide(correspondence, self.unreadable(&e, ctx)),
@@ -2050,8 +2174,12 @@ impl PendingHandshake<'_> {
     /// "best-effort" means here: the resume record is committed, the channel is
     /// established, and refusing the ratchet over an unscrubbed provisional
     /// record would destroy a working correspondence. The superseded `ss0` is
-    /// erased at the next [`DmPersist::restart_channel`] instead, so the leak is
-    /// bounded by one restart rather than permanent.
+    /// erased by [`DmPersist::sweep_lingering_provisionals`] instead, which a
+    /// client runs when it rebuilds its correspondences — so the leak is bounded
+    /// by one restart rather than permanent. **It is bounded by the sweep and
+    /// not by [`DmPersist::restart_channel`]**, which only reaches a
+    /// correspondence some caller is already acting on and would therefore leave
+    /// the record for as long as that conversation stayed untouched.
     pub fn establish_with_resume(self, resume: &ResumeRecord) -> Result<Ratchet, DmPersistError> {
         let Self {
             persist,
@@ -2130,8 +2258,8 @@ fn commit_then_erase(
     persist.commit_resume(&correspondence, resume)?;
     // Best-effort, per A4.8, and the discarded error is the point rather than an
     // oversight: the resume record is committed, so the correspondence is
-    // established whatever happens next, and `restart_channel` erases what is
-    // left behind on the next pass. See `establish_with_resume`.
+    // established whatever happens next, and `sweep_lingering_provisionals`
+    // erases what is left behind. See `establish_with_resume`.
     let _ = erase(persist, correspondence);
     Ok(())
 }
@@ -2292,6 +2420,109 @@ mod tests {
                 panic!("an established channel resumed its own handshake")
             }
         }
+    }
+
+    /// **A lookup must not delete.** [`DmPersist::peek_channel_restart`] answers
+    /// the restart question and leaves the store exactly as it found it;
+    /// [`DmPersist::restart_channel`] answers the same question and cleans.
+    ///
+    /// The fixture is A4.8's crash window — the resume record written, the
+    /// provisional one not yet deleted — because that is the only state in which
+    /// the cleaning branch is reachable at all.
+    ///
+    /// **The two halves are each other's control**, and neither is sufficient
+    /// alone: without the second, a `peek` that simply never reached the cleaning
+    /// branch would pass; without the first, a `restart_channel` that had quietly
+    /// stopped cleaning would pass. Run in this order against one fixture, they
+    /// pin the difference rather than either behaviour on its own.
+    #[test]
+    fn peeking_a_restart_leaves_a_lingering_provisional_record_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let l = label(0x5C);
+
+        p.save_provisional(&l, &ctx(), &record()).expect("saves");
+        p.commit_resume(&l, &resume_record(1, SendFloor::new(4, 100)))
+            .expect("commits");
+
+        let path = record_path(&p, &l, "provisional.bin");
+        assert!(
+            path.exists(),
+            "the fixture did not build the crash window this test is about"
+        );
+
+        match p.peek_channel_restart(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {}
+            StoredChannelRestart::HandshakeResumes(_) => {
+                panic!("a resume record was written, so the handshake must not resume")
+            }
+            StoredChannelRestart::TornDown(t) => panic!("a readable resume record tore down: {t}"),
+        }
+        assert!(
+            path.exists(),
+            "a lookup deleted a record belonging to a correspondence it was only asking about"
+        );
+
+        match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {}
+            StoredChannelRestart::HandshakeResumes(_) => {
+                panic!("a resume record was written, so the handshake must not resume")
+            }
+            StoredChannelRestart::TornDown(t) => panic!("a readable resume record tore down: {t}"),
+        }
+        assert!(
+            !path.exists(),
+            "the cleaning version left the lingering record behind, so the assertion \
+             above proves nothing about the peek"
+        );
+    }
+
+    /// **The sweep closes A4.8's crash window across the store, and leaves a
+    /// live handshake alone.**
+    ///
+    /// Three correspondences, and the third is what makes this a predicate
+    /// rather than a delete-everything: two in the crash window (resume record
+    /// written, provisional not yet erased) and one holding only a provisional
+    /// record, which is an ordinary handshake in flight and must survive. A
+    /// sweep that deleted unconditionally passes both crash-window assertions
+    /// and fails on that one.
+    ///
+    /// The returned count is asserted too, so a sweep that deleted the right
+    /// files by some other route — or reported work it did not do — is caught.
+    #[test]
+    fn the_sweep_scrubs_superseded_provisional_records_and_spares_live_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let (a, b, live) = (label(0x71), label(0x72), label(0x73));
+
+        for l in [&a, &b] {
+            p.save_provisional(l, &ctx(), &record()).expect("saves");
+            p.commit_resume(l, &resume_record(1, SendFloor::new(4, 100)))
+                .expect("commits");
+        }
+        p.save_provisional(&live, &ctx(), &record()).expect("saves");
+
+        let paths: Vec<_> = [&a, &b, &live]
+            .iter()
+            .map(|l| record_path(&p, l, "provisional.bin"))
+            .collect();
+        assert!(
+            paths.iter().all(|path| path.exists()),
+            "the fixture did not write all three provisional records"
+        );
+
+        assert_eq!(
+            p.sweep_lingering_provisionals().expect("sweeps"),
+            2,
+            "the sweep did not report scrubbing exactly the two superseded records"
+        );
+
+        assert!(!paths[0].exists(), "a superseded record survived the sweep");
+        assert!(!paths[1].exists(), "a superseded record survived the sweep");
+        assert!(
+            paths[2].exists(),
+            "the sweep deleted a handshake still in flight, which has no resume record"
+        );
     }
 
     /// **The split's first half: deriving a ratchet leaves the record where it

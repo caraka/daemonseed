@@ -54,6 +54,11 @@ zeroize = { workspace = true }
 # `--all-targets` cargo does enable the feature for this crate's bin target too,
 # so "off in every build" would be false — it is off in the build that ships.
 daemonseed-core = { path = "../daemonseed-core", features = ["testing"] }
+# Test targets only: `ResumeRecord::new` takes key arrays sized by this crate's
+# `SK_LEN` / `PK_LEN`, so a fixture that builds one names them. No production
+# code here references it, and a dev-dependency carries no edge into the shipped
+# artifact.
+oxicrypt-ml-dsa = { workspace = true }
 # Integration test (#97): the 2-node send_sealed-over-private-route oracle.
 # Runs on a host that can attach to the public network (`--ignored`).
 # `test-util` drives the WB-3 scheduler oracles in paused virtual time

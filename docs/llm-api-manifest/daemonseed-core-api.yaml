@@ -1412,6 +1412,14 @@ modules:
       record beside it is deleted best-effort, and a resume record that will not
       read is TornDown(StoreUnreadable) rather than a fall-through to the
       provisional record.
+      peek_channel_restart(label, ctx) -> StoredChannelRestart returns the same
+      three arms and writes nothing: no provisional record is deleted and no lock
+      is taken. It is the form for a caller scanning correspondences it is not
+      acting on.
+      sweep_lingering_provisionals() -> Result<usize, DmPersistError> deletes
+      every provisional record left beside a readable resume record and returns
+      the count. A store that will not enumerate is an error; a correspondence
+      whose resume record will not read is skipped.
       PendingHandshake owns the record, lends eph_ek/address_root, and offers
       five endings: ratchet() derives a Ratchet and leaves the record on disk,
       for the window between an initiator's knock and the acceptance that

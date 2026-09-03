@@ -710,6 +710,20 @@ route taken to reach a decision are not recorded here — the git history and `C
   than one per receive poll, and its rate under real traffic is unmeasured because there is no
   transport cadence yet to measure it against.
 
+- **A restart lookup does not write.** Deciding what a channel does at startup is offered in two
+  forms: `restart_channel`, which deletes a lingering provisional record on its way past, and
+  `peek_channel_restart`, which returns the same three arms and touches nothing. The cleaning is
+  correct for a caller about to establish or resume *that* correspondence and wrong for one walking
+  the store asking which correspondence it has — that caller writes to every correspondence it
+  passes that holds a readable resume record, and takes a lock on each. It does **not** change which
+  label the scan returns: the scan matches only `HandshakeResumes`, and a correspondence in the
+  crash window answers `Established`. The rejected alternative was to leave one method and have the
+  scan tolerate the deletions, which keeps a write on a path that names nothing it is writing to.
+  Because the scan was the only caller that reached an arbitrary stored correspondence, the crash
+  window is closed instead by `sweep_lingering_provisionals`, run once where every correspondence is
+  rebuilt; without it, removing the cleaning from the scan would leave a superseded `ss0` that
+  nothing scrubs.
+
 - **The contact cache stores the address root `AR` and never `ss0`.** § D-PFS is explicit: both the
   address chain and the deletable seal-key chain are seeded from `ss0`, "but only `AR` is retained"
   (`docs/design/direct-messaging.md:319`). Line 706 rules on this record by name — retaining `ss0`

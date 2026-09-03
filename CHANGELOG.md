@@ -150,6 +150,14 @@ work lives in the maintainer's own planning notes, not here.
   without waiting out the `GIVE_UP_MS` window, carrying a `Teardown` for the reason.
   `DmPersistError::AmbiguousCorrespondent` is propagated and nothing is marked. An idle queue is
   not written. **Breaking (crate API):** `DmPersistError` gains a `FirstContact` variant. (#261)
+- `daemonseed_core::dm::persist` — `DmPersist::peek_channel_restart`, which returns the same
+  `StoredChannelRestart` arms as `restart_channel` and writes nothing: it deletes no lingering
+  provisional record and takes no lock. `DmMachine::provisional_label`'s scan across stored
+  correspondences uses it.
+- `daemonseed_core::dm::persist` — `DmPersist::sweep_lingering_provisionals() -> Result<usize, DmPersistError>`
+  deletes every provisional record left beside a readable resume record and reports how many. A
+  store that will not enumerate is an error; a single correspondence that will not read is skipped.
+  The DM driver runs it once when it rebuilds its correspondences from the store.
 - `daemonseed_core::dm::contact_cache` — `ContactRecord::addresses_same_channel`, which reports
   whether an address root is the one this record stores. The comparison is not
   constant-time. It holds only under one at-rest store per `pk_lt`, which nothing enforces. (#261)

@@ -4189,8 +4189,10 @@ impl DmMachine {
     ///
     /// In-memory first; then the store, because a restart empties the map while
     /// the record survives; and only then a fresh mint. The store lookup asks
-    /// [`DmPersist::restart_channel`] under this recipient's context at each
-    /// live epoch — a record opens only under the context it was sealed with,
+    /// [`DmPersist::peek_channel_restart`] under this recipient's context at each
+    /// live epoch — the non-writing form, because this walks correspondences it
+    /// is not acting on — and a record opens only under the context it was
+    /// sealed with,
     /// so a record that opens IS this recipient's. A record older than the
     /// accept window will not open and a new label is minted, which is the
     /// bound this leaves: the outbox's seven-day give-up window is longer than
@@ -4215,9 +4217,19 @@ impl DmMachine {
                 fc_epoch: epoch,
             };
             for label in self.persist.store().correspondences()? {
+                // `peek_`, not `restart_channel`: this walks every correspondence
+                // on disk asking whether it is the recipient's, so the cleaning
+                // version would delete a lingering provisional record for every
+                // one it passed that held a readable resume record — writing to
+                // conversations this call named nothing about, and taking a lock
+                // on each. It would not change which label is returned: the arm
+                // below matches only `HandshakeResumes`, and a correspondence in
+                // that state answers `Established`. Cleaning belongs to the
+                // callers that know they are establishing, and to
+                // `sweep_lingering_provisionals` at startup.
                 if let daemonseed_core::dm::persist::StoredChannelRestart::HandshakeResumes(
                     pending,
-                ) = self.persist.restart_channel(&label, &ctx)
+                ) = self.persist.peek_channel_restart(&label, &ctx)
                 {
                     // Dropped rather than established: this is a lookup, and
                     // establishing here would erase the record the write is
@@ -4676,6 +4688,17 @@ fn refused(
 /// fatal: a driver that refused to start over one unreadable correspondence
 /// would take every other correspondence down with it.
 fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
+    // A4.8's crash window is closed here, once, before anything is rebuilt: a
+    // crash between the resume record's write and its best-effort erase leaves a
+    // provisional record holding `ss0` — which roots `RK0` and every message key
+    // the ratchet believes it deleted — beside the resume record that supersedes
+    // it. This is the one caller that walks every correspondence knowing it is
+    // rebuilding all of them, so the sweep belongs here and not in a lookup.
+    match persist.sweep_lingering_provisionals() {
+        Ok(0) => {}
+        Ok(n) => crate::vtrace!("dm driver: scrubbed {n} superseded provisional record(s)"),
+        Err(e) => crate::vtrace!("dm driver: the lingering-record sweep did not run: {e}"),
+    }
     let labels = match persist.store().correspondences() {
         Ok(labels) => labels,
         Err(e) => {
@@ -5797,6 +5820,72 @@ mod tests {
                 poisoned: false,
             },
         )
+    }
+
+    /// **The scan behind a first contact does not write to the correspondences
+    /// it walks past.**
+    ///
+    /// `provisional_label` asks every stored correspondence whether it is this
+    /// recipient's. Asking through `restart_channel` would delete a lingering
+    /// provisional record on each one holding a readable resume record — a
+    /// conversation the call named nothing about. This drives the machine, not
+    /// the persist layer, because the wiring is the claim: `dm::persist`'s own
+    /// tests already pin that the peek does not clean and `restart_channel`
+    /// does, and neither of them says which one this scan reaches.
+    ///
+    /// The bystander is put in A4.8's crash window deliberately, since that is
+    /// the only state in which the cleaning branch is reachable at all.
+    #[test]
+    fn a_first_contact_scan_does_not_scrub_a_bystanders_provisional_record() {
+        use daemonseed_core::dm::ratchet::ROOT_KEY_LEN;
+        use daemonseed_core::dm::resume::{CommittedRoot, ResumeRecord, SendFloor};
+        use daemonseed_core::storage::dm_store::RecordKind;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut a = machine(&dir);
+
+        // The bystander: a real knock, so its provisional record is written the
+        // way production writes one.
+        let bystander_peer = peer_identity();
+        let _ = knock_as_initiator(&mut a, &bystander_peer);
+        let bystander = sole_label(&a);
+
+        // Into the crash window: the resume record committed, the provisional
+        // record not yet erased.
+        a.persist
+            .commit_resume(
+                &bystander,
+                &ResumeRecord::new(
+                    Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
+                    Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
+                    CommittedRoot::from_bytes([0x33u8; ROOT_KEY_LEN]),
+                    None,
+                    SendFloor::new(0, 0),
+                    BASE_MS,
+                    0,
+                ),
+            )
+            .expect("commits");
+
+        let present = |m: &DmMachine| {
+            m.persist
+                .store()
+                .read_unlocked(&bystander, RecordKind::Provisional)
+                .expect("reads")
+                .is_some()
+        };
+        assert!(present(&a), "the fixture did not build the crash window");
+
+        // A first contact with somebody else, which is what runs the scan. The
+        // in-memory map has no entry for this recipient, so it falls through to
+        // the store.
+        let _ = knock_as_initiator(&mut a, &third_identity());
+
+        assert!(
+            present(&a),
+            "the first-contact scan deleted a provisional record belonging to a \
+             correspondence it was only asking about"
+        );
     }
 
     /// The one correspondence label in a machine's store.

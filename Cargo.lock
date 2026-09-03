@@ -1792,6 +1792,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "futures-util",
  "getrandom 0.3.4",
+ "oxicrypt-ml-dsa",
  "oxicrypt-module",
  "tempfile",
  "thiserror 1.0.69",
