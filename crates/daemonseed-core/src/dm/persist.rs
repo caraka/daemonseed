@@ -101,11 +101,13 @@ use std::path::PathBuf;
 use oxicrypt_aes::Aes256Key;
 use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_ml_kem as ml_kem;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::dm::block_list::{BlockList, BlockListError};
 use crate::dm::contact_cache::{ContactCacheError, ContactRecord};
-use crate::dm::firstcontact::{FirstContactError, ROOT_LEN, VerifiedFirstContact};
+use crate::dm::firstcontact::{
+    FirstContactError, ROOT_LEN, VerifiedFirstContact, derive_channel_roots,
+};
 use crate::dm::outbox::{Outbox, OutboxError, TeardownOutcome};
 use crate::dm::provisional::{
     ChannelRestart, ProvisionalError, ProvisionalRecord, ReceiveCursor, RecordContext, Teardown,
@@ -1425,7 +1427,7 @@ impl DmPersist {
         let Some(contact) = self.read_contact(&correspondence)? else {
             return Ok(StateLoss::NoCorrespondence);
         };
-        if contact.addresses_same_channel(&knock.roots().ar)? {
+        if contact.addresses_same_channel(&knock.roots().ar) {
             return Ok(StateLoss::SameChannel(correspondence));
         }
         let teardown = Teardown::correspondent_state_lost();
@@ -1751,12 +1753,26 @@ impl DmPersist {
         let label = CorrespondenceLabel::mint()?;
         let ss0 = verified.into_ss0();
         let ratchet = Ratchet::recipient(&ss0, eph_ek)?;
+        // The contact record stores `AR` and never `ss0` (§ D-PFS, design lines
+        // 706 and 710): retaining `ss0` for the life of the correspondence would
+        // regenerate `RK0` and with it every message key the ratchet believes it
+        // deleted. So the root is derived here, from the `ss0` this frame
+        // already holds and destroys on the way out, and only the root crosses
+        // into the record.
+        // The bare copy is cleared rather than left in the frame — `decode`'s
+        // #135 pattern. `ChannelRoots` destroys its own copy and `chan_id` with
+        // it, but the value read out of it lands in an unprotected stack slot on
+        // the way into the wrapper, and this module's own docs argue `AR` is
+        // worth erasing.
+        let mut bare_ar = derive_channel_roots(&ss0)?.ar;
+        let ar = Zeroizing::new(bare_ar);
+        bare_ar.zeroize();
         // Seeded, so the record is written whatever the mutator reports — see
         // `update_contact`. There is nothing to change about a record built
         // from the knock in the same call.
         self.update_contact(
             &label,
-            move || Ok(ContactRecord::new(pk_lt, pk_pc, ss0, now_ms, now_ms)?),
+            move || Ok(ContactRecord::new(pk_lt, pk_pc, ar, now_ms, now_ms)?),
             |_| Ok(Mutation::Unchanged(())),
         )?;
         Ok((label, ratchet))
@@ -5014,13 +5030,21 @@ mod tests {
     /// A record whose every field is a function of `tag`, so two fixtures built
     /// with different tags disagree in all four stored facts — which is what
     /// lets an assertion, rather than a `panic!` in a seed, carry the kill.
+    /// **The root is derived, not invented.** `ROOT_LEN` and `SS0_LEN` are both
+    /// 32, so a fixture handing `ContactRecord::new` an `ss0` where an `AR`
+    /// belongs compiles and stores the wrong kind of value with nothing
+    /// complaining. Deriving it here keeps the fixture the shape production
+    /// writes, and lets a test compare against `derive_channel_roots` over the
+    /// same secret.
     fn contact_tagged(tag: u8, first_seen: i64, last_seen: i64) -> ContactRecord {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut secret = ss0();
         secret[0] ^= tag;
+        let ar = Zeroizing::new(derive_channel_roots(&secret).expect("derives").ar);
         ContactRecord::new(
             pk(tag),
             pk(tag.wrapping_add(0x7F)),
-            Zeroizing::new(secret),
+            ar,
             first_seen,
             last_seen,
         )
@@ -5099,11 +5123,9 @@ mod tests {
         assert_eq!(stored.last_seen_ms(), LAST_SEEN);
 
         assert_eq!(
-            stored.address_root().expect("derives"),
-            contact(FIRST_SEEN, LAST_SEEN)
-                .address_root()
-                .expect("derives"),
-            "ss0 did not survive the store's seal"
+            stored.address_root(),
+            contact(FIRST_SEEN, LAST_SEEN).address_root(),
+            "the address root did not survive the store's seal"
         );
     }
 
@@ -5121,7 +5143,6 @@ mod tests {
                 .expect("reads")
                 .expect("there")
                 .address_root()
-                .expect("derives")
         };
 
         let p = persist(dir.path());
@@ -5133,9 +5154,9 @@ mod tests {
         assert_eq!(stored.last_seen_ms(), LAST_SEEN);
         assert_eq!(stored.pk_pc(), pk(0x80).as_ref());
         assert_eq!(
-            stored.address_root().expect("derives"),
+            stored.address_root(),
             root,
-            "ss0 did not survive the restart"
+            "the address root did not survive the restart"
         );
     }
 
@@ -5355,8 +5376,7 @@ mod tests {
             .read_contact(&l)
             .expect("reads")
             .expect("there")
-            .address_root()
-            .expect("derives");
+            .address_root();
 
         p.update_contact(
             &l,
@@ -5381,9 +5401,9 @@ mod tests {
                     "the seed's long-term key displaced the stored one"
                 );
                 assert_eq!(
-                    c.address_root().expect("derives"),
+                    c.address_root(),
                     stored_root,
-                    "the seed's ss0 displaced the stored one"
+                    "the seed's address root displaced the stored one"
                 );
                 Ok(Mutation::Unchanged(()))
             },
@@ -6464,6 +6484,12 @@ mod tests {
     /// The lookup is the positive control that matters — a call that minted a
     /// label and built a ratchet without writing anything would return the same
     /// pair and leave the identity unknown on disk.
+    ///
+    /// **This is also the production guard for § D-PFS**, and the only one.
+    /// `ROOT_LEN` and `SS0_LEN` are both 32, so writing `*ss0` where the derived
+    /// root belongs compiles clean; the `addresses_same_channel` assertion below
+    /// is what kills it. `dm::contact_cache`'s own `ss0`-absence scan cannot —
+    /// the type has no field for it to find.
     #[test]
     fn accepting_a_knock_establishes_a_findable_correspondence() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6490,14 +6516,13 @@ mod tests {
         assert_eq!(stored.pk_pc().as_slice(), expected_pk_pc.as_slice());
         assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
         assert_eq!(stored.last_seen_ms(), FIRST_SEEN);
-        // The ratchet handed back is over the same `ss0` the record holds: the
-        // record's address root is derived from its stored secret, and the
-        // ratchet's conversation fingerprint is derived from the same value, so
-        // agreement here is agreement about which secret was established.
+        // The ratchet handed back is over the same `ss0` the record's root came
+        // from: `accept_first_contact` derives `AR` from the established secret
+        // and stores that, and the ratchet's conversation fingerprint derives
+        // from the same value, so agreement here is agreement about which
+        // secret was established.
         assert!(
-            stored
-                .addresses_same_channel(&derive_channel_roots(&ss0()).expect("roots").ar)
-                .expect("compare"),
+            stored.addresses_same_channel(&derive_channel_roots(&ss0()).expect("roots").ar),
             "the stored record does not address the knock's channel"
         );
         assert_eq!(

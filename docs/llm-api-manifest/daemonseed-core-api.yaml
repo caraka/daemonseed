@@ -1185,18 +1185,21 @@ modules:
       Debug.
       Sub-module dm::contact_cache is the per-correspondence contact record,
       stored as RecordKind::ContactCache. ContactRecord holds the
-      correspondent's long-term public key, its pseudonym public key, ss0, and
-      first/last-seen timestamps, in a fixed CONTACT_RECORD_LEN layout;
+      correspondent's long-term public key, its pseudonym public key, the
+      channel's address root AR, and first/last-seen timestamps, in a fixed
+      CONTACT_RECORD_LEN layout; it does not hold ss0.
+      new(pk_lt, pk_pc, Zeroizing<[u8; ROOT_LEN]>, first_seen_ms, last_seen_ms)
+      takes the root already derived; the caller runs derive_channel_roots.
       encode() -> Zeroizing<Vec<u8>> and decode(&Zeroizing<Vec<u8>>) are the
       at-rest form; the record carries no seal of its own and the store seals it.
-      address_root() -> Result<[u8; ROOT_LEN], FirstContactError> derives the
-      channel root from ss0; chan_id is not exposed.
-      addresses_same_channel(&[u8; ROOT_LEN]) -> Result<bool, FirstContactError>
-      reports whether that root is the one address_root derives; the comparison is
+      address_root() -> [u8; ROOT_LEN] returns the stored root; chan_id is
+      neither exposed nor derivable here.
+      addresses_same_channel(&[u8; ROOT_LEN]) -> bool
+      reports whether that root is the stored one; the comparison is
       not constant-time. It assumes one at-rest store per pk_lt, which nothing
       enforces and multi-device support must revisit.
-      new and decode refuse an all-zero ss0 with
-      ContactCacheError::PlaceholderSecret. new and decode refuse a
+      new and decode refuse an all-zero root with
+      ContactCacheError::PlaceholderAddressRoot. new and decode refuse a
       record whose last_seen_ms precedes its first_seen_ms with
       ContactCacheError::TimestampsOutOfOrder; decode also gives
       WrongLength { expected, actual } for any payload that is not

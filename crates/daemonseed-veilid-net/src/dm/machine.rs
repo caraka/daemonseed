@@ -5690,10 +5690,21 @@ mod tests {
             .update_contact(
                 &label,
                 || {
+                    // `AR`, not `ss0` — the record stores the derived root
+                    // (§ D-PFS). Both are 32 bytes, so passing the secret here
+                    // would compile and seed a record production could never
+                    // write.
+                    let ar = zeroize::Zeroizing::new(
+                        daemonseed_core::dm::firstcontact::derive_channel_roots(
+                            seeded.ss0_for_test(),
+                        )
+                        .expect("derives")
+                        .ar,
+                    );
                     Ok(daemonseed_core::dm::contact_cache::ContactRecord::new(
                         Box::new(*seeded.pk_lt()),
                         Box::new(*seeded.pk_pc()),
-                        zeroize::Zeroizing::new(*seeded.ss0_for_test()),
+                        ar,
                         BASE_MS,
                         BASE_MS,
                     )?)

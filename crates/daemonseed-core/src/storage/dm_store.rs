@@ -437,12 +437,13 @@ pub enum RecordKind {
     ReceiveCursor,
     /// What is known about the correspondent themselves
     /// ([`crate::dm::contact_cache::ContactRecord`]) — their long-term and
-    /// pseudonym public keys, the correspondence's `ss0`, and when they were
-    /// first and last seen.
+    /// pseudonym public keys, the correspondence's address root `AR`, and when
+    /// they were first and last seen. **Not `ss0`**: § D-PFS retains only `AR`,
+    /// and that module says why.
     ///
     /// **Arrives as plaintext**, unlike [`RecordKind::Provisional`]. This record
     /// carries no seal of its own, so this store's seal and its AAD are the
-    /// whole of its protection, and `ss0` is live in the payload until
+    /// whole of its protection, and `AR` is live in the payload until
     /// [`Locked::replace`] seals it. Weakening either for this kind is therefore
     /// not the defence-in-depth trade it would be for a pre-sealed kind — there
     /// is no second layer behind it. `crate::dm::contact_cache` argues why the
@@ -5952,12 +5953,12 @@ mod tests {
     /// with every stored field intact and the file at the kind's fixed size.
     ///
     /// Compared field by field rather than as bytes, because the fields are what
-    /// a caller uses. `ss0` has no accessor by design, so it is checked through
-    /// the value it derives.
+    /// a caller uses. The stored root is read back through
+    /// `ContactRecord::address_root`, the only accessor over it.
     #[test]
     fn a_contact_record_round_trips_through_the_store() {
         use crate::dm::contact_cache::ContactRecord;
-        use crate::dm::firstcontact::{SS0_LEN, derive_channel_roots};
+        use crate::dm::firstcontact::ROOT_LEN;
         use oxicrypt_ml_dsa as ml_dsa;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -5968,7 +5969,12 @@ mod tests {
         let pk_lt: Box<[u8; ml_dsa::PK_LEN]> = Box::new([0x11u8; ml_dsa::PK_LEN]);
         let pk_pc: Box<[u8; ml_dsa::PK_LEN]> = Box::new([0x22u8; ml_dsa::PK_LEN]);
         assert_ne!(pk_lt, pk_pc, "the fixture's two keys are the same key");
-        let ss0 = [0x33u8; SS0_LEN];
+        // Byte-distinct, so a field written or read reversed does not round-trip
+        // by coincidence — the same control the two public keys carry.
+        let mut ar = [0u8; ROOT_LEN];
+        for (i, b) in ar.iter_mut().enumerate() {
+            *b = 0x33u8.wrapping_add(i as u8 * 5);
+        }
         const FIRST: i64 = 1_700_000_000_000;
         const LAST: i64 = 1_700_000_999_999;
         assert_ne!(FIRST, LAST, "the two timestamps are the same value");
@@ -5976,7 +5982,7 @@ mod tests {
         let encoded = ContactRecord::new(
             pk_lt.clone(),
             pk_pc.clone(),
-            zeroize::Zeroizing::new(ss0),
+            zeroize::Zeroizing::new(ar),
             FIRST,
             LAST,
         )
@@ -5999,7 +6005,7 @@ mod tests {
         );
 
         // `Locked::read` hands back a plain `Vec<u8>`, and for this kind that
-        // payload is cleartext `ss0`. `decode` takes a `Zeroizing` buffer so the
+        // payload is the cleartext address root. `decode` takes a `Zeroizing` buffer so the
         // wrapping cannot be forgotten; this is what that looks like at a call site.
         let read = zeroize::Zeroizing::new(
             s.critical_section::<_, DmStoreError>(&l, |g| g.read(kind))
@@ -6014,9 +6020,9 @@ mod tests {
         assert_eq!(reopened.first_seen_ms(), FIRST);
         assert_eq!(reopened.last_seen_ms(), LAST);
         assert_eq!(
-            reopened.address_root().unwrap(),
-            derive_channel_roots(&ss0).unwrap().ar,
-            "the derived AR does not match an independent derivation over ss0"
+            reopened.address_root(),
+            ar,
+            "the address root did not survive the store"
         );
     }
 
@@ -6031,7 +6037,7 @@ mod tests {
     #[test]
     fn a_contact_record_from_another_correspondence_does_not_open() {
         use crate::dm::contact_cache::ContactRecord;
-        use crate::dm::firstcontact::SS0_LEN;
+        use crate::dm::firstcontact::ROOT_LEN;
         use oxicrypt_ml_dsa as ml_dsa;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -6043,7 +6049,7 @@ mod tests {
             ContactRecord::new(
                 Box::new([tag; ml_dsa::PK_LEN]),
                 Box::new([tag ^ 0xFF; ml_dsa::PK_LEN]),
-                zeroize::Zeroizing::new([tag; SS0_LEN]),
+                zeroize::Zeroizing::new([tag; ROOT_LEN]),
                 1_700_000_000_000,
                 1_700_000_000_001,
             )

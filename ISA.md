@@ -410,7 +410,7 @@ The direct-messaging family is deferred from the MVP gate to alpha2. The MVP cli
 - [ ] ISC-C41: The **sender-blind doorbell** (`dflt(32)`, recipient-keyed `HKDF(PK_lt_B)`) holds a **self-contained first-contact entry** in slot `HKDF(sender_secret_A, PK_lt_B) % 32` (sender-secret ⇒ stable-per-pair, idempotent, not observer-computable — no pairwise contact-graph oracle). The entry carries `ct0` + a sealed body {pseudonym + in-seal binding to the long-term identity, `eph_ek_A`, hashed intended-recipient, `fc_epoch`, a reserved `key_selector` (=STATIC in alpha), body} ≈ 18 KB < 32768. Admission is A+B+C (PoW rate-bound + grantee-bound one-time invite token under an invite-only policy + the sender-blind self-contained entry). Idempotent retry via A-persisted `ss0`. Accepted limit: 32 concurrent unknown senders (post-alpha lever: pointer+body split).
 - [ ] ISC-C42: The ongoing channel is **per-page scattered records** `page_addr(dir,p) = HKDF(AR ‖ dir ‖ p)` (K=16 messages per `dflt(16)` record; `AR = HKDF(ss0)`), owner-write gated by the AR-derived owner so **no third party can write, forge, or erase** it (the load-bearing win). Messages are AES-256-GCM-sealed under the ratchet message key with a `msg_sig` binding `chan_id ‖ dir ‖ seq ‖ eph_ek ‖ recipient` (no epoch — addressing is decoupled from content-binding). Paging fixes the write budget (opens amortized K:1, watchable, no wrap); the frozen decision #4 closes at ≈3.13/min with a **client-global aggregate ack cap**.
 - [ ] ISC-C43: Established contact rides the AR-derived channel directly (contact cache holds the channel key + pseudonym); the doorbell is consulted only for first contact, so doorbell erasure is a first-contact nuisance, never a way to suppress an established conversation.
-- [ ] ISC-C44: The contact cache lives in the at-rest blob — per contact: long-term + pseudonym pubkeys, the channel/`AR` material, `ss0`, first/last timestamps — encrypted at rest under the passphrase that protects mute/hide (the binding of these public values to the local user is sensitive social-graph metadata). Enables established-contact delivery across restart; B additionally persists provisional-handshake state and the receive high-water cursor.
+- [ ] ISC-C44: The contact cache lives in the at-rest blob — per contact: long-term + pseudonym pubkeys, the channel address root `AR`, first/last timestamps — encrypted at rest under the passphrase that protects mute/hide (the binding of these public values to the local user is sensitive social-graph metadata). **`ss0` is not among them**: § D-PFS retains only `AR` (`docs/design/direct-messaging.md:319`), and line 706 names this criterion's earlier `ss0` as the error rather than a live option, because it regenerates `RK0` and every message key the ratchet believes it deleted. Enables established-contact delivery across restart; B additionally persists provisional-handshake state and the receive high-water cursor.
 - [ ] ISC-C45: First-contact UX is explicit-accept — an unknown sender surfaces as a contact request; the thread renders only on accept. A known sender whose cached identity key matches is delivered directly; a mismatch surfaces a trust event ("known handle, new key") via the ISC-C28 taxonomy. The gate is local UI, not a protocol round trip. **User-education requirement:** the pre-establishment first message is labeled **hello-grade** — "not yet secured; say hello, not secrets" — because it has no forward secrecy until B's first reply forks the ratchet.
 - [x] ISC-C46: The block list is the DM revocation primitive (a `blocked` set keyed on identity pubkey): **a blocked sender's records are not read.** Their doorbell entries are dropped at sweep, matched on the sealed `sender_pubkey_hash`, and their outbox is no longer swept — neither the page plane nor the acknowledgement plane fetches or folds anything for a suppressed correspondent, and a block taken while an operation is in flight drops what that operation returns without settling it. The block is **silent and unilateral**: it is taken and reversed locally, nothing on the wire announces it, and the contact cache is preserved so an unblock resumes the conversation. A tick that cannot read the list suppresses everything and says so once, rather than falling open. Mute stays scoped to chat-render suppression. (Amended 2026-09-03: the original wording added "the blocked sender's experience is byte-identical to 'never came online'", which this side's continuing outbox re-seeds and acknowledgement writes do not deliver for a correspondent who had already collected; the criterion is re-cut to what the design specifies — records are not read — and the gap is recorded as a bounded residual under ISC-A-C23. See Verification.)
 - [ ] ISC-A-C20: The DHT and any storage node never see DM content or forgeable authorship — every message and first-contact entry is AES-256-GCM-sealed, the signature lives inside the seal, and ongoing-channel writes are AR-owner-gated; ISC-A-S2 holds as for chat circles.
@@ -710,16 +710,23 @@ route taken to reach a decision are not recorded here — the git history and `C
   than one per receive poll, and its rate under real traffic is unmeasured because there is no
   transport cadence yet to measure it against.
 
-- **The contact cache stores `ss0` and derives the channel/`AR` material rather than storing both.**
-  ISC-C44 lists them as separate per-contact contents, but they are not independent: the channel
-  roots are a deterministic HKDF over `ss0`, and ISC-A-C24 states the relationship itself. Storing
-  both would write derivable secret material to disk twice and leave the record holding two values
-  that can disagree, against the principle the provisional record already applies — a record must not
-  be made redundant with the secret it contains. The rejected alternative was to store the root
-  literally, as the criterion's wording reads; it saves one deterministic derivation per open, paid
-  against a second copy of secret bytes at rest for the life of the contact. The criterion's
-  requirement is met by the material being *available* from the record, which it is. ISC-C44's own
-  text is unchanged; this entry is the reading in force.
+- **The contact cache stores the address root `AR` and never `ss0`.** § D-PFS is explicit: both the
+  address chain and the deletable seal-key chain are seeded from `ss0`, "but only `AR` is retained"
+  (`docs/design/direct-messaging.md:319`). Line 706 rules on this record by name — retaining `ss0`
+  "is not a live option — it regenerates `RK0` and with it every message key the ratchet believes it
+  deleted" — and line 710's retained set ends "Deleted: `ss0`, `chan_id`, and all ratchet state."
+  A record holding `ss0` for the life of a correspondence is a permanent copy of the value that
+  reconstructs every deleted message key, which is what content forward secrecy here rests on.
+  The rejected alternative was to keep storing `ss0` and derive `AR` per call: it avoids one stored
+  value that could in principle disagree with a second, but there is no second — with `ss0` gone the
+  root is the only channel fact stored, so the redundancy argument has nothing to bite on. Cost of
+  the change, stated: `AR` is frozen at establishment rather than re-derived, so a future change to
+  the address KDF splits existing records from fresh knocks, and `addresses_same_channel`'s false
+  branch is terminal for the queue (#261). No record has ever been written, so that is a migration
+  obligation and not a live defect.
+  **This entry supersedes the earlier one that recorded the opposite reading.** That entry argued
+  ISC-C44's list of "channel/`AR` material" and `ss0` was redundant and resolved it toward storing
+  `ss0`; § D-PFS resolves it the other way, and the design outranks the reading.
 
 - **The client GUI is Slint.** It is Rust-native with declarative markup, is royalty-free for desktop,
   mobile, and web, and is the only Rust GUI toolkit with official Android support. The terminal client
@@ -983,6 +990,15 @@ git log; this records only shifts in what "done" means.
 
 Evidence that criteria hold, recorded as current state rather than as history. The mechanized
 authority is `cargo xtask isc-coverage`; this section records what that authority does *not* settle.
+
+**ISC-C44's `ss0` exclusion is guarded in exactly one place, and it is not where the name suggests.**
+`ROOT_LEN` and `SS0_LEN` are both 32, so a caller writing `ss0` where the derived root belongs
+compiles clean. `dm::contact_cache`'s `ss0`-absence scan cannot catch that — the type has no field
+either value could come from, so the scan is a regression guard against re-adding one and cannot
+fail today. The live guard is `dm::persist`'s
+`accepting_a_knock_establishes_a_findable_correspondence`, whose `addresses_same_channel` assertion
+kills the substitution. Measured by mutation, not by reading: the substitution fails that one test
+and no other.
 
 **The DM driver (`daemonseed_veilid_net::dm`) calls every DM module in production, and both front
 ends spawn it beside their net actor on connect.** The acknowledgement record, its piggyback path

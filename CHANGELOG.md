@@ -151,11 +151,11 @@ work lives in the maintainer's own planning notes, not here.
   `DmPersistError::AmbiguousCorrespondent` is propagated and nothing is marked. An idle queue is
   not written. **Breaking (crate API):** `DmPersistError` gains a `FirstContact` variant. (#261)
 - `daemonseed_core::dm::contact_cache` — `ContactRecord::addresses_same_channel`, which reports
-  whether an address root is the one this record's `ss0` derives. The comparison is not
+  whether an address root is the one this record stores. The comparison is not
   constant-time. It holds only under one at-rest store per `pk_lt`, which nothing enforces. (#261)
-- `daemonseed_core::dm::contact_cache` — `ContactRecord::new` and `decode` refuse an all-zero `ss0`
-  as `ContactCacheError::PlaceholderSecret`. **Breaking (crate API):** `ContactCacheError` gains a
-  `PlaceholderSecret` variant. (#261)
+- `daemonseed_core::dm::contact_cache` — `ContactRecord::new` and `decode` refuse an all-zero
+  address root as `ContactCacheError::PlaceholderAddressRoot`. **Breaking (crate API):**
+  `ContactCacheError` gains a `PlaceholderAddressRoot` variant. (#261)
 - `daemonseed_core::dm::provisional` — `TeardownCause::CorrespondentStateLost`, the fourth cause and
   the only one under which `Outbox::channel_torn_down` ends an `AwaitingCollection` entry. Its
   `TeardownOutcome::retained` is always empty. (#261)
@@ -585,6 +585,11 @@ work lives in the maintainer's own planning notes, not here.
   for the life of the driver and not persisted.
   `daemonseed_core::dm::keyrec::KeyRecordCache::accept_encoded` decodes and admits raw fetched
   bytes in one step.
+- `daemonseed_core::dm::contact_cache::ContactRecord` stores the channel's address root `AR` in
+  place of `ss0`. `new` takes `Zeroizing<[u8; ROOT_LEN]>`, `address_root` returns
+  `[u8; ROOT_LEN]`, `addresses_same_channel` returns `bool`, and an all-zero root is
+  `ContactCacheError::PlaceholderAddressRoot`. `CONTACT_RECORD_LEN` and the
+  `RecordKind::ContactCache` bucket are unchanged.
 - `daemonseed_core::dm::resume::ResumeRecord::new` takes `sealed: Option<SealedReEst>`, and
   `attempt`, `sealed` and `sealed_re_est` return `Option`. `None` is the empty handshake slot,
   encoded at rest as attempt `0` with a zero-length frame and ordering below every `Attempt`;
