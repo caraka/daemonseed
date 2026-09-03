@@ -184,8 +184,8 @@ pub enum DmPersistError {
     /// seal carries its own length prefix, so a record written with a shorter
     /// payload is a full-width, authentic file holding something this module
     /// cannot read as a page number. Reporting it as the store's
-    /// [`DmStoreError::WrongFileLen`] described a 40-byte file as being however
-    /// many bytes the payload was.
+    /// [`DmStoreError::WrongFileLen`] would describe a 40-byte file as being
+    /// however many bytes the payload is.
     ///
     /// The payload itself is not carried, for
     /// [`Self::CursorNotCorroborated`]'s reason: the remedy is to sweep from
@@ -3620,9 +3620,9 @@ mod tests {
     ///
     /// The store's fixed size bounds the file; the seal carries the payload's
     /// own length prefix, so `replace(ReceiveCursor, &[..3])` writes a valid
-    /// 40-byte record that opens to three bytes. Before this had its own error
-    /// the fallback reported `WrongFileLen { expected: 8, actual: 3 }`, whose
-    /// Display describes a 40-byte file as three bytes long.
+    /// 40-byte record that opens to three bytes. A file-length error cannot
+    /// describe that: `WrongFileLen { expected: 8, actual: 3 }` reads as a
+    /// three-byte file.
     #[test]
     fn a_cursor_record_whose_payload_is_not_eight_bytes_is_refused() {
         let tmp = tempfile::tempdir().unwrap();

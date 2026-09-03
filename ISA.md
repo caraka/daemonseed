@@ -700,9 +700,7 @@ route taken to reach a decision are not recorded here — the git history and `C
   cost more than it saved — it put a second branch in the write path, the read path and the erase
   path, and the erasure sentinel had to be length-bounded because of it. Two alternatives were
   rejected. Keeping it clear and naming the leak as an accepted residual leaves the disclosure in
-  place for a saving measured in
-
-  one AEAD seal per page of received messages. Sealing it but accepting a clear file on read, once,
+  place for a saving measured in one AEAD seal per page of received messages. Sealing it but accepting a clear file on read, once,
   and rewriting it sealed would migrate a format that never shipped: the at-rest format is unreleased,
   so the only thing such a path could ever accept is a file an attacker wrote, which is precisely what
   the seal is for. A cursor file of the former width is therefore refused as `WrongFileLen` — the
@@ -1002,8 +1000,8 @@ the TUI affordance; `TrustEventLog::append` does not dedupe the log.
 Both front ends write it to the ISC-C28 audit log, asymmetrically: the TUI's `fold_trust_event`
 writes the log *and* raises the persistent-non-blocking affordance, while the GUI appends to a
 `TrustEventLog` it now holds and raises nothing, having no affordance surface to raise it on. The entry carries the key and the wall clock and nothing naming the
-correspondent, which is what ISC-C28's scope rule and ISC-A-C1 require of it. **`ChannelLost` has
-only ever carried one key**: `correspondent_state_lost` is the only teardown that reaches it, so
+correspondent, which is what ISC-C28's scope rule and ISC-A-C1 require of it. **`ChannelLost`
+carries exactly one key**: `correspondent_state_lost` is the only teardown that reaches it, so
 `DmCorrespondentStateLost` is the only value the field takes. The other three causes —
 `NoProvisionalRecord`, `RecordUnusable`, `StoreUnreadable` — arise on three paths and have three
 dispositions. The introduce-probe path carries the cause's key to the client on
@@ -1139,8 +1137,8 @@ spanning four distinct pages ends holding the watched window and nothing more),
 `a_page_with_a_sweep_in_flight_is_not_closed_until_the_outcome_lands`,
 `a_torn_down_channel_hands_back_every_page_of_its_conversation` and
 `a_closed_page_named_again_is_re_opened_with_its_contents_intact`,
-`a_given_up_sending_page_is_handed_back`, `a_panicked_page_write_releases_the_page_it_was_holding`
-, `a_torn_down_conversation_plans_nothing_more`,
+`a_given_up_sending_page_is_handed_back`, `a_panicked_page_write_releases_the_page_it_was_holding`,
+`a_torn_down_conversation_plans_nothing_more`,
 `a_page_in_flight_at_teardown_is_handed_back_when_its_outcome_lands`,
 `a_peer_acknowledgement_hands_back_the_sending_page_it_finishes`,
 `a_page_with_a_publish_in_flight_is_not_closed_until_the_outcome_lands` and

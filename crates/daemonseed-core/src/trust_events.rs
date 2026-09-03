@@ -1297,8 +1297,8 @@ mod tests {
     ///
     /// **The asymmetry is the reason this exists.** `ReceiveCursor` holds one
     /// page number and no key material; `Provisional` failing to erase leaves
-    /// `ss0` readable. Before the scope carried the kind, one
-    /// keystroke on the harmless one silenced the dangerous one.
+    /// `ss0` readable. Without the kind in the scope, one keystroke on the
+    /// harmless one would silence the dangerous one.
     #[test]
     fn dismiss_is_scoped_to_the_record_kind() {
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);

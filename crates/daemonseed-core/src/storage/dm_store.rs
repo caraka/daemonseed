@@ -4572,8 +4572,8 @@ mod tests {
     /// Two halves, because one alone would pass on a broken store. Absence of
     /// the plaintext is checked against the *file's whole bytes* rather than a
     /// prefix, so a cursor written verbatim anywhere in the record fails. And a
-    /// decoy planted in the clear — the exact file the store used to write —
-    /// must not read back as a cursor, which is what shows the value is being
+    /// decoy planted in the clear — a bare eight-byte page number as the whole
+    /// file — must not read back as a cursor, which is what shows the value is being
     /// recovered from the seal and not from the bytes.
     #[test]
     fn the_cursor_is_sealed_at_rest_and_a_clear_one_is_not_read() {
@@ -4865,7 +4865,7 @@ mod tests {
     /// that could tell a bounded read from an unbounded one, every other kind
     /// being `NONCE_LEN + LEN_PREFIX + capacity + TAG_LEN` ≥ 33. Sealing it
     /// (#389) took that discriminating power away rather than the property, so
-    /// this test now pins the cursor's ordinary behaviour and
+    /// this test pins the cursor's ordinary behaviour and
     /// `record_kinds_admit_a_usable_sentinel` is what holds the bound itself.
     /// Every other `ErasureInterrupted` assertion in the tree
     /// was on a ≥32-byte kind, which is why reverting `read_record` to
