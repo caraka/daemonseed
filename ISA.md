@@ -1005,9 +1005,19 @@ writes the log *and* raises the persistent-non-blocking affordance, while the GU
 correspondent, which is what ISC-C28's scope rule and ISC-A-C1 require of it. **`ChannelLost` has
 only ever carried one key**: `correspondent_state_lost` is the only teardown that reaches it, so
 `DmCorrespondentStateLost` is the only value the field takes. The other three causes —
-`NoProvisionalRecord`, `RecordUnusable`, `StoreUnreadable` — arise on the introduce-probe and erase
-paths, which turn them into a refusal or a trace and give them no route to a client, so no
-driver-level test pins their cause-to-key mapping; core pins it, per cause. Pinned by
+`NoProvisionalRecord`, `RecordUnusable`, `StoreUnreadable` — arise on three paths and have three
+dispositions. The introduce-probe path carries the cause's key to the client on
+`DmEvent::Refused`'s `event`, which both front ends fold into the audit log. The erase path keeps
+its cause as a trace. The label lookup discards it: `provisional_label` asks every stored label
+whether it opens for this recipient, so a teardown there is ordinarily another correspondence's
+record declining to open, and the lookup cannot separate that from this recipient's own record
+being corrupt — it mints a fresh label and the old record stays on disk. A cause discarded there
+reaches no audit entry, and that is the accounting gap the taxonomy still owes. That key is
+unpinned at its
+source: `on_mint`'s teardown arm reads the record `save_provisional` wrote immediately above it,
+under the same label and the same context, so no test drives the arm. What is pinned is everything
+below it — `refused()` carries the key it is given, and each front end logs it exactly once — and
+the cause-to-key mapping itself, which core pins per cause. Pinned by
 `a_torn_down_channel_raises_its_trust_event_exactly_once` (the driver's public path: the knock that
 loses the channel is re-delivered twice more and still raises one event, within the one process),
 `a_re_knock_from_a_known_correspondent_is_channel_lost` (the loss and the key arrive together),

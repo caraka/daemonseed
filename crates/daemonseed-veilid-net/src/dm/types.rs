@@ -143,6 +143,21 @@ pub enum DmEvent {
         acceptance: Acceptance,
         /// Where it stopped.
         reason: RefusalReason,
+        /// The classed trust event this refusal is raised as, where the refusal
+        /// is a channel the store would not hand back — from
+        /// [`Teardown::event`](daemonseed_core::dm::provisional::Teardown::event).
+        ///
+        /// **Carried here rather than derived by the receiver**, for the reason
+        /// [`DmEvent::ChannelLost`]'s field of the same name states: ISC-A-C12
+        /// forbids a client skipping the audit entry a teardown owes, and a key
+        /// a front end has to go and fetch is a key a front end can forget.
+        ///
+        /// `None` on a refusal that tears nothing down — a full outbox, a mint
+        /// that failed, an identity already established — and a front end folds
+        /// exactly what is present. `reason` stays what the user is told in
+        /// words; this is what the audit log and the affordance class are keyed
+        /// on.
+        event: Option<TrustEventKey>,
     },
     /// An accepted request could not be established.
     ///
@@ -184,11 +199,17 @@ pub enum DmEvent {
         /// event.** `Teardown::correspondent_state_lost` is the sole teardown
         /// that arrives here, so the field's only value is
         /// [`TrustEventKey::DmCorrespondentStateLost`]. The other three causes —
-        /// `NoProvisionalRecord`, `RecordUnusable`, `StoreUnreadable` — are
-        /// produced by the introduce-probe and erase paths, which turn them into
-        /// a refusal or a trace: they have no route to a client at all, so this
-        /// field cannot be what makes them loud, and no driver-level test pins
-        /// their cause-to-key mapping. Core pins that mapping, per cause.
+        /// `NoProvisionalRecord`, `RecordUnusable`, `StoreUnreadable` — arise on
+        /// three paths and have three dispositions. The introduce-probe path
+        /// carries the cause's key to the client on [`DmEvent::Refused`]'s
+        /// `event`. The erase path keeps its cause as a trace. The label lookup
+        /// discards it: that lookup asks every stored label whether it opens for
+        /// this recipient, so a teardown there is ordinarily another
+        /// correspondence's record declining to open, and it cannot separate
+        /// that from this recipient's own record being corrupt — it mints a
+        /// fresh label and the old record stays on disk. **A cause discarded
+        /// there reaches no audit entry**, and that is the accounting gap the
+        /// taxonomy still owes. Core pins the cause-to-key mapping for all four.
         event: TrustEventKey,
         /// The sequence numbers now
         /// [`Lifecycle::Undelivered`](daemonseed_core::dm::outbox::Lifecycle::Undelivered)
@@ -572,11 +593,19 @@ impl core::fmt::Debug for DmEvent {
                 write!(f, ", seq: {seq}, state: {state:?} }}")
             }
             DmEvent::Refused {
-                acceptance, reason, ..
+                acceptance,
+                reason,
+                event,
+                ..
             } => {
                 f.write_str("Refused { to: ")?;
                 redacted_pk(f)?;
-                write!(f, ", acceptance: {acceptance:?}, reason: {reason:?} }}")
+                // The key names a kind of ending, never a correspondent, so it
+                // is printable where the identity above is not (ISC-C28).
+                write!(
+                    f,
+                    ", acceptance: {acceptance:?}, reason: {reason:?}, event: {event:?} }}"
+                )
             }
             DmEvent::AcceptFailed {
                 request, reason, ..

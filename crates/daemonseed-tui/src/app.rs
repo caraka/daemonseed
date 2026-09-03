@@ -1334,6 +1334,11 @@ impl DmState {
                 to,
                 acceptance,
                 reason,
+                // Matched by name rather than by `..`: a field added to
+                // `Refused` must break this fold rather than be dropped
+                // silently. The key is folded by the caller, which is where
+                // the audit log lives.
+                event: _,
             } => {
                 self.last_refusal = Some(DmRefusal {
                     to: to.clone(),
@@ -1939,13 +1944,20 @@ impl App {
             // No interface renders them yet, so the
             // screen is byte-identical before and after one is folded.
             //
-            // The exception is a torn-down channel, which is raised loudly:
-            // the driver hands the classed key over on the event itself and
-            // ISC-A-C12 forbids dropping it here, so it goes to the same audit
-            // log and the same affordance class as every other trust event.
+            // The exception is a teardown, which is raised loudly: the driver
+            // hands the classed key over on the event itself and ISC-A-C12
+            // forbids dropping it here, so it goes to the same audit log and
+            // the same affordance class as every other trust event. A teardown
+            // reaches here two ways — as a lost channel, and as the refusal an
+            // introduction ends in — and a refusal that tore nothing down
+            // carries no key and folds nothing.
             NetEvent::Dm(ref event) => {
-                if let DmEvent::ChannelLost { event: key, .. } = &**event {
-                    self.fold_trust_event(TrustEventScope::bare(*key), None);
+                match &**event {
+                    DmEvent::ChannelLost { event: key, .. }
+                    | DmEvent::Refused {
+                        event: Some(key), ..
+                    } => self.fold_trust_event(TrustEventScope::bare(*key), None),
+                    _ => {}
                 }
                 self.dm.fold(event);
             }
@@ -9115,6 +9127,7 @@ mod tests {
             to: dm_pk(7),
             acceptance: Acceptance::Unconfirmed,
             reason: RefusalReason::NoKeyRecord,
+            event: None,
         })));
 
         let refusal = app
@@ -9178,6 +9191,74 @@ mod tests {
                 .expect("correspondence folded")
                 .undelivered,
             vec![4, 5]
+        );
+    }
+
+    /// A refusal that carries a classed key is audit-logged exactly once, and a
+    /// refusal that carries none writes nothing.
+    ///
+    /// An introduction whose channel is torn down is stated as a refusal, so
+    /// this fold is the only thing between the driver's classed key and the log
+    /// — the standing ISC-A-C12 puts on a lost channel, on the event the
+    /// introduce-probe path actually emits. The second half is what keeps the
+    /// fold conditional: a client that logged every refusal would pass the
+    /// first assertion and write an audit entry for a full outbox.
+    #[test]
+    fn dm_refused_carrying_a_trust_event_is_audit_logged_once() {
+        let mut app = App::new();
+        assert_eq!(app.trust_log().len(), 0, "the fixture starts empty");
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Refused {
+            to: dm_pk(9),
+            acceptance: Acceptance::Unconfirmed,
+            reason: RefusalReason::StoreFailure,
+            event: Some(TrustEventKey::DmProvisionalRecordUnreadable),
+        })));
+
+        let entries = app.trust_log().entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the refusal's key reached the log {} times",
+            entries.len()
+        );
+        assert_eq!(entries[0].key, TrustEventKey::DmProvisionalRecordUnreadable);
+        // ISC-C28 again: the key is the whole statement, and no scope field is
+        // filled with anything that would name the correspondent.
+        assert!(entries[0].server_id.is_none());
+        assert!(entries[0].suite_id.is_none());
+        assert!(entries[0].record_kind.is_none());
+        assert_eq!(
+            class_of(TrustEventKey::DmProvisionalRecordUnreadable),
+            TrustEventClass::PersistentNonBlocking
+        );
+        assert_eq!(app.persistent.len(), 1, "the affordance did not surface");
+
+        // The refusal is still a refusal to the rest of the fold.
+        assert_eq!(
+            app.dm_state()
+                .last_refusal
+                .as_ref()
+                .expect("refusal folded")
+                .reason,
+            RefusalReason::StoreFailure
+        );
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Refused {
+            to: dm_pk(9),
+            acceptance: Acceptance::Unconfirmed,
+            reason: RefusalReason::OutboxFull { needed: 12 },
+            event: None,
+        })));
+        assert_eq!(
+            app.trust_log().entries().len(),
+            1,
+            "a refusal that tore nothing down was audit-logged"
+        );
+        assert_eq!(
+            app.persistent.len(),
+            1,
+            "a refusal that tore nothing down raised an affordance"
         );
     }
 
@@ -9312,6 +9393,7 @@ mod tests {
                 to: dm_pk(3),
                 acceptance: Acceptance::Unconfirmed,
                 reason: RefusalReason::PublishFailed,
+                event: None,
             })));
             app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::DoorbellHealth {
                 outcome: daemonseed_veilid_net::SweepOutcome::default(),

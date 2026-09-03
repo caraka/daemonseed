@@ -62,6 +62,7 @@ use daemonseed_core::dm::ratchet::{Direction, Ratchet, RatchetError, FIRST_RECIP
 use daemonseed_core::dm::token::SpentTokenSet;
 use daemonseed_core::identity::keys::{SignKeypair, IDENTITY_PK_LEN, ML_DSA_SEED_LEN};
 use daemonseed_core::storage::dm_store::CorrespondenceLabel;
+use daemonseed_core::trust_events::TrustEventKey;
 
 use crate::actor::{DmPageRecord, DmPageSweep, DoorbellDispatch, DoorbellSweep};
 use crate::dm::driver::{DmDriverConfig, SpentTokenStore};
@@ -1344,10 +1345,10 @@ impl DmMachine {
             }
             DmOutcome::Panicked { job } => match job {
                 Some(PanickedJob::Mint(recipient)) => {
-                    self.refuse_introduction(&recipient, RefusalReason::MintPanicked)
+                    self.refuse_introduction(&recipient, RefusalReason::MintPanicked, None)
                 }
                 Some(PanickedJob::Dht(recipient)) => {
-                    self.refuse_introduction(&recipient, RefusalReason::TaskPanicked)
+                    self.refuse_introduction(&recipient, RefusalReason::TaskPanicked, None)
                 }
                 // The set in memory is now ahead of the file by an unknown
                 // amount, exactly as a failed write leaves it — and a later
@@ -1402,9 +1403,11 @@ impl DmMachine {
                         // front end may ask again, and a silently retained
                         // introduction would refuse that second ask as a duplicate.
                         match tag.introduction {
-                            Some(recipient) => {
-                                self.refuse_introduction(&recipient, RefusalReason::PublishFailed)
-                            }
+                            Some(recipient) => self.refuse_introduction(
+                                &recipient,
+                                RefusalReason::PublishFailed,
+                                None,
+                            ),
                             None => Vec::new(),
                         }
                     }
@@ -1595,12 +1598,14 @@ impl DmMachine {
             return vec![DmEffect::Emit(refused(
                 to,
                 RefusalReason::NotEstablishedThisSession,
+                None,
             ))];
         };
         let Some((ratchet, _, _)) = self.correspondences[index].live() else {
             return vec![DmEffect::Emit(refused(
                 to,
                 RefusalReason::NotEstablishedThisSession,
+                None,
             ))];
         };
         let label = self.correspondences[index].label;
@@ -1610,7 +1615,11 @@ impl DmMachine {
         // Checked here rather than left to `seal`, which reports it only after
         // the ratchet has already stepped.
         if body.len() > firstcontact::DM_BODY_CAP {
-            return vec![DmEffect::Emit(refused(to, RefusalReason::BodyTooLarge))];
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::BodyTooLarge,
+                None,
+            ))];
         }
 
         // The ask. `Unchanged` because nothing is written: this is a question
@@ -1631,15 +1640,24 @@ impl DmMachine {
                 return vec![DmEffect::Emit(refused(
                     to,
                     RefusalReason::OutboxFull { needed },
+                    None,
                 ))];
             }
             Ok(Err(e)) => {
                 crate::vtrace!("dm driver: the outbox refused sequence {next_seq}: {e}");
-                return vec![DmEffect::Emit(refused(to, RefusalReason::StoreFailure))];
+                return vec![DmEffect::Emit(refused(
+                    to,
+                    RefusalReason::StoreFailure,
+                    None,
+                ))];
             }
             Err(e) => {
                 crate::vtrace!("dm driver: the outbox could not be read: {e}");
-                return vec![DmEffect::Emit(refused(to, RefusalReason::StoreFailure))];
+                return vec![DmEffect::Emit(refused(
+                    to,
+                    RefusalReason::StoreFailure,
+                    None,
+                ))];
             }
         }
 
@@ -1656,7 +1674,7 @@ impl DmMachine {
             Ok(h) => h,
             Err(e) => {
                 crate::vtrace!("dm driver: recipient hash failed: {e}");
-                return vec![DmEffect::Emit(refused(to, RefusalReason::Module))];
+                return vec![DmEffect::Emit(refused(to, RefusalReason::Module, None))];
             }
         };
         let (Some(ratchet), Some(signing_pc), Some(channel)) = (
@@ -1667,6 +1685,7 @@ impl DmMachine {
             return vec![DmEffect::Emit(refused(
                 to,
                 RefusalReason::NotEstablishedThisSession,
+                None,
             ))];
         };
         // Past this line a sequence number has been spent.
@@ -1674,7 +1693,7 @@ impl DmMachine {
             Ok(o) => o,
             Err(e) => {
                 crate::vtrace!("dm driver: the ratchet refused to mint a key: {e}");
-                return vec![DmEffect::Emit(refused(to, RefusalReason::SealFailed))];
+                return vec![DmEffect::Emit(refused(to, RefusalReason::SealFailed, None))];
             }
         };
         let seq = outbound.header.seq;
@@ -1694,7 +1713,7 @@ impl DmMachine {
             Ok(bytes) => bytes,
             Err(e) => {
                 crate::vtrace!("dm driver: the frame would not seal: {e}");
-                return vec![DmEffect::Emit(refused(to, RefusalReason::SealFailed))];
+                return vec![DmEffect::Emit(refused(to, RefusalReason::SealFailed, None))];
             }
         };
         let queued = persist.update_outbox(&label, direction, now_ms, |outbox| {
@@ -1711,7 +1730,11 @@ impl DmMachine {
             // since, so this is a store fault rather than the capacity refusal
             // — and the sequence number IS spent, because the seal is behind us.
             crate::vtrace!("dm driver: sequence {seq} sealed and could not be queued: {e}");
-            return vec![DmEffect::Emit(refused(to, RefusalReason::StoreFailure))];
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::StoreFailure,
+                None,
+            ))];
         }
         vec![DmEffect::Emit(DmEvent::Delivery {
             to: Box::new(**to),
@@ -3761,6 +3784,7 @@ impl DmMachine {
             return vec![DmEffect::Emit(refused(
                 &recipient,
                 RefusalReason::AlreadyInFlight,
+                None,
             ))];
         }
         // **First contact is for strangers.** Knocking at an identity we
@@ -3773,6 +3797,7 @@ impl DmMachine {
                 return vec![DmEffect::Emit(refused(
                     &recipient,
                     RefusalReason::AlreadyEstablished,
+                    None,
                 ))];
             }
             Ok(None) => {}
@@ -3783,6 +3808,7 @@ impl DmMachine {
                 return vec![DmEffect::Emit(refused(
                     &recipient,
                     RefusalReason::StoreFailure,
+                    None,
                 ))];
             }
         }
@@ -3790,7 +3816,11 @@ impl DmMachine {
             Ok(seed) => *seed.as_bytes(),
             Err(e) => {
                 crate::vtrace!("dm driver: recipient key-record derivation failed: {e}");
-                return vec![DmEffect::Emit(refused(&recipient, RefusalReason::Module))];
+                return vec![DmEffect::Emit(refused(
+                    &recipient,
+                    RefusalReason::Module,
+                    None,
+                ))];
             }
         };
         let tag = OpTag::introduction(Box::new(*recipient));
@@ -3821,6 +3851,7 @@ impl DmMachine {
             return vec![DmEffect::Emit(refused(
                 &recipient,
                 RefusalReason::NoKeyRecord,
+                None,
             ))];
         };
         // **Verified THROUGH the session's bound, never beside it.** A record
@@ -3851,6 +3882,7 @@ impl DmMachine {
                 return vec![DmEffect::Emit(refused(
                     &recipient,
                     RefusalReason::KeyRecordRollback,
+                    None,
                 ))];
             }
             Err(e) => {
@@ -3858,6 +3890,7 @@ impl DmMachine {
                 return vec![DmEffect::Emit(refused(
                     &recipient,
                     RefusalReason::KeyRecordInvalid,
+                    None,
                 ))];
             }
         };
@@ -3866,14 +3899,22 @@ impl DmMachine {
             Ok(k) => k,
             Err(e) => {
                 crate::vtrace!("dm driver: pseudonym keygen failed: {e}");
-                return vec![DmEffect::Emit(refused(&recipient, RefusalReason::Module))];
+                return vec![DmEffect::Emit(refused(
+                    &recipient,
+                    RefusalReason::Module,
+                    None,
+                ))];
             }
         };
         let recipient_keyrec_addr = match keyrec::derive_owner_seed(&recipient) {
             Ok(seed) => *seed.as_bytes(),
             Err(e) => {
                 crate::vtrace!("dm driver: recipient key-record derivation failed: {e}");
-                return vec![DmEffect::Emit(refused(&recipient, RefusalReason::Module))];
+                return vec![DmEffect::Emit(refused(
+                    &recipient,
+                    RefusalReason::Module,
+                    None,
+                ))];
             }
         };
         self.minting.push(Box::new(*recipient));
@@ -3905,7 +3946,7 @@ impl DmMachine {
             Ok(pair) => pair,
             Err(e) => {
                 crate::vtrace!("dm driver: first-contact build failed: {e}");
-                return self.refuse_introduction(&recipient, RefusalReason::MintFailed);
+                return self.refuse_introduction(&recipient, RefusalReason::MintFailed, None);
             }
         };
         // **A conversation already established with this identity is never
@@ -3929,7 +3970,7 @@ impl DmMachine {
             .is_some_and(|i| self.correspondences[i].peer_pk_pc.is_some())
         {
             crate::vtrace!("dm driver: this identity is already established; the mint is dropped");
-            return self.refuse_introduction(&recipient, RefusalReason::AlreadyEstablished);
+            return self.refuse_introduction(&recipient, RefusalReason::AlreadyEstablished, None);
         }
         // **One provisional label per recipient, never one per attempt.** A
         // second label is a second correspondence directory holding a live
@@ -3939,7 +3980,7 @@ impl DmMachine {
             Ok(label) => label,
             Err(e) => {
                 crate::vtrace!("dm driver: correspondence label mint failed: {e}");
-                return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+                return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
             }
         };
         // Read before `into_provisional` moves the state: the record recomputes
@@ -3953,7 +3994,7 @@ impl DmMachine {
             Ok(r) => r,
             Err(e) => {
                 crate::vtrace!("dm driver: provisional record build failed: {e}");
-                return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+                return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
             }
         };
         // Persisted BEFORE the write is asked for. The record holds the opening
@@ -3968,20 +4009,20 @@ impl DmMachine {
             &record,
         ) {
             crate::vtrace!("dm driver: provisional record write failed: {e}");
-            return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+            return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
         }
         let owner_seed = match doorbell::derive_owner_seed(&recipient) {
             Ok(seed) => *seed.as_bytes(),
             Err(e) => {
                 crate::vtrace!("dm driver: recipient doorbell derivation failed: {e}");
-                return self.refuse_introduction(&recipient, RefusalReason::Module);
+                return self.refuse_introduction(&recipient, RefusalReason::Module, None);
             }
         };
         let slot = match doorbell::slot_for(&self.identity.doorbell_slot_secret, &recipient) {
             Ok(slot) => slot,
             Err(e) => {
                 crate::vtrace!("dm driver: doorbell slot derivation failed: {e}");
-                return self.refuse_introduction(&recipient, RefusalReason::Module);
+                return self.refuse_introduction(&recipient, RefusalReason::Module, None);
             }
         };
         // **The initiator's ratchet opens here, and the record STAYS.** The
@@ -4008,15 +4049,35 @@ impl DmMachine {
                 Ok(ratchet) => ratchet,
                 Err(e) => {
                     crate::vtrace!("dm driver: the initiator's ratchet would not open: {e}");
-                    return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+                    return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
                 }
             },
+            // **The refusal carries the teardown's classed key.** The channel
+            // this introduction was opening is gone, ISC-A-C12 owes that an
+            // audit entry, and the refusal is the only event a front end sees
+            // for it, so the key travels on the refusal.
+            //
+            // **No test drives this arm**, because nothing inside this call
+            // produces it: `restart_channel` reads the record
+            // `save_provisional` wrote above, under the same label and the same
+            // context. What reaches it comes from outside the call. The write
+            // takes the store's lock and the read does not, so an erase another
+            // writer left interrupted reads back as `NoProvisionalRecord` with
+            // no error anywhere, and a genuine read fault reads back as
+            // `StoreUnreadable`. A hit here is a question about the other
+            // writer first and the disk second. Everything downstream of the
+            // key is pinned from `refuse_introduction` on.
             StoredChannelRestart::TornDown(teardown) => {
                 crate::vtrace!(
                     "dm driver: the record just written would not open: {:?}",
                     teardown.cause()
                 );
-                return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+                let event = teardown.event();
+                return self.refuse_introduction(
+                    &recipient,
+                    RefusalReason::StoreFailure,
+                    Some(event),
+                );
             }
         };
         let conversation = *ratchet.ar_fingerprint();
@@ -4080,7 +4141,7 @@ impl DmMachine {
             });
         if let Err(e) = queued {
             crate::vtrace!("dm driver: the knock could not be queued: {e}");
-            return self.refuse_introduction(&recipient, RefusalReason::StoreFailure);
+            return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
         }
 
         // The recipient stays in `minting` until this write's outcome lands, so
@@ -4188,16 +4249,35 @@ impl DmMachine {
 
     /// Drop an in-flight introduction and tell the front end it did not
     /// proceed.
-    fn refuse_introduction(&mut self, recipient: &PkLt, reason: RefusalReason) -> Vec<DmEffect> {
+    ///
+    /// `event` is the classed trust event where the refusal is a channel torn
+    /// down, and `None` where it is not — see [`DmEvent::Refused`]'s field of
+    /// that name for why the key travels on the event.
+    fn refuse_introduction(
+        &mut self,
+        recipient: &PkLt,
+        reason: RefusalReason,
+        event: Option<TrustEventKey>,
+    ) -> Vec<DmEffect> {
         let before = self.outbound.len() + self.minting.len();
         self.outbound
             .retain(|i| i.recipient.as_slice() != recipient.as_slice());
         self.minting
             .retain(|pk| pk.as_slice() != recipient.as_slice());
+        // Nothing was in flight, so nothing is refused and `event` goes with
+        // it. A teardown cannot be lost this way. It is raised from `on_mint`,
+        // which runs for a recipient `on_key_record` pushed into `minting`, and
+        // between that push and the teardown the only operation tagged with
+        // this introduction is the doorbell publish `on_mint` itself asks for —
+        // so no outcome naming this recipient can have arrived to drop it, and
+        // `introduction_in_flight` refuses a second attempt for as long as it
+        // sits there. The other removals, this function's own four lines above
+        // included, all run on an introduction that is ending rather than one
+        // still minting.
         if self.outbound.len() + self.minting.len() == before {
             return Vec::new();
         }
-        vec![DmEffect::Emit(refused(recipient, reason))]
+        vec![DmEffect::Emit(refused(recipient, reason, event))]
     }
 
     /// Ask for the spent-token set to be written back, where one is kept.
@@ -4221,12 +4301,6 @@ impl DmMachine {
     }
 }
 
-/// A first contact that did not proceed.
-///
-/// [`Acceptance::Unconfirmed`] is all this layer can say about the write: no
-/// emission of this introduction has been confirmed, which is true of every
-/// path here — nothing reaches this function after a confirmed doorbell write.
-/// `reason` is the part that varies and the part a front end acts on.
 /// Erase this correspondence's provisional record, if it still holds one, and
 /// forget the handle only once the record is actually gone.
 ///
@@ -4520,15 +4594,32 @@ fn accept_refused(recipient: &[u8; IDENTITY_PK_LEN], reason: RefusalReason) -> V
             seq: FIRST_RECIPIENT_CHANNEL_SEQ,
             state: DeliveryState::Undelivered,
         }),
-        DmEffect::Emit(refused(recipient, reason)),
+        DmEffect::Emit(refused(recipient, reason, None)),
     ]
 }
 
-fn refused(recipient: &[u8; IDENTITY_PK_LEN], reason: RefusalReason) -> DmEvent {
+/// A first contact that did not proceed.
+///
+/// [`Acceptance::Unconfirmed`] is all this layer can say about the write: no
+/// emission of this introduction has been confirmed, which is true of every
+/// path here — nothing reaches this function after a confirmed doorbell write.
+/// `reason` is the part that varies and the part a front end acts on.
+///
+/// The driver's only construction of [`DmEvent::Refused`], tests aside.
+/// `event` is a parameter rather than a second constructor: a refusal that ends
+/// a channel owes the taxonomy an audit entry, and passing the key in at the
+/// single construction site is what keeps every other refusal's `None` an
+/// explicit statement instead of a default nothing states.
+fn refused(
+    recipient: &[u8; IDENTITY_PK_LEN],
+    reason: RefusalReason,
+    event: Option<TrustEventKey>,
+) -> DmEvent {
     DmEvent::Refused {
         to: Box::new(*recipient),
         acceptance: daemonseed_core::dm::outbox::Acceptance::Unconfirmed,
         reason,
+        event,
     }
 }
 
@@ -5023,6 +5114,100 @@ mod tests {
                 })
             ),
             "the duplicate was not refused as a duplicate"
+        );
+    }
+
+    /// A refusal raised by a teardown carries that teardown's classed key, and
+    /// carries it as the teardown states it.
+    ///
+    /// The key is what the audit log and the affordance class are keyed on, and
+    /// [`DmEvent::Refused`] is the only event a front end sees for an
+    /// introduction that ends this way — so a refusal that dropped it would
+    /// leave the teardown stated in words and absent from the taxonomy.
+    ///
+    /// The teardown is a real one, from `restart` over an unreadable store, and
+    /// it enters through `refuse_introduction` — the call `on_mint`'s teardown
+    /// arm makes. What is pinned is the key's route from there to the emitted
+    /// event; `on_mint`'s own arm is not driven, and says so.
+    #[test]
+    fn a_refusal_raised_by_a_teardown_carries_its_classed_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut m = machine(&dir);
+        let recipient: PkLt = Box::new(*fake_knock(12).pk_lt());
+
+        // A real teardown, so the key under assertion is the one core derives
+        // from the cause rather than one the test chose.
+        let seal_key = daemonseed_core::dm::provisional::derive_seal_key(&[0x11u8; AEAD_KEY_LEN])
+            .expect("seal key");
+        let addr = [0x22u8; keyrec::DM_KEYREC_OWNER_SEED_LEN];
+        let unreadable = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "seeds.bin");
+        let teardown = match daemonseed_core::dm::provisional::restart(
+            Err(unreadable),
+            &seal_key,
+            &RecordContext {
+                recipient_keyrec_addr: &addr,
+                fc_epoch: 7,
+            },
+        ) {
+            daemonseed_core::dm::provisional::ChannelRestart::TornDown(t) => t,
+            daemonseed_core::dm::provisional::ChannelRestart::HandshakeResumes(_) => {
+                panic!("nothing was read, so nothing resumes")
+            }
+        };
+        assert_eq!(
+            teardown.cause(),
+            &TeardownCause::StoreUnreadable("seeds.bin".into()),
+            "the fixture built a different teardown than the one asserted below"
+        );
+
+        // An introduction has to be in flight, or the refusal drops nothing and
+        // emits nothing.
+        let started = m.on_command(
+            BASE_MS,
+            DmCommand::FirstContact {
+                recipient: recipient.clone(),
+                body: "one".into(),
+            },
+        );
+        assert!(
+            matches!(&started[..], [DmEffect::Dht(DhtOp::FetchKeyRecord { .. })]),
+            "the introduction did not start: {started:?}"
+        );
+
+        // The control: a refusal that tears nothing down claims no trust event,
+        // so the key below is carried rather than always present.
+        let duplicate = m.on_command(
+            BASE_MS,
+            DmCommand::FirstContact {
+                recipient: recipient.clone(),
+                body: "two".into(),
+            },
+        );
+        assert!(
+            matches!(
+                &duplicate[..],
+                [DmEffect::Emit(DmEvent::Refused {
+                    reason: RefusalReason::AlreadyInFlight,
+                    event: None,
+                    ..
+                })]
+            ),
+            "a refusal that tore no channel down claimed a trust event: {duplicate:?}"
+        );
+
+        let out = m.refuse_introduction(
+            &recipient,
+            RefusalReason::StoreFailure,
+            Some(teardown.event()),
+        );
+        let [DmEffect::Emit(DmEvent::Refused { reason, event, .. })] = &out[..] else {
+            panic!("the teardown did not refuse the introduction: {out:?}");
+        };
+        assert_eq!(*reason, RefusalReason::StoreFailure);
+        assert_eq!(
+            *event,
+            Some(TrustEventKey::DmProvisionalRecordUnreadable),
+            "the refusal did not carry the teardown's classed key"
         );
     }
 
