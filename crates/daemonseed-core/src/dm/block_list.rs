@@ -73,12 +73,16 @@
 //! ## What this module cannot enforce
 //!
 //! **"Byte-identical to never came online" is the caller's obligation, and it
-//! holds fully only at the doorbell.** ISC-C46 requires a blocked sender to be
-//! unable to distinguish a block from silence. At the doorbell that is
-//! achievable and it is the caller's to achieve: drop the entry where an
-//! un-blocked one would have been filed, emit nothing, write nothing, and take
-//! the same time doing it. A refusal that logs, replies, or returns early enough
-//! to be timed reintroduces exactly the oracle the criterion forbids.
+//! holds fully only at the doorbell.** That indistinguishability is **not**
+//! ISC-C46's, which asks only that a blocked sender's records are not read and
+//! that the block is silent and unilateral; it is the bounded residual named by
+//! **ISC-A-C23**, which records that a block stops reads and not writes. At the
+//! doorbell it is nevertheless achievable, and it is the caller's to achieve:
+//! drop the entry where an un-blocked one would have been filed, emit nothing,
+//! write nothing, and take the same time doing it. A refusal that logs, replies,
+//! or returns early enough to be timed reintroduces exactly the oracle the
+//! doorbell plane is otherwise free of, widening the ISC-A-C23 residual past
+//! what the design accepts.
 //!
 //! **At the channel plane a residual survives any amount of caller care.**
 //! Ceasing to sweep *is* the channel suppression, and the design records it as a

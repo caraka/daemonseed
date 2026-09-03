@@ -2117,7 +2117,10 @@ impl DmMachine {
     /// entries at sweep (matched on the sealed `sender_pubkey_hash`) and stops
     /// sweeping their outbox. Silent and unilateral; the blocked sender's view
     /// is byte-identical to 'never came online' …"*
-    /// (`docs/design/direct-messaging.md`). Suppression is therefore READING
+    /// (`docs/design/direct-messaging.md`). The quoted line is the design's, not
+    /// the criterion's: ISC-C46 carries only the not-read half, and the
+    /// byte-identical half is ISC-A-C23's bounded residual. Suppression is
+    /// therefore READING
     /// only, and the split runs along that word. **Reads stop:** this planner,
     /// [`Self::ack_fetches`], and the two fold paths that meet an outcome after
     /// the block ([`Self::on_page`], [`Self::on_peer_ack`]). **Writes do not:**
