@@ -530,6 +530,38 @@ impl DmPersist {
     /// channel down loudly, and a store that could not be *read* tears it down
     /// without declaring anything lost.
     ///
+    /// **The resume record is consulted first, and that is structural rather
+    /// than advisory** (`docs/design/direct-messaging.md` § A4.8). A first
+    /// establishment writes the resume record and then deletes the provisional
+    /// one, so both records present is the crash window between those two
+    /// writes; reading the provisional record first would answer
+    /// [`StoredChannelRestart::HandshakeResumes`] and re-run first establishment
+    /// on a channel that already has one. A lingering provisional record is
+    /// therefore ignored, and deleted on the way past — the same erasure
+    /// [`PendingHandshake::commit`] performs, and a failure to perform it here
+    /// costs another pass rather than the answer.
+    ///
+    /// **A resume record that will not read tears the channel down as an
+    /// unreadable store, never as an absent record.** Falling through to the
+    /// provisional record would offer a destructive fresh first contact over
+    /// what may be an `EIO`, so the fail-closed direction is the arm that
+    /// declares nothing lost.
+    ///
+    /// ⚠️ **Two different faults collapse into that one arm, and the collapse is
+    /// a real limitation rather than an equivalence.** A store fault is
+    /// transient and `StoreUnreadable`'s contract — nothing lost, retry — fits
+    /// it. A resume record whose *plaintext* will not decode is a permanent
+    /// record-level fault, and reporting it the same way means every restart
+    /// retries a record that will never read, with the user never told to
+    /// re-establish. The honest arm would be
+    /// [`TeardownCause::RecordUnusable`](crate::dm::provisional::TeardownCause::RecordUnusable),
+    /// which carries a
+    /// [`crate::dm::provisional::ProvisionalError`] and cannot
+    /// carry a [`ResumeError`] — so the collapse is forced by that type, and
+    /// splitting it needs a variant that does not exist.
+    /// `a_resume_record_that_will_not_decode_tears_the_channel_down` pins what
+    /// the collapse actually produces.
+    ///
     /// **Reads without the lock, deliberately.** This is a question asked of
     /// every channel at startup, and entering a critical section to ask it would
     /// create a correspondence directory for each one — turning the directory
@@ -544,6 +576,24 @@ impl DmPersist {
         correspondence: &CorrespondenceLabel,
         ctx: &RecordContext<'_>,
     ) -> StoredChannelRestart<'_> {
+        // A4.8's read order. Unlocked like the read below it and for the same
+        // reason: asking every channel this question under the lock would create
+        // a correspondence directory per channel (#253).
+        match self.store.read_unlocked(correspondence, RecordKind::Resume) {
+            Ok(Some(bytes)) => {
+                // `Zeroizing`: this plaintext holds a signing key, as
+                // `read_resume` notes at the same decode.
+                return match ResumeRecord::decode(&Zeroizing::new(bytes)) {
+                    Ok(record) => {
+                        self.clean_lingering_provisional(correspondence);
+                        StoredChannelRestart::Established(Box::new(record))
+                    }
+                    Err(e) => self.decide(correspondence, self.unreadable(&e, ctx)),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => return self.decide(correspondence, self.unreadable(&e, ctx)),
+        }
         // An interrupted erase is a record the store **lost**, not a store it
         // could not read, and the difference is load-bearing rather than
         // cosmetic. `StoreUnreadable`'s whole contract is that "nothing is
@@ -571,7 +621,23 @@ impl DmPersist {
             Ok(bytes) => Ok(bytes.as_deref()),
             Err(e) => Err(e),
         };
-        match restart(borrowed, &self.provisional_key, ctx) {
+        self.decide(
+            correspondence,
+            restart(borrowed, &self.provisional_key, ctx),
+        )
+    }
+
+    /// Carry [`crate::dm::provisional::restart`]'s decision into this module's
+    /// enum, attaching the store to the resumption arm.
+    ///
+    /// One place, so the two call sites cannot answer the same decision
+    /// differently.
+    fn decide(
+        &self,
+        correspondence: &CorrespondenceLabel,
+        decision: ChannelRestart,
+    ) -> StoredChannelRestart<'_> {
+        match decision {
             ChannelRestart::HandshakeResumes(record) => {
                 StoredChannelRestart::HandshakeResumes(PendingHandshake {
                     persist: self,
@@ -581,6 +647,45 @@ impl DmPersist {
             }
             ChannelRestart::TornDown(teardown) => StoredChannelRestart::TornDown(teardown),
         }
+    }
+
+    /// The teardown for a resume record that could not be read.
+    ///
+    /// Routed through [`crate::dm::provisional::restart`] rather than built
+    /// here, because [`Teardown`] is constructible only by that call — which is
+    /// what makes holding one proof the decision was taken. The argument is
+    /// `Err`, so the answer is always `StoreUnreadable` carrying `e`'s rendering
+    /// and the key is never consulted.
+    fn unreadable<E: std::fmt::Display>(&self, e: &E, ctx: &RecordContext<'_>) -> ChannelRestart {
+        restart(Err::<Option<&[u8]>, &E>(e), &self.provisional_key, ctx)
+    }
+
+    /// Delete a provisional record left beside a resume record, and say nothing
+    /// if it will not go.
+    ///
+    /// The lingering record is A4.8's create-first crash window. It is already
+    /// ignored by the time this runs — the caller has the resume record and is
+    /// answering [`StoredChannelRestart::Established`] — so the delete is the
+    /// erasure of a superseded `ss0` rather than a step the answer depends on,
+    /// and a store that refuses it is asked again at the next restart.
+    ///
+    /// **The look and the delete are one critical section**, which is not
+    /// tidiness: deciding from [`DmStore::read_unlocked`] and then deleting
+    /// through a second call is the read-decide-write split that read's own
+    /// documentation refuses, and a writer landing a *fresh* provisional record
+    /// in the gap would have that one deleted instead of the stale one. The lock
+    /// creates a correspondence directory where none existed (#253), which is
+    /// harmless here and only here: the caller reached this holding a decoded
+    /// resume record, so the directory is already on disk.
+    fn clean_lingering_provisional(&self, correspondence: &CorrespondenceLabel) {
+        let _ =
+            self.store
+                .critical_section(correspondence, |guard| -> Result<(), DmPersistError> {
+                    if guard.read(RecordKind::Provisional)?.is_some() {
+                        guard.delete(RecordKind::Provisional)?;
+                    }
+                    Ok(())
+                });
     }
 
     /// Read the outbox **to look at it**, without the lock.
@@ -850,6 +955,12 @@ impl DmPersist {
     /// Commit a re-establishment resume record and hand back the sealed RE-EST
     /// bytes to emit (A9.2).
     ///
+    /// **`Ok(None)` where the record's handshake slot is empty**, which is the
+    /// state a record written at first establishment is in: there is a record
+    /// and there is nothing to emit. The two anti-rollback guards below read the
+    /// empty slot as ordering beneath every attempt, so a first establishment is
+    /// replaceable by the first real re-establishment and never the reverse.
+    ///
     /// **The whole record replaces the stored one in a single
     /// `replace_atomically`**, so no crash can pair a committed root with a
     /// stale attempt. There is no call here that writes part of a record.
@@ -906,26 +1017,60 @@ impl DmPersist {
         &self,
         correspondence: &CorrespondenceLabel,
         record: &ResumeRecord,
-    ) -> Result<Vec<u8>, DmPersistError> {
+    ) -> Result<Option<Vec<u8>>, DmPersistError> {
         let encoded = record.encode();
-        self.store
-            .critical_section(correspondence, |guard| -> Result<Vec<u8>, DmPersistError> {
+        self.store.critical_section(
+            correspondence,
+            |guard| -> Result<Option<Vec<u8>>, DmPersistError> {
                 if let Some(bytes) = guard.read(RecordKind::Resume)? {
                     let stored = ResumeRecord::decode(&Zeroizing::new(bytes))?;
-                    if record.attempt() < stored.attempt() {
-                        return Err(ResumeError::AttemptWouldRollBack {
-                            stored: stored.attempt().get(),
-                            offered: record.attempt().get(),
+                    match (record.attempt(), stored.attempt()) {
+                        (Some(offered), Some(held)) => {
+                            if offered < held {
+                                return Err(ResumeError::AttemptWouldRollBack {
+                                    stored: held.get(),
+                                    offered: offered.get(),
+                                }
+                                .into());
+                            }
+                            if offered == held && record.sealed_re_est() != stored.sealed_re_est() {
+                                return Err(ResumeError::AttemptResealed {
+                                    attempt: offered.get(),
+                                }
+                                .into());
+                            }
                         }
-                        .into());
+                        (None, Some(held)) => {
+                            return Err(ResumeError::EmptySlotWouldReplaceAttempt {
+                                stored: held.get(),
+                            }
+                            .into());
+                        }
+                        // A first establishment over a first establishment, or a
+                        // first re-establishment over one. Neither is a
+                        // regression; the pseudonym guard below is what stops
+                        // the first case replacing the keypair.
+                        (Some(_), None) | (None, None) => {}
                     }
-                    if record.attempt() == stored.attempt()
-                        && record.sealed_re_est() != stored.sealed_re_est()
-                    {
-                        return Err(ResumeError::AttemptResealed {
-                            attempt: record.attempt().get(),
-                        }
-                        .into());
+                    // **The pseudonym pair may not change, whatever the slot
+                    // holds.** Without this, two records whose handshake slots
+                    // are both empty are indistinguishable to every guard above:
+                    // the attempts compare equal, so the sealed-bytes comparison
+                    // that discriminates same-attempt records never runs, and an
+                    // unmoved floor is admitted. A second first-establishment
+                    // write would replace `s_pc` and `pk_pc` and report success,
+                    // leaving this side signing under a key the correspondent
+                    // never saw and rejecting every frame the correspondent
+                    // sends — on disk, unspeakable, with nothing reported. The
+                    // occupied slot is covered by the sealed-bytes comparison;
+                    // this covers both.
+                    //
+                    // A plain comparison rather than a constant-time one: both
+                    // sides are this party's own material and the caller already
+                    // holds the offered copy, so there is no secret here that the
+                    // comparison could leak to whoever can call this.
+                    if record.s_pc() != stored.s_pc() || record.pk_pc() != stored.pk_pc() {
+                        return Err(ResumeError::PseudonymPairChanged.into());
                     }
                     if !stored.send_floor().admits(record.send_floor()) {
                         return Err(ResumeError::FloorWouldRollBack {
@@ -936,8 +1081,9 @@ impl DmPersist {
                     }
                 }
                 guard.replace(RecordKind::Resume, &encoded)?;
-                Ok(record.sealed_re_est().to_vec())
-            })
+                Ok(record.sealed_re_est().map(<[u8]>::to_vec))
+            },
+        )
     }
 
     /// Read the persisted resume record, or `Ok(None)` if none was written.
@@ -1741,6 +1887,21 @@ pub enum StateLoss {
 #[derive(Debug)]
 #[must_use = "a discarded restart decision is the silent rebuild #243 abolished"]
 pub enum StoredChannelRestart<'a> {
+    /// A resume record was present and opened: the correspondence is
+    /// established, and this is what it needs to speak — our own `S_pc` and the
+    /// correspondent's `PK_pc` above all.
+    ///
+    /// **Ahead of the other two arms, and that ordering is A4.8's read order**
+    /// (`docs/design/direct-messaging.md` § A4.8): a resume record is the
+    /// authority, and a provisional record lying beside it is a crash between
+    /// the two writes of a first establishment, not a handshake to resume.
+    /// Answering `HandshakeResumes` there would re-run first establishment on an
+    /// already-established channel — a fresh `ss0` and a colliding sequence
+    /// space.
+    ///
+    /// Boxed because a [`ResumeRecord`] carries an ML-DSA-87 keypair's worth of
+    /// bytes and every other arm is small.
+    Established(Box<ResumeRecord>),
     /// The record opened. [`PendingHandshake::establish`] is what finishes it.
     HandshakeResumes(PendingHandshake<'a>),
     /// The channel is over, and [`Teardown`] is the statement the user gets.
@@ -1851,6 +2012,58 @@ impl PendingHandshake<'_> {
         Ok(ratchet)
     }
 
+    /// Establish the channel and write the resume record first (A4.8).
+    ///
+    /// [`Self::establish`]'s ordering with the write A4.8 puts ahead of the
+    /// erasure: **create the resume record, then delete the provisional one**
+    /// (`docs/design/direct-messaging.md` § A4.8). The resume record is the
+    /// correspondence's only at-rest home for our `S_pc` and the
+    /// correspondent's `PK_pc` — neither is derivable from the shared secret or
+    /// the mnemonic — so a channel established without it is on disk and
+    /// unspeakable after the next restart.
+    ///
+    /// **The order is what makes the crash window recoverable.** Deleting first
+    /// and crashing leaves neither record, which
+    /// [`DmPersist::restart_channel`] reads as an ordinary established teardown;
+    /// writing first and crashing leaves both, which the same call reads as
+    /// established, because it consults the resume record first.
+    ///
+    /// **A failed resume write is an error and nothing has been destroyed** —
+    /// the provisional record is still on disk and the establishment can be
+    /// taken again. **A failed erase is not an error**, which is what
+    /// "best-effort" means here: the resume record is committed, the channel is
+    /// established, and refusing the ratchet over an unscrubbed provisional
+    /// record would destroy a working correspondence. The superseded `ss0` is
+    /// erased at the next [`DmPersist::restart_channel`] instead, so the leak is
+    /// bounded by one restart rather than permanent.
+    pub fn establish_with_resume(self, resume: &ResumeRecord) -> Result<Ratchet, DmPersistError> {
+        let Self {
+            persist,
+            correspondence,
+            record,
+        } = self;
+        let ratchet = record.into_ratchet()?;
+        commit_then_erase(persist, correspondence, resume)?;
+        Ok(ratchet)
+    }
+
+    /// Write the resume record, then erase — [`Self::commit`] under A4.8's write
+    /// order.
+    ///
+    /// The pair to [`Self::ratchet`], for the initiator whose two moments are
+    /// apart: the ratchet is in hand from the knock, and the correspondent is
+    /// verified when the acceptance lands, which is the moment the resume record
+    /// can name a `PK_pc` and the provisional record stops being needed. The two
+    /// failures are [`Self::establish_with_resume`]'s.
+    pub fn commit_with_resume(self, resume: &ResumeRecord) -> Result<(), DmPersistError> {
+        let Self {
+            persist,
+            correspondence,
+            ..
+        } = self;
+        commit_then_erase(persist, correspondence, resume)
+    }
+
     /// Derive the ratchet and leave the record exactly where it is.
     ///
     /// **The half of [`Self::establish`] that is safe to take early.** An
@@ -1889,6 +2102,22 @@ impl PendingHandshake<'_> {
         } = self;
         erase(persist, correspondence)
     }
+}
+
+/// A4.8's write order, in the one place both endings reach it — so the two
+/// cannot drift into writing and deleting in different orders.
+fn commit_then_erase(
+    persist: &DmPersist,
+    correspondence: CorrespondenceLabel,
+    resume: &ResumeRecord,
+) -> Result<(), DmPersistError> {
+    persist.commit_resume(&correspondence, resume)?;
+    // Best-effort, per A4.8, and the discarded error is the point rather than an
+    // oversight: the resume record is committed, so the correspondence is
+    // established whatever happens next, and `restart_channel` erases what is
+    // left behind on the next pass. See `establish_with_resume`.
+    let _ = erase(persist, correspondence);
+    Ok(())
 }
 
 /// The critical section both endings share, so the two cannot drift into
@@ -2020,6 +2249,9 @@ mod tests {
         );
 
         let pending = match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => pending,
             StoredChannelRestart::TornDown(t) => panic!("a saved record must resume: {t}"),
         };
@@ -2034,6 +2266,9 @@ mod tests {
         );
         assert!(!path.exists(), "the record file survived establishment");
         match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::TornDown(t) => {
                 assert_eq!(t.cause(), &TeardownCause::NoProvisionalRecord);
             }
@@ -2063,6 +2298,9 @@ mod tests {
         let path = record_path(&p, &l, "provisional.bin");
 
         let fingerprint = match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => {
                 let r = pending.ratchet().expect("derives a ratchet");
                 // The `PendingHandshake` drops here, uncommitted.
@@ -2083,6 +2321,9 @@ mod tests {
         // resumes into the SAME conversation. A record that opened into a
         // different one would satisfy every assertion above.
         match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => {
                 let again = pending.ratchet().expect("derives again");
                 assert_eq!(
@@ -2104,6 +2345,9 @@ mod tests {
         // one thing this window exists to make possible. So the far end is
         // built for real and its first frame is driven through.
         let derived = match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => {
                 pending.ratchet().expect("derives once more")
             }
@@ -2155,9 +2399,15 @@ mod tests {
             .expect("saves");
 
         let by_split = match p.restart_channel(&split, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => {
                 let r = pending.ratchet().expect("derives");
                 match p.restart_channel(&split, &ctx()) {
+                    StoredChannelRestart::Established(_) => {
+                        panic!("nothing wrote a resume record, so nothing can find one")
+                    }
                     StoredChannelRestart::HandshakeResumes(again) => {
                         again.commit().expect("commits")
                     }
@@ -2168,6 +2418,9 @@ mod tests {
             StoredChannelRestart::TornDown(t) => panic!("must resume: {t}"),
         };
         let by_whole = match p.restart_channel(&whole, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => {
                 pending.establish().expect("establishes")
             }
@@ -2210,6 +2463,9 @@ mod tests {
         );
 
         match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => {
                 pending.commit().expect("commits");
             }
@@ -2225,6 +2481,9 @@ mod tests {
             "ss0 is still readable from the store after the commit"
         );
         match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::TornDown(t) => {
                 assert_eq!(t.cause(), &TeardownCause::NoProvisionalRecord);
             }
@@ -2247,6 +2506,9 @@ mod tests {
             .expect("saves");
 
         match p.restart_channel(&mine, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => {
                 pending.establish().expect("establishes");
             }
@@ -2280,6 +2542,9 @@ mod tests {
 
         let p = persist(tmp.path());
         match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::HandshakeResumes(pending) => {
                 assert_eq!(pending.eph_ek(), &ek, "a different opening ephemeral");
                 assert_eq!(
@@ -2307,6 +2572,9 @@ mod tests {
         let l = label(5);
 
         match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::TornDown(t) => {
                 assert_eq!(t.cause(), &TeardownCause::NoProvisionalRecord);
             }
@@ -2348,6 +2616,9 @@ mod tests {
         std::fs::write(&path, &raw).expect("writes");
 
         match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::TornDown(t) => assert_eq!(
                 t.cause(),
                 &TeardownCause::NoProvisionalRecord,
@@ -2370,6 +2641,9 @@ mod tests {
         p.save_provisional(&l, &ctx(), &record()).expect("saves");
 
         match p.restart_channel(&l, &other_ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::TornDown(t) => match t.cause() {
                 TeardownCause::RecordUnusable(_) => {}
                 other => panic!("expected an unusable record, got {other:?}"),
@@ -2396,6 +2670,9 @@ mod tests {
         std::fs::write(record_path(&p, &to, "provisional.bin"), &stolen).expect("writes");
 
         match p.restart_channel(&to, &ctx()) {
+            StoredChannelRestart::Established(_) => {
+                panic!("nothing wrote a resume record, so nothing can find one")
+            }
             StoredChannelRestart::TornDown(t) => match t.cause() {
                 // The store refuses before the record is ever reached, so this
                 // is a failed *read*, and `restart` is right not to declare the
@@ -3953,6 +4230,18 @@ mod tests {
         token
     }
 
+    /// The stored record's attempt as a number, which is what these assertions
+    /// compare — and an `expect` on the slot, because every fixture here
+    /// occupies it.
+    fn attempt_number(p: &DmPersist, l: &CorrespondenceLabel) -> u32 {
+        p.read_resume(l)
+            .expect("reads")
+            .expect("there")
+            .attempt()
+            .expect("the fixture's handshake slot is occupied")
+            .get()
+    }
+
     fn resume_record_sealed(attempt: u32, floor: SendFloor, seal: u8) -> ResumeRecord {
         ResumeRecord::new(
             Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
@@ -3960,11 +4249,13 @@ mod tests {
             crate::dm::resume::CommittedRoot::from_bytes(
                 [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
-            crate::dm::resume::SealedReEst::seal(
-                fresh(attempt),
-                vec![seal; 256].into_boxed_slice(),
-            )
-            .expect("within MAX_FRAME_LEN"),
+            Some(
+                crate::dm::resume::SealedReEst::seal(
+                    fresh(attempt),
+                    vec![seal; 256].into_boxed_slice(),
+                )
+                .expect("within MAX_FRAME_LEN"),
+            ),
             floor,
             1_700_000_000_000,
             2,
@@ -3988,7 +4279,7 @@ mod tests {
         let record = resume_record(1, SendFloor::new(4, 100));
         let emitted = p.commit_resume(&l, &record).expect("commits");
         assert_eq!(
-            emitted,
+            emitted.as_deref(),
             record.sealed_re_est(),
             "the caller was handed something other than the persisted seal"
         );
@@ -3997,7 +4288,7 @@ mod tests {
             .read_resume(&l)
             .expect("reads")
             .expect("a record was committed");
-        assert_eq!(stored.attempt().get(), 1);
+        assert_eq!(stored.attempt(), crate::dm::resume::Attempt::FIRST.into());
         assert_eq!(stored.send_floor(), SendFloor::new(4, 100));
         assert_eq!(
             stored.sealed_re_est(),
@@ -4032,7 +4323,7 @@ mod tests {
         // And the refusal wrote nothing: the stored record is untouched, which
         // a refusal that had already replaced the file would not leave.
         let stored = p.read_resume(&l).expect("reads").expect("still there");
-        assert_eq!(stored.attempt().get(), 1);
+        assert_eq!(stored.attempt(), crate::dm::resume::Attempt::FIRST.into());
         assert_eq!(stored.send_floor(), SendFloor::new(4, 100));
     }
 
@@ -4050,14 +4341,7 @@ mod tests {
         p.commit_resume(&l, &resume_record(2, floor))
             .expect("an unmoved floor was refused on a new attempt");
 
-        assert_eq!(
-            p.read_resume(&l)
-                .expect("reads")
-                .expect("there")
-                .attempt()
-                .get(),
-            2
-        );
+        assert_eq!(attempt_number(&p, &l), 2);
     }
 
     /// A generation bump that carries the sequence forward is admitted — the
@@ -4134,7 +4418,7 @@ mod tests {
         // The refusal wrote nothing: the first seal is still the stored one, so
         // recovery still re-emits the bytes the peer actually saw.
         let stored = p.read_resume(&l).expect("reads").expect("there");
-        assert_eq!(stored.sealed_re_est(), &[0xA5u8; 256]);
+        assert_eq!(stored.sealed_re_est(), Some(&[0xA5u8; 256][..]));
 
         // And a NEW attempt may carry fresh bytes — that is A9.1's other half.
         p.commit_resume(&l, &resume_record_sealed(2, floor, 0x5A))
@@ -4164,14 +4448,7 @@ mod tests {
             ),
             "wrong error: {err:?}"
         );
-        assert_eq!(
-            p.read_resume(&l)
-                .expect("reads")
-                .expect("there")
-                .attempt()
-                .get(),
-            5
-        );
+        assert_eq!(attempt_number(&p, &l), 5);
     }
 
     /// Two correspondences do not share a resume record.
@@ -4185,6 +4462,538 @@ mod tests {
         assert!(
             p.read_resume(&label(0x56)).expect("reads").is_none(),
             "one correspondence's resume record was visible to another"
+        );
+    }
+
+    // ------------------------------------------- first establishment (A4.8)
+
+    /// A per-correspondent pseudonym keypair, deterministic in `tag` so two of
+    /// them are distinct and reproducible.
+    fn pseudonym(tag: u8) -> crate::identity::keys::SignKeypair {
+        crate::identity::keys::SignKeypair::from_ml_dsa_seed(
+            &[tag; crate::identity::keys::ML_DSA_SEED_LEN],
+        )
+        .expect("the module is initialized by `persist`")
+    }
+
+    /// The record a first establishment writes: the pseudonym pair, and a
+    /// handshake slot standing empty because no re-establishment frame exists.
+    fn opening_record(
+        ours: &crate::identity::keys::SignKeypair,
+        theirs: &crate::identity::keys::SignKeypair,
+        floor: SendFloor,
+    ) -> ResumeRecord {
+        ResumeRecord::new(
+            Box::new(*ours.secret_key()),
+            Box::new(*theirs.public_key()),
+            crate::dm::resume::CommittedRoot::from_bytes(
+                [0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
+            ),
+            None,
+            floor,
+            1_700_000_000_000,
+            0,
+        )
+    }
+
+    /// A re-establishment record carrying the same pseudonym pair as
+    /// [`opening_record`], so a fixture can advance the attempt without also
+    /// changing the keys — which the pair guard refuses independently.
+    fn re_established_record(
+        ours: &crate::identity::keys::SignKeypair,
+        theirs: &crate::identity::keys::SignKeypair,
+        attempt: u32,
+        floor: SendFloor,
+    ) -> ResumeRecord {
+        ResumeRecord::new(
+            Box::new(*ours.secret_key()),
+            Box::new(*theirs.public_key()),
+            crate::dm::resume::CommittedRoot::from_bytes(
+                [0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
+            ),
+            Some(
+                crate::dm::resume::SealedReEst::seal(
+                    fresh(attempt),
+                    vec![0xA5u8; 256].into_boxed_slice(),
+                )
+                .expect("within MAX_FRAME_LEN"),
+            ),
+            floor,
+            1_700_000_000_000,
+            0,
+        )
+    }
+
+    /// A correspondence established in one process can still sign and verify in
+    /// the next one.
+    ///
+    /// The keys are exercised rather than compared: reading the bytes back only
+    /// says the encoding round-tripped, and what the correspondence needs is
+    /// that the recovered secret signs under the public half the peer holds, and
+    /// that the recovered verifying key accepts what the peer signs. The
+    /// crossed-key control at the end is what stops both halves passing under
+    /// one key.
+    #[test]
+    fn a_correspondence_signs_and_verifies_after_a_restart() {
+        const OUTBOUND: &[u8] = b"a frame this party sends";
+        const INBOUND: &[u8] = b"a frame the correspondent sends";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = label(0x61);
+        let ours = pseudonym(0x01);
+        let theirs = pseudonym(0x02);
+
+        {
+            let p = persist(dir.path());
+            p.save_provisional(&l, &ctx(), &record()).expect("saves");
+            let pending = match p.restart_channel(&l, &ctx()) {
+                StoredChannelRestart::HandshakeResumes(pending) => pending,
+                other => panic!("a saved record must resume: {other:?}"),
+            };
+            pending
+                .establish_with_resume(&opening_record(&ours, &theirs, SendFloor::new(0, 0)))
+                .expect("establishes");
+        }
+
+        // The store is dropped and reopened at the same path, which is what a
+        // restart leaves the next process holding.
+        let p = persist(dir.path());
+        let stored = match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(record) => record,
+            other => panic!("an established correspondence was lost: {other:?}"),
+        };
+        assert!(
+            stored.attempt().is_none(),
+            "a first establishment claimed a re-establishment attempt"
+        );
+
+        let outbound = oxicrypt_ml_dsa::sign(stored.s_pc(), OUTBOUND, &[])
+            .expect("the recovered signing key signs");
+        crate::identity::keys::verify_signature(ours.public_key(), OUTBOUND, &outbound)
+            .expect("the recovered signing key is not this party's pseudonym");
+
+        let inbound = theirs.sign(INBOUND).expect("the correspondent signs");
+        crate::identity::keys::verify_signature(stored.pk_pc(), INBOUND, &inbound)
+            .expect("the recovered verifying key is not the correspondent's pseudonym");
+
+        // The control: one key verifying both would pass every assertion above.
+        assert!(
+            crate::identity::keys::verify_signature(stored.pk_pc(), OUTBOUND, &outbound).is_err(),
+            "the two recovered keys are halves of one keypair"
+        );
+    }
+
+    /// A crash between A4.8's two writes leaves both records, and the loader
+    /// reads the resume record as the authority.
+    ///
+    /// The provisional record is present at the moment of the read — asserted,
+    /// not assumed, because a fixture that had already lost it would pass while
+    /// testing nothing — and gone afterwards, which is the "ignored and cleaned"
+    /// half of the same line.
+    #[test]
+    fn both_records_present_reads_as_established_and_cleans_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x62);
+        let ours = pseudonym(0x03);
+        let theirs = pseudonym(0x04);
+
+        p.save_provisional(&l, &ctx(), &record()).expect("saves");
+        p.commit_resume(&l, &opening_record(&ours, &theirs, SendFloor::new(0, 0)))
+            .expect("commits");
+
+        let path = record_path(&p, &l, "provisional.bin");
+        assert!(
+            path.exists(),
+            "the fixture never reached the crash window it exists to describe"
+        );
+
+        match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::Established(stored) => {
+                assert_eq!(stored.pk_pc(), theirs.public_key());
+            }
+            other => panic!("a resume record beside a provisional one lost: {other:?}"),
+        }
+
+        assert!(
+            !path.exists(),
+            "a provisional record beside a resume record was left on disk"
+        );
+    }
+
+    /// The resume record is written **before** the provisional record is
+    /// erased, so a refused write leaves the handshake exactly where it was.
+    ///
+    /// Under the reverse order the erase would already have happened and this
+    /// establishment would be unrepeatable — the correspondence lost to a store
+    /// that answered a question wrongly. The refusal is arranged through the
+    /// anti-rollback guard, which is the one way a resume write fails without
+    /// the store itself being broken.
+    #[test]
+    fn a_refused_resume_write_leaves_the_provisional_record_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x63);
+
+        p.save_provisional(&l, &ctx(), &record()).expect("saves");
+        let pending = match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::HandshakeResumes(pending) => pending,
+            other => panic!("a saved record must resume: {other:?}"),
+        };
+
+        // A later attempt lands between the handshake being taken up and the
+        // establishment committing, so the establishment's own write regresses
+        // it and is refused.
+        p.commit_resume(&l, &resume_record(3, SendFloor::new(0, 0)))
+            .expect("commits");
+
+        let err = pending
+            .establish_with_resume(&opening_record(
+                &pseudonym(0x05),
+                &pseudonym(0x06),
+                SendFloor::new(0, 0),
+            ))
+            .expect_err("a rolled-back resume write was accepted");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::EmptySlotWouldReplaceAttempt { stored: 3 })
+            ),
+            "wrong error: {err:?}"
+        );
+        assert!(
+            record_path(&p, &l, "provisional.bin").exists(),
+            "the provisional record was erased before the resume write was accepted"
+        );
+    }
+
+    /// An empty handshake slot survives the round trip, hands back nothing to
+    /// emit, and admits a genuine first attempt over it.
+    #[test]
+    fn an_empty_handshake_slot_round_trips_and_admits_a_first_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x64);
+        let floor = SendFloor::new(0, 0);
+        let ours = pseudonym(0x07);
+        let theirs = pseudonym(0x08);
+        let opening = opening_record(&ours, &theirs, floor);
+
+        assert_eq!(
+            p.commit_resume(&l, &opening).expect("commits"),
+            None,
+            "an empty handshake slot handed back bytes to emit"
+        );
+
+        let stored = p.read_resume(&l).expect("reads").expect("a record");
+        assert!(
+            stored.attempt().is_none(),
+            "attempt 0 decoded as an attempt"
+        );
+        assert_eq!(stored.sealed_re_est(), None);
+        assert_eq!(stored.s_pc(), opening.s_pc());
+        assert_eq!(stored.pk_pc(), opening.pk_pc());
+
+        // Rewriting the same empty slot is not a re-seal: the record is written
+        // again for reasons the handshake slot knows nothing about.
+        p.commit_resume(&l, &opening)
+            .expect("an unchanged empty slot was refused");
+
+        p.commit_resume(&l, &re_established_record(&ours, &theirs, 1, floor))
+            .expect("a first attempt was refused over an empty slot");
+        assert_eq!(attempt_number(&p, &l), 1);
+    }
+
+    /// The empty slot orders below every attempt, so it may not replace one.
+    ///
+    /// The direction that matters: a record written at first establishment
+    /// arriving after a re-establishment has been persisted would discard the
+    /// attempt the peer has already deduped on.
+    #[test]
+    fn an_empty_handshake_slot_may_not_replace_a_persisted_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x65);
+        let floor = SendFloor::new(0, 0);
+
+        p.commit_resume(&l, &resume_record(1, floor))
+            .expect("commits");
+        let err = p
+            .commit_resume(
+                &l,
+                &opening_record(&pseudonym(0x09), &pseudonym(0x0A), floor),
+            )
+            .expect_err("an empty slot replaced a persisted attempt");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::EmptySlotWouldReplaceAttempt { stored: 1 })
+            ),
+            "wrong error: {err:?}"
+        );
+        assert_eq!(
+            attempt_number(&p, &l),
+            1,
+            "the refusal replaced the stored record anyway"
+        );
+    }
+
+    /// The floor guard reads the same on an empty handshake slot as on an
+    /// occupied one — it is a bound on this party's own sequence numbers and has
+    /// nothing to do with the slot.
+    #[test]
+    fn the_floor_guard_is_unchanged_by_an_empty_handshake_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x66);
+        let ours = pseudonym(0x0B);
+        let theirs = pseudonym(0x0C);
+
+        p.commit_resume(&l, &opening_record(&ours, &theirs, SendFloor::new(4, 100)))
+            .expect("commits");
+        let err = p
+            .commit_resume(&l, &opening_record(&ours, &theirs, SendFloor::new(4, 99)))
+            .expect_err("a regressing floor was accepted on an empty slot");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::FloorWouldRollBack { .. })
+            ),
+            "wrong error: {err:?}"
+        );
+        p.commit_resume(&l, &opening_record(&ours, &theirs, SendFloor::new(4, 101)))
+            .expect("an advancing floor was refused on an empty slot");
+    }
+
+    /// **A second first establishment may not change the pseudonym pair.**
+    ///
+    /// Two records whose handshake slots are both empty carry the same attempt
+    /// (none) and the same frame (none), so the sealed-bytes comparison that
+    /// discriminates two same-attempt records has nothing to compare, and an
+    /// unmoved floor is admitted. Without a guard on the pair itself the second
+    /// write wins and reports success, leaving this side signing under a key the
+    /// correspondent never saw.
+    ///
+    /// Each half is offered on its own so a guard that checked only one of them
+    /// fails here. The stored pair is read back at the end: a refusal that had
+    /// already replaced the file would return an error and still lose the keys.
+    #[test]
+    fn a_second_first_establishment_may_not_change_the_pseudonym_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x69);
+        let floor = SendFloor::new(0, 0);
+        let ours = pseudonym(0x11);
+        let theirs = pseudonym(0x12);
+
+        p.commit_resume(&l, &opening_record(&ours, &theirs, floor))
+            .expect("commits");
+
+        for (what, offered) in [
+            (
+                "our own signing key",
+                opening_record(&pseudonym(0x13), &theirs, floor),
+            ),
+            (
+                "the correspondent's verifying key",
+                opening_record(&ours, &pseudonym(0x14), floor),
+            ),
+        ] {
+            let err = p
+                .commit_resume(&l, &offered)
+                .err()
+                .unwrap_or_else(|| panic!("{what} was replaced silently"));
+            assert!(
+                matches!(
+                    err,
+                    DmPersistError::Resume(ResumeError::PseudonymPairChanged)
+                ),
+                "wrong error for {what}: {err:?}"
+            );
+        }
+
+        // Identical is still admitted: the record is rewritten for reasons the
+        // pseudonym pair knows nothing about.
+        p.commit_resume(&l, &opening_record(&ours, &theirs, SendFloor::new(0, 1)))
+            .expect("an unchanged pair was refused");
+
+        let stored = p.read_resume(&l).expect("reads").expect("a record");
+        assert_eq!(stored.s_pc(), ours.secret_key());
+        assert_eq!(stored.pk_pc(), theirs.public_key());
+    }
+
+    /// The pair guard holds across a re-establishment too: the stored slot being
+    /// occupied does not license changing the keys.
+    #[test]
+    fn a_re_establishment_may_not_change_the_pseudonym_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x6A);
+        let floor = SendFloor::new(0, 0);
+
+        p.commit_resume(&l, &resume_record(1, floor))
+            .expect("commits");
+        let mut different = resume_record_sealed(2, floor, 0x5A);
+        different = ResumeRecord::new(
+            Box::new(*pseudonym(0x15).secret_key()),
+            Box::new(*different.pk_pc()),
+            crate::dm::resume::CommittedRoot::from_bytes(
+                [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
+            ),
+            different.sealed().map(|s| {
+                crate::dm::resume::SealedReEst::seal(
+                    fresh(2),
+                    s.bytes().to_vec().into_boxed_slice(),
+                )
+                .expect("within MAX_FRAME_LEN")
+            }),
+            floor,
+            1_700_000_000_000,
+            2,
+        );
+        let err = p
+            .commit_resume(&l, &different)
+            .expect_err("a new attempt carried a new signing key");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::PseudonymPairChanged)
+            ),
+            "wrong error: {err:?}"
+        );
+    }
+
+    /// `commit_with_resume` is the split path's ending, and takes the same write
+    /// order: the resume record lands and the provisional record goes.
+    #[test]
+    fn commit_with_resume_writes_the_record_and_erases_the_handshake() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x6B);
+        let theirs = pseudonym(0x16);
+
+        p.save_provisional(&l, &ctx(), &record()).expect("saves");
+        let pending = match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::HandshakeResumes(pending) => pending,
+            other => panic!("a saved record must resume: {other:?}"),
+        };
+        // The half taken early, which is why this ending exists at all.
+        pending.ratchet().expect("derives a ratchet");
+        pending
+            .commit_with_resume(&opening_record(
+                &pseudonym(0x17),
+                &theirs,
+                SendFloor::new(0, 0),
+            ))
+            .expect("commits");
+
+        assert!(
+            !record_path(&p, &l, "provisional.bin").exists(),
+            "the provisional record survived the commit"
+        );
+        let stored = p.read_resume(&l).expect("reads").expect("a record");
+        assert_eq!(stored.pk_pc(), theirs.public_key());
+    }
+
+    /// A resume record whose plaintext will not decode tears the channel down as
+    /// an unreadable store — the collapse `restart_channel` documents.
+    ///
+    /// Pinned because it is a limitation rather than a property: the honest
+    /// answer for a permanent record-level fault is `RecordUnusable`, which
+    /// cannot carry a `ResumeError`. This test is what will fail, loudly, if a
+    /// later change splits them — which is the point of writing it down.
+    ///
+    /// The record is sealed by the store and only its *plaintext* is nonsense,
+    /// so the seal opens and the decode is what fails. A tampered file would
+    /// fail one layer earlier and prove something else.
+    #[test]
+    fn a_resume_record_that_will_not_decode_tears_the_channel_down() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x6C);
+
+        p.store()
+            .critical_section(&l, |guard| -> Result<(), DmPersistError> {
+                // At least `RESUME_MAGIC.len()` bytes, so the reader gets as far
+                // as comparing the magic and refuses on that rather than on the
+                // length. A shorter payload ends inside the first field and
+                // reports a different error.
+                guard.replace(RecordKind::Resume, &[b'X'; 64])?;
+                Ok(())
+            })
+            .expect("seals the nonsense");
+
+        match p.restart_channel(&l, &ctx()) {
+            StoredChannelRestart::TornDown(t) => match t.cause() {
+                // The decode failure itself, rendered: the seal opened and the
+                // plaintext underneath is what `ResumeRecord::decode` refused.
+                // Pinned against the specific decode error's own rendering, and
+                // the sealed payload is deliberately not that string: an
+                // assertion satisfied by the bytes written cannot tell a
+                // decoder that ran from one that echoed.
+                TeardownCause::StoreUnreadable(rendered) => assert_eq!(
+                    rendered.as_str(),
+                    ResumeError::BadMagic.to_string().as_str(),
+                    "the teardown did not carry the decode failure: {rendered}"
+                ),
+                other => panic!("expected an unreadable store, got {other:?}"),
+            },
+            other => panic!("a corrupt resume record did not tear the channel down: {other:?}"),
+        }
+    }
+
+    /// The file's length says nothing about whether the handshake slot is
+    /// occupied. The field itself is variable — a length prefix and a frame —
+    /// and the constant on-disk size comes from the store padding every record
+    /// of a kind to one bucket.
+    ///
+    /// A padding-removal mutation goes red at the store's own
+    /// `debug_assert_eq!` before the comparison below is reached, so in a debug
+    /// build that assertion is what catches it; this test's own comparison
+    /// carries the claim in a release build.
+    ///
+    /// The inequality at the end is the control: the two plaintexts differ in
+    /// length, so equal files are the store's padding rather than a coincidence
+    /// of the fixtures.
+    ///
+    /// **In a debug build the comparison below is not what catches a padding
+    /// regression.** The store asserts its own "every record of a kind is one
+    /// size on disk" invariant in a `debug_assert_eq!`
+    /// ([`crate::storage::dm_store`]), which fires while the record is being
+    /// written and therefore before either `metadata` call here is reached — so
+    /// removing the padding turns this test red at that internal assertion
+    /// rather than at `empty_len == occupied_len`. The comparison earns its keep
+    /// in a release build, where the store's assertion is compiled out and this
+    /// is the only thing looking.
+    #[test]
+    fn the_on_disk_length_does_not_report_the_handshake_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let empty = label(0x67);
+        let occupied = label(0x68);
+        let floor = SendFloor::new(0, 0);
+        let opening = opening_record(&pseudonym(0x0D), &pseudonym(0x0E), floor);
+        let re_established = resume_record(1, floor);
+
+        p.commit_resume(&empty, &opening).expect("commits");
+        p.commit_resume(&occupied, &re_established)
+            .expect("commits");
+
+        let empty_len = std::fs::metadata(record_path(&p, &empty, "resume.bin"))
+            .expect("reads")
+            .len();
+        let occupied_len = std::fs::metadata(record_path(&p, &occupied, "resume.bin"))
+            .expect("reads")
+            .len();
+        assert_eq!(
+            empty_len, occupied_len,
+            "the file's size reports whether a re-establishment frame is stored"
+        );
+
+        assert_ne!(
+            opening.encode().len(),
+            re_established.encode().len(),
+            "the fixtures encode to one length, so the sizes above agree for the wrong reason"
         );
     }
     // ------------------------------------------------------------ the contact cache (ISC-C44)

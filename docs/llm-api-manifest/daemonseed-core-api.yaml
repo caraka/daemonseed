@@ -1402,16 +1402,26 @@ modules:
       storage::dm_store, and is what makes any of this reach a disk. DmPersist
       derives both the store key and the provisional record's key from one
       at_rest_key. restart_channel(label, ctx) -> StoredChannelRestart is
-      HandshakeResumes(PendingHandshake) or TornDown(Teardown), and asks through
-      the store's lock-free read so probing an unknown channel creates nothing.
+      Established(Box<ResumeRecord>), HandshakeResumes(PendingHandshake) or
+      TornDown(Teardown), and asks through the store's lock-free read so probing
+      an unknown channel creates nothing. The resume record is consulted first
+      (A4.8 read order): a present resume record is the authority, a provisional
+      record beside it is deleted best-effort, and a resume record that will not
+      read is TornDown(StoreUnreadable) rather than a fall-through to the
+      provisional record.
       PendingHandshake owns the record, lends eph_ek/address_root, and offers
-      three endings: ratchet() derives a Ratchet and leaves the record on disk,
+      five endings: ratchet() derives a Ratchet and leaves the record on disk,
       for the window between an initiator's knock and the acceptance that
       verifies its correspondent; commit() consumes the handshake and deletes
       the record; establish() is the pair, and builds the ratchet first so a
       failed delete returns an error rather than a ratchet, leaving the call a
-      safe retry. It is must_use: a resumed handshake that is neither committed
-      nor dropped leaves ss0 on disk. update_outbox(label, direction, now_ms, f) and
+      safe retry; commit_with_resume(&ResumeRecord) and
+      establish_with_resume(&ResumeRecord) -> Result<Ratchet, DmPersistError>
+      are commit() and establish() under the A4.8 write order — the resume
+      record is committed first and the erase that follows is best-effort, so a
+      refused resume write leaves the provisional record in place and a refused
+      erase does not withhold the ratchet. It is must_use: a resumed handshake
+      that is neither committed nor dropped leaves ss0 on disk. update_outbox(label, direction, now_ms, f) and
       advance_cursor(label, page, read_through) are read-modify-write inside one
       critical_section; there is no load-then-save pair to lose an update. f
       returns Mutation<T>, which is Changed(T) or Unchanged(T) and is must_use;
@@ -1426,15 +1436,21 @@ modules:
       entry has been queued. Debug builds panic when an Unchanged report follows
       a change to the outbox. A stored record is re-encoded to the current
       format and write suite on any write.
-      commit_resume(&CorrespondenceLabel, &ResumeRecord) -> Result<Vec<u8>,
+      commit_resume(&CorrespondenceLabel, &ResumeRecord) -> Result<Option<Vec<u8>>,
       DmPersistError> writes the resume record inside one critical section and
       returns its sealed RE-EST bytes, so the frame is unreachable without a
-      completed write; it refuses with DmPersistError::Resume(
+      completed write; Ok(None) is a record whose handshake slot is empty, which
+      has nothing to emit. It refuses with DmPersistError::Resume(
       ResumeError::FloorWouldRollBack) when the stored send floor is ahead of
       the offered one, ResumeError::AttemptWouldRollBack { stored, offered } on
       an attempt regression, and ResumeError::AttemptResealed { attempt } when a
-      persisted attempt is offered with different sealed bytes; it writes nothing
-      in any of those cases. A stored record that will not decode makes every
+      persisted attempt is offered with different sealed bytes,
+      ResumeError::EmptySlotWouldReplaceAttempt { stored } when a record with an
+      empty handshake slot is offered against a stored attempt, and
+      ResumeError::PseudonymPairChanged when the offered s_pc or pk_pc differs
+      from the stored one — the pair is fixed for the life of a correspondence,
+      and on two empty slots it is the only guard that discriminates them; it
+      writes nothing in any of those cases. A stored record that will not decode makes every
       further commit for that correspondence fail, which is the fail-closed
       direction. read_resume(
       &CorrespondenceLabel) -> Result<Option<ResumeRecord>, DmPersistError>
@@ -1641,11 +1657,14 @@ modules:
       transport that emits from an outbox (#235 transport half).
       Sub-module dm::resume is the A9.2 re-establishment resume record.
       ResumeRecord::new(s_pc: Box<[u8; ml_dsa::SK_LEN]>, pk_pc: Box<[u8;
-      ml_dsa::PK_LEN]>, committed_root: CommittedRoot, sealed: SealedReEst,
-      send_floor: SendFloor, window_anchor_ms: i64, toward_c: u32) ->
+      ml_dsa::PK_LEN]>, committed_root: CommittedRoot, sealed:
+      Option<SealedReEst>, send_floor: SendFloor, window_anchor_ms: i64,
+      toward_c: u32) ->
       ResumeRecord takes every field at once; there is no builder and no field
       setter, and it is infallible because SealedReEst carries the frame-length
-      invariant. Attempt is a u32 newtype ordered numerically: Attempt::FIRST,
+      invariant. sealed is None for the empty handshake slot, which is what a
+      record written at first establishment carries; at rest it is attempt 0 and
+      a zero-length frame, and None orders below every Attempt. Attempt is a u32 newtype ordered numerically: Attempt::FIRST,
       get() -> u32, advance() -> Option<FreshAttempt> yielding the successor and
       None at u32::MAX. FreshAttempt is the authority to seal a fresh RE-EST,
       minted only by FreshAttempt::first() and Attempt::advance(), and is
@@ -1660,8 +1679,9 @@ modules:
       it. DmPersist::commit_resume is the enforcement point in all cases.
       Accessors s_pc/pk_pc/
       committed_root/attempt/send_floor/window_anchor_ms/toward_c/sealed/
-      sealed_re_est borrow; sealed_re_est returns the same bytes every call and
-      attempt() returns Attempt. s_pc and committed_root zero on drop and Debug
+      sealed_re_est borrow; sealed_re_est returns the same bytes every call.
+      attempt() -> Option<Attempt>, sealed() -> Option<&SealedReEst> and
+      sealed_re_est() -> Option<&[u8]> are None on an empty handshake slot. s_pc and committed_root zero on drop and Debug
       renders both redacted. CommittedRoot::from_bytes([u8;
       ROOT_KEY_LEN]) is a redacted secret newtype distinct from
       ratchet::RootKey. SendFloor::new(generation: u32, seq: u64) orders
@@ -1677,7 +1697,12 @@ modules:
       suite id, plaintext; storage::dm_store seals and pads it. decode takes no
       clock: no stored value here drives a terminal transition. It rejects a
       wrong magic, a truncation, a frame length above MAX_FRAME_LEN checked
-      before any allocation, a sentinel or unknown suite id, and trailing bytes.
+      before any allocation, a sentinel or unknown suite id, trailing bytes, and
+      ResumeError::EmptySlotHasFrame { len } for attempt 0 beside a non-empty
+      frame and ResumeError::OccupiedSlotHasNoFrame { attempt } for a real
+      attempt beside a zero-length one. Neither is reachable from encode, which
+      derives both halves from one Option; they guard decode against another
+      encoder.
       MAX_ENCODED_LEN is the computed worst case and bounds
       dm_store::RESUME_CAPACITY. The record carries no receive-side peer
       high-water; that stays ratchet-resident.

@@ -657,17 +657,17 @@ struct Introduction {
 ///
 /// **This state does not survive a restart, and that is a real gap rather than
 /// an oversight.** The design homes our own `S_pc` and the correspondent's
-/// `PK_pc` in the resume record (A4.8 / A9.2), and
-/// [`ResumeRecord::new`](daemonseed_core::dm::resume::ResumeRecord::new)
-/// cannot be written at first establishment: it requires a
-/// [`SealedReEst`](daemonseed_core::dm::resume::SealedReEst), which is a sealed
-/// re-establishment frame and therefore does not exist until the channel has
-/// actually re-established once. So a correspondence established in this
-/// process can be signed and verified for as long as this process lives, and a
-/// restart before the first re-establishment loses the pseudonym pair with no
-/// path back — the correspondence is on disk, and nothing can speak on it.
-/// Closing that needs a way to commit the pair at establishment, which is a
-/// change to what the resume record requires and not a wiring one.
+/// `PK_pc` in the resume record (A4.8 / A9.2), and the store writes one at
+/// first establishment —
+/// [`PendingHandshake::establish_with_resume`](daemonseed_core::dm::persist::PendingHandshake::establish_with_resume)
+/// commits the pair and then erases the provisional record. This driver does
+/// not call it: it establishes through
+/// [`PendingHandshake::commit`](daemonseed_core::dm::persist::PendingHandshake::commit)
+/// and builds no [`ResumeRecord`](daemonseed_core::dm::resume::ResumeRecord),
+/// so a correspondence established in this process can be signed and verified
+/// for as long as this process lives, and a restart loses the pseudonym pair —
+/// the correspondence is on disk, and nothing can speak on it. Closing it is a
+/// wiring change in this driver.
 struct Correspondence {
     /// The correspondent's long-term identity key.
     pk_lt: PkLt,
@@ -704,9 +704,8 @@ struct Correspondence {
     /// arrives and the next sweep retries it.
     ///
     /// **Still in-memory only.** The at-rest home for the pseudonym pair is the
-    /// resume record (A4.8 / A9.2), which cannot be written before the channel
-    /// has re-established once, so a restart loses this exactly as it loses the
-    /// ratchet — one event, not two.
+    /// resume record (A4.8 / A9.2), and this driver writes none, so a restart
+    /// loses this exactly as it loses the ratchet — one event, not two.
     peer_pk_pc: Option<Box<[u8; IDENTITY_PK_LEN]>>,
     /// The conversation's address root and channel id, derived from `ss0` at
     /// establishment. `None` alongside a `None` ratchet, and for the same
@@ -4055,6 +4054,19 @@ impl DmMachine {
                     return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
                 }
             },
+            // The label was minted for this introduction, so a resume record
+            // under it is a correspondence that already exists — not the
+            // handshake just written. Refused rather than resumed: this path
+            // opens a ratchet from a fresh `ss0`, which would collide with the
+            // established channel's sequence space.
+            //
+            // **No trust event.** Nothing was torn down here — the channel is
+            // alive and this introduction is what is refused — so there is no
+            // teardown whose key ISC-A-C12 would owe an audit entry for.
+            StoredChannelRestart::Established(_) => {
+                crate::vtrace!("dm driver: the label just minted is already established");
+                return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
+            }
             // **The refusal carries the teardown's classed key.** The channel
             // this introduction was opening is gone, ISC-A-C12 owes that an
             // audit entry, and the refusal is the only event a front end sees
@@ -4552,6 +4564,17 @@ fn erase_record(
         fc_epoch,
     };
     match persist.restart_channel(label, &ctx) {
+        // A resume record is the authority, and the loader erases a provisional
+        // record left beside it — so the erase this call exists to perform has
+        // already been attempted. It is best-effort there, so the answer comes
+        // from the store rather than from the arm.
+        StoredChannelRestart::Established(_) => matches!(
+            persist.store().read_unlocked(
+                label,
+                daemonseed_core::storage::dm_store::RecordKind::Provisional,
+            ),
+            Ok(None)
+        ),
         StoredChannelRestart::HandshakeResumes(pending) => match pending.commit() {
             Ok(()) => true,
             Err(e) => {

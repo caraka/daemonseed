@@ -149,10 +149,15 @@
 //!
 //! ⚠️ **The "rewriting outbox and resume" half is not established.**
 //! [`crate::dm::persist::DmPersist::commit_resume`] has **zero production
-//! callers** — every call in the tree is a test — so nothing yet shows that an
-//! emission touches the resume record. If it does not, the costs are 3 and 17
-//! rather than 4 and 32. The figures above take the higher reading deliberately,
-//! so the driver cannot make this analysis optimistic by arriving.
+//! callers** — every call in the tree is a test, and so is every call of the
+//! first-establishment entry points
+//! [`PendingHandshake::establish_with_resume`](crate::dm::persist::PendingHandshake::establish_with_resume)
+//! and
+//! [`commit_with_resume`](crate::dm::persist::PendingHandshake::commit_with_resume)
+//! that reach it — so nothing yet shows that an emission touches the resume
+//! record. If it does not, the costs are 3 and 17 rather than 4 and 32. The
+//! figures above take the higher reading deliberately, so the driver cannot make
+//! this analysis optimistic by arriving.
 //!
 //! Not counted: `RecordKind::Provisional` writes (per-correspondence, first
 //! contact only), and the per-message accounting over-counts because one

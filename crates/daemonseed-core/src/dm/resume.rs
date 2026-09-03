@@ -128,6 +128,54 @@ pub enum ResumeError {
     /// the permanent `UnknownEphemeral` divergence
     /// ([`crate::dm::ratchet`]) A9.1 exists to forbid.
     AttemptResealed { attempt: u32 },
+    /// A record whose handshake slot is **empty** offered against a stored one
+    /// carrying a real attempt.
+    ///
+    /// The empty slot is what first establishment writes, so this is a first
+    /// establishment arriving after a re-establishment has been persisted. It is
+    /// [`Self::AttemptWouldRollBack`]'s case for the slot that has no number —
+    /// separate rather than reported as `offered: 0`, because no [`Attempt`] is
+    /// ever `0` and a log line saying so names a value that cannot exist.
+    EmptySlotWouldReplaceAttempt { stored: u32 },
+    /// A record offering a different `s_pc` or `pk_pc` than the stored one.
+    ///
+    /// **The pseudonym pair is fixed for the life of a correspondence.** It is
+    /// at-rest-only and not mnemonic-derivable (§ Keys), so the stored copy is
+    /// the only one there is: replacing it discards the key every frame already
+    /// sent was signed under and the key every frame received is verified
+    /// against, leaving a correspondence that is on disk and cannot speak. A
+    /// different pair means a different correspondence, which needs a different
+    /// label rather than this record.
+    ///
+    /// Neither key is reported. `s_pc` is a signing key, and `pk_pc` would name
+    /// the correspondent in a log line.
+    PseudonymPairChanged,
+    /// At-rest bytes spelling attempt `0` — the empty handshake slot — beside a
+    /// non-empty sealed frame.
+    ///
+    /// The two halves contradict each other: [`Attempt::FIRST`] is `1`, so `0`
+    /// is reachable at rest only as the empty slot, and an empty slot has no
+    /// frame. Refused rather than repaired, because either half could be the
+    /// true one and nothing here can say which.
+    ///
+    /// **[`ResumeRecord::encode`] cannot produce these bytes** — it derives both
+    /// halves from one `Option` — so no round-trip test reaches this arm, and
+    /// neither does a tampered file, which fails the store's seal before any of
+    /// it arrives here. The path that does reach it is a caller handing
+    /// [`ResumeRecord::decode`] a hand-written buffer, which is what a record
+    /// from another encoder is, and
+    /// `the_decoder_refuses_a_slot_that_contradicts_itself` takes it.
+    EmptySlotHasFrame { len: usize },
+    /// The mirror: at-rest bytes spelling a real attempt beside a **zero-length**
+    /// frame.
+    ///
+    /// A [`SealedReEst`] is a sealed frame bound to its attempt, so an attempt
+    /// with no frame is the same contradiction the other way round, and letting
+    /// it through would build the one value
+    /// [`ResumeRecord::sealed_re_est`] says cannot exist — a `Some` carrying
+    /// nothing, which a re-emit would send as an empty frame. Reached the same
+    /// way, by the same test.
+    OccupiedSlotHasNoFrame { attempt: u32 },
 }
 
 impl std::fmt::Display for ResumeError {
@@ -152,6 +200,21 @@ impl std::fmt::Display for ResumeError {
             Self::AttemptResealed { attempt } => write!(
                 f,
                 "attempt {attempt} is already persisted under different sealed bytes"
+            ),
+            Self::EmptySlotHasFrame { len } => write!(
+                f,
+                "an empty handshake slot carries {len} bytes of sealed frame"
+            ),
+            Self::OccupiedSlotHasNoFrame { attempt } => {
+                write!(f, "attempt {attempt} carries no sealed frame")
+            }
+            Self::EmptySlotWouldReplaceAttempt { stored } => write!(
+                f,
+                "a record with no re-establishment is behind the stored attempt {stored}"
+            ),
+            Self::PseudonymPairChanged => write!(
+                f,
+                "the correspondence's pseudonym keypair may not change once stored"
             ),
             Self::FloorWouldRollBack { stored, offered } => write!(
                 f,
@@ -538,6 +601,15 @@ pub struct ResumeRecord {
     /// bound together rather than as fields a caller could pair wrongly. See
     /// [`SealedReEst`] for the construction rule that enforces it.
     ///
+    /// **`None` is the handshake slot standing empty** rather than a missing
+    /// field: a correspondence that has established and not yet
+    /// re-established has a resume record and no re-establishment frame, and
+    /// [`SealedReEst::seal`] cannot mint a stand-in for one because it consumes
+    /// a [`FreshAttempt`] — spending attempt 1 on a frame that was never
+    /// emitted, which `AttemptResealed` then refuses when the real first
+    /// re-establishment arrives. At rest the slot is attempt `0` and a
+    /// zero-length frame; [`Attempt::FIRST`] is `1`, so the spelling is free.
+    ///
     /// The bytes are load-bearing in this blob (A9.2): ML-KEM encapsulation is
     /// randomized and `ss → eph_ct` is not invertible, so A9.1(a)'s
     /// byte-identical re-emit cannot be rebuilt from the key inputs. Recovery
@@ -546,7 +618,7 @@ pub struct ResumeRecord {
     /// `zeroize(skip)` matches what the two fields it replaces both carried: an
     /// attempt counter and a sealed frame are neither of them secrets.
     #[zeroize(skip)]
-    sealed: SealedReEst,
+    sealed: Option<SealedReEst>,
     /// The durable send-side floor. See [`SendFloor`].
     #[zeroize(skip)]
     send_floor: SendFloor,
@@ -590,11 +662,16 @@ impl ResumeRecord {
     /// there is nothing left here to refuse. The attempt arrives inside the same
     /// value for the reason [`SealedReEst`] gives: the pairing is fixed at
     /// sealing time and this call cannot restate it.
+    ///
+    /// **`sealed` is `None` at first establishment.** The keys, the committed
+    /// root and the floor are known the moment a correspondence exists; a sealed
+    /// re-establishment frame is not, and there is nothing legitimate to put in
+    /// its place. See the field's own note.
     pub fn new(
         s_pc: Box<[u8; ml_dsa::SK_LEN]>,
         pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
         committed_root: CommittedRoot,
-        sealed: SealedReEst,
+        sealed: Option<SealedReEst>,
         send_floor: SendFloor,
         window_anchor_ms: i64,
         toward_c: u32,
@@ -641,9 +718,17 @@ impl ResumeRecord {
         &self.committed_root
     }
 
-    /// Which attempt this record describes.
-    pub fn attempt(&self) -> Attempt {
-        self.sealed.attempt()
+    /// Which attempt this record describes, or `None` while the handshake slot
+    /// stands empty.
+    ///
+    /// **`None` orders below every [`Attempt`]**, which is what the anti-rollback
+    /// comparison in
+    /// [`commit_resume`](crate::dm::persist::DmPersist::commit_resume) needs and
+    /// gets for free from `Option`'s derived ordering: a record with no
+    /// re-establishment yet may be replaced by one carrying
+    /// [`Attempt::FIRST`], and never the other way round.
+    pub fn attempt(&self) -> Option<Attempt> {
+        self.sealed.as_ref().map(SealedReEst::attempt)
     }
 
     /// The sealed frame bound to its attempt — what a re-emit sends.
@@ -651,8 +736,8 @@ impl ResumeRecord {
     /// A re-emit path wants *this*, not the loose bytes: it carries the attempt
     /// the peer will dedup on (A9.4) alongside the frame, and there is no
     /// constructor on it that would re-seal either.
-    pub fn sealed(&self) -> &SealedReEst {
-        &self.sealed
+    pub fn sealed(&self) -> Option<&SealedReEst> {
+        self.sealed.as_ref()
     }
 
     /// The durable send-side floor.
@@ -676,8 +761,12 @@ impl ResumeRecord {
     /// Retained beside [`Self::sealed`] for the callers that genuinely want only
     /// the bytes — the store's encode path and the persist layer's
     /// byte-comparison guard.
-    pub fn sealed_re_est(&self) -> &[u8] {
-        self.sealed.bytes()
+    ///
+    /// `None` while the handshake slot stands empty, and deliberately not an
+    /// empty slice: a caller that emits what this returns must have nothing to
+    /// emit in that state, and an empty slice is a frame of length zero.
+    pub fn sealed_re_est(&self) -> Option<&[u8]> {
+        self.sealed.as_ref().map(SealedReEst::bytes)
     }
 
     /// The at-rest form, plaintext. `dm_store` seals it.
@@ -697,19 +786,26 @@ impl ResumeRecord {
     /// [`crate::dm::outbox`] does it, and it loses nothing because the field
     /// describes the writer rather than the payload.
     pub fn encode(&self) -> Zeroizing<Vec<u8>> {
-        let mut out = Zeroizing::new(Vec::with_capacity(FIXED_LEN + self.sealed.bytes().len()));
+        // The empty slot: attempt `0`, which `Attempt::FIRST` leaves free, and a
+        // zero-length frame. Both halves come from one `Option`, so the two
+        // spellings that disagree — an attempt with no frame, a frame with no
+        // attempt — have no expression here; `decode` refuses them on the way
+        // back in, for bytes this encoder did not write.
+        let attempt = self.attempt().map_or(0, Attempt::get);
+        let frame = self.sealed_re_est().unwrap_or(&[]);
+        let mut out = Zeroizing::new(Vec::with_capacity(FIXED_LEN + frame.len()));
         out.extend_from_slice(RESUME_MAGIC);
         out.extend_from_slice(&Registry::default_write_suite().get().to_be_bytes());
         out.extend_from_slice(self.s_pc.as_ref());
         out.extend_from_slice(self.pk_pc.as_ref());
         out.extend_from_slice(self.committed_root.as_bytes());
-        out.extend_from_slice(&self.sealed.attempt().get().to_be_bytes());
+        out.extend_from_slice(&attempt.to_be_bytes());
         out.extend_from_slice(&self.send_floor.generation.to_be_bytes());
         out.extend_from_slice(&self.send_floor.seq.to_be_bytes());
         out.extend_from_slice(&self.window_anchor_ms.to_be_bytes());
         out.extend_from_slice(&self.toward_c.to_be_bytes());
-        out.extend_from_slice(&(self.sealed.bytes().len() as u64).to_be_bytes());
-        out.extend_from_slice(self.sealed.bytes());
+        out.extend_from_slice(&(frame.len() as u64).to_be_bytes());
+        out.extend_from_slice(frame);
         out
     }
 
@@ -771,7 +867,22 @@ impl ResumeRecord {
         // The at-rest form is the one place an attempt and a frame are paired
         // from separate bytes rather than at sealing time — which is why
         // `from_stored` is private to this module and this is its only caller.
-        let sealed = SealedReEst::from_stored(Attempt(attempt), sealed_re_est)?;
+        //
+        // Attempt `0` is the empty slot, and `Attempt(0)` is therefore never
+        // constructed: below `Attempt::FIRST`, it would order beneath a real
+        // attempt while claiming to be one.
+        let sealed = match attempt {
+            0 if !sealed_re_est.is_empty() => {
+                return Err(ResumeError::EmptySlotHasFrame {
+                    len: sealed_re_est.len(),
+                });
+            }
+            0 => None,
+            n if sealed_re_est.is_empty() => {
+                return Err(ResumeError::OccupiedSlotHasNoFrame { attempt: n });
+            }
+            n => Some(SealedReEst::from_stored(Attempt(n), sealed_re_est)?),
+        };
         Ok(Self {
             s_pc,
             pk_pc,
@@ -858,13 +969,30 @@ mod tests {
         token
     }
 
+    /// The fixture's occupied handshake slot, so a test asserting on the frame
+    /// says which state it assumes rather than unwrapping in the assertion.
+    fn frame_of(record: &ResumeRecord) -> &[u8] {
+        record
+            .sealed_re_est()
+            .expect("the fixture's handshake slot is occupied")
+    }
+
+    /// As [`frame_of`], for the attempt.
+    fn attempt_of(record: &ResumeRecord) -> Attempt {
+        record
+            .attempt()
+            .expect("the fixture's handshake slot is occupied")
+    }
+
     fn populated() -> ResumeRecord {
         ResumeRecord::new(
             s_pc(0x11),
             pk_pc(0x22),
             root(0x33),
-            SealedReEst::seal(fresh(7), pattern(0x44, 512).into_boxed_slice())
-                .expect("the fixture is within MAX_FRAME_LEN"),
+            Some(
+                SealedReEst::seal(fresh(7), pattern(0x44, 512).into_boxed_slice())
+                    .expect("the fixture is within MAX_FRAME_LEN"),
+            ),
             SendFloor::new(4, 100),
             ANCHOR,
             3,
@@ -897,11 +1025,11 @@ mod tests {
         // hollow this test by making two of them equal. The earlier guard
         // covered three pairs and left the rest distinct only by accident.
         let scalars: [(&str, u64); 5] = [
-            ("attempt", u64::from(before.attempt().get())),
+            ("attempt", u64::from(attempt_of(&before).get())),
             ("generation", u64::from(before.send_floor().generation())),
             ("seq", before.send_floor().seq()),
             ("toward_c", u64::from(before.toward_c())),
-            ("frame_len", before.sealed_re_est().len() as u64),
+            ("frame_len", frame_of(&before).len() as u64),
         ];
         for (i, (na, a)) in scalars.iter().enumerate() {
             for (nb, b) in &scalars[i + 1..] {
@@ -928,15 +1056,66 @@ mod tests {
             + 8 /* window_anchor_ms */
             + 4 /* toward_c */
             + 8 /* frame length prefix */
-            + record.sealed_re_est().len();
+            + frame_of(&record).len();
         assert_eq!(
             encoded.len(),
             named,
             "a field is present that nothing names"
         );
-        assert_eq!(encoded.len(), FIXED_LEN + record.sealed_re_est().len());
+        assert_eq!(encoded.len(), FIXED_LEN + frame_of(&record).len());
     }
 
+    /// A record's plaintext, assembled by hand so the two contradictory slot
+    /// spellings can be written down at all.
+    ///
+    /// [`ResumeRecord::encode`] reads both halves from one `Option`, so neither
+    /// spelling has an expression there; this is the second opinion the layout
+    /// test uses, reused to reach the decoder's own guards.
+    fn assembled(attempt: u32, frame: &[u8]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(RESUME_MAGIC);
+        out.extend_from_slice(&crate::crypto::suite::CNSA_2_0.id.get().to_be_bytes());
+        out.extend_from_slice(&pattern(0x11, ml_dsa::SK_LEN));
+        out.extend_from_slice(&pattern(0x22, ml_dsa::PK_LEN));
+        out.extend_from_slice(&pattern(0x33, ROOT_KEY_LEN));
+        out.extend_from_slice(&attempt.to_be_bytes());
+        out.extend_from_slice(&4u32.to_be_bytes());
+        out.extend_from_slice(&100u64.to_be_bytes());
+        out.extend_from_slice(&ANCHOR.to_be_bytes());
+        out.extend_from_slice(&3u32.to_be_bytes());
+        out.extend_from_slice(&(frame.len() as u64).to_be_bytes());
+        out.extend_from_slice(frame);
+        out
+    }
+
+    /// **Both spellings in which the attempt and the frame contradict each other
+    /// are refused**, and the two that agree still decode.
+    ///
+    /// The pair that agrees is the positive control: without it a decoder that
+    /// refused every record would pass this test. Neither refusal is reachable
+    /// from this build's encoder — it derives both halves from one `Option`, and
+    /// the store seals the record so an altered file fails to open first — so
+    /// handing `decode` a buffer is the only path to them, and it is the path
+    /// a record written by some other encoder would take.
+    #[test]
+    fn the_decoder_refuses_a_slot_that_contradicts_itself() {
+        assert_eq!(
+            ResumeRecord::decode(&assembled(0, &pattern(0x44, 64))).err(),
+            Some(ResumeError::EmptySlotHasFrame { len: 64 }),
+            "an empty slot carrying a frame decoded"
+        );
+        assert_eq!(
+            ResumeRecord::decode(&assembled(7, &[])).err(),
+            Some(ResumeError::OccupiedSlotHasNoFrame { attempt: 7 }),
+            "an attempt carrying no frame decoded"
+        );
+
+        let empty = ResumeRecord::decode(&assembled(0, &[])).expect("the empty slot is legal");
+        assert!(empty.attempt().is_none());
+        let occupied =
+            ResumeRecord::decode(&assembled(7, &pattern(0x44, 64))).expect("an attempt is legal");
+        assert_eq!(occupied.attempt().map(Attempt::get), Some(7));
+    }
     /// **The at-rest layout is pinned against an independently assembled
     /// buffer**, so a record written by an older build still decodes here.
     ///
@@ -1020,11 +1199,14 @@ mod tests {
     #[test]
     fn the_bound_frame_and_the_loose_bytes_agree() {
         let record = populated();
-        assert_eq!(record.sealed().attempt(), record.attempt());
-        assert_eq!(record.sealed().bytes(), record.sealed_re_est());
+        let sealed = record
+            .sealed()
+            .expect("the fixture's handshake slot is occupied");
+        assert_eq!(Some(sealed.attempt()), record.attempt());
+        assert_eq!(Some(sealed.bytes()), record.sealed_re_est());
         // Non-degenerate: the fixture's frame is neither empty nor uniform with
         // anything else asserted here.
-        assert_eq!(record.sealed().bytes().len(), 512);
+        assert_eq!(sealed.bytes().len(), 512);
     }
 
     /// A9.2's lexicographic rule, in the direction that matters: a generation
@@ -1136,11 +1318,13 @@ mod tests {
             s_pc(0x11),
             pk_pc(0x22),
             root(0x33),
-            SealedReEst::seal(
-                FreshAttempt::first(),
-                pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
-            )
-            .expect("a frame of exactly MAX_FRAME_LEN is allowed"),
+            Some(
+                SealedReEst::seal(
+                    FreshAttempt::first(),
+                    pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
+                )
+                .expect("a frame of exactly MAX_FRAME_LEN is allowed"),
+            ),
             SendFloor::new(0, 0),
             ANCHOR,
             0,

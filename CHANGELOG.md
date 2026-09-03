@@ -383,6 +383,12 @@ work lives in the maintainer's own planning notes, not here.
   outboxes at `DeliveryState::ConfirmedCollected`. Proof of work minted and verified at
   `PowDifficulty::PRODUCTION`. (#235, #236)
 
+- `daemonseed_core::dm::persist::PendingHandshake::establish_with_resume` and
+  `commit_with_resume` take a `&ResumeRecord`, commit it, and then erase the provisional record
+  best-effort. `StoredChannelRestart::Established(Box<ResumeRecord>)` is a third restart outcome:
+  a stored resume record is the authority, and a provisional record beside it is ignored and
+  deleted. (#401)
+
 ### Fixed
 
 - The terminal client shows a direct-message channel torn down for want of a stored handshake
@@ -579,6 +585,15 @@ work lives in the maintainer's own planning notes, not here.
   for the life of the driver and not persisted.
   `daemonseed_core::dm::keyrec::KeyRecordCache::accept_encoded` decodes and admits raw fetched
   bytes in one step.
+- `daemonseed_core::dm::resume::ResumeRecord::new` takes `sealed: Option<SealedReEst>`, and
+  `attempt`, `sealed` and `sealed_re_est` return `Option`. `None` is the empty handshake slot,
+  encoded at rest as attempt `0` with a zero-length frame and ordering below every `Attempt`;
+  attempt `0` beside a non-empty frame is `ResumeError::EmptySlotHasFrame { len }`.
+  `DmPersist::commit_resume` returns `Result<Option<Vec<u8>>, DmPersistError>`, `None` where the
+  slot is empty, and refuses `ResumeError::PseudonymPairChanged` when a write would change the
+  stored `s_pc` or `pk_pc`, `ResumeError::EmptySlotWouldReplaceAttempt { stored }` when an empty
+  slot is offered against a persisted attempt, and — at decode —
+  `ResumeError::OccupiedSlotHasNoFrame { attempt }` beside `EmptySlotHasFrame { len }`. (#401)
 
 - `daemonseed_tui::net::NetCommand` derives `Debug` only and `daemonseed_tui::net::NetEvent`
   derives `Debug` and `Clone` only: `DmCommand` is not `Clone` and `DmEvent` has no equality.

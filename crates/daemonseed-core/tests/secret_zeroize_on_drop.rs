@@ -1095,8 +1095,10 @@ fn resume_record() -> ResumeRecord {
         Box::new([0xA7; ML_DSA_SK_LEN]),
         Box::new([0xB3; PK_LEN]),
         CommittedRoot::from_bytes([0xC5; ROOT_KEY_LEN]),
-        SealedReEst::seal(FreshAttempt::first(), vec![0xD1; 64].into_boxed_slice())
-            .expect("a 64-byte frame is inside MAX_FRAME_LEN"),
+        Some(
+            SealedReEst::seal(FreshAttempt::first(), vec![0xD1; 64].into_boxed_slice())
+                .expect("a 64-byte frame is inside MAX_FRAME_LEN"),
+        ),
         SendFloor::new(7, 11),
         1_700_000_000_000,
         3,

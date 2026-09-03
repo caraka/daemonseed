@@ -831,7 +831,15 @@ route taken to reach a decision are not recorded here — the git history and `C
   and that record cannot be written at first establishment because it requires a sealed
   re-establishment frame that exists only after the channel has re-established once. Persisting them
   elsewhere would invent a second at-rest home the design does not name. The cost is stated as a
-  limit: a correspondence established in this process does not survive a restart.
+  limit: a correspondence established in this process does not survive a restart. (Amended
+  2026-09-03: the premise is no longer true. The resume record's handshake slot is
+  `Option<SealedReEst>`, `None` at first establishment — the handshake slot standing empty, spelled
+  at rest as attempt `0` — so the record can be written the moment a
+  correspondence exists, and `PendingHandshake::establish_with_resume` / `commit_with_resume` write
+  it under A4.8's order. The *conclusion* stands unchanged and for a different reason: the driver
+  does not call them, so the pair is still in-memory only and a correspondence established in this
+  process still does not survive a restart. What remains is wiring, not a change to what the record
+  requires. See Decisions.)
 
 - **A first contact to an identity already corresponded with is refused before anything reaches the
   network; a repeat request whose outbox direction cannot be determined is reported and never acted
@@ -1149,3 +1157,26 @@ and settles nothing else in its text.
 **Anti-criteria are verified by negative fixtures**, each of which must be shown to fail before its
 guard lands: replay, clock skew, counter rollback, handle mismatch, forged provenance, a forged share
 identifier on both the announce and withdraw paths, and an outsider key against a room seal.
+
+**The resume record is writable at first establishment, and nothing in production writes one.**
+`PendingHandshake::establish_with_resume` and `commit_with_resume` implement the create-then-erase
+order, and `restart_channel` consults the resume record first, answering
+`StoredChannelRestart::Established`. Every entry point is reached only from tests: `commit_resume`,
+`establish_with_resume` and `commit_with_resume` have no non-test caller, so the driver still
+establishes by the older path and a correspondence created in one process does not survive into the
+next. What the tests do settle: the pseudonym pair recovered after a store is dropped and reopened
+signs and verifies real frames, with a crossed-key control; the create-then-erase order holds when
+the resume write is refused; an empty handshake slot round-trips, admits a first attempt, cannot
+replace a persisted one, and leaves the send-floor guard unchanged; and a record's on-disk length
+does not report whether the slot is occupied.
+
+**`commit_resume` refuses a changed pseudonym pair**, because two records whose slots are both empty
+are otherwise indistinguishable to every other guard — the rollback and reseal comparisons both
+degenerate — and a second write would leave a correspondence signing under a key its correspondent
+never saw. An identical pair is still admitted so a send-floor advance can rewrite the record.
+
+**A resume record whose plaintext will not decode is reported as an unreadable store**, which is the
+outcome whose contract is that nothing is lost and the caller may retry. That contract fits a
+transient store fault and not a decode failure, which is permanent: every restart retries a record
+that will never read, and the user is never told to re-establish. The honest variant cannot carry a
+decode error, so the collapse is forced by the type rather than chosen.
