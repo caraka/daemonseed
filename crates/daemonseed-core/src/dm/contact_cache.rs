@@ -37,7 +37,7 @@
 //! substitution costs nothing at the call sites and removes the retention. It
 //! also removes an internal-consistency question rather than creating one: with
 //! `ss0` gone there is no second stored fact for the root to disagree with, and
-//! [`derive_channel_roots`] runs once at the caller, before the record exists.
+//! [`crate::dm::firstcontact::derive_channel_roots`] runs once at the caller, before the record exists.
 //!
 //! **`ss0` is still what a caller holds when it builds one.** The caller derives
 //! the root, hands it over, and lets its own `ss0` destroy itself; the record
@@ -49,7 +49,7 @@
 //! `chan_id` is deliberately not exposed beside it: § v4's minor invariant says
 //! it must never be serialized anywhere, and handing it out alongside a record's
 //! other outputs invites a caller to persist it with them. A caller that
-//! genuinely needs it reaches [`derive_channel_roots`] directly and keeps it in
+//! genuinely needs it reaches [`crate::dm::firstcontact::derive_channel_roots`] directly and keeps it in
 //! memory.
 //!
 //! ## The record is encoded here and sealed by the store
@@ -130,12 +130,8 @@ const TIMESTAMP_LEN: usize = 8;
 /// [`RecordKind::ContactCache`](crate::storage::dm_store::RecordKind::ContactCache)
 /// takes it verbatim as its capacity.
 ///
-/// **The number was unchanged by the move from `ss0` to `AR`**, because the
-/// two lengths happened to be equal — 32 each — so the store's bucket for this
-/// kind did not move and no file already on disk was invalidated. That was a
-/// coincidence of two independent constants and is recorded here as history,
-/// not relied on: only [`ROOT_LEN`] participates in this length now, and if it
-/// moves, the bucket moves with it and — per
+/// **Only [`ROOT_LEN`] participates in this length**, so if it moves, the
+/// store's bucket for this kind moves with it and — per
 /// [`CONTACT_RECORD_VERSION`]'s docs — that is a format break rather than a
 /// version negotiation.
 pub const CONTACT_RECORD_LEN: usize = 1 + 2 * ml_dsa::PK_LEN + ROOT_LEN + 2 * TIMESTAMP_LEN;
@@ -260,7 +256,7 @@ impl ContactRecord {
     /// [`ContactCacheError::PlaceholderAddressRoot`].
     ///
     /// **Takes `AR`, never `ss0`.** The caller derives the root with
-    /// [`derive_channel_roots`] and keeps `ss0` to itself; this type must not
+    /// [`crate::dm::firstcontact::derive_channel_roots`] and keeps `ss0` to itself; this type must not
     /// retain it (§ D-PFS, and the module docs above). A constructor taking
     /// `ss0` and deriving internally would read as tidier and would put the one
     /// value that reconstructs every deleted message key into the frame of every
@@ -358,15 +354,13 @@ impl ContactRecord {
     /// once, by the caller that built the record, from an `ss0` neither of them
     /// keeps.
     ///
-    /// **Infallible, where the `ss0`-deriving version was not.** There is no
-    /// derivation left to fail, so callers no longer carry a
-    /// [`FirstContactError`](crate::dm::firstcontact::FirstContactError) arm for
-    /// a case that could not arise.
+    /// **Infallible**: there is no derivation to fail, so no caller carries an
+    /// error arm for a case that cannot arise.
     ///
-    /// **`chan_id` is not available here at all**, which is stronger than the
-    /// deliberate omission it replaces. It must never be serialized anywhere
-    /// (§ v4 minor invariant), and a record without `ss0` cannot derive it: a
-    /// caller that genuinely needs it reaches [`derive_channel_roots`] with the
+    /// **`chan_id` is not available here at all.** It must never be serialized
+    /// anywhere (§ v4 minor invariant), and a record without `ss0` cannot
+    /// derive it: a
+    /// caller that genuinely needs it reaches [`crate::dm::firstcontact::derive_channel_roots`] with the
     /// secret it holds, and keeps the result in memory only.
     pub fn address_root(&self) -> [u8; ROOT_LEN] {
         *self.ar
@@ -568,7 +562,7 @@ mod tests {
 
     /// The fixture's address root, derived the way a caller derives it.
     ///
-    /// **It initialises the crypto module**, because [`derive_channel_roots`]
+    /// **It initialises the crypto module**, because [`crate::dm::firstcontact::derive_channel_roots`]
     /// runs a real derivation and the module is process-global. Without this the
     /// module's tests pass only when some *other* test happened to initialise it
     /// first — green under the whole suite, failing when run alone, which is the

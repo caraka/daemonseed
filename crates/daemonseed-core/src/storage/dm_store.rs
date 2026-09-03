@@ -439,7 +439,7 @@ pub enum RecordKind {
     /// ([`crate::dm::contact_cache::ContactRecord`]) — their long-term and
     /// pseudonym public keys, the correspondence's address root `AR`, and when
     /// they were first and last seen. **Not `ss0`**: § D-PFS retains only `AR`,
-    /// and that module says why.
+    /// and [`crate::dm::contact_cache`] says why.
     ///
     /// **Arrives as plaintext**, unlike [`RecordKind::Provisional`]. This record
     /// carries no seal of its own, so this store's seal and its AAD are the
