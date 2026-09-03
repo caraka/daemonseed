@@ -1717,6 +1717,76 @@ modules:
       MAX_ENCODED_LEN is the computed worst case and bounds
       dm_store::RESUME_CAPACITY. The record carries no receive-side peer
       high-water; that stays ratchet-resident.
+      Sub-module dm::reest is the three A9 re-establishment legs. A leg on the
+      wire is one AES-256-GCM envelope over a fixed-size padded plaintext and
+      carries no clear field: no kind, no generation, no seq, no attempt, no
+      direction, no AAD. All three legs are LEG_LEN bytes. FRAME_KIND_RE_EST
+      (re-est), FRAME_KIND_RE_ACK (re-ack) and FRAME_KIND_RE_CONFIRM
+      (re-confirm) are HKDF-info and signature-preimage discriminators, not wire
+      bytes. The seal key is K(RS_n, gen, seq, attempt, leg, dir) — HKDF-SHA384
+      extract under DM_REEST_SALT over the committed root, expand over
+      DM_REEST_LEG followed by the kind, the direction label, the generation
+      (u32 BE), the sequence position (u64 BE) and the attempt (u32 BE), each
+      prefixed with its length as a u64 BE. Inside the seal the plaintext is
+      payload || ML-DSA-87 signature, padded to 8192 bytes as len(u32 LE) ||
+      bytes || zero-pad. The signature preimage is DM_REEST_SIG followed by the
+      kind, the direction label, the generation, the sequence position, the
+      attempt and the payload, same length prefixing; it is produced under the
+      party's S_pc and verified under the peer's PK_pc, both read from the
+      resume record.
+      seal_re_est(root: &CommittedRoot, dir: Direction, generation: u32, seq:
+      u64, attempt: &FreshAttempt, eph_ek: &[u8; ml_kem::EK_LEN], s_pc: &[u8;
+      ml_dsa::SK_LEN]) takes the token, so a fresh encapsulation is only
+      possible under a new attempt. seal_re_ack(root, dir, seq, authority:
+      ReAckAuthority, eph_ct: &[u8; ml_kem::CT_LEN], s_pc) takes a
+      ReAckAuthority, which carries the generation and attempt it answers and is
+      minted only by OpenedReEst::answer(self); it is neither Clone nor Copy, so
+      one opened RE-EST authorises one RE-ACK. seal_re_confirm(root, dir,
+      generation, seq, attempt: Attempt, s_pc) takes a plain Attempt: it
+      encapsulates nothing, so it cannot spell a fresh ciphertext under an
+      unchanged key. Each sealer returns Vec<u8> of LEG_LEN.
+      scan_re_est / scan_re_ack / scan_re_confirm(root, dir, generation, seq:
+      u64, last_seen: u32, encoded: &[u8], peer_pk_pc: &[u8; ml_dsa::PK_LEN])
+      recover a leg by bounded trial decryption over the attempt window
+      [last_seen, last_seen + MAX_GAP] inclusive, skipping attempt 0; dir,
+      generation, seq and the kind come from the reader, never from the bytes.
+      They return OpenedReEst / OpenedReAck / OpenedReConfirm with generation(),
+      attempt() and, for the first two, eph_ek() / eph_ct(); OpenedReEst also has
+      answer() -> ReAckAuthority, whose generation() and attempt() read back.
+      ReEstError is Truncated for bytes that are not LEG_LEN, PayloadLen {
+      expected, got } for an opened payload of the wrong size in either
+      direction, PayloadTooLong { max, got } for a payload handed to the sealer
+      that does not fit the padded plaintext (a local caller error, unreachable
+      from the public sealers), DidNotOpen for a window that yielded nothing,
+      Signature for an opened leg whose signature does not verify (the scan
+      stops there rather than trying the next candidate), Kdf, Module, Sealing
+      and EntropySource.
+      tiebreak_winner(root, generation) -> Direction is the contest coin: HKDF
+      over DM_REEST_TIEBREAK with the generation length-prefixed, and the
+      least-significant bit of the first expanded byte names the winner — 0 is
+      AToB, 1 is BToA. contest_outcome(root, generation, our_direction,
+      our_pending_initiation_at: Option<u32>) -> ContestOutcome returns NoContest
+      unless the pending initiation is at this generation, then WeSurvive or
+      WeAbandon. ReEstGate::new() / admit(generation, attempt, budget: impl
+      FnOnce() -> bool) -> ReEstAdmission holds one accepted (generation,
+      attempt) and orders incoming pairs against it: the same pair is ReServe
+      with no charge, a pair ordering below it (a lower attempt at that
+      generation, or any lower generation) is Dropped with no charge and no
+      state change, and a pair above it — a higher generation, or A5.1's
+      superseding higher attempt at the accepted generation — is charged and
+      replaces the slot, yielding Emit or Withheld. accepted() reads the slot
+      back as Option<(u32, Attempt)>. It is A3.4's acceptance slot plus A5.1's
+      supersede, not A5.3's durable dedup memory, which is unbuilt and has no
+      ResumeRecord field; A5.1(ii)'s confirmation lock is also not here and the
+      caller owes it. AttemptBudget::empty() / from_record(&ResumeRecord) / count() /
+      exhausted() / charge() -> Option<Self> is the toward-C count, exhausted at
+      ATTEMPT_CEILING on a >= boundary; it carries no window-start anchor and no
+      rollover. ATTEMPT_CEILING is 8 and MAX_GAP equals it; both are placeholders
+      for the design's tunable C, protocol-global rather than per-deployment, and
+      moving them changes no encoding. MAX_GAP = C holds only while a sender's
+      attempt stays within C of the receiver's last_seen; the window-start anchor
+      and last_seen-derived rollover that would guarantee it are not built, so a
+      multi-window attempt is unopenable until RS_n retires.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

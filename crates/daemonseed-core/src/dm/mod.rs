@@ -83,6 +83,7 @@ pub mod persist;
 pub mod pow;
 pub mod provisional;
 pub mod ratchet;
+pub mod reest;
 pub mod resume;
 pub mod spent_store;
 pub mod token;

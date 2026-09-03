@@ -55,6 +55,8 @@ use crate::crypto::suite::{Registry, SuiteId, SuiteIdError};
 use crate::dm::frame::MAX_FRAME_LEN;
 use crate::dm::ratchet::ROOT_KEY_LEN;
 use crate::secret_seed::redacted_secret_newtype;
+use std::num::NonZeroU32;
+
 use oxicrypt_ml_dsa as ml_dsa;
 
 /// At-rest magic. The version is **inside** it, so a decoder compares one thing
@@ -388,6 +390,23 @@ impl Attempt {
     /// The number, for encoding and for error reporting.
     pub fn get(self) -> u32 {
         self.0
+    }
+
+    /// Name an attempt whose non-zero-ness the caller has already established.
+    ///
+    /// Takes a [`NonZeroU32`] rather than a `u32` returning `Option`, so the
+    /// empty-slot spelling — attempt `0`, which orders below every real attempt
+    /// — is unrepresentable here instead of being a case every caller has to
+    /// remember to reject. [`crate::dm::reest`]'s trial-decryption scan builds
+    /// its candidates this way and consequently has no zero branch to leave
+    /// dead; its gate stores one of these rather than a bare `u32`.
+    ///
+    /// Crate-private, and it yields no [`FreshAttempt`]: it names an attempt
+    /// without authorising a seal under it, which is why it is not a hole in
+    /// A9.1. The authority to seal still comes only from [`Self::advance`] and
+    /// [`FreshAttempt::first`].
+    pub(crate) const fn from_nonzero(n: NonZeroU32) -> Self {
+        Self(n.get())
     }
 
     /// Advance to the next attempt, yielding the one token that authorises a

@@ -710,6 +710,16 @@ route taken to reach a decision are not recorded here — the git history and `C
   than one per receive poll, and its rate under real traffic is unmeasured because there is no
   transport cadence yet to measure it against.
 
+- **A re-establishment leg announces nothing on the wire: § A3.9 governs, not § A5.2's reading.** The
+  two sections can be read against each other. A5.2 says the receiver *"knows `gen`/`leg`/`dir` from
+  the frame"*, which reads as clear header fields; A3.9 says a re-establish frame is *"shaped exactly
+  like an ordinary frame and identified by trial decryption"*, which admits no clear field at all.
+  A3.9 governs: the receiver supplies kind, direction, generation and sequence position from its own
+  state and recovers only the attempt, by bounded trial decryption. The rejected option was one clear
+  `u32` generation field, which buys a shorter scan and costs a per-frame reconnect-generation
+  counter readable by any co-host of the channel record — the discriminator class A5.2 itself
+  rejects a clear `attempt` for, so the alternative reading defeats its own section's argument.
+
 - **A restart lookup does not write.** Deciding what a channel does at startup is offered in two
   forms: `restart_channel`, which deletes a lingering provisional record on its way past, and
   `peek_channel_restart`, which returns the same three arms and touches nothing. The cleaning is
@@ -738,9 +748,8 @@ route taken to reach a decision are not recorded here — the git history and `C
   the address KDF splits existing records from fresh knocks, and `addresses_same_channel`'s false
   branch is terminal for the queue (#261). No record has ever been written, so that is a migration
   obligation and not a live defect.
-  **This entry supersedes the earlier one that recorded the opposite reading.** That entry argued
-  ISC-C44's list of "channel/`AR` material" and `ss0` was redundant and resolved it toward storing
-  `ss0`; § D-PFS resolves it the other way, and the design outranks the reading.
+  ISC-C44 lists "channel/`AR` material" and `ss0` as separate per-contact contents; they are not
+  independent, and § D-PFS settles which one is retained.
 
 - **The client GUI is Slint.** It is Rust-native with declarative markup, is royalty-free for desktop,
   mobile, and web, and is the only Rust GUI toolkit with official Android support. The terminal client

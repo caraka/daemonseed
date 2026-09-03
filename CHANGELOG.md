@@ -26,6 +26,22 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_core::dm::reest` — the three A9 channel re-establishment legs. A leg is one
+  AES-256-GCM envelope over a plaintext padded to 8192 bytes, `LEG_LEN` on the wire for all three
+  kinds, with no clear kind, generation, seq, attempt or direction field and no AAD. The seal key is
+  `K(RS_n, gen, seq, attempt, leg, dir)` under `DM_REEST_SALT` / `DM_REEST_LEG`; the plaintext
+  carries the leg's payload followed by an ML-DSA-87 signature over `DM_REEST_SIG`, the same five
+  values and the payload, signed under `S_pc` and verified under the peer's `PK_pc`. `seal_re_est` takes a
+  `FreshAttempt`; `seal_re_ack` takes a `ReAckAuthority` minted only by `OpenedReEst::answer`;
+  `seal_re_confirm` takes an `Attempt`. `scan_re_est` / `scan_re_ack` / `scan_re_confirm` recover a
+  leg by bounded trial decryption over the attempt window `[last_seen, last_seen + MAX_GAP]`.
+  `tiebreak_winner` is the contest coin, the least-significant bit of the first byte expanded under
+  `DM_REEST_TIEBREAK`; `contest_outcome` is the local contest check. `ReEstGate::admit` evaluates
+  duplicate detection before the response budget. `AttemptBudget` is the toward-`C` count, exhausted
+  at `ATTEMPT_CEILING`. `ATTEMPT_CEILING` is 8 and `MAX_GAP` equals it; both are placeholders for the
+  design's tunable `C`. (#404)
+- `DM_REEST_SALT`, `DM_REEST_LEG`, `DM_REEST_TIEBREAK` and `DM_REEST_SIG` in
+  `daemonseed_core::dm::domain` — the re-establishment label family. (#404)
 - `daemonseed_tui::net` / `daemonseed_gui::net` — the front-end DM contract. `NetCommand::Connect`
   carries `dm_session_keys: Option<DmSessionKeys>` (the full identity KEM keypair, the doorbell slot
   secret and the profile at-rest key); the net actor moves it into `DmDriverParts` and spawns a
@@ -597,7 +613,10 @@ work lives in the maintainer's own planning notes, not here.
   place of `ss0`. `new` takes `Zeroizing<[u8; ROOT_LEN]>`, `address_root` returns
   `[u8; ROOT_LEN]`, `addresses_same_channel` returns `bool`, and an all-zero root is
   `ContactCacheError::PlaceholderAddressRoot`. `CONTACT_RECORD_LEN` and the
-  `RecordKind::ContactCache` bucket are unchanged.
+  `RecordKind::ContactCache` bucket are unchanged. **Breaking (crate API):**
+  `ContactRecord::new`'s third parameter, `address_root`'s and
+  `addresses_same_channel`'s return types, and `ContactCacheError`'s
+  `PlaceholderSecret` variant, now `PlaceholderAddressRoot`.
 - `daemonseed_core::dm::resume::ResumeRecord::new` takes `sealed: Option<SealedReEst>`, and
   `attempt`, `sealed` and `sealed_re_est` return `Option`. `None` is the empty handshake slot,
   encoded at rest as attempt `0` with a zero-length frame and ordering below every `Attempt`;

@@ -375,6 +375,29 @@ dm_labels! {
     /// extraction, so learning a message key never yields the chain it came from.
     /// FROZEN.
     DM_CK = b"daemonseed/dm/ck/v2";
+
+    /// HKDF-Extract salt for every derivation rooted in a committed
+    /// re-establishment root — the leg keys and the tiebreak coin alike. FROZEN.
+    DM_REEST_SALT = b"daemonseed/dm/reest/salt/v1";
+
+    /// HKDF-Expand `info` prefix for one re-establishment leg's seal key. The
+    /// leg kind, the direction, the generation and the attempt follow it, each
+    /// length-prefixed — A4.6's `K(RS_n, gen, attempt, leg, dir)`. Every one of
+    /// those is a KEY input rather than a wire field: a leg carries no clear
+    /// discriminator at all, so this derivation is what a receiver's trial
+    /// decryption is scanning over. FROZEN.
+    DM_REEST_LEG = b"daemonseed/dm/reest/leg/v1";
+
+    /// HKDF-Expand `info` prefix for A3.7's tiebreak coin, with the
+    /// re-establishment generation length-prefixed after it. Distinct from
+    /// [`DM_REEST_LEG`] so a seal key can never be read as a coin. FROZEN.
+    DM_REEST_TIEBREAK = b"daemonseed/dm/reest/tiebreak/v1";
+
+    /// Signature domain for a re-establishment leg's authorship signature
+    /// (A3.1), signed under the sender's per-correspondent pseudonym key. The
+    /// leg kind, the direction, the generation, the attempt and the leg's
+    /// payload follow it, each length-prefixed. FROZEN.
+    DM_REEST_SIG = b"daemonseed/dm/reest/sig/v1";
 }
 
 #[cfg(test)]
@@ -511,7 +534,7 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 43] = [
+        let pinned: [(&[u8], &[u8]); 47] = [
             (DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3".as_slice()),
             (DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1".as_slice()),
             (
@@ -582,6 +605,13 @@ mod tests {
             ),
             (DM_RATCHET_ROOT, b"daemonseed/dm/ratchet/root/v2".as_slice()),
             (DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2".as_slice()),
+            (DM_REEST_LEG, b"daemonseed/dm/reest/leg/v1".as_slice()),
+            (DM_REEST_SALT, b"daemonseed/dm/reest/salt/v1".as_slice()),
+            (DM_REEST_SIG, b"daemonseed/dm/reest/sig/v1".as_slice()),
+            (
+                DM_REEST_TIEBREAK,
+                b"daemonseed/dm/reest/tiebreak/v1".as_slice(),
+            ),
             (DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1".as_slice()),
             (DM_STORE_AAD, b"daemonseed/dm/store/aad/v1".as_slice()),
             (
