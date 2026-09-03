@@ -5291,6 +5291,72 @@ mod tests {
         );
     }
 
+    /// **What a person actually sees for this teardown, on both surfaces that
+    /// draw it.**
+    ///
+    /// The label helper is unit-tested on its own. This drives the two real
+    /// render paths — the status badge and the Trust History list — because a
+    /// call site that stops going through the helper is invisible to a test of
+    /// the helper, and the two sites are independent.
+    ///
+    /// Assertions are on the row that carries the badge, not on the whole
+    /// screen, so a match somewhere else cannot stand in for it. The terminal
+    /// is deliberately wider than the content: the status bar hard-truncates
+    /// with no wrap, and at 120 columns the second chip sits within 16 cells of
+    /// the edge, which would fail this test for a layout reason and report it
+    /// as a labelling one.
+    #[test]
+    fn the_teardown_label_reaches_both_surfaces_and_the_key_reaches_neither() {
+        const KEY: &str = "dm-channel-torn-down-on-restart";
+        let mut app = drive_to_main();
+        app.fold_trust_event(
+            TrustEventScope::bare(TrustEventKey::DmChannelTornDownOnRestart),
+            None,
+        );
+        // A key with no label of its own, so every assertion below has a
+        // control that must render verbatim on the same surface.
+        app.fold_trust_event(
+            TrustEventScope::bare(TrustEventKey::DmRecordErasureBlocked),
+            None,
+        );
+
+        let badge = buffer_rows(&app, 200, 24)[1].clone();
+        assert!(
+            badge.contains("conversation ended"),
+            "the badge row does not carry the label: {badge:?}"
+        );
+        assert!(
+            badge.contains("dm-record-erasure-blocked"),
+            "the unlabelled control is not on the badge row, so the absence \
+             below proves nothing: {badge:?}"
+        );
+        assert!(
+            !badge.contains(KEY),
+            "the badge row carries the raw key: {badge:?}"
+        );
+
+        // The second surface. A call site that bypasses the helper here is
+        // invisible to every assertion above.
+        for _ in 0..7 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::TrustHistory);
+        let history = render_text(&app, 200, 24);
+        assert!(
+            history.contains("conversation ended"),
+            "the history view does not carry the label:\n{history}"
+        );
+        assert!(
+            history.contains("dm-record-erasure-blocked"),
+            "the unlabelled control is not in the history view, so the absence \
+             below proves nothing:\n{history}"
+        );
+        assert!(
+            !history.contains(KEY),
+            "the history view carries the raw key:\n{history}"
+        );
+    }
+
     /// A Transient event is a toast that is NOT logged (the A-C12 asymmetry) and
     /// auto-dismisses on the next key press (ISC-24).
     #[test]

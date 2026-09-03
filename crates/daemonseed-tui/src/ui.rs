@@ -379,8 +379,13 @@ fn render_preview_tree(f: &FetchUi, frame: &mut Frame, area: Rect, color: Color)
 }
 
 /// The Trust History view (ISC-25 / C28 LogOnly surface): every recorded trust
-/// event, newest first, with its stable key, scope, and dismissed/resolved
-/// markers. The selected row is highlighted; Enter dismisses it.
+/// event, newest first, with its label, scope, and dismissed/resolved markers.
+/// The selected row is highlighted; Enter dismisses it.
+///
+/// **The label is the stable key for every event except those
+/// [`trust_persistent_text`] gives a sentence to**, which today is one. Per-key
+/// dismissal still rides on the key itself, never on what is drawn: the row
+/// carries `e.key`, and the label is a rendering of it.
 fn render_trust_history(app: &App, frame: &mut Frame, area: Rect) {
     let entries = app.trust_log().entries();
     let lines: Vec<Line> = if entries.is_empty() {
@@ -402,7 +407,10 @@ fn render_trust_history(app: &App, frame: &mut Frame, area: Rect) {
                 } else {
                     ""
                 };
-                let line = format!("{marker}{}  @{scope}{dismissed}", event_key_string(e.key));
+                let line = format!(
+                    "{marker}{}  @{scope}{dismissed}",
+                    trust_persistent_text(e.key)
+                );
                 let style = if i == app.history_sel() {
                     Style::default().fg(Color::Cyan).bold()
                 } else {
@@ -527,6 +535,38 @@ fn trust_toast_text(key: TrustEventKey) -> String {
     match key {
         TrustEventKey::ConnectionRateLimited => "server busy — backing off".to_owned(),
         TrustEventKey::UpdateRelayFallbackUsed => "update via fallback relay".to_owned(),
+        other => event_key_string(other).to_owned(),
+    }
+}
+
+/// A short label for a trust key, for the status badge and Trust History.
+///
+/// **Called with keys of every class**, not only the persistent ones the badge
+/// draws: [`render_trust_history`] renders the whole log through it. That is
+/// harmless because the fallback is the key's own stable string, but the domain
+/// is the whole taxonomy and the doc says so rather than naming the surface that
+/// happens to matter most.
+///
+/// **Falls back to the key's stable string form**, which is a machine
+/// identifier and reads as one. That fallback is deliberate rather than
+/// unfinished work: a raw key is visibly a key, where a wrong sentence is not.
+/// Keys get an arm here when their *name* asserts something that is not true on
+/// every path that mints them.
+///
+/// [`TrustEventKey::DmChannelTornDownOnRestart`] is the one such key today. It
+/// is cause-correct — no record survived — and it is wire-stable, persisted in
+/// the audit log and parsed by
+/// [`event_key_from_str`](daemonseed_core::trust_events::event_key_from_str),
+/// so the key itself cannot change. But a restart is the ordinary way a record
+/// fails to survive, not the only way: a record written moments earlier and
+/// destroyed by another writer before it is read back mints the same key with
+/// the application having run continuously. Rendered verbatim, it tells that
+/// user their app restarted when it did not.
+fn trust_persistent_text(key: TrustEventKey) -> String {
+    match key {
+        TrustEventKey::DmChannelTornDownOnRestart => {
+            "conversation ended — start a new one".to_owned()
+        }
         other => event_key_string(other).to_owned(),
     }
 }
@@ -1212,7 +1252,7 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     for item in app.persistent_trust() {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
-            format!("⚠ {}", event_key_string(item.key)),
+            format!("⚠ {}", trust_persistent_text(item.key)),
             Style::default().fg(Color::Yellow).bold(),
         ));
     }
@@ -1885,7 +1925,9 @@ fn render_first_start_body(fs: &FirstStartUi, frame: &mut Frame, area: Rect) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ellipsize, fit_row, scroll_window_start};
+    use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
+
+    use super::{ellipsize, fit_row, scroll_window_start, trust_persistent_text};
 
     /// The window always contains the cursor, never starts past the last page,
     /// and is page-aligned — checked at every boundary the render can hit,
@@ -1979,5 +2021,41 @@ mod tests {
         let a = ellipsize(&format!("{}ALPHA", "L".repeat(70)), 40);
         let b = ellipsize(&format!("{}OMEGA", "L".repeat(70)), 40);
         assert_ne!(a, b, "tails distinguish the two names");
+    }
+
+    /// **The badge and Trust History must not tell the user the app restarted
+    /// when it did not.**
+    ///
+    /// `DmChannelTornDownOnRestart` is minted whenever no provisional record
+    /// survived. A restart is the ordinary way that happens and not the only
+    /// way — a record written moments earlier and destroyed by another writer
+    /// before it is read back mints the same key with the application having
+    /// run continuously. The key is wire-stable and stays; what a person reads
+    /// must not repeat its claim.
+    ///
+    /// This is the assertion that reaches a user. The equivalent in
+    /// `daemonseed-core` is on `Display for Teardown`, which nothing outside
+    /// tests renders.
+    #[test]
+    fn the_restart_teardown_badge_does_not_claim_a_restart() {
+        let said = trust_persistent_text(TrustEventKey::DmChannelTornDownOnRestart);
+        // Case-insensitive: the claim is that no restart is asserted, not that
+        // one lowercase spelling is absent. "the app Restarted" passes a
+        // case-sensitive guard while making exactly the claim this forbids.
+        assert!(!said.to_lowercase().contains("restart"), "got {said:?}");
+        assert!(!said.is_empty());
+
+        // Positive control: the fallback really does render the key verbatim,
+        // so the assertion above is the arm doing work and not a function that
+        // returns something harmless for everything.
+        let fallback = trust_persistent_text(TrustEventKey::ServerKeyMismatch);
+        assert_eq!(fallback, event_key_string(TrustEventKey::ServerKeyMismatch));
+
+        // And the key itself is untouched, which is what the audit log and
+        // `event_key_from_str` depend on.
+        assert_eq!(
+            event_key_string(TrustEventKey::DmChannelTornDownOnRestart),
+            "dm-channel-torn-down-on-restart"
+        );
     }
 }

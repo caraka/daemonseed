@@ -385,6 +385,14 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- The terminal client shows a direct-message channel torn down for want of a stored handshake
+  record as "conversation ended — start a new one" in the status badge and Trust History,
+  through `trust_persistent_text`, rather than printing the event key
+  `dm-channel-torn-down-on-restart` verbatim. Every other key of that class still renders as
+  its stable string. The event key is unchanged.
+- `Display for TeardownCause::NoProvisionalRecord` no longer states that the application
+  restarted, a claim that does not hold on every path reaching that cause; it states that the
+  conversation cannot be resumed. The impl has no caller outside tests.
 - Corrected the direct-message outbox record's growth, which retained every entry ever
   inserted and so grew with lifetime rather than owed messages, reaching a wall past which
   every persist for that correspondence failed for good. `DmPersist::update_outbox` calls
@@ -499,19 +507,78 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
-- Amended the direct-message design of record: the acknowledgement handshake terminates on an elapsed-time taper rather than mutual observation, acknowledgement reads are priced against the read pool at one fetch per tick per unsettled correspondence, and the receive cursor is sealed at rest so the store has no unsealed record kind. ISC-C46 re-cut to "a blocked correspondent's records are not read" and closed; block-stops-reads-not-writes recorded under ISC-A-C23. (#389)
+- Amended the direct-message design of record: the acknowledgement handshake terminates on an
+  elapsed-time taper rather than mutual observation, acknowledgement reads are priced against the
+  read pool at one fetch per tick per unsettled correspondence, and the receive cursor is sealed
+  at rest so the store has no unsealed record kind. ISC-C46 re-cut to "a blocked correspondent's
+  records are not read" and closed; block-stops-reads-not-writes recorded under ISC-A-C23. (#389)
 
-- The DM driver hands a channel page's DHT record back when it will not address the page again: a receiving page below both the watched window and the first unsettled position, a sending page whose every position the correspondent has settled, and every page of a torn-down conversation. `daemonseed_veilid_net::dm::seam::DmDht::close_dm_page` and `VeilidNetHandle::close_dm_page` take the new direction-erased `daemonseed_veilid_net::actor::DmPageRecord` and answer whether a record was released; `Command::CloseDmPage` carries it to the actor, where `rendezvous::close_page_now` drops the open-cache entry and closes the record under its own `record_lock`, refusing a page an operation still holds. `daemonseed_core::dm::collect::Collection::retired_below`, `daemonseed_core::dm::collect::WATCHED_PAGES` and `daemonseed_core::dm::ack::AckState::settled_pages_below` are the settlement bounds those signals read; a sending position given up at the seven-day window settles for that bound, and a torn-down conversation plans and writes nothing further on the channel plane — sweeps, page writes, acknowledgement fetches and acknowledgement writes are all gated on it, the last at its candidate scan so a dead correspondence cannot spend the client-global acknowledgement permit or starve a live one — and a page an operation was holding at teardown is handed back when that operation's outcome lands. The receiving side has no give-up signal — no record carries the sender's abandonment, so a permanently lost inbound position pins its pages and `Collection::abandoned` still has no production caller — and `rendezvous::RecordLocks` entries are still never removed, an entry being unsafe to drop while any task holds a clone of its `Arc`. Covers the open-cache and page-ring half of issue #252. (#252)
+- The DM driver hands a channel page's DHT record back when it will not address the page again: a
+  receiving page below both the watched window and the first unsettled position, a sending page
+  whose every position the correspondent has settled, and every page of a torn-down conversation.
+  `daemonseed_veilid_net::dm::seam::DmDht::close_dm_page` and `VeilidNetHandle::close_dm_page`
+  take the new direction-erased `daemonseed_veilid_net::actor::DmPageRecord` and answer whether a
+  record was released; `Command::CloseDmPage` carries it to the actor, where
+  `rendezvous::close_page_now` drops the open-cache entry and closes the record under its own
+  `record_lock`, refusing a page an operation still holds.
+  `daemonseed_core::dm::collect::Collection::retired_below`,
+  `daemonseed_core::dm::collect::WATCHED_PAGES` and
+  `daemonseed_core::dm::ack::AckState::settled_pages_below` are the settlement bounds those
+  signals read; a sending position given up at the seven-day window settles for that bound, and a
+  torn-down conversation plans and writes nothing further on the channel plane — sweeps, page
+  writes, acknowledgement fetches and acknowledgement writes are all gated on it, the last at its
+  candidate scan so a dead correspondence cannot spend the client-global acknowledgement permit
+  or starve a live one — and a page an operation was holding at teardown is handed back when that
+  operation's outcome lands. The receiving side has no give-up signal — no record carries the
+  sender's abandonment, so a permanently lost inbound position pins its pages and
+  `Collection::abandoned` still has no production caller — and `rendezvous::RecordLocks` entries
+  are still never removed, an entry being unsafe to drop while any task holds a clone of its
+  `Arc`. Covers the open-cache and page-ring half of issue #252. (#252)
 
-- `daemonseed_core::dm::persist::DmPersist::advance_cursor` returns `CursorAdvance` (`moved()` / `repaired()`) and replaces a `cursor.bin` it cannot read — wrong width, not authentic, interrupted erase, or a payload that is not `RECEIVE_CURSOR_LEN` bytes — with the caller's own page, reporting `repaired()`; an environment error and `DmPersistError::CursorNotCorroborated` still propagate. A payload of another length is the new `DmPersistError::CursorPayloadWrongLen`. `DmPersistError::is_unreadable_record` is public and says which errors license that replacement. The DM driver flags a `cursor.bin` its seed cannot read and replaces it on the next idle tick — the fold's repair only fires when the contiguous prefix moved, which a correspondence with no live channel never does. `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` carries `cursor_records_repaired`, folded by `daemonseed_tui::app::DmChannelHealth` and `daemonseed_gui::state::DmChannelHealth`. (#389)
+- `daemonseed_core::dm::persist::DmPersist::advance_cursor` returns `CursorAdvance` (`moved()` /
+  `repaired()`) and replaces a `cursor.bin` it cannot read — wrong width, not authentic,
+  interrupted erase, or a payload that is not `RECEIVE_CURSOR_LEN` bytes — with the caller's own
+  page, reporting `repaired()`; an environment error and `DmPersistError::CursorNotCorroborated`
+  still propagate. A payload of another length is the new
+  `DmPersistError::CursorPayloadWrongLen`. `DmPersistError::is_unreadable_record` is public and
+  says which errors license that replacement. The DM driver flags a `cursor.bin` its seed cannot
+  read and replaces it on the next idle tick — the fold's repair only fires when the contiguous
+  prefix moved, which a correspondence with no live channel never does.
+  `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` carries `cursor_records_repaired`, folded
+  by `daemonseed_tui::app::DmChannelHealth` and `daemonseed_gui::state::DmChannelHealth`. (#389)
 
-- `daemonseed_core::storage::dm_store::RecordKind::ReceiveCursor` is sealed at rest under AAD tag 4 and padded to a fixed bucket, like every other kind: `capacity` is `RECEIVE_CURSOR_LEN` = 8 and `on_disk_len` is `NONCE_LEN + LEN_PREFIX + 8 + TAG_LEN`. `RecordKind::is_sealed` and `DmStoreError::UnsealedPayloadNotExact` are removed; a cursor payload shorter than 8 bytes is padded and recovered exactly rather than refused, and a `cursor.bin` of the former 8-byte width reads as `DmStoreError::WrongFileLen`. (#389)
+- `daemonseed_core::storage::dm_store::RecordKind::ReceiveCursor` is sealed at rest under AAD tag
+  4 and padded to a fixed bucket, like every other kind: `capacity` is `RECEIVE_CURSOR_LEN` = 8
+  and `on_disk_len` is `NONCE_LEN + LEN_PREFIX + 8 + TAG_LEN`. `RecordKind::is_sealed` and
+  `DmStoreError::UnsealedPayloadNotExact` are removed; a cursor payload shorter than 8 bytes is
+  padded and recovered exactly rather than refused, and a `cursor.bin` of the former 8-byte width
+  reads as `DmStoreError::WrongFileLen`. (#389)
 
-- `daemonseed_veilid_net::dm::DmEvent::ChannelLost` carries `event: daemonseed_core::trust_events::TrustEventKey`, the key `daemonseed_core::dm::provisional::Teardown::event` classes the teardown's cause under (the 2026-07-30 loud-teardown note in `docs/design/direct-messaging.md`). `daemonseed_tui::app::App::on_net_event` folds it into the trust-event audit log and raises its ISC-C28 persistent-non-blocking affordance; `daemonseed_gui::state::GuiState` gains a `TrustEventLog` and `GuiState::on_dm_event` appends to it only, the GUI having no affordance surface. The entry carries the key, the wall clock and no correspondent.
+- `daemonseed_veilid_net::dm::DmEvent::ChannelLost` carries `event:
+  daemonseed_core::trust_events::TrustEventKey`, the key
+  `daemonseed_core::dm::provisional::Teardown::event` classes the teardown's cause under (the
+  2026-07-30 loud-teardown note in `docs/design/direct-messaging.md`).
+  `daemonseed_tui::app::App::on_net_event` folds it into the trust-event audit log and raises its
+  ISC-C28 persistent-non-blocking affordance; `daemonseed_gui::state::GuiState` gains a
+  `TrustEventLog` and `GuiState::on_dm_event` appends to it only, the GUI having no affordance
+  surface. The entry carries the key, the wall clock and no correspondent.
 
-- `daemonseed_veilid_net::dm::DmEvent::Refused` carries `event: Option<daemonseed_core::trust_events::TrustEventKey>` — `Some` where the refusal is a provisional channel torn down as an introduction is minted, carrying `daemonseed_core::dm::provisional::Teardown::event`'s key for that cause, and `None` on every other refusal. `daemonseed_tui::app::App::on_net_event` folds a carried key into the trust-event audit log and raises its ISC-C28 affordance; `daemonseed_gui::state::GuiState::on_dm_event` appends it to the audit log.
+- `daemonseed_veilid_net::dm::DmEvent::Refused` carries `event:
+  Option<daemonseed_core::trust_events::TrustEventKey>` — `Some` where the refusal is a
+  provisional channel torn down as an introduction is minted, carrying
+  `daemonseed_core::dm::provisional::Teardown::event`'s key for that cause, and `None` on every
+  other refusal. `daemonseed_tui::app::App::on_net_event` folds a carried key into the
+  trust-event audit log and raises its ISC-C28 affordance;
+  `daemonseed_gui::state::GuiState::on_dm_event` appends it to the audit log.
 
-- The DM driver verifies a fetched key record through a per-correspondent `daemonseed_core::dm::keyrec::KeyRecordCache` keyed by the correspondent's long-term identity key, so a record naming a `version` below the highest already verified for that identity is refused with the new `RefusalReason::KeyRecordRollback` instead of being sealed to (design M1); an equal version is accepted as a re-fetch and a higher one advances the bound, which is held for the life of the driver and not persisted. `daemonseed_core::dm::keyrec::KeyRecordCache::accept_encoded` decodes and admits raw fetched bytes in one step.
+- The DM driver verifies a fetched key record through a per-correspondent
+  `daemonseed_core::dm::keyrec::KeyRecordCache` keyed by the correspondent's long-term identity
+  key, so a record naming a `version` below the highest already verified for that identity is
+  refused with the new `RefusalReason::KeyRecordRollback` instead of being sealed to (design M1);
+  an equal version is accepted as a re-fetch and a higher one advances the bound, which is held
+  for the life of the driver and not persisted.
+  `daemonseed_core::dm::keyrec::KeyRecordCache::accept_encoded` decodes and admits raw fetched
+  bytes in one step.
 
 - `daemonseed_tui::net::NetCommand` derives `Debug` only and `daemonseed_tui::net::NetEvent`
   derives `Debug` and `Clone` only: `DmCommand` is not `Clone` and `DmEvent` has no equality.

@@ -822,11 +822,20 @@ impl Teardown {
 impl std::fmt::Display for Teardown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.cause {
+            // Deliberately does NOT name a restart, though the trust event key
+            // does. The key is cause-correct — no record survived, and a restart
+            // is the ordinary way that happens — but it is not the only way. A
+            // record written moments earlier and destroyed by another writer
+            // before it is read back reaches this arm with the application
+            // having run continuously, and telling that user their app
+            // restarted is a false statement about their own machine. What
+            // holds on every path is that nothing was kept, so that is what it
+            // says.
             TeardownCause::NoProvisionalRecord => write!(
                 f,
-                "this conversation ended when the app restarted and cannot be resumed; \
-                 messages already sent keep trying to arrive, and a new conversation \
-                 has to be started to continue"
+                "this conversation cannot be resumed, because nothing was kept \
+                 that could carry it on; messages already sent keep trying to \
+                 arrive, and a new conversation has to be started"
             ),
             TeardownCause::RecordUnusable(e) => write!(
                 f,
@@ -1564,9 +1573,28 @@ mod tests {
         );
 
         // And it says something, in words, rather than only having a name.
+        //
+        // One positive substring, not three. The arm's property is that the
+        // channel cannot be resumed, and that is worth pinning; the rest of the
+        // sentence is editorial and a test that pins it breaks on a re-word it
+        // has no opinion about. "messages already sent keep trying to arrive" is
+        // deliberately NOT asserted: it is true only inside the outbox's give-up
+        // window, so a test asserting it would be pinning a promise the code
+        // does not make unconditionally.
         let said = torn.to_string();
-        assert!(said.contains("restarted"), "got {said:?}");
-        assert!(!said.is_empty());
+        assert!(said.contains("cannot be resumed"), "got {said:?}");
+
+        // **It must not claim a restart, and the event key must still name one.**
+        // The key is cause-correct — no record survived — and it is wire-stable,
+        // persisted in the audit log and parsed by `event_key_from_str`, so it
+        // stays. The sentence is not: the same arm is reached when a record
+        // written moments earlier is destroyed by another writer before it is
+        // read back, with no restart anywhere.
+        assert!(
+            !said.contains("restart"),
+            "the user-facing sentence claims a restart that did not happen on \
+             every path reaching this cause: {said:?}"
+        );
     }
 
     /// A record that will not open strands the handshake, and says so under its
@@ -1644,10 +1672,19 @@ mod tests {
         }
     }
 
-    /// The three teardown events are distinct keys, so a UI can tell an ended
-    /// conversation from a lost introduction from a store it could not read.
+    /// The teardown events are distinct keys, so a UI can tell an ended
+    /// conversation from a lost introduction from a store it could not read
+    /// from a correspondent whose state is gone.
+    ///
+    /// ⚠️ **The `to_string()` half is weaker than it reads, for two of the four
+    /// pairs.** `RecordUnusable` and `StoreUnreadable` both interpolate their
+    /// carried error, so their renderings differ here partly because the fixture
+    /// gives them different payloads: making their prose byte-identical leaves
+    /// this test green. The `event()` half is exact for every pair and is what
+    /// the taxonomy rests on. Stated rather than fixed, because the honest
+    /// repair is a rendering assertion per arm and not a stronger loop.
     #[test]
-    fn the_three_teardowns_are_different_events() {
+    fn the_teardowns_are_different_events() {
         let all = [
             Teardown {
                 cause: TeardownCause::NoProvisionalRecord,
@@ -1657,6 +1694,9 @@ mod tests {
             },
             Teardown {
                 cause: TeardownCause::StoreUnreadable("disk on fire".into()),
+            },
+            Teardown {
+                cause: TeardownCause::CorrespondentStateLost,
             },
         ];
         for (i, a) in all.iter().enumerate() {
