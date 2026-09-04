@@ -13,10 +13,37 @@
 //! | Field | Shape | Why it cannot be recomputed |
 //! |---|---|---|
 //! | `pk_lt` | the contact's long-term identity key | a public key the peer chose; nothing derives it |
-//! | `pk_pc` | the contact's per-contact pseudonym key | likewise, and it is what authorship is checked against |
+//! | `pk_pc` | the contact's per-contact pseudonym key, **absent until acceptance** | likewise, and it is what authorship is checked against |
 //! | `AR` | the correspondence's address root | derived from an `ss0` this record must not keep |
 //! | `first_seen_ms` | `i64` milliseconds | an observation, not a derivation |
 //! | `last_seen_ms` | `i64` milliseconds | likewise |
+//!
+//! ## `pk_pc` is absent for as long as the correspondence is one-sided
+//!
+//! The two parties learn the fields at different moments. An acceptor learns
+//! everything at once: the knock carries `pk_lt`, `pk_pc` and the `ss0` that
+//! `AR` descends from, so its record is complete the instant it is written. An
+//! **initiator** holds `pk_lt` and `AR` from the moment it composes its knock
+//! and cannot hold `pk_pc` at all — that key first crosses in the acceptance
+//! frame, which may be days away and may never arrive.
+//!
+//! A record is nonetheless written at knock time, because it is the only thing
+//! that maps a correspondent's identity key back to the correspondence that is
+//! waiting on them:
+//! [`DmPersist::correspondence_for_pk_lt`](crate::dm::persist::DmPersist::correspondence_for_pk_lt)
+//! scans contact records and nothing else. An initiator that wrote no record
+//! until acceptance could not answer that question across a restart, so the
+//! acceptance it was waiting for would never be collected and every message the
+//! correspondent composed would re-emit to the seven-day give-up.
+//! `first_seen_ms` on such a record is when the knock was composed, which is
+//! when the correspondence began on this side.
+//!
+//! **The presence byte is the truth, not the zero bytes.** `pk_pc` occupies its
+//! full width whether or not it is known, and a separate byte says which — so
+//! the record stays one fixed length, and an all-zero key never has to double
+//! as "not yet". [`ContactRecord::record_pseudonym`] fills it in place when the
+//! acceptance arrives and refuses to replace a key already recorded with a
+//! different one.
 //!
 //! **`ss0` is NOT among them, and that is the design of record rather than a
 //! preference.** § D-PFS (`docs/design/direct-messaging.md:319`) seeds both the
@@ -79,12 +106,18 @@
 //!
 //! ## At rest
 //!
-//! `version ‖ pk_lt ‖ pk_pc ‖ AR ‖ first_seen ‖ last_seen` —
+//! `version ‖ pk_lt ‖ pk_pc_present ‖ pk_pc ‖ AR ‖ first_seen ‖ last_seen` —
 //! [`CONTACT_RECORD_LEN`] bytes for every record. Every field is fixed-width, so
 //! there are no interior length prefixes able to disagree with what they
 //! describe, and once the store has sealed and padded it a directory of these
 //! leaks neither how much is known about a contact nor how long they have been
 //! known.
+//!
+//! **`pk_pc` keeps its width when it is absent**, filled with zeroes, so a
+//! correspondence waiting on its acceptance encodes to exactly the same length
+//! as an established one. An absence expressed by omitting the field would put
+//! the handshake's state into the record's length, where the store's bucket
+//! sizes and any future padding scheme would have to carry it too.
 //!
 //! **A truncation is still diagnosed here.** [`ContactRecord::decode`] checks the
 //! length before it parses, so a short or padded payload reports
@@ -109,7 +142,9 @@ use crate::dm::firstcontact::ROOT_LEN;
 /// length-changing version is a format break, not a version negotiation.
 ///
 /// ⚠️ **It stayed at `1` across the `ss0` → `AR` change, which is exactly the
-/// same-length reinterpretation this byte exists to catch.** The bytes at
+/// same-length reinterpretation this byte exists to catch**, and again across
+/// the addition of the `pk_pc` presence byte, which is the length change the
+/// paragraph above calls a format break. The bytes at
 /// `1 + 2·PK_LEN ..+ ROOT_LEN` mean something different than they did, at the
 /// same length, so a v1 record written by an older build would be read as a
 /// current one with the wrong value in the field that decides addressing. Not
@@ -122,8 +157,23 @@ pub const CONTACT_RECORD_VERSION: u8 = 1;
 /// Bytes in each of the two timestamps: an `i64` of milliseconds, big-endian.
 const TIMESTAMP_LEN: usize = 8;
 
-/// Encoded length: the version byte, both public keys, `AR`, and the two
-/// timestamps. Fixed — every field is fixed-width.
+/// The byte that says whether `pk_pc` has been recorded yet.
+///
+/// [`PSEUDONYM_ABSENT`] and [`PSEUDONYM_PRESENT`] are the only two values a
+/// record encodes, and [`ContactRecord::decode`] refuses every other — see
+/// [`ContactCacheError::UnknownPseudonymPresence`].
+const PSEUDONYM_PRESENCE_LEN: usize = 1;
+
+/// The presence byte of a record whose correspondent has not yet accepted.
+const PSEUDONYM_ABSENT: u8 = 0;
+
+/// The presence byte of a record whose `pk_pc` field carries the key.
+const PSEUDONYM_PRESENT: u8 = 1;
+
+/// Encoded length: the version byte, both public keys, the pseudonym presence
+/// byte, `AR`, and the two timestamps. Fixed — every field is fixed-width, and
+/// an unknown `pk_pc` occupies its full width rather than shortening the
+/// record.
 ///
 /// One number for every record, which is what lets the store give this kind a
 /// fixed-size bucket:
@@ -134,7 +184,8 @@ const TIMESTAMP_LEN: usize = 8;
 /// store's bucket for this kind moves with it and — per
 /// [`CONTACT_RECORD_VERSION`]'s docs — that is a format break rather than a
 /// version negotiation.
-pub const CONTACT_RECORD_LEN: usize = 1 + 2 * ml_dsa::PK_LEN + ROOT_LEN + 2 * TIMESTAMP_LEN;
+pub const CONTACT_RECORD_LEN: usize =
+    1 + 2 * ml_dsa::PK_LEN + PSEUDONYM_PRESENCE_LEN + ROOT_LEN + 2 * TIMESTAMP_LEN;
 
 /// Why a contact record could not be built or read back.
 #[derive(Debug, PartialEq, Eq)]
@@ -173,6 +224,33 @@ pub enum ContactCacheError {
     /// [`Self::TimestampsOutOfOrder`], which refuses a self-contradicting record
     /// at construction rather than leaving it for a validator.
     PlaceholderAddressRoot,
+    /// The pseudonym presence byte is neither of the two values a record
+    /// encodes.
+    ///
+    /// Refused rather than read as absence, which is the direction that costs
+    /// something: a record whose byte is unrecognised may be one whose `pk_pc`
+    /// *is* recorded, and treating it as unknown would send a correspondence
+    /// back to accepting an unauthenticated first frame from anyone.
+    UnknownPseudonymPresence { found: u8 },
+    /// The record says `pk_pc` is present and carries all zeroes for it.
+    ///
+    /// The mirror of [`Self::PlaceholderAddressRoot`], and refused for the
+    /// mirror reason: an all-zero key is what a caller reaches for when it means
+    /// *not filled in yet*, and this type spells that with the presence byte
+    /// instead. Accepting it would give a correspondence a pseudonym no frame
+    /// can ever verify against, with no path back — [`ContactRecord::record_pseudonym`]
+    /// refuses to replace a recorded key.
+    PlaceholderPseudonym,
+    /// [`ContactRecord::record_pseudonym`] was asked to replace a `pk_pc`
+    /// already recorded with a different one.
+    ///
+    /// **The pair is fixed for the life of a correspondence**, so a second key
+    /// is not a rotation this layer may perform: every frame already collected
+    /// was verified against the recorded one, and overwriting it would make the
+    /// conversation's own history unverifiable while accepting whatever the new
+    /// key signs. Filling an absent key is not this case, and neither is
+    /// re-recording the identical key.
+    PseudonymAlreadyRecorded,
 }
 
 impl std::fmt::Display for ContactCacheError {
@@ -197,6 +275,19 @@ impl std::fmt::Display for ContactCacheError {
             Self::PlaceholderAddressRoot => f.write_str(
                 "the contact record's address root is all zeroes, which is a placeholder \
                  rather than a key derivation's output",
+            ),
+            Self::UnknownPseudonymPresence { found } => write!(
+                f,
+                "the contact record's pseudonym presence byte is {found}, which is \
+                 neither absent nor present"
+            ),
+            Self::PlaceholderPseudonym => f.write_str(
+                "the contact record says its pseudonym key is recorded and carries all \
+                 zeroes for it",
+            ),
+            Self::PseudonymAlreadyRecorded => f.write_str(
+                "the contact record already holds a different pseudonym key for this \
+                 correspondent",
             ),
         }
     }
@@ -234,7 +325,7 @@ impl std::error::Error for ContactCacheError {}
 /// when it was known does not exist to be validated.
 pub struct ContactRecord {
     pk_lt: Box<[u8; ml_dsa::PK_LEN]>,
-    pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
+    pk_pc: Option<Box<[u8; ml_dsa::PK_LEN]>>,
     ar: Zeroizing<[u8; ROOT_LEN]>,
     first_seen_ms: i64,
     last_seen_ms: i64,
@@ -265,9 +356,16 @@ impl ContactRecord {
     /// `ar` arrives already wrapped so it can be *moved* in. Taking a bare
     /// `[u8; ROOT_LEN]` would copy it at the call site and leave that copy live
     /// in the caller's frame, which is the hazard the wrapper exists to close.
+    ///
+    /// **`pk_pc` is `None` for an initiator that has not been accepted yet**,
+    /// and the argument is an `Option` rather than a second constructor so
+    /// every caller states which of the two it is building. `first_seen_ms` is
+    /// then the moment the knock was composed: the correspondence began on this
+    /// side when its opening secret was minted, not when the answer arrived.
+    /// See the module docs.
     pub fn new(
         pk_lt: Box<[u8; ml_dsa::PK_LEN]>,
-        pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
+        pk_pc: Option<Box<[u8; ml_dsa::PK_LEN]>>,
         ar: Zeroizing<[u8; ROOT_LEN]>,
         first_seen_ms: i64,
         last_seen_ms: i64,
@@ -282,6 +380,9 @@ impl ContactRecord {
         // value that is not key material at all.
         if ar.iter().all(|b| *b == 0) {
             return Err(ContactCacheError::PlaceholderAddressRoot);
+        }
+        if pk_pc.as_ref().is_some_and(|k| k.iter().all(|b| *b == 0)) {
+            return Err(ContactCacheError::PlaceholderPseudonym);
         }
         Ok(Self {
             pk_lt,
@@ -298,12 +399,65 @@ impl ContactRecord {
     }
 
     /// The contact's per-contact pseudonym key — what a frame's authorship
-    /// signature is verified against.
-    pub fn pk_pc(&self) -> &[u8; ml_dsa::PK_LEN] {
-        &self.pk_pc
+    /// signature is verified against — or `None` while the correspondence is
+    /// still waiting to be accepted.
+    ///
+    /// **`None` is not an error and not a missing field.** It is the state an
+    /// initiator's record is in from the knock until the acceptance is
+    /// collected, so a caller that needs the key has to say what it does
+    /// without one: refuse to verify a frame, decline to treat the
+    /// correspondence as established, or wait. See the module docs.
+    pub fn pk_pc(&self) -> Option<&[u8; ml_dsa::PK_LEN]> {
+        self.pk_pc.as_deref()
+    }
+
+    /// Record the correspondent's pseudonym key, returning whether it was newly
+    /// filled in.
+    ///
+    /// The one transition an initiator's record makes: `pk_pc` is absent from
+    /// the knock until the acceptance frame carries it, and this is where the
+    /// key it carried is written down. `false` means the identical key was
+    /// already recorded, which a re-presented acceptance produces and which
+    /// changes nothing.
+    ///
+    /// **A different key is [`ContactCacheError::PseudonymAlreadyRecorded`],
+    /// never a replacement.** Every frame already collected on this
+    /// correspondence was verified against the recorded key, so accepting a
+    /// second one would leave the conversation's own history unverifiable while
+    /// admitting whatever the new key signs — and nothing at rest says which of
+    /// the two the correspondent chose. Rotation is a protocol question with an
+    /// answer of its own; it is not this call quietly overwriting.
+    ///
+    /// An all-zero key is refused as [`ContactCacheError::PlaceholderPseudonym`]
+    /// for [`Self::new`]'s reason: absence is the presence byte's job.
+    #[must_use = "an ignored answer is a pseudonym that may already have been recorded"]
+    pub fn record_pseudonym(
+        &mut self,
+        pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
+    ) -> Result<bool, ContactCacheError> {
+        if pk_pc.iter().all(|b| *b == 0) {
+            return Err(ContactCacheError::PlaceholderPseudonym);
+        }
+        match &self.pk_pc {
+            // Not a constant-time comparison: both keys are public, and the
+            // caller supplied one of them.
+            Some(recorded) if recorded.as_slice() == pk_pc.as_slice() => Ok(false),
+            Some(_) => Err(ContactCacheError::PseudonymAlreadyRecorded),
+            None => {
+                self.pk_pc = Some(pk_pc);
+                Ok(true)
+            }
+        }
     }
 
     /// When this correspondence was first observed, in milliseconds.
+    ///
+    /// **For an acceptor that is the knock; for an initiator it is when the
+    /// knock was composed**, which is the first moment this side had a
+    /// correspondence at all. An initiator has observed nothing of the
+    /// correspondent yet — that is what an absent [`Self::pk_pc`] says — so
+    /// dating the record from the acceptance would leave the waiting period
+    /// unrecorded on the only record that exists during it.
     pub fn first_seen_ms(&self) -> i64 {
         self.first_seen_ms
     }
@@ -421,7 +575,19 @@ impl ContactRecord {
         let mut out = Zeroizing::new(Vec::with_capacity(CONTACT_RECORD_LEN));
         out.push(CONTACT_RECORD_VERSION);
         out.extend_from_slice(self.pk_lt.as_slice());
-        out.extend_from_slice(self.pk_pc.as_slice());
+        match &self.pk_pc {
+            Some(pk_pc) => {
+                out.push(PSEUDONYM_PRESENT);
+                out.extend_from_slice(pk_pc.as_slice());
+            }
+            // Zeroes, so the field keeps its width and the record keeps its
+            // length. They are filler and never a value: the presence byte
+            // above is what `decode` reads.
+            None => {
+                out.push(PSEUDONYM_ABSENT);
+                out.extend(std::iter::repeat_n(0u8, ml_dsa::PK_LEN));
+            }
+        }
         out.extend_from_slice(self.ar.as_slice());
         out.extend_from_slice(&self.first_seen_ms.to_be_bytes());
         out.extend_from_slice(&self.last_seen_ms.to_be_bytes());
@@ -431,13 +597,26 @@ impl ContactRecord {
 
     /// Read the at-rest form back.
     ///
-    /// Three checks, and deliberately no more:
+    /// Four checks, and deliberately no more:
     ///
     /// 1. **The length**, before the parse, so a truncated or padded payload is
     ///    named as such instead of surfacing as a field that landed wrong.
     /// 2. **The version byte**, so a future shape change fails by name.
-    /// 3. **The timestamp order**, because these bytes did not come from
+    /// 3. **The pseudonym presence byte**, which has two legal values and no
+    ///    default: an unrecognised one is
+    ///    [`ContactCacheError::UnknownPseudonymPresence`] rather than absence,
+    ///    because reading it as absence would send an established
+    ///    correspondence back to accepting an unauthenticated frame.
+    /// 4. **The timestamp order**, because these bytes did not come from
     ///    [`Self::new`] and have made none of its promises.
+    ///
+    /// **The presence byte decides, and the bytes under it are not consulted.**
+    /// A record that says the key is absent parses as absent whatever those
+    /// bytes hold, so there is no second authority for the same fact and no
+    /// pair of them to disagree — [`Self::new`]'s
+    /// [`ContactCacheError::PlaceholderPseudonym`] then refuses the one
+    /// combination that would be a lie in the other direction, a key claimed
+    /// present and all zeroes.
     ///
     /// Authenticity is **not** among them and is not missing: the store opens
     /// the AEAD before this ever sees a byte, under a key derived from the
@@ -482,7 +661,14 @@ impl ContactRecord {
         let mut at = 1;
         let pk_lt = boxed_from_slice::<{ ml_dsa::PK_LEN }>(&bytes[at..at + ml_dsa::PK_LEN]);
         at += ml_dsa::PK_LEN;
-        let pk_pc = boxed_from_slice::<{ ml_dsa::PK_LEN }>(&bytes[at..at + ml_dsa::PK_LEN]);
+        let present = match bytes[at] {
+            PSEUDONYM_ABSENT => false,
+            PSEUDONYM_PRESENT => true,
+            found => return Err(ContactCacheError::UnknownPseudonymPresence { found }),
+        };
+        at += PSEUDONYM_PRESENCE_LEN;
+        let pk_pc = present
+            .then(|| boxed_from_slice::<{ ml_dsa::PK_LEN }>(&bytes[at..at + ml_dsa::PK_LEN]));
         at += ml_dsa::PK_LEN;
         let mut ar = [0u8; ROOT_LEN];
         ar.copy_from_slice(&bytes[at..at + ROOT_LEN]);
@@ -589,7 +775,7 @@ mod tests {
     fn record() -> ContactRecord {
         ContactRecord::new(
             pk(0x01),
-            pk(0x80),
+            Some(pk(0x80)),
             Zeroizing::new(ar()),
             FIRST_SEEN,
             LAST_SEEN,
@@ -616,7 +802,7 @@ mod tests {
             "the fixture's two keys are the same key"
         );
         assert_eq!(reopened.pk_lt(), pk(0x01).as_ref());
-        assert_eq!(reopened.pk_pc(), pk(0x80).as_ref());
+        assert_eq!(reopened.pk_pc(), Some(pk(0x80).as_ref()));
 
         // Likewise: distinct stamps, so a decode that read one field twice fails.
         assert_ne!(
@@ -643,7 +829,7 @@ mod tests {
         // And it tracks what it was given rather than being a constant.
         let other = ContactRecord::new(
             pk(0x01),
-            pk(0x80),
+            Some(pk(0x80)),
             Zeroizing::new(other_ar()),
             FIRST_SEEN,
             LAST_SEEN,
@@ -684,8 +870,8 @@ mod tests {
         assert_eq!(encoded.len(), CONTACT_RECORD_LEN);
 
         // The layout claim, at the offset the module docs declare:
-        // `version ‖ pk_lt ‖ pk_pc ‖ AR ‖ first_seen ‖ last_seen`.
-        let at = 1 + 2 * ml_dsa::PK_LEN;
+        // `version ‖ pk_lt ‖ pk_pc_present ‖ pk_pc ‖ AR ‖ first_seen ‖ last_seen`.
+        let at = 1 + 2 * ml_dsa::PK_LEN + PSEUDONYM_PRESENCE_LEN;
         assert_eq!(
             &encoded[at..at + ROOT_LEN],
             roots.ar.as_slice(),
@@ -710,7 +896,7 @@ mod tests {
     fn every_record_encodes_to_one_length() {
         let sparse = ContactRecord::new(
             Box::new([0u8; ml_dsa::PK_LEN]),
-            Box::new([0u8; ml_dsa::PK_LEN]),
+            None,
             Zeroizing::new([0x01u8; ROOT_LEN]),
             0,
             0,
@@ -741,7 +927,7 @@ mod tests {
         assert!(
             ContactRecord::new(
                 pk(0x01),
-                pk(0x80),
+                Some(pk(0x80)),
                 Zeroizing::new(ar()),
                 FIRST_SEEN,
                 FIRST_SEEN,
@@ -753,7 +939,7 @@ mod tests {
         assert_eq!(
             ContactRecord::new(
                 pk(0x01),
-                pk(0x80),
+                Some(pk(0x80)),
                 Zeroizing::new(ar()),
                 FIRST_SEEN,
                 FIRST_SEEN - 1,
@@ -946,7 +1132,7 @@ mod tests {
     fn a_placeholder_address_root_is_refused_at_both_doors() {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let build = |root: [u8; ROOT_LEN]| {
-            ContactRecord::new(pk(0x01), pk(0x80), Zeroizing::new(root), 0, 0)
+            ContactRecord::new(pk(0x01), Some(pk(0x80)), Zeroizing::new(root), 0, 0)
         };
 
         // Control: one bit away from the refused pattern, and accepted.
@@ -963,7 +1149,7 @@ mod tests {
         // the one that matters, since a placeholder on disk is what a future
         // writer would leave behind.
         let mut bytes = good.encode().to_vec();
-        let at = 1 + 2 * ml_dsa::PK_LEN;
+        let at = 1 + 2 * ml_dsa::PK_LEN + PSEUDONYM_PRESENCE_LEN;
         bytes[at..at + ROOT_LEN].fill(0);
         assert_eq!(
             ContactRecord::decode(&Zeroizing::new(bytes)).expect_err("decode accepted one"),
@@ -973,5 +1159,165 @@ mod tests {
         // And it says so, rather than only having a name.
         let said = ContactCacheError::PlaceholderAddressRoot.to_string();
         assert!(said.contains("placeholder"), "unhelpful rendering: {said}");
+    }
+
+    // ---- the pseudonym is absent until the correspondent accepts -------------
+
+    /// A record written by an initiator, which has no pseudonym for its
+    /// correspondent yet.
+    fn pending_record() -> ContactRecord {
+        ContactRecord::new(pk(0x01), None, Zeroizing::new(ar()), FIRST_SEEN, LAST_SEEN)
+            .expect("ordered timestamps")
+    }
+
+    /// **The oracle for the presence byte.** Both shapes survive the at-rest
+    /// form, and they are told apart by the byte rather than by the key's
+    /// contents — so a record waiting on its acceptance comes back waiting, and
+    /// one that has been accepted comes back with the key every frame's
+    /// authorship is checked against.
+    #[test]
+    fn a_record_round_trips_with_the_pseudonym_absent_and_present() {
+        let pending = ContactRecord::decode(&pending_record().encode()).expect("decodes");
+        assert_eq!(
+            pending.pk_pc(),
+            None,
+            "an absent pseudonym came back present"
+        );
+        assert_eq!(pending.pk_lt(), pk(0x01).as_ref());
+        assert_eq!(pending.address_root(), ar());
+        assert_eq!(pending.first_seen_ms(), FIRST_SEEN);
+        assert_eq!(pending.last_seen_ms(), LAST_SEEN);
+
+        let accepted = ContactRecord::decode(&record().encode()).expect("decodes");
+        assert_eq!(accepted.pk_pc(), Some(pk(0x80).as_ref()));
+
+        // **The absent key's bytes are zeroes at rest, and nothing else pins
+        // that.** The presence byte is what `decode` reads, so an encoder that
+        // wrote the real key under an ABSENT byte would round-trip correctly
+        // and every other assertion here would pass — while the key it claims
+        // not to hold sat in the record.
+        let at = 1 + ml_dsa::PK_LEN + PSEUDONYM_PRESENCE_LEN;
+        let encoded = pending_record().encode();
+        assert!(
+            encoded[at..at + ml_dsa::PK_LEN].iter().all(|b| *b == 0),
+            "an absent pseudonym's field is not zeroes at rest"
+        );
+        // Control: the same window carries the key when there is one, so the
+        // assertion above is about the absence and not about the offset.
+        assert_eq!(
+            &record().encode()[at..at + ml_dsa::PK_LEN],
+            pk(0x80).as_slice(),
+            "the pseudonym is not at the offset the check above reads"
+        );
+
+        // The two differ only in that field, so the assertions above are about
+        // the pseudonym and not about two unrelated fixtures.
+        assert_eq!(pending.pk_lt(), accepted.pk_lt());
+        assert_eq!(pending.address_root(), accepted.address_root());
+        assert_eq!(
+            pending.encode().len(),
+            accepted.encode().len(),
+            "the handshake's state reached the record's length"
+        );
+    }
+
+    /// The presence byte is what says the key is there, so the bytes under it
+    /// are filler when it says absent — and a record that claims the key IS
+    /// there while carrying that filler is refused rather than read as a
+    /// pseudonym of all zeroes.
+    #[test]
+    fn a_pseudonym_claimed_present_and_all_zeroes_is_refused_at_both_doors() {
+        // The constructor door.
+        assert_eq!(
+            ContactRecord::new(
+                pk(0x01),
+                Some(Box::new([0u8; ml_dsa::PK_LEN])),
+                Zeroizing::new(ar()),
+                FIRST_SEEN,
+                LAST_SEEN,
+            )
+            .expect_err("a placeholder pseudonym was accepted"),
+            ContactCacheError::PlaceholderPseudonym
+        );
+
+        // The at-rest door, over bytes that never went through `new`: an
+        // encoded pending record with its presence byte flipped to present, so
+        // the zeroes it already carries become the claimed key.
+        let at = 1 + ml_dsa::PK_LEN;
+        let mut bytes = pending_record().encode().to_vec();
+        assert_eq!(bytes[at], PSEUDONYM_ABSENT, "the fixture is not pending");
+        bytes[at] = PSEUDONYM_PRESENT;
+        assert_eq!(
+            ContactRecord::decode(&Zeroizing::new(bytes)).expect_err("decode accepted one"),
+            ContactCacheError::PlaceholderPseudonym
+        );
+
+        // Control: the same byte over a record that really does carry a key
+        // decodes, which pins the refusal to the zeroes rather than to the flip.
+        let mut good = record().encode().to_vec();
+        good[at] = PSEUDONYM_PRESENT;
+        assert_eq!(
+            ContactRecord::decode(&Zeroizing::new(good))
+                .expect("a real pseudonym was refused")
+                .pk_pc(),
+            Some(pk(0x80).as_ref())
+        );
+    }
+
+    /// An unrecognised presence byte is refused, never read as absence: bytes
+    /// that may say the pseudonym IS recorded must not quietly return a
+    /// correspondence to accepting an unauthenticated frame.
+    #[test]
+    fn an_unknown_pseudonym_presence_byte_is_refused() {
+        let at = 1 + ml_dsa::PK_LEN;
+        let mut bytes = record().encode().to_vec();
+        bytes[at] = 2;
+        assert_eq!(
+            ContactRecord::decode(&Zeroizing::new(bytes)).expect_err("decode accepted one"),
+            ContactCacheError::UnknownPseudonymPresence { found: 2 }
+        );
+
+        // And it says so, rather than only having a name.
+        let said = ContactCacheError::UnknownPseudonymPresence { found: 2 }.to_string();
+        assert!(said.contains('2'), "unhelpful rendering: {said}");
+    }
+
+    /// **The oracle for the fill.** The one transition an initiator's record
+    /// makes is absent-to-recorded; re-recording the identical key is accepted
+    /// and changes nothing, and a *different* key is refused with the recorded
+    /// one left exactly as it was.
+    #[test]
+    fn a_recorded_pseudonym_is_not_replaced_by_a_different_one() {
+        let mut c = pending_record();
+        assert!(
+            c.record_pseudonym(pk(0x80)).expect("fills"),
+            "the first key was not recorded"
+        );
+        assert_eq!(c.pk_pc(), Some(pk(0x80).as_ref()));
+
+        // Idempotent: a re-presented acceptance carries the same key.
+        assert!(
+            !c.record_pseudonym(pk(0x80)).expect("re-records"),
+            "re-recording the same key reported a change"
+        );
+
+        assert_eq!(
+            c.record_pseudonym(pk(0x40))
+                .expect_err("a second key was accepted"),
+            ContactCacheError::PseudonymAlreadyRecorded
+        );
+        assert_eq!(
+            c.pk_pc(),
+            Some(pk(0x80).as_ref()),
+            "the refused key displaced the recorded one"
+        );
+
+        // The refusal is about a *different* key, not about the field being
+        // occupied at all — so the placeholder guard still fires on it.
+        assert_eq!(
+            c.record_pseudonym(Box::new([0u8; ml_dsa::PK_LEN]))
+                .expect_err("a placeholder was accepted over a recorded key"),
+            ContactCacheError::PlaceholderPseudonym
+        );
     }
 }

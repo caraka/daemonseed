@@ -79,6 +79,28 @@ use crate::dm::types::{
 /// request refused for room here reappears once the user has cleared some.
 pub const PENDING_REQUEST_CAP: usize = 64;
 
+/// Consecutive faulty re-arm attempts after which a stored handshake is treated
+/// as unusable.
+///
+/// **Small on purpose.** Each attempt costs two sealed reads and the thing it is
+/// waiting for is a store that recovers within a tick or two; a record still
+/// unreadable after this many is one nothing is going to repair, and reading it
+/// for the rest of the session buys nothing. What giving up costs is the
+/// acceptance for one entry, which the correspondent's own re-seed offers again.
+const REARM_FAULT_CEILING: u8 = 8;
+
+/// Consecutive faulty attempts after which a collected acceptance's pseudonym
+/// stops being written.
+///
+/// **Small for the reason above, and giving up costs something different.** The
+/// re-arm gives up an acceptance the correspondent will offer again; this gives
+/// up the disk's memory of a conversation that has already verified, so the
+/// contact record is left torn and the next accept or knock for that identity
+/// repairs it. Both are bounded because the thing being waited on is a store
+/// that recovers within a tick or two, and neither is worth a sealed read on
+/// every tick for the rest of the session.
+const PSEUDONYM_WRITE_FAULT_CEILING: u8 = 8;
+
 /// The sending-direction sequence number the first-contact knock occupies.
 ///
 /// The same number as
@@ -703,13 +725,20 @@ struct Correspondence {
     /// [`DmEvent::ChannelHealth`]'s `peer_pseudonym_unknown` until the ACCEPT
     /// arrives and the next sweep retries it.
     ///
-    /// **Still in-memory only.** The at-rest home for the pseudonym pair is the
-    /// resume record (A4.8 / A9.2), and this driver writes none, so a restart
-    /// loses this exactly as it loses the ratchet — one event, not two.
+    /// **Read back at startup from the contact record**, which holds the
+    /// correspondent's pseudonym from the moment the acceptance is collected.
+    /// A correspondence whose entry has not been accepted has none recorded,
+    /// and comes back `None` — the same state it was in before the process
+    /// ended. This side's OWN pseudonym keypair is a different matter: its
+    /// at-rest home is the resume record (A4.8 / A9.2), this driver writes
+    /// none, and a restart loses it.
     peer_pk_pc: Option<Box<[u8; IDENTITY_PK_LEN]>>,
-    /// The conversation's address root and channel id, derived from `ss0` at
-    /// establishment. `None` alongside a `None` ratchet, and for the same
-    /// reason — nothing at rest carries them.
+    /// The conversation's address root and channel id, derived from `ss0`.
+    ///
+    /// `None` alongside a `None` ratchet on an established correspondence,
+    /// because nothing at rest carries `ss0` once the handshake is over. Before
+    /// the acceptance the provisional record still holds it, so both are
+    /// recomputed — see [`DmMachine::rearm_handshake`].
     channel: Option<ChannelRoots>,
     /// What has been collected on the receiving direction.
     collection: Collection,
@@ -826,6 +855,32 @@ struct Correspondence {
     /// the right key. `None` on the acceptor's side, which never writes one, and
     /// after the erasure.
     provisional: Option<(ProvisionalContext, u64)>,
+    /// Whether a stored handshake may still be re-armed for this
+    /// correspondence.
+    ///
+    /// Set only where the store says a first-contact entry was sent and not yet
+    /// accepted, which is the one state whose ratchet and channel roots can be
+    /// recomputed from disk. Cleared by the attempt itself, whether or not it
+    /// found anything — see [`DmMachine::rearm_handshake`] for why one
+    /// conclusive attempt is all a session gets.
+    rearm_handshake: bool,
+    /// Consecutive re-arm attempts that ended in a fault rather than an answer.
+    ///
+    /// Bounds the retry that a store fault earns: see
+    /// [`REARM_FAULT_CEILING`].
+    rearm_faults: u8,
+    /// Whether a collected acceptance's pseudonym still has to reach the
+    /// contact record.
+    ///
+    /// Set when the write that records it was refused, which leaves this
+    /// session able to speak on the conversation and the disk unable to
+    /// remember who it is with. The tick retries the write and erases the
+    /// handshake record once it lands; until then that record stays, because it
+    /// is the only state a restart could re-arm from.
+    pseudonym_unwritten: bool,
+    /// Consecutive attempts at that write that ended in a fault rather than an
+    /// answer. Bounded by [`PSEUDONYM_WRITE_FAULT_CEILING`].
+    pseudonym_faults: u8,
 }
 
 /// The recipient key-record address half of a
@@ -881,6 +936,25 @@ impl Correspondence {
     fn live(&self) -> Option<(&Ratchet, &SignKeypair, &ChannelRoots)> {
         match (&self.ratchet, &self.signing_pc, &self.channel) {
             (Some(r), Some(pc), Some(ch)) => Some((r, pc, ch)),
+            _ => None,
+        }
+    }
+
+    /// What it takes to READ this correspondence's pages: the ratchet and the
+    /// channel roots, without this side's own pseudonym keypair.
+    ///
+    /// **Sending needs a signing key and receiving does not**, and the two come
+    /// apart for one party in one window. An initiator whose process ended
+    /// before its entry was accepted has lost the pseudonym keypair it signed
+    /// that entry with — the key is minted from the CSPRNG and its at-rest
+    /// home, the resume record, does not exist until establishment — while the
+    /// ratchet and the roots are recomputable from the stored handshake. Such a
+    /// correspondence can still open the acceptance it is waiting for, which is
+    /// what its queued opening message depends on, so a page sweep asks this
+    /// rather than [`Self::live`].
+    fn receiving(&self) -> Option<(&Ratchet, &ChannelRoots)> {
+        match (&self.ratchet, &self.channel) {
+            (Some(r), Some(ch)) => Some((r, ch)),
             _ => None,
         }
     }
@@ -1266,6 +1340,8 @@ impl DmMachine {
                 }
             };
             for index in 0..self.correspondences.len() {
+                self.rearm_handshake(now_ms, index);
+                self.retry_pseudonym_write(now_ms, index);
                 out.extend(self.repair_cursor(index));
                 out.extend(self.give_ups(now_ms, index));
                 out.extend(self.due_emissions(now_ms, index));
@@ -1280,6 +1356,229 @@ impl DmMachine {
         // been waiting longest.
         out.extend(self.standalone_acks(now_ms));
         out
+    }
+
+    /// Try again to write a collected acceptance's pseudonym into the contact
+    /// record, and release the handshake record once it lands.
+    ///
+    /// **The pair is what makes a refused write recoverable.** The acceptance
+    /// has verified and this session holds the pseudonym, so the conversation
+    /// works; what is missing is the disk's memory of it. Until the write
+    /// succeeds the handshake record stays, because it is the only state a
+    /// restart can re-arm from — a correspondence that lost both would come back
+    /// waiting for an acceptance it can no longer open. When the write lands the
+    /// record is owed to the erase list rather than deleted here, so a store
+    /// that refuses the deletion is retried by the same tick that retries every
+    /// other one.
+    ///
+    /// **A refusal that no later attempt can change ends the retry AND releases
+    /// the handshake record**, which is the opposite of what holding on to it
+    /// achieves. A contact record that is absent, will not decode, or already
+    /// holds a different pseudonym answers the same way for ever
+    /// ([`DmPersistError::retrying_cannot_help`]), so retrying re-reads a sealed
+    /// record every tick for the life of the session — and because the erase
+    /// waits on the write, `ss0` would be kept on disk indefinitely against a
+    /// write that will never succeed. The design deletes `ss0` at establishment
+    /// regardless, and this correspondence is established: the acceptance
+    /// verified. What is left is a torn contact record, which the correspondent
+    /// repairs by knocking again or this side repairs by accepting one — and
+    /// neither of those needs the opening secret.
+    ///
+    /// **A fault that keeps recurring ends the same way, at
+    /// [`PSEUDONYM_WRITE_FAULT_CEILING`] consecutive attempts.** A store that
+    /// has not recovered by then is indistinguishable at each attempt from one
+    /// about to, so an unbounded retry reads and writes a sealed record every
+    /// tick for the life of the session and withholds the erase for exactly as
+    /// long. Giving up costs what the settled case costs, and for the same
+    /// reason: the acceptance verified, so the correspondence is established
+    /// whatever the disk remembers.
+    fn retry_pseudonym_write(&mut self, now_ms: i64, index: usize) {
+        if !self.correspondences[index].pseudonym_unwritten {
+            return;
+        }
+        let Some(pk_pc) = self.correspondences[index].peer_pk_pc.clone() else {
+            // Unreachable through `on_page`, which installs the key in the same
+            // arm that sets the flag. Cleared rather than retried for ever: with
+            // no key there is nothing this call could write.
+            self.correspondences[index].pseudonym_unwritten = false;
+            return;
+        };
+        let label = self.correspondences[index].label;
+        match self
+            .persist
+            .record_correspondent_pseudonym(&label, pk_pc, now_ms)
+        {
+            Ok(_) => self.stop_owing_the_pseudonym(index, label),
+            Err(e) if e.retrying_cannot_help() => {
+                crate::vtrace!("dm driver: the pseudonym will never record: {e}");
+                self.stop_owing_the_pseudonym(index, label);
+            }
+            Err(e) => {
+                crate::vtrace!("dm driver: the pseudonym still would not record: {e}");
+                let faults = self.correspondences[index]
+                    .pseudonym_faults
+                    .saturating_add(1);
+                self.correspondences[index].pseudonym_faults = faults;
+                if faults >= PSEUDONYM_WRITE_FAULT_CEILING {
+                    crate::vtrace!(
+                        "dm driver: giving up on the pseudonym after {PSEUDONYM_WRITE_FAULT_CEILING} faults"
+                    );
+                    self.stop_owing_the_pseudonym(index, label);
+                }
+            }
+        }
+    }
+
+    /// Stop retrying the pseudonym write and release the handshake record it
+    /// was holding.
+    ///
+    /// One body for all three endings — the write landed, it never can, or it
+    /// has faulted too many times running — so none of them can drift into
+    /// releasing a different amount. The record goes to the erase list rather
+    /// than being deleted here, so a store that refuses the deletion is retried
+    /// by the same tick that retries every other one.
+    fn stop_owing_the_pseudonym(&mut self, index: usize, label: CorrespondenceLabel) {
+        self.correspondences[index].pseudonym_unwritten = false;
+        if let Some((keyrec_addr, fc_epoch)) = self.correspondences[index].provisional.take() {
+            self.pending_erase.push((label, keyrec_addr, fc_epoch));
+        }
+    }
+
+    /// Recompute the ratchet and channel roots of a correspondence whose
+    /// first-contact entry has been sent and not yet accepted.
+    ///
+    /// **Without this a restarted initiator can find its correspondence and
+    /// still not read it.** The contact record says which correspondence a
+    /// correspondent's identity key belongs to; it deliberately holds no `ss0`,
+    /// so it yields neither a ratchet nor the `chan_id` every frame's seal
+    /// binds. Both come back from the provisional record, which stays on disk
+    /// for exactly this window — until an acceptance verifies — and the
+    /// acceptance is an ordinary channel frame that cannot be opened without
+    /// them. So a correspondence left unarmed sweeps nothing, opens nothing,
+    /// and the correspondent's messages re-emit until their outbox gives up on
+    /// them.
+    ///
+    /// **The context is rebuilt rather than remembered.** A provisional record
+    /// opens only under the context it was sealed with, which binds the
+    /// recipient's key-record address and the first-contact epoch. The address
+    /// derives from the correspondent's identity key, which the contact record
+    /// holds; the epoch does not, so both live epochs are tried, exactly as the
+    /// lookup that finds a recipient's existing label does.
+    ///
+    /// **One CONCLUSIVE attempt per session, and a store fault is not
+    /// conclusive.** Epochs only move forward, so a record that is absent or
+    /// will not decode at both epochs tried here will answer the same way on
+    /// every later tick — retrying that would re-read two sealed records for
+    /// the life of the entry and never answer differently. A store that could
+    /// not be read says nothing about the record at all, and clearing the flag
+    /// on one would leave the correspondence without a ratchet for the rest of
+    /// the session over a fault that may already have passed, which is exactly
+    /// the state this call exists to prevent. So the flag survives that answer
+    /// and the next tick tries again. An entry that outlives its epochs is the
+    /// bound this leaves, and it is the same bound the label lookup carries.
+    ///
+    /// **A key derivation that fails is decisive too.** The correspondent's
+    /// key-record address is derived from a `pk_lt` held in memory and reads no
+    /// disk, so a later tick runs the identical computation over the identical
+    /// bytes and cannot answer differently.
+    ///
+    /// **The retry is bounded at [`REARM_FAULT_CEILING`] consecutive faults.** A
+    /// store fault that never clears — a truncated record nothing repairs — is
+    /// indistinguishable at each attempt from one that is about to, so an
+    /// unbounded retry re-reads two sealed records every tick for the life of
+    /// the session. Past the ceiling the record is treated as unusable, which is
+    /// the answer the same bytes would have given if the store had managed to
+    /// classify them.
+    ///
+    /// A correspondence that is re-armed carries its provisional context
+    /// forward, so the record is erased where every other path erases it: when
+    /// the acceptance verifies.
+    fn rearm_handshake(&mut self, now_ms: i64, index: usize) {
+        if !self.correspondences[index].rearm_handshake {
+            return;
+        }
+        let Self {
+            persist,
+            correspondences,
+            ..
+        } = self;
+        let correspondence = &mut correspondences[index];
+        let keyrec_addr = match keyrec::derive_owner_seed(&correspondence.pk_lt) {
+            Ok(seed) => *seed.as_bytes(),
+            Err(e) => {
+                crate::vtrace!("dm driver: correspondent key-record derivation failed: {e}");
+                correspondence.rearm_handshake = false;
+                return;
+            }
+        };
+        let current = keyrec::fc_epoch(unix_secs(now_ms));
+        // Set by any answer that a later tick could answer differently: a store
+        // that would not read, or a crypto fault deriving from a record that
+        // did. Absence and an undecodable record are not among them.
+        let mut retryable = false;
+        for fc_epoch in [current, current.saturating_sub(1)] {
+            let ctx = RecordContext {
+                recipient_keyrec_addr: &keyrec_addr,
+                fc_epoch,
+            };
+            // `peek_`, not `restart_channel`: this asks whether a handshake is
+            // there and takes nothing on the answer, so the cleaning form would
+            // delete a record the caller has not finished with.
+            let pending = match persist.peek_channel_restart(&correspondence.label, &ctx) {
+                daemonseed_core::dm::persist::StoredChannelRestart::HandshakeResumes(pending) => {
+                    pending
+                }
+                daemonseed_core::dm::persist::StoredChannelRestart::Established(_) => continue,
+                daemonseed_core::dm::persist::StoredChannelRestart::TornDown(teardown) => {
+                    if let TeardownCause::StoreUnreadable(cause) = teardown.cause() {
+                        crate::vtrace!("dm driver: the stored handshake would not read: {cause}");
+                        retryable = true;
+                    }
+                    continue;
+                }
+            };
+            let roots = match pending.channel_roots() {
+                Ok(roots) => roots,
+                Err(e) => {
+                    crate::vtrace!("dm driver: the stored handshake's roots would not derive: {e}");
+                    retryable = true;
+                    continue;
+                }
+            };
+            let ratchet = match pending.ratchet() {
+                // The handle is dropped uncommitted: the record it names is
+                // what the acceptance will be opened against, and erasing it
+                // here would take the conversation's opening secret with it.
+                Ok(ratchet) => ratchet,
+                Err(e) => {
+                    crate::vtrace!("dm driver: the stored handshake would not open: {e}");
+                    retryable = true;
+                    continue;
+                }
+            };
+            correspondence.channel = Some(ChannelRoots {
+                address_root: roots.ar,
+                chan_id: roots.chan_id,
+            });
+            correspondence.ratchet = Some(ratchet);
+            correspondence.provisional = Some((keyrec_addr, fc_epoch));
+            correspondence.rearm_handshake = false;
+            return;
+        }
+        if !retryable {
+            correspondence.rearm_handshake = false;
+            crate::vtrace!(
+                "dm driver: no stored handshake opened for a correspondence awaiting its acceptance"
+            );
+            return;
+        }
+        correspondence.rearm_faults = correspondence.rearm_faults.saturating_add(1);
+        if correspondence.rearm_faults >= REARM_FAULT_CEILING {
+            correspondence.rearm_handshake = false;
+            crate::vtrace!(
+                "dm driver: giving up on a stored handshake after {REARM_FAULT_CEILING} faults"
+            );
+        }
     }
 
     /// Replace a `cursor.bin` the seed found unreadable, once.
@@ -2160,7 +2459,7 @@ impl DmMachine {
             ..
         } = self;
         let correspondence = &mut correspondences[index];
-        if correspondence.live().is_none() {
+        if correspondence.receiving().is_none() {
             return Vec::new();
         }
         let Some(block_list) = block_list else {
@@ -2179,7 +2478,7 @@ impl DmMachine {
         // because the acceptance itself arrives by sweep: it is an ordinary
         // channel frame at the acceptor's sequence zero. What it cannot do is
         // open anything later than that, which `on_page` decides per slot.
-        let Some((ratchet, _, channel)) = correspondence.live() else {
+        let Some((ratchet, channel)) = correspondence.receiving() else {
             return Vec::new();
         };
         let conversation = *ratchet.ar_fingerprint();
@@ -2643,8 +2942,30 @@ impl DmMachine {
                     // after a verified acceptance: a failed open leaves the
                     // ratchet, the record and the slot exactly as they were.
                     if let Some(pk_pc) = installed {
+                        // **The record is written first, and the handshake
+                        // record is erased only if that write succeeded.** The
+                        // contact record was created when the entry was sent
+                        // and has held no pseudonym since; this is the one
+                        // transition it makes. Erasing the handshake record
+                        // regardless would destroy the only state a restart
+                        // could re-arm from while leaving the pseudonym
+                        // unrecorded — a correspondence that comes back
+                        // waiting for an acceptance it can no longer open, and
+                        // no later frame could ever establish it. So a refused
+                        // write keeps both the handle and the record, and the
+                        // tick retries the pair.
+                        match persist.record_correspondent_pseudonym(
+                            &correspondence.label,
+                            pk_pc.clone(),
+                            now_ms,
+                        ) {
+                            Ok(_) => erase_provisional(persist, correspondence),
+                            Err(e) => {
+                                crate::vtrace!("dm driver: the pseudonym would not record: {e}");
+                                correspondence.pseudonym_unwritten = true;
+                            }
+                        }
                         correspondence.peer_pk_pc = Some(pk_pc);
-                        erase_provisional(persist, correspondence);
                     }
                     if correspondence.collection.collected(at).is_err() {
                         correspondence.owed_acks.push(at);
@@ -3249,8 +3570,8 @@ impl DmMachine {
             if pending.iter().any(|held| held.knock.pk_lt() == pk) {
                 return true;
             }
-            match persist.correspondence_for_pk_lt(pk) {
-                Ok(found) => found.is_some(),
+            match established_with(persist, pk) {
+                Ok(found) => found,
                 // Fail closed: an unreadable or ambiguous store must not read
                 // as "this identity is a stranger", which would surface a
                 // second contact request for an existing correspondent. The
@@ -3437,9 +3758,9 @@ impl DmMachine {
         // destroyed. Asking the two questions that can be asked without it
         // means the two failures a user can actually do something about leave
         // the request on screen to answer again.
-        match self.persist.correspondence_for_pk_lt(&pk_lt) {
-            Ok(Some(_)) => return self.hold_again(held, AcceptFailure::AlreadyEstablished),
-            Ok(None) => {}
+        match self.established_with(&pk_lt) {
+            Ok(true) => return self.hold_again(held, AcceptFailure::AlreadyEstablished),
+            Ok(false) => {}
             Err(e) => {
                 crate::vtrace!("dm driver: correspondence lookup failed: {e}");
                 return self.hold_again(held, AcceptFailure::StoreFailure);
@@ -3523,6 +3844,10 @@ impl DmMachine {
                         // The acceptor holds no provisional record: it was
                         // never the one waiting on a reply.
                         provisional: None,
+                        rearm_handshake: false,
+                        rearm_faults: 0,
+                        pseudonym_unwritten: false,
+                        pseudonym_faults: 0,
                     });
                 }
                 // **The acceptance fires here, in the same call**, because the
@@ -3794,15 +4119,15 @@ impl DmMachine {
         // our at-rest state, and their client answers it by ending every
         // message they have queued for us — so an unguarded `FirstContact` from
         // the UI is a way to destroy a live conversation from the wrong button.
-        match self.persist.correspondence_for_pk_lt(&recipient) {
-            Ok(Some(_)) => {
+        match self.established_with(&recipient) {
+            Ok(true) => {
                 return vec![DmEffect::Emit(refused(
                     &recipient,
                     RefusalReason::AlreadyEstablished,
                     None,
                 ))];
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(e) => {
                 // Fail closed for the same reason the sweep does: an unreadable
                 // store must not read as "this identity is a stranger".
@@ -4013,6 +4338,40 @@ impl DmMachine {
             crate::vtrace!("dm driver: provisional record write failed: {e}");
             return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
         }
+        // **The contact record is written HERE, before the entry is published,
+        // and it is what a restart taken before the acceptance depends on.**
+        // The provisional record above holds the handshake's secrets and says
+        // nothing about who this correspondence is with, so on its own it
+        // leaves `DmPersist::correspondence_for_pk_lt` unable to map the
+        // correspondent's identity key back to this label — and that mapping is
+        // how an acceptance is routed to the entry it answers. Without it a
+        // restart strands the knock: the acceptance is never collected and
+        // every message the correspondent composes re-emits to the outbox's
+        // seven-day give-up. The record carries no pseudonym; the correspondent's
+        // is installed by `on_page` when their acceptance verifies.
+        if let Err(e) = self.persist.record_first_contact_sent(
+            &label,
+            Box::new(*recipient),
+            zeroize::Zeroizing::new(channel.address_root),
+            now_ms,
+        ) {
+            crate::vtrace!("dm driver: contact record write failed: {e}");
+            // **The handshake record written a moment ago goes with the
+            // refusal.** A refused introduction prunes this session's memory of
+            // it and deletes nothing, so leaving it would strand `ss0` on disk
+            // in a correspondence nothing can reach: the startup seed skips a
+            // directory with no contact record, and the sweep that collects
+            // superseded handshake records only looks beside a resume record,
+            // which this correspondence has never had. A deletion the store
+            // refuses goes to the retry list rather than being dropped, because
+            // the context naming that record is the only thing that can ever
+            // open it again.
+            if !erase_record(&self.persist, &label, &recipient_keyrec_addr, fc_epoch) {
+                self.pending_erase
+                    .push((label, recipient_keyrec_addr, fc_epoch));
+            }
+            return self.refuse_introduction(&recipient, RefusalReason::StoreFailure, None);
+        }
         let owner_seed = match doorbell::derive_owner_seed(&recipient) {
             Ok(seed) => *seed.as_bytes(),
             Err(e) => {
@@ -4133,6 +4492,10 @@ impl DmMachine {
                 own_ack: AckState::new(),
                 last_accept_refusal: None,
                 provisional: Some((recipient_keyrec_addr, fc_epoch)),
+                rearm_handshake: false,
+                rearm_faults: 0,
+                pseudonym_unwritten: false,
+                pseudonym_faults: 0,
             });
         }
 
@@ -4240,9 +4603,33 @@ impl DmMachine {
                 }
             }
         }
+        // **A correspondence already recorded for this identity is reused, and
+        // this is the last thing standing between a re-sent entry and an
+        // unroutable identity.** The peek above finds a label only while the
+        // provisional record still opens, which is the two live first-contact
+        // epochs; the contact record has no such window, so an entry re-sent
+        // after that has passed still finds its label here. Minting instead
+        // would put a second contact record under a second label for one
+        // identity, and `correspondence_for_pk_lt` refuses to choose between
+        // two — the identity would be unroutable for the life of the store.
+        if let Some(label) = self.persist.correspondence_for_pk_lt(recipient)? {
+            self.provisionals.push((Box::new(**recipient), label));
+            return Ok(label);
+        }
         let label = CorrespondenceLabel::mint()?;
         self.provisionals.push((Box::new(**recipient), label));
         Ok(label)
+    }
+
+    /// [`established_with`] over this machine's store.
+    ///
+    /// The free function is what the doorbell sweep reaches, because that path
+    /// destructures `self` to borrow the seen and spent sets alongside it.
+    fn established_with(
+        &self,
+        pk_lt: &[u8; IDENTITY_PK_LEN],
+    ) -> Result<bool, daemonseed_core::dm::persist::DmPersistError> {
+        established_with(&self.persist, pk_lt)
     }
 
     /// Whether this recipient already has an introduction between the command
@@ -4543,6 +4930,34 @@ fn collection_accepting_a_knock() -> Collection {
     collection
 }
 
+/// Whether the store holds an ESTABLISHED correspondence with this identity.
+///
+/// [`DmPersist::correspondence_for_pk_lt`] answers for both an established
+/// correspondence and one whose own first-contact entry is still unanswered,
+/// because the second is what routes an acceptance back to the entry it
+/// answers. Every caller here means the first: an unanswered entry of this
+/// side's own must not make the correspondent a stranger — the admission gate
+/// would then stop offering their knock, and a mutual knock, where each side
+/// knocks before either answers, would leave both sides waiting for an
+/// acceptance neither can send.
+///
+/// A record with no pseudonym is the unanswered case; see
+/// [`ContactRecord::pk_pc`](daemonseed_core::dm::contact_cache::ContactRecord::pk_pc).
+/// A record that vanishes between the two reads answers "not established",
+/// which refuses nothing and leaves every write downstream to take the store's
+/// own lock.
+fn established_with(
+    persist: &DmPersist,
+    pk_lt: &[u8; IDENTITY_PK_LEN],
+) -> Result<bool, daemonseed_core::dm::persist::DmPersistError> {
+    let Some(label) = persist.correspondence_for_pk_lt(pk_lt)? else {
+        return Ok(false);
+    };
+    Ok(persist
+        .read_contact(&label)?
+        .is_some_and(|contact| contact.pk_pc().is_some()))
+}
+
 fn erase_provisional(persist: &DmPersist, correspondence: &mut Correspondence) {
     let Some((keyrec_addr, fc_epoch)) = correspondence.provisional else {
         return;
@@ -4745,7 +5160,13 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             label,
             ratchet: None,
             signing_pc: None,
-            peer_pk_pc: Some(Box::new(*record.pk_pc())),
+            // Absent on a correspondence whose first-contact entry has been
+            // sent and not yet accepted, which is the state the record was
+            // written in. `on_page` reads the same absence as "only the
+            // acceptance can be opened", so a restarted initiator resumes
+            // waiting for the frame it was waiting for rather than treating the
+            // conversation as verifiable.
+            peer_pk_pc: record.pk_pc().map(|pk_pc| Box::new(*pk_pc)),
             channel: None,
             collection: Collection::resuming_from_page(page),
             read_through: 0,
@@ -4757,9 +5178,21 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             pending_sent_ms: Vec::new(),
             own_ack: AckState::new(),
             last_accept_refusal: None,
-            // A correspondence on disk is one that was established; nothing
-            // provisional survives it.
+            // Named by the re-arm below, which is the only thing here that
+            // knows the epoch a stored handshake was sealed under. Nothing is
+            // erased on the strength of a handle this seed invented.
             provisional: None,
+            // Set from the record, which distinguishes an established
+            // correspondence from one whose first-contact entry is still
+            // unanswered. Only the second has a stored handshake to
+            // recompute a ratchet and channel roots from.
+            rearm_handshake: record.pk_pc().is_none(),
+            rearm_faults: 0,
+            // Nothing is owed on a record read back from disk: the pseudonym
+            // it holds is already written down, and one it does not hold has
+            // not been collected.
+            pseudonym_unwritten: false,
+            pseudonym_faults: 0,
         });
     }
     out
@@ -5726,7 +6159,7 @@ mod tests {
                     );
                     Ok(daemonseed_core::dm::contact_cache::ContactRecord::new(
                         Box::new(*seeded.pk_lt()),
-                        Box::new(*seeded.pk_pc()),
+                        Some(Box::new(*seeded.pk_pc())),
                         ar,
                         BASE_MS,
                         BASE_MS,
@@ -6020,6 +6453,10 @@ mod tests {
             own_ack: AckState::new(),
             last_accept_refusal: None,
             provisional: None,
+            rearm_handshake: false,
+            rearm_faults: 0,
+            pseudonym_unwritten: false,
+            pseudonym_faults: 0,
         });
         assert_eq!(
             m.only_next_send_seq(),
@@ -6132,6 +6569,10 @@ mod tests {
             own_ack: AckState::new(),
             last_accept_refusal: None,
             provisional: None,
+            rearm_handshake: false,
+            rearm_faults: 0,
+            pseudonym_unwritten: false,
+            pseudonym_faults: 0,
         });
         assert_eq!(
             m.only_next_send_seq(),
@@ -6285,9 +6726,19 @@ mod tests {
     /// left behind is a genuine initiator with no pseudonym for its
     /// correspondent — which is the state every test below is about.
     fn knock_as_initiator(a: &mut DmMachine, peer: &IdentityKeys) -> (u16, Vec<u8>) {
+        knock_as_initiator_at(a, peer, BASE_MS)
+    }
+
+    /// [`knock_as_initiator`] at a named instant, for a test that has to cross
+    /// a first-contact epoch boundary.
+    fn knock_as_initiator_at(
+        a: &mut DmMachine,
+        peer: &IdentityKeys,
+        now_ms: i64,
+    ) -> (u16, Vec<u8>) {
         let pk_lt: PkLt = Box::new(*peer.signing.public_key());
         let out = a.on_command(
-            BASE_MS,
+            now_ms,
             DmCommand::FirstContact {
                 recipient: pk_lt.clone(),
                 body: "knock".into(),
@@ -6304,12 +6755,12 @@ mod tests {
             keyrec::DM_KEY_RECORD_INVITE_ONLY,
         )
         .expect("key record");
-        let mut out = a.on_key_record(BASE_MS, pk_lt, Some(record));
+        let mut out = a.on_key_record(now_ms, pk_lt, Some(record));
         assert_eq!(out.len(), 1, "the key record did not start a mint: {out:?}");
         let DmEffect::Compute(ComputeJob::MintFirstContact(request)) = out.remove(0) else {
             panic!("the key record did not start a mint");
         };
-        let out = a.on_mint(BASE_MS, run_mint(*request));
+        let out = a.on_mint(now_ms, run_mint(*request));
         out.iter()
             .find_map(|e| match e {
                 DmEffect::Dht(DhtOp::PublishDoorbell { entry, slot, .. }) => {
@@ -8049,6 +8500,776 @@ mod tests {
         }
     }
 
+    /// M26. A knock this driver sent is on disk under the recipient's identity
+    /// key before the entry is published, and a restart finds it there.
+    ///
+    /// **The entry the driver publishes names nothing the acceptance can be
+    /// routed by.** An acceptance arrives carrying the correspondent's identity
+    /// key and nothing else this side knows, and the only path from that key to
+    /// a correspondence is a contact record — so an initiator that wrote none
+    /// until the acceptance verified would, after a restart, have no
+    /// correspondence to collect it into. The correspondent's messages then
+    /// re-emit until the outbox gives up on them, seven days later, and are
+    /// surfaced to them as undelivered.
+    ///
+    /// The record carries no pseudonym, and the restarted correspondence does
+    /// not either: that absence is what tells the page sweep only the
+    /// acceptance may be opened. The acceptance is then delivered to the
+    /// restarted driver and collected, which is the whole of what the
+    /// correspondent's queued messages wait on.
+    #[test]
+    fn a_knock_survives_a_restart_and_collects_the_acceptance_it_was_waiting_for() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let peer = peer_identity();
+        let peer_pk = *peer.signing.public_key();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision B");
+
+        let (label, acceptance) = {
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            let entry = knock_as_initiator(&mut a, &peer);
+
+            let label = a
+                .persist
+                .correspondence_for_pk_lt(&peer_pk)
+                .expect("lookup")
+                .expect("the knock recorded no correspondence for its recipient");
+            assert_eq!(
+                label, a.correspondences[0].label,
+                "the record is under a label this driver does not hold"
+            );
+            let record = a
+                .persist
+                .read_contact(&label)
+                .expect("reads")
+                .expect("a record");
+            assert_eq!(record.pk_lt().as_slice(), peer_pk.as_slice());
+            assert_eq!(
+                record.pk_pc(),
+                None,
+                "the initiator recorded a pseudonym it cannot know yet"
+            );
+            assert_eq!(
+                record.address_root(),
+                a.correspondences[0]
+                    .channel
+                    .as_ref()
+                    .expect("the knock opened a channel")
+                    .address_root,
+                "the record addresses a channel this driver is not using"
+            );
+            // The correspondent answers while this side is still running, so
+            // the acceptance is waiting on their pages when it comes back.
+            let offered = b.on_doorbell(BASE_MS, sweep_of(vec![entry]));
+            let request = offered
+                .iter()
+                .find_map(|e| match e {
+                    DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => {
+                        Some(request.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the correspondent was not offered the entry");
+            b.on_command(BASE_MS, DmCommand::Accept { request });
+            let label_b = b.correspondences[b.correspondences.len() - 1].label;
+            (label, queued_frame_at(&b, &label_b, 0, BASE_MS))
+        };
+
+        // The restart: a second machine over the same store, seeded from disk,
+        // holding nothing the first one held.
+        let mut a = machine(&dir);
+        assert_eq!(
+            a.correspondence_count(),
+            1,
+            "the unanswered correspondence did not survive the restart"
+        );
+        assert_eq!(a.correspondences[0].label, label);
+        assert_eq!(a.correspondences[0].pk_lt.as_slice(), peer_pk.as_slice());
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_none(),
+            "a correspondence still waiting for its acceptance came back verifiable"
+        );
+        assert_eq!(
+            a.persist
+                .correspondence_for_pk_lt(&peer_pk)
+                .expect("lookup"),
+            Some(label),
+            "the restarted driver cannot route an acceptance by identity key"
+        );
+        assert!(
+            a.correspondences[0].ratchet.is_none(),
+            "the seed produced a ratchet, so the re-arm below proves nothing"
+        );
+
+        // The tick that re-arms it from the stored handshake.
+        a.on_tick(BASE_MS);
+        assert!(
+            a.correspondences[0].ratchet.is_some() && a.correspondences[0].channel.is_some(),
+            "the stored handshake was not re-armed, so no page can be opened"
+        );
+
+        let conversation = conversation_of(&a, 0);
+        let out = fold_page_at(
+            &mut a,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(0), acceptance)],
+        );
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_some(),
+            "the restarted driver did not collect the acceptance: {out:?}"
+        );
+        assert_eq!(
+            a.correspondences[0]
+                .peer_pk_pc
+                .as_deref()
+                .map(|k| k.as_slice()),
+            a.persist
+                .read_contact(&label)
+                .expect("reads")
+                .expect("a record")
+                .pk_pc()
+                .map(|k| k.as_slice()),
+            "the collected pseudonym did not reach the record a later restart reads"
+        );
+        assert_eq!(
+            messages_in(&out),
+            vec![String::new()],
+            "the acceptance must surface once, with an empty body: {out:?}"
+        );
+    }
+
+    /// One first-contact epoch, in the milliseconds the driver counts in.
+    const FC_PERIOD_MS: i64 = (daemonseed_core::dm::keyrec::FC_PERIOD_SECS as i64) * 1000;
+
+    /// M27. A restarted correspondence plans the sweep that fetches its
+    /// acceptance.
+    ///
+    /// **Kills a page sweep that keeps requiring this side's own pseudonym
+    /// keypair.** An initiator that restarts before its entry is accepted has
+    /// lost that keypair — it is minted from the CSPRNG and nothing writes it
+    /// down before establishment — while the ratchet and channel roots come
+    /// back from the stored handshake. Requiring it would leave the
+    /// correspondence planning nothing, so the acceptance would never be
+    /// fetched and the test that folds a page by hand would never notice.
+    #[test]
+    fn a_restarted_correspondence_plans_the_sweep_that_fetches_its_acceptance() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let peer = peer_identity();
+        {
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            let _ = knock_as_initiator(&mut a, &peer);
+        }
+
+        let mut a = machine(&dir);
+        assert!(
+            a.correspondences[0].signing_pc.is_none(),
+            "the restart kept a pseudonym keypair, so this proves nothing"
+        );
+        let out = a.on_tick(BASE_MS);
+        let swept: Vec<_> = out
+            .iter()
+            .filter(|e| matches!(e, DmEffect::Dht(DhtOp::SweepPage { .. })))
+            .collect();
+        assert!(
+            !swept.is_empty(),
+            "a restarted correspondence planned no page sweep: {out:?}"
+        );
+    }
+
+    /// M28. The stored handshake is re-armed from the PREVIOUS first-contact
+    /// epoch as well as the current one.
+    ///
+    /// **Kills a re-arm that only tries the epoch it is running in.** A record
+    /// is sealed under the epoch its entry was composed in, and an acceptance
+    /// arrives whenever the correspondent gets to it — commonly in the epoch
+    /// after. Trying one epoch would strand every entry that outlived the week
+    /// it was sent in.
+    #[test]
+    fn a_stored_handshake_is_re_armed_from_the_previous_epoch() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let peer = peer_identity();
+        {
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            let _ = knock_as_initiator(&mut a, &peer);
+        }
+
+        let later = BASE_MS + FC_PERIOD_MS;
+        assert_ne!(
+            keyrec::fc_epoch(unix_secs(later)),
+            keyrec::fc_epoch(unix_secs(BASE_MS)),
+            "the fixture did not cross an epoch boundary"
+        );
+        let mut a = machine(&dir);
+        a.on_tick(later);
+        assert!(
+            a.correspondences[0].ratchet.is_some(),
+            "a handshake sealed one epoch ago was not re-armed"
+        );
+    }
+
+    /// M29. An established correspondence is never re-armed, and a tick leaves
+    /// it holding no handshake record.
+    ///
+    /// **Kills a seed that marks every correspondence for re-arming.** An
+    /// established one has no handshake record — it was erased when the
+    /// acceptance verified — so a re-arm would read two sealed records per
+    /// correspondence on the first tick of every session and could only ever
+    /// answer that there is nothing there. Worse, a handle installed on the
+    /// strength of some other record would name something for the erase to
+    /// delete.
+    #[test]
+    fn an_established_correspondence_is_not_re_armed() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_identity();
+        {
+            let mut a = machine(&dir_a);
+            let mut b = machine_as(peer_identity(), &dir_b);
+            a.persist.provision_block_list().expect("provision A");
+            b.persist.provision_block_list().expect("provision B");
+            establish_pair(&mut a, &mut b, &b_keys);
+        }
+
+        let mut a = machine(&dir_a);
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_some(),
+            "the fixture did not establish the correspondence it is about"
+        );
+        assert!(
+            !a.correspondences[0].rearm_handshake,
+            "an established correspondence was marked for re-arming"
+        );
+        a.on_tick(BASE_MS);
+        assert!(
+            a.correspondences[0].provisional.is_none(),
+            "a tick gave an established correspondence a handshake record to erase"
+        );
+        assert!(
+            a.correspondences[0].ratchet.is_none(),
+            "a tick armed a ratchet for a correspondence with no stored handshake"
+        );
+    }
+
+    /// M30. A store that will not read leaves the re-arm to the next tick.
+    ///
+    /// **Kills a one-shot flag cleared before the attempt.** Absence and an
+    /// undecodable record answer the same way on every later tick, so one
+    /// attempt is right for them; a store that could not be read says nothing
+    /// about the record, and giving up on it would leave the correspondence
+    /// without a ratchet for the rest of the session — the very state the
+    /// re-arm exists to prevent. The fault here is made by truncating the
+    /// record, which the store reports as a file it cannot read.
+    #[test]
+    fn a_store_fault_leaves_the_re_arm_for_the_next_tick() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let peer = peer_identity();
+        {
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            let _ = knock_as_initiator(&mut a, &peer);
+        }
+
+        let mut a = machine(&dir);
+        let files = provisional_files(&a);
+        assert_eq!(files.len(), 1, "the fixture must hold exactly one record");
+        let path = files[0].clone();
+        let healthy = std::fs::read(&path).expect("the record reads");
+        std::fs::write(&path, &healthy[..healthy.len() - 1]).expect("the record writes");
+
+        a.on_tick(BASE_MS);
+        assert!(
+            a.correspondences[0].ratchet.is_none(),
+            "the truncated record was read anyway, so the fault is not the fixture's"
+        );
+        assert!(
+            a.correspondences[0].rearm_handshake,
+            "a store fault gave up the re-arm for the whole session"
+        );
+
+        std::fs::write(&path, &healthy).expect("the record is restored");
+        a.on_tick(BASE_MS);
+        assert!(
+            a.correspondences[0].ratchet.is_some(),
+            "the tick after the store recovered did not re-arm"
+        );
+    }
+
+    /// M31. A refused pseudonym write keeps the handshake record, and the tick
+    /// finishes the pair.
+    ///
+    /// **Kills an erase that runs whatever the write did.** The acceptance is
+    /// the only frame carrying the correspondent's pseudonym. Erasing the
+    /// handshake record while that key is unrecorded destroys the one state a
+    /// restart could re-arm from and leaves the contact record still waiting,
+    /// so the correspondence would come back unable to open the acceptance
+    /// again — and no later frame could establish it.
+    #[test]
+    fn a_refused_pseudonym_write_keeps_the_handshake_record_until_it_lands() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let peer = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision B");
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let entry = knock_as_initiator(&mut a, &peer);
+
+        let offered = b.on_doorbell(BASE_MS, sweep_of(vec![entry]));
+        let request = offered
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("the correspondent was not offered the entry");
+        b.on_command(BASE_MS, DmCommand::Accept { request });
+        let label_b = b.correspondences[b.correspondences.len() - 1].label;
+        let acceptance = queued_frame_at(&b, &label_b, 0, BASE_MS);
+
+        // The fault: the record the pseudonym must be written into is gone, so
+        // the write is refused and nothing about the acceptance itself changes.
+        // Named the way the store names it: the directory is the label in hex.
+        let dir_name: String = a.correspondences[0]
+            .label
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let contact = a
+            .persist
+            .store()
+            .root()
+            .join(dir_name)
+            .join("contact-cache.bin");
+        let held = std::fs::read(&contact).expect("the record reads");
+        std::fs::remove_file(&contact).expect("the record is removed");
+
+        let conversation = conversation_of(&a, 0);
+        fold_page_at(
+            &mut a,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(0), acceptance)],
+        );
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_some(),
+            "the acceptance verified and was not installed in memory"
+        );
+        assert!(
+            has_provisional(&a),
+            "the handshake record was erased while the pseudonym was unrecorded"
+        );
+        assert!(
+            a.correspondences[0].pseudonym_unwritten,
+            "the refused write was not queued for retry"
+        );
+
+        // The record comes back, and the next tick writes the pseudonym and
+        // releases the handshake record.
+        std::fs::write(&contact, &held).expect("the record is restored");
+        a.on_tick(BASE_MS);
+        assert!(
+            !a.correspondences[0].pseudonym_unwritten,
+            "the retry did not write the pseudonym"
+        );
+        assert!(
+            a.persist
+                .read_contact(&a.correspondences[0].label)
+                .expect("reads")
+                .expect("a record")
+                .pk_pc()
+                .is_some(),
+            "the retry reported success without writing the key"
+        );
+        assert!(
+            !has_provisional(&a),
+            "the handshake record outlived the write that releases it"
+        );
+    }
+
+    /// M32. An entry re-sent after its handshake record has aged out never
+    /// mints a second correspondence for the identity.
+    ///
+    /// **Kills a re-send that mints a fresh label.** The lookup that recovers a
+    /// recipient's correspondence only opens a handshake record at the two live
+    /// first-contact epochs; past that it finds nothing, and a mint would put a
+    /// second contact record under a second label for one identity.
+    /// `correspondence_for_pk_lt` refuses to choose between two, so the
+    /// identity would be unroutable for the life of the store — every consumer
+    /// of that lookup fails closed on the refusal, and no later event undoes
+    /// it.
+    ///
+    /// The re-send is itself refused, and that is asserted rather than worked
+    /// around: the reused correspondence still holds the first entry at the
+    /// knock's sequence, and the outbox refuses a second entry at a sequence it
+    /// already carries. What matters here is that the refusal leaves the
+    /// identity naming one correspondence, which a user can act on, where a
+    /// second label would leave it naming none.
+    #[test]
+    fn an_entry_re_sent_after_its_handshake_record_ages_out_mints_no_second_correspondence() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let peer = peer_identity();
+        let peer_pk = *peer.signing.public_key();
+        let first = {
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            let _ = knock_as_initiator(&mut a, &peer);
+            a.correspondences[0].label
+        };
+
+        // Two epochs on, in a session that remembers nothing: the record
+        // written above opens under neither of the epochs a lookup may try, so
+        // the label can only come from the contact record.
+        let later = BASE_MS + 2 * FC_PERIOD_MS;
+        let mut a = machine(&dir);
+        let pk_lt: PkLt = Box::new(*peer.signing.public_key());
+        a.on_command(
+            later,
+            DmCommand::FirstContact {
+                recipient: pk_lt.clone(),
+                body: "knock".into(),
+            },
+        );
+        let record = keyrec::build_encoded(
+            &peer.signing,
+            peer.kem.encapsulation_key(),
+            keyrec::DM_KEY_RECORD_VERSION,
+            keyrec::DM_KEY_RECORD_INVITE_ONLY,
+        )
+        .expect("key record");
+        let mut out = a.on_key_record(later, pk_lt, Some(record));
+        let DmEffect::Compute(ComputeJob::MintFirstContact(request)) = out.remove(0) else {
+            panic!("the key record did not start a mint");
+        };
+        let out = a.on_mint(later, run_mint(*request));
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::Refused {
+                    reason: RefusalReason::StoreFailure,
+                    ..
+                })
+            )),
+            "the re-sent entry was expected to be refused at the queue: {out:?}"
+        );
+
+        assert_eq!(
+            a.persist.store().correspondences().expect("list").len(),
+            1,
+            "the re-sent entry minted a second correspondence"
+        );
+        assert_eq!(
+            a.persist
+                .correspondence_for_pk_lt(&peer_pk)
+                .expect("lookup"),
+            Some(first),
+            "the identity stopped naming a single correspondence"
+        );
+        assert_eq!(
+            a.correspondences.len(),
+            1,
+            "the driver holds two entries for one identity"
+        );
+    }
+
+    /// M33. A pseudonym write that can never succeed stops retrying and
+    /// releases the handshake record.
+    ///
+    /// **Kills a retry with no conclusive/retryable split.** A contact record
+    /// that is absent or will not decode answers the same way on every tick, so
+    /// an unconditional retry re-reads a sealed record for the life of the
+    /// session — and because the erase waits on the write, the opening secret
+    /// stays on disk against a write that will never land. The correspondence
+    /// is established either way: the acceptance verified.
+    #[test]
+    fn a_pseudonym_write_that_can_never_succeed_releases_the_handshake_record() {
+        let (mut a, contact) = accepted_with_a_refused_pseudonym_write();
+        assert!(
+            has_provisional(&a),
+            "the fixture did not leave a handshake record to release"
+        );
+
+        // The record is not merely missing but unreadable, which no later tick
+        // can improve on.
+        std::fs::write(&contact, vec![0u8; 8]).expect("the record writes");
+        a.on_tick(BASE_MS);
+        assert!(
+            !a.correspondences[0].pseudonym_unwritten,
+            "a refusal no retry can change is still queued for retry"
+        );
+        assert!(
+            !has_provisional(&a),
+            "the opening secret is held against a write that will never land"
+        );
+
+        // And nothing is retried afterwards: the flag stays clear across a
+        // second tick, so the give-up is not re-armed by the next one.
+        a.on_tick(BASE_MS);
+        assert!(
+            !a.correspondences[0].pseudonym_unwritten,
+            "the give-up was undone by the next tick"
+        );
+    }
+
+    /// M34. A refused contact-record write leaves no handshake record behind.
+    ///
+    /// **Kills a refusal that deletes nothing.** The refusal prunes this
+    /// session's memory of the introduction, so a handshake record left on disk
+    /// holds the opening secret in a correspondence nothing can reach: the
+    /// startup seed skips a directory with no contact record, and the sweep for
+    /// superseded handshake records only looks beside a resume record, which
+    /// this correspondence never had.
+    #[test]
+    fn a_refused_contact_record_write_leaves_no_handshake_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let peer = peer_identity();
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+
+        // The label the introduction will use, chosen here so the record that
+        // refuses the write can be put in place before it runs. It holds a
+        // different identity, which is the one refusal that leaves every other
+        // read on this path answering normally.
+        let label = CorrespondenceLabel::mint().expect("label");
+        a.provisionals
+            .push((Box::new(*peer.signing.public_key()), label));
+        a.persist
+            .record_first_contact_sent(
+                &label,
+                Box::new(*other_peer_identity().signing.public_key()),
+                zeroize::Zeroizing::new([0x5Cu8; ADDRESS_ROOT_LEN]),
+                BASE_MS,
+            )
+            .expect("the standing record was not written");
+
+        let out = introduce(&mut a, &peer, BASE_MS);
+        assert!(
+            out.iter().any(|e| matches!(
+                e,
+                DmEffect::Emit(DmEvent::Refused {
+                    reason: RefusalReason::StoreFailure,
+                    ..
+                })
+            )),
+            "the fixture did not refuse the introduction: {out:?}"
+        );
+        assert!(
+            !has_provisional(&a),
+            "the refused introduction stranded the conversation's opening secret"
+        );
+        assert!(
+            a.pending_erase.is_empty(),
+            "the erase was deferred when it had already succeeded"
+        );
+    }
+
+    /// M35. A store fault that never clears is given up on at the ceiling.
+    ///
+    /// **Kills an unbounded retry.** A truncated record nothing repairs answers
+    /// `StoreUnreadable` on every tick, and at each attempt that is
+    /// indistinguishable from a fault about to clear — so without a bound the
+    /// re-arm reads two sealed records every tick for the life of the session.
+    /// The boundary is asserted from both sides so the ceiling is the number the
+    /// constant names.
+    #[test]
+    fn a_store_fault_that_never_clears_is_given_up_at_the_ceiling() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let peer = peer_identity();
+        {
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            let _ = knock_as_initiator(&mut a, &peer);
+        }
+
+        let mut a = machine(&dir);
+        let files = provisional_files(&a);
+        assert_eq!(files.len(), 1, "the fixture must hold exactly one record");
+        let healthy = std::fs::read(&files[0]).expect("the record reads");
+        std::fs::write(&files[0], &healthy[..healthy.len() - 1]).expect("the record writes");
+
+        for tick in 1..REARM_FAULT_CEILING {
+            a.on_tick(BASE_MS);
+            assert!(
+                a.correspondences[0].rearm_handshake,
+                "the re-arm was abandoned after {tick} fault(s), below the ceiling"
+            );
+        }
+        a.on_tick(BASE_MS);
+        assert!(
+            !a.correspondences[0].rearm_handshake,
+            "a fault that never clears is retried past the ceiling"
+        );
+
+        // Even a store that recovers afterwards is not re-armed: the give-up is
+        // the answer, not a pause.
+        std::fs::write(&files[0], &healthy).expect("the record is restored");
+        a.on_tick(BASE_MS);
+        assert!(
+            a.correspondences[0].ratchet.is_none(),
+            "the abandoned re-arm ran again"
+        );
+    }
+
+    /// M36. A contact record that is not there at all is a settled refusal.
+    ///
+    /// **Kills a classification that reads a missing record as worth retrying.**
+    /// The other settled cases are bytes that will not decode; absence is the
+    /// one that arrives with no bytes to look at, and reading it as transient
+    /// would retry a write that has nothing to write into — holding the
+    /// conversation's opening secret on disk for the life of the session
+    /// against a record no tick brings back.
+    #[test]
+    fn a_missing_contact_record_is_a_settled_refusal() {
+        let (mut a, contact) = accepted_with_a_refused_pseudonym_write();
+        assert!(
+            !contact.exists(),
+            "the fixture must leave the record absent, not merely unreadable"
+        );
+        assert!(
+            has_provisional(&a),
+            "the fixture did not leave a handshake record to release"
+        );
+
+        a.on_tick(BASE_MS);
+        assert!(
+            !a.correspondences[0].pseudonym_unwritten,
+            "an absent record is still queued for retry"
+        );
+        assert!(
+            !has_provisional(&a),
+            "the opening secret is held against a record no tick brings back"
+        );
+    }
+
+    /// M37. A store fault that never clears ends the pseudonym write at the
+    /// ceiling.
+    ///
+    /// **Kills an unbounded retry of the transient half.** A settled refusal
+    /// stops on the first tick; a fault does not, and without a bound it reads
+    /// and writes a sealed record every tick for the life of the session while
+    /// withholding the erase for exactly as long — the sibling re-arm loop is
+    /// bounded for the same reason. The boundary is asserted from both sides so
+    /// the ceiling is the number the constant names.
+    #[test]
+    fn a_faulting_pseudonym_write_is_given_up_at_the_ceiling() {
+        let (mut a, contact) = accepted_with_a_refused_pseudonym_write();
+
+        // A directory where the record belongs: the write faults on every
+        // attempt and never reports anything about bytes.
+        std::fs::create_dir(&contact).expect("the obstruction is created");
+
+        for tick in 1..PSEUDONYM_WRITE_FAULT_CEILING {
+            a.on_tick(BASE_MS);
+            assert!(
+                a.correspondences[0].pseudonym_unwritten,
+                "the write was abandoned after {tick} fault(s), below the ceiling"
+            );
+            assert!(
+                has_provisional(&a),
+                "the handshake record was released after {tick} fault(s)"
+            );
+        }
+        a.on_tick(BASE_MS);
+        assert!(
+            !a.correspondences[0].pseudonym_unwritten,
+            "a fault that never clears is retried past the ceiling"
+        );
+        assert!(
+            !has_provisional(&a),
+            "the give-up did not release the handshake record"
+        );
+    }
+
+    /// A correspondence whose acceptance was collected while the contact record
+    /// could not be written, with the path to that record.
+    fn accepted_with_a_refused_pseudonym_write() -> (DmMachine, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let peer = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision B");
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let entry = knock_as_initiator(&mut a, &peer);
+
+        let offered = b.on_doorbell(BASE_MS, sweep_of(vec![entry]));
+        let request = offered
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("the correspondent was not offered the entry");
+        b.on_command(BASE_MS, DmCommand::Accept { request });
+        let label_b = b.correspondences[b.correspondences.len() - 1].label;
+        let acceptance = queued_frame_at(&b, &label_b, 0, BASE_MS);
+
+        let contact = a
+            .persist
+            .store()
+            .root()
+            .join(label_dir(&a.correspondences[0].label))
+            .join("contact-cache.bin");
+        std::fs::remove_file(&contact).expect("the record is removed");
+        let conversation = conversation_of(&a, 0);
+        fold_page_at(
+            &mut a,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(0), acceptance)],
+        );
+        assert!(
+            a.correspondences[0].pseudonym_unwritten,
+            "the fixture did not refuse the pseudonym write"
+        );
+        // The temp dirs are leaked deliberately: the machine reads its store for
+        // the rest of the test, and dropping them here would remove it.
+        std::mem::forget((dir, dir_b));
+        (a, contact)
+    }
+
+    /// The directory a correspondence's records live in: its label in hex.
+    fn label_dir(label: &CorrespondenceLabel) -> String {
+        label
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Drive one introduction through the key record and the mint, returning
+    /// what the mint produced.
+    fn introduce(a: &mut DmMachine, peer: &IdentityKeys, now_ms: i64) -> Vec<DmEffect> {
+        let pk_lt: PkLt = Box::new(*peer.signing.public_key());
+        a.on_command(
+            now_ms,
+            DmCommand::FirstContact {
+                recipient: pk_lt.clone(),
+                body: "knock".into(),
+            },
+        );
+        let record = keyrec::build_encoded(
+            &peer.signing,
+            peer.kem.encapsulation_key(),
+            keyrec::DM_KEY_RECORD_VERSION,
+            keyrec::DM_KEY_RECORD_INVITE_ONLY,
+        )
+        .expect("key record");
+        let mut out = a.on_key_record(now_ms, pk_lt, Some(record));
+        let DmEffect::Compute(ComputeJob::MintFirstContact(request)) = out.remove(0) else {
+            panic!("the key record did not start a mint");
+        };
+        a.on_mint(now_ms, run_mint(*request))
+    }
+
     /// Whether any correspondence directory in this machine's store still holds
     /// a provisional record.
     ///
@@ -8119,6 +9340,10 @@ mod tests {
             own_ack: AckState::new(),
             last_accept_refusal: None,
             provisional: None,
+            rearm_handshake: false,
+            rearm_faults: 0,
+            pseudonym_unwritten: false,
+            pseudonym_faults: 0,
         });
 
         let out = m.fire_accept(BASE_MS, 0);

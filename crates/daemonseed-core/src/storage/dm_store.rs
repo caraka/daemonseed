@@ -2761,7 +2761,7 @@ mod tests {
         // The contact record's size is the module's, not a copy of it.
         assert_eq!(RecordKind::ContactCache.capacity(), CONTACT_RECORD_LEN);
         assert_eq!(
-            CONTACT_RECORD_LEN, 5233,
+            CONTACT_RECORD_LEN, 5234,
             "the encoded contact record's size"
         );
         // The ratified 512-identity ceiling, in bytes, and its arithmetic
@@ -5981,7 +5981,7 @@ mod tests {
 
         let encoded = ContactRecord::new(
             pk_lt.clone(),
-            pk_pc.clone(),
+            Some(pk_pc.clone()),
             zeroize::Zeroizing::new(ar),
             FIRST,
             LAST,
@@ -6016,7 +6016,7 @@ mod tests {
 
         let reopened = ContactRecord::decode(&read).expect("decodes");
         assert_eq!(reopened.pk_lt(), pk_lt.as_ref());
-        assert_eq!(reopened.pk_pc(), pk_pc.as_ref());
+        assert_eq!(reopened.pk_pc(), Some(pk_pc.as_ref()));
         assert_eq!(reopened.first_seen_ms(), FIRST);
         assert_eq!(reopened.last_seen_ms(), LAST);
         assert_eq!(
@@ -6048,7 +6048,7 @@ mod tests {
         let encode = |tag: u8| {
             ContactRecord::new(
                 Box::new([tag; ml_dsa::PK_LEN]),
-                Box::new([tag ^ 0xFF; ml_dsa::PK_LEN]),
+                Some(Box::new([tag ^ 0xFF; ml_dsa::PK_LEN])),
                 zeroize::Zeroizing::new([tag; ROOT_LEN]),
                 1_700_000_000_000,
                 1_700_000_000_001,

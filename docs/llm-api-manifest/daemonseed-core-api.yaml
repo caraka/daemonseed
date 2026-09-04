@@ -1018,8 +1018,10 @@ modules:
       the crate, dm::persist's PendingHandshake is the only path from a record
       to a ratchet. Both go through Ratchet::initiator, which re-derives
       the root — so neither AR nor RK nor chan_id is stored, and no byte
-      constructor for RootKey exists at any visibility. chan_id is not returned
-      with AR; a caller needing it calls firstcontact::derive_channel_roots.
+      constructor for RootKey exists at any visibility. address_root() does not
+      return chan_id with AR; channel_roots() -> Result<ChannelRoots,
+      FirstContactError> recomputes both, for a caller resuming a handshake that
+      must open a frame as well as address it.
       eph_ek() borrows the public half. The record is not Clone, renders no bytes
       in Debug, and has no Drop of its own so both ephemeral halves move out.
       RecordContext { recipient_keyrec_addr: &[u8; DM_KEYREC_OWNER_SEED_LEN],
@@ -1187,11 +1189,20 @@ modules:
       stored as RecordKind::ContactCache. ContactRecord holds the
       correspondent's long-term public key, its pseudonym public key, the
       channel's address root AR, and first/last-seen timestamps, in a fixed
-      CONTACT_RECORD_LEN layout; it does not hold ss0.
-      new(pk_lt, pk_pc, Zeroizing<[u8; ROOT_LEN]>, first_seen_ms, last_seen_ms)
-      takes the root already derived; the caller runs derive_channel_roots.
+      CONTACT_RECORD_LEN layout; it does not hold ss0. The pseudonym is absent
+      on a record written by an initiator whose first-contact entry has not
+      been accepted, and first_seen_ms on such a record is when that entry was
+      sent.
+      new(pk_lt, Option<Box<[u8; ml_dsa::PK_LEN]>>, Zeroizing<[u8; ROOT_LEN]>,
+      first_seen_ms, last_seen_ms) takes the root already derived; the caller
+      runs derive_channel_roots. pk_pc() -> Option<&[u8; ml_dsa::PK_LEN]>.
+      record_pseudonym(Box<[u8; ml_dsa::PK_LEN]>) -> Result<bool, ContactCacheError>
+      fills an absent pseudonym and is must_use; an identical key reports false
+      and a different one is ContactCacheError::PseudonymAlreadyRecorded.
       encode() -> Zeroizing<Vec<u8>> and decode(&Zeroizing<Vec<u8>>) are the
       at-rest form; the record carries no seal of its own and the store seals it.
+      The layout is version, pk_lt, a pseudonym presence byte, pk_pc, AR,
+      first_seen, last_seen; pk_pc keeps its width when absent.
       address_root() -> [u8; ROOT_LEN] returns the stored root; chan_id is
       neither exposed nor derivable here.
       addresses_same_channel(&[u8; ROOT_LEN]) -> bool
@@ -1199,12 +1210,14 @@ modules:
       not constant-time. It assumes one at-rest store per pk_lt, which nothing
       enforces and multi-device support must revisit.
       new and decode refuse an all-zero root with
-      ContactCacheError::PlaceholderAddressRoot. new and decode refuse a
+      ContactCacheError::PlaceholderAddressRoot, and a pseudonym claimed
+      present and all-zero with PlaceholderPseudonym. new and decode refuse a
       record whose last_seen_ms precedes its first_seen_ms with
       ContactCacheError::TimestampsOutOfOrder; decode also gives
       WrongLength { expected, actual } for any payload that is not
-      CONTACT_RECORD_LEN bytes, and UnsupportedVersion for an unrecognised
-      version byte at a matching length. observed_at(at_ms) -> bool is must_use
+      CONTACT_RECORD_LEN bytes, UnsupportedVersion for an unrecognised
+      version byte at a matching length, and
+      UnknownPseudonymPresence { found } for a presence byte outside {0, 1}. observed_at(at_ms) -> bool is must_use
       and refuses any time earlier than last_seen_ms. Debug is redacted.
       Sub-module dm::block_list holds the DM revocation set. BlockList is keyed
       on the long-term identity public key ([u8; ml_dsa::PK_LEN]);
@@ -1420,8 +1433,8 @@ modules:
       every provisional record left beside a readable resume record and returns
       the count. A store that will not enumerate is an error; a correspondence
       whose resume record will not read is skipped.
-      PendingHandshake owns the record, lends eph_ek/address_root, and offers
-      five endings: ratchet() derives a Ratchet and leaves the record on disk,
+      PendingHandshake owns the record, lends eph_ek/address_root/channel_roots,
+      and offers five endings: ratchet() derives a Ratchet and leaves the record on disk,
       for the window between an initiator's knock and the acceptance that
       verifies its correspondent; commit() consumes the handshake and deletes
       the record; establish() is the pair, and builds the ratchet first so a
@@ -1466,6 +1479,12 @@ modules:
       direction. read_resume(
       &CorrespondenceLabel) -> Result<Option<ResumeRecord>, DmPersistError>
       reads it back. DmPersistError::Resume(ResumeError) carries both.
+      DmPersistError::retrying_cannot_help() -> bool reports whether repeating
+      the same call could answer differently: Contact, ContactRecordMissing,
+      CorrespondenceHoldsAnotherIdentity, AlreadyEstablished,
+      AmbiguousCorrespondent, OutboxDirectionMismatch and CursorPayloadWrongLen
+      are settled, a Store error is settled when is_unreadable_record is, and
+      every other variant is retryable.
       read_contact(&CorrespondenceLabel) -> Result<Option<ContactRecord>,
       DmPersistError> reads the stored contact record. A record that exists and
       will not decode is DmPersistError::Contact(ContactCacheError), never
@@ -1481,12 +1500,23 @@ modules:
       if f fails, though taking the lock creates the correspondence directory
       and its lock file. A stored record that will not decode fails the call and
       is never re-seeded over. Debug builds panic when an Unchanged report
-      follows a change to a stored record. The keys are write-once through this
-      module: ContactRecord::observed_at is the record's only &mut self method and
-      update_contact ignores its seed once a record exists, so no path here
-      replaces a stored pk_pc. DmPersistError::Contact(ContactCacheError)
-      carries a stored record that will not decode and a caller's own contact
-      error raised inside f.
+      follows a change to a stored record. A recorded pk_pc is write-once: no
+      path here replaces one with a different key.
+      record_first_contact_sent(&CorrespondenceLabel, Box<[u8; ml_dsa::PK_LEN]>,
+      Zeroizing<[u8; ROOT_LEN]>, i64) -> Result<(), DmPersistError> writes an
+      initiator's contact record when a first-contact entry is sent, with no
+      pseudonym; a record already present is re-addressed to the given root and
+      keeps its first_seen_ms. It is DmPersistError::AlreadyEstablished on a
+      record whose pk_pc is present and CorrespondenceHoldsAnotherIdentity on
+      one naming a different pk_lt.
+      record_correspondent_pseudonym(&CorrespondenceLabel,
+      Box<[u8; ml_dsa::PK_LEN]>, i64) -> Result<bool, DmPersistError> fills an
+      absent pseudonym and records the sighting, reporting whether it was newly
+      recorded; an identical key is false and spends no seal, a different one is
+      DmPersistError::Contact(ContactCacheError::PseudonymAlreadyRecorded), and a
+      correspondence with no record is DmPersistError::ContactRecordMissing.
+      DmPersistError::Contact(ContactCacheError) carries a stored record that
+      will not decode and a caller's own contact error raised inside f.
       correspondence_for_pk_lt(&[u8; ml_dsa::PK_LEN]) ->
       Result<Option<CorrespondenceLabel>, DmPersistError> names the
       correspondence whose contact record holds that long-term identity key. It
@@ -1494,7 +1524,9 @@ modules:
       index is stored and no answer is cached. Ok(None) is no match. Two or more
       matches is DmPersistError::AmbiguousCorrespondent { matches }, which
       carries the count and no label; the scan reads every correspondence on
-      every call, so it does not stop at the first match. A correspondence with
+      every call, so it does not stop at the first match. A record whose pk_pc
+      is absent matches like any other, so a caller meaning an established
+      correspondence reads the record. A correspondence with
       no contact record is skipped; a record that exists and will not decode
       fails the whole lookup, as does an IO error that is not absence. The key
       comparison is not constant-time. The answer is not
@@ -1504,7 +1536,9 @@ modules:
       Result<StateLoss, DmPersistError> answers an opened first-contact entry
       against what is stored and stops that correspondence's outbox where the
       entry means the correspondent lost their at-rest state. StateLoss is
-      NoCorrespondence when no correspondence holds the entry's pk_lt;
+      NoCorrespondence when no correspondence holds the entry's pk_lt and when
+      the one that does has no recorded pseudonym, which is a correspondence
+      this side is still waiting to have accepted;
       SameChannel(label) when the stored record's address root is the entry's,
       which is the introduction that established it arriving again and changes
       nothing; Confirmed { correspondence, teardown, outcome } when the roots
@@ -1522,9 +1556,14 @@ modules:
       Result<(CorrespondenceLabel, Ratchet), DmPersistError> is the acceptor's
       establishment, the counterpart of PendingHandshake::establish: it mints a
       label, opens the recipient ratchet over the knock's ss0, and writes the
-      contact record carrying pk_lt, pk_pc and ss0 with both timestamps at now_ms,
-      in one call. The ratchet is built before the record is written, so a module
-      fault leaves the disk untouched. No provisional record is written and no
+      contact record carrying pk_lt, pk_pc and the address root derived from that
+      ss0, with both timestamps at now_ms, in one call. The ratchet is built
+      before the record is written, so a module fault leaves the disk untouched.
+      A correspondence already holding the knock's pk_lt is
+      DmPersistError::AlreadyEstablished where its record carries a pseudonym;
+      where it does not, that record is this side's own unanswered first-contact
+      entry and is removed before the new label is minted, so one identity is
+      never under two records. No provisional record is written and no
       resume record is written — the acceptor has neither.
       read_block_list() -> Result<BlockList, DmPersistError> reads the profile's
       block list through the store's lock-free profile read. An absent record is

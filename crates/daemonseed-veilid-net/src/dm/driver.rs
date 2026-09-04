@@ -2165,7 +2165,13 @@ mod tests {
             contact.pk_lt().as_slice(),
             peer.signing.public_key().as_slice()
         );
-        assert_eq!(contact.pk_pc().as_slice(), pc.public_key().as_slice());
+        assert_eq!(
+            contact
+                .pk_pc()
+                .expect("the acceptor records a pseudonym")
+                .as_slice(),
+            pc.public_key().as_slice()
+        );
 
         handle.send(DmCommand::Shutdown).await.expect("shutdown");
         task.await.expect("the driver task ends");

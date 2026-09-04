@@ -106,7 +106,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::dm::block_list::{BlockList, BlockListError};
 use crate::dm::contact_cache::{ContactCacheError, ContactRecord};
 use crate::dm::firstcontact::{
-    FirstContactError, ROOT_LEN, VerifiedFirstContact, derive_channel_roots,
+    ChannelRoots, FirstContactError, ROOT_LEN, VerifiedFirstContact, derive_channel_roots,
 };
 use crate::dm::outbox::{Outbox, OutboxError, TeardownOutcome};
 use crate::dm::provisional::{
@@ -228,6 +228,25 @@ pub enum DmPersistError {
     /// through an error. A caller that needs it asks
     /// [`DmPersist::correspondence_for_pk_lt`], which is where the answer lives.
     AlreadyEstablished,
+    /// The correspondence's contact record names a different identity than the
+    /// caller's.
+    ///
+    /// Distinct from [`Self::AlreadyEstablished`], which is one identity in two
+    /// places; this is two identities under one label. A label is either minted
+    /// for a recipient or recovered from that recipient's own provisional
+    /// record, so neither route produces it and a caller that reaches it has
+    /// mixed up two correspondences. Refused rather than written through: the
+    /// write would replace one correspondent's record with another's, and
+    /// nothing afterwards could say what the first one held.
+    CorrespondenceHoldsAnotherIdentity,
+    /// A call that must find a contact record found none.
+    ///
+    /// Absence is ordinary for [`DmPersist::read_contact`] and is not ordinary
+    /// here: this is raised only where the caller is filling in a field of a
+    /// record it has already established exists, so it says the record was
+    /// never written or has been removed underneath. Seeding one instead would
+    /// mean inventing the identity key and address root a record must carry.
+    ContactRecordMissing,
     /// A channel root could not be derived from a stored contact record.
     ///
     /// The store read fine; the crypto module or the KDF underneath it did not.
@@ -278,6 +297,12 @@ impl std::fmt::Display for DmPersistError {
                 "a correspondence already holds this identity key, so establishing a second \
                  one was refused",
             ),
+            Self::CorrespondenceHoldsAnotherIdentity => {
+                f.write_str("this correspondence's contact record names a different identity key")
+            }
+            Self::ContactRecordMissing => {
+                f.write_str("this correspondence has no contact record to write into")
+            }
             Self::FirstContact(e) => write!(f, "channel roots: {e}"),
         }
     }
@@ -299,7 +324,9 @@ impl std::error::Error for DmPersistError {
             | Self::CursorNotCorroborated { .. }
             | Self::CursorPayloadWrongLen { .. }
             | Self::AmbiguousCorrespondent { .. }
-            | Self::AlreadyEstablished => None,
+            | Self::AlreadyEstablished
+            | Self::CorrespondenceHoldsAnotherIdentity
+            | Self::ContactRecordMissing => None,
         }
     }
 }
@@ -334,6 +361,48 @@ impl DmPersistError {
             | Self::CursorNotCorroborated { .. }
             | Self::AmbiguousCorrespondent { .. }
             | Self::AlreadyEstablished
+            | Self::CorrespondenceHoldsAnotherIdentity
+            | Self::ContactRecordMissing
+            | Self::FirstContact(_) => false,
+        }
+    }
+
+    /// Whether retrying the same call could ever answer differently.
+    ///
+    /// **The caller this exists for is a write that is retried on a timer.** A
+    /// refusal that is a fact about bytes already on disk, or about a key that
+    /// is already recorded, answers the same way on every later attempt — so a
+    /// caller that keeps retrying it re-reads a sealed record for the life of
+    /// the session and holds open whatever it was deferring until the write
+    /// lands. A refusal from the environment says nothing about the request and
+    /// is worth trying again.
+    ///
+    /// Every [`ContactCacheError`] is settled: each is a statement about a
+    /// payload's shape, its timestamps, or a key already written down, and none
+    /// of them changes because time passed. A store error is settled exactly
+    /// when [`Self::is_unreadable_record`] says the bytes on disk are the
+    /// problem, which is the same split that decides whether a record may be
+    /// replaced.
+    ///
+    /// Exhaustive, so a new variant has to be classified rather than defaulting
+    /// into the retrying half.
+    pub fn retrying_cannot_help(&self) -> bool {
+        match self {
+            Self::Store(e) => is_unreadable_record(e),
+            Self::CursorPayloadWrongLen { .. } => true,
+            Self::Contact(_)
+            | Self::ContactRecordMissing
+            | Self::CorrespondenceHoldsAnotherIdentity
+            | Self::AlreadyEstablished
+            | Self::AmbiguousCorrespondent { .. }
+            | Self::OutboxDirectionMismatch { .. } => true,
+            Self::Record(_)
+            | Self::Outbox(_)
+            | Self::Resume(_)
+            | Self::BlockList(_)
+            | Self::BlockListMissing
+            | Self::Ratchet(_)
+            | Self::CursorNotCorroborated { .. }
             | Self::FirstContact(_) => false,
         }
     }
@@ -1381,16 +1450,22 @@ impl DmPersist {
     /// itself. What this call does separate is a record that exists and will not
     /// decode, which is never reported as absence.
     ///
-    /// **Known limitation: the keys are write-once through this module.**
-    /// [`ContactRecord::observed_at`] is the record's only `&mut self` method
-    /// and [`Self::update_contact`] ignores its seed once a record exists, so a
-    /// correspondent who rotates `PK_pc` leaves a record this API cannot repair
-    /// — every later frame fails authorship against the stale key and the only
-    /// remedy is out-of-band. Replacing a stored record is deliberately absent
-    /// rather than overlooked: an unconditional overwrite is the lost update
-    /// this whole shape exists to refuse, so a rotation path has to say what
-    /// authorises the new key, which is a protocol question and not a wiring
-    /// one.
+    /// **`pk_pc` may be absent, and absence is a state rather than a fault.**
+    /// An initiator's record is written when its first-contact entry is sent
+    /// and carries no pseudonym until the acceptance arrives, so a caller that
+    /// needs the key must say what it does without one. See
+    /// [`ContactRecord::pk_pc`].
+    ///
+    /// **Known limitation: a recorded key is write-once through this module.**
+    /// [`Self::record_correspondent_pseudonym`] fills an absent one and
+    /// [`ContactRecord::record_pseudonym`] refuses to replace a recorded one
+    /// with a different key, so a correspondent who rotates `PK_pc` leaves a
+    /// record this API cannot repair — every later frame fails authorship
+    /// against the stale key and the only remedy is out-of-band. That refusal
+    /// is deliberate rather than overlooked: an unconditional overwrite is the
+    /// lost update this whole shape exists to refuse, so a rotation path has to
+    /// say what authorises the new key, which is a protocol question and not a
+    /// wiring one.
     pub fn read_contact(
         &self,
         correspondence: &CorrespondenceLabel,
@@ -1399,9 +1474,9 @@ impl DmPersist {
             .store
             .read_unlocked(correspondence, RecordKind::ContactCache)?
         {
-            // `Zeroizing`: this plaintext *is* the correspondence's `ss0` — this
-            // kind carries no seal of its own, so the store hands back the
-            // cleartext record — and the store zeroizes only its own copy.
+            // `Zeroizing`: this kind carries no seal of its own, so the store
+            // hands back the record as cleartext, and that cleartext holds the
+            // channel's address root — and the store zeroizes only its own copy.
             Some(bytes) => Ok(Some(ContactRecord::decode(&Zeroizing::new(bytes))?)),
             None => Ok(None),
         }
@@ -1412,6 +1487,15 @@ impl DmPersist {
     /// The question a knock asks: a frame arrives carrying a long-term identity
     /// key, and the receiver has to know whether that identity is one it already
     /// corresponds with and under which label.
+    ///
+    /// **A correspondence still waiting to be accepted answers too**, because
+    /// that is the case the mapping exists for: an initiator writes its record
+    /// when it sends its first-contact entry and the acceptance it is waiting
+    /// on names nothing but the correspondent's identity key, so a lookup that
+    /// skipped pseudonym-less records could not route the one frame the
+    /// correspondence is waiting for. **Callers that mean *established* must
+    /// say so** by reading the record — see [`ContactRecord::pk_pc`] — because
+    /// a label alone no longer distinguishes the two.
     ///
     /// **Derived, never stored, and that is a design decision rather than an
     /// omission** (`docs/design/direct-messaging.md` § A3.14: *"No journal, no
@@ -1551,6 +1635,20 @@ impl DmPersist {
         let Some(contact) = self.read_contact(&correspondence)? else {
             return Ok(StateLoss::NoCorrespondence);
         };
+        // **A correspondence still waiting to be accepted says nothing about
+        // the correspondent's state, and its root would say the wrong thing.**
+        // Such a record was written by this side's own knock, under the root of
+        // an `ss0` this side encapsulated; a knock arriving from that identity
+        // carries the root of an `ss0` THEY encapsulated, so the two never
+        // match and the comparison below would read a mutual knock — each side
+        // knocking before either answered — as the correspondent having lost
+        // their at-rest state. That would mark this side's own pending entries
+        // undelivered, terminally, on a correspondence that is about to work.
+        // The inference this method draws needs an established correspondence
+        // to be about; an absent `pk_pc` says there is not one yet.
+        if contact.pk_pc().is_none() {
+            return Ok(StateLoss::NoCorrespondence);
+        }
         if contact.addresses_same_channel(&knock.roots().ar) {
             return Ok(StateLoss::SameChannel(correspondence));
         }
@@ -1615,10 +1713,11 @@ impl DmPersist {
     /// the record moved, and short-circuits away the call that would not.
     ///
     /// `seed` supplies the record when the correspondence has none — first
-    /// contact, where the keys and `ss0` are in hand. **It is a closure so it is
-    /// built only when it is needed:** a seed carries `ss0` in the clear, and a
-    /// sweep that constructs one per tick to discard it makes a live copy of the
-    /// correspondence secret on every call that already has a stored record.
+    /// contact, where the keys and the address root are in hand. **It is a
+    /// closure so it is built only when it is needed:** a seed carries the
+    /// address root in the clear, and a sweep that constructs one per tick to
+    /// discard it makes a live copy of that root on every call that already has
+    /// a stored record.
     /// When a record does exist the seed is not built at all and the stored
     /// record is what `f` sees — a caller cannot displace `first_seen_ms`, or an
     /// advanced `last_seen_ms`, with a stale in-memory copy.
@@ -1628,7 +1727,8 @@ impl DmPersist {
     /// There, `Unchanged` on an absent record correctly writes nothing:
     /// `Outbox::new(direction)` is empty and derivable from the argument, so
     /// dropping it loses no fact. A seed is the opposite — `pk_lt`, `pk_pc` and
-    /// `ss0` have no other home — and the losing call is the ordinary one: seed
+    /// the address root have no other home — and the losing call is the
+    /// ordinary one: seed
     /// at the local clock, then record a sighting stamped earlier (a
     /// sender-supplied time, or a clock read taken before the seed's).
     /// `observed_at` refuses it, `f` honestly reports `Unchanged`, and under
@@ -1649,13 +1749,15 @@ impl DmPersist {
     /// does [`Self::commit_resume`], and for the same reason: the decode is
     /// `?`-propagated and never falls through to `seed`. Recovering by
     /// re-seeding would overwrite `first_seen_ms` and — where the stored bytes
-    /// are merely unreadable to *this* build — a live `ss0`, silently, on a path
-    /// no caller asked to be destructive. Fail closed and let the caller decide.
+    /// are merely unreadable to *this* build — a live correspondent's pseudonym
+    /// and address root, silently, on a path no caller asked to be destructive.
+    /// Fail closed and let the caller decide.
     ///
     /// **`Unchanged` is a promise the caller can break, and in debug builds it
     /// is checked** — again as [`Self::update_outbox`] does, and by comparison
-    /// rather than [`assert_eq!`], because this record's encoding *is* `ss0` and
-    /// `assert_eq!` would render it into the panic message. The check runs only
+    /// rather than [`assert_eq!`], because this record's encoding carries the
+    /// channel's address root and `assert_eq!` would render it into the panic
+    /// message. The check runs only
     /// on the stored path, which is the only path where a false report can lose
     /// anything: on the seeded path the write happens regardless, so the case
     /// the guard structurally cannot see is one that no longer exists.
@@ -1672,8 +1774,9 @@ impl DmPersist {
                 // report is consulted at all.
                 let (mut contact, seeded) = match guard.read(RecordKind::ContactCache)? {
                     // `Zeroizing` for `Self::read_contact`'s reason: the store's
-                    // answer for this kind is cleartext `ss0`. Propagated, never
-                    // recovered from by re-seeding — see this method's docs.
+                    // answer for this kind is cleartext and holds the address
+                    // root. Propagated, never recovered from by re-seeding — see
+                    // this method's docs.
                     Some(bytes) => (ContactRecord::decode(&Zeroizing::new(bytes))?, false),
                     None => (seed()?, true),
                 };
@@ -1709,6 +1812,179 @@ impl DmPersist {
                 }
                 Ok(out)
             })
+    }
+
+    /// Record that this side has sent a first-contact entry to `pk_lt` under
+    /// `correspondence`, before the entry is published.
+    ///
+    /// **The initiator's half of the contact cache, and the only thing that
+    /// survives a restart taken before the acceptance arrives.**
+    /// [`Self::correspondence_for_pk_lt`] reads contact records and nothing
+    /// else, so without one an initiator cannot answer which correspondence a
+    /// correspondent's identity key belongs to: the acceptance it is waiting
+    /// for is never collected, and everything the correspondent composes
+    /// re-emits to the outbox's seven-day give-up. The record holds `pk_lt`, the
+    /// address root the entry addresses the channel under, and no pseudonym —
+    /// that key first crosses in the acceptance frame, and
+    /// [`Self::record_correspondent_pseudonym`] is where it lands.
+    ///
+    /// **`AR` is replaced when a record is already there, and that is why this
+    /// is not [`Self::update_contact`].** A second entry to a recipient a
+    /// knock already failed for is legitimate and reuses the same label, but it
+    /// encapsulates a fresh `ss0` and so addresses a different channel; a
+    /// mutator that could only move timestamps would leave the record naming
+    /// the root of an entry nothing will ever answer. No method on
+    /// [`ContactRecord`] replaces a root for the same reason — an established
+    /// correspondence's root must not be replaceable at all — so the record is
+    /// rebuilt here, under the store's lock, from the fields the new entry
+    /// carries.
+    ///
+    /// **`first_seen_ms` survives that rebuild**: the correspondence began when
+    /// this side first knocked, and a retry is the same correspondence still
+    /// waiting. `last_seen_ms` moves to `now_ms` where that is not a rewind.
+    ///
+    /// **An established correspondence is
+    /// [`DmPersistError::AlreadyEstablished`].** Knocking at an identity this
+    /// side already corresponds with reads at the far end as evidence of lost
+    /// at-rest state and ends every message they have queued for us, so the
+    /// state that would do it is refused where it would be written rather than
+    /// diagnosed afterwards. A record naming a *different* identity is
+    /// [`DmPersistError::CorrespondenceHoldsAnotherIdentity`]: the label is not
+    /// this recipient's, and writing through it would replace someone else's
+    /// contact record with this one.
+    ///
+    /// **A DIFFERENT correspondence already holding this identity is
+    /// [`DmPersistError::AlreadyEstablished`] too, and this is the refusal that
+    /// keeps the identity routable.** [`Self::correspondence_for_pk_lt`] is the
+    /// only path from a correspondent's identity key to the correspondence
+    /// waiting on them, and it refuses to choose between two — so a second
+    /// record for one identity makes that identity
+    /// [`DmPersistError::AmbiguousCorrespondent`] permanently, and every
+    /// consumer of the lookup then fails closed on it. The state arises without
+    /// anything going wrong: an entry re-sent after its handshake record has
+    /// aged past both live first-contact epochs cannot recover the label it was
+    /// written under, so a caller that minted a fresh one would land here. The
+    /// remedy is to write through the label this call names in the refusal —
+    /// ask [`Self::correspondence_for_pk_lt`] before minting.
+    ///
+    /// **The scan is taken before the lock and is not a lock**, exactly as
+    /// [`Self::accept_first_contact`]'s is: a concurrent writer can create a
+    /// second correspondence between the scan and the write, and the duplicate
+    /// that leaves is detectable where a silently-written one is not.
+    ///
+    /// # What the extra file discloses to someone holding the disk
+    ///
+    /// This write puts a contact record beside the provisional record of a
+    /// correspondence that has not been accepted, where before there was only
+    /// the provisional one. Record filenames are fixed, so presence is readable
+    /// without any key — and that is already priced: record presence reveals
+    /// handshake state, and a present provisional record means an unconfirmed
+    /// handshake (`docs/design/direct-messaging.md`, § *What is actually
+    /// keyless*).
+    ///
+    /// **The residual covers this, and nothing needs to be added to it.** The
+    /// two records are present together in exactly one state and it is the
+    /// state the provisional record already announces on its own, so the second
+    /// filename carries no bit the first does not. The pairing is not a new
+    /// signal either: a contact record whose correspondence has no provisional
+    /// record beside it is the established case the design already expects to
+    /// find one in.
+    ///
+    /// **What the residual does NOT price is the other direction: a provisional
+    /// record with NO contact record beside it is now a state of its own.** It
+    /// is the shape [`Self::accept_first_contact`] leaves behind when it
+    /// supersedes an unanswered entry to an identity it is establishing, and the
+    /// shape a caller leaves if this write is refused after the handshake record
+    /// was written. Someone holding the disk and no key can tell that from an
+    /// ordinary pending knock, where the design's passage speaks only of what
+    /// `provisional.bin`'s presence discloses on its own.
+    pub fn record_first_contact_sent(
+        &self,
+        correspondence: &CorrespondenceLabel,
+        pk_lt: Box<[u8; ml_dsa::PK_LEN]>,
+        ar: Zeroizing<[u8; ROOT_LEN]>,
+        now_ms: i64,
+    ) -> Result<(), DmPersistError> {
+        if self
+            .correspondence_for_pk_lt(&pk_lt)?
+            .is_some_and(|held| held != *correspondence)
+        {
+            return Err(DmPersistError::AlreadyEstablished);
+        }
+        self.store
+            .critical_section(correspondence, |guard| -> Result<(), DmPersistError> {
+                // `Zeroizing` for `Self::read_contact`'s reason: this kind
+                // carries no seal of its own, so the store hands back cleartext
+                // that holds the channel's address root.
+                let stored = match guard.read(RecordKind::ContactCache)? {
+                    Some(bytes) => Some(ContactRecord::decode(&Zeroizing::new(bytes))?),
+                    None => None,
+                };
+                let (first_seen_ms, last_seen_ms) = match &stored {
+                    Some(existing) => {
+                        if existing.pk_lt() != pk_lt.as_ref() {
+                            return Err(DmPersistError::CorrespondenceHoldsAnotherIdentity);
+                        }
+                        if existing.pk_pc().is_some() {
+                            return Err(DmPersistError::AlreadyEstablished);
+                        }
+                        (
+                            existing.first_seen_ms(),
+                            existing.last_seen_ms().max(now_ms),
+                        )
+                    }
+                    None => (now_ms, now_ms),
+                };
+                let record = ContactRecord::new(pk_lt, None, ar, first_seen_ms, last_seen_ms)?;
+                guard.replace(RecordKind::ContactCache, &record.encode())?;
+                Ok(())
+            })
+    }
+
+    /// Fill in the correspondent's pseudonym key on a record that was written
+    /// without one, returning whether it was newly recorded.
+    ///
+    /// The other end of [`Self::record_first_contact_sent`]: an initiator's
+    /// record holds no `pk_pc` until the acceptance frame carries one, and this
+    /// is the call that writes it down once that frame has verified. `false`
+    /// means the identical key was already recorded — a re-presented acceptance
+    /// — and costs no seal.
+    ///
+    /// **A different key is
+    /// [`DmPersistError::Contact`]`(`[`ContactCacheError::PseudonymAlreadyRecorded`]`)`,
+    /// not a replacement**, and the guard is the record's own; see
+    /// [`ContactRecord::record_pseudonym`].
+    ///
+    /// **A correspondence with no record at all is
+    /// [`DmPersistError::ContactRecordMissing`], never a record seeded here.**
+    /// An acceptance names the correspondence it answers, and this call knows
+    /// neither the identity key nor the address root that a record must carry —
+    /// seeding one would mean inventing them. Absence says the entry this
+    /// acceptance answers was never recorded as sent, which is a fault in the
+    /// caller's ordering rather than something to paper over.
+    ///
+    /// `now_ms` is recorded as a sighting, because an acceptance is one.
+    pub fn record_correspondent_pseudonym(
+        &self,
+        correspondence: &CorrespondenceLabel,
+        pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
+        now_ms: i64,
+    ) -> Result<bool, DmPersistError> {
+        self.update_contact(
+            correspondence,
+            || Err(DmPersistError::ContactRecordMissing),
+            |contact| {
+                let recorded = contact.record_pseudonym(pk_pc)?;
+                // `observed_at`'s bool is not the `Mutation` answer — see
+                // `update_contact`. The stamp is what says whether it moved.
+                let observed = contact.last_seen_ms() < now_ms && contact.observed_at(now_ms);
+                Ok(if recorded || observed {
+                    Mutation::Changed(recorded)
+                } else {
+                    Mutation::Unchanged(recorded)
+                })
+            },
+        )
     }
 
     /// The profile's block list.
@@ -1814,8 +2090,8 @@ impl DmPersist {
     /// The counterpart of [`PendingHandshake::establish`], which is the
     /// INITIATOR's: that one resumes a handshake this side started and erases
     /// the record it started from; this one has no record to erase, because the
-    /// acceptor's `ss0` arrived inside the entry and reaches the disk for the
-    /// first time here, as the contact record's own field.
+    /// `ss0` this side answers under arrived inside the entry and is never
+    /// written: the contact record stores the root derived from it.
     ///
     /// **It is one act for the reason `establish` is one act.** Minting the
     /// label, opening the ratchet and recording who the correspondence is with
@@ -1853,6 +2129,26 @@ impl DmPersist {
     /// [`Self::correspondence_for_pk_lt`] documents, and the duplicate it
     /// leaves is detectable where a silently-minted one is not.
     ///
+    /// # When both parties knocked at once
+    ///
+    /// Each side can send a first-contact entry before either has answered.
+    /// Both then hold a record written by their own entry, and one of them
+    /// answers the other's — so for a moment two correspondences exist for the
+    /// same identity, which is the state that makes every later lookup for it
+    /// ambiguous and unroutable.
+    ///
+    /// **The acceptance wins: the record written by this side's own unanswered
+    /// entry is removed, and the correspondence established here is the one
+    /// that survives.** The alternative is for the acceptance to take over the
+    /// label the unanswered entry already holds, which avoids the leftover
+    /// described next but leaves that entry's queued opening message sitting
+    /// under a label whose channel has changed beneath it. What the choice made
+    /// here costs is a correspondence directory with no contact record: the
+    /// unanswered entry keeps its own queue, nothing will answer it, and no
+    /// lookup names it again. The two parties still converge on one
+    /// conversation, because the entry each of them sent is answered by the
+    /// other.
+    ///
     /// `now_ms` stamps both `first_seen_ms` and `last_seen_ms`: the knock is
     /// the first and so far only sighting.
     pub fn accept_first_contact(
@@ -1866,8 +2162,29 @@ impl DmPersist {
         // `AmbiguousCorrespondent`, which in turn makes
         // `correspondent_state_lost` refuse to act and leaves the identity
         // unroutable for the life of the store.
-        if self.correspondence_for_pk_lt(verified.pk_lt())?.is_some() {
-            return Err(DmPersistError::AlreadyEstablished);
+        if let Some(existing) = self.correspondence_for_pk_lt(verified.pk_lt())? {
+            match self.read_contact(&existing)? {
+                Some(contact) if contact.pk_pc().is_some() => {
+                    return Err(DmPersistError::AlreadyEstablished);
+                }
+                // A record with no pseudonym is this side's own unanswered
+                // knock at the same identity — a mutual knock, where each side
+                // knocked before either answered. It is superseded rather than
+                // refused: the conversation the two of them end up holding is
+                // the one being established here, and the knock this side sent
+                // is answered, if at all, on a channel this establishment does
+                // not use. The record is removed FIRST so that no moment exists
+                // in which two records hold this identity key; what a failure
+                // between the two writes leaves behind is a correspondence
+                // whose identity is not indexed, which is the state every
+                // unanswered knock was in before it was recorded at all.
+                //
+                // **This arm is the guard on the removal**, which has none of
+                // its own: it has read the record and found no pseudonym, so
+                // the established case cannot reach `forget_contact`.
+                Some(_) => self.forget_contact(&existing)?,
+                None => {}
+            }
         }
         // Copied out before `into_ss0` consumes the knock. Each is a public key
         // rather than a secret; the one secret, `ss0`, is moved.
@@ -1896,10 +2213,37 @@ impl DmPersist {
         // from the knock in the same call.
         self.update_contact(
             &label,
-            move || Ok(ContactRecord::new(pk_lt, pk_pc, ar, now_ms, now_ms)?),
+            move || Ok(ContactRecord::new(pk_lt, Some(pk_pc), ar, now_ms, now_ms)?),
             |_| Ok(Mutation::Unchanged(())),
         )?;
         Ok((label, ratchet))
+    }
+
+    /// Remove a correspondence's contact record, refusing to remove an
+    /// established one.
+    ///
+    /// **The one way a contact record leaves the disk.** A record with no
+    /// pseudonym holds facts a knock can restate — the identity knocked at and
+    /// the root that knock addressed — so losing it costs the knock its index
+    /// and nothing else. A record with one is the only copy of the key every
+    /// frame's authorship is checked against, and removing it would leave a
+    /// live conversation unable to verify its correspondent with no way back.
+    ///
+    /// **The caller is what keeps this off an established record.** There is
+    /// one, [`Self::accept_first_contact`], and it reaches here only from the
+    /// match arm that has just read the record and found no pseudonym in it.
+    /// A second guard here would re-read the same bytes to ask the same
+    /// question, and nothing could ever drive it — a guard no fixture can make
+    /// fire is not a guard, so the check lives once, where a new caller has to
+    /// write it.
+    ///
+    /// Absence is `Ok(())`: the state being asked for is the state that holds.
+    fn forget_contact(&self, correspondence: &CorrespondenceLabel) -> Result<(), DmPersistError> {
+        self.store
+            .critical_section(correspondence, |guard| -> Result<(), DmPersistError> {
+                guard.delete(RecordKind::ContactCache)?;
+                Ok(())
+            })
     }
 }
 
@@ -2095,6 +2439,22 @@ impl PendingHandshake<'_> {
     /// handshake derives its page addresses from.
     pub fn address_root(&self) -> Result<[u8; ROOT_LEN], FirstContactError> {
         self.record.address_root()
+    }
+
+    /// Both channel roots, for a party resuming a handshake it cannot finish
+    /// from `AR` alone.
+    ///
+    /// An initiator whose process ended before the acceptance arrived holds
+    /// nothing about the conversation in memory. To collect that acceptance it
+    /// must address the correspondent's pages, which takes `AR`, **and** open
+    /// the frame it finds there, which binds `chan_id` into the AEAD — so the
+    /// pair is what a resumption needs and `AR` on its own leaves the frame
+    /// unreadable.
+    ///
+    /// See [`ProvisionalRecord::channel_roots`] for why handing `chan_id` back
+    /// here does not weaken the rule that it is never written down.
+    pub fn channel_roots(&self) -> Result<ChannelRoots, FirstContactError> {
+        self.record.channel_roots()
     }
 
     /// Establish the channel: open the ratchet **and** erase the record.
@@ -5274,7 +5634,7 @@ mod tests {
         let ar = Zeroizing::new(derive_channel_roots(&secret).expect("derives").ar);
         ContactRecord::new(
             pk(tag),
-            pk(tag.wrapping_add(0x7F)),
+            Some(pk(tag.wrapping_add(0x7F))),
             ar,
             first_seen,
             last_seen,
@@ -5343,7 +5703,7 @@ mod tests {
             "the fixture's two keys are the same key"
         );
         assert_eq!(stored.pk_lt(), pk(0x01).as_ref());
-        assert_eq!(stored.pk_pc(), pk(0x80).as_ref());
+        assert_eq!(stored.pk_pc(), Some(pk(0x80).as_ref()));
 
         // Likewise: distinct stamps, so a read that took one field twice fails.
         assert_ne!(
@@ -5383,11 +5743,219 @@ mod tests {
             .expect("the record did not survive the process that wrote it");
         assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
         assert_eq!(stored.last_seen_ms(), LAST_SEEN);
-        assert_eq!(stored.pk_pc(), pk(0x80).as_ref());
+        assert_eq!(stored.pk_pc(), Some(pk(0x80).as_ref()));
         assert_eq!(
             stored.address_root(),
             root,
             "the address root did not survive the restart"
+        );
+    }
+
+    /// **The oracle for issue #402.** An initiator writes its first-contact
+    /// entry, the process ends before the correspondent answers, and the next
+    /// process collects that acceptance by the correspondent's identity key —
+    /// which is the only thing the acceptance names.
+    ///
+    /// The lookup is the whole of it: `correspondence_for_pk_lt` reads contact
+    /// records and nothing else, so an initiator that wrote none until
+    /// acceptance would answer `Ok(None)` here, the acceptance would never be
+    /// routed to the entry it answers, and everything the correspondent
+    /// composed would re-emit to the outbox's seven-day give-up.
+    #[test]
+    fn an_unanswered_first_contact_survives_a_restart_and_collects_its_acceptance() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = label(0x71);
+        let correspondent = pk(0x11);
+        let their_pk_pc = pk(0x22);
+        let ar = derive_channel_roots(&ss0()).expect("derives").ar;
+
+        {
+            let p = persist(dir.path());
+            p.record_first_contact_sent(&l, correspondent.clone(), Zeroizing::new(ar), FIRST_SEEN)
+                .expect("the entry was not recorded");
+        }
+
+        // The restart: a second `DmPersist` over the same root, holding nothing
+        // the first one held.
+        let p = persist(dir.path());
+        let found = p
+            .correspondence_for_pk_lt(&correspondent)
+            .expect("lookup")
+            .expect("the correspondent's identity key names no correspondence");
+        assert_eq!(found, l);
+
+        let waiting = p.read_contact(&found).expect("reads").expect("a record");
+        assert_eq!(
+            waiting.pk_pc(),
+            None,
+            "an entry that has not been accepted recorded a pseudonym"
+        );
+        assert_eq!(
+            waiting.first_seen_ms(),
+            FIRST_SEEN,
+            "the correspondence is dated from when the entry was sent"
+        );
+        assert_eq!(waiting.address_root(), ar);
+
+        // The acceptance, collected by identity key alone.
+        assert!(
+            p.record_correspondent_pseudonym(&found, their_pk_pc.clone(), LAST_SEEN)
+                .expect("records"),
+            "the pseudonym the acceptance carried was not newly recorded"
+        );
+
+        let accepted = p.read_contact(&found).expect("reads").expect("a record");
+        assert_eq!(accepted.pk_pc(), Some(their_pk_pc.as_ref()));
+        assert_eq!(accepted.last_seen_ms(), LAST_SEEN);
+        assert_eq!(
+            accepted.first_seen_ms(),
+            FIRST_SEEN,
+            "the acceptance re-dated a correspondence that began at the entry"
+        );
+    }
+
+    /// A second entry to the same recipient re-addresses the record, because it
+    /// encapsulates a fresh `ss0` and so addresses a different channel. The
+    /// correspondence's own start is not moved by the retry.
+    #[test]
+    fn a_second_first_contact_entry_re_addresses_the_record_it_finds() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x72);
+        let correspondent = pk(0x11);
+
+        let first = derive_channel_roots(&ss0()).expect("derives").ar;
+        let mut retry_secret = ss0();
+        retry_secret[0] ^= 0xAA;
+        let retry = derive_channel_roots(&retry_secret).expect("derives").ar;
+        assert_ne!(first, retry, "the two entries address one channel");
+
+        p.record_first_contact_sent(&l, correspondent.clone(), Zeroizing::new(first), FIRST_SEEN)
+            .expect("the first entry was not recorded");
+        p.record_first_contact_sent(&l, correspondent.clone(), Zeroizing::new(retry), LAST_SEEN)
+            .expect("the retry was not recorded");
+
+        let stored = p.read_contact(&l).expect("reads").expect("a record");
+        assert_eq!(
+            stored.address_root(),
+            retry,
+            "the record still addresses the channel of an entry nothing will answer"
+        );
+        assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
+        assert_eq!(stored.last_seen_ms(), LAST_SEEN);
+        assert_eq!(stored.pk_pc(), None);
+    }
+
+    /// An entry sent to an identity this side already corresponds with is
+    /// refused where it would be written. Knocking at an established
+    /// correspondent reads at the far end as this side having lost its at-rest
+    /// state, which ends every message they have queued.
+    #[test]
+    fn an_entry_to_an_established_correspondent_is_refused() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x73);
+        let established = contact_tagged(0x01, FIRST_SEEN, LAST_SEEN);
+        let root = established.address_root();
+        seed_contact(&p, &l, established);
+
+        let ar = derive_channel_roots(&ss0()).expect("derives").ar;
+        assert!(
+            matches!(
+                p.record_first_contact_sent(&l, pk(0x01), Zeroizing::new(ar), LAST_SEEN),
+                Err(DmPersistError::AlreadyEstablished)
+            ),
+            "an entry was written over an established correspondence"
+        );
+        let stored = p.read_contact(&l).expect("reads").expect("a record");
+        assert_eq!(
+            stored.address_root(),
+            root,
+            "the refused entry re-addressed the channel"
+        );
+        assert!(
+            stored.pk_pc().is_some(),
+            "the refused entry cleared the pseudonym"
+        );
+
+        // A label holding someone else's record is the other refusal, and it is
+        // a different answer: this one is about two identities under one label.
+        assert!(
+            matches!(
+                p.record_first_contact_sent(&l, pk(0x33), Zeroizing::new(ar), LAST_SEEN),
+                Err(DmPersistError::CorrespondenceHoldsAnotherIdentity)
+            ),
+            "an entry was written into another correspondent's record"
+        );
+    }
+
+    /// The replace-guard, through the call the driver makes: a second, different
+    /// pseudonym is refused and the stored record keeps the key every frame
+    /// already collected was verified against.
+    #[test]
+    fn filling_a_pseudonym_twice_with_different_keys_is_refused_on_disk() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x74);
+        let ar = derive_channel_roots(&ss0()).expect("derives").ar;
+        p.record_first_contact_sent(&l, pk(0x11), Zeroizing::new(ar), FIRST_SEEN)
+            .expect("the entry was not recorded");
+
+        assert!(
+            p.record_correspondent_pseudonym(&l, pk(0x22), FIRST_SEEN)
+                .expect("records"),
+            "the first pseudonym was not recorded"
+        );
+        // Idempotent, and it costs no seal: a re-presented acceptance carries
+        // the key already recorded.
+        let before = p.store().seal_count();
+        assert!(
+            !p.record_correspondent_pseudonym(&l, pk(0x22), FIRST_SEEN)
+                .expect("re-records"),
+            "re-recording the same key reported a change"
+        );
+        assert_eq!(
+            p.store().seal_count(),
+            before,
+            "an unchanged record spent a seal"
+        );
+
+        assert!(
+            matches!(
+                p.record_correspondent_pseudonym(&l, pk(0x44), LAST_SEEN),
+                Err(DmPersistError::Contact(
+                    ContactCacheError::PseudonymAlreadyRecorded
+                ))
+            ),
+            "a second pseudonym was accepted"
+        );
+        assert_eq!(
+            p.read_contact(&l)
+                .expect("reads")
+                .expect("a record")
+                .pk_pc(),
+            Some(pk(0x22).as_ref()),
+            "the refused key displaced the recorded one"
+        );
+    }
+
+    /// A correspondence with no record at all is named as such, rather than
+    /// seeded from a call that knows neither the identity key nor the address
+    /// root a record must carry.
+    #[test]
+    fn filling_a_pseudonym_on_an_unrecorded_correspondence_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        assert!(
+            matches!(
+                p.record_correspondent_pseudonym(&label(0x75), pk(0x22), FIRST_SEEN),
+                Err(DmPersistError::ContactRecordMissing)
+            ),
+            "a record was invented for a correspondence that has none"
         );
     }
 
@@ -5567,7 +6135,7 @@ mod tests {
             .expect("the seeded record was destroyed by an Unchanged report");
         assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
         assert_eq!(stored.last_seen_ms(), LAST_SEEN);
-        assert_eq!(stored.pk_pc(), pk(0x80).as_ref());
+        assert_eq!(stored.pk_pc(), Some(pk(0x80).as_ref()));
         assert_eq!(
             p.store().seal_count() - before,
             1,
@@ -6487,6 +7055,138 @@ mod tests {
         );
     }
 
+    /// A knock from an identity this side has knocked at, and not yet been
+    /// accepted by, is not state loss.
+    ///
+    /// **Kills a `correspondent_state_lost` that reads a pseudonym-less record
+    /// like any other.** Such a record was written by this side's own entry,
+    /// under the root of an `ss0` this side encapsulated; the knock carries the
+    /// root of an `ss0` the correspondent encapsulated, so the two roots never
+    /// agree and the root comparison would report state loss on every mutual
+    /// knock — ending this side's own pending messages on a correspondence that
+    /// is about to work. The inference needs an established correspondence to
+    /// be about.
+    #[test]
+    fn a_knock_from_an_identity_whose_entry_is_unanswered_is_not_state_loss() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0xB8);
+        let now = FIRST_SEEN;
+
+        // This side's entry, under one root.
+        let ours = derive_channel_roots(&ss0_tagged(0x11)).expect("derives").ar;
+        p.record_first_contact_sent(&l, pk(0x11), Zeroizing::new(ours), FIRST_SEEN)
+            .expect("the entry was not recorded");
+        seed_two_pending(&p, &l, now);
+
+        // Their entry, under another — which is what every knock from them
+        // carries, because the secret is theirs.
+        let theirs = knock(0x11, ss0_tagged(0x22));
+        assert_ne!(
+            theirs.roots().ar,
+            ours,
+            "the fixture's two entries address one channel, so the roots agree \
+             for the wrong reason"
+        );
+        match p.correspondent_state_lost(&theirs, Direction::AToB, now) {
+            Ok(StateLoss::NoCorrespondence) => {}
+            other => {
+                panic!("an unanswered entry of our own was read as their state loss: {other:?}")
+            }
+        }
+        assert_eq!(
+            stored_states(&p, &l, now),
+            vec![DeliveryState::Composed, DeliveryState::Composed],
+            "a mutual knock ended this side's own pending messages"
+        );
+    }
+
+    /// Both parties knocking before either answers leaves one correspondence
+    /// holding the identity, not two.
+    ///
+    /// **Kills an `accept_first_contact` that leaves this side's own
+    /// pseudonym-less record where it found it.** Two records under one
+    /// identity make [`DmPersist::correspondence_for_pk_lt`] answer
+    /// [`DmPersistError::AmbiguousCorrespondent`] for ever, and every consumer
+    /// of that lookup fails closed on it — the identity becomes unroutable for
+    /// the life of the store, which is worse than either record alone.
+    #[test]
+    fn accepting_a_knock_supersedes_our_own_unanswered_entry_to_that_identity() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let ours = label(0xB9);
+        let ar = derive_channel_roots(&ss0_tagged(0x33)).expect("derives").ar;
+        p.record_first_contact_sent(&ours, pk(0x33), Zeroizing::new(ar), FIRST_SEEN)
+            .expect("the entry was not recorded");
+        assert_eq!(
+            p.correspondence_for_pk_lt(&pk(0x33)).expect("lookup"),
+            Some(ours),
+            "the fixture did not record the entry it is about"
+        );
+
+        let (label, _ratchet) = p
+            .accept_first_contact(knock(0x33, ss0_tagged(0x44)), LAST_SEEN)
+            .expect("the acceptance was refused");
+        assert_ne!(label, ours, "the acceptance reused the entry's own label");
+
+        assert_eq!(
+            p.correspondence_for_pk_lt(&pk(0x33)).expect("lookup"),
+            Some(label),
+            "the identity no longer names a single correspondence"
+        );
+        assert!(
+            p.read_contact(&ours).expect("reads").is_none(),
+            "the superseded record is still on disk"
+        );
+        assert!(
+            p.read_contact(&label)
+                .expect("reads")
+                .expect("a record")
+                .pk_pc()
+                .is_some(),
+            "the established record carries no pseudonym"
+        );
+    }
+
+    /// A second entry to one identity never lands under a second label.
+    ///
+    /// **Kills a `record_first_contact_sent` that only checks the label it was
+    /// given.** A handshake record ages out after two first-contact epochs, so
+    /// a caller re-sending an entry after that cannot recover the label from
+    /// the record and may mint a fresh one. Writing through it would put a
+    /// second contact record under one identity, which is the permanently
+    /// unroutable state.
+    #[test]
+    fn a_second_entry_under_a_fresh_label_is_refused() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let first = label(0xBA);
+        let second = label(0xBB);
+        let ar = derive_channel_roots(&ss0_tagged(0x55)).expect("derives").ar;
+
+        p.record_first_contact_sent(&first, pk(0x55), Zeroizing::new(ar), FIRST_SEEN)
+            .expect("the entry was not recorded");
+        assert!(
+            matches!(
+                p.record_first_contact_sent(&second, pk(0x55), Zeroizing::new(ar), LAST_SEEN),
+                Err(DmPersistError::AlreadyEstablished)
+            ),
+            "a second label took a second record for one identity"
+        );
+        assert!(
+            p.read_contact(&second).expect("reads").is_none(),
+            "the refused write left a record behind"
+        );
+        assert_eq!(
+            p.correspondence_for_pk_lt(&pk(0x55)).expect("lookup"),
+            Some(first),
+            "the identity stopped naming a single correspondence"
+        );
+    }
+
     /// **An identity no correspondence holds touches nothing.** An ordinary
     /// first contact from a stranger, which is most of them.
     #[test]
@@ -6744,7 +7444,13 @@ mod tests {
         );
         let stored = p.read_contact(&label).expect("read").expect("a record");
         assert_eq!(stored.pk_lt().as_slice(), pk(9).as_slice());
-        assert_eq!(stored.pk_pc().as_slice(), expected_pk_pc.as_slice());
+        assert_eq!(
+            stored
+                .pk_pc()
+                .expect("the acceptor records a pseudonym")
+                .as_slice(),
+            expected_pk_pc.as_slice()
+        );
         assert_eq!(stored.first_seen_ms(), FIRST_SEEN);
         assert_eq!(stored.last_seen_ms(), FIRST_SEEN);
         // The ratchet handed back is over the same `ss0` the record's root came

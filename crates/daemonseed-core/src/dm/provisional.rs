@@ -136,7 +136,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
-use crate::dm::firstcontact::{FirstContactError, ROOT_LEN, SS0_LEN, derive_channel_roots};
+use crate::dm::firstcontact::{
+    ChannelRoots, FirstContactError, ROOT_LEN, SS0_LEN, derive_channel_roots,
+};
 use crate::dm::paging::MAX_PAGE;
 use crate::dm::ratchet::{EphemeralDecapKey, Ratchet, RatchetError};
 use crate::dm::{domain, keyrec, push_lp};
@@ -468,12 +470,30 @@ impl ProvisionalRecord {
     /// **`chan_id` is deliberately not returned with it.** It is the one value in
     /// the derivation that must never be serialized anywhere (§ v4 minor
     /// invariant), so handing it out beside a record's other outputs invites a
-    /// caller to persist it alongside them — and a caller that genuinely needs it
-    /// for a frame AAD or signature reaches [`derive_channel_roots`] directly and
-    /// keeps it in memory only. Returning the smaller thing costs that caller one
-    /// call and removes the invitation.
+    /// caller to persist it alongside them. A caller that genuinely needs it for
+    /// a frame AAD or signature asks [`Self::channel_roots`], which returns the
+    /// pair in a type that destroys itself. Returning the smaller thing here
+    /// costs that caller one call and removes the invitation from every caller
+    /// that only wanted an address.
     pub fn address_root(&self) -> Result<[u8; ROOT_LEN], FirstContactError> {
         Ok(derive_channel_roots(&self.ss0)?.ar)
+    }
+
+    /// Both channel roots, recomputed — `AR` and `chan_id` together.
+    ///
+    /// **What a resuming handshake needs to open the frame it is waiting for.**
+    /// `AR` addresses the pages and `chan_id` is bound into every frame's AEAD,
+    /// so a party that has restarted mid-handshake and holds only this record
+    /// needs both: with `AR` alone it can find the acceptance and cannot open
+    /// it.
+    ///
+    /// **`chan_id` still reaches no disk.** [`ChannelRoots`] carries it in a
+    /// value that erases itself when it is dropped, and nothing here writes it
+    /// down — the § v4 invariant is about serialization, and recomputing a value
+    /// into memory from the secret the record already holds adds no copy that
+    /// outlives the call.
+    pub fn channel_roots(&self) -> Result<ChannelRoots, FirstContactError> {
+        derive_channel_roots(&self.ss0)
     }
 
     /// The opening ephemeral's public half, which the recipient's reply

@@ -412,9 +412,38 @@ work lives in the maintainer's own planning notes, not here.
   best-effort. `StoredChannelRestart::Established(Box<ResumeRecord>)` is a third restart outcome:
   a stored resume record is the authority, and a provisional record beside it is ignored and
   deleted. (#401)
+- `daemonseed_core::dm::persist::DmPersist::record_first_contact_sent(label, pk_lt, ar, now_ms)` —
+  writes the initiator's contact record when a first-contact entry is sent, with no pseudonym. A
+  record already there is re-addressed to the new root and keeps its `first_seen_ms`;
+  `DmPersistError::AlreadyEstablished` for an established correspondence and
+  `CorrespondenceHoldsAnotherIdentity` for one holding a different `pk_lt`. (#402)
+- `daemonseed_core::dm::persist::DmPersist::record_correspondent_pseudonym(label, pk_pc, now_ms) -> bool`
+  — fills the pseudonym on that record when the acceptance verifies, reporting whether it was newly
+  recorded, and records the sighting. `DmPersistError::ContactRecordMissing` where no record exists.
+  (#402)
+- `daemonseed_core::dm::contact_cache::ContactRecord::record_pseudonym(pk_pc) -> bool` — fills an
+  absent pseudonym; `ContactCacheError::PseudonymAlreadyRecorded` for a different key, an identical
+  key reports `false`. (#402)
+- `daemonseed_core::dm::contact_cache::ContactCacheError` — `UnknownPseudonymPresence { found }`,
+  `PlaceholderPseudonym`, `PseudonymAlreadyRecorded`. (#402)
+- `daemonseed_core::dm::persist::DmPersistError` — `CorrespondenceHoldsAnotherIdentity`,
+  `ContactRecordMissing`. (#402)
+- `daemonseed_core::dm::persist::DmPersistError::retrying_cannot_help()` — whether repeating the
+  same call could answer differently. Every `Contact`, `ContactRecordMissing`,
+  `CorrespondenceHoldsAnotherIdentity`, `AlreadyEstablished`, `AmbiguousCorrespondent`,
+  `OutboxDirectionMismatch` and `CursorPayloadWrongLen` is settled, as is a `Store` error naming
+  unreadable bytes. (#402)
+- `daemonseed_core::dm::provisional::ProvisionalRecord::channel_roots()` and
+  `daemonseed_core::dm::persist::PendingHandshake::channel_roots()` — both channel roots
+  recomputed from the stored handshake, `AR` and `chan_id` together, in a `ChannelRoots` that
+  erases itself. (#402)
 
 ### Fixed
 
+- A direct-message first-contact entry sent and then restarted before it was accepted no longer
+  strands: the acceptance is collected and the correspondent's messages are delivered, where before
+  nothing mapped their identity key to the correspondence and every message they composed re-emitted
+  to the outbox's seven-day give-up. (#402)
 - The terminal client shows a direct-message channel torn down for want of a stored handshake
   record as "conversation ended — start a new one" in the status badge and Trust History,
   through `trust_persistent_text`, rather than printing the event key
@@ -536,6 +565,27 @@ work lives in the maintainer's own planning notes, not here.
   path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
+
+- `daemonseed_core::dm::contact_cache::ContactRecord` holds `pk_pc` as `Option`: `new` takes
+  `Option<Box<[u8; ml_dsa::PK_LEN]>>` and `pk_pc()` returns `Option<&[u8; ml_dsa::PK_LEN]>`. The
+  at-rest form gains a presence byte before the key, which keeps its width when absent;
+  `CONTACT_RECORD_LEN` is 5234. `decode` refuses a presence byte outside `{0, 1}` and a key claimed
+  present and all-zero. (#402)
+- `daemonseed_core::dm::persist::DmPersist::correspondence_for_pk_lt` names a correspondence whose
+  contact record carries no pseudonym; `correspondent_state_lost` reports `NoCorrespondence` for
+  one. `accept_first_contact` refuses only an established correspondence and removes a
+  pseudonym-less record for the same identity before minting. (#402)
+- The direct-message driver writes the contact record when it sends a first-contact entry, fills the
+  pseudonym when the acceptance verifies, and seeds a restarted correspondence with the pseudonym
+  the record holds. Its established-correspondence checks read the record rather than the label.
+  On the first tick after a restart it recomputes the ratchet and channel roots of a correspondence
+  whose entry is unanswered, from the stored handshake at either live first-contact epoch, and
+  collects the acceptance. A page sweep requires the ratchet and channel roots, no longer this
+  side's own pseudonym keypair. It reuses a recorded correspondence's label when re-sending an
+  entry, and erases the stored handshake only once the collected pseudonym has reached the contact
+  record, retrying that write on the tick and releasing the handshake record when the refusal is
+  settled. A refused contact-record write erases the handshake record it wrote a moment earlier, and
+  a re-arm gives up after eight consecutive store faults, as does the pseudonym write. (#402)
 
 - Amended the direct-message design of record: the acknowledgement handshake terminates on an
   elapsed-time taper rather than mutual observation, acknowledgement reads are priced against the
