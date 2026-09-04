@@ -1506,6 +1506,53 @@ work lives in the maintainer's own planning notes, not here.
   once an entry has been queued. Debug builds panic when an `Unchanged` report
   follows a change. A record is re-encoded to the current format and write suite
   only on a `Changed` write. `DmStore` counts its seals in test builds. (#347)
+- `daemonseed_core::dm::resume::ResumeRecord` carries the re-establishment state that must agree
+  with itself, written by one `replace_atomically`. `new` takes two grouped structs in place of
+  eight positional fields: `ReEstState { reconnect_gen, attempt, own, acceptance,
+  attempt_at_window_start }` holds the two handshake slots, the committed generation, the monotone
+  attempt counter and the window anchor (A3.14, A3.4, A5.2, A7.3), and `Retention { retained, dedup,
+  stopped }` holds everything scoped to the retained `RS_n`. New: the peer-acceptance slot
+  (`AcceptanceSlot`, carrying the sealed `RE-ACK` that is re-served byte-identically and the
+  confirmation lock; A3.4, A5.1(ii)), the retained `RS_n` with its write-once `superseded_at_ms`
+  (`RetainedRoot`), the dedup memory keyed `(gen, attempt, leg, dir, seq)` (`DedupMemory`,
+  `DedupKey`, `Leg`, `Novelty`, bounded at `DEDUP_CAPACITY` and holding the one plane a party
+  receives on; A5.3), `reconnect_gen`, the `attempt` counter as a field of its own, and the
+  retained-but-stopped flag (A5.4). `retire_retained` drops the retained root, its stamp, its dedup
+  memory and the flag together; `observe_accepted` raises the `RE-EST` window base and, in the same
+  call, drops the dedup entries whose frames the scan can no longer open. `last_seen_re_est` and
+  `last_seen_re_ack` are the two window bases, one per direction (A6.1); the `RE-EST` base is a
+  stored, monotone field of `ReEstState` rather than a reading of the acceptance slot, which is
+  zeroed on completion. `commit_resume` licenses dropping a dedup position below the offered base and refuses
+  dropping one at or above it, so the record's eviction is committable and the memory does not grow
+  without bound across the window rollovers a retention contains.
+  Removed: `window_anchor_ms` and the stored `toward_c`, replaced by `attempt_at_window_start` — an
+  attempt number from which the toward-`C` count is a subtraction (A7.3). `previously_established`,
+  the peer's `PK_lt` and cached EK, and the clear ratchet-generation counter are **not** in the
+  record: their homes are the record's own presence, `dm::contact_cache`, and the outbox (A4.8)
+  respectively, and the module docs record each. The at-rest form changes; no released build has
+  written this record. (#404)
+- `daemonseed_core::dm::persist::DmPersist::commit_resume` narrows
+  `ResumeError::EmptySlotWouldReplaceAttempt` to an empty own slot at an unchanged `reconnect_gen`,
+  so the slot may be zeroed on completion (A3.14), and adds guards for the acceptance slot
+  (no attempt rollback within a generation, no reseal of an accepted attempt, no clearing a confirmed
+  slot without a generation advance), the write-once `superseded_at_ms`, monotone `reconnect_gen`,
+  and dedup positions dropped while their `RS_n` is retained (a subset test, so a swap is refused as
+  well as a shrink). The own slot may be emptied by an abandonment (A3.7) — recognised by an acceptance
+  newly occupying the contested generation — or by the completion that advances `reconnect_gen`, and
+  by nothing else. `ResumeRecord::decode` additionally refuses an empty frame, a slot whose attempt
+  disagrees with the counter, a generation on an empty slot, retained bytes under a clear presence
+  flag, and a duplicate dedup position. (#404)
+- `daemonseed_core::dm::reest::ReEstGate` is built by `from_record` and carries the persisted
+  confirmation lock (A5.1(ii)); `admit` answers the new `ReEstAdmission::Locked` for any differing
+  attempt at a confirmed generation, ahead of the budget closure (A9.4(ii)). The type
+  no longer derives `Default`. `AttemptBudget` is anchor-based: it carries
+  `attempt_at_window_start` beside the monotone attempt counter, derives the toward-`C` count as
+  their difference, and resets the anchor only through `observe_peer_opened`, which takes the attempt
+  an opened `RE-ACK` names — the `last_seen`-derived rollover (A8.2). Together these bound
+  `attempt − last_seen` by `C`, so `MAX_GAP = C` is sufficient and the multi-window lockout is
+  unreachable (A7.3). The gate additionally carries the record's committed `reconnect_gen` as a
+  floor, so a gate reloaded after a completion — which zeroes the acceptance slot — still drops the
+  generations that handshake closed. (#404)
 
 ## [0.36.3] — 2026-07-28
 

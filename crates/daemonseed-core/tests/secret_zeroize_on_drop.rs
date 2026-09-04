@@ -78,7 +78,8 @@ use daemonseed_core::dm::firstcontact::{ChannelRoots, ROOT_LEN, SS0_LEN, Verifie
 use daemonseed_core::dm::ratchet::EphemeralDecapKey;
 use daemonseed_core::dm::ratchet::ROOT_KEY_LEN;
 use daemonseed_core::dm::resume::{
-    CommittedRoot, FreshAttempt, ResumeRecord, SealedReEst, SendFloor,
+    CommittedRoot, DedupMemory, FreshAttempt, OwnSlot, ReEstState, ResumeRecord, RetainedRoot,
+    Retention, SealedReEst, SendFloor,
 };
 use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
@@ -1095,14 +1096,42 @@ fn resume_record() -> ResumeRecord {
         Box::new([0xA7; ML_DSA_SK_LEN]),
         Box::new([0xB3; PK_LEN]),
         CommittedRoot::from_bytes([0xC5; ROOT_KEY_LEN]),
-        Some(
-            SealedReEst::seal(FreshAttempt::first(), vec![0xD1; 64].into_boxed_slice())
-                .expect("a 64-byte frame is inside MAX_FRAME_LEN"),
-        ),
+        ReEstState {
+            reconnect_gen: 9,
+            attempt: 1,
+            last_seen_re_est: 0,
+            own: Some(OwnSlot::new(
+                10,
+                SealedReEst::seal(FreshAttempt::first(), vec![0xD1; 64].into_boxed_slice())
+                    .expect("a 64-byte frame is inside MAX_FRAME_LEN"),
+            )),
+            acceptance: None,
+            attempt_at_window_start: 2,
+        },
+        Retention {
+            retained: Some(RetainedRoot::new(
+                CommittedRoot::from_bytes([0xE9; ROOT_KEY_LEN]),
+                1_700_000_000_000,
+            )),
+            dedup: DedupMemory::new(),
+            stopped: false,
+        },
         SendFloor::new(7, 11),
-        1_700_000_000_000,
-        3,
     )
+}
+
+/// Where the retained root's bytes sit inside the record.
+///
+/// `Retention` holds it behind an `Option`, so the offset cannot be computed
+/// from `ResumeRecord`'s layout alone the way `committed_root`'s can. The
+/// accessor gives the address of the bytes themselves, and the watch is set over
+/// the record's whole allocation — containment is what matches, and the accessor
+/// is what pins which bytes are being read.
+fn retained_root_bytes(r: &ResumeRecord) -> &[u8] {
+    r.retained()
+        .expect("the fixture retains a superseded root")
+        .root()
+        .as_bytes()
 }
 
 /// **The two secret halves of `ResumeRecord` are wiped before their memory is
@@ -1172,6 +1201,19 @@ fn resume_record_secret_halves_are_zeroed_before_their_memory_is_released() {
         || Box::new(resume_record()),
         |r| at(r.committed_root().as_bytes()),
     );
+
+    // **The retained `RS_n` is deliberately NOT a case here.** It sits inside an
+    // `Option<RetainedRoot>` inside `Retention`, and this harness matches a freed
+    // block against a fixed offset in the record's own allocation — a shape an
+    // `Option` payload does not reliably present, so a case written here cannot
+    // be shown to be watching the bytes it names rather than the neighbouring
+    // `Vec` and flag. `dm::resume`'s
+    // `zeroizing_a_retained_root_wipes_its_root_and_its_stamp` calls that impl
+    // directly instead, which is a probe whose subject is not in doubt.
+    //
+    // The fixture still carries a retained root, because it strengthens the two
+    // cases above: it puts a second root in the record, so a watch that drifted
+    // onto it would read a different filler rather than an incidental zero.
 }
 
 /// **The controls: the `#[zeroize(skip)]` neighbours must still be readable right
@@ -1199,5 +1241,15 @@ fn the_record_is_populated_before_any_drop_so_the_wipe_cases_have_a_control() {
     assert!(
         r.committed_root().as_bytes().iter().any(|&b| b != 0),
         "the committed root is all-zero before any drop, so wiping it proves nothing"
+    );
+    assert!(
+        retained_root_bytes(&r).iter().all(|&b| b == 0xE9),
+        "the retained root is not the fixture's pattern before any drop, so wiping \
+         it proves nothing"
+    );
+    assert_ne!(
+        retained_root_bytes(&r),
+        r.committed_root().as_bytes(),
+        "the two roots share a filler, so a watch on one could pass on the other"
     );
 }

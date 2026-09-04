@@ -1461,10 +1461,15 @@ modules:
       a change to the outbox. A stored record is re-encoded to the current
       format and write suite on any write.
       commit_resume(&CorrespondenceLabel, &ResumeRecord) -> Result<Option<Vec<u8>>,
-      DmPersistError> writes the resume record inside one critical section and
-      returns its sealed RE-EST bytes, so the frame is unreachable without a
-      completed write; Ok(None) is a record whose handshake slot is empty, which
-      has nothing to emit. It refuses with DmPersistError::Resume(
+      DmPersistError> applies every ResumeRecord invariant this module owns and
+      writes the record inside one critical section. Note that DmPersist::store()
+      hands out a &DmStore whose critical_section takes &self and yields a mutable
+      guard, so a caller can reach Locked::replace(RecordKind::Resume, ...) around
+      those guards; the guards bound what this module's write path can do to the
+      record, not what any code in the process can do to the file. On a
+      successful write it returns the record's sealed RE-EST bytes, so the frame
+      is unreachable without a completed write; Ok(None) is a record whose
+      handshake slot is empty, which has nothing to emit. It refuses with DmPersistError::Resume(
       ResumeError::FloorWouldRollBack) when the stored send floor is ahead of
       the offered one, ResumeError::AttemptWouldRollBack { stored, offered } on
       an attempt regression, and ResumeError::AttemptResealed { attempt } when a
@@ -1707,14 +1712,48 @@ modules:
       transport that emits from an outbox (#235 transport half).
       Sub-module dm::resume is the A9.2 re-establishment resume record.
       ResumeRecord::new(s_pc: Box<[u8; ml_dsa::SK_LEN]>, pk_pc: Box<[u8;
-      ml_dsa::PK_LEN]>, committed_root: CommittedRoot, sealed:
-      Option<SealedReEst>, send_floor: SendFloor, window_anchor_ms: i64,
-      toward_c: u32) ->
+      ml_dsa::PK_LEN]>, committed_root: CommittedRoot, handshake: ReEstState,
+      retention: Retention, send_floor: SendFloor) ->
       ResumeRecord takes every field at once; there is no builder and no field
-      setter, and it is infallible because SealedReEst carries the frame-length
-      invariant. sealed is None for the empty handshake slot, which is what a
-      record written at first establishment carries; at rest it is attempt 0 and
-      a zero-length frame, and None orders below every Attempt. Attempt is a u32 newtype ordered numerically: Attempt::FIRST,
+      setter, and it is infallible because SealedReEst and AcceptanceSlot carry
+      the frame-length invariants. The two struct arguments group the fields that
+      move together in one write. ReEstState { reconnect_gen: u32, attempt: u32,
+      last_seen_re_est: u32, own: Option<OwnSlot>,
+      acceptance: Option<AcceptanceSlot>, attempt_at_window_start: u32 } is
+      A3.14's two handshake slots plus A3.4's generation, A5.2's monotone attempt
+      counter, A6.1's RE-EST window base and A7.3's window anchor;
+      ReEstState::first_establishment() is all of it empty. The counter is its
+      own field rather than the own slot's copy: A3.14 zeroes the slot on
+      completion, so a counter read out of it would restart at 1 at every
+      completed handshake and the anti-rollback comparison would stop firing
+      across exactly that boundary. The slot keeps a copy because A9.1(a)'s
+      re-emit needs the number bound to the bytes; decode and commit_resume both
+      refuse a record whose two disagree (ResumeError::AttemptSlotDisagrees). Retention { retained: Option<RetainedRoot>, dedup:
+      DedupMemory, stopped: bool } is everything scoped to the retained RS_n;
+      Retention::none() is nothing retained. Either slot is None for a slot
+      standing empty, which is what a record written at first establishment
+      carries; at rest a slot is attempt 0 and a zero-length frame, and None
+      orders below every Attempt.
+      OwnSlot::new(generation: u32, sealed: SealedReEst) with generation(),
+      attempt() -> Attempt and sealed() -> &SealedReEst is our own pending
+      initiation; the generation is the one it is trying to reach, which A3.4
+      distinguishes from the committed reconnect_gen.
+      AcceptanceSlot::accept(generation: u32, attempt: Attempt, sealed_re_ack:
+      Box<[u8]>) -> Result<AcceptanceSlot, ResumeError> is the peer initiation we
+      accepted, refusing ResumeError::FrameTooLong { len } above
+      MAX_SEALED_LEG_LEN (a leg's length plus headroom, not MAX_FRAME_LEN — two
+      slots at the frame ceiling do not fit RESUME_CAPACITY). confirm(self) ->
+      Self sets A5.1(ii)'s lock and is the only way to set it; generation(),
+      attempt(), sealed_re_ack() -> &[u8] and confirmed() -> bool read back. Both
+      slot constructors also refuse a ZERO-length frame with
+      ResumeError::EmptyFrame: an occupied slot with no bytes encodes without
+      complaint and then never decodes again, which wedges commit_resume, since
+      every later write reads the stored record first. The
+      stored RE-ACK bytes are the only copy of the answer A3.4 re-serves
+      byte-identically.
+      RetainedRoot::new(root: CommittedRoot, superseded_at_ms: i64) with root()
+      and superseded_at_ms() is A3.5's retained RS_n; the stamp is write-once per
+      root and commit_resume enforces it. Attempt is a u32 newtype ordered numerically: Attempt::FIRST,
       get() -> u32, advance() -> Option<FreshAttempt> yielding the successor and
       None at u32::MAX. FreshAttempt is the authority to seal a fresh RE-EST,
       minted only by FreshAttempt::first() and Attempt::advance(), and is
@@ -1727,11 +1766,57 @@ modules:
       several tokens for one successor. decode rebuilds a SealedReEst from
       at-rest bytes with no token, so holding one is not proof a token authorised
       it. DmPersist::commit_resume is the enforcement point in all cases.
-      Accessors s_pc/pk_pc/
-      committed_root/attempt/send_floor/window_anchor_ms/toward_c/sealed/
-      sealed_re_est borrow; sealed_re_est returns the same bytes every call.
-      attempt() -> Option<Attempt>, sealed() -> Option<&SealedReEst> and
-      sealed_re_est() -> Option<&[u8]> are None on an empty handshake slot. s_pc and committed_root zero on drop and Debug
+      Accessors s_pc/pk_pc/committed_root/reconnect_gen/attempt/send_floor/
+      attempt_at_window_start/own_slot/acceptance/retained/dedup/
+      retained_but_stopped/sealed/sealed_re_est borrow; sealed_re_est returns the
+      same bytes every call. attempt() -> Option<Attempt> is the counter, not the
+      slot's copy. attempt() -> Option<Attempt>, own_slot() ->
+      Option<&OwnSlot>, sealed() -> Option<&SealedReEst> and sealed_re_est() ->
+      Option<&[u8]> are None on an empty own slot, and acceptance() ->
+      Option<&AcceptanceSlot> on an empty acceptance slot. A6.1's window base is
+      TWO derivations, not one, because the two legs travel in opposite
+      directions and are keyed on different attempt spaces: last_seen_re_est() ->
+      u32 is what scan_re_est and scan_re_confirm take; last_seen_re_ack() -> u32
+      is this party's own counter and is what scan_re_ack takes. Both are 0 on an
+      empty correspondence. last_seen_re_est is a STORED field, monotone
+      within a correspondence, not derived from the acceptance slot:
+      A3.14 zeroes that slot on completion, so a derived base would drop to 0 at
+      every completed handshake and re-admit attempts the dedup memory had
+      already evicted. It is a field of ReEstState, beside the attempt counter —
+      both are correspondence-lifetime numbers and neither is scoped to a
+      retention. Occupying the slot raises it (new and observe_accepted), and
+      retire_retained leaves it alone; commit_resume refuses a record whose base
+      is behind the stored one with
+      ResumeError::ReEstBaseWouldRegress { stored, offered }. There is no window_anchor_ms and no stored toward_c: A7.3's
+      anchor is an attempt number (attempt_at_window_start) and the toward-C count
+      is the subtraction AttemptBudget performs.
+      note_processed(key: DedupKey) -> Result<Novelty, ResumeError> records a
+      processed handshake frame and answers Novelty::Novel or Novelty::Repeat.
+      retire_retained(&mut self) drops the retained root, its stamp, its dedup
+      memory and the stopped flag together — the one act that ends any of them,
+      because A5.3 scopes the memory's lifetime to the root's.
+      Eviction below the window is not a public call: new() and
+      observe_accepted() both drop the entries whose attempt has fallen below
+      their leg's scan-window base (RE-EST and RE-CONFIRM against
+      last_seen_re_est, RE-ACK against last_seen_re_ack) as an idempotent
+      recomputation from the record's own state. A5.2 has the scan rejecting
+      anything outside [last_seen, last_seen + MAX_GAP], so such a frame can no
+      longer open and so cannot alarm; A6.1 rolls the window anchor over inside
+      one retention, so a retained RS_n sees C attempts per window rather than
+      C in total, which is what keeps DedupFull unreachable on a legitimate
+      drive. decode() runs no eviction; a below-base entry it admits goes at
+      the next observe_accepted().
+      DedupMemory::new() / insert(DedupKey) -> Result<Novelty, ResumeError> /
+      contains(DedupKey) -> bool / len() / is_empty() / keys() -> &[DedupKey] is
+      A5.3's durable, retention-scoped memory; insert returns
+      ResumeError::DedupFull { capacity } at DEDUP_CAPACITY (27 = 3 legs x
+      (MAX_GAP + 1), one surviving scan window per leg on the one plane a party
+      receives; dm::reest pins the equality at compile time) rather than
+      evicting. DedupKey::new(generation: u32, attempt: Attempt, leg: Leg,
+      direction: Direction, seq: u64) is A5.3's key, with attempt load-bearing:
+      two different-attempt RE-ESTs share gen and seq. Leg is ReEst / ReAck /
+      ReConfirm, carried here rather than in dm::reest because the key is durable
+      state in this record. s_pc and committed_root zero on drop and Debug
       renders both redacted. CommittedRoot::from_bytes([u8;
       ROOT_KEY_LEN]) is a redacted secret newtype distinct from
       ratchet::RootKey. SendFloor::new(generation: u32, seq: u64) orders
@@ -1747,10 +1832,26 @@ modules:
       suite id, plaintext; storage::dm_store seals and pads it. decode takes no
       clock: no stored value here drives a terminal transition. It rejects a
       wrong magic, a truncation, a frame length above MAX_FRAME_LEN checked
-      before any allocation, a sentinel or unknown suite id, trailing bytes, and
+      before any allocation, a sentinel or unknown suite id, trailing bytes,
       ResumeError::EmptySlotHasFrame { len } for attempt 0 beside a non-empty
-      frame and ResumeError::OccupiedSlotHasNoFrame { attempt } for a real
-      attempt beside a zero-length one. Neither is reachable from encode, which
+      frame, ResumeError::OccupiedSlotHasNoFrame { attempt } for a real
+      attempt beside a zero-length one, ResumeError::EmptyAcceptanceHasContent {
+      frame_len, confirmed } and ResumeError::AcceptanceHasNoFrame { attempt } for
+      the same two contradictions in the acceptance slot,
+      ResumeError::RetentionHalfPresent { present } for a retained root without
+      its stamp or a stamp without its root, ResumeError::UnknownLeg(u8) and
+      ResumeError::UnknownDirection(u8) for a dedup entry naming neither,
+      ResumeError::DedupFull { capacity } for more entries than DEDUP_CAPACITY,
+      ResumeError::DuplicateDedupEntry for the same position twice,
+      ResumeError::SlotGenerationWithoutAttempt { generation } for a generation
+      on a slot standing empty, ResumeError::RetainedBytesWithoutFlag for
+      retained bytes under a clear presence flag, and
+      ResumeError::AttemptSlotDisagrees { field, slot } for an own slot whose
+      attempt is not the counter, and
+      ResumeError::ReEstBaseWouldRegress { stored, offered } for a window base
+      behind the stored one. The acceptance frame's length prefix is bounded
+      by MAX_SEALED_LEG_LEN and the own frame's by MAX_FRAME_LEN, each checked
+      before anything is reserved. Neither is reachable from encode, which
       derives both halves from one Option; they guard decode against another
       encoder.
       MAX_ENCODED_LEN is the computed worst case and bounds
@@ -1806,26 +1907,45 @@ modules:
       AToB, 1 is BToA. contest_outcome(root, generation, our_direction,
       our_pending_initiation_at: Option<u32>) -> ContestOutcome returns NoContest
       unless the pending initiation is at this generation, then WeSurvive or
-      WeAbandon. ReEstGate::new() / admit(generation, attempt, budget: impl
-      FnOnce() -> bool) -> ReEstAdmission holds one accepted (generation,
-      attempt) and orders incoming pairs against it: the same pair is ReServe
-      with no charge, a pair ordering below it (a lower attempt at that
-      generation, or any lower generation) is Dropped with no charge and no
-      state change, and a pair above it — a higher generation, or A5.1's
-      superseding higher attempt at the accepted generation — is charged and
-      replaces the slot, yielding Emit or Withheld. accepted() reads the slot
-      back as Option<(u32, Attempt)>. It is A3.4's acceptance slot plus A5.1's
-      supersede, not A5.3's durable dedup memory, which is unbuilt and has no
-      ResumeRecord field; A5.1(ii)'s confirmation lock is also not here and the
-      caller owes it. AttemptBudget::empty() / from_record(&ResumeRecord) / count() /
-      exhausted() / charge() -> Option<Self> is the toward-C count, exhausted at
-      ATTEMPT_CEILING on a >= boundary; it carries no window-start anchor and no
-      rollover. ATTEMPT_CEILING is 8 and MAX_GAP equals it; both are placeholders
-      for the design's tunable C, protocol-global rather than per-deployment, and
-      moving them changes no encoding. MAX_GAP = C holds only while a sender's
-      attempt stays within C of the receiver's last_seen; the window-start anchor
-      and last_seen-derived rollover that would guarantee it are not built, so a
-      multi-window attempt is unopenable until RS_n retires.
+      WeAbandon. ReEstGate::from_record(&ResumeRecord) / new() / admit(generation,
+      attempt, budget: impl FnOnce() -> bool) -> ReEstAdmission holds one accepted
+      (generation, attempt) with A5.1(ii)'s confirmation flag and orders incoming
+      pairs against it: the same pair is ReServe with no charge; any differing
+      attempt at a CONFIRMED generation is Locked with no charge, checked before
+      the budget closure; a pair ordering below it (a lower attempt at an
+      unconfirmed generation, or any lower generation) is Dropped with no charge
+      and no state change; and a pair above it — a higher generation, or A5.1's
+      superseding higher attempt at an unconfirmed candidate — is charged and
+      replaces the slot, yielding Emit or Withheld. accepted() reads the slot back
+      as Option<(u32, Attempt)>, is_confirmed() -> bool reads the lock, and
+      floor() -> u32 reads the committed generation below which nothing is
+      admitted. Locked is deliberately wider than A5.1(ii)'s "lower-or-stale": a
+      higher attempt is refused too, because confirmation means a frame has
+      opened under the re-rooted chain and re-rooting again would fork the root
+      the peer is already using.
+      from_record is the constructor production uses and the type has no Default:
+      the accepted pair, the lock and the floor are durable state, so a gate built
+      empty after a restart would let a returning peer's stale attempt supersede a
+      candidate both sides had settled. The floor is carried even when the
+      acceptance slot is empty — A3.14 zeroes that slot on completion, so a gate
+      seeded from the slot alone would admit generations A3.4 has already closed;
+      a replay of the accepted pair is still re-served ahead of the floor. It is A3.4's acceptance slot plus A5.1's
+      supersede and lock, not A5.3's durable dedup memory, which lives in
+      ResumeRecord::dedup and is keyed (gen, attempt, leg, dir, seq).
+      AttemptBudget::empty() / from_record(&ResumeRecord) / anchor() / attempt() /
+      count() / exhausted() / charge() -> Option<Self> / observe_peer_opened(
+      attempt: Attempt) -> Self carries A7.3's window anchor beside the monotone
+      attempt counter and derives the toward-C count as their difference, so no
+      second counter can disagree with the number it describes. charge refuses at
+      anchor + ATTEMPT_CEILING on a >= boundary. observe_peer_opened is the only
+      anchor reset (A8.2's last_seen-derived rollover, recomputed at load) and
+      takes the attempt an opened RE-ACK names; an observation at or below the
+      anchor, or above the counter, is inert. ATTEMPT_CEILING is 8 and MAX_GAP
+      equals it; both are placeholders for the design's tunable C,
+      protocol-global rather than per-deployment, and moving them changes no
+      encoding. Together the ceiling and the anchor reset bound attempt −
+      last_seen by C, so the legitimate current attempt is always inside the
+      receiver's scan window.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

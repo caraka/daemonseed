@@ -6271,7 +6271,9 @@ mod tests {
     #[test]
     fn a_first_contact_scan_does_not_scrub_a_bystanders_provisional_record() {
         use daemonseed_core::dm::ratchet::ROOT_KEY_LEN;
-        use daemonseed_core::dm::resume::{CommittedRoot, ResumeRecord, SendFloor};
+        use daemonseed_core::dm::resume::{
+            CommittedRoot, ReEstState, ResumeRecord, Retention, SendFloor,
+        };
         use daemonseed_core::storage::dm_store::RecordKind;
 
         let dir = tempfile::tempdir().expect("temp dir");
@@ -6292,10 +6294,9 @@ mod tests {
                     Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
                     Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
                     CommittedRoot::from_bytes([0x33u8; ROOT_KEY_LEN]),
-                    None,
+                    ReEstState::first_establishment(),
+                    Retention::none(),
                     SendFloor::new(0, 0),
-                    BASE_MS,
-                    0,
                 ),
             )
             .expect("commits");

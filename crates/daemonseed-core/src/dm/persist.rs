@@ -561,11 +561,25 @@ impl DmPersist {
         })
     }
 
-    /// The store underneath, for enumeration and for tests.
+    /// The store underneath, for enumeration and for the record kinds this
+    /// module does not own.
     ///
-    /// Read-only: [`DmStore`]'s mutating surface lives on the guard its own
-    /// [`DmStore::critical_section`] hands out, so a shared borrow cannot write
-    /// a record around this module.
+    /// **A shared borrow of [`DmStore`] can write.**
+    /// [`DmStore::critical_section`] takes `&self` and hands out a mutable
+    /// guard, so this accessor reaches [`Locked::replace`](crate::storage::dm_store::Locked::replace) and therefore reaches
+    /// [`RecordKind::Resume`] — around every guard
+    /// [`Self::commit_resume`] applies.
+    ///
+    /// **Not closed at the store, deliberately.** [`Locked::replace`](crate::storage::dm_store::Locked::replace) is a
+    /// kind-parametric byte primitive that cannot check a `ResumeRecord`
+    /// invariant, and refusing one kind inside it would put a `dm::resume`
+    /// rule in a module that knows nothing about the type — while the caller
+    /// that wanted to write raw bytes would still reach
+    /// [`DmStore::read_unlocked`] and the file itself. The guards' actual
+    /// contract is narrower than it looks and is worth stating: they bound what
+    /// *this module's* write path can do to a record, which is what makes
+    /// `commit_resume` safe to call, not what any code in the process can do to
+    /// the file.
     pub fn store(&self) -> &DmStore {
         &self.store
     }
@@ -1219,34 +1233,8 @@ impl DmPersist {
             |guard| -> Result<Option<Vec<u8>>, DmPersistError> {
                 if let Some(bytes) = guard.read(RecordKind::Resume)? {
                     let stored = ResumeRecord::decode(&Zeroizing::new(bytes))?;
-                    match (record.attempt(), stored.attempt()) {
-                        (Some(offered), Some(held)) => {
-                            if offered < held {
-                                return Err(ResumeError::AttemptWouldRollBack {
-                                    stored: held.get(),
-                                    offered: offered.get(),
-                                }
-                                .into());
-                            }
-                            if offered == held && record.sealed_re_est() != stored.sealed_re_est() {
-                                return Err(ResumeError::AttemptResealed {
-                                    attempt: offered.get(),
-                                }
-                                .into());
-                            }
-                        }
-                        (None, Some(held)) => {
-                            return Err(ResumeError::EmptySlotWouldReplaceAttempt {
-                                stored: held.get(),
-                            }
-                            .into());
-                        }
-                        // A first establishment over a first establishment, or a
-                        // first re-establishment over one. Neither is a
-                        // regression; the pseudonym guard below is what stops
-                        // the first case replacing the keypair.
-                        (Some(_), None) | (None, None) => {}
-                    }
+                    Self::guard_attempt_counter(record, &stored)?;
+                    Self::guard_own_slot(record, &stored)?;
                     // **The pseudonym pair may not change, whatever the slot
                     // holds.** Without this, two records whose handshake slots
                     // are both empty are indistinguishable to every guard above:
@@ -1267,6 +1255,9 @@ impl DmPersist {
                     if record.s_pc() != stored.s_pc() || record.pk_pc() != stored.pk_pc() {
                         return Err(ResumeError::PseudonymPairChanged.into());
                     }
+                    Self::guard_reconnect_gen(record, &stored)?;
+                    Self::guard_acceptance(record, &stored)?;
+                    Self::guard_retention(record, &stored)?;
                     if !stored.send_floor().admits(record.send_floor()) {
                         return Err(ResumeError::FloorWouldRollBack {
                             stored: stored.send_floor(),
@@ -1279,6 +1270,279 @@ impl DmPersist {
                 Ok(record.sealed_re_est().map(<[u8]>::to_vec))
             },
         )
+    }
+
+    /// A5.2's attempt counter is monotone for the correspondence's whole
+    /// lifetime, so it never returns to an earlier value and never returns to
+    /// none.
+    ///
+    /// **It is compared against the record's `attempt` field, not against the
+    /// own slot's copy.** A3.14 zeroes the slot on completion, so a comparison
+    /// reading the slot would see `None` after every completed handshake and
+    /// then admit a fresh attempt `1` — the counter would restart, and the
+    /// guard would stop firing across exactly the boundary it exists to hold.
+    /// A9.2 lists the counter and the sealed frame bytes as separate fields for
+    /// this reason.
+    ///
+    /// The **reseal** half stays on the slot, because that is where the bytes
+    /// are: one attempt may not be sealed twice under different bytes (A9.1).
+    fn guard_attempt_counter(
+        record: &ResumeRecord,
+        stored: &ResumeRecord,
+    ) -> Result<(), DmPersistError> {
+        let offered = record.attempt().map_or(0, |a| a.get());
+        let held = stored.attempt().map_or(0, |a| a.get());
+        if offered == 0 && held > 0 {
+            // Reported apart from the ordinary rollback because no `Attempt` is
+            // ever `0`: a message naming `offered: 0` would name a value that
+            // cannot exist. This is a first establishment arriving over a
+            // re-establishment.
+            return Err(ResumeError::EmptySlotWouldReplaceAttempt { stored: held }.into());
+        }
+        if offered < held {
+            return Err(ResumeError::AttemptWouldRollBack {
+                stored: held,
+                offered,
+            }
+            .into());
+        }
+        // The slot's copy of the number is bound to the bytes a re-emit sends,
+        // so a record whose slot disagrees with its counter would re-emit under
+        // a key neither number names. `decode` refuses the same pairing; this
+        // stops one reaching disk in the first place.
+        if let Some(slot) = record.own_slot()
+            && slot.attempt().get() != offered
+        {
+            return Err(ResumeError::AttemptSlotDisagrees {
+                field: offered,
+                slot: slot.attempt().get(),
+            }
+            .into());
+        }
+        if let (Some(offered_slot), Some(held_slot)) = (record.own_slot(), stored.own_slot())
+            && offered_slot.attempt() == held_slot.attempt()
+            && offered_slot.sealed().bytes() != held_slot.sealed().bytes()
+        {
+            return Err(ResumeError::AttemptResealed {
+                attempt: held_slot.attempt().get(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// An occupied own slot is emptied by exactly two acts, and this refuses
+    /// every other way of arriving at an empty one.
+    ///
+    /// **A3.7's abandonment is one write at an unchanged generation.** The coin's
+    /// loser *"abandons its own handshake and answers the winner's frame as an
+    /// ordinary responder — abandonment and acceptance committed together,
+    /// intra-record"*. The generation does not move: A3.4 advances it only by a
+    /// *completed* handshake, which is two legs later. So the abandonment is
+    /// recognised by what replaces the initiation — an acceptance slot newly
+    /// occupying the generation the abandoned initiation was contesting.
+    ///
+    /// **A3.14's completion is the other act**, and it does advance the
+    /// generation: a folded `RE-ACK` ends the exchange, A3.4 advances
+    /// `reconnect_gen`, and the slot is zeroed in the same write.
+    ///
+    /// What stays refused is an initiation that simply disappears — no
+    /// acceptance took its place and no generation completed — which is a
+    /// re-establishment this side would go on believing it had in flight.
+    fn guard_own_slot(record: &ResumeRecord, stored: &ResumeRecord) -> Result<(), DmPersistError> {
+        let (Some(held), None) = (stored.own_slot(), record.own_slot()) else {
+            return Ok(());
+        };
+        if record.reconnect_gen() > stored.reconnect_gen() {
+            return Ok(());
+        }
+        let contested = record.acceptance().is_some_and(|offered| {
+            offered.generation() == held.generation()
+                && stored.acceptance().map(|s| (s.generation(), s.attempt()))
+                    != Some((offered.generation(), offered.attempt()))
+        });
+        if contested {
+            return Ok(());
+        }
+        Err(ResumeError::OwnSlotAbandonedWithoutAcceptance {
+            attempt: held.attempt().get(),
+        }
+        .into())
+    }
+
+    /// A3.4's generation is strictly monotonic — it *"advances only by a
+    /// completed handshake"* — so a record offering an earlier one describes a
+    /// state this correspondence has already left.
+    ///
+    /// It is checked before the acceptance and retention guards because both of
+    /// them read the generation to decide what a legitimate write looks like: a
+    /// generation advance is what licenses clearing a confirmed acceptance and
+    /// what licenses retaining a fresh `RS_n`, so a generation that could go
+    /// backwards would license either of those by going backwards first.
+    fn guard_reconnect_gen(
+        record: &ResumeRecord,
+        stored: &ResumeRecord,
+    ) -> Result<(), DmPersistError> {
+        if record.reconnect_gen() < stored.reconnect_gen() {
+            return Err(ResumeError::ReconnectGenWouldRollBack {
+                stored: stored.reconnect_gen(),
+                offered: record.reconnect_gen(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The peer-acceptance slot's three guards, the mirror of what the own slot
+    /// already had.
+    ///
+    /// **No rollback within a generation.** A5.1(i) admits a *higher* attempt
+    /// superseding an unconfirmed candidate and A3.4 drops a lower one, so a
+    /// stored acceptance never moves backwards — not in its generation, and not
+    /// in its attempt at one generation.
+    ///
+    /// **No reseal of an accepted attempt.** A3.4 re-serves *the stored*
+    /// `RE-ACK`, byte-identical, and those bytes are the only copy: the leg
+    /// carries a randomized ML-KEM ciphertext. Replacing them under one accepted
+    /// pair would answer one question twice, and the peer — deduping on the
+    /// attempt (A9.4) — confirms the first, leaving the two sides on different
+    /// siblings.
+    ///
+    /// **No clearing a confirmed slot without a generation advance.** A5.1(ii)
+    /// locks a confirmed candidate. The lock is durable so it survives a
+    /// restart, and the one write that legitimately ends it is the advance that
+    /// retires the whole exchange.
+    fn guard_acceptance(
+        record: &ResumeRecord,
+        stored: &ResumeRecord,
+    ) -> Result<(), DmPersistError> {
+        let Some(held) = stored.acceptance() else {
+            return Ok(());
+        };
+        let advanced = record.reconnect_gen() > stored.reconnect_gen();
+        match record.acceptance() {
+            Some(offered) => {
+                if (offered.generation(), offered.attempt()) < (held.generation(), held.attempt()) {
+                    return Err(ResumeError::AcceptanceWouldRollBack {
+                        stored_generation: held.generation(),
+                        stored_attempt: held.attempt().get(),
+                        offered_generation: offered.generation(),
+                        offered_attempt: offered.attempt().get(),
+                    }
+                    .into());
+                }
+                if offered.generation() == held.generation()
+                    && offered.attempt() == held.attempt()
+                    && offered.sealed_re_ack() != held.sealed_re_ack()
+                {
+                    return Err(ResumeError::AcceptanceResealed {
+                        generation: held.generation(),
+                        attempt: held.attempt().get(),
+                    }
+                    .into());
+                }
+                if held.confirmed()
+                    && !advanced
+                    && (offered.generation(), offered.attempt())
+                        != (held.generation(), held.attempt())
+                {
+                    return Err(ResumeError::ConfirmedAcceptanceCleared {
+                        generation: held.generation(),
+                        attempt: held.attempt().get(),
+                    }
+                    .into());
+                }
+            }
+            None if held.confirmed() && !advanced => {
+                return Err(ResumeError::ConfirmedAcceptanceCleared {
+                    generation: held.generation(),
+                    attempt: held.attempt().get(),
+                }
+                .into());
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// The retained `RS_n`'s two guards.
+    ///
+    /// **`superseded_at_ms` is write-once per retained root.** A5.4 stamps it at
+    /// the *first* supersede *"so `T_RETIRE` cannot slide forward per
+    /// re-attempt"*. The guard keys on the root's own bytes rather than on
+    /// presence, which is what makes it per-`RS_n`: retiring one root and
+    /// retaining its successor is a new stamp on a new root, and re-stamping the
+    /// same root is the sliding ceiling. Compared plainly rather than in
+    /// constant time — both copies are this party's own material and the caller
+    /// already holds the offered one, the same reasoning the pseudonym guard
+    /// above records.
+    ///
+    /// **Dedup entries may not be dropped while their root is still retained.**
+    /// A5.3 gates eviction on *"actual `RS_n` retirement"*, because byte-novelty
+    /// is what stops a co-host re-serving captured `RE-EST` bytes to re-fire the
+    /// peer-state-regressed alarm, and that defence is live for exactly as long
+    /// as the retained root can open those bytes.
+    /// [`ResumeRecord::retire_retained`] drops both together and is the only
+    /// call that does; this refuses the pairing arriving from a record built
+    /// field by field.
+    fn guard_retention(record: &ResumeRecord, stored: &ResumeRecord) -> Result<(), DmPersistError> {
+        // **Ahead of the retention checks, because the base is not scoped to a
+        // root being retained.** A6.1's window slides with observed traffic for
+        // the life of the correspondence; retiring `RS_n` ends what the memory
+        // is for, not what the receiver has seen.
+        if record.last_seen_re_est() < stored.last_seen_re_est() {
+            return Err(ResumeError::ReEstBaseWouldRegress {
+                stored: stored.last_seen_re_est(),
+                offered: record.last_seen_re_est(),
+            }
+            .into());
+        }
+        let Some(held) = stored.retained() else {
+            return Ok(());
+        };
+        let Some(offered) = record.retained() else {
+            return Ok(());
+        };
+        if offered.root().as_bytes() != held.root().as_bytes() {
+            return Ok(());
+        }
+        if offered.superseded_at_ms() != held.superseded_at_ms() {
+            return Err(ResumeError::SupersededStampMoved {
+                stored: held.superseded_at_ms(),
+                offered: offered.superseded_at_ms(),
+            }
+            .into());
+        }
+        // **A subset test above the window base, and no test below it.** A write
+        // that removes one key and adds another keeps the count and drops a
+        // position, and the frame it covered becomes byte-novel again — the
+        // alarm A5.3 exists to stop a co-host re-firing. So every stored
+        // position must still be present *unless the window has moved past it*:
+        // A5.2's scan rejects an attempt below the base, so such a frame can
+        // never open and can never alarm, which is the one shrink the design
+        // licenses. That exception is what makes the record's own eviction
+        // committable at all; without it the memory could only ever grow, and a
+        // long retention would reach `DedupFull` and refuse a legitimate
+        // handshake frame.
+        let base_for = |leg| match leg {
+            crate::dm::resume::Leg::ReEst | crate::dm::resume::Leg::ReConfirm => {
+                record.last_seen_re_est()
+            }
+            crate::dm::resume::Leg::ReAck => record.last_seen_re_ack(),
+        };
+        if stored
+            .dedup()
+            .keys()
+            .iter()
+            .any(|key| key.attempt().get() >= base_for(key.leg()) && !record.dedup().contains(*key))
+        {
+            return Err(ResumeError::DedupEvictedWhileRetained {
+                stored: stored.dedup().len(),
+                offered: record.dedup().len(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// Read the persisted resume record, or `Ok(None)` if none was written.
@@ -4856,16 +5120,23 @@ mod tests {
             crate::dm::resume::CommittedRoot::from_bytes(
                 [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
-            Some(
-                crate::dm::resume::SealedReEst::seal(
-                    fresh(attempt),
-                    vec![seal; 256].into_boxed_slice(),
-                )
-                .expect("within MAX_FRAME_LEN"),
-            ),
+            crate::dm::resume::ReEstState {
+                reconnect_gen: 0,
+                attempt,
+                last_seen_re_est: 0,
+                own: Some(crate::dm::resume::OwnSlot::new(
+                    1,
+                    crate::dm::resume::SealedReEst::seal(
+                        fresh(attempt),
+                        vec![seal; 256].into_boxed_slice(),
+                    )
+                    .expect("within MAX_FRAME_LEN"),
+                )),
+                acceptance: None,
+                attempt_at_window_start: 0,
+            },
+            crate::dm::resume::Retention::none(),
             floor,
-            1_700_000_000_000,
-            2,
         )
     }
 
@@ -5096,10 +5367,9 @@ mod tests {
             crate::dm::resume::CommittedRoot::from_bytes(
                 [0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
-            None,
+            crate::dm::resume::ReEstState::first_establishment(),
+            crate::dm::resume::Retention::none(),
             floor,
-            1_700_000_000_000,
-            0,
         )
     }
 
@@ -5118,16 +5388,23 @@ mod tests {
             crate::dm::resume::CommittedRoot::from_bytes(
                 [0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
-            Some(
-                crate::dm::resume::SealedReEst::seal(
-                    fresh(attempt),
-                    vec![0xA5u8; 256].into_boxed_slice(),
-                )
-                .expect("within MAX_FRAME_LEN"),
-            ),
+            crate::dm::resume::ReEstState {
+                reconnect_gen: 0,
+                attempt,
+                last_seen_re_est: 0,
+                own: Some(crate::dm::resume::OwnSlot::new(
+                    1,
+                    crate::dm::resume::SealedReEst::seal(
+                        fresh(attempt),
+                        vec![0xA5u8; 256].into_boxed_slice(),
+                    )
+                    .expect("within MAX_FRAME_LEN"),
+                )),
+                acceptance: None,
+                attempt_at_window_start: 0,
+            },
+            crate::dm::resume::Retention::none(),
             floor,
-            1_700_000_000_000,
-            0,
         )
     }
 
@@ -5447,16 +5724,25 @@ mod tests {
             crate::dm::resume::CommittedRoot::from_bytes(
                 [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
-            different.sealed().map(|s| {
-                crate::dm::resume::SealedReEst::seal(
-                    fresh(2),
-                    s.bytes().to_vec().into_boxed_slice(),
-                )
-                .expect("within MAX_FRAME_LEN")
-            }),
+            crate::dm::resume::ReEstState {
+                reconnect_gen: different.reconnect_gen(),
+                attempt: 2,
+                last_seen_re_est: 0,
+                own: different.sealed().map(|s| {
+                    crate::dm::resume::OwnSlot::new(
+                        1,
+                        crate::dm::resume::SealedReEst::seal(
+                            fresh(2),
+                            s.bytes().to_vec().into_boxed_slice(),
+                        )
+                        .expect("within MAX_FRAME_LEN"),
+                    )
+                }),
+                acceptance: None,
+                attempt_at_window_start: 0,
+            },
+            crate::dm::resume::Retention::none(),
             floor,
-            1_700_000_000_000,
-            2,
         );
         let err = p
             .commit_resume(&l, &different)
@@ -7648,5 +7934,926 @@ mod tests {
         let list = p.read_block_list().expect("read");
         assert_eq!(list.len(), 1, "the block survived provisioning");
         assert!(list.is_blocked(&pk(4)));
+    }
+
+    // ---------------------------------------------------------------------
+    // The second handshake slot and the retained root, at the store.
+    // ---------------------------------------------------------------------
+
+    /// A record carrying whatever the caller wants in each group, with the
+    /// pseudonym pair the other resume fixtures use — the pair guard refuses a
+    /// change to it independently, so every fixture here must share one.
+    fn resume_with(
+        handshake: crate::dm::resume::ReEstState,
+        retention: crate::dm::resume::Retention,
+        floor: SendFloor,
+    ) -> ResumeRecord {
+        ResumeRecord::new(
+            Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
+            Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
+            crate::dm::resume::CommittedRoot::from_bytes(
+                [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
+            ),
+            handshake,
+            retention,
+            floor,
+        )
+    }
+
+    fn attempt_of(n: u32) -> crate::dm::resume::Attempt {
+        crate::dm::resume::Attempt::from_nonzero(
+            std::num::NonZeroU32::new(n).expect("a real attempt"),
+        )
+    }
+
+    fn acceptance(generation: u32, attempt: u32, seal: u8) -> crate::dm::resume::AcceptanceSlot {
+        crate::dm::resume::AcceptanceSlot::accept(
+            generation,
+            attempt_of(attempt),
+            vec![seal; 128].into_boxed_slice(),
+        )
+        .expect("within MAX_SEALED_LEG_LEN")
+    }
+
+    fn own(generation: u32, attempt: u32, seal: u8) -> crate::dm::resume::OwnSlot {
+        crate::dm::resume::OwnSlot::new(
+            generation,
+            crate::dm::resume::SealedReEst::seal(
+                fresh(attempt),
+                vec![seal; 128].into_boxed_slice(),
+            )
+            .expect("within MAX_FRAME_LEN"),
+        )
+    }
+
+    fn dedup_key(n: u32) -> crate::dm::resume::DedupKey {
+        crate::dm::resume::DedupKey::new(
+            100 + n,
+            attempt_of(200 + n),
+            crate::dm::resume::Leg::ReEst,
+            crate::dm::ratchet::Direction::AToB,
+            u64::from(300 + n),
+        )
+    }
+
+    /// **A5.1(ii)'s confirmation lock survives the store being dropped and
+    /// reopened.**
+    ///
+    /// A6.1 sets the lock on the first frame that opens under the re-rooted
+    /// chain, and A5.4 homes it in the durable record. Held in memory it would
+    /// clear on exactly the restart this feature exists to survive, and a
+    /// returning peer's stale attempt would then supersede a candidate both
+    /// sides had settled.
+    ///
+    /// The store is dropped and rebuilt over the same directory, so the gate
+    /// below is built from bytes that went to disk rather than from a value
+    /// still in hand.
+    ///
+    /// Kills a codec or accessor that loses `confirmed`: the reloaded gate would
+    /// answer `Emit` to the differing attempt instead of `Locked`.
+    #[test]
+    fn the_confirmation_lock_survives_a_reopen_and_then_refuses_a_differing_attempt() {
+        use crate::dm::reest::{ReEstAdmission, ReEstGate};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = label(0x7A);
+        let floor = SendFloor::new(0, 0);
+
+        {
+            let p = persist(dir.path());
+            p.commit_resume(
+                &l,
+                &resume_with(
+                    crate::dm::resume::ReEstState {
+                        reconnect_gen: 6,
+                        attempt: 0,
+                        last_seen_re_est: 0,
+                        own: None,
+                        acceptance: Some(acceptance(7, 5, 0xC1).confirm()),
+                        attempt_at_window_start: 0,
+                    },
+                    crate::dm::resume::Retention::none(),
+                    floor,
+                ),
+            )
+            .expect("commits");
+        }
+
+        let p = persist(dir.path());
+        let reloaded = p
+            .read_resume(&l)
+            .expect("reads")
+            .expect("the record is on disk");
+        assert!(
+            reloaded
+                .acceptance()
+                .expect("the slot is occupied")
+                .confirmed(),
+            "the lock did not survive the reopen"
+        );
+
+        let mut gate = ReEstGate::from_record(&reloaded);
+        assert!(gate.is_confirmed());
+        assert_eq!(
+            gate.admit(7, attempt_of(6), || panic!("the budget was consulted")),
+            ReEstAdmission::Locked
+        );
+    }
+
+    /// **A supersede is admitted while the candidate is unconfirmed** — the
+    /// control for the test above.
+    ///
+    /// A5.1(i): *"an unconfirmed `RS_{n+1}` may be superseded by a newer
+    /// attempt's"*. Without this, a build that reported every reloaded slot as
+    /// confirmed would pass there.
+    ///
+    /// Kills a `from_record` that hard-codes the lock on.
+    #[test]
+    fn an_unconfirmed_slot_reloads_and_admits_a_supersede() {
+        use crate::dm::reest::{ReEstAdmission, ReEstGate};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = label(0x7B);
+        let floor = SendFloor::new(0, 0);
+
+        {
+            let p = persist(dir.path());
+            p.commit_resume(
+                &l,
+                &resume_with(
+                    crate::dm::resume::ReEstState {
+                        reconnect_gen: 6,
+                        attempt: 0,
+                        last_seen_re_est: 0,
+                        own: None,
+                        acceptance: Some(acceptance(7, 5, 0xC1)),
+                        attempt_at_window_start: 0,
+                    },
+                    crate::dm::resume::Retention::none(),
+                    floor,
+                ),
+            )
+            .expect("commits");
+        }
+
+        let p = persist(dir.path());
+        let reloaded = p
+            .read_resume(&l)
+            .expect("reads")
+            .expect("the record is on disk");
+        assert!(
+            !reloaded
+                .acceptance()
+                .expect("the slot is occupied")
+                .confirmed()
+        );
+        let mut gate = ReEstGate::from_record(&reloaded);
+        assert_eq!(gate.admit(7, attempt_of(6), || true), ReEstAdmission::Emit);
+        assert_eq!(gate.accepted().map(|(g, a)| (g, a.get())), Some((7, 6)));
+    }
+
+    /// **A3.7's coin-loser commits its abandonment and its acceptance together,
+    /// at an unchanged generation, and the store admits that write.**
+    ///
+    /// A3.7: the loser *"abandons its own handshake and answers the winner's
+    /// frame as an ordinary responder — abandonment and acceptance committed
+    /// together, intra-record"*. `reconnect_gen` does not move: A3.4 advances it
+    /// only by a *completed* handshake, which is two legs later. A guard keyed
+    /// on the generation alone would refuse the one write A3.7 requires.
+    ///
+    /// Kills a guard that demands a generation advance to empty the own slot
+    /// (the loser's commit would be refused) and a guard deleted outright (the
+    /// second half, an initiation that disappears with nothing in its place,
+    /// would be admitted). Both are asserted.
+    #[test]
+    fn the_coin_losers_abandonment_commits_beside_its_acceptance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x7C);
+        let floor = SendFloor::new(0, 0);
+
+        // Our own initiation contesting generation 5, committed at 4.
+        let stored = resume_with(
+            crate::dm::resume::ReEstState {
+                reconnect_gen: 4,
+                attempt: 3,
+                last_seen_re_est: 0,
+                own: Some(own(5, 3, 0xA1)),
+                acceptance: None,
+                attempt_at_window_start: 0,
+            },
+            crate::dm::resume::Retention::none(),
+            floor,
+        );
+        p.commit_resume(&l, &stored).expect("commits");
+
+        // The abandonment with nothing in its place: refused.
+        let vanished = resume_with(
+            crate::dm::resume::ReEstState {
+                reconnect_gen: 4,
+                attempt: 3,
+                last_seen_re_est: 0,
+                own: None,
+                acceptance: None,
+                attempt_at_window_start: 0,
+            },
+            crate::dm::resume::Retention::none(),
+            floor,
+        );
+        let err = p
+            .commit_resume(&l, &vanished)
+            .expect_err("an initiation may not simply disappear");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::OwnSlotAbandonedWithoutAcceptance {
+                    attempt: 3
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+
+        // The coin-loser's actual commit: own slot cleared, the winner's frame
+        // accepted at the SAME generation the abandoned initiation contested,
+        // and `reconnect_gen` unmoved.
+        let loser = resume_with(
+            crate::dm::resume::ReEstState {
+                reconnect_gen: 4,
+                attempt: 3,
+                last_seen_re_est: 0,
+                own: None,
+                acceptance: Some(acceptance(5, 1, 0xB2)),
+                attempt_at_window_start: 0,
+            },
+            crate::dm::resume::Retention::none(),
+            floor,
+        );
+        p.commit_resume(&l, &loser)
+            .expect("A3.7 commits the abandonment and the acceptance together");
+        let after = p.read_resume(&l).expect("reads").expect("on disk");
+        assert!(after.own_slot().is_none(), "the abandonment did not land");
+        assert_eq!(
+            after.acceptance().expect("accepted").generation(),
+            5,
+            "the acceptance did not land at the contested generation"
+        );
+        assert_eq!(
+            after.reconnect_gen(),
+            4,
+            "the generation must not have moved"
+        );
+        assert_eq!(
+            after.attempt().map(|a| a.get()),
+            Some(3),
+            "the counter survives the slot being zeroed"
+        );
+    }
+
+    /// **The monotone counter survives the completion that zeroes the own slot,
+    /// so a later attempt cannot restart at 1.**
+    ///
+    /// A5.2 makes `attempt` monotone for the correspondence's whole lifetime and
+    /// A9.2 lists it apart from the sealed frame bytes. Read out of the slot —
+    /// which A3.14 zeroes on completion — the counter would restart at every
+    /// completed handshake, and the rollback guard would stop firing across
+    /// exactly the boundary it exists to hold.
+    ///
+    /// Kills `guard_attempt_counter` comparing the own slot instead of the
+    /// field: after the completion the stored slot is `None`, so a slot-based
+    /// comparison has nothing to refuse and admits attempt 1 over 5.
+    #[test]
+    fn the_attempt_counter_outlives_the_slot_a_completion_zeroes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x81);
+        let floor = SendFloor::new(0, 0);
+
+        p.commit_resume(
+            &l,
+            &resume_with(
+                crate::dm::resume::ReEstState {
+                    reconnect_gen: 4,
+                    attempt: 5,
+                    last_seen_re_est: 0,
+                    own: Some(own(5, 5, 0xA1)),
+                    acceptance: None,
+                    attempt_at_window_start: 0,
+                },
+                crate::dm::resume::Retention::none(),
+                floor,
+            ),
+        )
+        .expect("commits");
+
+        // The completion: the generation advances and the slot is zeroed.
+        p.commit_resume(
+            &l,
+            &resume_with(
+                crate::dm::resume::ReEstState {
+                    reconnect_gen: 5,
+                    attempt: 5,
+                    last_seen_re_est: 0,
+                    own: None,
+                    acceptance: None,
+                    attempt_at_window_start: 5,
+                },
+                crate::dm::resume::Retention::none(),
+                floor,
+            ),
+        )
+        .expect("a completion empties the slot and advances the generation");
+        let after = p.read_resume(&l).expect("reads").expect("on disk");
+        assert!(after.own_slot().is_none(), "the completion did not land");
+        assert_eq!(
+            after.attempt().map(|a| a.get()),
+            Some(5),
+            "the counter reset"
+        );
+
+        // A fresh initiation at attempt 1 below the stored counter of 5 is a
+        // rollback, and is refused.
+        let err = p
+            .commit_resume(
+                &l,
+                &resume_with(
+                    crate::dm::resume::ReEstState {
+                        reconnect_gen: 5,
+                        attempt: 1,
+                        last_seen_re_est: 0,
+                        own: Some(own(6, 1, 0xA2)),
+                        acceptance: None,
+                        attempt_at_window_start: 0,
+                    },
+                    crate::dm::resume::Retention::none(),
+                    floor,
+                ),
+            )
+            .expect_err("the counter may not restart after a completion");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::AttemptWouldRollBack {
+                    stored: 5,
+                    offered: 1
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+        // The control: the next legitimate attempt is admitted.
+        p.commit_resume(
+            &l,
+            &resume_with(
+                crate::dm::resume::ReEstState {
+                    reconnect_gen: 5,
+                    attempt: 6,
+                    last_seen_re_est: 0,
+                    own: Some(own(6, 6, 0xA2)),
+                    acceptance: None,
+                    attempt_at_window_start: 5,
+                },
+                crate::dm::resume::Retention::none(),
+                floor,
+            ),
+        )
+        .expect("attempt 6 continues the counter");
+    }
+
+    /// **`reconnect_gen` is monotone.**
+    ///
+    /// A3.4: generations *"advance only by a completed handshake"* and are
+    /// strictly monotonic, so a record offering an earlier one describes a state
+    /// this correspondence has already left — and, since a generation advance is
+    /// what licenses clearing a confirmed acceptance, a generation that could go
+    /// backwards would license that by going backwards first.
+    ///
+    /// Kills a guard written `<=`, which would refuse an unchanged generation —
+    /// the ordinary case, since most resume writes change something else.
+    #[test]
+    fn the_reconnect_generation_never_rolls_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x7D);
+        let floor = SendFloor::new(0, 0);
+
+        let at = |generation: u32| {
+            resume_with(
+                crate::dm::resume::ReEstState {
+                    reconnect_gen: generation,
+                    attempt: 0,
+                    last_seen_re_est: 0,
+                    own: None,
+                    acceptance: None,
+                    attempt_at_window_start: 0,
+                },
+                crate::dm::resume::Retention::none(),
+                floor,
+            )
+        };
+        p.commit_resume(&l, &at(4)).expect("commits");
+        let err = p
+            .commit_resume(&l, &at(3))
+            .expect_err("a generation may not roll back");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::ReconnectGenWouldRollBack {
+                    stored: 4,
+                    offered: 3
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+        // Both directions of the boundary, so a `<=` guard fails here.
+        p.commit_resume(&l, &at(4))
+            .expect("an unchanged generation is legal");
+        p.commit_resume(&l, &at(5)).expect("an advance is legal");
+    }
+
+    /// **The acceptance slot's three guards.**
+    ///
+    /// No attempt rollback within a generation (A5.1(i) admits only a higher
+    /// one, A3.4 drops a lower); no reseal of an accepted attempt (A3.4 re-serves
+    /// *the stored* `RE-ACK`, and its randomized ML-KEM ciphertext is not
+    /// re-derivable); no clearing a confirmed slot without a generation advance
+    /// (A5.1(ii)'s lock).
+    ///
+    /// Kills each guard on its own: the three cases fail with three distinct
+    /// errors, and the legal writes after each are the controls that stop a
+    /// guard refusing everything.
+    #[test]
+    fn the_acceptance_slot_may_not_roll_back_reseal_or_clear_a_confirmation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x7E);
+        let floor = SendFloor::new(0, 0);
+        // The window base is the highest attempt this correspondence has
+        // accepted, and it never goes backwards (A6.1), so every record here
+        // carries the highest the test reaches. The acceptance-slot guards under
+        // test are independent of it.
+        let at = |generation: u32, slot: Option<crate::dm::resume::AcceptanceSlot>| {
+            resume_with(
+                crate::dm::resume::ReEstState {
+                    reconnect_gen: generation,
+                    attempt: 0,
+                    last_seen_re_est: 8,
+                    own: None,
+                    acceptance: slot,
+                    attempt_at_window_start: 0,
+                },
+                crate::dm::resume::Retention::none(),
+                floor,
+            )
+        };
+
+        p.commit_resume(&l, &at(7, Some(acceptance(7, 5, 0xC1))))
+            .expect("commits");
+
+        let err = p
+            .commit_resume(&l, &at(7, Some(acceptance(7, 4, 0xC1))))
+            .expect_err("an accepted attempt may not roll back");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::AcceptanceWouldRollBack {
+                    stored_generation: 7,
+                    stored_attempt: 5,
+                    offered_generation: 7,
+                    offered_attempt: 4
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+
+        let err = p
+            .commit_resume(&l, &at(7, Some(acceptance(7, 5, 0xC2))))
+            .expect_err("an accepted attempt may not be resealed");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::AcceptanceResealed {
+                    generation: 7,
+                    attempt: 5
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+
+        // The supersede is legal while unconfirmed, which is the control for the
+        // rollback guard above.
+        p.commit_resume(&l, &at(7, Some(acceptance(7, 6, 0xC3))))
+            .expect("a higher attempt supersedes an unconfirmed candidate");
+        // Now confirm it, and the clearing guard engages.
+        p.commit_resume(&l, &at(7, Some(acceptance(7, 6, 0xC3).confirm())))
+            .expect("confirming is a legal write");
+        for offered in [None, Some(acceptance(7, 8, 0xC4))] {
+            let err = p
+                .commit_resume(&l, &at(7, offered))
+                .expect_err("a confirmed slot may not be cleared or moved");
+            assert!(
+                matches!(
+                    err,
+                    DmPersistError::Resume(ResumeError::ConfirmedAcceptanceCleared {
+                        generation: 7,
+                        attempt: 6
+                    })
+                ),
+                "wrong error: {err:?}"
+            );
+        }
+        // The generation advance is what legitimately ends the lock.
+        p.commit_resume(&l, &at(8, None))
+            .expect("a generation advance retires the exchange");
+        assert!(
+            p.read_resume(&l)
+                .expect("reads")
+                .expect("on disk")
+                .acceptance()
+                .is_none()
+        );
+    }
+
+    /// **`superseded_at_ms` is write-once per retained `RS_n`.**
+    ///
+    /// A5.4 stamps it at the *first* supersede *"so `T_RETIRE` cannot slide
+    /// forward per re-attempt"*. Re-stamping would extend, one re-attempt at a
+    /// time, the window a stale copy of the superseded root enjoys.
+    ///
+    /// Kills a guard keyed on presence rather than on the root's own bytes: the
+    /// last write here retains a *different* root, which is a new `RS_n` and a
+    /// legitimately new stamp, and a presence-keyed guard would refuse it.
+    #[test]
+    fn the_supersede_stamp_is_write_once_per_retained_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x7F);
+        let floor = SendFloor::new(0, 0);
+        let retaining = |seed: u8, stamp: i64| {
+            resume_with(
+                crate::dm::resume::ReEstState::first_establishment(),
+                crate::dm::resume::Retention {
+                    retained: Some(crate::dm::resume::RetainedRoot::new(
+                        crate::dm::resume::CommittedRoot::from_bytes(
+                            [seed; crate::dm::ratchet::ROOT_KEY_LEN],
+                        ),
+                        stamp,
+                    )),
+                    dedup: crate::dm::resume::DedupMemory::new(),
+                    stopped: false,
+                },
+                floor,
+            )
+        };
+
+        p.commit_resume(&l, &retaining(0x91, 1_700_000_000_000))
+            .expect("commits");
+        let err = p
+            .commit_resume(&l, &retaining(0x91, 1_700_000_999_999))
+            .expect_err("the stamp may not slide forward");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::SupersededStampMoved {
+                    stored: 1_700_000_000_000,
+                    offered: 1_700_000_999_999
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+        // Re-offering the same stamp for the same root is the ordinary case.
+        p.commit_resume(&l, &retaining(0x91, 1_700_000_000_000))
+            .expect("an unchanged stamp is legal");
+        // A different root is a different `RS_n`, and carries its own stamp.
+        p.commit_resume(&l, &retaining(0x92, 1_700_000_999_999))
+            .expect("a new retained root carries a new stamp");
+    }
+
+    /// **Dedup entries may not be dropped while their `RS_n` is still
+    /// retained, and survive a reopen.**
+    ///
+    /// A5.3 gates eviction on *"actual `RS_n` retirement"*, because byte-novelty
+    /// is what stops a co-host re-serving captured `RE-EST` bytes to re-fire the
+    /// peer-state-regressed alarm — and that defence is live for exactly as long
+    /// as the retained root can open those bytes. The memory is durable for the
+    /// same reason: *"a lost entry is a torn security invariant"*.
+    ///
+    /// Kills the guard's removal (the shrinking write would be admitted) and a
+    /// codec that drops the memory (the reloaded record would hold none).
+    #[test]
+    fn dedup_entries_survive_a_reopen_and_may_not_be_dropped_before_retirement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let l = label(0x80);
+        let floor = SendFloor::new(0, 0);
+        let root = |seed: u8| {
+            crate::dm::resume::CommittedRoot::from_bytes([seed; crate::dm::ratchet::ROOT_KEY_LEN])
+        };
+        let retaining = |entries: u32, seed: u8| {
+            let mut dedup = crate::dm::resume::DedupMemory::new();
+            for n in 0..entries {
+                dedup.insert(dedup_key(n)).expect("inside DEDUP_CAPACITY");
+            }
+            resume_with(
+                crate::dm::resume::ReEstState::first_establishment(),
+                crate::dm::resume::Retention {
+                    retained: Some(crate::dm::resume::RetainedRoot::new(
+                        root(seed),
+                        1_700_000_000_000,
+                    )),
+                    dedup,
+                    stopped: true,
+                },
+                floor,
+            )
+        };
+
+        {
+            let p = persist(dir.path());
+            p.commit_resume(&l, &retaining(3, 0x91)).expect("commits");
+        }
+
+        let p = persist(dir.path());
+        let reloaded = p
+            .read_resume(&l)
+            .expect("reads")
+            .expect("the record is on disk");
+        assert_eq!(reloaded.dedup().len(), 3, "the memory did not survive");
+        assert!(reloaded.dedup().contains(dedup_key(0)));
+        assert!(reloaded.retained_but_stopped(), "the flag did not survive");
+
+        let err = p
+            .commit_resume(&l, &retaining(1, 0x91))
+            .expect_err("the memory may not shrink while its root is retained");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::DedupEvictedWhileRetained {
+                    stored: 3,
+                    offered: 1
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+
+        // Growing is the ordinary case, so the guard is not refusing every
+        // write to the memory.
+        p.commit_resume(&l, &retaining(4, 0x91))
+            .expect("recording a further position is legal");
+
+        // Retirement is what drops both, and `retire_retained` is the only act
+        // that spells it — after which the memory is legitimately empty.
+        let mut retired = retaining(4, 0x91);
+        retired.retire_retained();
+        assert!(retired.retained().is_none());
+        assert!(retired.dedup().is_empty());
+        p.commit_resume(&l, &retired)
+            .expect("retirement drops the root and its memory together");
+        let after = p.read_resume(&l).expect("reads").expect("on disk");
+        assert!(after.retained().is_none());
+        assert!(after.dedup().is_empty());
+    }
+
+    /// **A dedup write that swaps one key for another is refused, not just one
+    /// that shrinks the set.**
+    ///
+    /// A5.3's memory is what stops a co-host re-serving captured `RE-EST` bytes
+    /// to re-fire the peer-state-regressed alarm. A write that removes one
+    /// position and adds another keeps the count and drops a position, and the
+    /// frame it covered becomes byte-novel again — the same tear, invisible to a
+    /// length comparison.
+    ///
+    /// Kills the guard comparing lengths instead of testing that every stored
+    /// position is still present.
+    #[test]
+    fn a_dedup_write_may_not_swap_one_position_for_another() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x82);
+        let floor = SendFloor::new(0, 0);
+        let holding = |keys: &[u32]| {
+            let mut dedup = crate::dm::resume::DedupMemory::new();
+            for n in keys {
+                dedup.insert(dedup_key(*n)).expect("inside DEDUP_CAPACITY");
+            }
+            resume_with(
+                crate::dm::resume::ReEstState::first_establishment(),
+                crate::dm::resume::Retention {
+                    retained: Some(crate::dm::resume::RetainedRoot::new(
+                        crate::dm::resume::CommittedRoot::from_bytes(
+                            [0x91; crate::dm::ratchet::ROOT_KEY_LEN],
+                        ),
+                        1_700_000_000_000,
+                    )),
+                    dedup,
+                    stopped: false,
+                },
+                floor,
+            )
+        };
+
+        p.commit_resume(&l, &holding(&[0, 1, 2])).expect("commits");
+        // Same count, one position swapped out.
+        let err = p
+            .commit_resume(&l, &holding(&[0, 1, 9]))
+            .expect_err("a stored position may not be dropped");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::DedupEvictedWhileRetained {
+                    stored: 3,
+                    offered: 3
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+        // The control: a superset is admitted, so the guard is on the set rather
+        // than on the set being unchanged.
+        p.commit_resume(&l, &holding(&[0, 1, 2, 9]))
+            .expect("recording a further position is legal");
+    }
+
+    /// **A generation advance may carry a new acceptance pair over a confirmed
+    /// one.**
+    ///
+    /// A5.1(ii) locks a confirmed candidate, and A3.4 ends that lock the only
+    /// way it can end: the completed handshake that advances `reconnect_gen`
+    /// retires the whole exchange, and the next generation's acceptance is a
+    /// different exchange. Without this the accepting direction of the lock is
+    /// untested and a guard that refused every write over a confirmed slot would
+    /// pass.
+    ///
+    /// Kills `&& !advanced` being dropped from the guard's occupied arm.
+    #[test]
+    fn a_generation_advance_carries_a_new_acceptance_over_a_confirmed_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x83);
+        let floor = SendFloor::new(0, 0);
+        let at = |generation: u32, slot: Option<crate::dm::resume::AcceptanceSlot>| {
+            resume_with(
+                crate::dm::resume::ReEstState {
+                    reconnect_gen: generation,
+                    attempt: 0,
+                    last_seen_re_est: 0,
+                    own: None,
+                    acceptance: slot,
+                    attempt_at_window_start: 0,
+                },
+                crate::dm::resume::Retention::none(),
+                floor,
+            )
+        };
+
+        p.commit_resume(&l, &at(6, Some(acceptance(7, 5, 0xC1).confirm())))
+            .expect("commits");
+        // The same pair at an unchanged generation is the control: refused.
+        // Attempt 6, not 1: A5.2 makes the peer's counter monotone for the
+        // correspondence's lifetime, so a later acceptance never carries a lower
+        // attempt than one already observed.
+        let err = p
+            .commit_resume(&l, &at(6, Some(acceptance(8, 6, 0xC5))))
+            .expect_err("a confirmed slot may not move without an advance");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::ConfirmedAcceptanceCleared {
+                    generation: 7,
+                    attempt: 5
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+        // With the advance, the next generation's acceptance lands.
+        p.commit_resume(&l, &at(7, Some(acceptance(8, 6, 0xC5))))
+            .expect("a generation advance retires the confirmed exchange");
+        let after = p.read_resume(&l).expect("reads").expect("on disk");
+        let slot = after.acceptance().expect("accepted");
+        assert_eq!((slot.generation(), slot.attempt().get()), (8, 6));
+        assert!(!slot.confirmed(), "the new candidate inherits no lock");
+    }
+
+    /// **The store licenses exactly the shrink the record's eviction performs,
+    /// and no other.**
+    ///
+    /// A dedup position is kept only while the frame it guards can still open
+    /// and raise an alarm. The scan rejects any attempt below the window base,
+    /// so a position below the base guards a frame that can never open and
+    /// dropping it is legal; a position at or above the base still guards an
+    /// openable frame, so dropping it is refused. Without the first half the
+    /// memory could only grow, the record's own eviction would be
+    /// uncommittable, and a long retention would reach `DedupFull` and refuse a
+    /// legitimate handshake frame (A5.3).
+    ///
+    /// Kills the guard testing the whole stored set rather than the part at or
+    /// above the offered base (the first commit would be refused) and kills the
+    /// base bound being dropped altogether (the second would be admitted).
+    #[test]
+    fn a_dedup_position_below_the_window_base_may_be_dropped_and_one_above_may_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x84);
+        let floor = SendFloor::new(0, 0);
+        let at = |n: u32| attempt_of(n);
+        let key = |attempt: u32| {
+            crate::dm::resume::DedupKey::new(
+                1,
+                at(attempt),
+                crate::dm::resume::Leg::ReEst,
+                crate::dm::ratchet::Direction::AToB,
+                0,
+            )
+        };
+        let holding = |base: u32, attempts: &[u32]| {
+            let mut dedup = crate::dm::resume::DedupMemory::new();
+            for a in attempts {
+                dedup.insert(key(*a)).expect("inside DEDUP_CAPACITY");
+            }
+            resume_with(
+                crate::dm::resume::ReEstState {
+                    last_seen_re_est: base,
+                    ..crate::dm::resume::ReEstState::first_establishment()
+                },
+                crate::dm::resume::Retention {
+                    retained: Some(crate::dm::resume::RetainedRoot::new(
+                        crate::dm::resume::CommittedRoot::from_bytes(
+                            [0x91; crate::dm::ratchet::ROOT_KEY_LEN],
+                        ),
+                        1_700_000_000_000,
+                    )),
+                    dedup,
+                    stopped: false,
+                },
+                floor,
+            )
+        };
+
+        p.commit_resume(&l, &holding(3, &[3, 4, 9]))
+            .expect("commits");
+
+        // The base advanced to 9, so attempts 3 and 4 can no longer open and
+        // dropping them is the eviction the record performs.
+        p.commit_resume(&l, &holding(9, &[9]))
+            .expect("a below-base position may be dropped once the base has passed it");
+
+        // Attempt 9 is AT the base, so it is still reachable and may not go.
+        let err = p
+            .commit_resume(&l, &holding(9, &[]))
+            .expect_err("a position at the base is still reachable");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::DedupEvictedWhileRetained { .. })
+            ),
+            "wrong error: {err:?}"
+        );
+    }
+
+    /// **The window base never goes backwards inside one retention.**
+    ///
+    /// A6.1 has the window slide with observed traffic, forward only. The base
+    /// is what both the record's eviction and the store's no-shrink rule read to
+    /// decide which positions still matter, so a base that could regress would
+    /// let a later write re-admit frames an earlier one had put out of reach —
+    /// and would re-open the very drop the guard above had just licensed.
+    ///
+    /// Kills the regression check being absent, and kills it written `<=`, which
+    /// would refuse an unchanged base — the ordinary case, since most resume
+    /// writes change something else.
+    #[test]
+    fn the_re_est_window_base_never_regresses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x85);
+        let floor = SendFloor::new(0, 0);
+        let at_base = |base: u32| {
+            resume_with(
+                crate::dm::resume::ReEstState {
+                    last_seen_re_est: base,
+                    ..crate::dm::resume::ReEstState::first_establishment()
+                },
+                crate::dm::resume::Retention {
+                    retained: None,
+                    dedup: crate::dm::resume::DedupMemory::new(),
+                    stopped: false,
+                },
+                floor,
+            )
+        };
+
+        p.commit_resume(&l, &at_base(7)).expect("commits");
+        let err = p
+            .commit_resume(&l, &at_base(6))
+            .expect_err("the base may not regress");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::ReEstBaseWouldRegress {
+                    stored: 7,
+                    offered: 6
+                })
+            ),
+            "wrong error: {err:?}"
+        );
+        // Both directions of the boundary, so a `<=` guard fails here.
+        p.commit_resume(&l, &at_base(7))
+            .expect("an unchanged base is legal");
+        p.commit_resume(&l, &at_base(8))
+            .expect("a slide forward is legal");
     }
 }

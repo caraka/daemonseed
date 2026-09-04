@@ -2,8 +2,8 @@
 //! restart would otherwise destroy (A9.2, part of ISC-C39 / ISC-A-C21).
 //!
 //! Design of record: `docs/design/direct-messaging.md`, **Amendment A9**
-//! (RATIFIED 2026-07-30), § A9.2 in particular, plus § A4's enumeration at
-//! `:1061` and the store's atomicity contract in A8.2.
+//! (RATIFIED 2026-07-30), § A9.2 in particular, plus § A4.8's enumeration of
+//! what the record carries and the store's atomicity contract in § A8.2.
 //!
 //! A channel that goes down mid-re-establishment has to come back holding
 //! *exactly* what it held before, and A9.1 makes that literal: a re-emit of an
@@ -24,6 +24,67 @@
 //! [`crate::storage::dm_store`], and there is no API here that writes a part of
 //! it. "Commit-then-emit is provably a single atomic act" is a property of
 //! there being nothing else to call.
+//!
+//! ## Two handshake slots, not one
+//!
+//! A3.14 gives the record *"two handshake slots, own-initiation and
+//! peer-acceptance, always present and fixed-size"*, and A3.4 gives the reason:
+//! *"a party's own initiation does not consume the generation for
+//! acceptance"*. A party holding an initiation at the same generation as an
+//! incoming `RE-EST` is in a contest, and A3.7's coin decides which of the two
+//! frames survives — a decision one slot could not hold, because it would have
+//! had to overwrite one of them to store the other.
+//!
+//! Each slot stores the sealed leg it holds, and for the same reason: the
+//! `RE-EST` because A9.1(a) re-emits the persisted bytes, the `RE-ACK` because
+//! A3.4 re-serves the stored answer *"byte-identical"*. Neither is
+//! reconstructible — both legs carry randomized ML-KEM material.
+//!
+//! The acceptance slot also carries A5.1(ii)'s confirmation lock. Held in
+//! memory it would reset on the restart this record exists to survive, and a
+//! returning peer's stale attempt would then supersede a candidate both sides
+//! had already agreed on. [`crate::dm::reest::ReEstGate::from_record`] builds
+//! its in-session gate from this slot rather than from nothing.
+//!
+//! ## The window is anchored on an attempt number, never on a clock
+//!
+//! A7.3 persists `attempt_at_window_start` and derives *"attempts this window"*
+//! as `attempt − attempt_at_window_start`, so the toward-`C` count is arithmetic
+//! over two durable numbers rather than a third number a crash could leave
+//! disagreeing with them. A8.2 then makes the window's rollover *"an idempotent
+//! derivation from durable `last_seen` … recomputed at load"*, and `last_seen`
+//! is itself derived — the acceptance slot's attempt is the highest this
+//! direction has opened.
+//!
+//! What that buys is the one thing a time anchor could not: a window rolls over
+//! only when the peer has actually opened one of this window's attempts, so a
+//! sender's `attempt` can never run more than `C` ahead of the receiver's
+//! `last_seen`, and A8.1's `MAX_GAP = C` scan window is wide enough by
+//! construction. [`crate::dm::reest::AttemptBudget`] is that arithmetic.
+//!
+//! ## The dedup memory lives exactly as long as the retained root
+//!
+//! A5.3's processed-frame memory is durable — *"a lost entry is a torn security
+//! invariant"* — and retention-scoped, *"gated on **actual** `RS_n` retirement,
+//! not a fixed 14-day duration"*. So the retained `RS_n`, its write-once
+//! `superseded_at_ms` and the memory travel as one group, and
+//! [`ResumeRecord::retire_retained`] ends all of it in one act. There is no call
+//! that empties the memory while the root that makes its frames openable is
+//! still held.
+//!
+//! ## Four things A5.4 names that are deliberately not here
+//!
+//! A5.4's paragraph on the resume record is a list of what the *design* homes
+//! in one durable place, and four of its entries have a different home in this
+//! build. Each is recorded because a reader checking the list against the
+//! struct will find them missing and needs the reason rather than a gap.
+//!
+//! | absent | where it lives, and why |
+//! |---|---|
+//! | `previously_established` | Nowhere. Its only reader (A3.8) asks *"is `RS` absent or unreadable **while `previously_established` is set**"*, which is a question about a correspondence whose resume record it cannot read — so a flag inside that record could never answer it. The presence of the record is the fact, and `dm::persist`'s restart path reads it that way. |
+//! | the peer's `PK_lt` and cached EK | The contact record ([`crate::dm::contact_cache`]), which is the same blob discipline in the same store. Both are properties of the correspondent rather than of a re-establishment attempt, so they outlive every attempt and are read without one (A3.14). |
+//! | the clear ratchet-generation continuity counter | The outbox. A4.8 moved it there explicitly and gives the reason: it is *"a per-turn counter and persisting it only at a reconnect boundary produces the backwards jump"*, so it rides the same per-send write as `next_send_seq`. |
+//! | the receive-side peer high-water | The ratchet, in RAM — see the table below, which is A9.2's own separation. |
 //!
 //! ## The two high-waters are not both here, and that is the point
 //!
@@ -49,11 +110,11 @@
 //! plaintext, and `dm_store` seals it, pads it to the kind's fixed bucket and
 //! refuses an oversized payload — the same split [`crate::dm::outbox`] uses.
 
-use zeroize::{ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::suite::{Registry, SuiteId, SuiteIdError};
 use crate::dm::frame::MAX_FRAME_LEN;
-use crate::dm::ratchet::ROOT_KEY_LEN;
+use crate::dm::ratchet::{Direction, ROOT_KEY_LEN};
 use crate::secret_seed::redacted_secret_newtype;
 use std::num::NonZeroU32;
 
@@ -67,6 +128,60 @@ pub const RESUME_MAGIC: &[u8] = b"daemonseed/dm/resume/v1\0";
 /// Width of the suite-id field, big-endian, immediately after the magic.
 pub const SUITE_ID_LEN: usize = 2;
 
+/// The most a stored `RE-ACK` may measure.
+///
+/// A `RE-ACK` is a re-establishment leg, and every leg is one fixed length —
+/// `daemonseed_core::dm::reest::LEG_LEN`. That constant cannot be named here,
+/// because `reest` reads this module and a dependency the other way would be a
+/// cycle; `reest` asserts at compile time that `LEG_LEN` fits inside this
+/// number, so the two cannot drift apart without failing the build.
+///
+/// [`MAX_FRAME_LEN`] would be the wrong bound: it is four times a leg, and two
+/// slots sized against it do not fit
+/// [`crate::storage::dm_store::RESUME_CAPACITY`].
+pub const MAX_SEALED_LEG_LEN: usize = 8_320;
+
+/// How many processed-handshake-frame keys the A5.3 dedup memory holds.
+///
+/// **Sized against the scan window, not against a re-initiation window**, and
+/// the difference is what makes the bound reachable. A5.3 scopes the memory to
+/// `RS_n`'s whole retention, and the window anchor rolls over *inside* that
+/// retention (A6.1), so the number of attempts a retained root sees is not `C`
+/// — it is `C` per window for as many windows as the peer keeps answering. A
+/// set sized at one window's worth fills, and refusing a legitimate handshake
+/// frame is an outcome the design does not have (A3.15: every row recovering or
+/// loud).
+///
+/// What bounds it instead is the eviction [`ResumeRecord::observe_accepted`]
+/// performs when A6.1's window base moves, whose derivation is A5.3's own
+/// applied to the other thing that makes a frame unopenable. A5.3 evicts at retirement because *"once retired, a
+/// superseded-root frame cannot open and cannot alarm regardless"*; A5.2 says
+/// the receiver *"trial-decrypts over a bounded `attempt` window
+/// `[last_seen, last_seen + MAX_GAP]`, **rejecting anything beyond**"*, and
+/// A6.1 slides `last_seen` forward on observed attempts. So an entry whose
+/// attempt has fallen below its leg's window base names a frame the scan now
+/// rejects before any novelty question arises: it cannot open, so it cannot
+/// alarm, so it needs no memory.
+///
+/// What survives eviction is therefore one window per leg, on one plane:
+/// `3 × (MAX_GAP + 1)`. `reest` asserts that product against this constant at
+/// compile time, the same way it does for [`MAX_SEALED_LEG_LEN`], so widening
+/// the scan window cannot silently outgrow the set.
+///
+/// **One plane, not two, and [`DedupMemory`] enforces it.** This memory records
+/// frames that were *processed* — A5.3 calls it a *"receive-side memory"* of
+/// *"processed-handshake-frame"* positions, and A4.5's predicate governs whether
+/// an opened frame *"causes a state transition"*. A party opens only what
+/// arrives, and everything that arrives is read from the one plane the
+/// correspondent writes; a party never processes a frame it sealed itself. So
+/// the direction in the key identifies the plane rather than selecting between
+/// two populations, and [`DedupMemory::insert`] refuses a second one.
+pub const DEDUP_CAPACITY: usize = 27;
+
+/// Bytes one [`DedupKey`] occupies at rest: generation, attempt, leg,
+/// direction, sequence.
+const DEDUP_ENTRY_LEN: usize = 4 + 4 + 1 + 1 + 8;
+
 /// Every fixed-width field of the encoding, in order, so the worst case below
 /// is arithmetic rather than a guess.
 const FIXED_LEN: usize = RESUME_MAGIC.len()
@@ -74,24 +189,39 @@ const FIXED_LEN: usize = RESUME_MAGIC.len()
     + ml_dsa::SK_LEN /* s_pc */
     + ml_dsa::PK_LEN /* pk_pc */
     + ROOT_KEY_LEN /* committed_root */
+    + 4 /* reconnect_gen */
     + 4 /* attempt */
+    + 4 /* own slot generation */
+    + 4 /* own slot attempt */
+    + 4 /* acceptance slot generation */
+    + 4 /* acceptance slot attempt */
+    + 1 /* acceptance slot confirmed */
+    + 1 /* retained RS_n present */
+    + ROOT_KEY_LEN /* retained RS_n */
+    + 8 /* superseded_at_ms */
     + 4 /* send_floor.generation */
     + 8 /* send_floor.seq */
-    + 8 /* window_anchor_ms */
-    + 4 /* toward_c */
-    + 8 /* sealed RE-EST length prefix */;
+    + 4 /* attempt_at_window_start */
+    + 4 /* last_seen_re_est */
+    + 1 /* retained_but_stopped */
+    + 2 /* dedup entry count */
+    + 8 /* sealed RE-EST length prefix */
+    + 8 /* sealed RE-ACK length prefix */;
 
 /// The largest [`ResumeRecord::encode`] output this build can produce.
 ///
-/// **Computed, not estimated.** Every field but one is fixed-width, and the one
-/// that is not is bounded by [`MAX_FRAME_LEN`] — which [`SealedReEst::seal`]
-/// refuses to exceed and [`ResumeRecord::decode`] re-checks before allocating,
-/// so this is a real ceiling rather than a typical case.
-/// [`crate::storage::dm_store::RESUME_CAPACITY`] is sized
-/// against it, and `the_capacity_holds_the_worst_case` pins the relationship in
-/// the direction that matters: if a field is added here and the constant is not
+/// **Computed, not estimated.** Three fields are variable-width and each has a
+/// ceiling the encoder cannot exceed and the decoder re-checks before it
+/// allocates: the own slot's sealed `RE-EST` at [`MAX_FRAME_LEN`]
+/// ([`SealedReEst::seal`] refuses more), the acceptance slot's sealed `RE-ACK`
+/// at [`MAX_SEALED_LEG_LEN`] ([`AcceptanceSlot::accept`] refuses more), and the
+/// dedup memory at [`DEDUP_CAPACITY`] entries ([`DedupMemory::insert`] refuses
+/// more). [`crate::storage::dm_store::RESUME_CAPACITY`] is sized against the
+/// sum, and `the_capacity_holds_the_worst_case` pins the relationship in the
+/// direction that matters: if a field is added here and the constant is not
 /// revisited, that test fails rather than a write failing on a user's disk.
-pub const MAX_ENCODED_LEN: usize = FIXED_LEN + MAX_FRAME_LEN;
+pub const MAX_ENCODED_LEN: usize =
+    FIXED_LEN + MAX_FRAME_LEN + MAX_SEALED_LEG_LEN + DEDUP_CAPACITY * DEDUP_ENTRY_LEN;
 
 /// What can go wrong building or decoding a resume record.
 #[derive(Debug, PartialEq, Eq)]
@@ -130,7 +260,17 @@ pub enum ResumeError {
     /// the permanent `UnknownEphemeral` divergence
     /// ([`crate::dm::ratchet`]) A9.1 exists to forbid.
     AttemptResealed { attempt: u32 },
-    /// A record whose handshake slot is **empty** offered against a stored one
+    /// An occupied own-initiation slot replaced by an empty one with neither of
+    /// the two acts that legitimately empty it.
+    ///
+    /// A3.7's abandonment is *"abandonment and acceptance committed together,
+    /// intra-record"* at an unchanged generation — recognised by an acceptance
+    /// slot newly occupying the generation the abandoned initiation was
+    /// contesting. A3.14's completion advances `reconnect_gen` in the same
+    /// write. Anything else is an initiation that simply disappeared, leaving
+    /// this side believing it has a handshake in flight that no record holds.
+    OwnSlotAbandonedWithoutAcceptance { attempt: u32 },
+    /// A record whose `attempt` counter is **zero** offered against a stored one
     /// carrying a real attempt.
     ///
     /// The empty slot is what first establishment writes, so this is a first
@@ -138,7 +278,157 @@ pub enum ResumeError {
     /// [`Self::AttemptWouldRollBack`]'s case for the slot that has no number —
     /// separate rather than reported as `offered: 0`, because no [`Attempt`] is
     /// ever `0` and a log line saying so names a value that cannot exist.
+    ///
+    /// **The generation qualifier is the whole guard.** A3.14 zeroes the own
+    /// slot on completion — a folded `RE-ACK`, or the abandonment a lost coin
+    /// forces (A3.7) — and a completed handshake is exactly what advances
+    /// `reconnect_gen` (A3.4). So an empty slot replacing an occupied one is the
+    /// *normal* end of a re-establishment when the generation moved with it, and
+    /// refusing that write would make completion unpersistable. Only an empty
+    /// slot at an unchanged generation is a regression, and that is what this
+    /// names.
     EmptySlotWouldReplaceAttempt { stored: u32 },
+    /// A `reconnect_gen` behind the stored one. A3.4: generations advance only
+    /// by a completed handshake and are strictly monotonic, so a record offering
+    /// an earlier one describes a state this correspondence has already left.
+    ReconnectGenWouldRollBack { stored: u32, offered: u32 },
+    /// A peer-acceptance slot offered at a generation behind the stored one, or
+    /// at the same generation under an earlier attempt.
+    ///
+    /// A5.1(i) admits a *higher* attempt superseding an unconfirmed candidate
+    /// and A3.4 drops a lower one, so a stored acceptance never moves backwards.
+    AcceptanceWouldRollBack {
+        stored_generation: u32,
+        stored_attempt: u32,
+        offered_generation: u32,
+        offered_attempt: u32,
+    },
+    /// A peer-acceptance slot at the stored `(generation, attempt)` carrying
+    /// **different** sealed `RE-ACK` bytes.
+    ///
+    /// A3.4 answers a byte-identical replay by re-serving *the stored*
+    /// `RE-ACK` — *"the stored `RE-ACK` is re-served, byte-identical — safe
+    /// because it is the same frame"*. Those bytes are the only copy there is:
+    /// ML-KEM encapsulation is randomized, so a re-serve cannot re-derive them.
+    /// Replacing them under one accepted pair would send the peer a second,
+    /// different answer to one question, and the peer dedups on the attempt
+    /// (A9.4) and so confirms the first — the divergence to permanent
+    /// `UnknownEphemeral` ([`crate::dm::ratchet`]) that A9.1 forbids, reached
+    /// from the answering side.
+    AcceptanceResealed { generation: u32, attempt: u32 },
+    /// A record clearing or moving a **confirmed** peer-acceptance slot without
+    /// advancing `reconnect_gen`.
+    ///
+    /// A5.1(ii): a confirmed candidate *"is locked, and a later-arriving
+    /// lower-or-stale attempt's `RE-EST` never supersedes it"*. The lock is
+    /// durable, so it survives the restart that would otherwise reset it, and
+    /// the one write that legitimately ends it is the generation advance that
+    /// retires the whole exchange.
+    ConfirmedAcceptanceCleared { generation: u32, attempt: u32 },
+    /// A record offering an earlier `RE-EST` window base than the stored one.
+    ///
+    /// A6.1 has the window *"slide with observed traffic"*, forward only. The
+    /// base is what both the record's eviction and the store's no-shrink rule
+    /// read to decide which dedup positions still matter, so a base that could
+    /// regress would let a later write re-admit frames an earlier one had put
+    /// out of reach.
+    ReEstBaseWouldRegress { stored: u32, offered: u32 },
+    /// A second `superseded_at_ms` offered for a retained `RS_n` already
+    /// carrying one.
+    ///
+    /// A5.4 stamps it *"write-once at the first supersede so `T_RETIRE` cannot
+    /// slide forward per re-attempt"*. Re-stamping would extend the window a
+    /// stale copy of the superseded root enjoys, one re-attempt at a time, with
+    /// nothing reporting that the ceiling had moved.
+    SupersededStampMoved { stored: i64, offered: i64 },
+    /// A dedup position offered on a different plane from the one the memory
+    /// already holds.
+    ///
+    /// A5.3's memory is receive-side: every position in it was read from the
+    /// plane the correspondent writes, and a party never processes a frame it
+    /// sealed itself. A second direction would file our own attempt numbers in a
+    /// set bounded by the peer's window base.
+    DedupDirectionMixed,
+    /// A record dropping dedup entries while the `RS_n` they are scoped to is
+    /// still retained.
+    ///
+    /// A5.3 ties eviction to *"**actual** `RS_n` retirement, not a fixed 14-day
+    /// duration"*, because byte-novelty is what stops a co-host re-serving
+    /// captured `RE-EST` bytes to re-fire the peer-state-regressed alarm — and
+    /// that defence is live for exactly as long as the retained root can open
+    /// those bytes. [`ResumeRecord::retire_retained`] is the one act that drops
+    /// both together.
+    DedupEvictedWhileRetained { stored: usize, offered: usize },
+    /// More dedup entries than [`DEDUP_CAPACITY`], at rest or offered to
+    /// [`DedupMemory::insert`].
+    DedupFull { capacity: usize },
+    /// At-rest bytes whose leg discriminator names no [`Leg`].
+    UnknownLeg(u8),
+    /// At-rest bytes whose direction discriminator names no
+    /// [`Direction`].
+    UnknownDirection(u8),
+    /// At-rest bytes spelling an empty peer-acceptance slot — attempt `0` —
+    /// beside a non-empty sealed `RE-ACK` or a set confirmation flag.
+    ///
+    /// The halves contradict each other the way [`Self::EmptySlotHasFrame`]'s do
+    /// for the own slot, and are refused for the same reason: either could be
+    /// the true one and nothing here can say which. A confirmation flag with no
+    /// slot under it would be the worse repair of the two, since a confirmation
+    /// that names no attempt locks a generation against every attempt.
+    EmptyAcceptanceHasContent { frame_len: usize, confirmed: bool },
+    /// The mirror: at-rest bytes spelling a real acceptance attempt beside a
+    /// zero-length sealed `RE-ACK`.
+    ///
+    /// An acceptance slot exists to hold the bytes a re-serve sends, so one
+    /// without them would re-serve an empty frame.
+    AcceptanceHasNoFrame { attempt: u32 },
+    /// A sealed frame of zero length offered to [`SealedReEst::seal`] or
+    /// [`AcceptanceSlot::accept`].
+    ///
+    /// An occupied slot's whole purpose is to hold bytes a re-emit or a re-serve
+    /// sends, so a slot holding none would emit an empty frame. Refused at
+    /// construction rather than only at decode: an empty frame beside a real
+    /// attempt encodes without complaint, and the record it produces then fails
+    /// [`ResumeRecord::decode`] for ever — which wedges
+    /// [`commit_resume`](crate::dm::persist::DmPersist::commit_resume)
+    /// permanently, since every later write reads the stored record first.
+    EmptyFrame,
+    /// An own-initiation slot whose attempt disagrees with the record's own
+    /// `attempt` counter.
+    ///
+    /// A9.2 lists *"the `attempt` counter"* and *"the sealed `RE-EST` frame
+    /// bytes"* as separate fields, and the slot's copy of the number is bound to
+    /// the bytes for the byte-identical re-emit (A9.1(a)). They are written in
+    /// one atomic act (A8.1: commit-then-emit persists both before any
+    /// emission), so they agree or the record is one no honest writer produced.
+    AttemptSlotDisagrees { field: u32, slot: u32 },
+    /// At-rest bytes carrying a generation for a slot standing empty.
+    ///
+    /// An empty slot is attempt `0`, a zero-length frame and a zero generation:
+    /// there is no exchange for a generation to name. Refused rather than
+    /// ignored, because a generation read back out of an empty slot would be a
+    /// value nothing wrote and nothing checks.
+    SlotGenerationWithoutAttempt { generation: u32 },
+    /// At-rest bytes carrying retained-root bytes beside a clear presence flag.
+    ///
+    /// [`ResumeRecord::encode`] writes the absent case as an all-zero root, so
+    /// non-zero bytes under a clear flag are a record this encoder did not
+    /// write — a retained root the flag hides, or a flag the bytes contradict.
+    RetainedBytesWithoutFlag,
+    /// The same dedup position twice in one record's at-rest bytes.
+    ///
+    /// Accepting it would decode to a set one entry smaller than the bytes hold,
+    /// so the record would re-encode to different bytes than it was read from —
+    /// and the length the eviction bound is checked against would disagree with
+    /// what is on disk.
+    DuplicateDedupEntry,
+    /// At-rest bytes carrying a `superseded_at_ms` for a retained `RS_n` that is
+    /// absent, or a retained `RS_n` with no stamp.
+    ///
+    /// The stamp is what bounds the retention (A3.5's `T_RETIRE` runs from it),
+    /// so a root without one has no ceiling and a stamp without a root bounds
+    /// nothing.
+    RetentionHalfPresent { present: bool },
     /// A record offering a different `s_pc` or `pk_pc` than the stored one.
     ///
     /// **The pseudonym pair is fixed for the life of a correspondence.** It is
@@ -210,9 +500,99 @@ impl std::fmt::Display for ResumeError {
             Self::OccupiedSlotHasNoFrame { attempt } => {
                 write!(f, "attempt {attempt} carries no sealed frame")
             }
+            Self::OwnSlotAbandonedWithoutAcceptance { attempt } => write!(
+                f,
+                "the initiation at attempt {attempt} was abandoned with no acceptance \
+                 in its place and no generation advance"
+            ),
             Self::EmptySlotWouldReplaceAttempt { stored } => write!(
                 f,
-                "a record with no re-establishment is behind the stored attempt {stored}"
+                "a record with no re-establishment is behind the stored attempt {stored} \
+                 at an unchanged generation"
+            ),
+            Self::ReconnectGenWouldRollBack { stored, offered } => write!(
+                f,
+                "reconnect generation {offered} is behind the stored {stored}"
+            ),
+            Self::AcceptanceWouldRollBack {
+                stored_generation,
+                stored_attempt,
+                offered_generation,
+                offered_attempt,
+            } => write!(
+                f,
+                "accepted {offered_generation}:{offered_attempt} is behind the stored \
+                 {stored_generation}:{stored_attempt}"
+            ),
+            Self::AcceptanceResealed {
+                generation,
+                attempt,
+            } => write!(
+                f,
+                "accepted {generation}:{attempt} is already persisted under different \
+                 sealed bytes"
+            ),
+            Self::ConfirmedAcceptanceCleared {
+                generation,
+                attempt,
+            } => write!(
+                f,
+                "the confirmed acceptance {generation}:{attempt} may only be cleared by a \
+                 generation advance"
+            ),
+            Self::ReEstBaseWouldRegress { stored, offered } => write!(
+                f,
+                "the re-establishment window base {offered} is behind the stored {stored}"
+            ),
+            Self::SupersededStampMoved { stored, offered } => write!(
+                f,
+                "the retained root was superseded at {stored} and may not be re-stamped at \
+                 {offered}"
+            ),
+            Self::DedupEvictedWhileRetained { stored, offered } => write!(
+                f,
+                "{offered} dedup entries offered against {stored} stored while the \
+                 superseded root is still retained"
+            ),
+            Self::DedupDirectionMixed => write!(
+                f,
+                "the dedup memory holds one plane and this position is on the other"
+            ),
+            Self::DedupFull { capacity } => {
+                write!(f, "the dedup memory holds at most {capacity} entries")
+            }
+            Self::UnknownLeg(tag) => write!(f, "{tag} names no re-establishment leg"),
+            Self::UnknownDirection(tag) => write!(f, "{tag} names no direction"),
+            Self::EmptyAcceptanceHasContent {
+                frame_len,
+                confirmed,
+            } => write!(
+                f,
+                "an empty acceptance slot carries {frame_len} bytes of sealed frame and \
+                 confirmed={confirmed}"
+            ),
+            Self::AcceptanceHasNoFrame { attempt } => {
+                write!(f, "accepted attempt {attempt} carries no sealed frame")
+            }
+            Self::EmptyFrame => write!(f, "a handshake slot may not hold an empty frame"),
+            Self::AttemptSlotDisagrees { field, slot } => write!(
+                f,
+                "the attempt counter is {field} and its sealed slot names {slot}"
+            ),
+            Self::SlotGenerationWithoutAttempt { generation } => {
+                write!(f, "an empty handshake slot names generation {generation}")
+            }
+            Self::RetainedBytesWithoutFlag => write!(
+                f,
+                "retained root bytes are present beside a clear retention flag"
+            ),
+            Self::DuplicateDedupEntry => {
+                write!(f, "the same dedup position appears twice in one record")
+            }
+            Self::RetentionHalfPresent { present } => write!(
+                f,
+                "the retained root's presence flag is {present} and its supersede stamp \
+                 disagrees"
             ),
             Self::PseudonymPairChanged => write!(
                 f,
@@ -334,7 +714,7 @@ impl SendFloor {
     /// that stands still, because standing still is not progress. This one
     /// guards a *record write*, and a resume record is rewritten for reasons
     /// that have nothing to do with the send side — a new `attempt`, a new
-    /// window anchor, a fresh toward-`C` count. Refusing an unmoved floor here
+    /// window anchor, a peer acceptance recorded. Refusing an unmoved floor here
     /// would refuse those writes, so the invariant this enforces is the only one
     /// that is actually true of the send side: **it never goes backwards.**
     ///
@@ -350,7 +730,7 @@ impl SendFloor {
     ///
     /// So the ordering stays lexicographic as A9.2 ratifies — that is what
     /// [`Ord`] and [`Self::advance_to`] use — and only this **write guard** is
-    /// conservative. If the unbuilt re-establishment path does restart `seq`,
+    /// conservative. If a re-establishment is ever made to restart `seq`,
     /// relaxing this to the plain comparison is then a deliberate, reviewed
     /// change rather than a hole nobody notices. The question is filed.
     pub fn admits(self, offered: Self) -> bool {
@@ -564,6 +944,13 @@ impl SealedReEst {
         if bytes.len() > MAX_FRAME_LEN {
             return Err(ResumeError::FrameTooLong { len: bytes.len() });
         }
+        // Both ends of the range, not just the top. An occupied slot with no
+        // bytes encodes without complaint and then fails `decode` for ever,
+        // which wedges `commit_resume` — every later write reads the stored
+        // record before it writes.
+        if bytes.is_empty() {
+            return Err(ResumeError::EmptyFrame);
+        }
         Ok(Self { attempt, bytes })
     }
 
@@ -591,6 +978,563 @@ impl std::fmt::Debug for SealedReEst {
     }
 }
 
+/// Our own pending initiation: the generation it acts at, and the sealed
+/// `RE-EST` bound to the attempt it was sealed under.
+///
+/// A3.14 gives the resume record *"two handshake slots, own-initiation and
+/// peer-acceptance"*, and A3.4 says why they are two rather than one: *"a
+/// party's own initiation does not consume the generation for acceptance"*. A
+/// party holding an initiation at the same generation as an incoming `RE-EST`
+/// is in a contest (A3.7), which one slot could not express — it would have to
+/// overwrite one of the two frames the coin is about to choose between.
+///
+/// The generation is carried here rather than read off
+/// [`ResumeRecord::reconnect_gen`] because they are different numbers: A3.4's
+/// `reconnect_gen` advances only *"by a completed handshake"*, so an initiation
+/// in flight sits at the generation it is trying to reach, one past the
+/// committed one.
+///
+/// **The slot is zeroed, not edited.** A3.14 has both slots *"zeroed on
+/// completion"*: an own slot ends when the `RE-ACK` folds, or when a lost coin
+/// abandons it (A3.7), and either way the next record carries `None` here.
+pub struct OwnSlot {
+    generation: u32,
+    sealed: SealedReEst,
+}
+
+impl OwnSlot {
+    /// Occupy the slot with a sealed initiation at `generation`.
+    pub fn new(generation: u32, sealed: SealedReEst) -> Self {
+        Self { generation, sealed }
+    }
+
+    /// The generation this initiation is trying to reach.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The attempt the frame was sealed under.
+    pub fn attempt(&self) -> Attempt {
+        self.sealed.attempt()
+    }
+
+    /// The sealed frame bound to its attempt — what a re-emit sends.
+    pub fn sealed(&self) -> &SealedReEst {
+        &self.sealed
+    }
+}
+
+impl std::fmt::Debug for OwnSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnSlot")
+            .field("generation", &self.generation)
+            .field("sealed", &self.sealed)
+            .finish()
+    }
+}
+
+/// The peer initiation we accepted: the generation and attempt it arrived
+/// under, the sealed `RE-ACK` we answered it with, and whether the answer has
+/// been confirmed.
+///
+/// **The stored `RE-ACK` bytes are the only copy of that answer.** A3.4 answers
+/// a byte-identical replay by re-serving them — *"the stored `RE-ACK` is
+/// re-served, byte-identical — safe because it is the same frame"* — and
+/// re-deriving them is not available: the leg carries an ML-KEM ciphertext, the
+/// encapsulation is randomized, and A9.2 records the same fact about the other
+/// leg (*"`ss` → `eph_ct` is not invertible"*). Losing them costs the re-serve,
+/// so they are durable state in this blob rather than a cache.
+///
+/// **`confirmed` is A5.1(ii)'s lock, persisted.** A6.1 says what sets it: *"the
+/// first frame that opens under the re-rooted chain — content *or* RE-CONFIRM,
+/// whichever arrives — confirms the candidate and ends supersede-eligibility"*.
+/// Held only in memory it would reset on the restart this record exists to
+/// survive, and a returning peer's stale attempt would then supersede a
+/// candidate the two sides had already agreed on, stranding them on different
+/// siblings. [`crate::dm::reest::ReEstGate::from_record`] reads it back.
+pub struct AcceptanceSlot {
+    generation: u32,
+    attempt: Attempt,
+    sealed_re_ack: Box<[u8]>,
+    confirmed: bool,
+}
+
+impl AcceptanceSlot {
+    /// Accept a peer initiation at `(generation, attempt)`, storing the sealed
+    /// `RE-ACK` that answers it.
+    ///
+    /// Unconfirmed: [`Self::confirm`] is the only way to set the lock, so the
+    /// two acts are separate calls and a caller cannot reach the locked state by
+    /// filling in a field.
+    ///
+    /// Refuses a frame past [`MAX_SEALED_LEG_LEN`], which is a leg's length plus
+    /// headroom rather than [`MAX_FRAME_LEN`]: two slots sized against the frame
+    /// ceiling do not fit [`crate::storage::dm_store::RESUME_CAPACITY`].
+    pub fn accept(
+        generation: u32,
+        attempt: Attempt,
+        sealed_re_ack: Box<[u8]>,
+    ) -> Result<Self, ResumeError> {
+        if sealed_re_ack.len() > MAX_SEALED_LEG_LEN {
+            return Err(ResumeError::FrameTooLong {
+                len: sealed_re_ack.len(),
+            });
+        }
+        // As [`SealedReEst::seal`]: an accepted attempt with no bytes would
+        // re-serve an empty frame, and the record it encodes to never decodes
+        // again.
+        if sealed_re_ack.is_empty() {
+            return Err(ResumeError::EmptyFrame);
+        }
+        Ok(Self {
+            generation,
+            attempt,
+            sealed_re_ack,
+            confirmed: false,
+        })
+    }
+
+    /// Lock the slot: a frame has opened under the re-rooted chain (A6.1), so
+    /// the candidate is confirmed and no differing attempt at this generation
+    /// may supersede it (A5.1(ii)).
+    ///
+    /// Idempotent, and takes `self` by value so a caller cannot hold an
+    /// unconfirmed copy of a slot it has just confirmed.
+    pub fn confirm(mut self) -> Self {
+        self.confirmed = true;
+        self
+    }
+
+    /// The generation this acceptance consumed.
+    pub fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// The attempt that was accepted.
+    pub fn attempt(&self) -> Attempt {
+        self.attempt
+    }
+
+    /// The sealed `RE-ACK`, borrowed — the same bytes every call, which is
+    /// A3.4's byte-identical re-serve at this layer.
+    pub fn sealed_re_ack(&self) -> &[u8] {
+        &self.sealed_re_ack
+    }
+
+    /// Whether a frame has opened under the re-rooted chain.
+    pub fn confirmed(&self) -> bool {
+        self.confirmed
+    }
+}
+
+impl std::fmt::Debug for AcceptanceSlot {
+    /// The frame's length rather than its bytes, the judgement
+    /// [`SealedReEst`]'s own `Debug` makes for the same reason.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcceptanceSlot")
+            .field("generation", &self.generation)
+            .field("attempt", &self.attempt)
+            .field("sealed_re_ack_len", &self.sealed_re_ack.len())
+            .field("confirmed", &self.confirmed)
+            .finish()
+    }
+}
+
+/// The superseded root a party keeps after committing its successor, with the
+/// moment it was superseded.
+///
+/// A3.5: each party retains `RS_n` *"from its own commit of `RS_{n+1}` until its
+/// confirming observation (A3.6) or `T_RETIRE`"*. What the retention buys is the
+/// ability to open the peer's frames at the superseded generation — the contest
+/// path (A3.7) and the regressed-peer recovery row.
+///
+/// **`superseded_at_ms` is write-once**, stamped at the *first* supersede (A5.4)
+/// *"so `T_RETIRE` cannot slide forward per re-attempt"*. A record that
+/// re-stamped it would extend, one re-attempt at a time, exactly the exposure
+/// the ceiling exists to bound.
+pub struct RetainedRoot {
+    root: CommittedRoot,
+    superseded_at_ms: i64,
+}
+
+impl Zeroize for RetainedRoot {
+    /// Written out rather than derived because the stamp is a plain `i64` a
+    /// derive would leave alone.
+    ///
+    /// It is reached through [`Retention`]'s `Option` field: `Option::zeroize`
+    /// calls `value.zeroize()` and *then* takes the option, so both halves of
+    /// this body run before the payload is dropped. `zeroize` 1.8.2 says why the
+    /// take follows rather than replaces it — *"Without the take, the drop of
+    /// the (zeroized) value isn't called, which might lead to a leak"*.
+    ///
+    /// A test at the group level cannot pin this body, because the take leaves
+    /// `None` whatever the body did;
+    /// `zeroizing_a_retained_root_wipes_its_root_and_its_stamp` calls it
+    /// directly for that reason.
+    fn zeroize(&mut self) {
+        self.root.zeroize();
+        self.superseded_at_ms = 0;
+    }
+}
+
+impl RetainedRoot {
+    /// Retain `root`, stamped at the moment it was superseded.
+    pub fn new(root: CommittedRoot, superseded_at_ms: i64) -> Self {
+        Self {
+            root,
+            superseded_at_ms,
+        }
+    }
+
+    /// The retained root.
+    pub fn root(&self) -> &CommittedRoot {
+        &self.root
+    }
+
+    /// When it was superseded, in the caller's clock. Write-once.
+    pub fn superseded_at_ms(&self) -> i64 {
+        self.superseded_at_ms
+    }
+}
+
+impl std::fmt::Debug for RetainedRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RetainedRoot")
+            .field("root", &self.root)
+            .field("superseded_at_ms", &self.superseded_at_ms)
+            .finish()
+    }
+}
+
+/// Which of the three re-establishment legs a [`DedupKey`] names.
+///
+/// Lives here rather than beside the legs themselves because the key is durable
+/// state in this record and [`crate::dm::reest`] reads this module — a
+/// dependency the other way would be a cycle. The tag bytes are at-rest wire,
+/// so `reest` pins the mapping from its own frame-kind constants to these
+/// variants in a test rather than leaving two spellings free to drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leg {
+    /// The returning side's ask.
+    ReEst,
+    /// The answer carrying the ciphertext.
+    ReAck,
+    /// The returning side settling the exchange.
+    ReConfirm,
+}
+
+impl Leg {
+    /// The at-rest discriminator. FROZEN — it is inside a durable record.
+    const fn tag(self) -> u8 {
+        match self {
+            Self::ReEst => 1,
+            Self::ReAck => 2,
+            Self::ReConfirm => 3,
+        }
+    }
+
+    const fn from_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::ReEst),
+            2 => Some(Self::ReAck),
+            3 => Some(Self::ReConfirm),
+            _ => None,
+        }
+    }
+}
+
+/// The at-rest discriminator for a direction. FROZEN, for the same reason
+/// [`Leg::tag`] is.
+const fn direction_tag(dir: Direction) -> u8 {
+    match dir {
+        Direction::AToB => 1,
+        Direction::BToA => 2,
+    }
+}
+
+const fn direction_from_tag(tag: u8) -> Option<Direction> {
+    match tag {
+        1 => Some(Direction::AToB),
+        2 => Some(Direction::BToA),
+        _ => None,
+    }
+}
+
+/// One position in A5.3's processed-handshake-frame memory:
+/// `(gen, attempt, leg, dir, seq)`.
+///
+/// **`attempt` is load-bearing in the key**, and A5.3 says why in terms: *"two
+/// legitimate different-attempt `RE-EST`s share `gen`/`seq` (the AAD is
+/// attempt-blind …; only the KDF differs), so a position-only key would collide
+/// them and wrongly drop a legitimate frame"*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupKey {
+    generation: u32,
+    attempt: Attempt,
+    leg: Leg,
+    direction: Direction,
+    seq: u64,
+}
+
+impl DedupKey {
+    /// Name the position a handshake frame arrived at.
+    pub fn new(
+        generation: u32,
+        attempt: Attempt,
+        leg: Leg,
+        direction: Direction,
+        seq: u64,
+    ) -> Self {
+        Self {
+            generation,
+            attempt,
+            leg,
+            direction,
+            seq,
+        }
+    }
+
+    /// The generation the frame acts at.
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+
+    /// The attempt it was sealed under.
+    pub fn attempt(self) -> Attempt {
+        self.attempt
+    }
+
+    /// Which leg it is.
+    pub fn leg(self) -> Leg {
+        self.leg
+    }
+
+    /// Which direction's pages it was read from.
+    pub fn direction(self) -> Direction {
+        self.direction
+    }
+
+    /// The sequence position it was fetched from.
+    pub fn seq(self) -> u64 {
+        self.seq
+    }
+}
+
+/// Whether a handshake frame had been processed before.
+///
+/// An enum rather than a `bool` because both answers cause work and neither is
+/// the "failure": a novel frame may fire the peer-state-regressed alarm, and a
+/// repeat must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Novelty {
+    /// Not seen at this position before. A4.5's byte-novelty predicate is
+    /// satisfied and a superseded-root frame may cause a transition.
+    Novel,
+    /// Already recorded. The frame is inert: it causes no transition and fires
+    /// no alarm.
+    Repeat,
+}
+
+/// A5.3's durable, retention-scoped memory of the handshake frames this
+/// correspondence has already processed.
+///
+/// **Durable, not soft.** A5.3: *"a lost entry is a torn security invariant … a
+/// co-host re-serves captured `RE-EST` bytes into an empty dedup → byte-novel →
+/// re-fires the peer-state-regressed alarm, reopening MAJOR-CRYPTO-3's
+/// inducibility"*. So it travels in the resume blob with the roots rather than
+/// in the volatile schedule record A5.4 keeps for genuinely self-healing state.
+///
+/// **Its lifetime is the retained root's, and nothing else's.** A5.3 ties
+/// eviction to *"actual `RS_n` retirement, not a fixed 14-day duration"*: byte
+/// novelty only matters while `RS_n` is retained, because once it is gone a
+/// superseded-root frame cannot open and cannot alarm. That is why the memory
+/// has no `clear` of its own — [`ResumeRecord::retire_retained`] drops the root
+/// and the memory in one act, so there is no spelling for emptying one without
+/// the other.
+///
+/// Bounded at [`DEDUP_CAPACITY`], which A5.3 sizes as *"a few handshake frames
+/// per attempt"* against A6.3's per-window cap.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DedupMemory {
+    keys: Vec<DedupKey>,
+}
+
+impl DedupMemory {
+    /// The plane every entry was read from, or `None` while the memory is
+    /// empty.
+    ///
+    /// Established by the first entry rather than declared: a party learns which
+    /// plane is inbound by receiving on it, and there is only ever one.
+    pub fn direction(&self) -> Option<Direction> {
+        self.keys.first().map(|key| key.direction)
+    }
+}
+
+impl DedupMemory {
+    /// An empty memory.
+    pub const fn new() -> Self {
+        Self { keys: Vec::new() }
+    }
+
+    /// Record that a frame was processed at `key`, and say whether it was novel.
+    ///
+    /// [`Novelty::Repeat`] for a key already held, and the memory is unchanged —
+    /// which is what makes a replay storm cost nothing.
+    ///
+    /// [`ResumeError::DedupFull`] rather than an eviction when the bound is
+    /// reached: evicting to make room would drop a key whose frame can still be
+    /// replayed, which is the torn invariant this memory exists to hold. The
+    /// bound is sized against the population A5.3 and A6.3 allow, so reaching it
+    /// means the window's cap has already been exceeded somewhere else.
+    pub fn insert(&mut self, key: DedupKey) -> Result<Novelty, ResumeError> {
+        // **One plane per memory.** A party processes only what arrives, and
+        // everything that arrives is read from the plane the correspondent
+        // writes — so a second direction is a frame this side sealed itself
+        // being filed as one it opened, which would put our own attempt numbers
+        // in a set the peer's window base is used to bound. Refused rather than
+        // accommodated: it is not a state the design produces, and admitting it
+        // would make the eviction's per-leg base the wrong number for half the
+        // set.
+        if let Some(established) = self.direction()
+            && established != key.direction
+        {
+            return Err(ResumeError::DedupDirectionMixed);
+        }
+        if self.keys.contains(&key) {
+            return Ok(Novelty::Repeat);
+        }
+        if self.keys.len() >= DEDUP_CAPACITY {
+            return Err(ResumeError::DedupFull {
+                capacity: DEDUP_CAPACITY,
+            });
+        }
+        self.keys.push(key);
+        Ok(Novelty::Novel)
+    }
+
+    /// Whether a frame at this position has been processed.
+    pub fn contains(&self, key: DedupKey) -> bool {
+        self.keys.contains(&key)
+    }
+
+    /// How many positions are held.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Whether nothing has been processed.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The positions, in the order they were recorded — which is the order they
+    /// encode in, so a round trip is byte-stable.
+    pub fn keys(&self) -> &[DedupKey] {
+        &self.keys
+    }
+}
+
+/// The re-establishment handshake's own state: the committed generation and the
+/// two slots A3.14 gives the record, with A7.3's window anchor.
+///
+/// Grouped rather than passed as loose arguments because they move together: a
+/// completed handshake advances `reconnect_gen` and zeroes the own slot in the
+/// same write (A3.4, A3.14), and the anchor is read against the own slot's
+/// attempt.
+#[derive(Debug, Default)]
+pub struct ReEstState {
+    /// A3.4's generation, advanced only by a completed handshake.
+    pub reconnect_gen: u32,
+    /// A6.1's `RE-EST` window base, **stored rather than derived from the
+    /// acceptance slot**, and monotone for the correspondence's lifetime.
+    ///
+    /// A6.1 has the window *"slide with observed traffic"* — forward only. Read
+    /// off the acceptance slot it would instead jump back to `0` at every
+    /// completed handshake, because A3.14 zeroes that slot on completion, and
+    /// attempts already evicted from the dedup memory would become openable
+    /// again inside `[0, MAX_GAP]`.
+    ///
+    /// **Here rather than in [`Retention`]**, beside the other
+    /// correspondence-lifetime counter: A6.1 scopes the window to the
+    /// correspondence, not to whichever `RS_n` is retained at the moment.
+    /// Retiring a root ends what the dedup memory is *for*; it does not unsee
+    /// what the receiver has seen, and a base that reset at retirement would
+    /// make [`ResumeRecord::retire_retained`] unwritable — the store refuses a
+    /// base behind the stored one, so the retirement would be its own
+    /// regression.
+    pub last_seen_re_est: u32,
+    /// A5.2's monotone attempt counter, *"a monotonic per-(correspondence,
+    /// direction) counter … advancing on every `RE-EST` seal and persisted
+    /// ahead of emission"*. `0` before the first attempt.
+    ///
+    /// **Its own field, not the own slot's copy**, and A9.2 lists the two
+    /// separately for the reason A3.14 makes visible: the slot is *"zeroed on
+    /// completion"*, and a counter read out of it would restart at `1` at every
+    /// completed handshake — so the anti-rollback comparison would stop firing
+    /// across exactly the boundary it exists to guard, and a replayed record
+    /// from an earlier generation would be admitted. The slot keeps a copy
+    /// because A9.1(a)'s re-emit needs the number bound to the bytes; this is
+    /// the counter.
+    pub attempt: u32,
+    /// Our own pending initiation, or `None` while the slot stands empty.
+    pub own: Option<OwnSlot>,
+    /// The peer initiation we accepted, or `None` while the slot stands empty.
+    pub acceptance: Option<AcceptanceSlot>,
+    /// A7.3's `attempt_at_window_start`: the attempt number the current
+    /// re-initiation window opened at, so *"attempts this window"* is
+    /// `attempt − attempt_at_window_start` rather than a second stored counter
+    /// a crash could disagree with.
+    ///
+    /// `0` before the first attempt, which [`Attempt::FIRST`] leaves free.
+    pub attempt_at_window_start: u32,
+}
+
+impl ReEstState {
+    /// The state a first establishment writes: generation `0`, both slots
+    /// empty, the window anchored before the first attempt.
+    pub fn first_establishment() -> Self {
+        Self::default()
+    }
+}
+
+/// Everything scoped to the retained `RS_n`: the root itself with its
+/// write-once supersede stamp, the dedup memory whose lifetime is that root's,
+/// and A5.4's retained-but-stopped flag.
+///
+/// The three are one group because retirement ends all of them at once — see
+/// [`ResumeRecord::retire_retained`], which is the only act that does so.
+#[derive(Debug, Default)]
+pub struct Retention {
+    /// The superseded root, retained until its confirming observation or
+    /// `T_RETIRE` (A3.5).
+    pub retained: Option<RetainedRoot>,
+    /// A5.3's processed-frame memory, scoped to `retained`.
+    pub dedup: DedupMemory,
+    /// A5.4's durable retained-but-stopped flag: the stored handshake frames are
+    /// kept for a re-serve, and their ladder has reached its give-up.
+    ///
+    /// Durable *"so emission-eligibility past give-up is never inferable from a
+    /// losable schedule"* — a lost volatile schedule would otherwise default to
+    /// rung-0-due-now and resurrect a re-seed the give-up had stopped.
+    pub stopped: bool,
+}
+
+impl Retention {
+    /// Nothing retained: what a correspondence carries before its first
+    /// supersede, and what it carries again after retirement.
+    pub fn none() -> Self {
+        Self::default()
+    }
+}
+
+impl Zeroize for Retention {
+    fn zeroize(&mut self) {
+        self.retained.zeroize();
+        self.dedup.keys.clear();
+        self.stopped = false;
+    }
+}
+
 /// Everything a re-establishment needs to survive a restart, in one blob.
 ///
 /// **Every field here is one A9.2 enumerates**, and the list is closed: the
@@ -609,44 +1553,76 @@ pub struct ResumeRecord {
     s_pc: Box<[u8; ml_dsa::SK_LEN]>,
     /// **The peer's**, and public: the verifying key every inbound leg's
     /// `msg_sig` is checked against. Without it an inbound leg fails signature
-    /// check and is indistinguishable from filler (A4, `:1061`).
+    /// check and is indistinguishable from filler (A4.8).
     #[zeroize(skip)]
     pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
     /// The re-establishment root this party has committed to.
     committed_root: CommittedRoot,
-    /// **The sealed RE-EST frame and the attempt it was sealed under, as one
-    /// value.** The peer dedups a re-emit on the attempt (A9.4), and A9.1 permits
-    /// a fresh secret only under a **new** one — so the two facts are carried
-    /// bound together rather than as fields a caller could pair wrongly. See
-    /// [`SealedReEst`] for the construction rule that enforces it.
+    /// A3.4's generation, the committed authority every other record derives
+    /// from. It advances only by a completed handshake and never goes backwards
+    /// — `commit_resume` refuses a record that would.
+    #[zeroize(skip)]
+    reconnect_gen: u32,
+    /// A5.2's monotone attempt counter. See [`ReEstState::attempt`] for why it
+    /// is not read out of the own slot.
+    #[zeroize(skip)]
+    attempt: u32,
+    /// A6.1's `RE-EST` window base. See [`ReEstState::last_seen_re_est`].
+    #[zeroize(skip)]
+    last_seen_re_est: u32,
+    /// **Our own initiation slot**: the generation it acts at, and the sealed
+    /// RE-EST bound to the attempt it was sealed under. The peer dedups a
+    /// re-emit on the attempt (A9.4), and A9.1 permits a fresh secret only under
+    /// a **new** one — so the two facts are carried bound together rather than
+    /// as fields a caller could pair wrongly. See [`SealedReEst`] for the
+    /// construction rule that enforces it.
     ///
-    /// **`None` is the handshake slot standing empty** rather than a missing
-    /// field: a correspondence that has established and not yet
-    /// re-established has a resume record and no re-establishment frame, and
-    /// [`SealedReEst::seal`] cannot mint a stand-in for one because it consumes
-    /// a [`FreshAttempt`] — spending attempt 1 on a frame that was never
-    /// emitted, which `AttemptResealed` then refuses when the real first
-    /// re-establishment arrives. At rest the slot is attempt `0` and a
-    /// zero-length frame; [`Attempt::FIRST`] is `1`, so the spelling is free.
+    /// **`None` is the slot standing empty** rather than a missing field: a
+    /// correspondence that has established and not yet re-established has a
+    /// resume record and no re-establishment frame, and [`SealedReEst::seal`]
+    /// cannot mint a stand-in for one because it consumes a [`FreshAttempt`] —
+    /// spending attempt 1 on a frame that was never emitted, which
+    /// `AttemptResealed` then refuses when the real first re-establishment
+    /// arrives. At rest the slot is attempt `0` and a zero-length frame;
+    /// [`Attempt::FIRST`] is `1`, so the spelling is free.
     ///
     /// The bytes are load-bearing in this blob (A9.2): ML-KEM encapsulation is
     /// randomized and `ss → eph_ct` is not invertible, so A9.1(a)'s
     /// byte-identical re-emit cannot be rebuilt from the key inputs. Recovery
     /// re-emits *these*, not a fresh encapsulation.
     ///
-    /// `zeroize(skip)` matches what the two fields it replaces both carried: an
-    /// attempt counter and a sealed frame are neither of them secrets.
+    /// `zeroize(skip)`: an attempt counter, a generation and a sealed frame are
+    /// none of them secrets.
     #[zeroize(skip)]
-    sealed: Option<SealedReEst>,
+    own: Option<OwnSlot>,
+    /// **The peer-acceptance slot** A3.14 names beside the own slot, carrying
+    /// the sealed `RE-ACK` a re-serve sends and A5.1(ii)'s confirmation lock.
+    /// See [`AcceptanceSlot`].
+    #[zeroize(skip)]
+    acceptance: Option<AcceptanceSlot>,
+    /// The retained `RS_n`, the dedup memory scoped to it, and the
+    /// retained-but-stopped flag. See [`Retention`].
+    ///
+    /// **Not skipped**: the retained root is a root. It is the one field of this
+    /// group that is secret, and the group's own `Zeroize` is written out
+    /// because the stamp beside it is a plain integer a derive would leave.
+    retention: Retention,
     /// The durable send-side floor. See [`SendFloor`].
     #[zeroize(skip)]
     send_floor: SendFloor,
-    /// The re-establishment window's anchor, in the caller's clock.
+    /// A7.3's window anchor: the attempt number the current re-initiation
+    /// window opened at. `0` before the first attempt.
+    ///
+    /// **An attempt number, not a timestamp.** A7.3 persists
+    /// `attempt_at_window_start` and derives *"attempts this window"* as
+    /// `attempt − attempt_at_window_start`; A8.2 then requires window membership
+    /// and anchor reset be *"an idempotent derivation from durable `last_seen`
+    /// … recomputed at load"*. A wall-clock anchor can satisfy neither: a
+    /// rollover read off a clock tears at the boundary, and a crash across it
+    /// would let a loop mint a fresh window's worth of attempts without the peer
+    /// having opened one.
     #[zeroize(skip)]
-    window_anchor_ms: i64,
-    /// How far this correspondence has progressed toward `C`.
-    #[zeroize(skip)]
-    toward_c: u32,
+    attempt_at_window_start: u32,
 }
 
 impl std::fmt::Debug for ResumeRecord {
@@ -658,12 +1634,15 @@ impl std::fmt::Debug for ResumeRecord {
             .field("s_pc", &"<redacted>")
             .field("pk_pc", &"<peer verifying key>")
             .field("committed_root", &self.committed_root)
+            .field("reconnect_gen", &self.reconnect_gen)
             .field("send_floor", &self.send_floor)
-            .field("window_anchor_ms", &self.window_anchor_ms)
-            .field("toward_c", &self.toward_c)
-            // Renders the attempt and the frame's length; `SealedReEst`'s own
-            // `Debug` makes the same redaction decision this impl does.
-            .field("sealed", &self.sealed)
+            .field("attempt_at_window_start", &self.attempt_at_window_start)
+            // Each renders its attempt and its frame's length; their own `Debug`
+            // impls make the same redaction decision this one does, and
+            // `RetainedRoot`'s root renders through `CommittedRoot`'s.
+            .field("own", &self.own)
+            .field("acceptance", &self.acceptance)
+            .field("retention", &self.retention)
             .finish()
     }
 }
@@ -682,27 +1661,72 @@ impl ResumeRecord {
     /// value for the reason [`SealedReEst`] gives: the pairing is fixed at
     /// sealing time and this call cannot restate it.
     ///
-    /// **`sealed` is `None` at first establishment.** The keys, the committed
+    /// **Both slots are `None` at first establishment.** The keys, the committed
     /// root and the floor are known the moment a correspondence exists; a sealed
     /// re-establishment frame is not, and there is nothing legitimate to put in
-    /// its place. See the field's own note.
+    /// its place. [`ReEstState::first_establishment`] and [`Retention::none`]
+    /// are that state written down.
+    ///
+    /// **The two groups are structs rather than eleven positional arguments**,
+    /// and the grouping is the design rather than a way to shorten a signature:
+    /// each group's fields move together in one write and are read together at
+    /// load. A [`ReEstState`] is what a completed handshake replaces wholesale —
+    /// the generation advances and the own slot empties in the same act — and a
+    /// [`Retention`] is what [`Self::retire_retained`] ends wholesale.
     pub fn new(
         s_pc: Box<[u8; ml_dsa::SK_LEN]>,
         pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
         committed_root: CommittedRoot,
-        sealed: Option<SealedReEst>,
+        handshake: ReEstState,
+        retention: Retention,
         send_floor: SendFloor,
-        window_anchor_ms: i64,
-        toward_c: u32,
     ) -> Self {
-        Self {
+        let mut record = Self {
             s_pc,
             pk_pc,
             committed_root,
-            sealed,
+            reconnect_gen: handshake.reconnect_gen,
+            attempt: handshake.attempt,
+            last_seen_re_est: handshake.last_seen_re_est,
+            own: handshake.own,
+            acceptance: handshake.acceptance,
+            retention,
             send_floor,
-            window_anchor_ms,
-            toward_c,
+            attempt_at_window_start: handshake.attempt_at_window_start,
+        };
+        // An occupied acceptance slot IS the observation A6.1 slides the window
+        // on, so building a record with one raises the base to it — a raise,
+        // never a set, because the stored number may already be higher from an
+        // exchange whose slot has since been zeroed.
+        if let Some(slot) = record.acceptance.as_ref() {
+            let observed = slot.attempt().get();
+            if observed > record.last_seen_re_est {
+                record.last_seen_re_est = observed;
+            }
+        }
+        // Idempotent, so running it here costs nothing when the caller has
+        // already run it and closes the gap when the caller has not.
+        record.evict_dedup_below_window();
+        record
+    }
+
+    /// Record that a peer `RE-EST` at `attempt` was accepted, sliding A6.1's
+    /// window base forward and evicting what the new window can no longer reach.
+    ///
+    /// **The two acts are one call because they are one invariant.** The store
+    /// refuses a commit that drops a dedup position at or above the base
+    /// ([`commit_resume`](crate::dm::persist::DmPersist::commit_resume)), and
+    /// eviction drops positions below it — so a base that moved without the
+    /// eviction leaves entries the memory no longer needs, and an eviction
+    /// without the base having moved is a shrink the store refuses. Neither is
+    /// spellable separately.
+    ///
+    /// A raise, never a set: an observation at or below the stored base is a
+    /// window this side has already left, and is inert.
+    pub fn observe_accepted(&mut self, attempt: Attempt) {
+        if attempt.get() > self.last_seen_re_est {
+            self.last_seen_re_est = attempt.get();
+            self.evict_dedup_below_window();
         }
     }
 
@@ -737,8 +1761,64 @@ impl ResumeRecord {
         &self.committed_root
     }
 
-    /// Which attempt this record describes, or `None` while the handshake slot
-    /// stands empty.
+    /// A3.4's committed generation.
+    pub fn reconnect_gen(&self) -> u32 {
+        self.reconnect_gen
+    }
+
+    /// Our own pending initiation, or `None` while the slot stands empty.
+    pub fn own_slot(&self) -> Option<&OwnSlot> {
+        self.own.as_ref()
+    }
+
+    /// The peer initiation we accepted, or `None` while the slot stands empty.
+    pub fn acceptance(&self) -> Option<&AcceptanceSlot> {
+        self.acceptance.as_ref()
+    }
+
+    /// The window base for scanning inbound `RE-EST` and `RE-CONFIRM` legs —
+    /// A6.1's `last_seen` on the **responder's** side.
+    ///
+    /// **Stored and monotone, not read off the acceptance slot.** A6.1 has the
+    /// window *"slide with observed traffic"*, forward only; A3.14 zeroes the
+    /// acceptance slot on completion, so a base read from the slot would drop
+    /// back to `0` at every completed handshake and re-admit attempts the dedup
+    /// memory has already evicted. Occupying the slot *raises* this number —
+    /// [`Self::new`] and [`Self::observe_accepted`] are the two places that do
+    /// — and nothing lowers it while the retention lasts.
+    ///
+    /// A `RE-CONFIRM` settles the attempt that acceptance named, so it scans
+    /// against the same base.
+    ///
+    /// `0` for a correspondence that has accepted nothing.
+    ///
+    /// Pass it as [`crate::dm::reest::scan_re_est`]'s and
+    /// [`crate::dm::reest::scan_re_confirm`]'s `last_seen`.
+    pub fn last_seen_re_est(&self) -> u32 {
+        self.last_seen_re_est
+    }
+
+    /// The window base for scanning inbound `RE-ACK` legs — A6.1's `last_seen`
+    /// on the **initiator's** side.
+    ///
+    /// **A different number from [`Self::last_seen_re_est`], and one derivation
+    /// cannot serve both.** The two legs travel in opposite directions and are
+    /// keyed on different attempt spaces: a `RE-EST` we receive was sealed under
+    /// the *peer's* attempt counter, and a `RE-ACK` we receive answers one of
+    /// *our own* attempts, so its window is rooted at our own counter. Scanning
+    /// an inbound `RE-ACK` against the acceptance slot's number would put the
+    /// window in the peer's space, where our current attempt need not sit at
+    /// all — the lockout of A7.3 arriving through the wrong accessor.
+    ///
+    /// It is the counter rather than the own slot's copy, so it survives the
+    /// completion that zeroes the slot (A3.14).
+    ///
+    /// Pass it as [`crate::dm::reest::scan_re_ack`]'s `last_seen`.
+    pub fn last_seen_re_ack(&self) -> u32 {
+        self.attempt
+    }
+
+    /// A5.2's monotone attempt counter, or `None` before the first attempt.
     ///
     /// **`None` orders below every [`Attempt`]**, which is what the anti-rollback
     /// comparison in
@@ -747,7 +1827,7 @@ impl ResumeRecord {
     /// re-establishment yet may be replaced by one carrying
     /// [`Attempt::FIRST`], and never the other way round.
     pub fn attempt(&self) -> Option<Attempt> {
-        self.sealed.as_ref().map(SealedReEst::attempt)
+        NonZeroU32::new(self.attempt).map(Attempt::from_nonzero)
     }
 
     /// The sealed frame bound to its attempt — what a re-emit sends.
@@ -756,7 +1836,7 @@ impl ResumeRecord {
     /// the peer will dedup on (A9.4) alongside the frame, and there is no
     /// constructor on it that would re-seal either.
     pub fn sealed(&self) -> Option<&SealedReEst> {
-        self.sealed.as_ref()
+        self.own.as_ref().map(OwnSlot::sealed)
     }
 
     /// The durable send-side floor.
@@ -764,14 +1844,106 @@ impl ResumeRecord {
         self.send_floor
     }
 
-    /// The re-establishment window's anchor.
-    pub fn window_anchor_ms(&self) -> i64 {
-        self.window_anchor_ms
+    /// A7.3's window anchor — the attempt the current window opened at.
+    pub fn attempt_at_window_start(&self) -> u32 {
+        self.attempt_at_window_start
     }
 
-    /// Progress toward `C`.
-    pub fn toward_c(&self) -> u32 {
-        self.toward_c
+    /// The retained `RS_n` and its write-once supersede stamp, or `None` once it
+    /// has retired.
+    pub fn retained(&self) -> Option<&RetainedRoot> {
+        self.retention.retained.as_ref()
+    }
+
+    /// A5.3's processed-handshake-frame memory.
+    pub fn dedup(&self) -> &DedupMemory {
+        &self.retention.dedup
+    }
+
+    /// A5.4's retained-but-stopped flag.
+    pub fn retained_but_stopped(&self) -> bool {
+        self.retention.stopped
+    }
+
+    /// Record that a handshake frame was processed at `key`, and say whether it
+    /// was novel (A4.5's byte-novelty predicate, A5.3's memory).
+    ///
+    /// The caller persists the record afterwards; until it does, the memory has
+    /// not survived a restart and the frame can be replayed novel again. That is
+    /// commit-then-act in the same shape the rest of this record uses, and it is
+    /// why this returns the answer rather than acting on it.
+    pub fn note_processed(&mut self, key: DedupKey) -> Result<Novelty, ResumeError> {
+        self.retention.dedup.insert(key)
+    }
+
+    /// Drop the dedup entries whose frames the scan can no longer open.
+    ///
+    /// **The bound on the memory, and it is A5.3's own argument applied to the
+    /// other thing that makes a frame unopenable.** A5.3 evicts at retirement
+    /// because *"once retired, a superseded-root frame cannot open and cannot
+    /// alarm regardless"*. A5.2 gives the second cause: the receiver
+    /// *"trial-decrypts over a bounded `attempt` window
+    /// `[last_seen, last_seen + MAX_GAP]`, **rejecting anything beyond**"*, and
+    /// A6.1 slides that base forward on observed attempts. An entry below its
+    /// leg's base therefore names a frame the scan rejects before novelty is
+    /// ever consulted — it cannot open, so it cannot alarm, so the memory of it
+    /// buys nothing.
+    ///
+    /// Without this the set is unbounded in practice rather than in principle:
+    /// the anchor rolls over inside one retention (A6.1), so a retained `RS_n`
+    /// sees `C` attempts per window for as many windows as the peer answers,
+    /// and a memory sized at one window's worth would start refusing legitimate
+    /// handshake frames — an outcome A3.15's table does not contain.
+    ///
+    /// The bases are the record's own derivations, so this is an idempotent
+    /// recomputation from durable state in A8.2's shape: running it twice
+    /// changes nothing, and running it after a reload gives the same answer as
+    /// running it before.
+    ///
+    /// **Private, and called from exactly two places** — [`Self::new`] and
+    /// [`Self::observe_accepted`], the two moments the base can move. A public
+    /// version would be an invariant the caller had to remember, and the store's
+    /// no-shrink rule would refuse the commit of a record whose caller forgot.
+    fn evict_dedup_below_window(&mut self) {
+        let re_est_base = self.last_seen_re_est();
+        let re_ack_base = self.last_seen_re_ack();
+        // **The leg alone selects the base, because the direction is fixed
+        // across the set.** [`DedupMemory::insert`] admits one plane, so every
+        // entry here was read from the correspondent's plane: an inbound
+        // `RE-EST` or `RE-CONFIRM` carries the peer's attempt and is scanned
+        // against [`Self::last_seen_re_est`], and an inbound `RE-ACK` answers one
+        // of ours and is scanned against [`Self::last_seen_re_ack`]. Were both
+        // planes admitted the roles would swap for the second one and the leg
+        // would no longer name a base; that is the state `insert` refuses.
+        self.retention.dedup.keys.retain(|key| {
+            let base = match key.leg {
+                // A `RE-CONFIRM` settles the attempt the acceptance named, so it
+                // is scanned against the same base as the `RE-EST` that opened
+                // the exchange.
+                Leg::ReEst | Leg::ReConfirm => re_est_base,
+                Leg::ReAck => re_ack_base,
+            };
+            key.attempt.get() >= base
+        });
+    }
+
+    /// Retire the retained `RS_n`: drop the root, its supersede stamp, its dedup
+    /// memory and the retained-but-stopped flag, together.
+    ///
+    /// **The one act, because A5.3 scopes the memory's lifetime to the root's**
+    /// — *"gated on **actual** `RS_n` retirement, not a fixed 14-day duration"*.
+    /// Byte-novelty defends against a co-host re-serving captured `RE-EST` bytes
+    /// to re-fire the peer-state-regressed alarm, and that defence is needed for
+    /// exactly as long as the retained root can open those bytes: once it is
+    /// gone the frame cannot open and cannot alarm. Neither field has a setter,
+    /// so *"a still-live `RS_n` paired with an emptied dedup"* has no spelling
+    /// here; `commit_resume` refuses it arriving from a caller that built a
+    /// record by hand.
+    ///
+    /// Idempotent: retiring an already-retired retention is a write of the state
+    /// it is already in.
+    pub fn retire_retained(&mut self) {
+        self.retention = Retention::none();
     }
 
     /// The sealed RE-EST frame, borrowed — the same bytes every call, which is
@@ -785,7 +1957,7 @@ impl ResumeRecord {
     /// empty slice: a caller that emits what this returns must have nothing to
     /// emit in that state, and an empty slice is a frame of length zero.
     pub fn sealed_re_est(&self) -> Option<&[u8]> {
-        self.sealed.as_ref().map(SealedReEst::bytes)
+        self.sealed().map(SealedReEst::bytes)
     }
 
     /// The at-rest form, plaintext. `dm_store` seals it.
@@ -810,40 +1982,99 @@ impl ResumeRecord {
         // spellings that disagree — an attempt with no frame, a frame with no
         // attempt — have no expression here; `decode` refuses them on the way
         // back in, for bytes this encoder did not write.
-        let attempt = self.attempt().map_or(0, Attempt::get);
-        let frame = self.sealed_re_est().unwrap_or(&[]);
-        let mut out = Zeroizing::new(Vec::with_capacity(FIXED_LEN + frame.len()));
+        let own_generation = self.own.as_ref().map_or(0, OwnSlot::generation);
+        // **The SLOT's attempt, not the counter.** They agree while the slot is
+        // occupied and part company the moment a completion zeroes it (A3.14),
+        // and writing the counter here would spell an occupied slot with no
+        // frame — which `decode` then refuses for ever.
+        let own_attempt = self.own.as_ref().map_or(0, |slot| slot.attempt().get());
+        let own_frame = self.sealed_re_est().unwrap_or(&[]);
+        let acc_generation = self
+            .acceptance
+            .as_ref()
+            .map_or(0, AcceptanceSlot::generation);
+        let acc_attempt = self
+            .acceptance
+            .as_ref()
+            .map_or(0, |slot| slot.attempt().get());
+        let acc_confirmed = self
+            .acceptance
+            .as_ref()
+            .is_some_and(AcceptanceSlot::confirmed);
+        let acc_frame = self
+            .acceptance
+            .as_ref()
+            .map_or(&[][..], AcceptanceSlot::sealed_re_ack);
+        let dedup = self.retention.dedup.keys();
+        let mut out = Zeroizing::new(Vec::with_capacity(
+            FIXED_LEN + own_frame.len() + acc_frame.len() + dedup.len() * DEDUP_ENTRY_LEN,
+        ));
         out.extend_from_slice(RESUME_MAGIC);
         out.extend_from_slice(&Registry::default_write_suite().get().to_be_bytes());
         out.extend_from_slice(self.s_pc.as_ref());
         out.extend_from_slice(self.pk_pc.as_ref());
         out.extend_from_slice(self.committed_root.as_bytes());
-        out.extend_from_slice(&attempt.to_be_bytes());
+        out.extend_from_slice(&self.reconnect_gen.to_be_bytes());
+        out.extend_from_slice(&self.attempt.to_be_bytes());
+        out.extend_from_slice(&own_generation.to_be_bytes());
+        out.extend_from_slice(&own_attempt.to_be_bytes());
+        out.extend_from_slice(&acc_generation.to_be_bytes());
+        out.extend_from_slice(&acc_attempt.to_be_bytes());
+        out.push(u8::from(acc_confirmed));
+        match self.retention.retained.as_ref() {
+            Some(retained) => {
+                out.push(1);
+                out.extend_from_slice(retained.root().as_bytes());
+                out.extend_from_slice(&retained.superseded_at_ms().to_be_bytes());
+            }
+            // The absent case still writes the fixed width, so the record's
+            // layout does not depend on its contents and every field after this
+            // one sits at a constant offset.
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; ROOT_KEY_LEN]);
+                out.extend_from_slice(&0i64.to_be_bytes());
+            }
+        }
         out.extend_from_slice(&self.send_floor.generation.to_be_bytes());
         out.extend_from_slice(&self.send_floor.seq.to_be_bytes());
-        out.extend_from_slice(&self.window_anchor_ms.to_be_bytes());
-        out.extend_from_slice(&self.toward_c.to_be_bytes());
-        out.extend_from_slice(&(frame.len() as u64).to_be_bytes());
-        out.extend_from_slice(frame);
+        out.extend_from_slice(&self.attempt_at_window_start.to_be_bytes());
+        out.extend_from_slice(&self.last_seen_re_est.to_be_bytes());
+        out.push(u8::from(self.retention.stopped));
+        // `DEDUP_CAPACITY` bounds this far below `u16::MAX`, and `insert` is the
+        // only way in, so the cast cannot truncate.
+        out.extend_from_slice(&(dedup.len() as u16).to_be_bytes());
+        for key in dedup {
+            out.extend_from_slice(&key.generation.to_be_bytes());
+            out.extend_from_slice(&key.attempt.get().to_be_bytes());
+            out.push(key.leg.tag());
+            out.push(direction_tag(key.direction));
+            out.extend_from_slice(&key.seq.to_be_bytes());
+        }
+        out.extend_from_slice(&(own_frame.len() as u64).to_be_bytes());
+        out.extend_from_slice(own_frame);
+        out.extend_from_slice(&(acc_frame.len() as u64).to_be_bytes());
+        out.extend_from_slice(acc_frame);
         out
     }
 
     /// Read the at-rest form back.
     ///
-    /// **No clock argument.** `window_anchor_ms` is taken verbatim: nothing in
-    /// this build computes a terminal transition from it, so a corrupt value
-    /// costs re-establishment timing rather than switching a guarantee off —
-    /// the distinction `dm::outbox::Outbox::decode` draws between the give-up
-    /// clock and `next_due_ms`.
+    /// **No clock argument, and the re-establishment window no longer wants
+    /// one.** A7.3's anchor is an attempt number and A8.2 derives window
+    /// membership from durable `last_seen`, so every value this decoder returns
+    /// that bounds a window is a counter compared against another counter. The
+    /// one stored timestamp left is `superseded_at_ms`, which A3.5 gives the
+    /// refusal `dm::outbox` applies to `composed_at_ms` — *"a future
+    /// `superseded_at_ms` refuses the record's decode rather than disabling the
+    /// ceiling"*. That comparison needs a clock, which this call does not take
+    /// and `dm::outbox::Outbox::decode` does; the refusal belongs at whichever
+    /// layer reads the stamp against `T_RETIRE`, and this decoder returns it
+    /// verbatim so that layer sees what was written.
     ///
-    /// **That is a statement about consumers that do not exist yet, so it is a
-    /// re-check rather than a settled property.** When the re-establishment
-    /// window logic lands, a future-dated anchor is the same clock-rollback
-    /// class `Outbox::decode` refuses, and this decision has to be made again
-    /// against what actually reads the field.
-    ///
-    /// The frame length is checked against what remains **before** anything is
-    /// reserved, so a corrupt length cannot drive an allocation.
+    /// The frame lengths and the dedup count are checked against what remains
+    /// **before** anything is reserved, so a corrupt length cannot drive an
+    /// allocation.
     pub fn decode(bytes: &[u8]) -> Result<Self, ResumeError> {
         let mut r = Reader::new(bytes);
         if r.take(RESUME_MAGIC.len())? != RESUME_MAGIC {
@@ -867,18 +2098,69 @@ impl ResumeRecord {
             .try_into()
             .map_err(|_| ResumeError::Truncated)?;
         let pk_pc: Box<[u8; ml_dsa::PK_LEN]> = Box::new(r.array()?);
-        let committed_root = CommittedRoot::from_bytes(r.array()?);
-        let attempt = u32::from_be_bytes(r.array()?);
+        // **Through a zeroizing local, never a bare `[u8; ROOT_KEY_LEN]`.**
+        // `r.array()` returns the root by value, and the copy the caller drops
+        // is not the copy `CommittedRoot` wipes — the same reasoning the `s_pc`
+        // read above records, which is why that one never builds a stack array
+        // either.
+        let mut root_bytes = Zeroizing::new(r.array::<ROOT_KEY_LEN>()?);
+        let committed_root = CommittedRoot::from_bytes(*root_bytes);
+        root_bytes.zeroize();
+        let reconnect_gen = u32::from_be_bytes(r.array()?);
+        let attempt_counter = u32::from_be_bytes(r.array()?);
+        let own_generation = u32::from_be_bytes(r.array()?);
+        let own_attempt = u32::from_be_bytes(r.array()?);
+        let acc_generation = u32::from_be_bytes(r.array()?);
+        let acc_attempt = u32::from_be_bytes(r.array()?);
+        let acc_confirmed = r.array::<1>()?[0] != 0;
+        let retained_present = r.array::<1>()?[0] != 0;
+        let mut retained_bytes = Zeroizing::new(r.array::<ROOT_KEY_LEN>()?);
+        let superseded_at_ms = i64::from_be_bytes(r.array()?);
         let generation = u32::from_be_bytes(r.array()?);
         let seq = u64::from_be_bytes(r.array()?);
-        let window_anchor_ms = i64::from_be_bytes(r.array()?);
-        let toward_c = u32::from_be_bytes(r.array()?);
-        let len = u64::from_be_bytes(r.array()?);
-        let len = usize::try_from(len).map_err(|_| ResumeError::Truncated)?;
-        if len > MAX_FRAME_LEN {
-            return Err(ResumeError::FrameTooLong { len });
+        let attempt_at_window_start = u32::from_be_bytes(r.array()?);
+        let last_seen_re_est = u32::from_be_bytes(r.array()?);
+        let stopped = r.array::<1>()?[0] != 0;
+        let dedup_count = usize::from(u16::from_be_bytes(r.array()?));
+        if dedup_count > DEDUP_CAPACITY {
+            return Err(ResumeError::DedupFull {
+                capacity: DEDUP_CAPACITY,
+            });
         }
-        let sealed_re_est: Box<[u8]> = r.take(len)?.to_vec().into_boxed_slice();
+        let mut dedup = DedupMemory::new();
+        for _ in 0..dedup_count {
+            let generation = u32::from_be_bytes(r.array()?);
+            let attempt = u32::from_be_bytes(r.array()?);
+            let leg_tag = r.array::<1>()?[0];
+            let direction_tag = r.array::<1>()?[0];
+            let seq = u64::from_be_bytes(r.array()?);
+            // A key naming attempt `0` names the empty slot, which no frame ever
+            // arrived under; refused as a truncation of the record's own
+            // vocabulary rather than repaired into attempt 1.
+            let attempt = NonZeroU32::new(attempt)
+                .map(Attempt::from_nonzero)
+                .ok_or(ResumeError::Truncated)?;
+            let leg = Leg::from_tag(leg_tag).ok_or(ResumeError::UnknownLeg(leg_tag))?;
+            let direction = direction_from_tag(direction_tag)
+                .ok_or(ResumeError::UnknownDirection(direction_tag))?;
+            if dedup.insert(DedupKey {
+                generation,
+                attempt,
+                leg,
+                direction,
+                seq,
+            })? == Novelty::Repeat
+            {
+                // Accepting it would decode to a set one entry smaller than the
+                // bytes hold, so the record would re-encode to bytes it was not
+                // read from.
+                return Err(ResumeError::DuplicateDedupEntry);
+            }
+        }
+        let own_len = Self::frame_len(&mut r, MAX_FRAME_LEN)?;
+        let sealed_re_est: Box<[u8]> = r.take(own_len)?.to_vec().into_boxed_slice();
+        let acc_len = Self::frame_len(&mut r, MAX_SEALED_LEG_LEN)?;
+        let sealed_re_ack: Box<[u8]> = r.take(acc_len)?.to_vec().into_boxed_slice();
         let rest = r.remaining();
         if rest != 0 {
             return Err(ResumeError::TrailingBytes(rest));
@@ -890,27 +2172,104 @@ impl ResumeRecord {
         // Attempt `0` is the empty slot, and `Attempt(0)` is therefore never
         // constructed: below `Attempt::FIRST`, it would order beneath a real
         // attempt while claiming to be one.
-        let sealed = match attempt {
+        let sealed = match own_attempt {
             0 if !sealed_re_est.is_empty() => {
                 return Err(ResumeError::EmptySlotHasFrame {
                     len: sealed_re_est.len(),
+                });
+            }
+            0 if own_generation != 0 => {
+                return Err(ResumeError::SlotGenerationWithoutAttempt {
+                    generation: own_generation,
                 });
             }
             0 => None,
             n if sealed_re_est.is_empty() => {
                 return Err(ResumeError::OccupiedSlotHasNoFrame { attempt: n });
             }
+            n if n != attempt_counter => {
+                return Err(ResumeError::AttemptSlotDisagrees {
+                    field: attempt_counter,
+                    slot: n,
+                });
+            }
             n => Some(SealedReEst::from_stored(Attempt(n), sealed_re_est)?),
         };
+        let acceptance = match acc_attempt {
+            0 if !sealed_re_ack.is_empty() || acc_confirmed => {
+                return Err(ResumeError::EmptyAcceptanceHasContent {
+                    frame_len: sealed_re_ack.len(),
+                    confirmed: acc_confirmed,
+                });
+            }
+            0 if acc_generation != 0 => {
+                return Err(ResumeError::SlotGenerationWithoutAttempt {
+                    generation: acc_generation,
+                });
+            }
+            0 => None,
+            n if sealed_re_ack.is_empty() => {
+                return Err(ResumeError::AcceptanceHasNoFrame { attempt: n });
+            }
+            n => Some(AcceptanceSlot {
+                generation: acc_generation,
+                attempt: Attempt(n),
+                sealed_re_ack,
+                confirmed: acc_confirmed,
+            }),
+        };
+        // The presence flag and the stamp have to agree: A3.5 runs `T_RETIRE`
+        // from the stamp, so a retained root without one has no ceiling, and a
+        // stamp without a root bounds nothing. `encode` writes the absent case as
+        // an all-zero root and a zero stamp, so a zero stamp beside a set flag is
+        // bytes this encoder did not write.
+        let retained = match (retained_present, superseded_at_ms) {
+            (true, 0) => {
+                return Err(ResumeError::RetentionHalfPresent { present: true });
+            }
+            (false, stamp) if stamp != 0 => {
+                return Err(ResumeError::RetentionHalfPresent { present: false });
+            }
+            // `encode` writes the absent case as an all-zero root, so bytes
+            // under a clear flag are a retained root the flag hides or a flag
+            // the bytes contradict; either way not a record this encoder wrote.
+            (false, _) if retained_bytes.iter().any(|b| *b != 0) => {
+                return Err(ResumeError::RetainedBytesWithoutFlag);
+            }
+            (true, stamp) => Some(RetainedRoot::new(
+                CommittedRoot::from_bytes(*retained_bytes),
+                stamp,
+            )),
+            (false, _) => None,
+        };
+        retained_bytes.zeroize();
         Ok(Self {
             s_pc,
             pk_pc,
             committed_root,
-            sealed,
+            reconnect_gen,
+            attempt: attempt_counter,
+            last_seen_re_est,
+            own: sealed.map(|sealed| OwnSlot::new(own_generation, sealed)),
+            acceptance,
+            retention: Retention {
+                retained,
+                dedup,
+                stopped,
+            },
             send_floor: SendFloor { generation, seq },
-            window_anchor_ms,
-            toward_c,
+            attempt_at_window_start,
         })
+    }
+
+    /// A length prefix, checked against its ceiling before anything is reserved.
+    fn frame_len(r: &mut Reader<'_>, max: usize) -> Result<usize, ResumeError> {
+        let len = u64::from_be_bytes(r.array()?);
+        let len = usize::try_from(len).map_err(|_| ResumeError::Truncated)?;
+        if len > max {
+            return Err(ResumeError::FrameTooLong { len });
+        }
+        Ok(len)
     }
 }
 
@@ -1003,18 +2362,129 @@ mod tests {
             .expect("the fixture's handshake slot is occupied")
     }
 
+    /// An occupied own-initiation slot at `generation`, sealed under `attempt`.
+    fn own_slot(generation: u32, attempt: u32, seed: u8, len: usize) -> OwnSlot {
+        OwnSlot::new(
+            generation,
+            SealedReEst::seal(fresh(attempt), pattern(seed, len).into_boxed_slice())
+                .expect("the fixture is within MAX_FRAME_LEN"),
+        )
+    }
+
+    /// An occupied, unconfirmed peer-acceptance slot.
+    fn acceptance_slot(generation: u32, attempt: u32, seed: u8, len: usize) -> AcceptanceSlot {
+        AcceptanceSlot::accept(
+            generation,
+            Attempt::from_nonzero(NonZeroU32::new(attempt).expect("a real attempt")),
+            pattern(seed, len).into_boxed_slice(),
+        )
+        .expect("the fixture is within MAX_SEALED_LEG_LEN")
+    }
+
+    /// A dedup key whose every component differs from its neighbours', so a
+    /// codec that transposed two of them fails rather than passing.
+    fn dedup_key(n: u32) -> DedupKey {
+        let leg = match n % 3 {
+            0 => Leg::ReEst,
+            1 => Leg::ReAck,
+            _ => Leg::ReConfirm,
+        };
+        // One plane: the memory admits a single direction, so a fixture that
+        // alternated would be testing a state `insert` refuses.
+        let direction = Direction::AToB;
+        DedupKey::new(
+            100 + n,
+            Attempt::from_nonzero(NonZeroU32::new(200 + n).expect("non-zero")),
+            leg,
+            direction,
+            u64::from(300 + n),
+        )
+    }
+
+    /// A retention holding a superseded root, its stamp, three processed
+    /// positions and the stopped flag — every field of the group non-default, so
+    /// a codec that dropped one fails.
+    fn full_retention() -> Retention {
+        let mut dedup = DedupMemory::new();
+        for n in 0..3 {
+            assert_eq!(
+                dedup.insert(dedup_key(n)).expect("inside DEDUP_CAPACITY"),
+                Novelty::Novel
+            );
+        }
+        Retention {
+            retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+            dedup,
+            stopped: true,
+        }
+    }
+
+    /// Every slot occupied and every flag set, so a round trip that dropped any
+    /// of them fails.
     fn populated() -> ResumeRecord {
         ResumeRecord::new(
             s_pc(0x11),
             pk_pc(0x22),
             root(0x33),
-            Some(
-                SealedReEst::seal(fresh(7), pattern(0x44, 512).into_boxed_slice())
-                    .expect("the fixture is within MAX_FRAME_LEN"),
-            ),
+            ReEstState {
+                reconnect_gen: 9,
+                attempt: 7,
+                last_seen_re_est: 0,
+                own: Some(own_slot(10, 7, 0x44, 512)),
+                acceptance: Some(acceptance_slot(8, 5, 0x66, 256).confirm()),
+                attempt_at_window_start: 2,
+            },
+            full_retention(),
             SendFloor::new(4, 100),
-            ANCHOR,
-            3,
+        )
+    }
+
+    /// The same record with both window bases set, so an eviction test can say
+    /// what the scan can still reach without hand-writing either number.
+    ///
+    /// The `RE-EST` base is the acceptance slot's attempt and the `RE-ACK` base
+    /// is the counter, so the two are set through the values they derive from.
+    fn with_bases(record: ResumeRecord, re_est: u32, re_ack: u32) -> ResumeRecord {
+        let mut rebuilt = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState {
+                reconnect_gen: record.reconnect_gen(),
+                attempt: re_ack,
+                last_seen_re_est: re_est,
+                own: None,
+                acceptance: (re_est > 0)
+                    .then(|| acceptance_slot(record.reconnect_gen() + 1, re_est, 0x66, 32)),
+                attempt_at_window_start: 0,
+            },
+            Retention {
+                retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                dedup: DedupMemory::new(),
+                stopped: false,
+            },
+            SendFloor::new(0, 0),
+        );
+        for key in record.dedup().keys() {
+            rebuilt
+                .note_processed(*key)
+                .expect("the set only moves across");
+        }
+        assert_eq!(rebuilt.last_seen_re_est(), re_est);
+        assert_eq!(rebuilt.last_seen_re_ack(), re_ack);
+        rebuilt
+    }
+
+    /// The same record with both handshake slots standing empty and nothing
+    /// retained — what a first establishment writes.
+    fn opening() -> ResumeRecord {
+        ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState::first_establishment(),
+            Retention::none(),
+            SendFloor::new(0, 0),
         )
     }
 
@@ -1031,9 +2501,33 @@ mod tests {
         );
         assert_eq!(after.attempt(), before.attempt());
         assert_eq!(after.send_floor(), before.send_floor());
-        assert_eq!(after.window_anchor_ms(), before.window_anchor_ms());
-        assert_eq!(after.toward_c(), before.toward_c());
+        assert_eq!(after.reconnect_gen(), before.reconnect_gen());
+        assert_eq!(
+            after.attempt_at_window_start(),
+            before.attempt_at_window_start()
+        );
         assert_eq!(after.sealed_re_est(), before.sealed_re_est());
+        assert_eq!(
+            after.own_slot().map(OwnSlot::generation),
+            before.own_slot().map(OwnSlot::generation)
+        );
+        let (after_acc, before_acc) = (
+            after.acceptance().expect("the fixture accepts"),
+            before.acceptance().expect("the fixture accepts"),
+        );
+        assert_eq!(after_acc.generation(), before_acc.generation());
+        assert_eq!(after_acc.attempt(), before_acc.attempt());
+        assert_eq!(after_acc.sealed_re_ack(), before_acc.sealed_re_ack());
+        assert_eq!(after_acc.confirmed(), before_acc.confirmed());
+        let (after_ret, before_ret) = (
+            after.retained().expect("the fixture retains"),
+            before.retained().expect("the fixture retains"),
+        );
+        assert_eq!(after_ret.root().as_bytes(), before_ret.root().as_bytes());
+        assert_eq!(after_ret.superseded_at_ms(), before_ret.superseded_at_ms());
+        assert_eq!(after.retained_but_stopped(), before.retained_but_stopped());
+        assert_eq!(before.dedup().len(), 3, "the fixture must hold positions");
+        assert_eq!(after.dedup().keys(), before.dedup().keys());
 
         // The fixture has to be non-degenerate for any of the above to mean
         // something: two fields holding the same bytes would let a crossed
@@ -1043,11 +2537,24 @@ mod tests {
         // Every scalar against every other, so a later fixture edit cannot
         // hollow this test by making two of them equal. The earlier guard
         // covered three pairs and left the rest distinct only by accident.
-        let scalars: [(&str, u64); 5] = [
+        let scalars: [(&str, u64); 9] = [
             ("attempt", u64::from(attempt_of(&before).get())),
-            ("generation", u64::from(before.send_floor().generation())),
+            (
+                "floor_generation",
+                u64::from(before.send_floor().generation()),
+            ),
             ("seq", before.send_floor().seq()),
-            ("toward_c", u64::from(before.toward_c())),
+            ("reconnect_gen", u64::from(before.reconnect_gen())),
+            (
+                "own_generation",
+                u64::from(before.own_slot().expect("occupied").generation()),
+            ),
+            ("acceptance_generation", u64::from(before_acc.generation())),
+            ("acceptance_attempt", u64::from(before_acc.attempt().get())),
+            (
+                "attempt_at_window_start",
+                u64::from(before.attempt_at_window_start()),
+            ),
             ("frame_len", frame_of(&before).len() as u64),
         ];
         for (i, (na, a)) in scalars.iter().enumerate() {
@@ -1064,24 +2571,45 @@ mod tests {
     fn the_encoding_has_room_for_nothing_else() {
         let record = populated();
         let encoded = record.encode();
+        let acceptance = record.acceptance().expect("the fixture accepts");
         let named = RESUME_MAGIC.len()
             + SUITE_ID_LEN
             + ml_dsa::SK_LEN
             + ml_dsa::PK_LEN
             + ROOT_KEY_LEN
-            + 4 /* attempt */
-            + 4 /* generation */
-            + 8 /* seq */
-            + 8 /* window_anchor_ms */
-            + 4 /* toward_c */
-            + 8 /* frame length prefix */
-            + frame_of(&record).len();
+            + 4 /* reconnect_gen */
+            + 4 /* attempt counter */
+            + 4 /* own slot generation */
+            + 4 /* own slot attempt */
+            + 4 /* acceptance generation */
+            + 4 /* acceptance attempt */
+            + 1 /* acceptance confirmed */
+            + 1 /* retained present */
+            + ROOT_KEY_LEN /* retained RS_n */
+            + 8 /* superseded_at_ms */
+            + 4 /* send floor generation */
+            + 8 /* send floor seq */
+            + 4 /* attempt_at_window_start */
+            + 4 /* last_seen_re_est */
+            + 1 /* retained_but_stopped */
+            + 2 /* dedup count */
+            + record.dedup().len() * DEDUP_ENTRY_LEN
+            + 8 /* own frame length prefix */
+            + frame_of(&record).len()
+            + 8 /* acceptance frame length prefix */
+            + acceptance.sealed_re_ack().len();
         assert_eq!(
             encoded.len(),
             named,
             "a field is present that nothing names"
         );
-        assert_eq!(encoded.len(), FIXED_LEN + frame_of(&record).len());
+        assert_eq!(
+            encoded.len(),
+            FIXED_LEN
+                + frame_of(&record).len()
+                + acceptance.sealed_re_ack().len()
+                + record.dedup().len() * DEDUP_ENTRY_LEN
+        );
     }
 
     /// A record's plaintext, assembled by hand so the two contradictory slot
@@ -1091,19 +2619,63 @@ mod tests {
     /// spelling has an expression there; this is the second opinion the layout
     /// test uses, reused to reach the decoder's own guards.
     fn assembled(attempt: u32, frame: &[u8]) -> Vec<u8> {
+        assembled_full(attempt, frame, 0, &[], false, None, &[])
+    }
+
+    /// Every field of the at-rest form, writable independently — which is what
+    /// lets a test spell a slot whose halves contradict each other, a retained
+    /// root missing its stamp, or a dedup entry naming no leg.
+    fn assembled_full(
+        own_attempt: u32,
+        own_frame: &[u8],
+        acc_attempt: u32,
+        acc_frame: &[u8],
+        acc_confirmed: bool,
+        retained: Option<i64>,
+        dedup: &[(u32, u32, u8, u8, u64)],
+    ) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
         out.extend_from_slice(RESUME_MAGIC);
         out.extend_from_slice(&crate::crypto::suite::CNSA_2_0.id.get().to_be_bytes());
         out.extend_from_slice(&pattern(0x11, ml_dsa::SK_LEN));
         out.extend_from_slice(&pattern(0x22, ml_dsa::PK_LEN));
         out.extend_from_slice(&pattern(0x33, ROOT_KEY_LEN));
-        out.extend_from_slice(&attempt.to_be_bytes());
-        out.extend_from_slice(&4u32.to_be_bytes());
-        out.extend_from_slice(&100u64.to_be_bytes());
-        out.extend_from_slice(&ANCHOR.to_be_bytes());
-        out.extend_from_slice(&3u32.to_be_bytes());
-        out.extend_from_slice(&(frame.len() as u64).to_be_bytes());
-        out.extend_from_slice(frame);
+        out.extend_from_slice(&9u32.to_be_bytes()); // reconnect_gen
+        out.extend_from_slice(&own_attempt.to_be_bytes()); // the attempt counter
+        // An empty slot carries a zero generation: the decoder refuses a
+        // generation naming an exchange that is not there.
+        out.extend_from_slice(&if own_attempt == 0 { 0u32 } else { 10 }.to_be_bytes());
+        out.extend_from_slice(&own_attempt.to_be_bytes()); // own slot attempt
+        out.extend_from_slice(&if acc_attempt == 0 { 0u32 } else { 8 }.to_be_bytes());
+        out.extend_from_slice(&acc_attempt.to_be_bytes());
+        out.push(u8::from(acc_confirmed));
+        out.push(u8::from(retained.is_some()));
+        // Zeros when the flag is clear: that is what `encode` writes for the
+        // absent case, and the decoder refuses bytes hiding under a clear flag.
+        out.extend_from_slice(&if retained.is_some() {
+            pattern(0x55, ROOT_KEY_LEN)
+        } else {
+            vec![0u8; ROOT_KEY_LEN]
+        });
+        out.extend_from_slice(&retained.unwrap_or(0).to_be_bytes());
+        out.extend_from_slice(&4u32.to_be_bytes()); // send floor generation
+        out.extend_from_slice(&100u64.to_be_bytes()); // send floor seq
+        out.extend_from_slice(&2u32.to_be_bytes()); // attempt_at_window_start
+        // The window base: an occupied acceptance slot raises it to its attempt.
+        out.extend_from_slice(&acc_attempt.to_be_bytes());
+        out.push(0); // retained_but_stopped
+        out.extend_from_slice(&(dedup.len() as u16).to_be_bytes());
+        for (generation, attempt, leg, direction, seq) in dedup {
+            out.extend_from_slice(&generation.to_be_bytes());
+            out.extend_from_slice(&attempt.to_be_bytes());
+            out.push(*leg);
+            out.push(*direction);
+            out.extend_from_slice(&seq.to_be_bytes());
+        }
+        out.extend_from_slice(&(own_frame.len() as u64).to_be_bytes());
+        out.extend_from_slice(own_frame);
+        out.extend_from_slice(&(acc_frame.len() as u64).to_be_bytes());
+        out.extend_from_slice(acc_frame);
         out
     }
 
@@ -1163,13 +2735,37 @@ mod tests {
         expected.extend_from_slice(&pattern(0x11, ml_dsa::SK_LEN));
         expected.extend_from_slice(&pattern(0x22, ml_dsa::PK_LEN));
         expected.extend_from_slice(&pattern(0x33, ROOT_KEY_LEN));
-        expected.extend_from_slice(&7u32.to_be_bytes()); // attempt
+        expected.extend_from_slice(&9u32.to_be_bytes()); // reconnect_gen
+        expected.extend_from_slice(&7u32.to_be_bytes()); // the attempt counter
+        expected.extend_from_slice(&10u32.to_be_bytes()); // own slot generation
+        expected.extend_from_slice(&7u32.to_be_bytes()); // own slot attempt
+        expected.extend_from_slice(&8u32.to_be_bytes()); // acceptance generation
+        expected.extend_from_slice(&5u32.to_be_bytes()); // acceptance attempt
+        expected.push(1); // acceptance confirmed
+        expected.push(1); // retained RS_n present
+        expected.extend_from_slice(&pattern(0x55, ROOT_KEY_LEN)); // retained RS_n
+        expected.extend_from_slice(&ANCHOR.to_be_bytes()); // superseded_at_ms
         expected.extend_from_slice(&4u32.to_be_bytes()); // floor generation
         expected.extend_from_slice(&100u64.to_be_bytes()); // floor seq
-        expected.extend_from_slice(&ANCHOR.to_be_bytes()); // window anchor
-        expected.extend_from_slice(&3u32.to_be_bytes()); // toward_c
-        expected.extend_from_slice(&512u64.to_be_bytes()); // frame length prefix
-        expected.extend_from_slice(&pattern(0x44, 512)); // the sealed frame
+        expected.extend_from_slice(&2u32.to_be_bytes()); // attempt_at_window_start
+        expected.extend_from_slice(&5u32.to_be_bytes()); // last_seen_re_est
+        expected.push(1); // retained_but_stopped
+        expected.extend_from_slice(&3u16.to_be_bytes()); // dedup entry count
+        for (generation, attempt, leg, direction, seq) in [
+            (100u32, 200u32, 1u8, 1u8, 300u64),
+            (101, 201, 2, 1, 301),
+            (102, 202, 3, 1, 302),
+        ] {
+            expected.extend_from_slice(&generation.to_be_bytes());
+            expected.extend_from_slice(&attempt.to_be_bytes());
+            expected.push(leg);
+            expected.push(direction);
+            expected.extend_from_slice(&seq.to_be_bytes());
+        }
+        expected.extend_from_slice(&512u64.to_be_bytes()); // own frame length prefix
+        expected.extend_from_slice(&pattern(0x44, 512)); // the sealed RE-EST
+        expected.extend_from_slice(&256u64.to_be_bytes()); // acceptance length prefix
+        expected.extend_from_slice(&pattern(0x66, 256)); // the sealed RE-ACK
 
         assert_eq!(
             &record.encode()[..],
@@ -1212,9 +2808,10 @@ mod tests {
 
     /// The two frame accessors describe one value and may not drift apart.
     ///
-    /// `sealed()` is new public API with no production caller yet — the re-emit
-    /// path it exists for is unbuilt — so without this it is untested surface,
-    /// the same complaint #280 records against an unreferenced function.
+    /// `sealed()` carries the attempt a re-emit dedups on and `sealed_re_est()`
+    /// carries only the bytes; both read one [`OwnSlot`], so a change that gave
+    /// either its own storage would let them disagree with nothing to say which
+    /// was right.
     #[test]
     fn the_bound_frame_and_the_loose_bytes_agree() {
         let record = populated();
@@ -1333,20 +2930,48 @@ mod tests {
         // genuinely a runtime fact, and all this test asserts, is that the bound
         // is REAL rather than generous: a record actually built at the frame
         // ceiling encodes to exactly it.
+        let mut dedup = DedupMemory::new();
+        for n in 0..DEDUP_CAPACITY {
+            assert_eq!(
+                dedup
+                    .insert(dedup_key(u32::try_from(n).expect("the capacity is small")))
+                    .expect("at the capacity, not past it"),
+                Novelty::Novel
+            );
+        }
+        assert_eq!(dedup.len(), DEDUP_CAPACITY, "the fixture must fill the set");
         let at_ceiling = ResumeRecord::new(
             s_pc(0x11),
             pk_pc(0x22),
             root(0x33),
-            Some(
-                SealedReEst::seal(
-                    FreshAttempt::first(),
-                    pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
-                )
-                .expect("a frame of exactly MAX_FRAME_LEN is allowed"),
-            ),
+            ReEstState {
+                reconnect_gen: 0,
+                attempt: 1,
+                last_seen_re_est: 0,
+                own: Some(OwnSlot::new(
+                    0,
+                    SealedReEst::seal(
+                        FreshAttempt::first(),
+                        pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
+                    )
+                    .expect("a frame of exactly MAX_FRAME_LEN is allowed"),
+                )),
+                acceptance: Some(
+                    AcceptanceSlot::accept(
+                        0,
+                        Attempt::FIRST,
+                        pattern(0x66, MAX_SEALED_LEG_LEN).into_boxed_slice(),
+                    )
+                    .expect("a frame of exactly MAX_SEALED_LEG_LEN is allowed"),
+                ),
+                attempt_at_window_start: 0,
+            },
+            Retention {
+                retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                dedup,
+                stopped: true,
+            },
             SendFloor::new(0, 0),
-            ANCHOR,
-            0,
         );
         assert_eq!(at_ceiling.encode().len(), MAX_ENCODED_LEN);
     }
@@ -1382,8 +3007,13 @@ mod tests {
         // The decoder cannot lean on the constructor, because the bytes it reads
         // did not come through it. A corrupt length is refused BEFORE anything
         // is reserved, so it cannot drive an allocation.
-        let mut bytes = populated().encode();
-        let len_at = FIXED_LEN - 8;
+        // The first-establishment record, whose dedup memory is empty — so the
+        // own frame's length prefix sits at a constant offset rather than one
+        // that moves with the number of recorded positions.
+        let record = opening();
+        assert!(record.dedup().is_empty(), "the offset below assumes it");
+        let mut bytes = record.encode();
+        let len_at = FIXED_LEN - 16;
         bytes[len_at..len_at + 8].copy_from_slice(&(too_long as u64).to_be_bytes());
         assert_eq!(
             ResumeRecord::decode(&bytes).err(),
@@ -1453,7 +3083,14 @@ mod tests {
         // they used to be two independent ones — so on their own they no longer
         // notice `ResumeRecord::Debug` dropping the rest of the record. The
         // remaining non-secret fields are named explicitly to restore that span.
-        for field in ["toward_c: 3", "window_anchor_ms:", "send_floor:"] {
+        for field in [
+            "reconnect_gen: 9",
+            "attempt_at_window_start: 2",
+            "send_floor:",
+            "confirmed: true",
+            "superseded_at_ms:",
+            "stopped: true",
+        ] {
             assert!(
                 shown.contains(field),
                 "Debug stopped rendering {field}: {shown}"
@@ -1513,5 +3150,1266 @@ mod tests {
 
         // Positive control: the same bytes with the suite untouched decode.
         assert!(ResumeRecord::decode(&populated().encode()).is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // The two handshake slots (A3.14, A3.4).
+    // ---------------------------------------------------------------------
+
+    /// **Both slots round-trip independently, in all four occupancy states.**
+    ///
+    /// A3.14 gives the record two slots because A3.4's *"a party's own
+    /// initiation does not consume the generation for acceptance"* makes the
+    /// two facts independent — a party may hold either, both (the contest A3.7
+    /// resolves) or neither.
+    ///
+    /// Kills a codec that carries one slot's occupancy into the other's — the
+    /// mutation that reads `acc_attempt` from the own slot's field, which a
+    /// round trip of a record with both slots at the same attempt would not
+    /// notice. Every state here pairs distinct attempts for that reason.
+    #[test]
+    fn both_handshake_slots_survive_every_occupancy() {
+        let states: [(Option<OwnSlot>, Option<AcceptanceSlot>); 4] = [
+            (None, None),
+            (Some(own_slot(10, 7, 0x44, 512)), None),
+            (None, Some(acceptance_slot(8, 5, 0x66, 256))),
+            (
+                Some(own_slot(10, 7, 0x44, 512)),
+                Some(acceptance_slot(8, 5, 0x66, 256)),
+            ),
+        ];
+        assert_eq!(states.len(), 4, "every occupancy of two slots");
+        for (own, acceptance) in states {
+            let (own_seen, acc_seen) = (own.is_some(), acceptance.is_some());
+            let own_attempt = own.as_ref().map_or(0, |slot| slot.attempt().get());
+            let before = ResumeRecord::new(
+                s_pc(0x11),
+                pk_pc(0x22),
+                root(0x33),
+                ReEstState {
+                    reconnect_gen: 9,
+                    attempt: own_attempt,
+                    last_seen_re_est: 0,
+                    own,
+                    acceptance,
+                    attempt_at_window_start: 2,
+                },
+                Retention::none(),
+                SendFloor::new(4, 100),
+            );
+            let after =
+                ResumeRecord::decode(&before.encode()).expect("a fresh encoding must decode");
+            assert_eq!(after.own_slot().is_some(), own_seen);
+            assert_eq!(after.acceptance().is_some(), acc_seen);
+            assert_eq!(
+                after.own_slot().map(OwnSlot::generation),
+                before.own_slot().map(OwnSlot::generation)
+            );
+            assert_eq!(after.attempt(), before.attempt());
+            assert_eq!(after.sealed_re_est(), before.sealed_re_est());
+            assert_eq!(
+                after.acceptance().map(AcceptanceSlot::generation),
+                before.acceptance().map(AcceptanceSlot::generation)
+            );
+            assert_eq!(
+                after.acceptance().map(AcceptanceSlot::attempt),
+                before.acceptance().map(AcceptanceSlot::attempt)
+            );
+            assert_eq!(
+                after.acceptance().map(AcceptanceSlot::sealed_re_ack),
+                before.acceptance().map(AcceptanceSlot::sealed_re_ack)
+            );
+        }
+    }
+
+    /// **A5.1(ii)'s confirmation lock is a stored bit, and it round-trips.**
+    ///
+    /// A6.1 sets it on *"the first frame that opens under the re-rooted chain"*.
+    /// Held only in memory it would clear on the restart this record exists to
+    /// survive, and a returning peer's stale attempt would then supersede a
+    /// candidate both sides had settled.
+    ///
+    /// Kills a codec that writes a constant in the confirmation byte's place:
+    /// both values are asserted through a round trip, so a hard-coded `0` fails
+    /// the confirmed case and a hard-coded `1` fails the unconfirmed one.
+    #[test]
+    fn the_confirmation_flag_survives_the_round_trip_in_both_states() {
+        for confirmed in [false, true] {
+            let slot = acceptance_slot(8, 5, 0x66, 256);
+            let slot = if confirmed { slot.confirm() } else { slot };
+            assert_eq!(slot.confirmed(), confirmed);
+            let before = ResumeRecord::new(
+                s_pc(0x11),
+                pk_pc(0x22),
+                root(0x33),
+                ReEstState {
+                    reconnect_gen: 9,
+                    attempt: 0,
+                    last_seen_re_est: 0,
+                    own: None,
+                    acceptance: Some(slot),
+                    attempt_at_window_start: 0,
+                },
+                Retention::none(),
+                SendFloor::new(4, 100),
+            );
+            let after = ResumeRecord::decode(&before.encode()).expect("decodes");
+            assert_eq!(
+                after
+                    .acceptance()
+                    .expect("the slot is occupied")
+                    .confirmed(),
+                confirmed
+            );
+        }
+    }
+
+    /// **The acceptance slot's contradictory spellings are refused, not
+    /// repaired.**
+    ///
+    /// The mirror of `the_decoder_refuses_a_slot_that_contradicts_itself` for
+    /// the own slot: an empty slot with a frame, an empty slot claiming
+    /// confirmation, and an occupied slot with no frame. A confirmation flag
+    /// over no slot is the worst of the three to repair, because a confirmation
+    /// naming no attempt would lock a generation against every attempt.
+    ///
+    /// Kills a decoder that reads the confirmation byte without checking the
+    /// attempt beside it — the middle case, which the other two do not reach.
+    #[test]
+    fn the_decoder_refuses_an_acceptance_slot_that_contradicts_itself() {
+        assert_eq!(
+            ResumeRecord::decode(&assembled_full(0, &[], 0, &[9u8; 16], false, None, &[])).err(),
+            Some(ResumeError::EmptyAcceptanceHasContent {
+                frame_len: 16,
+                confirmed: false
+            })
+        );
+        assert_eq!(
+            ResumeRecord::decode(&assembled_full(0, &[], 0, &[], true, None, &[])).err(),
+            Some(ResumeError::EmptyAcceptanceHasContent {
+                frame_len: 0,
+                confirmed: true
+            })
+        );
+        assert_eq!(
+            ResumeRecord::decode(&assembled_full(0, &[], 5, &[], false, None, &[])).err(),
+            Some(ResumeError::AcceptanceHasNoFrame { attempt: 5 })
+        );
+        // Positive control: the two agreeing spellings decode.
+        assert!(ResumeRecord::decode(&assembled_full(0, &[], 0, &[], false, None, &[])).is_ok());
+        assert!(
+            ResumeRecord::decode(&assembled_full(0, &[], 5, &[9u8; 16], true, None, &[])).is_ok()
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The retained root and A5.3's dedup memory.
+    // ---------------------------------------------------------------------
+
+    /// **A byte-identical replay at a position already recorded is inert.**
+    ///
+    /// A4.5's predicate: a superseded-root frame causes a transition only if its
+    /// bytes are novel. A5.3 homes the memory here because *"a lost entry is a
+    /// torn security invariant"* — a co-host re-serving captured `RE-EST` bytes
+    /// into an empty memory re-fires the peer-state-regressed alarm.
+    ///
+    /// Kills an `insert` that pushes unconditionally: the second call would
+    /// return `Novel` and the length would reach 2.
+    #[test]
+    fn a_replayed_position_is_a_repeat_and_does_not_grow_the_memory() {
+        let mut dedup = DedupMemory::new();
+        let key = dedup_key(0);
+        assert_eq!(dedup.insert(key).expect("room"), Novelty::Novel);
+        assert_eq!(dedup.len(), 1);
+        assert_eq!(dedup.insert(key).expect("room"), Novelty::Repeat);
+        assert_eq!(dedup.len(), 1, "a repeat may not grow the memory");
+        assert!(dedup.contains(key));
+        // A different position at the same generation is still novel, which is
+        // what makes the assertion above about the key rather than about the
+        // memory refusing everything after the first.
+        assert_eq!(dedup.insert(dedup_key(1)).expect("room"), Novelty::Novel);
+        assert_eq!(dedup.len(), 2);
+    }
+
+    /// **`attempt` is load-bearing in the dedup key.**
+    ///
+    /// A5.3 says why in terms: *"two legitimate different-attempt `RE-EST`s
+    /// share `gen`/`seq` … so a position-only key would collide them and
+    /// wrongly drop a legitimate frame"*.
+    ///
+    /// Kills a key that ignores any one of its five components: each pair below
+    /// differs in exactly one, and every one must read as novel.
+    #[test]
+    fn every_component_of_the_dedup_key_discriminates() {
+        let base = DedupKey::new(7, Attempt::FIRST, Leg::ReEst, Direction::AToB, 3);
+        let two = Attempt::from_nonzero(NonZeroU32::new(2).expect("non-zero"));
+        let variants = [
+            DedupKey::new(8, Attempt::FIRST, Leg::ReEst, Direction::AToB, 3),
+            DedupKey::new(7, two, Leg::ReEst, Direction::AToB, 3),
+            DedupKey::new(7, Attempt::FIRST, Leg::ReAck, Direction::AToB, 3),
+            DedupKey::new(7, Attempt::FIRST, Leg::ReEst, Direction::AToB, 4),
+        ];
+        assert_eq!(variants.len(), 4, "one variant per same-plane component");
+        let mut dedup = DedupMemory::new();
+        assert_eq!(dedup.insert(base).expect("room"), Novelty::Novel);
+        for (i, variant) in variants.into_iter().enumerate() {
+            assert_eq!(
+                dedup.insert(variant).expect("room"),
+                Novelty::Novel,
+                "component {i} does not discriminate"
+            );
+        }
+        assert_eq!(dedup.len(), 5);
+        // **The fifth component, direction, discriminates at the KEY and is
+        // refused at the MEMORY.** The two are different statements and both
+        // matter: the key must tell the planes apart (or a position on one would
+        // shadow the same position on the other), and the memory holds only the
+        // plane a party receives on.
+        let other_plane = DedupKey::new(7, Attempt::FIRST, Leg::ReEst, Direction::BToA, 3);
+        assert_ne!(base, other_plane, "direction does not discriminate the key");
+        assert_eq!(
+            dedup.insert(other_plane).err(),
+            Some(ResumeError::DedupDirectionMixed)
+        );
+        // Positive control: the base key, offered again unchanged, is a repeat —
+        // so the novelty above is the components differing and not the memory
+        // answering `Novel` to everything.
+        assert_eq!(dedup.insert(base).expect("room"), Novelty::Repeat);
+    }
+
+    /// **The dedup memory is evicted when `RS_n` retires, and not before.**
+    ///
+    /// A5.3 gates eviction on *"**actual** `RS_n` retirement, not a fixed 14-day
+    /// duration"*: byte-novelty matters for exactly as long as the retained root
+    /// can open the frames the memory covers. [`ResumeRecord::retire_retained`]
+    /// is the one act that ends both, so *"a still-live `RS_n` paired with an
+    /// emptied dedup"* has no spelling.
+    ///
+    /// Kills a `retire_retained` that drops the root and leaves the memory (or
+    /// the reverse): each half is asserted before and after, and the memory is
+    /// non-empty going in.
+    #[test]
+    fn retiring_the_root_evicts_the_dedup_memory_and_nothing_else_does() {
+        let mut record = populated();
+        assert_eq!(record.dedup().len(), 3, "the fixture holds positions");
+        assert!(record.retained().is_some());
+        assert!(record.retained_but_stopped());
+
+        // Recording another position does not retire anything.
+        assert_eq!(
+            record.note_processed(dedup_key(9)).expect("room"),
+            Novelty::Novel
+        );
+        assert_eq!(record.dedup().len(), 4);
+        assert!(
+            record.retained().is_some(),
+            "recording a position may not retire the root"
+        );
+
+        record.retire_retained();
+        assert!(record.retained().is_none(), "the root did not retire");
+        assert!(record.dedup().is_empty(), "the memory outlived its root");
+        assert!(!record.retained_but_stopped());
+
+        // Idempotent: retiring again is a write of the state it is already in.
+        record.retire_retained();
+        assert!(record.retained().is_none());
+        assert!(record.dedup().is_empty());
+    }
+
+    /// **Retirement leaves the window base alone, so a retired record is
+    /// writable after any accepted attempt.**
+    ///
+    /// A6.1 scopes the window to the correspondence, not to whichever `RS_n` is
+    /// retained: retiring a root ends what the dedup memory is *for*, it does
+    /// not unsee what the receiver has seen. With the base inside the retention
+    /// group, `retire_retained` would reset it to `0` — and the store refuses a
+    /// base behind the stored one, so retirement would be its own regression and
+    /// could never be committed.
+    ///
+    /// Kills the base being reset by `retire_retained` — through the group
+    /// assignment or otherwise: the assertion after retirement reads it back.
+    #[test]
+    fn retirement_leaves_the_window_base_where_it_stands() {
+        let at = |n: u32| Attempt::from_nonzero(NonZeroU32::new(n).expect("non-zero"));
+        let mut record = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState::first_establishment(),
+            Retention {
+                retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                dedup: DedupMemory::new(),
+                stopped: true,
+            },
+            SendFloor::new(0, 0),
+        );
+        record.observe_accepted(at(8));
+        assert_eq!(record.last_seen_re_est(), 8);
+
+        record.retire_retained();
+
+        assert!(record.retained().is_none(), "the root did not retire");
+        assert!(record.dedup().is_empty(), "the memory outlived its root");
+        assert_eq!(
+            record.last_seen_re_est(),
+            8,
+            "retirement reset the window base"
+        );
+
+        // And the base still governs: a position below it is evicted after
+        // retirement exactly as it was before.
+        record
+            .note_processed(DedupKey::new(1, at(3), Leg::ReEst, Direction::AToB, 0))
+            .expect("room");
+        record.observe_accepted(at(9));
+        assert_eq!(record.last_seen_re_est(), 9);
+        assert!(
+            record.dedup().is_empty(),
+            "the below-base position survived the eviction"
+        );
+    }
+
+    /// **A decoded record may hold a position below its own base, and the next
+    /// observation evicts it.**
+    ///
+    /// [`ResumeRecord::decode`] builds the record field by field and runs no
+    /// eviction, so a record written before its base moved decodes with entries
+    /// the scan can no longer reach. That is benign — the store's rule licenses
+    /// dropping exactly those — but it is a state the type admits, so it is
+    /// pinned rather than assumed away.
+    ///
+    /// Kills a decoder that silently dropped such entries, which would make a
+    /// record re-encode to bytes it was not read from.
+    #[test]
+    fn a_below_base_entry_survives_decode_and_goes_at_the_next_observation() {
+        let at = |n: u32| Attempt::from_nonzero(NonZeroU32::new(n).expect("non-zero"));
+        let mut dedup = DedupMemory::new();
+        dedup
+            .insert(DedupKey::new(1, at(2), Leg::ReEst, Direction::AToB, 0))
+            .expect("room");
+        // Built field by field rather than through `new`, which would evict it.
+        let encoded = {
+            let mut record = ResumeRecord::new(
+                s_pc(0x11),
+                pk_pc(0x22),
+                root(0x33),
+                ReEstState::first_establishment(),
+                Retention {
+                    retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                    dedup,
+                    stopped: false,
+                },
+                SendFloor::new(0, 0),
+            );
+            assert_eq!(record.dedup().len(), 1, "the base is 0, so nothing evicts");
+            // Raise the base WITHOUT the entry going: `observe_accepted` would
+            // evict it, so the base is moved by rebuilding, which is what a
+            // record written at a later base looks like.
+            record = ResumeRecord::decode(&record.encode()).expect("decodes");
+            let mut bytes = record.encode().to_vec();
+            let base_at = FIXED_LEN - 8 - 8 - 2 - 1 - 4;
+            bytes[base_at..base_at + 4].copy_from_slice(&7u32.to_be_bytes());
+            bytes
+        };
+
+        let mut decoded = ResumeRecord::decode(&encoded).expect("decodes");
+        assert_eq!(
+            decoded.last_seen_re_est(),
+            7,
+            "the patched base did not land"
+        );
+        assert_eq!(
+            decoded.dedup().len(),
+            1,
+            "decode dropped an entry it should have carried"
+        );
+
+        decoded.observe_accepted(at(8));
+        assert!(
+            decoded.dedup().is_empty(),
+            "the next observation did not evict the below-base entry"
+        );
+    }
+
+    /// **The dedup memory survives the round trip, keys and order intact.**
+    ///
+    /// Durable, per A5.4's rule that *"hard state (roots, counters, dedup
+    /// memory, slots, keys, flags) lives in the durable resume record"*.
+    ///
+    /// Kills a codec that writes the count and drops the entries, and one that
+    /// transposes two fields of a key — the fixture's keys differ in every
+    /// component, so a transposition changes at least one of them.
+    #[test]
+    fn the_dedup_memory_survives_the_round_trip() {
+        let before = populated();
+        let after = ResumeRecord::decode(&before.encode()).expect("decodes");
+        assert_eq!(before.dedup().len(), 3, "the fixture holds positions");
+        assert_eq!(after.dedup().len(), before.dedup().len());
+        assert_eq!(after.dedup().keys(), before.dedup().keys());
+        for key in before.dedup().keys() {
+            assert!(after.dedup().contains(*key));
+        }
+    }
+
+    /// **A dedup entry naming no leg or no direction is refused at decode.**
+    ///
+    /// The tags are at-rest wire, so a record written by a build with a fourth
+    /// leg is bytes this one cannot read; refusing names that rather than
+    /// picking a variant.
+    ///
+    /// Kills a decoder that casts the tag byte into a variant by arithmetic
+    /// instead of matching it.
+    #[test]
+    fn the_decoder_refuses_an_unknown_leg_or_direction_tag() {
+        assert_eq!(
+            ResumeRecord::decode(&assembled_full(
+                0,
+                &[],
+                0,
+                &[],
+                false,
+                None,
+                &[(1, 1, 4, 1, 1)]
+            ))
+            .err(),
+            Some(ResumeError::UnknownLeg(4))
+        );
+        assert_eq!(
+            ResumeRecord::decode(&assembled_full(
+                0,
+                &[],
+                0,
+                &[],
+                false,
+                None,
+                &[(1, 1, 1, 3, 1)]
+            ))
+            .err(),
+            Some(ResumeError::UnknownDirection(3))
+        );
+        // Positive control: the same entry with both tags in range decodes, and
+        // the entry actually lands.
+        let ok = ResumeRecord::decode(&assembled_full(
+            0,
+            &[],
+            0,
+            &[],
+            false,
+            None,
+            &[(1, 1, 1, 1, 1)],
+        ))
+        .expect("a well-formed entry decodes");
+        assert_eq!(ok.dedup().len(), 1);
+    }
+
+    /// **The retained root and its supersede stamp are present together or not
+    /// at all.**
+    ///
+    /// A3.5 runs `T_RETIRE` from the stamp, so a retained root without one has
+    /// no ceiling and a stamp without a root bounds nothing.
+    ///
+    /// Kills a decoder that reads the presence flag and ignores the stamp beside
+    /// it — the first case — and one that reads the stamp and ignores the flag,
+    /// which would build a retention out of `encode`'s all-zero absent case.
+    #[test]
+    fn the_decoder_refuses_half_a_retention() {
+        assert_eq!(
+            ResumeRecord::decode(&assembled_full(0, &[], 0, &[], false, Some(0), &[])).err(),
+            Some(ResumeError::RetentionHalfPresent { present: true })
+        );
+        // A stamp with the flag clear: written by hand, since `assembled_full`
+        // derives the flag from the `Option`.
+        let mut bytes = assembled_full(0, &[], 0, &[], false, None, &[]);
+        let stamp_at = bytes.len() - 8 - 8 - 2 - 1 - 4 - 8 - 4 - 8;
+        bytes[stamp_at..stamp_at + 8].copy_from_slice(&ANCHOR.to_be_bytes());
+        assert_eq!(
+            ResumeRecord::decode(&bytes).err(),
+            Some(ResumeError::RetentionHalfPresent { present: false })
+        );
+        // Positive control: both halves present, and the record carries them.
+        let ok = ResumeRecord::decode(&assembled_full(0, &[], 0, &[], false, Some(ANCHOR), &[]))
+            .expect("a well-formed retention decodes");
+        assert_eq!(ok.retained().expect("retained").superseded_at_ms(), ANCHOR);
+    }
+
+    /// **A first establishment writes both slots empty and nothing retained.**
+    ///
+    /// [`ReEstState::first_establishment`] and [`Retention::none`] are that
+    /// state written down, and the record round-trips out of it — so the
+    /// smallest record this module can produce is a decodable one rather than a
+    /// shape only the populated fixture reaches.
+    #[test]
+    fn a_first_establishment_record_round_trips() {
+        let before = opening();
+        let after = ResumeRecord::decode(&before.encode()).expect("decodes");
+        assert!(after.own_slot().is_none());
+        assert!(after.acceptance().is_none());
+        assert!(after.retained().is_none());
+        assert!(after.dedup().is_empty());
+        assert!(!after.retained_but_stopped());
+        assert_eq!(after.reconnect_gen(), 0);
+        assert_eq!(after.attempt_at_window_start(), 0);
+        assert_eq!(after.last_seen_re_est(), 0);
+        assert_eq!(after.last_seen_re_ack(), 0);
+    }
+
+    /// **The two window bases are different numbers, each read from its own
+    /// side of the exchange.**
+    ///
+    /// A `RE-EST` we receive was sealed under the peer's attempt counter, so its
+    /// window is rooted at the acceptance slot (A6.1); a `RE-ACK` we receive
+    /// answers one of our own attempts, so its window is rooted at our own
+    /// counter. One derivation cannot serve both.
+    ///
+    /// Kills either accessor being aliased to the other: the fixture's two
+    /// numbers differ, so a single derivation fails one of the four assertions.
+    #[test]
+    fn the_two_window_bases_read_opposite_sides_of_the_exchange() {
+        let record = populated();
+        assert_eq!(
+            record.acceptance().expect("occupied").attempt().get(),
+            5,
+            "the fixture's acceptance attempt"
+        );
+        assert_eq!(
+            record.attempt().expect("occupied").get(),
+            7,
+            "the fixture's own counter, which must differ from the acceptance's"
+        );
+        assert_eq!(record.last_seen_re_est(), 5, "the responder's base");
+        assert_eq!(record.last_seen_re_ack(), 7, "the initiator's base");
+        assert_eq!(opening().last_seen_re_est(), 0, "nothing accepted yet");
+        assert_eq!(opening().last_seen_re_ack(), 0, "nothing attempted yet");
+    }
+
+    /// **An initiator's `RE-ACK` base survives an empty acceptance slot.**
+    ///
+    /// A party that has only ever initiated has accepted nothing, so the
+    /// acceptance slot stands empty while its own counter is far from zero.
+    /// Reading the `RE-ACK` window off the acceptance slot would put the base at
+    /// `0` and every inbound `RE-ACK` outside `[0, MAX_GAP]` — A7.3's lockout
+    /// arriving through the wrong accessor.
+    ///
+    /// Kills `last_seen_re_ack` derived from the acceptance slot, and kills it
+    /// derived from the own *slot* rather than the counter, since the slot here
+    /// is empty while the counter is not.
+    #[test]
+    fn an_initiators_re_ack_base_is_its_own_counter_not_the_empty_acceptance() {
+        let two_c = 16;
+        let record = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState {
+                reconnect_gen: 4,
+                attempt: two_c,
+                last_seen_re_est: 0,
+                own: None,
+                acceptance: None,
+                attempt_at_window_start: 8,
+            },
+            Retention::none(),
+            SendFloor::new(0, 0),
+        );
+        assert!(record.acceptance().is_none(), "the fixture accepts nothing");
+        assert!(record.own_slot().is_none(), "and holds no sealed frame");
+        assert_eq!(record.last_seen_re_ack(), two_c);
+        assert_eq!(record.last_seen_re_est(), 0, "and the other base is not it");
+    }
+
+    /// **The memory refuses a key past its bound rather than evicting one.**
+    ///
+    /// Evicting to make room would drop a key whose frame can still be replayed,
+    /// which is the torn invariant the memory exists to hold.
+    ///
+    /// Kills an `insert` that drops the oldest entry at the bound: the length
+    /// would stay at [`DEDUP_CAPACITY`] and the call would return `Ok`.
+    #[test]
+    fn the_dedup_memory_refuses_rather_than_evicting_at_its_bound() {
+        let mut dedup = DedupMemory::new();
+        for n in 0..DEDUP_CAPACITY {
+            dedup
+                .insert(dedup_key(u32::try_from(n).expect("small")))
+                .expect("inside the bound");
+        }
+        assert_eq!(dedup.len(), DEDUP_CAPACITY);
+        let overflow = dedup_key(u32::try_from(DEDUP_CAPACITY).expect("small"));
+        assert_eq!(
+            dedup.insert(overflow).err(),
+            Some(ResumeError::DedupFull {
+                capacity: DEDUP_CAPACITY
+            })
+        );
+        assert_eq!(dedup.len(), DEDUP_CAPACITY, "nothing was evicted");
+        assert!(!dedup.contains(overflow));
+        // A repeat at the bound is still answered, because it needs no room.
+        assert_eq!(
+            dedup.insert(dedup_key(0)).expect("no room needed"),
+            Novelty::Repeat
+        );
+    }
+
+    /// **`DedupFull` is unreachable under the design's own attempt budget.**
+    ///
+    /// A5.3 scopes the memory to `RS_n`'s whole retention, and A6.1 rolls the
+    /// window anchor over *inside* that retention — so one retained root sees
+    /// `C` attempts per window for as many windows as the peer answers, not `C`
+    /// in total. What bounds the set is
+    /// [`ResumeRecord::evict_dedup_below_window`]: A5.2 has the scan
+    /// *"rejecting anything beyond"* `[last_seen, last_seen + MAX_GAP]`, so an
+    /// entry below its leg's base names a frame that can no longer open.
+    ///
+    /// Three windows of `C` attempts, three legs each, with the base advancing
+    /// as the peer answers. Refusing a legitimate handshake frame is an outcome
+    /// A3.15's table does not contain, so `insert` must never fail here.
+    ///
+    /// Kills `evict_dedup_below_window` doing nothing (the set fills and
+    /// `insert` returns `DedupFull`) and kills it evicting too much (the final
+    /// assertion requires the current window's positions still present).
+    #[test]
+    fn three_windows_of_attempts_never_fill_the_dedup_memory() {
+        const C: u32 = 8;
+        let legs = [Leg::ReEst, Leg::ReAck, Leg::ReConfirm];
+        let mut record = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState::first_establishment(),
+            Retention {
+                retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                dedup: DedupMemory::new(),
+                stopped: false,
+            },
+            SendFloor::new(0, 0),
+        );
+        let mut recorded = 0usize;
+        for window in 0..3u32 {
+            for step in 1..=C {
+                let attempt = window * C + step;
+                let a = Attempt::from_nonzero(NonZeroU32::new(attempt).expect("non-zero"));
+                for leg in legs {
+                    record
+                        .note_processed(DedupKey::new(1, a, leg, Direction::AToB, 0))
+                        .expect("a legitimate handshake frame is never refused");
+                    recorded += 1;
+                }
+            }
+            // Both bases move together, because in a live exchange they do: a
+            // `RE-ACK` we process answers an attempt we sealed, so receiving one
+            // at attempt N means our own counter already reached N. The record
+            // is rebuilt with both advanced — the shape a re-establishment
+            // write has — and `new` runs the eviction.
+            let base = (window + 1) * C;
+            let carried = record.dedup().clone();
+            record = ResumeRecord::new(
+                s_pc(0x11),
+                pk_pc(0x22),
+                root(0x33),
+                ReEstState {
+                    attempt: base,
+                    last_seen_re_est: base,
+                    ..ReEstState::first_establishment()
+                },
+                Retention {
+                    retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                    dedup: carried,
+                    stopped: false,
+                },
+                SendFloor::new(0, 0),
+            );
+            assert_eq!(record.last_seen_re_est(), base);
+            assert_eq!(record.last_seen_re_ack(), base);
+            assert!(
+                record.dedup().len() <= DEDUP_CAPACITY,
+                "window {window} overflowed the bound"
+            );
+        }
+        assert_eq!(
+            recorded,
+            3 * (3 * C) as usize,
+            "the drive was shorter than claimed"
+        );
+        // Non-degenerate: eviction kept the current window rather than emptying
+        // the set, and dropped the windows the scan can no longer reach.
+        assert!(!record.dedup().is_empty(), "eviction emptied the memory");
+        let last = Attempt::from_nonzero(NonZeroU32::new(3 * C).expect("non-zero"));
+        assert!(
+            record
+                .dedup()
+                .contains(DedupKey::new(1, last, Leg::ReEst, Direction::AToB, 0))
+        );
+        let first = Attempt::from_nonzero(NonZeroU32::new(1).expect("non-zero"));
+        assert!(
+            !record
+                .dedup()
+                .contains(DedupKey::new(1, first, Leg::ReEst, Direction::AToB, 0))
+        );
+    }
+
+    /// **An entry at or above its leg's window base is kept; one below is
+    /// dropped; and the two legs use different bases.**
+    ///
+    /// A `RE-CONFIRM` settles the attempt the acceptance named, so it is scanned
+    /// against the `RE-EST` base; a `RE-ACK` answers one of our own attempts and
+    /// is scanned against our own counter.
+    ///
+    /// **The memory holds one plane, and the other is refused.**
+    ///
+    /// A5.3's memory is receive-side: a party processes only what arrives, and
+    /// everything that arrives is read from the plane the correspondent writes.
+    /// A frame this side sealed itself is never processed, so a second direction
+    /// is not a state the design produces — and admitting it would file our own
+    /// attempt numbers in a set the peer's window base is used to bound, where
+    /// the eviction's per-leg base is the wrong number for half the set.
+    ///
+    /// Kills the direction check being dropped from `insert`: the second plane's
+    /// position would be admitted as novel.
+    #[test]
+    fn the_dedup_memory_admits_one_plane_and_refuses_the_other() {
+        let at = |n: u32| Attempt::from_nonzero(NonZeroU32::new(n).expect("non-zero"));
+        let mut dedup = DedupMemory::new();
+        assert_eq!(dedup.direction(), None, "an empty memory names no plane");
+
+        for leg in [Leg::ReEst, Leg::ReAck, Leg::ReConfirm] {
+            assert_eq!(
+                dedup
+                    .insert(DedupKey::new(1, at(4), leg, Direction::AToB, 0))
+                    .expect("room"),
+                Novelty::Novel,
+                "every leg is admitted on the established plane"
+            );
+        }
+        assert_eq!(dedup.len(), 3);
+        assert_eq!(dedup.direction(), Some(Direction::AToB));
+
+        for leg in [Leg::ReEst, Leg::ReAck, Leg::ReConfirm] {
+            assert_eq!(
+                dedup
+                    .insert(DedupKey::new(1, at(4), leg, Direction::BToA, 0))
+                    .err(),
+                Some(ResumeError::DedupDirectionMixed),
+                "the other plane is refused for every leg"
+            );
+        }
+        assert_eq!(dedup.len(), 3, "a refused position may not be recorded");
+    }
+
+    /// Kills an eviction that applies one base to every leg: the `RE-ACK` entry
+    /// here sits below the `RE-EST` base and above its own, so a single-base
+    /// eviction drops it.
+    #[test]
+    fn eviction_uses_each_legs_own_window_base() {
+        let at = |n: u32| Attempt::from_nonzero(NonZeroU32::new(n).expect("non-zero"));
+        let mut record = with_bases(opening(), 0, 4);
+        for (attempt, leg) in [
+            (9, Leg::ReEst),
+            (10, Leg::ReEst),
+            (9, Leg::ReConfirm),
+            (10, Leg::ReConfirm),
+            (3, Leg::ReAck),
+            (4, Leg::ReAck),
+        ] {
+            record
+                .note_processed(DedupKey::new(1, at(attempt), leg, Direction::AToB, 0))
+                .expect("room");
+        }
+        assert_eq!(record.dedup().len(), 6, "the fixture must hold all six");
+        assert_eq!(record.last_seen_re_ack(), 4);
+        // Raising the `RE-EST` base is what evicts; there is no separate call.
+        record.observe_accepted(at(10));
+        assert_eq!(record.last_seen_re_est(), 10);
+        let kept: Vec<(u32, Leg)> = record
+            .dedup()
+            .keys()
+            .iter()
+            .map(|k| (k.attempt().get(), k.leg()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![(10, Leg::ReEst), (10, Leg::ReConfirm), (4, Leg::ReAck)],
+            "each leg must be cut at its own base"
+        );
+    }
+
+    /// **The `RE-EST` window base holds across the completion that zeroes the
+    /// acceptance slot.**
+    ///
+    /// A3.14 zeroes the slot on completion, so a base read from it would drop
+    /// back to `0` and re-admit attempts the dedup memory has already evicted —
+    /// A5.2's scan would open, at the same base, frames it had already rejected.
+    /// A6.1 has the window slide forward only.
+    ///
+    /// Kills `last_seen_re_est` reading the acceptance slot: with the slot
+    /// zeroed it would answer `0` rather than the value it held.
+    #[test]
+    fn the_re_est_base_survives_a_completion() {
+        let accepted = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState {
+                reconnect_gen: 4,
+                attempt: 0,
+                last_seen_re_est: 0,
+                own: None,
+                acceptance: Some(acceptance_slot(5, 10, 0x66, 64)),
+                attempt_at_window_start: 0,
+            },
+            Retention {
+                retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                dedup: DedupMemory::new(),
+                stopped: false,
+            },
+            SendFloor::new(0, 0),
+        );
+        assert_eq!(
+            accepted.last_seen_re_est(),
+            10,
+            "occupying the slot must raise the base"
+        );
+
+        // The completion: both slots zeroed, the generation advanced, the
+        // retention carried across as the store carries it.
+        let completed = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState {
+                reconnect_gen: 5,
+                attempt: 0,
+                last_seen_re_est: accepted.last_seen_re_est(),
+                own: None,
+                acceptance: None,
+                attempt_at_window_start: 0,
+            },
+            Retention {
+                retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                dedup: DedupMemory::new(),
+                stopped: false,
+            },
+            SendFloor::new(0, 0),
+        );
+        assert!(completed.acceptance().is_none(), "the fixture completed");
+        assert_eq!(
+            completed.last_seen_re_est(),
+            10,
+            "the base regressed across the completion"
+        );
+        // And it survives the at-rest round trip, which is where a base that
+        // lived only in the slot would be lost for good.
+        let reloaded = ResumeRecord::decode(&completed.encode()).expect("decodes");
+        assert_eq!(reloaded.last_seen_re_est(), 10);
+    }
+
+    /// **Building a record runs the eviction, so a rebuilt one is consistent
+    /// with its own base.**
+    ///
+    /// A caller assembling a record from parts — the acceptance slot from one
+    /// place, the carried-over dedup memory from another — can hand [`Self::new`]
+    /// a base already past some of those positions. Leaving them would be a
+    /// memory holding frames A5.2's scan rejects, and the next write that did
+    /// evict them would look to the store like an unexplained shrink.
+    ///
+    /// Kills the eviction being dropped from [`Self::new`]: the below-base entry
+    /// would still be present in the record it returns.
+    #[test]
+    fn building_a_record_evicts_what_its_base_has_passed() {
+        let at = |n: u32| Attempt::from_nonzero(NonZeroU32::new(n).expect("non-zero"));
+        let mut dedup = DedupMemory::new();
+        for attempt in [2, 9] {
+            dedup
+                .insert(DedupKey::new(
+                    1,
+                    at(attempt),
+                    Leg::ReEst,
+                    Direction::AToB,
+                    0,
+                ))
+                .expect("room");
+        }
+        assert_eq!(dedup.len(), 2, "the fixture offers both");
+
+        let record = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState {
+                last_seen_re_est: 9,
+                ..ReEstState::first_establishment()
+            },
+            Retention {
+                retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                dedup,
+                stopped: false,
+            },
+            SendFloor::new(0, 0),
+        );
+
+        assert_eq!(record.last_seen_re_est(), 9);
+        assert_eq!(
+            record.dedup().len(),
+            1,
+            "the constructor left an entry its own base has passed"
+        );
+        assert!(
+            record
+                .dedup()
+                .contains(DedupKey::new(1, at(9), Leg::ReEst, Direction::AToB, 0))
+        );
+    }
+
+    /// **Raising the base is what evicts; there is no second call to forget.**
+    ///
+    /// The store refuses a commit that drops a dedup position at or above the
+    /// base and licenses one below it, so the base and the eviction are one
+    /// invariant read twice. A base that moved without the eviction leaves
+    /// entries the memory no longer needs; an eviction without the base having
+    /// moved is a shrink the store refuses.
+    ///
+    /// Kills `observe_accepted` raising the base without evicting: the entry
+    /// below the new base would still be present afterwards.
+    #[test]
+    fn raising_the_base_evicts_without_a_separate_call() {
+        let at = |n: u32| Attempt::from_nonzero(NonZeroU32::new(n).expect("non-zero"));
+        let mut record = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState::first_establishment(),
+            Retention {
+                retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                dedup: DedupMemory::new(),
+                stopped: false,
+            },
+            SendFloor::new(0, 0),
+        );
+        for attempt in [3, 9] {
+            record
+                .note_processed(DedupKey::new(
+                    1,
+                    at(attempt),
+                    Leg::ReEst,
+                    Direction::AToB,
+                    0,
+                ))
+                .expect("room");
+        }
+        assert_eq!(record.dedup().len(), 2, "the fixture holds both");
+
+        record.observe_accepted(at(9));
+
+        assert_eq!(record.last_seen_re_est(), 9);
+        assert_eq!(
+            record.dedup().len(),
+            1,
+            "the below-base entry was not evicted"
+        );
+        assert!(
+            record
+                .dedup()
+                .contains(DedupKey::new(1, at(9), Leg::ReEst, Direction::AToB, 0))
+        );
+
+        // An observation at or below the base is inert, so a stale one cannot
+        // evict anything.
+        record.observe_accepted(at(4));
+        assert_eq!(
+            record.last_seen_re_est(),
+            9,
+            "a stale observation moved the base"
+        );
+        assert_eq!(record.dedup().len(), 1);
+    }
+
+    /// **A frame of zero length is refused at construction, by both slots.**
+    ///
+    /// An occupied slot exists to hold the bytes a re-emit or a re-serve sends.
+    /// An empty one encodes without complaint and then fails
+    /// [`ResumeRecord::decode`] for ever, which wedges `commit_resume`
+    /// permanently — every later write reads the stored record first.
+    ///
+    /// Kills either constructor checking only its upper bound.
+    #[test]
+    fn neither_slot_accepts_an_empty_frame() {
+        assert_eq!(
+            SealedReEst::seal(FreshAttempt::first(), Vec::new().into_boxed_slice()).err(),
+            Some(ResumeError::EmptyFrame)
+        );
+        assert_eq!(
+            AcceptanceSlot::accept(1, Attempt::FIRST, Vec::new().into_boxed_slice()).err(),
+            Some(ResumeError::EmptyFrame)
+        );
+        // Positive control: one byte is enough, so the guard is on emptiness
+        // rather than on some larger floor.
+        assert!(SealedReEst::seal(FreshAttempt::first(), vec![1u8].into_boxed_slice()).is_ok());
+        assert!(AcceptanceSlot::accept(1, Attempt::FIRST, vec![1u8].into_boxed_slice()).is_ok());
+    }
+
+    /// **The acceptance slot's own length ceiling is enforced and is reachable.**
+    ///
+    /// [`MAX_SEALED_LEG_LEN`] rather than [`MAX_FRAME_LEN`]: two slots sized at
+    /// the frame ceiling do not fit
+    /// [`crate::storage::dm_store::RESUME_CAPACITY`].
+    ///
+    /// Kills the bound being dropped from `accept`, and kills it being widened
+    /// to `MAX_FRAME_LEN` — the refusal is asserted one byte over.
+    #[test]
+    fn the_acceptance_slot_refuses_a_frame_past_its_own_ceiling() {
+        let too_long = MAX_SEALED_LEG_LEN + 1;
+        assert_eq!(
+            AcceptanceSlot::accept(
+                1,
+                Attempt::FIRST,
+                pattern(0x66, too_long).into_boxed_slice()
+            )
+            .err(),
+            Some(ResumeError::FrameTooLong { len: too_long })
+        );
+        // Positive control: exactly the ceiling is accepted, so the assertion
+        // above is an off-by-one boundary rather than a blanket refusal.
+        assert!(
+            AcceptanceSlot::accept(
+                1,
+                Attempt::FIRST,
+                pattern(0x66, MAX_SEALED_LEG_LEN).into_boxed_slice()
+            )
+            .is_ok()
+        );
+    }
+
+    /// **The acceptance frame's length prefix is checked against the acceptance
+    /// ceiling, before anything is reserved.**
+    ///
+    /// The own frame's prefix is checked against [`MAX_FRAME_LEN`] and the
+    /// acceptance frame's against [`MAX_SEALED_LEG_LEN`], which is four times
+    /// smaller. A decoder checking both against the larger number would reserve
+    /// up to four times the acceptance slot's real ceiling from a corrupt
+    /// length.
+    ///
+    /// Kills the acceptance prefix being bounded by `MAX_FRAME_LEN`: the patched
+    /// length below sits between the two ceilings, so it is refused only under
+    /// the correct one.
+    #[test]
+    fn a_corrupt_acceptance_length_is_refused_at_its_own_ceiling() {
+        let record = opening();
+        assert!(record.dedup().is_empty(), "the offset below assumes it");
+        let over = MAX_SEALED_LEG_LEN + 1;
+        assert!(
+            over < MAX_FRAME_LEN,
+            "the case must lie between the ceilings"
+        );
+        let mut bytes = record.encode();
+        // The acceptance prefix is the last fixed field, and the own frame is
+        // empty in this record.
+        let len_at = FIXED_LEN - 8;
+        bytes[len_at..len_at + 8].copy_from_slice(&(over as u64).to_be_bytes());
+        assert_eq!(
+            ResumeRecord::decode(&bytes).err(),
+            Some(ResumeError::FrameTooLong { len: over })
+        );
+    }
+
+    /// **A slot standing empty may not name a generation, in either slot.**
+    ///
+    /// An empty slot is attempt `0`, a zero-length frame and a zero generation:
+    /// there is no exchange for a generation to name, so a value read back out
+    /// of one would be something nothing wrote and nothing checks.
+    ///
+    /// Kills a decoder that reads either slot's generation without consulting
+    /// the attempt beside it.
+    #[test]
+    fn the_decoder_refuses_a_generation_on_an_empty_slot() {
+        // `assembled_full` derives each slot's generation from its attempt, so
+        // the contradiction is written by hand.
+        let base = assembled_full(0, &[], 0, &[], false, None, &[]);
+        let own_gen_at = RESUME_MAGIC.len() + SUITE_ID_LEN + ml_dsa::SK_LEN + ml_dsa::PK_LEN
+            + ROOT_KEY_LEN + 4 /* reconnect_gen */ + 4 /* attempt counter */;
+        for (offset, generation) in [(own_gen_at, 10u32), (own_gen_at + 8, 8u32)] {
+            let mut bytes = base.clone();
+            bytes[offset..offset + 4].copy_from_slice(&generation.to_be_bytes());
+            assert_eq!(
+                ResumeRecord::decode(&bytes).err(),
+                Some(ResumeError::SlotGenerationWithoutAttempt { generation })
+            );
+        }
+        // Positive control: untouched, the same buffer decodes.
+        assert!(ResumeRecord::decode(&base).is_ok());
+    }
+
+    /// **Retained root bytes under a clear presence flag are refused.**
+    ///
+    /// [`ResumeRecord::encode`] writes the absent case as an all-zero root, so
+    /// non-zero bytes under a clear flag are a retained root the flag hides or a
+    /// flag the bytes contradict — and nothing here can say which.
+    ///
+    /// Kills a decoder that reads the flag and ignores the bytes.
+    #[test]
+    fn the_decoder_refuses_retained_bytes_under_a_clear_flag() {
+        let mut bytes = assembled_full(0, &[], 0, &[], false, None, &[]);
+        let root_at = RESUME_MAGIC.len()
+            + SUITE_ID_LEN
+            + ml_dsa::SK_LEN
+            + ml_dsa::PK_LEN
+            + ROOT_KEY_LEN
+            + 4
+            + 4
+            + 4
+            + 4
+            + 4
+            + 4
+            + 1
+            + 1;
+        bytes[root_at..root_at + ROOT_KEY_LEN].copy_from_slice(&pattern(0x55, ROOT_KEY_LEN));
+        assert_eq!(
+            ResumeRecord::decode(&bytes).err(),
+            Some(ResumeError::RetainedBytesWithoutFlag)
+        );
+    }
+
+    /// **The same dedup position twice in one record is refused.**
+    ///
+    /// Accepting it would decode to a set one entry smaller than the bytes hold,
+    /// so the record would re-encode to bytes it was not read from — and the
+    /// length the eviction bound is checked against would disagree with disk.
+    ///
+    /// Kills a decoder that lets `insert`'s `Repeat` pass silently.
+    #[test]
+    fn the_decoder_refuses_a_duplicate_dedup_entry() {
+        let entry = (100u32, 200u32, 1u8, 1u8, 300u64);
+        assert_eq!(
+            ResumeRecord::decode(&assembled_full(
+                0,
+                &[],
+                0,
+                &[],
+                false,
+                None,
+                &[entry, entry]
+            ))
+            .err(),
+            Some(ResumeError::DuplicateDedupEntry)
+        );
+        // Positive control: two DISTINCT entries decode, and both land.
+        let other = (101u32, 201u32, 2u8, 1u8, 301u64);
+        let ok = ResumeRecord::decode(&assembled_full(
+            0,
+            &[],
+            0,
+            &[],
+            false,
+            None,
+            &[entry, other],
+        ))
+        .expect("distinct entries decode");
+        assert_eq!(ok.dedup().len(), 2);
+    }
+
+    /// **An own slot whose attempt disagrees with the counter is refused at
+    /// decode.**
+    ///
+    /// A9.2 lists the counter and the sealed frame bytes as separate fields, and
+    /// A8.1's commit-then-emit writes both in one act, so they agree or the
+    /// record is one no honest writer produced. A record whose slot disagreed
+    /// would re-emit under a key neither number names.
+    ///
+    /// Kills a decoder that takes the two numbers from their own byte ranges
+    /// without comparing them.
+    #[test]
+    fn the_decoder_refuses_a_slot_that_disagrees_with_the_counter() {
+        let frame = pattern(0x44, 64);
+        let mut bytes = assembled_full(7, &frame, 0, &[], false, None, &[]);
+        let counter_at =
+            RESUME_MAGIC.len() + SUITE_ID_LEN + ml_dsa::SK_LEN + ml_dsa::PK_LEN + ROOT_KEY_LEN + 4;
+        bytes[counter_at..counter_at + 4].copy_from_slice(&9u32.to_be_bytes());
+        assert_eq!(
+            ResumeRecord::decode(&bytes).err(),
+            Some(ResumeError::AttemptSlotDisagrees { field: 9, slot: 7 })
+        );
+        // Positive control: untouched, the agreeing pair decodes.
+        assert!(ResumeRecord::decode(&assembled_full(7, &frame, 0, &[], false, None, &[])).is_ok());
+    }
+    /// **The hand-written `Zeroize` for the retention group wipes the retained
+    /// root and its stamp.**
+    ///
+    /// `RetainedRoot` cannot use the derive: it holds a `CommittedRoot` beside a
+    /// plain `i64`, and a derived impl over a group whose secret sits behind an
+    /// `Option` is not what the record needs. A hand-written impl is one a later
+    /// edit can empty out, and the retained root is what lets a party open the
+    /// peer's frames at the superseded generation (A3.5) — as secret as the
+    /// committed one.
+    ///
+    /// Kills `Zeroize for Retention` dropping any of its fields: each is
+    /// asserted and each is non-default going in. It does **not** kill an
+    /// emptied `Zeroize for RetainedRoot`, and the reason is the assertion
+    /// rather than the reachability — `Option::zeroize` takes the option after
+    /// delegating, so `retained` reads `None` whatever the delegated body did.
+    /// The test below asserts the bytes instead.
+    #[test]
+    fn zeroizing_the_retention_group_wipes_the_retained_root() {
+        let mut retention = full_retention();
+        assert!(
+            retention
+                .retained
+                .as_ref()
+                .expect("the fixture retains")
+                .root()
+                .as_bytes()
+                .iter()
+                .any(|b| *b != 0),
+            "the root is all-zero before the wipe, so wiping it proves nothing"
+        );
+        assert_eq!(
+            retention
+                .retained
+                .as_ref()
+                .expect("the fixture retains")
+                .superseded_at_ms(),
+            ANCHOR,
+            "the stamp is unset before the wipe"
+        );
+        assert_eq!(retention.dedup.len(), 3, "the memory is populated");
+        assert!(retention.stopped, "the flag is set");
+
+        retention.zeroize();
+
+        // `Option::zeroize` wipes the payload and then drops it, so the root is
+        // gone rather than present-and-zero — which is the stronger of the two.
+        assert!(retention.retained.is_none(), "the retained root survived");
+        assert!(retention.dedup.is_empty(), "the memory survived");
+        assert!(!retention.stopped, "the flag survived");
+    }
+
+    /// **A [`RetainedRoot`] zeroized directly wipes both of its halves.**
+    ///
+    /// A derive would leave the `i64` stamp alone, so the impl is written out.
+    /// The group-level test above cannot pin it: `Option::zeroize` delegates and
+    /// then takes the option, so `retained` reads `None` whether the delegated
+    /// body wiped anything or not. Asserting the bytes needs a value that is
+    /// still there afterwards, which means calling it directly.
+    ///
+    /// Kills the body being emptied, and kills a body that wipes the root and
+    /// leaves the stamp: both halves are asserted, and both are non-zero going
+    /// in.
+    #[test]
+    fn zeroizing_a_retained_root_wipes_its_root_and_its_stamp() {
+        let mut retained = RetainedRoot::new(root(0x55), ANCHOR);
+        assert!(
+            retained.root().as_bytes().iter().any(|b| *b != 0),
+            "the root is all-zero before the wipe, so wiping it proves nothing"
+        );
+        assert_ne!(retained.superseded_at_ms(), 0, "the stamp is unset");
+
+        retained.zeroize();
+
+        assert!(
+            retained.root().as_bytes().iter().all(|b| *b == 0),
+            "the retained root survived the wipe"
+        );
+        assert_eq!(
+            retained.superseded_at_ms(),
+            0,
+            "the stamp survived the wipe"
+        );
     }
 }
