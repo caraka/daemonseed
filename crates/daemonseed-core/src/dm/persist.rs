@@ -114,7 +114,7 @@ use crate::dm::provisional::{
     derive_seal_key, restart,
 };
 use crate::dm::ratchet::{Direction, Ratchet, RatchetError};
-use crate::dm::resume::{ResumeError, ResumeRecord};
+use crate::dm::resume::{ReEstState, ResumeError, ResumeRecord, Retention, SendFloor};
 use crate::storage::dm_store::{
     CorrespondenceLabel, DmStore, DmStoreError, OUTBOX_CAPACITY, RECEIVE_CURSOR_LEN, RecordKind,
 };
@@ -1346,14 +1346,36 @@ impl DmPersist {
     /// generation: a folded `RE-ACK` ends the exchange, A3.4 advances
     /// `reconnect_gen`, and the slot is zeroed in the same write.
     ///
-    /// What stays refused is an initiation that simply disappears — no
-    /// acceptance took its place and no generation completed — which is a
-    /// re-establishment this side would go on believing it had in flight.
+    /// **A3.8's give-up is the third act, and the record has to be able to
+    /// reach it.** A handshake leg *"reached its give-up"* is one of A3.8's loud
+    /// states and A3.13 forbids a terminal one, so an initiation that will never
+    /// complete must be releasable with no contest and no completion —
+    /// [`ResumeRecord::abandon_attempt`] is that release. It is admitted here by
+    /// the attempt counter standing still: A5.2 keeps the counter monotone for
+    /// the correspondence's lifetime, so a record that empties the slot while
+    /// still naming the abandoned attempt has given the number up rather than
+    /// forgotten it, and the next [`ResumeRecord::open_attempt`] mints its
+    /// successor.
+    ///
+    /// **What that trades is stated rather than glossed.** This guard can no
+    /// longer tell a deliberate give-up from a caller that dropped the slot by
+    /// accident, because the two produce identical bytes. What the counter buys
+    /// instead is the property the guard existed for: no later attempt can reuse
+    /// the abandoned number, so nothing seals a second frame under a key the
+    /// peer has already answered.
+    ///
+    /// What stays refused is an initiation that disappears while the counter
+    /// moves with it — a slot emptied by a write that also minted a fresh
+    /// attempt, which is a re-establishment this side would go on believing it
+    /// had in flight.
     fn guard_own_slot(record: &ResumeRecord, stored: &ResumeRecord) -> Result<(), DmPersistError> {
         let (Some(held), None) = (stored.own_slot(), record.own_slot()) else {
             return Ok(());
         };
         if record.reconnect_gen() > stored.reconnect_gen() {
+            return Ok(());
+        }
+        if record.attempt() == stored.attempt() {
             return Ok(());
         }
         let contested = record.acceptance().is_some_and(|offered| {
@@ -2413,11 +2435,19 @@ impl DmPersist {
     /// conversation, because the entry each of them sent is answered by the
     /// other.
     ///
+    /// `s_pc` is this side's own per-correspondent signing key, minted by the
+    /// caller for this conversation. It is taken here because establishment is
+    /// the moment it acquires its only at-rest home: it is not derivable from
+    /// the shared secret or from the mnemonic, so a correspondence established
+    /// without writing it can never sign a re-establishment leg
+    /// (`docs/design/direct-messaging.md:1056`, A4.8).
+    ///
     /// `now_ms` stamps both `first_seen_ms` and `last_seen_ms`: the knock is
     /// the first and so far only sighting.
     pub fn accept_first_contact(
         &self,
         verified: VerifiedFirstContact,
+        s_pc: &[u8; ml_dsa::SK_LEN],
         now_ms: i64,
     ) -> Result<(CorrespondenceLabel, Ratchet), DmPersistError> {
         // A second establishment for one identity is refused HERE, because
@@ -2469,9 +2499,38 @@ impl DmPersist {
         // it, but the value read out of it lands in an unprotected stack slot on
         // the way into the wrapper, and this module's own docs argue `AR` is
         // worth erasing.
-        let mut bare_ar = derive_channel_roots(&ss0)?.ar;
+        let roots = derive_channel_roots(&ss0)?;
+        let mut bare_ar = roots.ar;
         let ar = Zeroizing::new(bare_ar);
         bare_ar.zeroize();
+        // **The resume record is written before the contact record, and the
+        // order is the crash rule.** The contact record's pseudonym is what every
+        // later lookup reads as "established", so a crash between the two writes
+        // in the other order would leave a correspondence that is established and
+        // has no `S_pc` — unable to sign a re-establishment leg, and with no
+        // derivation that could recover the key, because `S_pc` is at-rest-only
+        // and not mnemonic-derivable (`docs/design/direct-messaging.md:1056`,
+        // A4.8). Written first, the same crash leaves a resume record under a
+        // correspondence no lookup names, which is the state every unanswered
+        // knock is already in.
+        //
+        // Both handshake slots stand empty and nothing is retained: the keys, the
+        // root and the floor are what a correspondence has the moment it exists,
+        // and a sealed re-establishment frame is not.
+        self.commit_resume(
+            &label,
+            &ResumeRecord::new(
+                Box::new(*s_pc),
+                pk_pc.clone(),
+                roots.rs0.clone(),
+                ReEstState::first_establishment(),
+                Retention::none(),
+                // Nothing has been sent on this channel: the acceptance is
+                // composed after this call returns. The floor rises at the first
+                // completed re-establishment.
+                SendFloor::new(0, 0),
+            ),
+        )?;
         // Seeded, so the record is written whatever the mutator reports — see
         // `update_contact`. There is nothing to change about a record built
         // from the knock in the same call.
@@ -5135,6 +5194,15 @@ mod tests {
         resume_record_sealed(attempt, floor, 0xA5)
     }
 
+    /// The per-correspondent signing key an acceptance hands
+    /// [`DmPersist::accept_first_contact`] to write into the resume record.
+    ///
+    /// Fixed bytes rather than a keygen: the call stores the key and never signs
+    /// with it, so what these tests read back is whatever they passed in.
+    fn accepting_s_pc() -> [u8; ml_dsa::SK_LEN] {
+        [0x71u8; ml_dsa::SK_LEN]
+    }
+
     /// Walk to `attempt` the way a real caller must.
     ///
     /// There is no shortcut on purpose: `FreshAttempt` is mintable only by
@@ -5182,6 +5250,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: Some(crate::dm::resume::OwnSlot::new(
                     1,
+                    77,
                     crate::dm::resume::SealedReEst::seal(
                         fresh(attempt),
                         vec![seal; 256].into_boxed_slice(),
@@ -5533,6 +5602,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: Some(crate::dm::resume::OwnSlot::new(
                     1,
+                    77,
                     crate::dm::resume::SealedReEst::seal(
                         fresh(attempt),
                         vec![0xA5u8; 256].into_boxed_slice(),
@@ -5872,6 +5942,7 @@ mod tests {
                 own: different.sealed().map(|s| {
                     crate::dm::resume::OwnSlot::new(
                         1,
+                        77,
                         crate::dm::resume::SealedReEst::seal(
                             fresh(2),
                             s.bytes().to_vec().into_boxed_slice(),
@@ -7557,7 +7628,7 @@ mod tests {
         );
 
         let (label, _ratchet) = p
-            .accept_first_contact(knock(0x33, ss0_tagged(0x44)), LAST_SEEN)
+            .accept_first_contact(knock(0x33, ss0_tagged(0x44)), &accepting_s_pc(), LAST_SEEN)
             .expect("the acceptance was refused");
         assert_ne!(label, ours, "the acceptance reused the entry's own label");
 
@@ -7866,7 +7937,9 @@ mod tests {
 
         let knock = knock(9, ss0());
         let expected_pk_pc = *knock.pk_pc();
-        let (label, ratchet) = p.accept_first_contact(knock, FIRST_SEEN).expect("accepts");
+        let (label, ratchet) = p
+            .accept_first_contact(knock, &accepting_s_pc(), FIRST_SEEN)
+            .expect("accepts");
 
         assert_eq!(
             p.correspondence_for_pk_lt(&pk(9)).expect("lookup"),
@@ -7900,6 +7973,90 @@ mod tests {
         );
     }
 
+    /// **The acceptor's establishment writes a complete resume record**, so the
+    /// correspondence can speak a re-establishment leg after the next restart.
+    ///
+    /// Every field asserted here is one that cannot be recovered from anywhere
+    /// else once this call returns: `S_pc` is not derivable from the shared
+    /// secret or the mnemonic, the peer's `PK_pc` arrived only in the knock, and
+    /// `RS_0` is an Expand sibling of an `ss0` the establishment destroys. A
+    /// record missing any of them is a correspondence that reads as established
+    /// and can never re-establish.
+    #[test]
+    fn accepting_a_knock_writes_the_resume_record_a_reconnect_needs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+
+        let knock = knock(9, ss0());
+        let expected_pk_pc = *knock.pk_pc();
+        let (label, _ratchet) = p
+            .accept_first_contact(knock, &accepting_s_pc(), FIRST_SEEN)
+            .expect("accepts");
+
+        let resume = p
+            .read_resume(&label)
+            .expect("reads")
+            .expect("the acceptance wrote a resume record");
+        assert_eq!(
+            resume.s_pc().as_slice(),
+            accepting_s_pc().as_slice(),
+            "the signing key the caller minted is not the one on disk"
+        );
+        assert_eq!(
+            resume.pk_pc().as_slice(),
+            expected_pk_pc.as_slice(),
+            "the record verifies legs under a key the correspondent never signed with"
+        );
+        assert_eq!(
+            resume.committed_root().as_bytes(),
+            derive_channel_roots(&ss0()).expect("roots").rs0.as_bytes(),
+            "the committed re-establishment root is not the sibling of the established secret"
+        );
+        assert_eq!(
+            resume.reconnect_gen(),
+            0,
+            "a first establishment has completed no handshake"
+        );
+        assert!(
+            resume.own_slot().is_none() && resume.acceptance().is_none(),
+            "a first establishment has no handshake in flight to record"
+        );
+        assert!(
+            resume.retained().is_none(),
+            "a first establishment has superseded no root"
+        );
+        assert_eq!(
+            resume.send_floor(),
+            SendFloor::new(0, 0),
+            "the acceptor has sent nothing, so its floor is the opening one"
+        );
+        assert_eq!(
+            resume.attempt(),
+            None,
+            "a first establishment has attempted no re-establishment"
+        );
+    }
+
+    /// **The write order inside `accept_first_contact` is not pinned by a test,
+    /// and the limit is the store rather than the argument**: nothing here can
+    /// make the contact write fail while the resume write succeeds, so the state
+    /// the ordering exists to avoid — an established correspondence with no
+    /// `S_pc` — has no fixture that reaches it. What is pinned is that both
+    /// records are present after a successful accept
+    /// (`accepting_a_knock_writes_the_resume_record_a_reconnect_needs` and
+    /// `accepting_a_knock_establishes_a_findable_correspondence`), and the order
+    /// itself is stated at the call site.
+    #[test]
+    fn accepting_a_knock_leaves_both_records_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = persist(tmp.path());
+        let (label, _ratchet) = p
+            .accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN)
+            .expect("accepts");
+        assert!(p.read_resume(&label).expect("reads").is_some());
+        assert!(p.read_contact(&label).expect("reads").is_some());
+    }
+
     /// The acceptor's establishment writes NO provisional record. That record is
     /// the initiator's, and one written here would be `ss0` left on disk with
     /// nothing that ever deletes it.
@@ -7908,7 +8065,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = persist(tmp.path());
         let (label, _ratchet) = p
-            .accept_first_contact(knock(9, ss0()), FIRST_SEEN)
+            .accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN)
             .expect("accepts");
 
         // Positive control: the contact record IS there, so the assertion below
@@ -7934,10 +8091,10 @@ mod tests {
         let mut other = ss0();
         other[0] ^= 0xFF;
         let (a, _) = p
-            .accept_first_contact(knock(9, ss0()), FIRST_SEEN)
+            .accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN)
             .expect("accepts");
         let (b, _) = p
-            .accept_first_contact(knock(11, other), FIRST_SEEN)
+            .accept_first_contact(knock(11, other), &accepting_s_pc(), FIRST_SEEN)
             .expect("accepts");
         assert_ne!(a, b, "each accept minted its own label");
         assert_eq!(p.store().correspondences().expect("list").len(), 2);
@@ -7955,7 +8112,7 @@ mod tests {
         let p = persist(tmp.path());
 
         let (first, _r) = p
-            .accept_first_contact(knock(9, ss0()), FIRST_SEEN)
+            .accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN)
             .expect("the first accept establishes");
 
         // A genuinely different knock from the same identity — a fresh `ss0`,
@@ -7963,7 +8120,7 @@ mod tests {
         let mut other = ss0();
         other[0] ^= 0xFF;
         let err = p
-            .accept_first_contact(knock(9, other), FIRST_SEEN)
+            .accept_first_contact(knock(9, other), &accepting_s_pc(), FIRST_SEEN)
             .expect_err("the second accept is refused");
         assert!(
             matches!(err, DmPersistError::AlreadyEstablished),
@@ -8004,7 +8161,7 @@ mod tests {
         perms.set_mode(0o500);
         std::fs::set_permissions(&root, perms).expect("chmod");
 
-        let result = p.accept_first_contact(knock(9, ss0()), FIRST_SEEN);
+        let result = p.accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN);
 
         let mut perms = std::fs::metadata(&root).expect("metadata").permissions();
         perms.set_mode(0o700);
@@ -8123,6 +8280,7 @@ mod tests {
     fn own(generation: u32, attempt: u32, seal: u8) -> crate::dm::resume::OwnSlot {
         crate::dm::resume::OwnSlot::new(
             generation,
+            77,
             crate::dm::resume::SealedReEst::seal(
                 fresh(attempt),
                 vec![seal; 128].into_boxed_slice(),
@@ -8294,11 +8452,13 @@ mod tests {
         );
         p.commit_resume(&l, &stored).expect("commits");
 
-        // The abandonment with nothing in its place: refused.
+        // A slot emptied by a write that ALSO minted a fresh attempt: refused.
+        // The counter moving is what separates this from A3.8's give-up — the
+        // initiation did not end, it was replaced by one nothing recorded.
         let vanished = resume_with(
             crate::dm::resume::ReEstState {
                 reconnect_gen: 4,
-                attempt: 3,
+                attempt: 4,
                 last_seen_re_est: 0,
                 own: None,
                 acceptance: None,
@@ -8310,7 +8470,7 @@ mod tests {
         );
         let err = p
             .commit_resume(&l, &vanished)
-            .expect_err("an initiation may not simply disappear");
+            .expect_err("an initiation may not disappear under a fresh attempt");
         assert!(
             matches!(
                 err,
@@ -8320,6 +8480,51 @@ mod tests {
             ),
             "wrong error: {err:?}"
         );
+
+        // A3.8's give-up, which `ResumeRecord::abandon_attempt` writes: the slot
+        // empties and the counter stands still, so the next attempt is the
+        // successor of the one given up and nothing reuses its key.
+        let mut abandoned = resume_with(
+            crate::dm::resume::ReEstState {
+                reconnect_gen: 4,
+                attempt: 3,
+                last_seen_re_est: 0,
+                own: Some(own(5, 3, 0xA1)),
+                acceptance: None,
+                attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
+            },
+            crate::dm::resume::Retention::none(),
+            floor,
+        );
+        abandoned.abandon_attempt();
+        p.commit_resume(&l, &abandoned)
+            .expect("a give-up that keeps its counter commits");
+        assert_eq!(attempt_number(&p, &l), 3);
+        // And the record it leaves takes the successor, never the same number.
+        let mut resumed = p.read_resume(&l).expect("reads").expect("there");
+        resumed
+            .open_attempt(
+                9,
+                crate::dm::resume::SealedReEst::seal(
+                    fresh(4),
+                    vec![0xC3u8; 256].into_boxed_slice(),
+                )
+                .expect("inside MAX_FRAME_LEN"),
+                crate::dm::eph_dk_fixture(),
+            )
+            .expect("the abandoned slot is free");
+        p.commit_resume(&l, &resumed)
+            .expect("the successor commits");
+        assert_eq!(attempt_number(&p, &l), 4);
+
+        // Back to the contested fixture for the coin-loser's own commit below.
+        p.store
+            .critical_section(&l, |guard| -> Result<(), DmPersistError> {
+                guard.replace(RecordKind::Resume, &stored.encode())?;
+                Ok(())
+            })
+            .expect("the fixture restores");
 
         // The coin-loser's actual commit: own slot cleared, the winner's frame
         // accepted at the SAME generation the abandoned initiation contested,

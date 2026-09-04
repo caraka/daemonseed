@@ -3277,7 +3277,7 @@ mod tests {
             while fresh.attempt().get() < own_attempt {
                 fresh = fresh.attempt().advance().expect("far below u32::MAX");
             }
-            OwnSlot::new(generation, seal_stub(fresh), eph_dk_fixture())
+            OwnSlot::new(generation, 77, seal_stub(fresh), eph_dk_fixture())
         });
         ResumeRecord::new(
             Box::new([0x11; ml_dsa::SK_LEN]),

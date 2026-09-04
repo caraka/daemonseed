@@ -48,7 +48,8 @@ use daemonseed_core::dm::keyrec::{
     self, DmKeyRecordError, KeyRecordCache, DM_KEYREC_OWNER_SEED_LEN,
 };
 use daemonseed_core::dm::outbox::{
-    DeliveryState, OutboxError, OutboxTarget, SealedFrame, GIVE_UP_MS,
+    DeliveryState, Lifecycle, OutboxEntry, OutboxError, OutboxTarget, ReseedSchedule, SealedFrame,
+    GIVE_UP_MS,
 };
 use daemonseed_core::dm::paging::{
     position_of, DmPageAddress, PagePosition, Receiving, Sending, ADDRESS_ROOT_LEN, PAGE_SLOTS,
@@ -59,6 +60,8 @@ use daemonseed_core::dm::persist::{
 use daemonseed_core::dm::pow;
 use daemonseed_core::dm::provisional::{RecordContext, TeardownCause};
 use daemonseed_core::dm::ratchet::{Direction, Ratchet, RatchetError, FIRST_RECIPIENT_CHANNEL_SEQ};
+use daemonseed_core::dm::reest::{self, AttemptBudget};
+use daemonseed_core::dm::resume::{ReEstState, ResumeRecord, Retention, SealedReEst, SendFloor};
 use daemonseed_core::dm::token::SpentTokenSet;
 use daemonseed_core::identity::keys::{SignKeypair, IDENTITY_PK_LEN, ML_DSA_SEED_LEN};
 use daemonseed_core::storage::dm_store::CorrespondenceLabel;
@@ -881,6 +884,40 @@ struct Correspondence {
     /// Consecutive attempts at that write that ended in a fault rather than an
     /// answer. Bounded by [`PSEUDONYM_WRITE_FAULT_CEILING`].
     pseudonym_faults: u8,
+    /// Whether this correspondence still owes the load-time re-establishment
+    /// pass — the dead-chain sweep and the reconnect decision.
+    ///
+    /// Set only where the store says a correspondence is established, which is
+    /// the one state that has a resume record to sweep against and a retained
+    /// root to speak a leg under. Cleared when the pass **completes**, so a
+    /// store fault leaves the work owed to the next tick rather than skipped for
+    /// the session — see [`DmMachine::resume_channel`].
+    resume_owed: bool,
+    /// Consecutive load-time passes that ended in a store fault rather than an
+    /// answer. It is the backoff's rung, saturating at
+    /// [`REARM_FAULT_CEILING`]'s.
+    resume_faults: u8,
+    /// When the next load-time pass may run.
+    ///
+    /// A3.15 row 6 has the unreadable case retry *"on a backoff"*, so a fault
+    /// pushes this forward by [`ReseedSchedule::delay_for_rung`] at the fault
+    /// count — the ladder the outbox already re-seeds on, reused rather than a
+    /// second cadence to reason about. `None` before the first fault.
+    resume_retry_due_ms: Option<i64>,
+    /// Whether this session has already told the front end that the resume
+    /// record will not read.
+    ///
+    /// A3.8 has the unreadable case *"loud on first occurrence, never a silent
+    /// loop"*, and the retry runs on a cadence; without this the same event
+    /// would go out on each of them.
+    resume_surfaced: bool,
+    /// Whether this session has already said the backoff reached its top rung.
+    ///
+    /// The pass is never abandoned — A3.13 forbids a terminal state — so a store
+    /// that has not recovered by [`REARM_FAULT_CEILING`] would otherwise retry
+    /// at a day's cadence for ever with nothing said after the first fault. One
+    /// further event names that, once.
+    resume_ceiling_surfaced: bool,
 }
 
 /// The recipient key-record address half of a
@@ -1341,7 +1378,10 @@ impl DmMachine {
             };
             for index in 0..self.correspondences.len() {
                 self.rearm_handshake(now_ms, index);
-                self.retry_pseudonym_write(now_ms, index);
+                out.extend(self.retry_pseudonym_write(now_ms, index));
+                // Before the give-up sweep, which is what surfaces whatever the
+                // dead-chain sweep inside this call just ended.
+                out.extend(self.resume_channel(now_ms, index));
                 out.extend(self.repair_cursor(index));
                 out.extend(self.give_ups(now_ms, index));
                 out.extend(self.due_emissions(now_ms, index));
@@ -1392,23 +1432,67 @@ impl DmMachine {
     /// long. Giving up costs what the settled case costs, and for the same
     /// reason: the acceptance verified, so the correspondence is established
     /// whatever the disk remembers.
-    fn retry_pseudonym_write(&mut self, now_ms: i64, index: usize) {
+    fn retry_pseudonym_write(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
         if !self.correspondences[index].pseudonym_unwritten {
-            return;
+            return Vec::new();
         }
         let Some(pk_pc) = self.correspondences[index].peer_pk_pc.clone() else {
             // Unreachable through `on_page`, which installs the key in the same
             // arm that sets the flag. Cleared rather than retried for ever: with
             // no key there is nothing this call could write.
             self.correspondences[index].pseudonym_unwritten = false;
-            return;
+            return Vec::new();
         };
         let label = self.correspondences[index].label;
         match self
             .persist
             .record_correspondent_pseudonym(&label, pk_pc, now_ms)
         {
-            Ok(_) => self.stop_owing_the_pseudonym(index, label),
+            Ok(_) => {
+                // **The establishment finishes here too, not only in
+                // `on_page`.** This is the same transition arriving late: the
+                // acceptance verified earlier and only the disk was behind, so
+                // the resume record is owed exactly as it is on the prompt path.
+                // Releasing the handshake record without writing it would leave
+                // an established correspondence with no `S_pc`.
+                let (persist, correspondences) = (&self.persist, &mut self.correspondences);
+                let outcome = match correspondences[index].peer_pk_pc.clone() {
+                    Some(peer_pk_pc) => establish_provisional(
+                        persist,
+                        &mut correspondences[index],
+                        &peer_pk_pc,
+                        now_ms,
+                    ),
+                    None => Establishment::Complete,
+                };
+                match outcome {
+                    Establishment::Complete => {
+                        self.stop_owing_the_pseudonym(index, label);
+                    }
+                    // **The pseudonym stays owed**, so the pair comes back to the
+                    // next tick. The fault counter is the same one the write's
+                    // own faults raise, so a store that never recovers is bounded
+                    // by one ceiling rather than by two.
+                    Establishment::Retry => {
+                        let faults = self.correspondences[index]
+                            .pseudonym_faults
+                            .saturating_add(1);
+                        self.correspondences[index].pseudonym_faults = faults;
+                        if faults >= PSEUDONYM_WRITE_FAULT_CEILING {
+                            crate::vtrace!(
+                                "dm driver: the resume record still would not commit after \
+                                 {faults} attempts"
+                            );
+                            self.stop_owing_the_pseudonym(index, label);
+                        }
+                    }
+                    Establishment::Unrecoverable => {
+                        self.stop_owing_the_pseudonym(index, label);
+                        let owed = pending_seqs(&self.persist, &label, now_ms);
+                        return cannot_resume(&self.correspondences[index], owed);
+                    }
+                }
+            }
             Err(e) if e.retrying_cannot_help() => {
                 crate::vtrace!("dm driver: the pseudonym will never record: {e}");
                 self.stop_owing_the_pseudonym(index, label);
@@ -1427,6 +1511,7 @@ impl DmMachine {
                 }
             }
         }
+        Vec::new()
     }
 
     /// Stop retrying the pseudonym write and release the handshake record it
@@ -2194,6 +2279,395 @@ impl DmMachine {
         out
     }
 
+    /// One correspondence's load-time re-establishment work: the dead-chain
+    /// sweep, and then the decision whether to open a re-establishment.
+    ///
+    /// **The sweep is a derivation re-run at every load, not a transaction**
+    /// (`docs/design/direct-messaging.md:927`, A3.12), so a crash between the
+    /// resume record's commit and this pass is repaired here rather than
+    /// prevented.
+    ///
+    /// **The reconnect decision is UNSEALED mail, not any mail.** A4.2's cause 2
+    /// is *"an entry composed while no chain exists"* — an entry that cannot
+    /// seal without a channel and would otherwise run to `Undelivered` with no
+    /// `RE-EST` ever sent. An already-sealed entry is cause 1: it re-seeds on its
+    /// own persisted ladder against the chain it was sealed under, and does not
+    /// need this handshake to make progress. Gating on it would open a
+    /// re-establishment for a conversation that is only waiting for an
+    /// acknowledgement.
+    ///
+    /// **A persisted attempt is re-emitted, never re-sealed** (A9.1(a),
+    /// `:1351`), and the position it goes back to is the one stored in the slot
+    /// rather than a fresh `next_send_seq`: `seq` is bound into the leg's seal
+    /// key and signature, so any other number publishes bytes the peer cannot
+    /// verify at an address it is not reading.
+    ///
+    /// **Commit before emit.** The record carrying the sealed leg is written
+    /// first and the outbox entry follows, so a crash between them leaves a
+    /// record whose bytes this pass re-emits unchanged and a wire that never saw
+    /// the attempt at all.
+    ///
+    /// **The pass is owed until it completes.** A store that would not answer
+    /// this tick may answer the next, and a flag cleared on the way past would
+    /// leave the correspondence unswept and unattempted for the life of the
+    /// session over a fault that had already gone. What bounds the retry is
+    /// [`REARM_FAULT_CEILING`], the same number and the same argument as the
+    /// handshake re-arm beside it.
+    ///
+    /// The swept entries are not surfaced here: `sweep_dead_chain` leaves each
+    /// one owing a surfacing in the record, and [`Self::give_ups`] — which runs
+    /// after this in the same tick — is what reads that obligation and tells the
+    /// front end.
+    ///
+    /// **The leg this queues is not dispatched.** Its page address needs the
+    /// resumed channel's own addressing, which a later slice builds, so
+    /// [`Self::due_emissions`] skips the target and the entry waits with its
+    /// ladder and its give-up clock untouched.
+    fn resume_channel(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        if !self.correspondences[index].resume_owed {
+            return Vec::new();
+        }
+        // A3.15 row 6's backoff: a pass that faulted is not asked again until
+        // its rung comes round. Nothing is owed to a correspondence that has
+        // never faulted, so the first pass runs on the tick that finds it.
+        if self.correspondences[index]
+            .resume_retry_due_ms
+            .is_some_and(|due| now_ms < due)
+        {
+            return Vec::new();
+        }
+        let label = self.correspondences[index].label;
+        let mut record = match self.persist.read_resume(&label) {
+            Ok(Some(record)) => record,
+            // **A3.15 row 6, the `absent` half.** The contact record says this
+            // correspondence is established and no resume record stands beside
+            // it, so nothing can sign a leg and nothing can ever re-root the
+            // chain. The design has this *"surface the recovery offer"*, and the
+            // offer is a fresh first contact.
+            Ok(None) => {
+                self.correspondences[index].resume_owed = false;
+                let owed = pending_seqs(&self.persist, &label, now_ms);
+                return cannot_resume(&self.correspondences[index], owed);
+            }
+            // **A3.15 row 6, the `unreadable` half: loud on first occurrence,
+            // and it keeps retrying.** A record that is present and will not
+            // read is most likely still intact on disk, so offering a
+            // destructive fresh first contact over it would spend an invite
+            // token to destroy a working channel — which is why the design
+            // splits this case from `absent` above rather than merging them. The
+            // event fires once per session; the retry is what the flag left set
+            // buys.
+            Err(e) => {
+                crate::vtrace!("dm driver: the resume record will not read: {e}");
+                return self.resume_fault(now_ms, index);
+            }
+        };
+        let direction = match self.persist.read_outbox(&label, now_ms) {
+            Ok(Some(outbox)) => outbox.direction(),
+            // No outbox record: nothing has ever been queued, so there is no
+            // dead chain to sweep and no mail to re-establish for. Settled, not
+            // faulted.
+            Ok(None) => {
+                self.correspondences[index].resume_owed = false;
+                return Vec::new();
+            }
+            // A store that would not answer says nothing about whether an outbox
+            // exists, so this is the fault path rather than the settled one —
+            // `stored_direction` folds the two together, which is right for a
+            // caller that only wants to drive what it can see and wrong for a
+            // pass that has to run exactly once.
+            Err(e) => {
+                crate::vtrace!("dm driver: the outbox direction would not read: {e}");
+                return self.resume_fault(now_ms, index);
+            }
+        };
+        let held = record
+            .own_slot()
+            .map(|slot| (slot.seq(), slot.sealed().bytes().to_vec()));
+        let held_seq = held.as_ref().map(|(seq, _)| *seq);
+        let reroot_gen = record.reroot_ratchet_gen();
+        let floor = record.send_floor();
+        let surveyed = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                // **The floor is checked before the sweep, and a refusal changes
+                // nothing.** A9.2's send-side floor is durable and the outbox's
+                // own counters are not, so an outbox behind it is a record that
+                // has been rolled back — and the sweep is a derivation from the
+                // resume record onto exactly that outbox. Running it over a
+                // rolled-back record would end entries against a generation the
+                // outbox never reached.
+                let position = SendFloor::new(outbox.last_clear_gen(), outbox.next_send_seq());
+                if !floor.admits(position) {
+                    return Ok(Mutation::Unchanged(ResumeSurvey::FloorRegressed {
+                        floor,
+                        position,
+                    }));
+                }
+                let fired = outbox.sweep_dead_chain(reroot_gen);
+                // **Keyed on the stored sequence, not on a live frame's bytes.**
+                // `OutboxEntry::frame` answers `Some` only while an entry is
+                // awaiting collection, so a byte comparison goes empty the moment
+                // a give-up or a sweep ends the leg — and every later load would
+                // read that as "never queued" and spend another sequence on the
+                // same stale attempt.
+                let leg = held_seq.map(|seq| {
+                    if outbox.entry(seq).is_some() {
+                        LegState::Queued
+                    } else if outbox.next_send_seq() > seq {
+                        // The sequence was spent and its entry has since been
+                        // pruned. The bytes are bound to that position and
+                        // cannot move to another.
+                        LegState::Stale
+                    } else {
+                        LegState::Missing
+                    }
+                });
+                let survey = ResumeSurvey::Surveyed {
+                    unsealed_pending: outbox
+                        .iter()
+                        .any(|entry| matches!(entry.lifecycle(), Lifecycle::AwaitingKey)),
+                    next_seq: outbox.next_send_seq(),
+                    leg,
+                };
+                Ok(if fired.is_empty() {
+                    Mutation::Unchanged(survey)
+                } else {
+                    Mutation::Changed(survey)
+                })
+            });
+        let survey = match surveyed {
+            Ok(survey) => survey,
+            Err(e) => {
+                crate::vtrace!("dm driver: the dead-chain sweep did not run: {e}");
+                return self.resume_fault(now_ms, index);
+            }
+        };
+        let (unsealed_pending, next_seq, leg) = match survey {
+            ResumeSurvey::FloorRegressed { floor, position } => {
+                crate::vtrace!(
+                    "dm driver: the outbox is at {position:?}, behind the resume record's \
+                     floor {floor:?}; nothing is swept and no attempt is opened"
+                );
+                self.correspondences[index].resume_owed = false;
+                return Vec::new();
+            }
+            ResumeSurvey::Surveyed {
+                unsealed_pending,
+                next_seq,
+                leg,
+            } => (unsealed_pending, next_seq, leg),
+        };
+        match (leg, held) {
+            (Some(LegState::Queued), _) => {
+                self.correspondences[index].resume_owed = false;
+                return Vec::new();
+            }
+            // **The slot is released here, not left occupied.** The stored bytes
+            // are bound to a sequence the outbox has spent, so they can never go
+            // back on the wire — and leaving the slot would make
+            // `ResumeRecord::open_attempt` refuse for ever, which is the
+            // dead-end state A3.13 forbids. The counter stands still, so the
+            // next attempt is the successor of the one given up.
+            (Some(LegState::Stale), Some((seq, _))) => {
+                crate::vtrace!(
+                    "dm driver: the stored attempt is addressed at sequence {seq}, which the \
+                     outbox has moved past"
+                );
+                record.abandon_attempt();
+                if let Err(e) = self.persist.commit_resume(&label, &record) {
+                    crate::vtrace!("dm driver: the give-up would not commit: {e}");
+                    return self.resume_fault(now_ms, index);
+                }
+                // **The pass stays owed, which is what makes the give-up an exit
+                // rather than an end.** The slot is free now, so the next tick
+                // opens the successor of the attempt just abandoned; leaving the
+                // flag clear would make a replacement wait for a restart, which
+                // is A3.13's dead-end state wearing a different clock.
+                self.correspondences[index].resume_owed = true;
+                let owed = pending_seqs(&self.persist, &label, now_ms);
+                return cannot_resume(&self.correspondences[index], owed);
+            }
+            (Some(LegState::Missing), Some((seq, bytes))) => {
+                if let Err(e) = enqueue_leg(&self.persist, &label, direction, now_ms, seq, &bytes) {
+                    crate::vtrace!("dm driver: the stored leg would not re-queue: {e}");
+                    return self.resume_fault(now_ms, index);
+                }
+                self.correspondences[index].resume_owed = false;
+                return Vec::new();
+            }
+            // A leg state is derived from the stored slot's own sequence, so a
+            // state with no slot behind it is a value the survey cannot produce.
+            // Named rather than unwrapped: an `expect` here would abort the
+            // driver over a correspondence, and the honest answer is to leave
+            // this one alone and say so.
+            (Some(state), None) => {
+                crate::vtrace!(
+                    "dm driver: the outbox survey reported {state:?} for a record with no \
+                     handshake slot"
+                );
+                self.correspondences[index].resume_owed = false;
+                return Vec::new();
+            }
+            (None, _) => {}
+        }
+        if !unsealed_pending {
+            self.correspondences[index].resume_owed = false;
+            return Vec::new();
+        }
+        if AttemptBudget::from_record(&record).exhausted() {
+            // **Loud, not a trace.** A3.8 has every anomaly classed and
+            // suppression-protected, and a window with no attempts left is a
+            // conversation that will not come back on its own: nothing here
+            // moves the anchor but a peer opening one of our attempts, and no
+            // attempt can be sent to be opened.
+            let owed = pending_seqs(&self.persist, &label, now_ms);
+            crate::vtrace!(
+                "dm driver: this re-initiation window has spent every attempt it admits, \
+                 with {} message(s) owed",
+                owed.len()
+            );
+            self.correspondences[index].resume_owed = false;
+            return cannot_resume(&self.correspondences[index], owed);
+        }
+        // The generation the initiation is REACHING, one past the committed one:
+        // A3.4 advances `reconnect_gen` only on a completed handshake, and
+        // `ReEstGate` drops a leg at or below the generation its own record has
+        // committed. Both sides compute it from their own committed number, so
+        // neither reads it off the wire.
+        let generation = record.reconnect_gen().saturating_add(1);
+        let fresh = match record.attempt() {
+            Some(attempt) => attempt.advance(),
+            None => Some(daemonseed_core::dm::resume::FreshAttempt::first()),
+        };
+        let Some(fresh) = fresh else {
+            // The counter is at its ceiling. The same record answers the same
+            // way on every later tick, so this is settled rather than faulted.
+            crate::vtrace!("dm driver: the attempt counter has no successor");
+            self.correspondences[index].resume_owed = false;
+            return Vec::new();
+        };
+        let (eph_ek, eph_dk) = match reest::mint_ephemeral() {
+            Ok(pair) => pair,
+            Err(e) => {
+                crate::vtrace!("dm driver: the re-establishment ephemeral would not mint: {e}");
+                return self.resume_fault(now_ms, index);
+            }
+        };
+        let leg = match reest::seal_re_est(
+            record.committed_root(),
+            direction,
+            generation,
+            next_seq,
+            &fresh,
+            &eph_ek,
+            record.s_pc(),
+        ) {
+            Ok(leg) => leg,
+            Err(e) => {
+                crate::vtrace!("dm driver: the RE-EST leg would not seal: {e}");
+                return self.resume_fault(now_ms, index);
+            }
+        };
+        let sealed = match SealedReEst::seal(fresh, leg.into_boxed_slice()) {
+            Ok(sealed) => sealed,
+            // A length refusal, and every leg is one length: the same bytes
+            // answer the same way on every tick, so this is settled.
+            Err(e) => {
+                crate::vtrace!("dm driver: the sealed leg would not bind to its attempt: {e}");
+                self.correspondences[index].resume_owed = false;
+                return Vec::new();
+            }
+        };
+        let bytes = sealed.bytes().to_vec();
+        if let Err(e) = record.open_attempt(next_seq, sealed, eph_dk) {
+            // A refusal about the record's own state — an occupied slot, a
+            // counter that does not advance — which the same record repeats.
+            crate::vtrace!("dm driver: the attempt would not open on the record: {e}");
+            self.correspondences[index].resume_owed = false;
+            return Vec::new();
+        }
+        if let Err(e) = self.persist.commit_resume(&label, &record) {
+            crate::vtrace!("dm driver: the opened attempt would not commit: {e}");
+            return self.resume_fault(now_ms, index);
+        }
+        if let Err(e) = enqueue_leg(&self.persist, &label, direction, now_ms, next_seq, &bytes) {
+            // The record holds the attempt and the wire has seen nothing, which
+            // is exactly the crash window the re-emit path recovers: the next
+            // pass finds the slot occupied and its sequence unspent, and queues
+            // the same bytes. So this is owed, not settled.
+            crate::vtrace!("dm driver: the re-establishment leg would not queue: {e}");
+            return self.resume_fault(now_ms, index);
+        }
+        self.correspondences[index].resume_owed = false;
+        Vec::new()
+    }
+
+    /// Keep the load-time pass owed after a store fault, widen the retry, and
+    /// say so once.
+    ///
+    /// **The flag survives the fault**, which is the whole of the difference
+    /// between a transient answer and a settled one: a correspondence whose
+    /// resume record could not be read this tick is one to ask again, not one to
+    /// leave unswept for the session.
+    ///
+    /// **A3.15 row 6 says the retry is on a BACKOFF, so it is.** The delay is
+    /// [`ReseedSchedule::delay_for_rung`](daemonseed_core::dm::outbox::ReseedSchedule::delay_for_rung) at the fault count — the outbox's own
+    /// re-seed ladder, reused rather than a second cadence — so a store that
+    /// keeps refusing is asked at a minute, then two, then four, and finally
+    /// once an hour, instead of costing two sealed reads on every tick for the
+    /// life of the session.
+    ///
+    /// **Hourly is the ceiling, not the ladder's daily rung, and A3.15 row 6 is
+    /// why.** The design's reason for retrying at all is that the record is
+    /// *"most likely still on disk and untouched"* and offering a destructive
+    /// fresh first contact over an `EIO` would spend an invite token to destroy a
+    /// working channel — so the retry exists to pick the correspondence up when
+    /// the store heals. A daily rung leaves a healed store unread for up to a
+    /// day; an hourly one costs two sealed reads an hour, which is nothing beside
+    /// the poll table [`crate::dm`]'s store module prices. Reaching the ladder's
+    /// top rung would mean raising [`REARM_FAULT_CEILING`], and that number is
+    /// the handshake re-arm's too.
+    ///
+    /// **The pass is never abandoned.** A3.13 forbids a terminal state, and a
+    /// correspondence given up on here is one whose user is told nothing further
+    /// however long the disk stays broken. Past [`REARM_FAULT_CEILING`] the
+    /// backoff simply stops widening — the ladder repeats its top rung, which is
+    /// the shape [`RESEED_LADDER`] itself has — and one further event says the
+    /// retry has reached that cadence.
+    ///
+    /// The event is A3.15 row 6's `unreadable` half and fires on the first fault
+    /// of a run: the design has it *"loud on first occurrence, never a silent
+    /// loop"*, and one per retry is that loop.
+    fn resume_fault(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        let correspondence = &mut self.correspondences[index];
+        let faults = correspondence
+            .resume_faults
+            .saturating_add(1)
+            .min(REARM_FAULT_CEILING);
+        correspondence.resume_faults = faults;
+        let delay = ReseedSchedule::delay_for_rung(u32::from(faults).saturating_sub(1));
+        correspondence.resume_retry_due_ms = Some(now_ms.saturating_add(duration_as_ms(delay)));
+        let at_ceiling = faults >= REARM_FAULT_CEILING && !correspondence.resume_ceiling_surfaced;
+        if at_ceiling {
+            correspondence.resume_ceiling_surfaced = true;
+        } else if correspondence.resume_surfaced {
+            return Vec::new();
+        }
+        correspondence.resume_surfaced = true;
+        let cause = if at_ceiling {
+            "the resume record has not read for the whole backoff"
+        } else {
+            "the resume record will not read"
+        };
+        vec![DmEffect::Emit(DmEvent::ChannelLost {
+            with: Box::new(*correspondence.pk_lt),
+            cause: TeardownCause::StoreUnreadable(cause.into()),
+            event: TrustEventKey::DmProvisionalRecordUnreadable,
+            surfaced: Vec::new(),
+        })]
+    }
+
     /// The direction the stored outbox was written for, or `None` when there is
     /// no record and so nothing to drive.
     ///
@@ -2265,7 +2739,10 @@ impl DmMachine {
         self.pending_erase = pending
             .into_iter()
             .filter(|(label, keyrec_addr, fc_epoch)| {
-                !erase_record(&self.persist, label, keyrec_addr, *fc_epoch)
+                match erase_record(&self.persist, label, keyrec_addr, *fc_epoch) {
+                    Erasure::Deleted | Erasure::Absent => false,
+                    Erasure::Retry => true,
+                }
             })
             .collect();
     }
@@ -2295,6 +2772,19 @@ impl DmMachine {
                     };
                     let target = entry.target();
                     if matches!(target, OutboxTarget::ChannelPage) && !live {
+                        continue;
+                    }
+                    // **A re-establishment leg is not emitted, and skipping it
+                    // BEFORE `emit` is the whole of it.** `emit` advances the
+                    // ladder whether or not the caller can do anything with the
+                    // bytes, so a leg picked up here on every due tick would
+                    // walk `RESEED_LADDER` end to end against a dispatch that
+                    // does not exist — spending emissions on nothing, and
+                    // leaving a record whose schedule says it has been trying
+                    // for a week. Its page address needs the resumed channel's own
+                    // addressing, which is a later slice; until then the entry
+                    // waits with its ladder untouched.
+                    if matches!(target, OutboxTarget::ReEstablishmentLeg) {
                         continue;
                     }
                     // A refusal here is `NothingToEmit` or `GaveUp`; the first
@@ -2367,6 +2857,11 @@ impl DmMachine {
                         frame,
                     }));
                 }
+                // Unreachable: the scan above skips this target before `emit`,
+                // so no leg reaches the publish loop. Written out rather than
+                // wildcarded so a dispatch added later has to be classified
+                // here on purpose.
+                OutboxTarget::ReEstablishmentLeg => {}
                 // The knock, re-seeded. Its bytes come back from the outbox
                 // unchanged, which is the whole reason it is queued there: a
                 // second `firstcontact::build` would encapsulate a fresh `ss0`
@@ -2849,6 +3344,11 @@ impl DmMachine {
 
         let cursor_before = correspondence.collection.contiguous_through();
         let mut out = Vec::new();
+        // **Collected here and pushed after the borrow ends**, the shape
+        // `due_emissions` uses for its own deferred writes: `correspondence` is
+        // borrowed from `self` for the whole fold, so `self.pending_erase`
+        // cannot be reached from inside it.
+        let mut owed_erase: Option<(CorrespondenceLabel, ProvisionalContext, u64)> = None;
 
         // The retry queue first: a position whose acknowledgement the
         // beyond-prefix set had no room for is already opened and displayed, so
@@ -2964,7 +3464,48 @@ impl DmMachine {
                             pk_pc.clone(),
                             now_ms,
                         ) {
-                            Ok(_) => erase_provisional(persist, correspondence),
+                            Ok(_) => {
+                                // **The pseudonym stays owed until the resume
+                                // record lands.** The two writes are not one
+                                // act, and the contact record's pseudonym is
+                                // what every later lookup reads as
+                                // *established* — so a store fault between them
+                                // would leave a correspondence that reads as
+                                // established and holds no `S_pc`, with nothing
+                                // owing the write that would fix it. Keeping the
+                                // flag set is what puts the pair back in front
+                                // of the next tick.
+                                match establish_provisional(persist, correspondence, &pk_pc, now_ms)
+                                {
+                                    Establishment::Complete => {}
+                                    Establishment::Retry => {
+                                        correspondence.pseudonym_unwritten = true;
+                                    }
+                                    Establishment::Unrecoverable => {
+                                        let owed =
+                                            pending_seqs(persist, &correspondence.label, now_ms);
+                                        out.extend(cannot_resume(correspondence, owed));
+                                        // **A handshake record the erase could
+                                        // not reach goes onto the retry list,
+                                        // not into the dark.** The
+                                        // correspondence is finished either way,
+                                        // but the record still holds `ss0` —
+                                        // which roots `RK0` — and the context
+                                        // beside it is the only thing that can
+                                        // ever open it again. Dropping the
+                                        // handle here would turn a transient
+                                        // store fault into a permanent leak of
+                                        // the secret the establishment exists to
+                                        // destroy.
+                                        if let Some((keyrec_addr, fc_epoch)) =
+                                            correspondence.provisional.take()
+                                        {
+                                            owed_erase =
+                                                Some((correspondence.label, keyrec_addr, fc_epoch));
+                                        }
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 crate::vtrace!("dm driver: the pseudonym would not record: {e}");
                                 correspondence.pseudonym_unwritten = true;
@@ -3050,6 +3591,9 @@ impl DmMachine {
             }
         }
         out.extend(correspondence.health_event(before));
+        if let Some(entry) = owed_erase {
+            self.pending_erase.push(entry);
+        }
         // The fold that settled a position is the signal that may have finished a
         // page, so the release is asked for here rather than on the tick: a timer
         // would either lag the settlement or ask when nothing had changed.
@@ -3782,7 +4326,15 @@ impl DmMachine {
             }
         };
 
-        match self.persist.accept_first_contact(*held.knock, now_ms) {
+        // The pseudonym's secret half travels into the establishment because
+        // that write is its only at-rest home: it is minted from the CSPRNG here
+        // and is not derivable from the mnemonic or the shared secret, so a
+        // correspondence established without it could never sign a
+        // re-establishment leg.
+        match self
+            .persist
+            .accept_first_contact(*held.knock, signing_pc.secret_key(), now_ms)
+        {
             Ok((label, ratchet)) => {
                 // **Updated in place where an entry already exists**, never
                 // pushed a second time. A mutual knock — each side knocking
@@ -3809,7 +4361,16 @@ impl DmMachine {
                     // pseudonym, and this branch has just installed one.
                     let (persist, correspondences) = (&self.persist, &mut self.correspondences);
                     let old_label = correspondences[index].label;
-                    erase_provisional(persist, &mut correspondences[index]);
+                    // The outcome is read for its trace only: this handle is
+                    // being abandoned either way, and a record that was already
+                    // gone is the ordinary answer on a knock the correspondent
+                    // never collected.
+                    match erase_provisional(persist, &mut correspondences[index]) {
+                        Erasure::Absent => crate::vtrace!(
+                            "dm driver: the superseded knock's handshake record was already gone"
+                        ),
+                        Erasure::Deleted | Erasure::Retry => {}
+                    }
                     // **What the erase could not reach is carried out, not
                     // dropped.** The entry is about to name a different label,
                     // so a handle left on it would address the wrong directory
@@ -3853,6 +4414,11 @@ impl DmMachine {
                         rearm_faults: 0,
                         pseudonym_unwritten: false,
                         pseudonym_faults: 0,
+                        resume_owed: false,
+                        resume_faults: 0,
+                        resume_retry_due_ms: None,
+                        resume_surfaced: false,
+                        resume_ceiling_surfaced: false,
                     });
                 }
                 // **The acceptance fires here, in the same call**, because the
@@ -4375,7 +4941,12 @@ impl DmMachine {
             // refuses goes to the retry list rather than being dropped, because
             // the context naming that record is the only thing that can ever
             // open it again.
-            if !erase_record(&self.persist, &label, &recipient_keyrec_addr, fc_epoch) {
+            let unreached =
+                match erase_record(&self.persist, &label, &recipient_keyrec_addr, fc_epoch) {
+                    Erasure::Deleted | Erasure::Absent => false,
+                    Erasure::Retry => true,
+                };
+            if unreached {
                 self.pending_erase
                     .push((label, recipient_keyrec_addr, fc_epoch));
             }
@@ -4505,6 +5076,11 @@ impl DmMachine {
                 rearm_faults: 0,
                 pseudonym_unwritten: false,
                 pseudonym_faults: 0,
+                resume_owed: false,
+                resume_faults: 0,
+                resume_retry_due_ms: None,
+                resume_surfaced: false,
+                resume_ceiling_surfaced: false,
             });
         }
 
@@ -4971,16 +5547,365 @@ fn established_with(
         .is_some_and(|contact| contact.pk_pc().is_some()))
 }
 
-fn erase_provisional(persist: &DmPersist, correspondence: &mut Correspondence) {
+fn erase_provisional(persist: &DmPersist, correspondence: &mut Correspondence) -> Erasure {
     let Some((keyrec_addr, fc_epoch)) = correspondence.provisional else {
-        return;
+        return Erasure::Absent;
     };
-    if erase_record(persist, &correspondence.label, &keyrec_addr, fc_epoch) {
-        correspondence.provisional = None;
+    let outcome = erase_record(persist, &correspondence.label, &keyrec_addr, fc_epoch);
+    match outcome {
+        // The record is gone either way, so the handle names a directory nothing
+        // will look in again.
+        Erasure::Deleted | Erasure::Absent => correspondence.provisional = None,
+        // The record is still there and this context is the only thing that can
+        // open it, so the handle is what the caller has to keep.
+        Erasure::Retry => {}
+    }
+    outcome
+}
+
+/// Queue one sealed re-establishment leg at `seq` on this side's direction
+/// record, with its first dispatch drawn off the instant it was queued.
+///
+/// A3.2 has every leg ride *"the ordinary outbox machinery (ladder, ack,
+/// give-up) at its own sequence position"*, so this is an ordinary enqueue and
+/// the leg is re-seeded, given up on and addressed exactly as a message is.
+///
+/// **The entry's provenance is its TARGET, not a generation number.** A3.12
+/// (`docs/design/direct-messaging.md:927`) asks provenance to exempt an entry
+/// composed during a reconnect from the dead-chain sweep, and
+/// [`OutboxTarget::ReEstablishmentLeg`] is that exemption: a leg hangs off no
+/// ratchet chain, so every number it could carry is either a fiction or one the
+/// next completed re-establishment sweeps the leg away by. The generation
+/// recorded beside it is zero and reads no differently for it.
+///
+/// **The first dispatch is drawn from A5.5's wide band**
+/// (`docs/design/direct-messaging.md:1152`): a device that comes back with
+/// several interrupted correspondences enqueues one leg for each in one pass,
+/// and an immediate due time would put all of them on the wire at one instant.
+fn enqueue_leg(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    direction: Direction,
+    now_ms: i64,
+    seq: u64,
+    bytes: &[u8],
+) -> Result<(), DmPersistError> {
+    persist.update_outbox(label, direction, now_ms, |outbox| {
+        let entry = outbox.enqueue_sealed(
+            seq,
+            OutboxTarget::ReEstablishmentLeg,
+            now_ms,
+            SealedFrame::new(bytes.to_vec()),
+            0,
+        )?;
+        entry.defer_first_dispatch(now_ms)?;
+        Ok(Mutation::Changed(()))
+    })
+}
+
+/// Where the resume record's stored attempt stands against the outbox.
+///
+/// **Three states, because the middle one is not recoverable and the other two
+/// are.** The leg's sequence is bound into its seal key and its signature, so
+/// the bytes can only go back to the position they were sealed for — and once
+/// that position has been spent and pruned, no re-emit exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegState {
+    /// The outbox holds an entry at the stored sequence. Nothing is owed.
+    Queued,
+    /// The sequence has been spent and its entry pruned, so the stored bytes
+    /// have no address left. The attempt cannot be re-emitted or replaced.
+    Stale,
+    /// The sequence is unspent: the crash the slot survived happened between the
+    /// commit and the enqueue, and the stored bytes go back where they belong.
+    Missing,
+}
+
+/// What one load-time pass learned from the outbox, under the store's lock.
+#[derive(Debug)]
+enum ResumeSurvey {
+    /// The outbox stands behind the resume record's durable send floor, so the
+    /// record family has been rolled back and no derivation from it is safe.
+    FloorRegressed {
+        floor: SendFloor,
+        position: SendFloor,
+    },
+    /// What the pass needs to decide: whether unsealed mail is waiting, where an
+    /// attempt would be addressed, and where the stored one stands.
+    Surveyed {
+        unsealed_pending: bool,
+        next_seq: u64,
+        leg: Option<LegState>,
+    },
+}
+
+/// Tell the user one correspondence cannot be resumed, and name what it owes.
+///
+/// **One event for three arrivals at one state**, because the user's remedy is
+/// the same in all three and the taxonomy already has the words for it.
+/// [`TeardownCause::NoProvisionalRecord`] renders as *"this conversation cannot
+/// be resumed, because nothing was kept that could carry it on; messages already
+/// sent keep trying to arrive, and a new conversation has to be started"*, and
+/// its key [`TrustEventKey::DmChannelTornDownOnRestart`] is
+/// `PersistentNonBlocking`, which ISC-A-C12 forbids suppressing. Every clause is
+/// true of a correspondence whose `S_pc` did not survive, of one whose handshake
+/// record is gone before `RS_0` could be derived, and of one whose only speakable
+/// attempt sits at a sequence the outbox has moved past.
+///
+/// `surfaced` carries what the user is owed rather than an empty list: these are
+/// messages they believed were on their way, and this event is the only place
+/// their fate is stated. A store that will not answer contributes none, which
+/// understates and never overstates.
+fn cannot_resume(correspondence: &Correspondence, surfaced: Vec<u64>) -> Vec<DmEffect> {
+    vec![DmEffect::Emit(DmEvent::ChannelLost {
+        with: Box::new(*correspondence.pk_lt),
+        cause: TeardownCause::NoProvisionalRecord,
+        event: TrustEventKey::DmChannelTornDownOnRestart,
+        surfaced,
+    })]
+}
+
+/// The sequence numbers one correspondence still owes its user, read from the
+/// stored outbox.
+///
+/// An empty list on a store that will not answer, which understates the loss and
+/// never overstates it — the direction § D-DELIV picks everywhere else here.
+fn pending_seqs(persist: &DmPersist, label: &CorrespondenceLabel, now_ms: i64) -> Vec<u64> {
+    match persist.read_outbox(label, now_ms) {
+        Ok(Some(outbox)) => outbox
+            .iter()
+            .filter(|entry| entry.lifecycle().is_pending())
+            .map(OutboxEntry::seq)
+            .collect(),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            crate::vtrace!("dm driver: the outbox would not read for what it owes: {e}");
+            Vec::new()
+        }
     }
 }
 
-/// Erase one provisional record, and say whether it is now gone.
+/// What one initiator-side establishment did to the disk.
+///
+/// **Three answers rather than a bool, because two of the failures have opposite
+/// remedies.** A store that could not be read this tick is a correspondence to
+/// try again; a handshake record that is gone, or a pseudonym key that did not
+/// survive the restart before the acceptance, is one that can never speak a
+/// re-establishment leg and whose user has to be told so. A single `false`
+/// collapsed those into "keep the handle", which retries the second for the life
+/// of the session and reports nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Establishment {
+    /// The resume record is on disk and the handshake record is gone.
+    Complete,
+    /// A transient store answer. The handle is kept and the tick tries again.
+    Retry,
+    /// This correspondence can never re-establish. Either its handshake record
+    /// is gone, so `RS_0` — an Expand sibling of an `ss0` establishment destroys
+    /// — cannot be derived; or this side's per-correspondent signing key did not
+    /// survive the restart that preceded the acceptance, and `S_pc` is neither
+    /// mnemonic-derivable nor recoverable from the shared secret
+    /// (`docs/design/direct-messaging.md:1056`). Recovery is a fresh first
+    /// contact, and the caller owes the user that in words.
+    Unrecoverable,
+}
+
+/// The initiator's establishment: write the resume record a reconnect needs,
+/// then erase the handshake record it supersedes.
+///
+/// **This is [`erase_provisional`] plus the write A4.8 puts ahead of the
+/// erasure** (`docs/design/direct-messaging.md:1056`), and the two sites are
+/// separate because only one of them is an establishment. `erase_provisional`
+/// also runs where this side's own knock is *abandoned* — a mutual knock, where
+/// accepting the correspondent's entry establishes the conversation under a
+/// different label — and a resume record written there would describe a channel
+/// nothing speaks on.
+///
+/// **A lost pseudonym key ends the correspondence, loudly.** `S_pc` is minted
+/// from the CSPRNG when the entry is sent and its only at-rest home is the
+/// record written here, so an initiator whose process ended before the
+/// acceptance arrived comes back without it and can never sign a leg. The
+/// handshake record is still erased — `ss0` roots `RK0`, and keeping it is the
+/// forward-secrecy claim inverted — and the answer is
+/// [`Establishment::Unrecoverable`], which the caller turns into the classed
+/// event a user can act on. The state that leaves behind is one the load path
+/// reads correctly on its own: an established contact record with no resume
+/// record beside it is A3.15 row 6, `RS` absent, which
+/// [`DmMachine::resume_channel`] surfaces as the recovery offer at every start.
+///
+/// The floor starts at the outbox's own counters, which is what this side has
+/// spent on the channel so far; it rises at the first completed
+/// re-establishment.
+fn establish_provisional(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    peer_pk_pc: &[u8; IDENTITY_PK_LEN],
+    now_ms: i64,
+) -> Establishment {
+    let Some((keyrec_addr, fc_epoch)) = correspondence.provisional else {
+        return Establishment::Complete;
+    };
+    let Some(signing_pc) = correspondence.signing_pc.as_ref() else {
+        crate::vtrace!(
+            "dm driver: this side's pseudonym key did not survive the restart, so this \
+             correspondence can never sign a re-establishment leg"
+        );
+        // Whatever the erase answers, the correspondence is unrecoverable: with
+        // no `S_pc` nothing can sign a leg, and with the record gone nothing can
+        // derive `RS_0` either. Both roads end at the same event.
+        match erase_provisional(persist, correspondence) {
+            Erasure::Deleted | Erasure::Absent => {}
+            Erasure::Retry => crate::vtrace!(
+                "dm driver: the handshake record of a correspondence that cannot re-establish \
+                 would not erase"
+            ),
+        }
+        return Establishment::Unrecoverable;
+    };
+    let floor = match persist.read_outbox(&correspondence.label, now_ms) {
+        Ok(Some(outbox)) => SendFloor::new(outbox.last_clear_gen(), outbox.next_send_seq()),
+        // Nothing has been queued on this channel, so nothing has been spent.
+        Ok(None) => SendFloor::new(0, 0),
+        Err(e) => {
+            crate::vtrace!("dm driver: the outbox would not read for the send floor: {e}");
+            return Establishment::Retry;
+        }
+    };
+    let outcome = establish_record(
+        persist,
+        &correspondence.label,
+        &keyrec_addr,
+        fc_epoch,
+        signing_pc,
+        peer_pk_pc,
+        floor,
+    );
+    if outcome == Establishment::Complete {
+        correspondence.provisional = None;
+    }
+    outcome
+}
+
+/// Write one correspondence's first resume record and erase the handshake
+/// record beside it.
+///
+/// **The committed re-establishment root comes from the handshake record and
+/// nowhere else.** `RS_0`
+/// is an Expand sibling of the `ss0` extraction
+/// (`docs/design/direct-messaging.md:302`), and establishment destroys `ss0` — so
+/// the last moment it can be read is from the record this call is about to
+/// erase. [`PendingHandshake::commit_with_resume`] is the ordering: the resume
+/// record is written first, the erase is best-effort behind it, and a crash
+/// between the two leaves both records, which the loader resolves in the resume
+/// record's favour.
+///
+/// [`Establishment::Retry`] on every outcome that leaves the handshake record
+/// where it was, so the caller keeps the handle that is the only thing able to
+/// open it again — the contract [`erase_record`] states in its own terms.
+fn establish_record(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    keyrec_addr: &ProvisionalContext,
+    fc_epoch: u64,
+    signing_pc: &SignKeypair,
+    peer_pk_pc: &[u8; IDENTITY_PK_LEN],
+    floor: SendFloor,
+) -> Establishment {
+    let ctx = RecordContext {
+        recipient_keyrec_addr: keyrec_addr,
+        fc_epoch,
+    };
+    match persist.restart_channel(label, &ctx) {
+        // A resume record is already the authority here, so this establishment
+        // has run before. The store says whether the erase behind it landed.
+        StoredChannelRestart::Established(_) => {
+            match persist.store().read_unlocked(
+                label,
+                daemonseed_core::storage::dm_store::RecordKind::Provisional,
+            ) {
+                Ok(None) => Establishment::Complete,
+                // The erase behind an earlier pass did not land. Nothing here is
+                // wrong with the correspondence; the record is owed a delete and
+                // the caller keeps the handle that addresses it.
+                Ok(Some(_)) => Establishment::Retry,
+                // **An I/O error is its own arm, not "the record is still
+                // there".** The two answers are indistinguishable in a
+                // `matches!` and lead to the same retry, but only one of them is
+                // a fault, and a store that will not read is worth a trace line
+                // where a record still awaiting its delete is not.
+                Err(e) => {
+                    crate::vtrace!(
+                        "dm driver: the store would not say whether the handshake record \
+                         is gone: {e}"
+                    );
+                    Establishment::Retry
+                }
+            }
+        }
+        StoredChannelRestart::HandshakeResumes(pending) => {
+            let roots = match pending.channel_roots() {
+                Ok(roots) => roots,
+                Err(e) => {
+                    crate::vtrace!("dm driver: the channel roots would not derive: {e}");
+                    return Establishment::Retry;
+                }
+            };
+            let resume = ResumeRecord::new(
+                Box::new(*signing_pc.secret_key()),
+                Box::new(*peer_pk_pc),
+                roots.rs0.clone(),
+                ReEstState::first_establishment(),
+                Retention::none(),
+                floor,
+            );
+            match pending.commit_with_resume(&resume) {
+                Ok(()) => Establishment::Complete,
+                Err(e) => {
+                    crate::vtrace!("dm driver: the resume record would not commit: {e}");
+                    Establishment::Retry
+                }
+            }
+        }
+        StoredChannelRestart::TornDown(teardown) => match teardown.cause() {
+            // No handshake record survives, so there is no `ss0` to derive
+            // `RS_0` from and no resume record can ever be written for this
+            // correspondence. Reported rather than answered `true`: the disk is
+            // tidy and the conversation is finished, and only the first of those
+            // was ever what the caller asked about.
+            TeardownCause::NoProvisionalRecord => Establishment::Unrecoverable,
+            cause => {
+                crate::vtrace!(
+                    "dm driver: the provisional record would not open to establish: {cause:?}"
+                );
+                Establishment::Retry
+            }
+        },
+    }
+}
+
+/// What became of one provisional record.
+///
+/// **Three answers rather than a bool, because the middle one is not the same
+/// news as the first.** A record this call deleted and a record that was
+/// already gone both leave the caller free to drop its handle, and a `true`
+/// covering both loses the one difference that matters: a record that vanished
+/// took `ss0` with it, so `RS_0` can never be derived and the correspondence can
+/// never re-establish. That is a user-visible state, and collapsing it into
+/// success is how it stayed unreported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Erasure {
+    /// The record was deleted by this call.
+    Deleted,
+    /// The store says there is no record here. Nothing to erase, and nothing
+    /// left that a re-establishment could be derived from.
+    Absent,
+    /// The store could not be read, the ciphertext did not open, or the
+    /// correspondent's state was lost. None of those says the record is gone, so
+    /// the caller keeps the handle that is the only thing able to address it.
+    Retry,
+}
+
+/// Erase one provisional record, and say what became of it.
 ///
 /// **The return value is the whole interface**, because the caller's only
 /// correct reaction to a failure is to keep the handle. The context names the
@@ -4988,17 +5913,12 @@ fn erase_provisional(persist: &DmPersist, correspondence: &mut Correspondence) {
 /// handle dropped on a failed erase leaves `{ss0, the opening ephemeral DK}` on
 /// disk with nothing left that could ever address it — a transient store fault
 /// turned into a permanent leak of the secret that roots `RK0`.
-///
-/// `true` on exactly two outcomes: the delete succeeded, or the store says
-/// there is no record there. Every other teardown cause is a statement about
-/// the store or the ciphertext at this moment, not about whether the record
-/// exists.
 fn erase_record(
     persist: &DmPersist,
     label: &CorrespondenceLabel,
     keyrec_addr: &ProvisionalContext,
     fc_epoch: u64,
-) -> bool {
+) -> Erasure {
     let ctx = RecordContext {
         recipient_keyrec_addr: keyrec_addr,
         fc_epoch,
@@ -5008,31 +5928,36 @@ fn erase_record(
         // record left beside it — so the erase this call exists to perform has
         // already been attempted. It is best-effort there, so the answer comes
         // from the store rather than from the arm.
-        StoredChannelRestart::Established(_) => matches!(
-            persist.store().read_unlocked(
+        StoredChannelRestart::Established(_) => {
+            match persist.store().read_unlocked(
                 label,
                 daemonseed_core::storage::dm_store::RecordKind::Provisional,
-            ),
-            Ok(None)
-        ),
+            ) {
+                Ok(None) => Erasure::Deleted,
+                Ok(Some(_)) => Erasure::Retry,
+                Err(e) => {
+                    crate::vtrace!(
+                        "dm driver: the store would not say whether the handshake record \
+                         is gone: {e}"
+                    );
+                    Erasure::Retry
+                }
+            }
+        }
         StoredChannelRestart::HandshakeResumes(pending) => match pending.commit() {
-            Ok(()) => true,
+            Ok(()) => Erasure::Deleted,
             Err(e) => {
                 crate::vtrace!("dm driver: the provisional record would not erase: {e}");
-                false
+                Erasure::Retry
             }
         },
         StoredChannelRestart::TornDown(teardown) => match teardown.cause() {
-            // Gone. Nothing to erase and nothing to retry.
-            TeardownCause::NoProvisionalRecord => true,
-            // The store could not be read, the ciphertext did not open, or the
-            // correspondent's state was lost. None of those says the record is
-            // absent, so the caller keeps its handle.
+            TeardownCause::NoProvisionalRecord => Erasure::Absent,
             cause => {
                 crate::vtrace!(
                     "dm driver: the provisional record would not open to erase: {cause:?}"
                 );
-                false
+                Erasure::Retry
             }
         },
     }
@@ -5200,6 +6125,14 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             // unanswered. Only the second has a stored handshake to
             // recompute a ratchet and channel roots from.
             rearm_handshake: record.pk_pc().is_none(),
+            // The mirror of the line above: a record holding a pseudonym is an
+            // established correspondence, which is the one state with a resume
+            // record behind it.
+            resume_owed: record.pk_pc().is_some(),
+            resume_faults: 0,
+            resume_retry_due_ms: None,
+            resume_surfaced: false,
+            resume_ceiling_surfaced: false,
             rearm_faults: 0,
             // Nothing is owed on a record read back from disk: the pseudonym
             // it holds is already written down, and one it does not hold has
@@ -5858,7 +6791,7 @@ mod tests {
         // Establish that identity behind the machine's back, so the accept
         // meets `AlreadyEstablished` from the store rather than from a stub.
         m.persist
-            .accept_first_contact(*fake_knock(21), BASE_MS)
+            .accept_first_contact(*fake_knock(21), &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
             .expect("the out-of-band establish succeeds");
 
         // Positive control: the request really is held before the accept.
@@ -6447,7 +7380,7 @@ mod tests {
         };
         let (label, ratchet) = m
             .persist
-            .accept_first_contact(*knock, BASE_MS)
+            .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
             .expect("the establish succeeds");
         m.correspondences.push(Correspondence {
             pk_lt,
@@ -6471,6 +7404,11 @@ mod tests {
             rearm_faults: 0,
             pseudonym_unwritten: false,
             pseudonym_faults: 0,
+            resume_owed: false,
+            resume_faults: 0,
+            resume_retry_due_ms: None,
+            resume_surfaced: false,
+            resume_ceiling_surfaced: false,
         });
         assert_eq!(
             m.only_next_send_seq(),
@@ -6562,7 +7500,7 @@ mod tests {
         };
         let (label, ratchet) = m
             .persist
-            .accept_first_contact(*knock, BASE_MS)
+            .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
             .expect("the establish succeeds");
         // Established, and its acceptance never composed — the state a refused
         // `fire_accept` leaves behind.
@@ -6588,6 +7526,11 @@ mod tests {
             rearm_faults: 0,
             pseudonym_unwritten: false,
             pseudonym_faults: 0,
+            resume_owed: false,
+            resume_faults: 0,
+            resume_retry_due_ms: None,
+            resume_surfaced: false,
+            resume_ceiling_surfaced: false,
         });
         assert_eq!(
             m.only_next_send_seq(),
@@ -9333,7 +10276,7 @@ mod tests {
         };
         let (label, _ratchet) = m
             .persist
-            .accept_first_contact(*knock, BASE_MS)
+            .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
             .expect("the establish succeeds");
         // No ratchet: the correspondence exists and cannot be spoken on, which
         // is the state a restart leaves behind.
@@ -9359,6 +10302,11 @@ mod tests {
             rearm_faults: 0,
             pseudonym_unwritten: false,
             pseudonym_faults: 0,
+            resume_owed: false,
+            resume_faults: 0,
+            resume_retry_due_ms: None,
+            resume_surfaced: false,
+            resume_ceiling_surfaced: false,
         });
 
         let out = m.fire_accept(BASE_MS, 0);
@@ -11634,6 +12582,1137 @@ mod tests {
                 "tick {tick} named a record of a torn-down conversation: {named:?}"
             );
         }
+    }
+
+    // ---- the load-time re-establishment pass (A3.12, A5.5, A9.1) -----------
+
+    /// Rewrite one correspondence's resume record with a different re-root
+    /// generation, keeping every other field the store's guards compare.
+    fn set_reroot_generation(m: &DmMachine, label: &CorrespondenceLabel, ratchet_gen: u32) {
+        let stored = read_resume(m, label);
+        let rewritten = ResumeRecord::new(
+            Box::new(*stored.s_pc()),
+            Box::new(*stored.pk_pc()),
+            stored.committed_root().clone(),
+            ReEstState {
+                reconnect_gen: stored.reconnect_gen() + 1,
+                reroot_ratchet_gen: ratchet_gen,
+                ..ReEstState::first_establishment()
+            },
+            Retention::none(),
+            stored.send_floor(),
+        );
+        m.persist
+            .commit_resume(label, &rewritten)
+            .expect("the rewritten record commits");
+    }
+
+    /// One correspondence's resume record, or a panic naming what was there.
+    fn read_resume(m: &DmMachine, label: &CorrespondenceLabel) -> ResumeRecord {
+        m.persist
+            .read_resume(label)
+            .expect("the resume record reads")
+            .expect("the establishment wrote one")
+    }
+
+    /// Queue one sealed channel entry at `seq`, sealed under `gen`.
+    fn queue_at_generation(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+        seq: u64,
+        gen: u32,
+    ) {
+        m.persist
+            .update_outbox(label, direction, BASE_MS, |outbox| {
+                outbox.enqueue_sealed(
+                    seq,
+                    OutboxTarget::ChannelPage,
+                    BASE_MS,
+                    SealedFrame::new(vec![0xC7; 64]),
+                    gen,
+                )?;
+                Ok(Mutation::Changed(()))
+            })
+            .expect("the entry queues");
+    }
+
+    /// Queue one entry that has no chain to seal against — A4.2's cause 2, and
+    /// the only state that opens a re-establishment.
+    fn queue_unsealed(m: &DmMachine, label: &CorrespondenceLabel, direction: Direction, seq: u64) {
+        m.persist
+            .update_outbox(label, direction, BASE_MS, |outbox| {
+                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, BASE_MS)?;
+                Ok(Mutation::Changed(()))
+            })
+            .expect("the entry queues");
+    }
+
+    /// Put one established correspondence into the state a crash between the
+    /// resume-record commit and the outbox enqueue leaves behind, and hand back
+    /// the sequence the leg was sealed for and its bytes.
+    ///
+    /// **The sequence is the outbox's live `next_send_seq`, never a literal.**
+    /// It is bound into the leg's seal key and its signature, so a fixture that
+    /// invented one would be testing a re-emit no production path can produce.
+    fn crash_after_committing_an_attempt(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+    ) -> (u64, Vec<u8>) {
+        let mut record = read_resume(m, label);
+        let seq = m
+            .persist
+            .read_outbox(label, BASE_MS)
+            .expect("the outbox reads")
+            .map_or(0, |outbox| outbox.next_send_seq());
+        let fresh = daemonseed_core::dm::resume::FreshAttempt::first();
+        let (eph_ek, eph_dk) = reest::mint_ephemeral().expect("the ephemeral mints");
+        let leg = reest::seal_re_est(
+            record.committed_root(),
+            direction,
+            record.reconnect_gen() + 1,
+            seq,
+            &fresh,
+            &eph_ek,
+            record.s_pc(),
+        )
+        .expect("the leg seals");
+        let bytes = leg.clone();
+        record
+            .open_attempt(
+                seq,
+                SealedReEst::seal(fresh, leg.into_boxed_slice()).expect("inside the length cap"),
+                eph_dk,
+            )
+            .expect("the slot is empty");
+        m.persist
+            .commit_resume(label, &record)
+            .expect("the opened attempt commits");
+        (seq, bytes)
+    }
+
+    /// The sequence numbers whose queued frame is exactly `bytes`.
+    fn queued_at_bytes(m: &DmMachine, label: &CorrespondenceLabel, bytes: &[u8]) -> Vec<u64> {
+        m.persist
+            .read_outbox(label, BASE_MS)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .iter()
+            .filter(|entry| entry.frame() == Some(bytes))
+            .map(|entry| entry.seq())
+            .collect()
+    }
+
+    /// Establish A with B and hand back A's label, leaving both machines alive.
+    fn established_initiator(
+        dir: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+    ) -> (DmMachine, DmMachine, CorrespondenceLabel) {
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), dir_b);
+        b.persist.provision_block_list().expect("provision B");
+        let mut a = machine(dir);
+        a.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let label = a.correspondences[0].label;
+        (a, b, label)
+    }
+
+    /// Every correspondence one batch of effects reports as lost.
+    fn lost(effects: &[DmEffect]) -> Vec<(TrustEventKey, Vec<u64>)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::ChannelLost {
+                    event, surfaced, ..
+                }) => Some((*event, surfaced.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The sequence numbers one batch of effects reports as undelivered.
+    fn undelivered_seqs(effects: &[DmEffect]) -> Vec<u64> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Delivery {
+                    seq,
+                    state: DeliveryState::Undelivered,
+                    ..
+                }) => Some(*seq),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M40. **A crash between committing an attempt and queueing it re-emits the
+    /// stored bytes at the stored sequence, and seals nothing new.**
+    ///
+    /// A9.1(a) makes a re-emit of a persisted attempt the byte-identical stored
+    /// seal, and the position is half of that: `seq` is bound into the leg's
+    /// seal key and its signature preimage, so bytes replayed at another
+    /// position open at an address the peer is not reading and verify against a
+    /// preimage it does not compute.
+    #[test]
+    fn a_crash_between_the_commit_and_the_queue_re_emits_the_stored_leg() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let label = {
+            let (a, _b, label) = established_initiator(&dir, &dir_b);
+            queue_unsealed(&a, &label, Direction::AToB, 40);
+            crash_after_committing_an_attempt(&a, &label, Direction::AToB);
+            label
+        };
+        let (held_seq, held) = {
+            let a = machine(&dir);
+            let slot = read_resume(&a, &label);
+            let slot = slot
+                .own_slot()
+                .expect("the crash left an attempt in flight");
+            (slot.seq(), slot.sealed().bytes().to_vec())
+        };
+        assert!(
+            queued_at_bytes(&machine(&dir), &label, &held).is_empty(),
+            "the fixture queued the leg, so there is no crash window to recover from"
+        );
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        a.on_tick(BASE_MS);
+
+        assert_eq!(
+            queued_at_bytes(&a, &label, &held),
+            vec![held_seq],
+            "the stored leg did not go back to the sequence it was sealed for"
+        );
+        let after = read_resume(&a, &label);
+        assert_eq!(
+            after.sealed_re_est().map(<[u8]>::to_vec),
+            Some(held),
+            "the record's sealed bytes changed under a re-emit"
+        );
+        assert_eq!(
+            after
+                .own_slot()
+                .map(daemonseed_core::dm::resume::OwnSlot::seq),
+            Some(held_seq),
+            "the record's stored sequence moved under a re-emit"
+        );
+    }
+
+    /// M41. **A second load does not queue the same leg twice, and neither does
+    /// one whose queued entry has since ended.**
+    ///
+    /// **The ended entry is the half a byte-comparison check gets wrong.**
+    /// `OutboxEntry::frame` answers `Some` only while an entry awaits
+    /// collection, so after a give-up such a check reads the leg as never
+    /// queued — and then reads its own spent sequence as one the outbox has
+    /// moved past, which is the unrecoverable state. The correspondence is
+    /// reported lost over an entry that is sitting right there, already
+    /// surfaced by the give-up that ended it. That is what the silence assertion
+    /// below catches; the sequence assertion alone does not.
+    #[test]
+    fn a_second_load_does_not_queue_the_same_leg_twice() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let label = {
+            let (a, _b, label) = established_initiator(&dir, &dir_b);
+            queue_unsealed(&a, &label, Direction::AToB, 40);
+            crash_after_committing_an_attempt(&a, &label, Direction::AToB);
+            label
+        };
+        let seq = {
+            let mut a = machine(&dir);
+            a.on_tick(BASE_MS);
+            let seq = read_resume(&a, &label).own_slot().expect("in flight").seq();
+            assert!(
+                a.persist
+                    .read_outbox(&label, BASE_MS)
+                    .expect("reads")
+                    .expect("there")
+                    .entry(seq)
+                    .is_some(),
+                "the first load did not queue the leg, so the second proves nothing"
+            );
+            seq
+        };
+
+        // The entry ends, which is what empties a byte comparison while the
+        // sequence stays spent. A teardown rather than the give-up sweep,
+        // because that sweep spares this target — and a correspondent whose
+        // state was lost ends every pending entry, legs included.
+        {
+            let a = machine(&dir);
+            a.persist
+                .update_outbox(
+                    &label,
+                    Direction::AToB,
+                    BASE_MS + GIVE_UP_MS + 1,
+                    |outbox| {
+                        let outcome = outbox.channel_torn_down(
+                            &TeardownCause::CorrespondentStateLost,
+                            BASE_MS + GIVE_UP_MS + 1,
+                        );
+                        assert!(outcome.surfaced.contains(&seq), "the fixture ended nothing");
+                        Ok(Mutation::Changed(()))
+                    },
+                )
+                .expect("the teardown runs");
+        }
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let out = a.on_tick(BASE_MS + GIVE_UP_MS + 1);
+
+        assert_eq!(
+            lost(&out),
+            Vec::new(),
+            "a queued leg whose entry has ended was reported unrecoverable: {out:?}"
+        );
+        let queued: Vec<u64> = a
+            .persist
+            .read_outbox(&label, BASE_MS + GIVE_UP_MS + 1)
+            .expect("reads")
+            .expect("there")
+            .iter()
+            .filter(|entry| entry.seq() >= seq)
+            .map(|entry| entry.seq())
+            .collect();
+        assert_eq!(
+            queued,
+            vec![seq],
+            "a second load queued the leg again at a fresh sequence"
+        );
+    }
+
+    /// M42. **The load path runs the dead-chain sweep; it ends only what was
+    /// sealed below the re-root generation, spares the knock, and the same tick
+    /// tells the user.**
+    ///
+    /// A3.12 makes the sweep a derivation re-run at every load, so this is the
+    /// driver's half of it: the core's tests say what the sweep decides, and
+    /// nothing but this says that a restart runs it. The entry at the re-root
+    /// generation and the doorbell entry beside it are the two controls — a
+    /// sweep that ended everything destroys live messages and an outstanding
+    /// first contact, and would pass a test that only checked the first.
+    #[test]
+    fn the_load_path_ends_only_entries_sealed_below_the_re_root_generation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let label = {
+            let (a, _b, label) = established_initiator(&dir, &dir_b);
+            set_reroot_generation(&a, &label, 5);
+            queue_at_generation(&a, &label, Direction::AToB, 20, 3);
+            queue_at_generation(&a, &label, Direction::AToB, 21, 5);
+            // A knock still awaiting collection, at a generation the re-root
+            // replaced. Only its target spares it — the real knock this
+            // correspondence sent has already been settled by the acceptance,
+            // so it is not the control this needs.
+            a.persist
+                .update_outbox(&label, Direction::AToB, BASE_MS, |outbox| {
+                    outbox.enqueue_sealed(
+                        22,
+                        OutboxTarget::Doorbell { slot: 3 },
+                        BASE_MS,
+                        SealedFrame::new(vec![0xD0; 64]),
+                        3,
+                    )?;
+                    Ok(Mutation::Changed(()))
+                })
+                .expect("the knock queues");
+            label
+        };
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        assert_eq!(
+            outbox_state(&a, &label, 20, BASE_MS),
+            DeliveryState::Composed,
+            "the fixture queued nothing to sweep"
+        );
+        assert_eq!(
+            outbox_state(&a, &label, 22, BASE_MS),
+            DeliveryState::Composed,
+            "the fixture has no live doorbell entry, so the exemption is untested"
+        );
+        let out = a.on_tick(BASE_MS);
+
+        assert_eq!(
+            outbox_state(&a, &label, 20, BASE_MS),
+            DeliveryState::Undelivered,
+            "an entry sealed under a chain the re-root replaced was left live"
+        );
+        assert_eq!(
+            outbox_state(&a, &label, 21, BASE_MS),
+            DeliveryState::Composed,
+            "an entry sealed under the re-rooted chain was ended as dead"
+        );
+        assert_eq!(
+            outbox_state(&a, &label, 22, BASE_MS),
+            DeliveryState::Composed,
+            "the outstanding knock was ended by the channel's dead-chain sweep"
+        );
+        assert_eq!(
+            undelivered_seqs(&out),
+            vec![20],
+            "the tick did not surface exactly the swept entry: {out:?}"
+        );
+    }
+
+    /// M43. **A leg goes onto the ANSWERING side's direction record too.**
+    ///
+    /// Kills a load path that names one direction: an acceptor's outbox runs
+    /// `b2a`, and an enqueue against `a2b` is refused as a direction mismatch,
+    /// so the leg would never be queued and the failure would be a trace line.
+    #[test]
+    fn an_acceptor_queues_its_leg_on_its_own_direction_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let label_b = {
+            let b_keys = peer_identity();
+            let mut b = machine_as(peer_identity(), &dir_b);
+            b.persist.provision_block_list().expect("provision B");
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            establish_pair(&mut a, &mut b, &b_keys);
+            let label_b = b.correspondences[b.correspondences.len() - 1].label;
+            assert_eq!(
+                b.persist
+                    .read_outbox(&label_b, BASE_MS)
+                    .expect("reads")
+                    .expect("the acceptance queued one")
+                    .direction(),
+                Direction::BToA,
+                "the acceptor's outbox is not the direction this test is about"
+            );
+            queue_unsealed(&b, &label_b, Direction::BToA, 40);
+            crash_after_committing_an_attempt(&b, &label_b, Direction::BToA);
+            label_b
+        };
+
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision B");
+        let seq = read_resume(&b, &label_b)
+            .own_slot()
+            .expect("in flight")
+            .seq();
+        b.on_tick(BASE_MS);
+
+        assert!(
+            b.persist
+                .read_outbox(&label_b, BASE_MS)
+                .expect("reads")
+                .expect("there")
+                .entry(seq)
+                .is_some(),
+            "the acceptor's leg was not queued on its own direction record"
+        );
+    }
+
+    /// M44. **Only UNSEALED mail opens a re-establishment.**
+    ///
+    /// A4.2's cause 2 is an entry that cannot seal without a chain. A sealed
+    /// entry re-seeds on its own persisted ladder against the chain it was
+    /// sealed under and needs no handshake, so opening one for it puts a leg on
+    /// the wire for a conversation that is only waiting for an acknowledgement.
+    /// The unsealed case is the positive control: without it a pass that never
+    /// opened anything would pass.
+    #[test]
+    fn a_sealed_pending_entry_opens_no_attempt_and_an_unsealed_one_does() {
+        for (unsealed, expected) in [(false, None), (true, Some(1u32))] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let label = {
+                let (a, _b, label) = established_initiator(&dir, &dir_b);
+                if unsealed {
+                    queue_unsealed(&a, &label, Direction::AToB, 40);
+                } else {
+                    queue_at_generation(&a, &label, Direction::AToB, 40, 0);
+                }
+                label
+            };
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            a.on_tick(BASE_MS);
+            assert_eq!(
+                read_resume(&a, &label).attempt().map(|a| a.get()),
+                expected,
+                "unsealed = {unsealed}: the pass opened the wrong number of attempts"
+            );
+        }
+    }
+
+    /// M45. **An outbox behind the resume record's durable send floor stops the
+    /// pass.**
+    ///
+    /// A9.2 makes the floor durable precisely so a rolled-back record family is
+    /// not silently trusted, and the sweep is a derivation from the resume
+    /// record onto that outbox. The at-floor case is the control: without it a
+    /// pass that refused every correspondence would pass.
+    #[test]
+    fn an_outbox_behind_the_stored_floor_stops_the_pass() {
+        // The establishment seeds the floor from the outbox, so the low case is
+        // the value already stored rather than zero — `commit_resume` refuses a
+        // floor that goes backwards, which is a different guard from the one
+        // this test is about.
+        for (floor_seq, opens) in [(1u64, true), (999u64, false)] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let label = {
+                let (a, _b, label) = established_initiator(&dir, &dir_b);
+                queue_unsealed(&a, &label, Direction::AToB, 40);
+                let stored = read_resume(&a, &label);
+                a.persist
+                    .commit_resume(
+                        &label,
+                        &ResumeRecord::new(
+                            Box::new(*stored.s_pc()),
+                            Box::new(*stored.pk_pc()),
+                            stored.committed_root().clone(),
+                            ReEstState::first_establishment(),
+                            Retention::none(),
+                            SendFloor::new(0, floor_seq),
+                        ),
+                    )
+                    .expect("the floor commits");
+                label
+            };
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            a.on_tick(BASE_MS);
+            assert_eq!(
+                read_resume(&a, &label).attempt().is_some(),
+                opens,
+                "floor seq {floor_seq}: the pass made the wrong call on a rolled-back outbox"
+            );
+        }
+    }
+
+    /// Overwrite one record with bytes that will not decode, and hand back the
+    /// original so the fault can be cleared again.
+    fn corrupt(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        kind: daemonseed_core::storage::dm_store::RecordKind,
+    ) -> Vec<u8> {
+        let good = m
+            .persist
+            .store()
+            .read_unlocked(label, kind)
+            .expect("reads")
+            .expect("the record exists");
+        m.persist
+            .store()
+            .critical_section(label, |guard| -> Result<(), DmPersistError> {
+                guard.replace(kind, b"not a record of this kind")?;
+                Ok(())
+            })
+            .expect("the fixture writes");
+        good
+    }
+
+    /// Put `bytes` back where [`corrupt`] found them.
+    fn restore(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        kind: daemonseed_core::storage::dm_store::RecordKind,
+        bytes: &[u8],
+    ) {
+        m.persist
+            .store()
+            .critical_section(label, |guard| -> Result<(), DmPersistError> {
+                guard.replace(kind, bytes)?;
+                Ok(())
+            })
+            .expect("the fixture restores");
+    }
+
+    /// One retry rung's worth of clock, plus a millisecond.
+    fn past_rung(rung: u32) -> i64 {
+        duration_as_ms(ReseedSchedule::delay_for_rung(rung)) + 1
+    }
+
+    /// M46. **A store fault at either read leaves the pass owed, and a later
+    /// tick completes it** — plus the classed event A3.15 row 6 owes on the way
+    /// past.
+    ///
+    /// Both records are faulted in turn because they fail at different points:
+    /// the resume record before the pass has a direction to work with, the
+    /// outbox record at the read that supplies it. A pass that cleared its flag
+    /// on the way in would leave the correspondence unswept and unattempted for
+    /// the life of the session over a fault that had already gone.
+    #[test]
+    fn a_store_fault_leaves_the_load_time_pass_owed_for_the_next_tick() {
+        use daemonseed_core::storage::dm_store::RecordKind;
+
+        for kind in [RecordKind::Resume, RecordKind::Outbox] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let (a, _b, label) = established_initiator(&dir, &dir_b);
+            queue_unsealed(&a, &label, Direction::AToB, 40);
+            drop(a);
+
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            let good = corrupt(&a, &label, kind);
+
+            let faulted = a.on_tick(BASE_MS);
+            assert_eq!(
+                lost(&faulted)
+                    .iter()
+                    .map(|(key, _)| *key)
+                    .collect::<Vec<_>>(),
+                vec![TrustEventKey::DmProvisionalRecordUnreadable],
+                "a {kind:?} that will not read was not surfaced: {faulted:?}"
+            );
+            assert!(
+                a.correspondences[0].resume_owed,
+                "the {kind:?} fault cleared the flag, so the pass will never run again"
+            );
+
+            restore(&a, &label, kind, &good);
+            a.on_tick(BASE_MS + past_rung(0));
+
+            assert!(
+                read_resume(&a, &label).attempt().is_some(),
+                "the pass did not complete on the tick after a {kind:?} fault cleared"
+            );
+            assert!(!a.correspondences[0].resume_owed);
+        }
+    }
+
+    /// M55. **A handshake record whose erase failed goes onto the retry list,
+    /// even when the correspondence it belonged to is finished.**
+    ///
+    /// The lost-`S_pc` path answers `Unrecoverable` whatever the erase did, so a
+    /// store fault there used to drop the handle with the record still on disk —
+    /// and that record holds `ss0`, which roots `RK0`, addressable only by the
+    /// context the handle carried. The correspondence being unrecoverable is not
+    /// a reason to stop erasing its opening secret.
+    ///
+    /// The fault is the provisional record itself: corrupted, `restart_channel`
+    /// answers `RecordUnusable`, which is the erase's retry case. Restored, the
+    /// next tick's retry finds it and deletes it — so the assertion is the
+    /// record's absence rather than the list's length, and a fixture that never
+    /// wrote a record could not pass it.
+    #[test]
+    fn a_failed_erase_on_an_unrecoverable_correspondence_is_retried() {
+        use daemonseed_core::storage::dm_store::RecordKind;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision B");
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+
+        // A knocks, B accepts, and B's acceptance is in hand — but A's pseudonym
+        // key is gone, which is the state a restart before the acceptance leaves.
+        let entry = knock_as_initiator(&mut a, &b_keys);
+        let label = a.correspondences[0].label;
+        let out = b.on_doorbell(BASE_MS, sweep_of(vec![entry]));
+        let request = out
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("B was not offered the knock");
+        b.on_command(BASE_MS, DmCommand::Accept { request });
+        let label_b = b.correspondences[b.correspondences.len() - 1].label;
+        let acceptance = queued_frame_at(&b, &label_b, 0, BASE_MS);
+        a.correspondences[0].signing_pc = None;
+        let good = corrupt(&a, &label, RecordKind::Provisional);
+
+        let conversation = conversation_of(&a, 0);
+        let folded = fold_page_at(
+            &mut a,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(0), acceptance)],
+        );
+
+        assert_eq!(
+            lost(&folded)
+                .iter()
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
+            vec![TrustEventKey::DmChannelTornDownOnRestart],
+            "a correspondence with no pseudonym key was not surfaced: {folded:?}"
+        );
+        assert!(
+            a.persist
+                .store()
+                .read_unlocked(&label, RecordKind::Provisional)
+                .expect("reads")
+                .is_some(),
+            "the fixture erased the record, so there is no failed erase to retry"
+        );
+
+        restore(&a, &label, RecordKind::Provisional, &good);
+        a.on_tick(BASE_MS);
+
+        assert!(
+            a.persist
+                .store()
+                .read_unlocked(&label, RecordKind::Provisional)
+                .expect("reads")
+                .is_none(),
+            "the handshake record survived the retry tick, so `ss0` is on disk with \
+             nothing that will ever address it again"
+        );
+    }
+
+    /// M52. **The unreadable retry widens, never abandons, and says so once when
+    /// it reaches the top rung.**
+    ///
+    /// A3.15 row 6 has the retry on a backoff and A3.13 forbids a terminal
+    /// state, so a store that never recovers must keep being asked — at a widening
+    /// cadence rather than on every tick, and with the user told once that the
+    /// cadence has stopped widening rather than told nothing for ever.
+    #[test]
+    fn the_unreadable_retry_widens_and_surfaces_its_ceiling_once() {
+        use daemonseed_core::storage::dm_store::RecordKind;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (a, _b, label) = established_initiator(&dir, &dir_b);
+        queue_unsealed(&a, &label, Direction::AToB, 40);
+        drop(a);
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let _good = corrupt(&a, &label, RecordKind::Resume);
+
+        let first = a.on_tick(BASE_MS);
+        assert_eq!(lost(&first).len(), 1, "the first fault said nothing");
+        // A tick inside the first rung asks nothing and says nothing.
+        let inside = a.on_tick(BASE_MS + 1);
+        assert!(
+            lost(&inside).is_empty(),
+            "a tick inside the backoff faulted again: {inside:?}"
+        );
+        assert_eq!(
+            a.correspondences[0].resume_faults, 1,
+            "a tick inside the backoff spent a rung"
+        );
+
+        // Walk the ladder to the ceiling and past it, one rung per tick.
+        let mut clock = BASE_MS;
+        let mut surfaces = lost(&first).len();
+        for rung in 0..u32::from(REARM_FAULT_CEILING) + 3 {
+            clock += past_rung(rung.min(u32::from(REARM_FAULT_CEILING) - 1));
+            surfaces += lost(&a.on_tick(clock)).len();
+        }
+
+        assert_eq!(
+            a.correspondences[0].resume_faults, REARM_FAULT_CEILING,
+            "the fault count did not saturate at the ceiling"
+        );
+        assert!(
+            a.correspondences[0].resume_owed,
+            "the pass was abandoned, which is the dead-end state A3.13 forbids"
+        );
+        assert_eq!(
+            surfaces, 2,
+            "expected exactly two events — the first fault and the ceiling — got {surfaces}"
+        );
+    }
+
+    /// M53. **A stale attempt releases its slot, so the next pass can open one.**
+    ///
+    /// Without the release `open_attempt` refuses for ever on the occupied slot,
+    /// and every later boot re-emits the same loss event over a correspondence
+    /// nothing can move — the dead-end state A3.13 forbids. The counter is what
+    /// keeps the release safe: the attempt that follows is the successor of the
+    /// one given up, never a reuse of its key.
+    #[test]
+    fn a_stale_attempt_releases_its_slot_and_the_next_pass_opens_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let label = {
+            let (a, _b, label) = established_initiator(&dir, &dir_b);
+            queue_unsealed(&a, &label, Direction::AToB, 40);
+            let (seq, _) = crash_after_committing_an_attempt(&a, &label, Direction::AToB);
+            // The leg's sequence spent and its entry pruned: the position the
+            // stored bytes are bound to no longer exists.
+            a.persist
+                .update_outbox(&label, Direction::AToB, BASE_MS, |outbox| {
+                    outbox.enqueue_sealed(
+                        seq,
+                        OutboxTarget::ChannelPage,
+                        BASE_MS,
+                        SealedFrame::new(vec![0x11; 32]),
+                        0,
+                    )?;
+                    outbox
+                        .entry_mut(seq)
+                        .expect("just enqueued")
+                        .confirm_written(BASE_MS)?;
+                    Ok(Mutation::Changed(()))
+                })
+                .expect("the fixture spends the sequence");
+            a.persist
+                .update_outbox(&label, Direction::AToB, BASE_MS, |outbox| {
+                    let ended = outbox.sweep_dead_chain(u32::MAX);
+                    assert!(ended.contains(&seq), "the fixture ended nothing");
+                    outbox.record_surfaced(&ended);
+                    let pruned = outbox.prune();
+                    assert!(pruned > 0, "the fixture pruned nothing");
+                    Ok(Mutation::Changed(()))
+                })
+                .expect("the fixture prunes");
+            label
+        };
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let out = a.on_tick(BASE_MS);
+        assert_eq!(
+            lost(&out).iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            vec![TrustEventKey::DmChannelTornDownOnRestart],
+            "a stale attempt was not surfaced: {out:?}"
+        );
+        assert!(
+            read_resume(&a, &label).own_slot().is_none(),
+            "the stale attempt kept its slot, so nothing can ever open another"
+        );
+
+        // The NEXT TICK of the same session opens the successor of the
+        // abandoned attempt: a give-up that needed a restart to be replaced
+        // would be a dead end with a longer clock.
+        assert!(
+            a.correspondences[0].resume_owed,
+            "the give-up left the pass unowed, so a replacement waits for a restart"
+        );
+        a.on_tick(BASE_MS);
+        let after = read_resume(&a, &label);
+        assert_eq!(
+            after.attempt().map(|a| a.get()),
+            Some(2),
+            "the pass after a give-up did not open the abandoned attempt's successor"
+        );
+    }
+
+    /// M54. **A queued leg does not burn its re-seed ladder while nothing can
+    /// dispatch it.**
+    ///
+    /// `OutboxEntry::emit` advances the rung whatever the caller does with the
+    /// bytes, so a leg picked up by the due loop would walk `RESEED_LADDER` end
+    /// to end against a dispatch that does not exist. The clock here runs past
+    /// `GIVE_UP_MS`, which is where the second half of the claim lives: the
+    /// give-up sweep spares the target too, so the leg does not turn up as a
+    /// message that failed to arrive at a sequence the user never sent.
+    #[test]
+    fn a_queued_leg_does_not_advance_its_ladder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (a, _b, label) = established_initiator(&dir, &dir_b);
+        queue_unsealed(&a, &label, Direction::AToB, 40);
+        let (seq, _) = crash_after_committing_an_attempt(&a, &label, Direction::AToB);
+        drop(a);
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        a.on_tick(BASE_MS);
+        assert!(
+            a.persist
+                .read_outbox(&label, BASE_MS)
+                .expect("reads")
+                .expect("there")
+                .entry(seq)
+                .is_some(),
+            "the fixture queued no leg"
+        );
+
+        // Well past the leg's first dispatch, every rung after it, AND the
+        // seven-day give-up — which is where the second claim lives: a leg
+        // swept by `sweep_give_ups` would be `Undelivered` here and owed a
+        // surfacing a user reads as a lost message.
+        let mut clock = BASE_MS;
+        let mut surfaced: Vec<u64> = Vec::new();
+        while clock < BASE_MS + GIVE_UP_MS * 2 {
+            clock += duration_as_ms(daemonseed_core::dm::outbox::RECONNECT_FIRST_DISPATCH) * 2;
+            surfaced.extend(undelivered_seqs(&a.on_tick(clock)));
+        }
+        assert!(
+            clock > BASE_MS + GIVE_UP_MS,
+            "the clock never reached the give-up, so half this test is vacuous"
+        );
+        // The unsealed entry the fixture queued IS a user message and gives up
+        // at seven days like any other — it is the control that says the sweep
+        // ran at all. The leg's own sequence must not be in that list.
+        assert!(
+            surfaced.contains(&40),
+            "the give-up sweep never fired, so the leg's absence proves nothing"
+        );
+        assert!(
+            !surfaced.contains(&seq),
+            "the leg was surfaced as a message that failed to arrive: {surfaced:?}"
+        );
+
+        let outbox = a
+            .persist
+            .read_outbox(&label, clock)
+            .expect("reads")
+            .expect("there");
+        let entry = outbox.entry(seq).expect("the leg is still queued");
+        assert_eq!(
+            entry.schedule().rung(),
+            0,
+            "the leg spent rungs of a ladder nothing is dispatching it on"
+        );
+        assert_eq!(
+            entry.delivery_state(),
+            DeliveryState::Composed,
+            "the leg reported a delivery state a user message would report"
+        );
+    }
+
+    /// M47. **An established correspondence with no resume record is loud, and
+    /// names a fresh first contact as the remedy.**
+    ///
+    /// A3.15 row 6's `absent` half. Reachable two ways and the same answer to
+    /// both: a correspondence established before the resume record was written
+    /// at all, and one whose initiator lost `S_pc` to a restart before its
+    /// acceptance arrived.
+    #[test]
+    fn an_established_correspondence_with_no_resume_record_is_surfaced() {
+        use daemonseed_core::storage::dm_store::RecordKind;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let _label = {
+            let (a, _b, label) = established_initiator(&dir, &dir_b);
+            queue_unsealed(&a, &label, Direction::AToB, 40);
+            a.persist
+                .store()
+                .critical_section(&label, |guard| -> Result<(), DmPersistError> {
+                    guard.delete(RecordKind::Resume)?;
+                    Ok(())
+                })
+                .expect("the fixture removes it");
+            label
+        };
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let out = a.on_tick(BASE_MS);
+
+        assert_eq!(
+            lost(&out),
+            vec![(TrustEventKey::DmChannelTornDownOnRestart, vec![40])],
+            "a correspondence that can never re-establish was not surfaced with \
+             what it owes: {out:?}"
+        );
+    }
+
+    /// M48. **An exhausted re-initiation window is surfaced with the mail it is
+    /// holding**, not returned as a trace.
+    ///
+    /// A3.8 has every anomaly classed and suppression-protected. The window is
+    /// exhausted at `ATTEMPT_CEILING` attempts against a window anchor, and
+    /// nothing here moves that anchor but a peer opening one of our attempts —
+    /// so the state is one the conversation does not leave on its own.
+    #[test]
+    fn an_exhausted_re_initiation_window_is_surfaced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let _label = {
+            let (a, _b, label) = established_initiator(&dir, &dir_b);
+            queue_unsealed(&a, &label, Direction::AToB, 40);
+            let stored = read_resume(&a, &label);
+            a.persist
+                .commit_resume(
+                    &label,
+                    &ResumeRecord::new(
+                        Box::new(*stored.s_pc()),
+                        Box::new(*stored.pk_pc()),
+                        stored.committed_root().clone(),
+                        ReEstState {
+                            attempt: daemonseed_core::dm::reest::ATTEMPT_CEILING,
+                            ..ReEstState::first_establishment()
+                        },
+                        Retention::none(),
+                        stored.send_floor(),
+                    ),
+                )
+                .expect("the exhausted window commits");
+            label
+        };
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let out = a.on_tick(BASE_MS);
+
+        assert_eq!(
+            lost(&out),
+            vec![(TrustEventKey::DmChannelTornDownOnRestart, vec![40])],
+            "an exhausted window was not surfaced with the mail it holds: {out:?}"
+        );
+    }
+
+    /// M49. **The late pseudonym write finishes the establishment**, so a
+    /// correspondence whose contact write was refused once still ends up with a
+    /// resume record.
+    ///
+    /// The state is the one `on_page` leaves behind when
+    /// `record_correspondent_pseudonym` is refused: the acceptance verified, the
+    /// pseudonym is owed, and the handshake record is still held because it is
+    /// the only thing a restart could re-arm from. Without the establishment on
+    /// this path the retry releases that record into an established
+    /// correspondence carrying no `S_pc`.
+    #[test]
+    fn a_retried_pseudonym_write_writes_the_resume_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let peer = peer_identity();
+        let _ = knock_as_initiator(&mut a, &peer);
+        let label = a.correspondences[0].label;
+        assert!(
+            a.correspondences[0].provisional.is_some(),
+            "the knock left no handshake record, so this path is not reachable"
+        );
+        assert!(
+            a.persist.read_resume(&label).expect("reads").is_none(),
+            "the knock wrote a resume record, so the write below proves nothing"
+        );
+        a.correspondences[0].peer_pk_pc = Some(Box::new([0x5cu8; IDENTITY_PK_LEN]));
+        a.correspondences[0].pseudonym_unwritten = true;
+
+        let out = a.retry_pseudonym_write(BASE_MS, 0);
+
+        assert!(
+            out.is_empty(),
+            "a write that landed reported the correspondence lost: {out:?}"
+        );
+        let resume = a
+            .persist
+            .read_resume(&label)
+            .expect("reads")
+            .expect("the retry owes a resume record");
+        assert_eq!(
+            resume.pk_pc().as_slice(),
+            [0x5cu8; IDENTITY_PK_LEN].as_slice(),
+            "the record verifies legs under a key the acceptance never carried"
+        );
+        assert!(
+            !a.correspondences[0].pseudonym_unwritten,
+            "the pseudonym is still owed after a write that landed"
+        );
+        assert!(
+            a.correspondences[0].provisional.is_none(),
+            "the handshake record was not released once its resume record landed"
+        );
+    }
+
+    /// M50. **Establishing twice is idempotent.** The second pass finds a resume
+    /// record already standing and answers `Complete` rather than writing a
+    /// second one over it — `commit_resume` refuses a changed pseudonym pair, so
+    /// a second write is an error rather than a no-op, and answering anything
+    /// but `Complete` leaves the caller holding a handle for a record that is
+    /// already gone.
+    ///
+    /// `establish_record` is called directly because that is the only way to
+    /// reach the arm: `establish_provisional` releases its handle on the first
+    /// success and returns before this arm on every later call.
+    #[test]
+    fn establishing_an_already_established_correspondence_changes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        let peer = peer_identity();
+        let _ = knock_as_initiator(&mut a, &peer);
+        let label = a.correspondences[0].label;
+        let (keyrec_addr, fc_epoch) = a.correspondences[0]
+            .provisional
+            .expect("the knock left a handshake record");
+        let peer_pk_pc = [0x5cu8; IDENTITY_PK_LEN];
+        let signing_pc = a.correspondences[0]
+            .signing_pc
+            .take()
+            .expect("the knock minted a pseudonym");
+
+        let first = establish_record(
+            &a.persist,
+            &label,
+            &keyrec_addr,
+            fc_epoch,
+            &signing_pc,
+            &peer_pk_pc,
+            SendFloor::new(0, 0),
+        );
+        assert_eq!(first, Establishment::Complete);
+        let after_first = read_resume(&a, &label).encode().to_vec();
+
+        let second = establish_record(
+            &a.persist,
+            &label,
+            &keyrec_addr,
+            fc_epoch,
+            &signing_pc,
+            &peer_pk_pc,
+            SendFloor::new(0, 0),
+        );
+
+        assert_eq!(
+            second,
+            Establishment::Complete,
+            "a second establishment did not read the standing resume record as done"
+        );
+        assert_eq!(
+            read_resume(&a, &label).encode().to_vec(),
+            after_first,
+            "a second establishment rewrote the resume record"
+        );
+    }
+
+    /// M51. **A correspondence with no ratchet refuses a send in as many
+    /// words.**
+    ///
+    /// Pinned because the re-emit's sequence recovery no longer depends on it,
+    /// and something else might: a path that queued on a downed channel would
+    /// move `next_send_seq` under a committed attempt's stored position.
+    #[test]
+    fn a_correspondence_with_no_ratchet_refuses_a_send() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let peer_pk = {
+            let (a, _b, _label) = established_initiator(&dir, &dir_b);
+            *a.correspondences[0].pk_lt
+        };
+
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        assert!(
+            a.correspondences[0].ratchet.is_none(),
+            "the reload kept a ratchet, so this proves nothing"
+        );
+        let out = a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(peer_pk),
+                body: "into a channel that is down".into(),
+            },
+        );
+
+        let reasons: Vec<RefusalReason> = out
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Refused { reason, .. }) => Some(*reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![RefusalReason::NotEstablishedThisSession],
+            "a send on a ratchet-less correspondence was not refused: {out:?}"
+        );
     }
 
     /// Every page a batch of effects asks the transport to close.

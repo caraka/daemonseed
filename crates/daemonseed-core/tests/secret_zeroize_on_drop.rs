@@ -1279,6 +1279,7 @@ fn resume_record() -> ResumeRecord {
             last_seen_re_est: 0,
             own: Some(OwnSlot::new(
                 10,
+                77,
                 SealedReEst::seal(FreshAttempt::first(), vec![0xD1; 64].into_boxed_slice())
                     .expect("a 64-byte frame is inside MAX_FRAME_LEN"),
                 EphemeralDecapKey::new(Box::new([0x3d; DK_LEN])),

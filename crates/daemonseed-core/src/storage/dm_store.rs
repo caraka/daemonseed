@@ -147,17 +147,21 @@
 //! compose and then after each rung. At 4 seals it takes a billion messages to
 //! reach the bound alone.
 //!
-//! ⚠️ **The "rewriting outbox and resume" half is not established.**
-//! [`crate::dm::persist::DmPersist::commit_resume`] has **zero production
-//! callers** — every call in the tree is a test, and so is every call of the
-//! first-establishment entry points
-//! [`PendingHandshake::establish_with_resume`](crate::dm::persist::PendingHandshake::establish_with_resume)
-//! and
+//! ⚠️ **The "rewriting outbox and resume" half is still the higher reading.** The
+//! resume record now has production writers —
+//! [`DmPersist::accept_first_contact`](crate::dm::persist::DmPersist::accept_first_contact)
+//! writes one at the acceptor's establishment,
 //! [`commit_with_resume`](crate::dm::persist::PendingHandshake::commit_with_resume)
-//! that reach it — so nothing yet shows that an emission touches the resume
-//! record. If it does not, the costs are 3 and 17 rather than 4 and 32. The
-//! figures above take the higher reading deliberately, so the driver cannot make
-//! this analysis optimistic by arriving.
+//! writes one at the initiator's, and the load-time re-establishment pass writes
+//! one per opened attempt — but none of those is an *emission*. A message's
+//! re-seed rewrites the outbox alone. So the per-message costs are 3 and 17
+//! rather than 4 and 32, and the figures above stay at the higher reading
+//! deliberately: a resume write per emission is what a later slice may add, and
+//! the bound must not have to be re-derived when it does.
+//!
+//! What the resume record does cost is **one seal per establishment** and one per
+//! re-establishment attempt, both per correspondence rather than per message, so
+//! neither is a term beside the poll table.
 //!
 //! Not counted: `RecordKind::Provisional` writes (per-correspondence, first
 //! contact only), and the per-message accounting over-counts because one

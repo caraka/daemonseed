@@ -1581,19 +1581,25 @@ modules:
       a stored record whose channel roots would not derive. Only the outbox is
       touched; the entry itself is accepted or declined separately and no pending
       frame is migrated onto the new channel.
-      accept_first_contact(VerifiedFirstContact, now_ms) ->
-      Result<(CorrespondenceLabel, Ratchet), DmPersistError> is the acceptor's
-      establishment, the counterpart of PendingHandshake::establish: it mints a
-      label, opens the recipient ratchet over the knock's ss0, and writes the
+      accept_first_contact(VerifiedFirstContact, s_pc: &[u8; ml_dsa::SK_LEN],
+      now_ms) -> Result<(CorrespondenceLabel, Ratchet), DmPersistError> is the
+      acceptor's establishment, the counterpart of PendingHandshake::establish: it
+      mints a label, opens the recipient ratchet over the knock's ss0, writes the
+      resume record carrying s_pc, the knock's pk_pc and RS_0, and then writes the
       contact record carrying pk_lt, pk_pc and the address root derived from that
-      ss0, with both timestamps at now_ms, in one call. The ratchet is built
+      ss0, with both timestamps at now_ms, in one call. s_pc is the acceptor's own
+      per-correspondent signing key, minted by the caller; the resume record is its
+      only at-rest home. The resume record is written first: the contact record's
+      pseudonym is what every later lookup reads as established, so a crash in the
+      other order leaves a correspondence that is established and cannot sign a
+      re-establishment leg. The ratchet is built
       before the record is written, so a module fault leaves the disk untouched.
       A correspondence already holding the knock's pk_lt is
       DmPersistError::AlreadyEstablished where its record carries a pseudonym;
       where it does not, that record is this side's own unanswered first-contact
       entry and is removed before the new label is minted, so one identity is
-      never under two records. No provisional record is written and no
-      resume record is written — the acceptor has neither.
+      never under two records. No provisional record is written — the acceptor
+      has none.
       read_block_list() -> Result<BlockList, DmPersistError> reads the profile's
       block list through the store's lock-free profile read. An absent record is
       DmPersistError::BlockListMissing, never an empty list: DmStore::open creates
@@ -1653,9 +1659,15 @@ modules:
       with the same DuplicateSequence a still-present entry would give. It is
       persisted, which is why the at-rest format is v4; v3 and v2 records are read
       with it defaulting to zero. OutboxTarget is Doorbell { slot },
-      validated against DOORBELL_SLOTS, or ChannelPage; the record key is not
-      carried and OutboxEntry::position() derives the page slot from the sequence
-      number. Lifecycle is AwaitingKey,
+      validated against DOORBELL_SLOTS, ChannelPage, or ReEstablishmentLeg; the
+      record key is not carried and OutboxEntry::position() derives the page slot
+      from the sequence number for both channel targets. ReEstablishmentLeg is
+      paged exactly as ChannelPage and differs only in being exempt from
+      sweep_dead_chain: a leg hangs off no ratchet chain, so the target rather
+      than a generation carries A3.12's exempting provenance. sweep_give_ups
+      spares it for a sharper reason: its return value is rendered to the user as
+      a message that failed to arrive, and a leg sits at a sequence the user
+      never sent anything at. Lifecycle is AwaitingKey,
       AwaitingCollection(SealedFrame), ConfirmedCollected or Undelivered, and
       is_pending() is the first two. OutboxEntry::surfacing() is
       Surfacing::Owed when a terminal transition has not yet been reported to the
@@ -1667,7 +1679,9 @@ modules:
       consumption it records. channel_torn_down's retained set is not flagged:
       those entries are unchanged and are re-reported on their own merits.
       encode/decode carry the flag; the at-rest form is
-      daemonseed/dm/outbox/v5\0 plus a 2-byte suite id. The v5 header carries
+      daemonseed/dm/outbox/v5\0 plus a 2-byte suite id; target tag 2 is
+      ReEstablishmentLeg, added to v5 in place because no released build has
+      written a v5 record. The v5 header carries
       next_send_seq: u64 and last_clear_gen: u32 after the pruned high-water, and
       each entry carries sealed_under_gen: u32 after next_due_ms. v4
       (OUTBOX_MAGIC_V4) is read with those three fields zero; v3
@@ -1682,7 +1696,10 @@ modules:
       sweep_dead_chain(reroot_ratchet_gen: u32) -> Vec<u64> ends, via
       OutboxEntry::end(Undelivered), exactly the AwaitingCollection entries whose
       target is OutboxTarget::ChannelPage and whose sealed_under_gen is strictly
-      below the argument; an OutboxTarget::Doorbell entry is left alone. It
+      below the argument; OutboxTarget::Doorbell and
+      OutboxTarget::ReEstablishmentLeg entries are left alone.
+      sweep_give_ups(now_ms) likewise ends no OutboxTarget::ReEstablishmentLeg
+      entry, whatever its age. It
       marks each ended entry Surfacing::Owed
       and returns their sequences; it is #[must_use], idempotent, and a
       derivation re-runnable at every load rather than a transaction. Sealing,
@@ -1717,6 +1734,13 @@ modules:
       and OnDht means the transport confirmed a write, not that the DHT holds
       the value (M2 — a losing set_dht_value also returns success).
       ReseedSchedule::new(now_ms) starts due immediately;
+      ReseedSchedule::deferred(now_ms) starts due at a delay drawn from
+      RECONNECT_FIRST_DISPATCH +/- RECONNECT_JITTER_FRAC — A5.5's
+      reconnect-cadence band, hours rather than the ladder's opening minute —
+      with the rung unspent, and
+      OutboxEntry::defer_first_dispatch(now_ms) -> Result<(), OutboxError>
+      installs one on an entry whose schedule still stands at rung 0, returning
+      OutboxError::FirstDispatchPassed once it does not;
       schedule_next_jittered(now_ms) consumes one rung of RESEED_LADDER (1, 2, 4,
       8, 16, 32, 64 minutes, then 60, then 86400 seconds repeating), jittered by
       RESEED_JITTER_FRAC through backoff::apply_jitter with the unit drawn from
@@ -1825,6 +1849,24 @@ modules:
       the crate holds a re-establishment result without holding the root the
       resumed channel's message keys descend from. Rerooted is Clone, Zeroize and
       ZeroizeOnDrop, and renders redacted.
+      ResumeRecord::open_attempt(seq: u64, sealed: SealedReEst, eph_dk:
+      EphemeralDecapKey) -> Result<(), ResumeError> occupies the own-initiation
+      slot at reconnect_gen + 1, records the outbox position the leg was
+      addressed to, and advances the attempt counter to the attempt the bytes
+      were sealed under, in one act — the counter and the slot cannot be set
+      apart, which is the pairing commit_resume and decode both refuse. An
+      occupied slot is ResumeError::AttemptAlreadyOpen and an attempt at or below
+      the counter is ResumeError::AttemptWouldRollBack. The window anchor is
+      untouched; only observed peer progress moves it.
+      ResumeRecord::abandon_attempt() empties the own-initiation slot and leaves
+      the attempt counter where it is — A3.8's give-up, the third act that
+      legitimately ends an initiation beside A3.7's contest and A3.14's
+      completion. commit_resume admits an empty slot at an unchanged generation
+      exactly when the counter has not moved; a slot emptied under a fresh
+      attempt is still ResumeError::OwnSlotAbandonedWithoutAcceptance. Keeping
+      the counter is what makes the release safe: the next open_attempt mints the
+      successor of the abandoned number, so nothing reseals under a key the peer
+      may already have answered.
       ResumeRecord::commit_reestablished(next: Rerooted, ratchet_gen: u32,
       now_ms: i64) -> Zeroizing<[u8; ROOT_KEY_LEN]> applies the whole transition
       in one act: the successor becomes
@@ -1904,7 +1946,9 @@ modules:
       Zeroizing<Vec<u8>> and decode(bytes) -> Result<ResumeRecord, ResumeError>
       are the
       at-rest form under RESUME_MAGIC (daemonseed/dm/resume/v2\0) plus a 2-byte
-      suite id, plaintext; storage::dm_store seals and pads it. decode takes no
+      suite id, plaintext; storage::dm_store seals and pads it. The own slot's
+      seq: u64 sits between its attempt and the ephemeral-key presence flag,
+      added to v2 in place because no released build has written a v2 record. decode takes no
       clock: no stored value here drives a terminal transition. RESUME_MAGIC_V1
       (daemonseed/dm/resume/v1\0) is recognised only to be refused by name as
       ResumeError::ObsoleteV1Layout. It rejects a
@@ -1921,7 +1965,9 @@ modules:
       ResumeError::DedupFull { capacity } for more entries than DEDUP_CAPACITY,
       ResumeError::DuplicateDedupEntry for the same position twice,
       ResumeError::SlotGenerationWithoutAttempt { generation } for a generation
-      on a slot standing empty, ResumeError::RetainedBytesWithoutFlag for
+      on a slot standing empty, ResumeError::EmptySlotHasSequence { seq } for a
+      non-zero sequence beside one (sequence 0 is a real position, so emptiness
+      cannot be spelled by the field), ResumeError::RetainedBytesWithoutFlag for
       retained bytes under a clear presence flag, and
       ResumeError::AttemptSlotDisagrees { field, slot } for an own slot whose
       attempt is not the counter, and

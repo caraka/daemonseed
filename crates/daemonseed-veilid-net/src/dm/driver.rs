@@ -3014,11 +3014,24 @@ mod tests {
             "A must actually have swept, or the acceptance above is vacuous"
         );
         // **The record the acceptance window existed for is gone**, and only
-        // now — the same read resumed before the knock's reply arrived.
+        // now — the same read resumed before the knock's reply arrived. The
+        // answer is `Established` rather than a teardown because the
+        // establishment wrote a resume record, and the loader reads that first:
+        // a resume record present is authority, whatever is or is not beside it.
         assert!(
             matches!(
                 store_a.restart_channel(&label_a, &ctx_a),
-                daemonseed_core::dm::persist::StoredChannelRestart::TornDown(_)
+                daemonseed_core::dm::persist::StoredChannelRestart::Established(_)
+            ),
+            "A's correspondence did not become established on a verified acceptance"
+        );
+        assert!(
+            matches!(
+                store_a.store().read_unlocked(
+                    &label_a,
+                    daemonseed_core::storage::dm_store::RecordKind::Provisional,
+                ),
+                Ok(None)
             ),
             "A's provisional record survived a verified acceptance"
         );

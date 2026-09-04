@@ -319,6 +319,34 @@ pub const RESEED_LADDER: &[Duration] = &[
 /// [`crate::backoff::DEFAULT_JITTER_FRAC`] rather than inventing a second number.
 pub const RESEED_JITTER_FRAC: f64 = crate::backoff::DEFAULT_JITTER_FRAC;
 
+/// The centre of the band a re-establishment leg's FIRST dispatch is drawn from
+/// — `docs/design/direct-messaging.md:1152` (A5.5).
+///
+/// **Hours, not the re-seed ladder's opening minute.** A5.5 requires a cause-2
+/// first dispatch to draw *"a wide randomized delay at reconnect-cadence scale
+/// (hours), not `RESEED_JITTER_FRAC`"*, and gives the reason the ladder's own
+/// jitter cannot serve: a device that comes back with k interrupted
+/// correspondences first-dispatches all of them from one boot instant, and a
+/// minute-scale spread around a shared `t₀` *"satisfies I6's letter and fails
+/// its purpose"*. Hours is the scale at which the batch stops being a batch.
+///
+/// The value is a build choice, like [`RESEED_LADDER`]'s rungs: A5.5 names the
+/// scale and leaves the number to the byte pass. Four hours with
+/// [`RECONNECT_JITTER_FRAC`] puts the band at one to seven hours, which spreads
+/// a boot's worth of legs across a working day.
+pub const RECONNECT_FIRST_DISPATCH: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// How wide the [`RECONNECT_FIRST_DISPATCH`] band is, as a fraction of its
+/// centre.
+///
+/// **0.75, against the re-seed ladder's 0.25**, because the two jitters answer
+/// different questions. The ladder's spreads one entry's retries so they do not
+/// beat against another record's; this one spreads a whole device's legs so the
+/// restart that caused them is not legible as a common cause, and A5.5 asks for
+/// it to be *wide*. At 0.75 the band is [0.25×, 1.75×] of the centre — a
+/// six-hour spread rather than a two-hour one.
+pub const RECONNECT_JITTER_FRAC: f64 = 0.75;
+
 /// Hard give-up: seven days from compose, after which the message is
 /// [`Lifecycle::Undelivered`] and surfaced.
 ///
@@ -332,6 +360,13 @@ pub const GIVE_UP_MS: i64 = GIVE_UP.as_secs() as i64 * 1_000;
 /// At-rest magic. The version is **inside** it, so a decoder compares one thing
 /// and cannot read a v1 body under a v2 header — the shape
 /// [`crate::dm::provisional`] uses.
+///
+/// **The v5 body was extended in place by target tag `2`
+/// ([`OutboxTarget::ReEstablishmentLeg`]) rather than by a v6.** No released
+/// build has written a v5 record, so none carrying the old tag set exists to be
+/// read, and every earlier version's decoder is unaffected: tag `2` is a value
+/// they never wrote. A version bump would add a migration arm for a population
+/// of zero.
 pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v5\0";
 
 /// The v4 magic, which [`Outbox::decode`] **reads**, defaulting the three fields
@@ -435,7 +470,7 @@ const ENTRY_FIXED_LEN: usize = 8 + 8 + 4 + 8 + 4 + 1 + 1 + 1;
 const fn target_encoded_len(target: OutboxTarget) -> usize {
     match target {
         OutboxTarget::Doorbell { .. } => 1 + 2,
-        OutboxTarget::ChannelPage => 1,
+        OutboxTarget::ChannelPage | OutboxTarget::ReEstablishmentLeg => 1,
     }
 }
 
@@ -568,6 +603,14 @@ pub enum OutboxError {
     /// live. Only a transition into a terminal state owes one, so no sequence
     /// of calls produces this — see [`Surfacing`].
     SurfacingOwedOnLiveEntry(u64),
+    /// [`OutboxEntry::defer_first_dispatch`] on an entry whose schedule has
+    /// already advanced past its first rung.
+    ///
+    /// The call moves an entry's *first* emission off the instant it was
+    /// enqueued at. An entry that has already been emitted has a due time
+    /// carrying a rung the ladder reached, and overwriting it would put a
+    /// message that has been waiting for hours back on the opening cadence.
+    FirstDispatchPassed(u64),
 }
 
 impl std::fmt::Display for OutboxError {
@@ -631,6 +674,9 @@ impl std::fmt::Display for OutboxError {
             }
             Self::SurfacingOwedOnLiveEntry(seq) => {
                 write!(f, "sequence {seq} owes a surfacing but has not ended")
+            }
+            Self::FirstDispatchPassed(seq) => {
+                write!(f, "sequence {seq} is past its first dispatch")
             }
         }
     }
@@ -720,6 +766,29 @@ pub enum OutboxTarget {
     /// the fail-safe posture forbids. One outbox per direction makes that
     /// unrepresentable instead of merely undocumented.
     ChannelPage,
+    /// A re-establishment leg, at the same page slot a channel entry of this
+    /// sequence would occupy.
+    ///
+    /// **A distinct target rather than a channel entry with a chosen
+    /// generation, because the provenance the sweep reads is a *kind*, not a
+    /// number.** `docs/design/direct-messaging.md:927` (A3.12) makes provenance
+    /// what *"exempts entries composed during a reconnect from the sweep"*, and
+    /// a leg has no honest generation to be exempted by: it hangs off no ratchet
+    /// chain, so any number written there is either below the next re-root
+    /// generation — [`Outbox::sweep_dead_chain`] then ends the very handshake
+    /// that completed — or a fiction chosen to sit above it. The doorbell knock
+    /// is exempted the same way and for the same reason, and its entry states
+    /// the argument in full.
+    ///
+    /// Addressed exactly as [`Self::ChannelPage`] is: a leg is *"shaped exactly
+    /// like an ordinary frame"* (A3.9) and rides *"at its own sequence
+    /// position"* (A3.2), so [`OutboxEntry::position`] answers for it.
+    ///
+    /// **Nothing publishes an entry with this target yet.** The re-establishment
+    /// slice queues one and stops there; deriving its page address needs the
+    /// resumed channel's own addressing, which is not built. An entry here is
+    /// committed state waiting for that, not a write in flight.
+    ReEstablishmentLeg,
 }
 
 /// Where an entry is in its life.
@@ -905,6 +974,36 @@ impl ReseedSchedule {
         }
     }
 
+    /// A schedule whose first emission is due at a wide randomized delay from
+    /// `now_ms` rather than at `now_ms` itself, with the ladder still standing
+    /// at its first rung.
+    ///
+    /// `docs/design/direct-messaging.md:1152` (A5.5) requires a re-establishment
+    /// leg's first dispatch to draw *"a wide randomized delay at
+    /// reconnect-cadence scale (hours), not `RESEED_JITTER_FRAC`"*. The cause is
+    /// gated on the restart by construction — a channel with no key schedule can
+    /// only first-dispatch after a boot — so k of them share one `t₀`, and a
+    /// minute-scale spread around it *"satisfies I6's letter and fails its
+    /// purpose"*. The band is [`RECONNECT_FIRST_DISPATCH`] ± [`RECONNECT_JITTER_FRAC`].
+    ///
+    /// **The rung does not advance, which is what separates this from
+    /// [`Self::schedule_next_jittered`].** That call consumes a rung, because it
+    /// runs after an emission; this one runs *before the first*, so consuming
+    /// one would start the ladder at its second delay and cost the entry a
+    /// re-seed it never spent. Every later emission is the ordinary ladder: only
+    /// the first dispatch is drawn from this band.
+    pub fn deferred(now_ms: i64) -> Self {
+        let delay = apply_jitter(
+            RECONNECT_FIRST_DISPATCH,
+            RECONNECT_JITTER_FRAC,
+            crate::jitter::unit(),
+        );
+        Self {
+            rung: 0,
+            next_due_ms: now_ms.saturating_add(delay.as_millis() as i64),
+        }
+    }
+
     /// How many emissions have been scheduled, saturating at the ladder's end.
     pub fn rung(&self) -> u32 {
         self.rung
@@ -1082,7 +1181,9 @@ impl OutboxEntry {
     /// doorbell knock, which is not paged.
     pub fn position(&self) -> Option<PagePosition> {
         match self.target {
-            OutboxTarget::ChannelPage => Some(position_of(self.seq)),
+            OutboxTarget::ChannelPage | OutboxTarget::ReEstablishmentLeg => {
+                Some(position_of(self.seq))
+            }
             OutboxTarget::Doorbell { .. } => None,
         }
     }
@@ -1166,6 +1267,33 @@ impl OutboxEntry {
     /// window is still pending and one exactly at it is not.
     pub fn is_given_up(&self, now_ms: i64) -> bool {
         now_ms.saturating_sub(self.composed_at_ms) >= GIVE_UP_MS
+    }
+
+    /// Move this entry's **first** emission off `now_ms` onto a delay drawn from
+    /// [`RECONNECT_FIRST_DISPATCH`] ± [`RECONNECT_JITTER_FRAC`].
+    ///
+    /// `docs/design/direct-messaging.md:1152` (A5.5) asks for this on a
+    /// re-establishment leg: an enqueue is due immediately, so a party that
+    /// enqueues one leg per interrupted correspondence at load would put all of
+    /// them on the wire at one instant. Drawing each independently from a
+    /// reconnect-cadence band is what leaves an observer holding several of
+    /// those records with arrival times that carry no common cause.
+    ///
+    /// **Refused once the first dispatch has happened**
+    /// ([`OutboxError::FirstDispatchPassed`]). After an emission the due time
+    /// carries a rung the ladder has reached, and overwriting it would put an
+    /// entry that has been waiting on the hourly rung back on the opening
+    /// cadence — a re-seed storm produced by the call whose whole purpose is to
+    /// prevent one.
+    ///
+    /// The give-up clock is untouched: it runs from compose, and the seven days
+    /// a message is owed do not grow because its first write was held back.
+    pub fn defer_first_dispatch(&mut self, now_ms: i64) -> Result<(), OutboxError> {
+        if self.schedule.rung() != 0 {
+            return Err(OutboxError::FirstDispatchPassed(self.seq));
+        }
+        self.schedule = ReseedSchedule::deferred(now_ms);
+        Ok(())
     }
 
     /// Emit this message: return the bytes to write, and advance the schedule.
@@ -1548,6 +1676,13 @@ impl Outbox {
     /// they were never sealed under any chain, so a re-establishment does not
     /// kill them — they seal against the new one when their key fetch succeeds.
     ///
+    /// **[`OutboxTarget::ReEstablishmentLeg`] entries are untouched, and that
+    /// exemption is what A3.12 asks provenance for.** A leg hangs off no ratchet
+    /// chain, so it has no generation this comparison could read truthfully; the
+    /// target says so instead. Without it a completed re-establishment ends the
+    /// very legs that completed it, which reaches the user as a message reported
+    /// undelivered and reaches the ladder as a stopped re-seed.
+    ///
     /// **[`OutboxTarget::Doorbell`] entries are untouched for the same reason,
     /// stated differently.** A doorbell knock is the conversation's opening
     /// write: it is sealed to the recipient's published static key, hangs from
@@ -1566,7 +1701,7 @@ impl Outbox {
         let mut fired = Vec::new();
         for entry in self.entries.values_mut() {
             if matches!(entry.lifecycle, Lifecycle::AwaitingCollection(_))
-                && !matches!(entry.target, OutboxTarget::Doorbell { .. })
+                && matches!(entry.target, OutboxTarget::ChannelPage)
                 && entry.sealed_under_gen < reroot_ratchet_gen
             {
                 entry.end(Lifecycle::Undelivered);
@@ -1882,10 +2017,22 @@ impl Outbox {
     /// [`Surfacing::Owed`] until a caller records that it was shown, so
     /// [`Self::owed_surfacings`] re-offers what this list carried across any
     /// number of restarts (#279).
+    ///
+    /// **[`OutboxTarget::ReEstablishmentLeg`] entries are exempt**, the same
+    /// exemption [`Self::sweep_dead_chain`] gives them and for a sharper reason.
+    /// The list this returns is *what a caller owes the user*, and it is rendered
+    /// as a message that failed to arrive — but a leg is a protocol frame at a
+    /// sequence the user never sent anything at, so a give-up on one reports a
+    /// delivery failure for a message that does not exist. The give-up a
+    /// re-establishment owes is A3.8's *re-establishment failed*, which is a
+    /// different surface with a different remedy; this sweep is not it.
     #[must_use = "a discarded give-up list is the silent abandonment the design forbids"]
     pub fn sweep_give_ups(&mut self, now_ms: i64) -> Vec<u64> {
         let mut fired = Vec::new();
         for entry in self.entries.values_mut() {
+            if matches!(entry.target, OutboxTarget::ReEstablishmentLeg) {
+                continue;
+            }
             if entry.lifecycle.is_pending() && entry.is_given_up(now_ms) {
                 entry.end(Lifecycle::Undelivered);
                 fired.push(entry.seq);
@@ -2174,6 +2321,7 @@ impl Outbox {
                     out.extend_from_slice(&slot.to_be_bytes());
                 }
                 OutboxTarget::ChannelPage => out.push(1),
+                OutboxTarget::ReEstablishmentLeg => out.push(2),
             }
             out.extend_from_slice(&entry.composed_at_ms.to_be_bytes());
             out.extend_from_slice(&entry.schedule.rung.to_be_bytes());
@@ -2289,6 +2437,7 @@ impl Outbox {
                     slot: u16::from_be_bytes(r.array()?),
                 },
                 1 => OutboxTarget::ChannelPage,
+                2 => OutboxTarget::ReEstablishmentLeg,
                 tag => {
                     return Err(OutboxError::UnknownTag {
                         field: "target",
@@ -2469,7 +2618,13 @@ fn validate_target(target: OutboxTarget) -> Result<(), OutboxError> {
         OutboxTarget::Doorbell { slot } if slot >= DOORBELL_SLOTS => {
             Err(OutboxError::SlotOutsideDoorbell(slot))
         }
-        _ => Ok(()),
+        // Written out rather than left to a wildcard: a target added later is a
+        // compile error here, where it has to be classified on purpose, instead
+        // of defaulting to unchecked — the discipline `Lifecycle::is_pending`
+        // states for its own match.
+        OutboxTarget::Doorbell { .. }
+        | OutboxTarget::ChannelPage
+        | OutboxTarget::ReEstablishmentLeg => Ok(()),
     }
 }
 
@@ -2605,6 +2760,155 @@ mod tests {
 
     fn frame(seed: u8) -> SealedFrame {
         SealedFrame::new(frame_bytes(seed))
+    }
+
+    /// **A deferred first dispatch is not due at the instant it was enqueued,
+    /// and the ladder still stands at its opening rung.**
+    ///
+    /// Both halves matter. Without the first the deferral did nothing and a
+    /// device that came back would write every leg at one boot instant; without
+    /// the second the entry has silently spent a rung and re-seeds one step
+    /// coarser for the rest of its life.
+    ///
+    /// The un-deferred entry beside it is the control: it IS due at `T0`, so a
+    /// clock that made everything undue would fail here rather than pass.
+    #[test]
+    fn a_deferred_first_dispatch_leaves_the_entry_undue_at_the_enqueue_instant() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, OutboxTarget::ChannelPage, T0, frame(0x11), 0)
+            .expect("enqueues");
+        ob.enqueue_sealed(2, OutboxTarget::ChannelPage, T0, frame(0x22), 0)
+            .expect("enqueues");
+        ob.entry_mut(2)
+            .expect("just enqueued")
+            .defer_first_dispatch(T0)
+            .expect("nothing has been emitted");
+
+        assert!(
+            ob.entry(1).expect("there").is_due(T0),
+            "an ordinary enqueue must be due at once, or this test proves nothing"
+        );
+        assert!(
+            !ob.entry(2).expect("there").is_due(T0),
+            "the deferred entry is still due at the instant it was enqueued"
+        );
+        assert_eq!(
+            ob.entry(2).expect("there").schedule().rung(),
+            0,
+            "deferring spent a rung of the ladder"
+        );
+        // **Both edges of A5.5's band, because one edge alone is vacuous.** A
+        // ceiling alone passes for a delay of zero — which is the un-deferred
+        // schedule this call exists to replace — and a floor alone passes for a
+        // leg parked for a week. The floor is what says the draw is at
+        // reconnect-cadence scale rather than at `RESEED_JITTER_FRAC`'s: the
+        // ladder's opening rung is a minute, and this floor is above it by two
+        // orders of magnitude.
+        let centre = RECONNECT_FIRST_DISPATCH.as_millis() as i64;
+        let floor = T0 + (centre as f64 * (1.0 - RECONNECT_JITTER_FRAC)) as i64;
+        let ceiling = T0 + (centre as f64 * (1.0 + RECONNECT_JITTER_FRAC)) as i64;
+        let due = ob.entry(2).expect("there").schedule().next_due_ms();
+        assert!(
+            due >= floor,
+            "the first dispatch is due at {due}, below the band's floor {floor}"
+        );
+        assert!(
+            due <= ceiling,
+            "the first dispatch is due at {due}, past the band's ceiling {ceiling}"
+        );
+        assert!(
+            floor > T0 + ReseedSchedule::delay_for_rung(0).as_millis() as i64,
+            "the band's floor is inside the re-seed ladder's opening rung, so \
+             this test cannot tell the two jitters apart"
+        );
+    }
+
+    /// **A re-establishment leg is exempt from the dead-chain sweep, and a
+    /// channel entry beside it at the same generation is not.**
+    ///
+    /// `docs/design/direct-messaging.md:927` (A3.12) makes provenance what
+    /// exempts an entry composed during a reconnect. The channel entry is the
+    /// control: without it a sweep that ended nothing at all would pass.
+    #[test]
+    fn the_sweep_spares_a_re_establishment_leg_and_ends_a_channel_entry_beside_it() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, OutboxTarget::ChannelPage, T0, frame(0x11), 3)
+            .expect("enqueues");
+        ob.enqueue_sealed(2, OutboxTarget::ReEstablishmentLeg, T0, frame(0x22), 3)
+            .expect("enqueues");
+
+        assert_eq!(
+            ob.sweep_dead_chain(5),
+            vec![1],
+            "the sweep must end the channel entry and spare the leg"
+        );
+        assert_eq!(
+            ob.entry(2).expect("there").delivery_state(),
+            DeliveryState::Composed,
+            "the leg was ended as if it hung off a chain"
+        );
+    }
+
+    /// **A leg does not give up at seven days either.** The give-up list is
+    /// rendered to the user as a message that failed to arrive, and a leg sits
+    /// at a sequence the user never sent anything at. The channel entry beside
+    /// it is the control: the sweep is running.
+    #[test]
+    fn the_give_up_sweep_spares_a_re_establishment_leg() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, OutboxTarget::ChannelPage, T0, frame(0x11), 0)
+            .expect("enqueues");
+        ob.enqueue_sealed(2, OutboxTarget::ReEstablishmentLeg, T0, frame(0x22), 0)
+            .expect("enqueues");
+
+        let past = T0 + GIVE_UP_MS + 1;
+        assert_eq!(
+            ob.sweep_give_ups(past),
+            vec![1],
+            "the give-up must end the channel entry and spare the leg"
+        );
+        assert_eq!(
+            ob.entry(2).expect("there").delivery_state(),
+            DeliveryState::Composed,
+            "the leg was reported as a message that failed to arrive"
+        );
+        assert_eq!(
+            ob.owed_surfacings(),
+            vec![1],
+            "the leg was queued for a surfacing a user would read as a lost message"
+        );
+    }
+
+    /// A leg is addressed at the page slot its sequence names, exactly as a
+    /// channel entry is — the exemption is about the sweep, not about paging.
+    #[test]
+    fn a_re_establishment_leg_is_paged_like_a_channel_entry() {
+        let mut ob = empty();
+        ob.enqueue_sealed(9, OutboxTarget::ReEstablishmentLeg, T0, frame(0x11), 0)
+            .expect("enqueues");
+        assert_eq!(
+            ob.entry(9).expect("there").position(),
+            Some(position_of(9)),
+            "a leg reported no page position, so nothing could address it"
+        );
+    }
+
+    /// **Deferring after the first dispatch is refused**, because the due time
+    /// then carries a rung the ladder reached and rewriting it would put an
+    /// entry that has been waiting on the slow rungs back on the opening
+    /// cadence.
+    #[test]
+    fn deferring_after_the_first_dispatch_is_refused() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, OutboxTarget::ChannelPage, T0, frame(0x11), 0)
+            .expect("enqueues");
+        let entry = ob.entry_mut(1).expect("just enqueued");
+        // The control: before the emission the same call is admitted.
+        entry.defer_first_dispatch(T0).expect("before any emission");
+        entry.emit(T0).expect("a live entry emits");
+
+        let refused = entry.defer_first_dispatch(T0);
+        assert_eq!(refused, Err(OutboxError::FirstDispatchPassed(1)));
     }
 
     /// The ask and the enqueue agree, at the boundary and on both sides of it.

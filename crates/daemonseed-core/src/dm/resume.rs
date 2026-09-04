@@ -134,6 +134,14 @@ use oxicrypt_ml_kem as ml_kem;
 /// At-rest magic. The version is **inside** it, so a decoder compares one thing
 /// and cannot read an older body under a newer header — the shape
 /// [`crate::dm::outbox`] and [`crate::dm::provisional`] both use.
+///
+/// **The v2 body was extended in place by the own slot's `seq`, rather than by
+/// a v3.** v2 has never been written by a released build, so no record of that
+/// layout exists to be read: a version bump would add a decoder arm for a
+/// population of zero, and `RESUME_MAGIC_V1`'s note gives the argument for why
+/// this module refuses predecessors rather than migrating them. The field order
+/// is `… own slot attempt · own slot seq · ephemeral key present …`, pinned by
+/// `the_at_rest_layout_is_byte_for_byte_what_it_was`.
 pub const RESUME_MAGIC: &[u8] = b"daemonseed/dm/resume/v2\0";
 
 /// The v1 magic, which [`ResumeRecord::decode`] recognises **only in order to
@@ -221,6 +229,7 @@ const FIXED_LEN: usize = RESUME_MAGIC.len()
     + 4 /* attempt */
     + 4 /* own slot generation */
     + 4 /* own slot attempt */
+    + 8 /* own slot seq */
     + 1 /* own slot ephemeral decapsulation key present */
     + ml_kem::DK_LEN /* own slot ephemeral decapsulation key */
     + 4 /* acceptance slot generation */
@@ -280,6 +289,22 @@ pub enum ResumeError {
     },
     /// A record offered under an earlier `attempt` than the stored one.
     AttemptWouldRollBack { stored: u32, offered: u32 },
+    /// An empty own-initiation slot carrying a non-zero sequence position.
+    ///
+    /// Sequence 0 is a real outbox position, so the field cannot spell its own
+    /// absence; [`ResumeRecord::encode`] writes zero beside an empty slot and a
+    /// record carrying anything else was written by something else.
+    EmptySlotHasSequence { seq: u64 },
+    /// [`ResumeRecord::open_attempt`] on a record whose own-initiation slot is
+    /// already occupied.
+    ///
+    /// A9.1(a) makes a re-emit of a persisted attempt the byte-identical stored
+    /// seal, so a party holding an initiation has nothing to seal: the bytes it
+    /// owes the wire are in the slot. Overwriting the slot would publish a
+    /// second encapsulation key for one logical attempt while the peer, which
+    /// dedups on `attempt` (A9.4), answers the first — and the two sides then
+    /// hold roots that never agree.
+    AttemptAlreadyOpen { attempt: u32 },
     /// A record offered under an `attempt` that is already persisted, carrying
     /// **different** sealed RE-EST bytes.
     ///
@@ -541,6 +566,12 @@ impl std::fmt::Display for ResumeError {
             }
             Self::AttemptWouldRollBack { stored, offered } => {
                 write!(f, "attempt {offered} is behind the stored attempt {stored}")
+            }
+            Self::AttemptAlreadyOpen { attempt } => {
+                write!(f, "attempt {attempt} is still in flight")
+            }
+            Self::EmptySlotHasSequence { seq } => {
+                write!(f, "an empty handshake slot names sequence {seq}")
             }
             Self::AttemptResealed { attempt } => write!(
                 f,
@@ -1213,6 +1244,7 @@ impl std::fmt::Debug for SealedReEst {
 /// parties stop on roots that will never agree.
 pub struct OwnSlot {
     generation: u32,
+    seq: u64,
     sealed: SealedReEst,
     eph_dk: crate::dm::ratchet::EphemeralDecapKey,
 }
@@ -1226,14 +1258,31 @@ impl OwnSlot {
     /// supplied at the same moment or not at all.
     pub fn new(
         generation: u32,
+        seq: u64,
         sealed: SealedReEst,
         eph_dk: crate::dm::ratchet::EphemeralDecapKey,
     ) -> Self {
         Self {
             generation,
+            seq,
             sealed,
             eph_dk,
         }
+    }
+
+    /// The outbox sequence position the sealed `RE-EST` was addressed to.
+    ///
+    /// **Stored rather than recomputed, and that is what makes A9.1(a)'s
+    /// byte-identical re-emit reachable.** `seq` is bound into the leg's seal
+    /// key and into its signature preimage, so a re-emit that guessed a
+    /// different position would publish bytes the peer scans at the wrong
+    /// address and cannot verify. Recomputing it from the outbox's
+    /// `next_send_seq` is not available: a give-up followed by a prune moves
+    /// that counter, and the crash this slot exists to survive is exactly the
+    /// window in which the enqueue that would have spent the number never
+    /// happened.
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     /// The secret half of the ephemeral this initiation published — what
@@ -1262,6 +1311,7 @@ impl std::fmt::Debug for OwnSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OwnSlot")
             .field("generation", &self.generation)
+            .field("seq", &self.seq)
             .field("sealed", &self.sealed)
             // Renders as `EphemeralDecapKey(<redacted>)`; the newtype makes that
             // decision, and repeating it here would be a second answer free to
@@ -2036,6 +2086,80 @@ impl ResumeRecord {
         self.reroot_ratchet_gen
     }
 
+    /// Open a re-establishment attempt: occupy the own-initiation slot with a
+    /// sealed `RE-EST` and the secret half of the ephemeral it published, and
+    /// advance the attempt counter to the attempt those bytes were sealed under.
+    ///
+    /// **The counter and the slot move together because a record that carried
+    /// one without the other is unwritable.**
+    /// [`commit_resume`](crate::dm::persist::DmPersist::commit_resume) refuses a
+    /// record whose slot names an attempt its counter does not
+    /// ([`ResumeError::AttemptSlotDisagrees`]), and `decode` refuses the same
+    /// pairing, so there is deliberately no way to set one from outside.
+    ///
+    /// **The slot's generation is `reconnect_gen + 1`, supplied here rather than
+    /// by the caller.** [`OwnSlot`] carries the generation an initiation is
+    /// *trying to reach*, which A3.4 puts one past the committed one — a
+    /// distinction a caller passing a number would be free to get wrong, and
+    /// which nothing downstream would report.
+    ///
+    /// Refused on an occupied slot ([`ResumeError::AttemptAlreadyOpen`]), and on
+    /// a `sealed` whose attempt does not advance the counter
+    /// ([`ResumeError::AttemptWouldRollBack`]). The window anchor is untouched:
+    /// A8.2 moves it only on observed peer progress
+    /// ([`crate::dm::reest::AttemptBudget::observe_peer_opened`]), so spending an
+    /// attempt raises the toward-`C` count rather than resetting the window it
+    /// is counted in.
+    pub fn open_attempt(
+        &mut self,
+        seq: u64,
+        sealed: SealedReEst,
+        eph_dk: crate::dm::ratchet::EphemeralDecapKey,
+    ) -> Result<(), ResumeError> {
+        if let Some(held) = self.own.as_ref() {
+            return Err(ResumeError::AttemptAlreadyOpen {
+                attempt: held.attempt().get(),
+            });
+        }
+        let offered = sealed.attempt().get();
+        if offered <= self.attempt {
+            return Err(ResumeError::AttemptWouldRollBack {
+                stored: self.attempt,
+                offered,
+            });
+        }
+        self.attempt = offered;
+        self.own = Some(OwnSlot::new(
+            self.reconnect_gen.saturating_add(1),
+            seq,
+            sealed,
+            eph_dk,
+        ));
+        Ok(())
+    }
+
+    /// Give up on the initiation in the own slot, keeping the attempt counter.
+    ///
+    /// **A3.8's *re-establishment failed* is a state the record has to be able
+    /// to reach.** The design has a handshake leg *"reach its give-up"* and
+    /// A3.13 forbids a terminal one — *"no confirmation step and no terminal
+    /// state"* — so an initiation that will never complete has to be releasable
+    /// without a contest (A3.7) and without a completion (A3.14), which are the
+    /// only two acts that otherwise empty this slot.
+    ///
+    /// **The counter is untouched, which is what makes the release safe.** A5.2
+    /// keeps `attempt` monotone for the correspondence's whole lifetime, so the
+    /// next [`Self::open_attempt`] mints the successor of the abandoned number
+    /// rather than reusing it — the key-reuse B-A4-2 closed. The generation does
+    /// not move either: A3.4 advances it only by a *completed* handshake, and
+    /// nothing completed.
+    ///
+    /// Inert on an empty slot, so a caller that cannot tell whether it has
+    /// already given up may call it either way.
+    pub fn abandon_attempt(&mut self) {
+        self.own = None;
+    }
+
     /// Commit one completed re-establishment, as one act.
     ///
     /// `docs/design/direct-messaging.md:935` (A3.14) has the whole transition
@@ -2348,6 +2472,11 @@ impl ResumeRecord {
         // and writing the counter here would spell an occupied slot with no
         // frame — which `decode` then refuses for ever.
         let own_attempt = self.own.as_ref().map_or(0, |slot| slot.attempt().get());
+        // Zero on an empty slot, which `decode` requires: sequence 0 is a real
+        // position, so emptiness is carried by the attempt and this field has to
+        // agree with it, or the record would re-encode to bytes it was not read
+        // from.
+        let own_seq = self.own.as_ref().map_or(0, OwnSlot::seq);
         // Fixed width whether the slot is occupied or not, so every field after
         // it sits at a constant offset — the same shape the retained root below
         // is written in.
@@ -2382,6 +2511,7 @@ impl ResumeRecord {
         out.extend_from_slice(&self.attempt.to_be_bytes());
         out.extend_from_slice(&own_generation.to_be_bytes());
         out.extend_from_slice(&own_attempt.to_be_bytes());
+        out.extend_from_slice(&own_seq.to_be_bytes());
         match own_dk {
             Some(dk) => {
                 out.push(1);
@@ -2492,6 +2622,7 @@ impl ResumeRecord {
         let attempt_counter = u32::from_be_bytes(r.array()?);
         let own_generation = u32::from_be_bytes(r.array()?);
         let own_attempt = u32::from_be_bytes(r.array()?);
+        let own_seq = u64::from_be_bytes(r.array()?);
         let own_dk_present = r.array::<1>()?[0] != 0;
         // **Boxed straight from the borrowed input, never through a stack
         // array**, for the reason the `s_pc` read above records: `r.array()`
@@ -2583,6 +2714,12 @@ impl ResumeRecord {
                     generation: own_generation,
                 });
             }
+            // Sequence 0 is a real position, so emptiness cannot be spelled by
+            // the field itself; `encode` writes zero for an absent slot and a
+            // record carrying anything else is bytes this encoder did not write.
+            0 if own_seq != 0 => {
+                return Err(ResumeError::EmptySlotHasSequence { seq: own_seq });
+            }
             0 => None,
             n if sealed_re_est.is_empty() => {
                 return Err(ResumeError::OccupiedSlotHasNoFrame { attempt: n });
@@ -2660,6 +2797,7 @@ impl ResumeRecord {
             own: sealed.map(|sealed| {
                 OwnSlot::new(
                     own_generation,
+                    own_seq,
                     sealed,
                     crate::dm::ratchet::EphemeralDecapKey::new(own_dk_bytes),
                 )
@@ -2780,8 +2918,14 @@ mod tests {
 
     /// An occupied own-initiation slot at `generation`, sealed under `attempt`.
     fn own_slot(generation: u32, attempt: u32, seed: u8, len: usize) -> OwnSlot {
+        own_slot_at(generation, 77, attempt, seed, len)
+    }
+
+    /// An occupied own-initiation slot at `generation`, addressed at `seq`.
+    fn own_slot_at(generation: u32, seq: u64, attempt: u32, seed: u8, len: usize) -> OwnSlot {
         OwnSlot::new(
             generation,
+            seq,
             SealedReEst::seal(fresh(attempt), pattern(seed, len).into_boxed_slice())
                 .expect("the fixture is within MAX_FRAME_LEN"),
             eph_dk_fixture(),
@@ -2907,6 +3051,147 @@ mod tests {
         )
     }
 
+    /// **Opening an attempt moves the counter and the slot in one act, and puts
+    /// the slot one generation ahead of the committed one.**
+    ///
+    /// The three facts are asserted together because a record carrying any two
+    /// of them is one `commit_resume` refuses: `AttemptSlotDisagrees` on a
+    /// counter that does not match its slot, and a slot generation the peer
+    /// never contests on one that names the committed generation instead of the
+    /// one being reached.
+    #[test]
+    fn opening_an_attempt_advances_the_counter_and_occupies_the_slot() {
+        let mut record = opening();
+        assert_eq!(record.attempt(), None, "the fixture has attempted nothing");
+
+        let sealed = SealedReEst::seal(fresh(1), pattern(0x9c, 128).into_boxed_slice())
+            .expect("inside MAX_SEALED_LEG_LEN");
+        let bytes = sealed.bytes().to_vec();
+        record
+            .open_attempt(77, sealed, eph_dk_fixture())
+            .expect("a first attempt on an empty slot");
+
+        assert_eq!(attempt_of(&record).get(), 1, "the counter did not advance");
+        assert_eq!(
+            record.own_slot().map(OwnSlot::generation),
+            Some(record.reconnect_gen() + 1),
+            "the slot must name the generation the initiation is reaching"
+        );
+        assert_eq!(
+            frame_of(&record),
+            bytes.as_slice(),
+            "the slot holds bytes other than the ones sealed"
+        );
+        assert_eq!(
+            record.attempt_at_window_start(),
+            0,
+            "spending an attempt moved the window anchor, which only peer \
+             progress may do"
+        );
+    }
+
+    /// **A second open on an occupied slot is refused rather than overwriting
+    /// it** — A9.1(a)'s re-emit is the stored bytes, so a party holding an
+    /// initiation has nothing to seal.
+    ///
+    /// The mirror control is the test above: the same call on an empty slot
+    /// succeeds, so this is a refusal of the state rather than of the call.
+    #[test]
+    fn a_second_attempt_cannot_replace_one_still_in_flight() {
+        let mut record = opening();
+        record
+            .open_attempt(
+                77,
+                SealedReEst::seal(fresh(1), pattern(0x9c, 128).into_boxed_slice())
+                    .expect("inside MAX_SEALED_LEG_LEN"),
+                eph_dk_fixture(),
+            )
+            .expect("the first attempt");
+        let held = frame_of(&record).to_vec();
+
+        let refused = record.open_attempt(
+            78,
+            SealedReEst::seal(fresh(2), pattern(0x3d, 128).into_boxed_slice())
+                .expect("inside MAX_SEALED_LEG_LEN"),
+            eph_dk_fixture(),
+        );
+
+        assert!(
+            matches!(refused, Err(ResumeError::AttemptAlreadyOpen { attempt: 1 })),
+            "expected the in-flight attempt to be named, got {refused:?}"
+        );
+        assert_eq!(
+            frame_of(&record),
+            held.as_slice(),
+            "a refused open still replaced the slot's bytes"
+        );
+        assert_eq!(
+            attempt_of(&record).get(),
+            1,
+            "a refused open moved the counter"
+        );
+    }
+
+    /// **An attempt that does not advance the counter is refused**, which is the
+    /// case a completed handshake leaves reachable: A3.14 zeroes the slot, so
+    /// the emptiness alone would admit a re-seal of an attempt the peer has
+    /// already answered.
+    #[test]
+    fn an_attempt_that_does_not_advance_the_counter_is_refused() {
+        // The slot empty and the counter at 7 — the shape a completed handshake
+        // leaves behind.
+        let mut record = ResumeRecord::new(
+            s_pc(0x11),
+            pk_pc(0x22),
+            root(0x33),
+            ReEstState {
+                reconnect_gen: 9,
+                attempt: 7,
+                last_seen_re_est: 0,
+                own: None,
+                acceptance: None,
+                attempt_at_window_start: 2,
+                reroot_ratchet_gen: 0,
+            },
+            Retention::none(),
+            SendFloor::new(4, 100),
+        );
+
+        let refused = record.open_attempt(
+            78,
+            SealedReEst::seal(fresh(7), pattern(0x3d, 128).into_boxed_slice())
+                .expect("inside MAX_SEALED_LEG_LEN"),
+            eph_dk_fixture(),
+        );
+
+        assert!(
+            matches!(
+                refused,
+                Err(ResumeError::AttemptWouldRollBack {
+                    stored: 7,
+                    offered: 7
+                })
+            ),
+            "expected a refusal naming both numbers, got {refused:?}"
+        );
+        assert!(
+            record.own_slot().is_none(),
+            "a refused open occupied the slot"
+        );
+
+        // The control: the successor is admitted, so the refusal above is about
+        // the number rather than about the empty slot.
+        record
+            .open_attempt(
+                77,
+                SealedReEst::seal(fresh(8), pattern(0x3d, 128).into_boxed_slice())
+                    .expect("inside MAX_SEALED_LEG_LEN"),
+                eph_dk_fixture(),
+            )
+            .expect("the successor advances the counter");
+        assert_eq!(attempt_of(&record).get(), 8);
+    }
+
     #[test]
     fn every_field_survives_the_round_trip() {
         let before = populated();
@@ -3000,6 +3285,7 @@ mod tests {
             + 4 /* attempt counter */
             + 4 /* own slot generation */
             + 4 /* own slot attempt */
+            + 8 /* own slot seq */
             + 1 /* own slot ephemeral key present */
             + ml_kem::DK_LEN /* own slot ephemeral decapsulation key */
             + 4 /* acceptance generation */
@@ -3068,6 +3354,9 @@ mod tests {
         // generation naming an exchange that is not there.
         out.extend_from_slice(&if own_attempt == 0 { 0u32 } else { 10 }.to_be_bytes());
         out.extend_from_slice(&own_attempt.to_be_bytes()); // own slot attempt
+        // An empty slot names sequence 0, because 0 is a real position and the
+        // field cannot spell its own absence.
+        out.extend_from_slice(&if own_attempt == 0 { 0u64 } else { 77 }.to_be_bytes());
         // An occupied slot carries the ephemeral its RE-EST published; an empty
         // one carries a clear flag over an all-zero key, which is what `encode`
         // writes and what the decoder refuses to see contradicted.
@@ -3171,6 +3460,7 @@ mod tests {
         expected.extend_from_slice(&7u32.to_be_bytes()); // the attempt counter
         expected.extend_from_slice(&10u32.to_be_bytes()); // own slot generation
         expected.extend_from_slice(&7u32.to_be_bytes()); // own slot attempt
+        expected.extend_from_slice(&77u64.to_be_bytes()); // own slot seq
         expected.push(1); // own slot ephemeral decapsulation key present
         expected.extend_from_slice(&[0x3d; ml_kem::DK_LEN]); // that key
         expected.extend_from_slice(&8u32.to_be_bytes()); // acceptance generation
@@ -3650,6 +3940,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: Some(OwnSlot::new(
                     0,
+                    77,
                     SealedReEst::seal(
                         FreshAttempt::first(),
                         pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
@@ -4992,7 +5283,7 @@ mod tests {
         let own_gen_at = RESUME_MAGIC.len() + SUITE_ID_LEN + ml_dsa::SK_LEN + ml_dsa::PK_LEN
             + ROOT_KEY_LEN + 4 /* reconnect_gen */ + 4 /* attempt counter */;
         let acc_gen_at = own_gen_at + 4 /* own slot generation */ + 4 /* own slot attempt */
-            + 1 /* ephemeral key present */ + ml_kem::DK_LEN;
+            + 8 /* own slot seq */ + 1 /* ephemeral key present */ + ml_kem::DK_LEN;
         for (offset, generation) in [(own_gen_at, 10u32), (acc_gen_at, 8u32)] {
             let mut bytes = base.clone();
             bytes[offset..offset + 4].copy_from_slice(&generation.to_be_bytes());
@@ -5024,6 +5315,7 @@ mod tests {
             + 4 /* attempt counter */
             + 4 /* own slot generation */
             + 4 /* own slot attempt */
+            + 8 /* own slot seq */
             + 1 /* ephemeral key present */
             + ml_kem::DK_LEN
             + 4 /* acceptance generation */

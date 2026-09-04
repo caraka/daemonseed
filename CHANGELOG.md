@@ -65,6 +65,34 @@ work lives in the maintainer's own planning notes, not here.
   design's tunable `C`. (#404)
 - `DM_REEST_SALT`, `DM_REEST_LEG`, `DM_REEST_TIEBREAK` and `DM_REEST_SIG` in
   `daemonseed_core::dm::domain` — the re-establishment label family. (#404)
+- `daemonseed_core::dm::resume::ResumeRecord::open_attempt(seq, SealedReEst, EphemeralDecapKey)` —
+  occupy the own-initiation slot at `reconnect_gen + 1` and advance the attempt counter in one act.
+  Refused on an occupied slot (`ResumeError::AttemptAlreadyOpen`) and on an attempt that does not
+  advance the counter (#404).
+- `daemonseed_core::dm::resume::OwnSlot` — a `seq` field carrying the outbox position its sealed
+  `RE-EST` was addressed to; `OwnSlot::new` takes it and `OwnSlot::seq()` reads it. `seq` is bound
+  into the leg's seal key and signature preimage, so a re-emit has no other way to reach the position
+  the peer reads (#404).
+- `daemonseed_core::dm::resume::ResumeRecord::abandon_attempt()` — empty the own-initiation slot
+  while the attempt counter stands still, which is A3.8's give-up. `commit_resume` admits an empty
+  slot at an unchanged generation exactly when the counter has not moved; a slot emptied under a
+  fresh attempt is still `ResumeError::OwnSlotAbandonedWithoutAcceptance` (#404).
+- `daemonseed_core::dm::outbox::OutboxTarget::ReEstablishmentLeg` — a channel-paged entry the
+  dead-chain sweep and the give-up sweep both skip. A leg hangs off no ratchet chain, so the target rather than a generation
+  carries A3.12's exempting provenance (#404).
+- `daemonseed_core::dm::outbox::ReseedSchedule::deferred(now_ms)`,
+  `OutboxEntry::defer_first_dispatch(now_ms)`, `RECONNECT_FIRST_DISPATCH` and
+  `RECONNECT_JITTER_FRAC` — a first emission due at a delay drawn from A5.5's reconnect-cadence band
+  rather than at the enqueue instant, with the rung unspent. Refused past the first dispatch
+  (`OutboxError::FirstDispatchPassed`) (#404).
+- `daemonseed_veilid_net::dm` — the DM driver's load-time re-establishment pass. On the first tick
+  after a load, an established correspondence runs the dead-chain sweep against its resume record's
+  re-root generation, and — where the outbox holds pending mail — seals a `RE-EST` under the
+  committed re-establishment root, commits it to the resume record, and queues it on its own
+  direction record under `OutboxTarget::ReEstablishmentLeg` with a first dispatch drawn from A5.5's
+  reconnect-cadence band. **Nothing dispatches a queued leg yet** — the emission loop skips that
+  target, so the entry waits with its re-seed ladder and its give-up clock untouched. A persisted attempt is re-emitted as the stored bytes at the sequence the
+  own slot records, never resealed (#404).
 - `daemonseed_tui::net` / `daemonseed_gui::net` — the front-end DM contract. `NetCommand::Connect`
   carries `dm_session_keys: Option<DmSessionKeys>` (the full identity KEM keypair, the doorbell slot
   secret and the profile at-rest key); the net actor moves it into `DmDriverParts` and spawns a
@@ -589,6 +617,15 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed_core::dm::persist::DmPersist::accept_first_contact` takes the acceptor's own
+  per-correspondent signing key and writes the correspondence's resume record before its contact
+  record (#404).
+- `daemonseed_core::dm::resume` at-rest v2 carries the own slot's `seq` between its attempt and the
+  ephemeral-key presence flag. The magic is unchanged: no released build has written v2.
+  `ResumeError::EmptySlotHasSequence` refuses a non-zero sequence beside an empty slot (#404).
+- `daemonseed_core::dm::outbox` at-rest v5 assigns target tag `2` to
+  `OutboxTarget::ReEstablishmentLeg`. The magic is unchanged: no released build has written v5.
+  `OutboxError::FirstDispatchPassed` is new (#404).
 - `daemonseed_core::dm::outbox` at-rest format v5 (`daemonseed/dm/outbox/v5\0`): the header carries
   `next_send_seq` and `last_clear_gen`, each entry carries `sealed_under_gen`. v4, v3 and v2 are
   read with the new fields zero; v1 is still refused. `Outbox::publish` and `Outbox::enqueue_sealed`

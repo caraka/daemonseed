@@ -329,7 +329,33 @@ types:
       the contiguous prefix moved, bounded by the pages this session has swept. A
       correspondence found on disk at startup is listed with no ratchet — a
       ratchet has no at-rest record — so it sweeps nothing and a Send to it is
-      refused with NotEstablishedThisSession. The same cadence carries the
+      refused with NotEstablishedThisSession. On the first tick after a load, an
+      established correspondence runs one re-establishment pass: the dead-chain
+      sweep against its resume record's reroot_ratchet_gen, ending every entry
+      sealed below it and leaving each owing the surfacing the same tick then
+      offers; and, where the outbox still holds a pending entry and the
+      re-initiation window has attempts left, a RE-EST sealed under the committed
+      re-establishment root at the outbox's next sequence, committed to the resume
+      record and only then queued on this side's direction record as an
+      OutboxTarget::ReEstablishmentLeg with its first dispatch drawn from A5.5's
+      reconnect-cadence band. Nothing dispatches a queued leg: the emission loop
+      skips that target before OutboxEntry::emit, so the entry's ladder does not
+      advance and its give-up does not run down. Pending mail means an UNSEALED entry
+      (Lifecycle::AwaitingKey): a sealed one re-seeds on its own ladder and needs
+      no handshake. A resume record already carrying an attempt is re-emitted as
+      its stored bytes at the sequence its own slot records, queued only if the
+      outbox does not already hold that sequence, and never resealed; a sequence
+      the outbox has moved past cannot be re-emitted at all and is surfaced. The
+      pass runs once per load and is re-owed on a store fault, bounded at eight
+      consecutive faults. An outbox standing behind the resume record's durable
+      send floor stops it, sweeping nothing and opening nothing. Three states
+      reach one classed event — DmEvent::ChannelLost carrying
+      TrustEventKey::DmChannelTornDownOnRestart and the sequences the
+      correspondence still owes: a resume record absent on an established
+      correspondence, a stored attempt whose sequence has been spent, and a
+      re-initiation window with no attempts left. A resume record that will not
+      read is DmProvisionalRecordUnreadable, emitted once per session while the
+      pass keeps retrying. The same cadence carries the
       acknowledgement plane. As a receiver the driver holds one
       daemonseed_core::dm::ack_cadence::StandaloneAckCadence per correspondence,
       keyed on the sent_unix_ms each collected frame asserted CLAMPED to the
