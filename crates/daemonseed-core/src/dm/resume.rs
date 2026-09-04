@@ -105,25 +105,53 @@
 //!
 //! ## What this module does not do
 //!
-//! It holds bytes and orders two integers. It seals nothing, derives nothing,
-//! reads no clock and encapsulates nothing: [`ResumeRecord::encode`] is
-//! plaintext, and `dm_store` seals it, pads it to the kind's fixed bucket and
-//! refuses an oversized payload — the same split [`crate::dm::outbox`] uses.
+//! [`ResumeRecord`] holds bytes and orders integers. It seals nothing, reads no
+//! clock and encapsulates nothing: [`ResumeRecord::encode`] is plaintext, and
+//! `dm_store` seals it, pads it to the kind's fixed bucket and refuses an
+//! oversized payload — the same split [`crate::dm::outbox`] uses.
+//!
+//! [`reroot`] is the one derivation here, and it sits beside the record rather
+//! than in [`crate::dm::ratchet`] because its subject is the **retained** root:
+//! it consumes the value this record stores and produces the value that
+//! replaces it, so putting it with the running ratchet's roots would invite a
+//! caller to advance the wrong one. It still encapsulates nothing — the fresh
+//! secret arrives as an argument, from [`crate::dm::reest`].
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use oxicrypt_kdf::HkdfSha384;
+
 use crate::crypto::suite::{Registry, SuiteId, SuiteIdError};
+use crate::dm::domain;
 use crate::dm::frame::MAX_FRAME_LEN;
 use crate::dm::ratchet::{Direction, ROOT_KEY_LEN};
 use crate::secret_seed::redacted_secret_newtype;
 use std::num::NonZeroU32;
 
 use oxicrypt_ml_dsa as ml_dsa;
+use oxicrypt_ml_kem as ml_kem;
 
 /// At-rest magic. The version is **inside** it, so a decoder compares one thing
 /// and cannot read an older body under a newer header — the shape
 /// [`crate::dm::outbox`] and [`crate::dm::provisional`] both use.
-pub const RESUME_MAGIC: &[u8] = b"daemonseed/dm/resume/v1\0";
+pub const RESUME_MAGIC: &[u8] = b"daemonseed/dm/resume/v2\0";
+
+/// The v1 magic, which [`ResumeRecord::decode`] recognises **only in order to
+/// refuse it by name**, with [`ResumeError::ObsoleteV1Layout`].
+///
+/// v2 widened the body by the own slot's ephemeral decapsulation key, its
+/// presence flag, and the re-rooted ratchet generation. A v1 body read under
+/// this layout runs out of bytes and reports [`ResumeError::Truncated`], which
+/// names the wrong fault and hides that the record is simply older — and the
+/// two fields it lacks are not defaultable in the direction that matters: an
+/// occupied own slot with no ephemeral key is precisely the state
+/// [`ResumeError::OccupiedSlotHasNoEphemeralKey`] exists to refuse, because such
+/// an initiation re-emits for ever and can never be completed.
+///
+/// [`crate::dm::outbox`] reads its own predecessors instead of refusing them.
+/// The difference is what the missing field is: an outbox's new fields have a
+/// truthful zero (nothing sent, the first chain), and this one's does not.
+pub const RESUME_MAGIC_V1: &[u8] = b"daemonseed/dm/resume/v1\0";
 
 /// Width of the suite-id field, big-endian, immediately after the magic.
 pub const SUITE_ID_LEN: usize = 2;
@@ -193,6 +221,8 @@ const FIXED_LEN: usize = RESUME_MAGIC.len()
     + 4 /* attempt */
     + 4 /* own slot generation */
     + 4 /* own slot attempt */
+    + 1 /* own slot ephemeral decapsulation key present */
+    + ml_kem::DK_LEN /* own slot ephemeral decapsulation key */
     + 4 /* acceptance slot generation */
     + 4 /* acceptance slot attempt */
     + 1 /* acceptance slot confirmed */
@@ -202,6 +232,7 @@ const FIXED_LEN: usize = RESUME_MAGIC.len()
     + 4 /* send_floor.generation */
     + 8 /* send_floor.seq */
     + 4 /* attempt_at_window_start */
+    + 4 /* reroot_ratchet_gen */
     + 4 /* last_seen_re_est */
     + 1 /* retained_but_stopped */
     + 2 /* dedup entry count */
@@ -468,6 +499,28 @@ pub enum ResumeError {
     /// nothing, which a re-emit would send as an empty frame. Reached the same
     /// way, by the same test.
     OccupiedSlotHasNoFrame { attempt: u32 },
+    /// An occupied own slot whose stored ephemeral decapsulation key is absent.
+    ///
+    /// The slot's sealed `RE-EST` is re-emitted byte-identically after a crash
+    /// (`docs/design/direct-messaging.md:1351`), which publishes an
+    /// encapsulation key this party must still be able to decapsulate against.
+    /// Loading the frame without its key would produce an initiation that can be
+    /// re-sent for ever and can never be completed.
+    OccupiedSlotHasNoEphemeralKey { attempt: u32 },
+    /// An empty own slot carrying an ephemeral decapsulation key.
+    ///
+    /// The mirror of [`Self::OccupiedSlotHasNoEphemeralKey`], and refused for
+    /// the reason [`Self::EmptySlotHasFrame`] is: [`ResumeRecord::encode`]
+    /// writes the empty slot as a clear flag over an all-zero key, so these are
+    /// bytes it did not write.
+    EphemeralKeyWithoutSlot,
+    /// A record in the superseded [`RESUME_MAGIC_V1`] layout.
+    ///
+    /// Named rather than reported as [`Self::Truncated`], which is what a v1
+    /// body decoded under the v2 layout would otherwise produce: the record is
+    /// intact and simply predates two fields, one of which has no truthful
+    /// default. See [`RESUME_MAGIC_V1`].
+    ObsoleteV1Layout,
 }
 
 impl std::fmt::Display for ResumeError {
@@ -500,6 +553,20 @@ impl std::fmt::Display for ResumeError {
             Self::OccupiedSlotHasNoFrame { attempt } => {
                 write!(f, "attempt {attempt} carries no sealed frame")
             }
+            Self::OccupiedSlotHasNoEphemeralKey { attempt } => write!(
+                f,
+                "attempt {attempt} carries no ephemeral decapsulation key"
+            ),
+            Self::EphemeralKeyWithoutSlot => write!(
+                f,
+                "an empty handshake slot carries an ephemeral decapsulation key"
+            ),
+            Self::ObsoleteV1Layout => write!(
+                f,
+                "a resume record in the superseded daemonseed/dm/resume/v1 layout, which \
+                 carries neither the own slot's ephemeral decapsulation key nor the \
+                 re-rooted ratchet generation"
+            ),
             Self::OwnSlotAbandonedWithoutAcceptance { attempt } => write!(
                 f,
                 "the initiation at attempt {attempt} was abandoned with no acceptance \
@@ -627,9 +694,146 @@ redacted_secret_newtype! {
 impl CommittedRoot {
     /// Wrap raw bytes. The caller is handing over a secret; nothing here copies
     /// it anywhere that does not zeroize.
-    pub fn from_bytes(bytes: [u8; ROOT_KEY_LEN]) -> Self {
-        Self(bytes)
+    ///
+    /// **Borrowed, not taken by value.** A `[u8; 32]` is `Copy`, so a by-value
+    /// parameter leaves the caller holding an unwiped copy of a root on its own
+    /// frame — the caller cannot reach an argument temporary to zeroize it.
+    /// Borrowing keeps the bytes in whatever the caller already wipes.
+    pub fn from_bytes(bytes: &[u8; ROOT_KEY_LEN]) -> Self {
+        Self(*bytes)
     }
+}
+
+/// What one re-establishment produces: the successor retained root, the ratchet
+/// root the resumed channel opens under, and the resumed channel's identifier.
+///
+/// **All three from one call, or none.** `docs/design/direct-messaging.md:722`
+/// and `:724` derive the two roots from the same two inputs, and committing
+/// `RS_{n+1}` without holding its `RK_0'` is the state that cannot be recovered
+/// from — the retained root has moved on, the secret that produced the ratchet
+/// root is gone, and no later call can rebuild it. The channel identifier is
+/// bound into every signature and AAD the resumed channel writes, so a party
+/// holding the roots without it can derive keys and still seal nothing.
+/// [`reroot`] is the only way to make one, so the three cannot be spelled apart.
+///
+/// **`Clone` is deliberate**: one re-establishment feeds two consumers — the
+/// ratchet the resumed channel runs on, and the record the commit writes — and
+/// both take the value by value. Cloning duplicates a grouping that is already
+/// fixed; it cannot produce a `next` belonging to a different `ratchet_root`.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct Rerooted {
+    next: CommittedRoot,
+    ratchet_root: crate::dm::ratchet::RootKey,
+    chan_id: [u8; ROOT_KEY_LEN],
+}
+
+impl Rerooted {
+    /// The successor retained root `RS_{n+1}`, which replaces `RS_n` at rest.
+    pub fn next(&self) -> &CommittedRoot {
+        &self.next
+    }
+
+    /// The re-rooted ratchet root `RK_0'`.
+    ///
+    /// **Crate-private**, so a caller outside the crate holds a re-establishment
+    /// result without ever holding the root the resumed channel's message keys
+    /// descend from. [`crate::dm::ratchet::Ratchet::reestablished`] is its only
+    /// reader.
+    pub(crate) fn ratchet_root(&self) -> &crate::dm::ratchet::RootKey {
+        &self.ratchet_root
+    }
+
+    /// The resumed channel's identifier `chan_id_{n+1}`.
+    ///
+    /// This is the value a resumed channel's frames bind into the
+    /// authorship-signature preimage and the seal AAD, in place of the
+    /// `chan_id` establishment deleted. A driver receives it from
+    /// [`ResumeRecord::commit_reestablished`], which returns it so the commit
+    /// and the identifier cannot be separated, and binds it into every frame on
+    /// the resumed channel. **That path is not built**, so nothing outside the
+    /// tests reads this accessor yet; the established-channel path binds the
+    /// identifier derived at first contact.
+    /// [`crate::dm::ratchet::Ratchet`] never holds it either way — a ratchet
+    /// binds its conversation by the fingerprint of `AR`, and the identifier is
+    /// bound one layer up, where sealing happens.
+    pub fn chan_id(&self) -> &[u8; ROOT_KEY_LEN] {
+        &self.chan_id
+    }
+}
+
+impl std::fmt::Debug for Rerooted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Rerooted(<redacted>)")
+    }
+}
+
+/// Advance a retained re-establishment root by a freshly encapsulated secret,
+/// yielding the successor root, the ratchet root the resumed channel opens
+/// under, and the resumed channel's identifier.
+///
+/// `docs/design/direct-messaging.md:722` gives the ratchet root as
+/// `RK_0' = advance_root(RS_n, ss_new)` — the previous root as extraction salt
+/// and the fresh secret as IKM, so a party holding only `RS_n` cannot compute it
+/// and a party holding only `ss_new` cannot either. `:724` gives the successor
+/// as `RS_{n+1} = Expand(Extract(DM_REEST_SALT, RS_n ‖ ss_new), DM_REEST_NEXT)`,
+/// a different extraction over the same two inputs, so neither output yields the
+/// other.
+///
+/// The channel identifier is a **sibling of the successor root**, expanded from
+/// that same extraction under [`domain::DM_REEST_CHAN_ID`]:
+/// `chan_id_{n+1} = Expand(Extract(DM_REEST_SALT, RS_n ‖ ss_new), DM_REEST_CHAN_ID)`.
+/// Establishment deletes the original `chan_id` with `ss0`
+/// (`docs/design/direct-messaging.md:710`), so a resumed channel has none to
+/// carry forward; deriving it here rather than retaining it keeps the at-rest
+/// set to `AR` and `RS_n`.
+///
+/// Ratcheting the retained root is what stops it being a permanent at-rest
+/// credential: without it a single copy of the sealed store would grant
+/// channel-resume authority for the life of the correspondence
+/// (`docs/design/direct-messaging.md:722`, Clause 1).
+///
+/// The caller is expected to write `RS_{n+1}` over `RS_n` and destroy the old
+/// value; this function only computes.
+pub fn reroot(
+    previous: &CommittedRoot,
+    ss_new: &[u8; ml_kem::SHARED_SECRET_LEN],
+) -> Result<Rerooted, crate::dm::ratchet::RatchetError> {
+    // The IKM widths are the KEM's and the root's, and they must agree for the
+    // concatenation below to be the one the design writes. Stated once, here,
+    // rather than by spelling one constant where the other belongs.
+    const _: () = assert!(ml_kem::SHARED_SECRET_LEN == ROOT_KEY_LEN);
+    // And the identifier's width is the frame layer's, because that is the
+    // parameter it is handed to.
+    const _: () = assert!(ROOT_KEY_LEN == crate::dm::firstcontact::ROOT_LEN);
+
+    // `advance_root` consumes the root it advances, so a spent root cannot be
+    // reused. The bytes are borrowed out of `previous` rather than copied
+    // through a temporary this frame could not reach to wipe.
+    let previous_key = crate::dm::ratchet::RootKey::from_bytes(previous.as_bytes());
+    let ratchet_root = crate::dm::ratchet::advance_root(previous_key, ss_new)?;
+
+    // `RS_n ‖ ss_new` is the extraction IKM, in that order. Zeroizing rather
+    // than a bare `Vec`: it holds the retained root in the clear until it is
+    // consumed, and a plain buffer would leave it in freed heap.
+    let mut ikm = Zeroizing::new(Vec::with_capacity(ROOT_KEY_LEN + ss_new.len()));
+    ikm.extend_from_slice(previous.as_bytes());
+    ikm.extend_from_slice(ss_new);
+    let hkdf = HkdfSha384::extract(Some(domain::DM_REEST_SALT), &ikm)
+        .map_err(crate::dm::ratchet::RatchetError::Kdf)?;
+    let mut next_bytes = Zeroizing::new([0u8; ROOT_KEY_LEN]);
+    hkdf.expand(domain::DM_REEST_NEXT, next_bytes.as_mut())
+        .map_err(crate::dm::ratchet::RatchetError::Kdf)?;
+    let mut chan_id = Zeroizing::new([0u8; ROOT_KEY_LEN]);
+    hkdf.expand(domain::DM_REEST_CHAN_ID, chan_id.as_mut())
+        .map_err(crate::dm::ratchet::RatchetError::Kdf)?;
+
+    Ok(Rerooted {
+        next: CommittedRoot::from_bytes(&next_bytes),
+        ratchet_root,
+        // The field is wiped by this struct's own `ZeroizeOnDrop`, so the copy
+        // made here is the last one; `chan_id` itself wipes as it leaves scope.
+        chan_id: *chan_id,
+    })
 }
 
 /// The send-side floor: how far this party's own sequence numbers have gone,
@@ -997,15 +1201,45 @@ impl std::fmt::Debug for SealedReEst {
 /// **The slot is zeroed, not edited.** A3.14 has both slots *"zeroed on
 /// completion"*: an own slot ends when the `RE-ACK` folds, or when a lost coin
 /// abandons it (A3.7), and either way the next record carries `None` here.
+///
+/// **The ephemeral's secret half travels with the sealed frame**, because the
+/// two are useless apart. `docs/design/direct-messaging.md:1351` (A9.1(a)) makes
+/// a re-emit of a persisted attempt the byte-identical stored `RE-EST`, so a
+/// party that crashes after committing re-emits a leg carrying an encapsulation
+/// key whose decapsulation key it must still hold to open the `RE-ACK` that
+/// answers it. Minting a fresh keypair on recovery would publish one key and
+/// hold another; keeping the key only in memory loses it at exactly the restart
+/// this record exists to survive. Either way the answer never opens and the two
+/// parties stop on roots that will never agree.
 pub struct OwnSlot {
     generation: u32,
     sealed: SealedReEst,
+    eph_dk: crate::dm::ratchet::EphemeralDecapKey,
 }
 
 impl OwnSlot {
-    /// Occupy the slot with a sealed initiation at `generation`.
-    pub fn new(generation: u32, sealed: SealedReEst) -> Self {
-        Self { generation, sealed }
+    /// Occupy the slot with a sealed initiation at `generation`, and the secret
+    /// half of the ephemeral that initiation published.
+    ///
+    /// The key is taken here rather than by a later setter so an occupied slot
+    /// cannot exist without one: the frame and the key that opens its answer are
+    /// supplied at the same moment or not at all.
+    pub fn new(
+        generation: u32,
+        sealed: SealedReEst,
+        eph_dk: crate::dm::ratchet::EphemeralDecapKey,
+    ) -> Self {
+        Self {
+            generation,
+            sealed,
+            eph_dk,
+        }
+    }
+
+    /// The secret half of the ephemeral this initiation published — what
+    /// [`crate::dm::reest::complete`] decapsulates the `RE-ACK` under.
+    pub fn eph_dk(&self) -> &crate::dm::ratchet::EphemeralDecapKey {
+        &self.eph_dk
     }
 
     /// The generation this initiation is trying to reach.
@@ -1029,6 +1263,10 @@ impl std::fmt::Debug for OwnSlot {
         f.debug_struct("OwnSlot")
             .field("generation", &self.generation)
             .field("sealed", &self.sealed)
+            // Renders as `EphemeralDecapKey(<redacted>)`; the newtype makes that
+            // decision, and repeating it here would be a second answer free to
+            // disagree with it.
+            .field("eph_dk", &self.eph_dk)
             .finish()
     }
 }
@@ -1487,6 +1725,20 @@ pub struct ReEstState {
     ///
     /// `0` before the first attempt, which [`Attempt::FIRST`] leaves free.
     pub attempt_at_window_start: u32,
+    /// The clear ratchet generation the re-rooted chain opened at
+    /// (`docs/design/direct-messaging.md:929`, A3.12).
+    ///
+    /// **The sweep compares a ratchet generation, not `reconnect_gen`.** The two
+    /// count different things: `reconnect_gen` counts completed handshakes,
+    /// while a frame's provenance is the clear ratchet generation it was sealed
+    /// under, which advances on every direction switch. Comparing an entry's
+    /// provenance against the reconnect counter would end live entries on an
+    /// established channel — the numbers are unrelated in size — so the record
+    /// stores the ratchet generation the sweep actually needs.
+    ///
+    /// `0` before the first re-establishment, when nothing has been superseded
+    /// and [`crate::dm::outbox::Outbox::sweep_dead_chain`] ends nothing.
+    pub reroot_ratchet_gen: u32,
 }
 
 impl ReEstState {
@@ -1591,8 +1843,16 @@ pub struct ResumeRecord {
     /// byte-identical re-emit cannot be rebuilt from the key inputs. Recovery
     /// re-emits *these*, not a fresh encapsulation.
     ///
-    /// `zeroize(skip)`: an attempt counter, a generation and a sealed frame are
-    /// none of them secrets.
+    /// The slot also carries the secret half of the ephemeral its `RE-EST`
+    /// published, so the leg can still be completed after the restart that
+    /// re-emits it. See [`OwnSlot`].
+    ///
+    /// `zeroize(skip)`, and the reason is now narrower than it was: the attempt
+    /// counter, the generation and the sealed frame are none of them secrets,
+    /// and the decapsulation key wipes itself. [`crate::dm::ratchet::EphemeralDecapKey`]
+    /// is `ZeroizeOnDrop`, so dropping this record drops the slot and wipes the
+    /// key without this derive reaching it — which is why the field is skipped
+    /// rather than the type being made `Zeroize`.
     #[zeroize(skip)]
     own: Option<OwnSlot>,
     /// **The peer-acceptance slot** A3.14 names beside the own slot, carrying
@@ -1623,6 +1883,11 @@ pub struct ResumeRecord {
     /// having opened one.
     #[zeroize(skip)]
     attempt_at_window_start: u32,
+    /// The clear ratchet generation the re-rooted chain opened at, which the
+    /// dead-chain sweep compares each outbox entry's provenance against. See
+    /// [`ReEstState::reroot_ratchet_gen`].
+    #[zeroize(skip)]
+    reroot_ratchet_gen: u32,
 }
 
 impl std::fmt::Debug for ResumeRecord {
@@ -1635,6 +1900,7 @@ impl std::fmt::Debug for ResumeRecord {
             .field("pk_pc", &"<peer verifying key>")
             .field("committed_root", &self.committed_root)
             .field("reconnect_gen", &self.reconnect_gen)
+            .field("reroot_ratchet_gen", &self.reroot_ratchet_gen)
             .field("send_floor", &self.send_floor)
             .field("attempt_at_window_start", &self.attempt_at_window_start)
             // Each renders its attempt and its frame's length; their own `Debug`
@@ -1693,6 +1959,7 @@ impl ResumeRecord {
             retention,
             send_floor,
             attempt_at_window_start: handshake.attempt_at_window_start,
+            reroot_ratchet_gen: handshake.reroot_ratchet_gen,
         };
         // An occupied acceptance slot IS the observation A6.1 slides the window
         // on, so building a record with one raises the base to it — a raise,
@@ -1762,6 +2029,99 @@ impl ResumeRecord {
     }
 
     /// A3.4's committed generation.
+    /// The clear ratchet generation the re-rooted chain opened at — what
+    /// [`crate::dm::outbox::Outbox::sweep_dead_chain`] compares each entry's
+    /// provenance against. See [`ReEstState::reroot_ratchet_gen`].
+    pub fn reroot_ratchet_gen(&self) -> u32 {
+        self.reroot_ratchet_gen
+    }
+
+    /// Commit one completed re-establishment, as one act.
+    ///
+    /// `docs/design/direct-messaging.md:935` (A3.14) has the whole transition
+    /// commit intra-record: the successor root, the advanced counter, the
+    /// superseded root with its stamp, and both slots emptied travel in one
+    /// `replace_atomically`. This method is that act written down, so a caller
+    /// cannot perform half of it — there is no setter for any of the fields it
+    /// moves.
+    ///
+    /// What it does, in the order the design gives:
+    ///
+    /// - the successor `RS_{n+1}` from `next` becomes the committed root;
+    /// - the root it replaces moves into [`Retention`] with `superseded_at_ms`
+    ///   written **once**, at `now_ms`, because A3.5 runs the retirement ceiling
+    ///   from that stamp and a stamp rewritten on a later commit would restart
+    ///   the ceiling;
+    /// - `reconnect_gen` advances by one — A3.4 advances it only here, by a
+    ///   *completed* handshake;
+    /// - `reroot_ratchet_gen` records the clear ratchet generation the resumed
+    ///   chain opened at, which the dead-chain sweep reads;
+    /// - the send floor is re-qualified by that same generation, its sequence
+    ///   unchanged;
+    /// - both handshake slots empty, because the exchange they held is over.
+    ///
+    /// **The send floor moves its generation here or the qualification does
+    /// nothing.** A9.2 (`docs/design/direct-messaging.md:1355`, the
+    /// qualification itself at `:1357`) qualifies the
+    /// floor by generation so that *"re-established and nothing sent yet"* and
+    /// *"a replayed stale resume blob"* are told apart, and the 2026-08-14 build
+    /// note (`:1479`) records that as the field's only purpose. The pair can
+    /// only distinguish them if a completed re-establishment raises the
+    /// generation, so this is the one place that ever does. The sequence is
+    /// carried across untouched: send `seq` is monotone per direction for the
+    /// life of the conversation and does not restart at a new generation, which
+    /// is the same build note's other half.
+    ///
+    /// **The ratchet root is not stored, and that is why the argument is a
+    /// [`Rerooted`] rather than a [`CommittedRoot`].** Taking the pair means a
+    /// caller cannot commit `RS_{n+1}` without having held `RK_0'` — the state
+    /// that cannot be recovered from, since the secret that produced the ratchet
+    /// root is gone by then. The ratchet root itself is dropped here: it belongs
+    /// to [`crate::dm::ratchet`], which the caller has already built.
+    ///
+    /// **The resumed channel's identifier is RETURNED, not stored.** It is the
+    /// last moment it can be handed over: `ss_new` is consumed by the act that
+    /// minted it, and `Rerooted` is taken by value here, so a caller that
+    /// committed without receiving it could never recompute it. Returning it
+    /// makes that unrepresentable rather than a caller obligation.
+    ///
+    /// It is **not written to disk**, and that is deliberate:
+    /// `docs/design/direct-messaging.md:670` keeps `chan_id` out of every
+    /// at-rest encoding, and the identifier a re-establishment derives is
+    /// session-lifetime in-memory state on exactly the terms the establishment
+    /// identifier already is — held while the channel runs, lost with the
+    /// process, re-minted by the next re-establishment. The caller binds it into
+    /// the authorship-signature preimage and the seal AAD of every frame the
+    /// resumed channel writes.
+    ///
+    /// **A previously retained root is replaced, not stacked.** One root is
+    /// retained at a time — the one just superseded — and its dedup memory goes
+    /// with it, because that memory exists to answer questions about frames
+    /// openable under it.
+    pub fn commit_reestablished(
+        &mut self,
+        next: Rerooted,
+        ratchet_gen: u32,
+        now_ms: i64,
+    ) -> Zeroizing<[u8; ROOT_KEY_LEN]> {
+        let chan_id = Zeroizing::new(*next.chan_id());
+        let superseded = std::mem::replace(&mut self.committed_root, next.next().clone());
+        self.retention = Retention {
+            retained: Some(RetainedRoot::new(superseded, now_ms)),
+            dedup: DedupMemory::new(),
+            stopped: false,
+        };
+        // Saturating rather than wrapping: a wrap would put two different roots
+        // on one generation number, and reaching `u32::MAX` completed handshakes
+        // is not a state any peer following the protocol arrives at.
+        self.reconnect_gen = self.reconnect_gen.saturating_add(1);
+        self.reroot_ratchet_gen = ratchet_gen;
+        self.send_floor = SendFloor::new(ratchet_gen, self.send_floor.seq);
+        self.own = None;
+        self.acceptance = None;
+        chan_id
+    }
+
     pub fn reconnect_gen(&self) -> u32 {
         self.reconnect_gen
     }
@@ -1988,6 +2348,10 @@ impl ResumeRecord {
         // and writing the counter here would spell an occupied slot with no
         // frame — which `decode` then refuses for ever.
         let own_attempt = self.own.as_ref().map_or(0, |slot| slot.attempt().get());
+        // Fixed width whether the slot is occupied or not, so every field after
+        // it sits at a constant offset — the same shape the retained root below
+        // is written in.
+        let own_dk = self.own.as_ref().map(|slot| slot.eph_dk().as_bytes());
         let own_frame = self.sealed_re_est().unwrap_or(&[]);
         let acc_generation = self
             .acceptance
@@ -2018,6 +2382,16 @@ impl ResumeRecord {
         out.extend_from_slice(&self.attempt.to_be_bytes());
         out.extend_from_slice(&own_generation.to_be_bytes());
         out.extend_from_slice(&own_attempt.to_be_bytes());
+        match own_dk {
+            Some(dk) => {
+                out.push(1);
+                out.extend_from_slice(dk);
+            }
+            None => {
+                out.push(0);
+                out.extend_from_slice(&[0u8; ml_kem::DK_LEN]);
+            }
+        }
         out.extend_from_slice(&acc_generation.to_be_bytes());
         out.extend_from_slice(&acc_attempt.to_be_bytes());
         out.push(u8::from(acc_confirmed));
@@ -2039,6 +2413,7 @@ impl ResumeRecord {
         out.extend_from_slice(&self.send_floor.generation.to_be_bytes());
         out.extend_from_slice(&self.send_floor.seq.to_be_bytes());
         out.extend_from_slice(&self.attempt_at_window_start.to_be_bytes());
+        out.extend_from_slice(&self.reroot_ratchet_gen.to_be_bytes());
         out.extend_from_slice(&self.last_seen_re_est.to_be_bytes());
         out.push(u8::from(self.retention.stopped));
         // `DEDUP_CAPACITY` bounds this far below `u16::MAX`, and `insert` is the
@@ -2077,7 +2452,14 @@ impl ResumeRecord {
     /// allocation.
     pub fn decode(bytes: &[u8]) -> Result<Self, ResumeError> {
         let mut r = Reader::new(bytes);
-        if r.take(RESUME_MAGIC.len())? != RESUME_MAGIC {
+        // Both magics are the same width, so one read serves both comparisons
+        // and a v1 record is refused by name rather than reported as a
+        // truncation of the layout it predates.
+        let magic = r.take(RESUME_MAGIC.len())?;
+        if magic == RESUME_MAGIC_V1 {
+            return Err(ResumeError::ObsoleteV1Layout);
+        }
+        if magic != RESUME_MAGIC {
             return Err(ResumeError::BadMagic);
         }
         let suite_raw = u16::from_be_bytes(r.array()?);
@@ -2104,12 +2486,23 @@ impl ResumeRecord {
         // read above records, which is why that one never builds a stack array
         // either.
         let mut root_bytes = Zeroizing::new(r.array::<ROOT_KEY_LEN>()?);
-        let committed_root = CommittedRoot::from_bytes(*root_bytes);
+        let committed_root = CommittedRoot::from_bytes(&root_bytes);
         root_bytes.zeroize();
         let reconnect_gen = u32::from_be_bytes(r.array()?);
         let attempt_counter = u32::from_be_bytes(r.array()?);
         let own_generation = u32::from_be_bytes(r.array()?);
         let own_attempt = u32::from_be_bytes(r.array()?);
+        let own_dk_present = r.array::<1>()?[0] != 0;
+        // **Boxed straight from the borrowed input, never through a stack
+        // array**, for the reason the `s_pc` read above records: `r.array()`
+        // would leave a 3 168-byte copy of a decapsulation key on this frame
+        // after the box that follows it.
+        let own_dk_bytes: Box<[u8; ml_kem::DK_LEN]> = r
+            .take(ml_kem::DK_LEN)?
+            .to_vec()
+            .into_boxed_slice()
+            .try_into()
+            .map_err(|_| ResumeError::Truncated)?;
         let acc_generation = u32::from_be_bytes(r.array()?);
         let acc_attempt = u32::from_be_bytes(r.array()?);
         let acc_confirmed = r.array::<1>()?[0] != 0;
@@ -2119,6 +2512,7 @@ impl ResumeRecord {
         let generation = u32::from_be_bytes(r.array()?);
         let seq = u64::from_be_bytes(r.array()?);
         let attempt_at_window_start = u32::from_be_bytes(r.array()?);
+        let reroot_ratchet_gen = u32::from_be_bytes(r.array()?);
         let last_seen_re_est = u32::from_be_bytes(r.array()?);
         let stopped = r.array::<1>()?[0] != 0;
         let dedup_count = usize::from(u16::from_be_bytes(r.array()?));
@@ -2178,6 +2572,12 @@ impl ResumeRecord {
                     len: sealed_re_est.len(),
                 });
             }
+            // An empty slot carries no ephemeral either. `encode` writes the
+            // absent case as a clear flag over an all-zero key, so a set flag
+            // here is bytes this encoder did not write.
+            0 if own_dk_present => {
+                return Err(ResumeError::EphemeralKeyWithoutSlot);
+            }
             0 if own_generation != 0 => {
                 return Err(ResumeError::SlotGenerationWithoutAttempt {
                     generation: own_generation,
@@ -2186,6 +2586,13 @@ impl ResumeRecord {
             0 => None,
             n if sealed_re_est.is_empty() => {
                 return Err(ResumeError::OccupiedSlotHasNoFrame { attempt: n });
+            }
+            // A stored `RE-EST` this party may have to re-emit byte-identically
+            // is worthless without the key that opens its answer
+            // (`docs/design/direct-messaging.md:1351`), so the pair is refused
+            // rather than loaded into a slot that can never complete.
+            n if !own_dk_present => {
+                return Err(ResumeError::OccupiedSlotHasNoEphemeralKey { attempt: n });
             }
             n if n != attempt_counter => {
                 return Err(ResumeError::AttemptSlotDisagrees {
@@ -2237,7 +2644,7 @@ impl ResumeRecord {
                 return Err(ResumeError::RetainedBytesWithoutFlag);
             }
             (true, stamp) => Some(RetainedRoot::new(
-                CommittedRoot::from_bytes(*retained_bytes),
+                CommittedRoot::from_bytes(&retained_bytes),
                 stamp,
             )),
             (false, _) => None,
@@ -2250,7 +2657,13 @@ impl ResumeRecord {
             reconnect_gen,
             attempt: attempt_counter,
             last_seen_re_est,
-            own: sealed.map(|sealed| OwnSlot::new(own_generation, sealed)),
+            own: sealed.map(|sealed| {
+                OwnSlot::new(
+                    own_generation,
+                    sealed,
+                    crate::dm::ratchet::EphemeralDecapKey::new(own_dk_bytes),
+                )
+            }),
             acceptance,
             retention: Retention {
                 retained,
@@ -2259,6 +2672,7 @@ impl ResumeRecord {
             },
             send_floor: SendFloor { generation, seq },
             attempt_at_window_start,
+            reroot_ratchet_gen,
         })
     }
 
@@ -2304,7 +2718,9 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::dm::eph_dk_fixture;
 
     const ANCHOR: i64 = 1_700_000_000_000;
 
@@ -2328,7 +2744,7 @@ mod tests {
     }
 
     fn root(seed: u8) -> CommittedRoot {
-        CommittedRoot::from_bytes(pattern(seed, ROOT_KEY_LEN).try_into().unwrap())
+        CommittedRoot::from_bytes(&pattern(seed, ROOT_KEY_LEN).try_into().unwrap())
     }
 
     /// Every field set to a value distinct from every other field's, so a
@@ -2368,6 +2784,7 @@ mod tests {
             generation,
             SealedReEst::seal(fresh(attempt), pattern(seed, len).into_boxed_slice())
                 .expect("the fixture is within MAX_FRAME_LEN"),
+            eph_dk_fixture(),
         )
     }
 
@@ -2433,6 +2850,7 @@ mod tests {
                 own: Some(own_slot(10, 7, 0x44, 512)),
                 acceptance: Some(acceptance_slot(8, 5, 0x66, 256).confirm()),
                 attempt_at_window_start: 2,
+                reroot_ratchet_gen: 0,
             },
             full_retention(),
             SendFloor::new(4, 100),
@@ -2457,6 +2875,7 @@ mod tests {
                 acceptance: (re_est > 0)
                     .then(|| acceptance_slot(record.reconnect_gen() + 1, re_est, 0x66, 32)),
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             Retention {
                 retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
@@ -2581,6 +3000,8 @@ mod tests {
             + 4 /* attempt counter */
             + 4 /* own slot generation */
             + 4 /* own slot attempt */
+            + 1 /* own slot ephemeral key present */
+            + ml_kem::DK_LEN /* own slot ephemeral decapsulation key */
             + 4 /* acceptance generation */
             + 4 /* acceptance attempt */
             + 1 /* acceptance confirmed */
@@ -2590,6 +3011,7 @@ mod tests {
             + 4 /* send floor generation */
             + 8 /* send floor seq */
             + 4 /* attempt_at_window_start */
+            + 4 /* reroot_ratchet_gen */
             + 4 /* last_seen_re_est */
             + 1 /* retained_but_stopped */
             + 2 /* dedup count */
@@ -2646,6 +3068,15 @@ mod tests {
         // generation naming an exchange that is not there.
         out.extend_from_slice(&if own_attempt == 0 { 0u32 } else { 10 }.to_be_bytes());
         out.extend_from_slice(&own_attempt.to_be_bytes()); // own slot attempt
+        // An occupied slot carries the ephemeral its RE-EST published; an empty
+        // one carries a clear flag over an all-zero key, which is what `encode`
+        // writes and what the decoder refuses to see contradicted.
+        out.push(u8::from(own_attempt != 0));
+        out.extend_from_slice(&if own_attempt == 0 {
+            [0u8; ml_kem::DK_LEN]
+        } else {
+            [0x3du8; ml_kem::DK_LEN]
+        });
         out.extend_from_slice(&if acc_attempt == 0 { 0u32 } else { 8 }.to_be_bytes());
         out.extend_from_slice(&acc_attempt.to_be_bytes());
         out.push(u8::from(acc_confirmed));
@@ -2661,6 +3092,7 @@ mod tests {
         out.extend_from_slice(&4u32.to_be_bytes()); // send floor generation
         out.extend_from_slice(&100u64.to_be_bytes()); // send floor seq
         out.extend_from_slice(&2u32.to_be_bytes()); // attempt_at_window_start
+        out.extend_from_slice(&0u32.to_be_bytes()); // reroot_ratchet_gen
         // The window base: an occupied acceptance slot raises it to its attempt.
         out.extend_from_slice(&acc_attempt.to_be_bytes());
         out.push(0); // retained_but_stopped
@@ -2739,6 +3171,8 @@ mod tests {
         expected.extend_from_slice(&7u32.to_be_bytes()); // the attempt counter
         expected.extend_from_slice(&10u32.to_be_bytes()); // own slot generation
         expected.extend_from_slice(&7u32.to_be_bytes()); // own slot attempt
+        expected.push(1); // own slot ephemeral decapsulation key present
+        expected.extend_from_slice(&[0x3d; ml_kem::DK_LEN]); // that key
         expected.extend_from_slice(&8u32.to_be_bytes()); // acceptance generation
         expected.extend_from_slice(&5u32.to_be_bytes()); // acceptance attempt
         expected.push(1); // acceptance confirmed
@@ -2748,6 +3182,7 @@ mod tests {
         expected.extend_from_slice(&4u32.to_be_bytes()); // floor generation
         expected.extend_from_slice(&100u64.to_be_bytes()); // floor seq
         expected.extend_from_slice(&2u32.to_be_bytes()); // attempt_at_window_start
+        expected.extend_from_slice(&0u32.to_be_bytes()); // reroot_ratchet_gen
         expected.extend_from_slice(&5u32.to_be_bytes()); // last_seen_re_est
         expected.push(1); // retained_but_stopped
         expected.extend_from_slice(&3u16.to_be_bytes()); // dedup entry count
@@ -2920,6 +3355,271 @@ mod tests {
         assert!(stored.admits(SendFloor::new(5, 101)));
     }
 
+    /// **`reroot` matches an independently computed HKDF-SHA384, on every
+    /// output.**
+    ///
+    /// Same discipline as `roots_from_one_ss0_are_pinned_siblings` in
+    /// `dm::ratchet`, and the same script — `hashlib`/`hmac`, no line shared with
+    /// `oxicrypt`:
+    ///
+    /// ```text
+    /// rs_n   = bytes.fromhex("a8042dbc77f2303ad708b1131d05e05a8382822ce9845c4285e5593d1b7e26dc")
+    /// ss_new = bytes((0x22 ^ ((i * 7 + 0x5b) & 0xFF)) & 0xFF for i in range(32))
+    ///
+    /// ratchet_root = expand(extract(rs_n, ss_new), b"daemonseed/dm/ratchet/step/v2", 32)
+    /// prk          = extract(b"daemonseed/dm/reest/salt/v1", rs_n + ss_new)
+    /// next         = expand(prk, b"daemonseed/dm/reest/next/v1", 32)
+    /// chan_id      = expand(prk, b"daemonseed/dm/reest/chanid/v1", 32)
+    ///
+    /// ratchet_root b011c303f26d81d50df4f057d12c4bb8cd4f10fd9aface16dae91163108f2f26
+    /// next         4c4a76e8c6b371814e9e2662db50e8cb6356c25dc5c710162491e43c912f39c0
+    /// chan_id      ce2baa5fe8bde40ce78dc354f735f01e2c91db39d7395436df6bcdf03ba99de3
+    /// ```
+    ///
+    /// **`RS_n` here is deliberately the value `root_derivation_is_pinned` pins,
+    /// so the ratchet-root vector has a control inside this crate.**
+    /// `root_advance_is_pinned` in `dm::ratchet` pins
+    /// `advance_root(root(0x11), ss(0x22))` at exactly the same hex, from the
+    /// same two inputs — so if these two lines ever disagree, one of them is
+    /// wrong and the pair says so rather than each passing alone. The two
+    /// reproduced lines are also the control on the script itself: an
+    /// independent implementation that disagreed with known-good outputs would
+    /// be the thing at fault, and its third value would be worth nothing.
+    ///
+    /// The three outputs are different bytes from the same pair of inputs, which
+    /// is the property `docs/design/direct-messaging.md:722` and `:724` require:
+    /// none of the retained successor, the live ratchet root and the resumed
+    /// channel's identifier is derivable from another. `chan_id` shares the
+    /// successor's extraction and differs only by label, so a build that
+    /// expanded it under `DM_REEST_NEXT` would collide the two — which the
+    /// vector and the distinctness assertion both catch.
+    #[test]
+    fn reroot_is_pinned_on_every_output() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let rs_n = CommittedRoot::from_bytes(
+            &hex::decode("a8042dbc77f2303ad708b1131d05e05a8382822ce9845c4285e5593d1b7e26dc")
+                .expect("the vector is hex")
+                .try_into()
+                .expect("the vector is a root's width"),
+        );
+        let mut ss_new = [0u8; ROOT_KEY_LEN];
+        for (i, b) in ss_new.iter_mut().enumerate() {
+            *b = 0x22 ^ (i as u8).wrapping_mul(7).wrapping_add(0x5b);
+        }
+
+        let out = reroot(&rs_n, &ss_new).expect("the module is operational");
+        assert_eq!(
+            hex::encode(out.ratchet_root().as_bytes()),
+            "b011c303f26d81d50df4f057d12c4bb8cd4f10fd9aface16dae91163108f2f26",
+            "RK_0' must be advance_root(RS_n, ss_new), which dm::ratchet pins \
+             independently for these same inputs"
+        );
+        assert_eq!(
+            hex::encode(out.next().as_bytes()),
+            "4c4a76e8c6b371814e9e2662db50e8cb6356c25dc5c710162491e43c912f39c0"
+        );
+        assert_eq!(
+            hex::encode(out.chan_id()),
+            "ce2baa5fe8bde40ce78dc354f735f01e2c91db39d7395436df6bcdf03ba99de3"
+        );
+        assert_ne!(
+            out.next().as_bytes(),
+            out.ratchet_root().as_bytes(),
+            "the retained successor and the live ratchet root must not be one value"
+        );
+        assert_ne!(
+            out.next().as_bytes(),
+            out.chan_id(),
+            "the resumed channel's identifier collided with the retained successor, \
+             which is what expanding it under the successor's label produces"
+        );
+        assert_ne!(
+            out.ratchet_root().as_bytes(),
+            out.chan_id(),
+            "the resumed channel's identifier collided with the live ratchet root"
+        );
+        assert_ne!(
+            out.next().as_bytes(),
+            rs_n.as_bytes(),
+            "RS_n+1 that equalled RS_n would be a static at-rest credential"
+        );
+    }
+
+    /// **Both outputs depend on both inputs**, in the shape
+    /// `advance_depends_on_both_inputs` already uses one module over.
+    ///
+    /// A derivation that dropped `ss_new` would let a holder of the retained root
+    /// alone compute the resumed channel's keys, and one that dropped `RS_n`
+    /// would let a passive observer of the handshake do the same. Neither is
+    /// visible from a single-vector KAT.
+    #[test]
+    fn reroot_depends_on_both_inputs() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let base = reroot(&root(0x33), &[0x01; ROOT_KEY_LEN]).expect("operational");
+        let other_root = reroot(&root(0x44), &[0x01; ROOT_KEY_LEN]).expect("operational");
+        let other_ss = reroot(&root(0x33), &[0x02; ROOT_KEY_LEN]).expect("operational");
+
+        for (label, candidate) in [
+            ("a different RS_n", &other_root),
+            ("a different ss_new", &other_ss),
+        ] {
+            assert_ne!(
+                base.next().as_bytes(),
+                candidate.next().as_bytes(),
+                "RS_n+1 ignored {label}"
+            );
+            assert_ne!(
+                base.ratchet_root().as_bytes(),
+                candidate.ratchet_root().as_bytes(),
+                "RK_0' ignored {label}"
+            );
+            assert_ne!(
+                base.chan_id(),
+                candidate.chan_id(),
+                "chan_id_n+1 ignored {label}"
+            );
+        }
+    }
+
+    /// **An occupied own slot carries its ephemeral through the round trip, and
+    /// the two spellings that separate the frame from its key are refused.**
+    ///
+    /// `docs/design/direct-messaging.md:1351` re-emits the stored `RE-EST`
+    /// byte-identically after a crash, which publishes an encapsulation key this
+    /// party must still be able to decapsulate against. A slot that survived
+    /// without its key would re-send for ever and never complete.
+    #[test]
+    fn the_own_slots_ephemeral_key_survives_the_round_trip() {
+        let record = populated();
+        let stored = ResumeRecord::decode(&record.encode()).expect("a populated record decodes");
+        assert_eq!(
+            stored
+                .own_slot()
+                .expect("the fixture's slot is occupied")
+                .eph_dk()
+                .as_bytes(),
+            eph_dk_fixture().as_bytes(),
+            "the ephemeral did not survive the round trip"
+        );
+
+        // A frame with no key: the state a build that kept the key in memory
+        // would write.
+        let frame = pattern(0x44, 64);
+        let mut bytes = assembled_full(7, &frame, 0, &[], false, None, &[]);
+        let flag_at = RESUME_MAGIC.len()
+            + SUITE_ID_LEN
+            + ml_dsa::SK_LEN
+            + ml_dsa::PK_LEN
+            + ROOT_KEY_LEN
+            + 4 /* reconnect_gen */
+            + 4 /* attempt counter */
+            + 4 /* own slot generation */
+            + 4 /* own slot attempt */;
+        bytes[flag_at] = 0;
+        bytes[flag_at + 1..flag_at + 1 + ml_kem::DK_LEN].fill(0);
+        assert_eq!(
+            ResumeRecord::decode(&bytes).err(),
+            Some(ResumeError::OccupiedSlotHasNoEphemeralKey { attempt: 7 })
+        );
+
+        // And the mirror: a key beside an empty slot.
+        let mut bytes = assembled_full(0, &[], 0, &[], false, None, &[]);
+        bytes[flag_at] = 1;
+        bytes[flag_at + 1..flag_at + 1 + ml_kem::DK_LEN].fill(0x3d);
+        assert_eq!(
+            ResumeRecord::decode(&bytes).err(),
+            Some(ResumeError::EphemeralKeyWithoutSlot)
+        );
+
+        // Positive control: untouched, both buffers decode. Without it, a decoder
+        // that refused everything would pass the two refusals above.
+        assert!(ResumeRecord::decode(&assembled_full(7, &frame, 0, &[], false, None, &[])).is_ok());
+        assert!(ResumeRecord::decode(&assembled_full(0, &[], 0, &[], false, None, &[])).is_ok());
+    }
+
+    /// **`commit_reestablished` moves every field of the transition, in one
+    /// call**, and the assertions below name them one by one rather than
+    /// comparing whole records — a whole-record comparison passes for a method
+    /// that moved nothing if the expected value was built the same way.
+    #[test]
+    fn commit_reestablished_advances_every_field_of_the_transition() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let mut record = populated();
+        let before_root = record.committed_root().as_bytes().to_vec();
+        let before_gen = record.reconnect_gen();
+        let before_floor = record.send_floor();
+        assert!(
+            before_floor.generation() < 41,
+            "the fixture's floor must start below the generation the commit moves it to, \
+             or the assertion on it could pass without the commit doing anything"
+        );
+        assert!(
+            record.own_slot().is_some(),
+            "the fixture must start occupied"
+        );
+        assert!(
+            record.acceptance().is_some(),
+            "the fixture must start occupied"
+        );
+
+        let rerooted = reroot(&root(0x77), &[0x09; ROOT_KEY_LEN]).expect("operational");
+        let expected_next = rerooted.next().as_bytes().to_vec();
+        let expected_chan_id = *rerooted.chan_id();
+        let chan_id = record.commit_reestablished(rerooted, 41, 1_700_000_500_000);
+        // The identifier is handed back rather than stored: `ss_new` is gone by
+        // now, so a commit that did not return it would leave the resumed
+        // channel with no way to name itself.
+        assert_eq!(
+            *chan_id, expected_chan_id,
+            "the commit returned an identifier other than the one it was given"
+        );
+        assert_ne!(
+            chan_id.as_slice(),
+            record.committed_root().as_bytes(),
+            "the identifier and the successor root must not be one value"
+        );
+
+        assert_eq!(
+            record.committed_root().as_bytes().to_vec(),
+            expected_next,
+            "the successor did not become the committed root"
+        );
+        assert_eq!(record.reconnect_gen(), before_gen + 1);
+        assert_eq!(record.reroot_ratchet_gen(), 41);
+        // A9.2's discriminator: the floor's generation is re-qualified by the
+        // ratchet generation the resumed chain opened at, and its sequence is
+        // carried across untouched. A commit that left the generation where it
+        // was would make "re-established, nothing sent" and "a replayed stale
+        // blob" the same pair of numbers, which is the whole reason the floor
+        // carries a generation at all.
+        assert_eq!(
+            record.send_floor().generation(),
+            41,
+            "the send floor was not re-qualified by the re-rooted generation"
+        );
+        assert_eq!(
+            record.send_floor().seq(),
+            before_floor.seq(),
+            "send seq is monotone per direction and does not restart at a new generation"
+        );
+        assert!(record.own_slot().is_none(), "the own slot did not empty");
+        assert!(
+            record.acceptance().is_none(),
+            "the acceptance slot did not empty"
+        );
+        let retained = record.retained().expect("the superseded root is retained");
+        assert_eq!(
+            retained.root().as_bytes().to_vec(),
+            before_root,
+            "the root that was superseded is not the one retained"
+        );
+        assert_eq!(retained.superseded_at_ms(), 1_700_000_500_000);
+        assert!(
+            record.dedup().is_empty(),
+            "the dedup memory belongs to the root that was just replaced"
+        );
+    }
+
     /// The store's bucket holds the worst case this module can produce. Sized
     /// against `MAX_ENCODED_LEN` rather than against a typical record, so a
     /// field added here fails this test instead of failing a write on a disk.
@@ -2955,6 +3655,7 @@ mod tests {
                         pattern(0x44, MAX_FRAME_LEN).into_boxed_slice(),
                     )
                     .expect("a frame of exactly MAX_FRAME_LEN is allowed"),
+                    eph_dk_fixture(),
                 )),
                 acceptance: Some(
                     AcceptanceSlot::accept(
@@ -2965,6 +3666,7 @@ mod tests {
                     .expect("a frame of exactly MAX_SEALED_LEG_LEN is allowed"),
                 ),
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             Retention {
                 retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
@@ -3018,6 +3720,63 @@ mod tests {
         assert_eq!(
             ResumeRecord::decode(&bytes).err(),
             Some(ResumeError::FrameTooLong { len: too_long })
+        );
+    }
+
+    /// **A v1 record is refused by name, and a v2 record round-trips.**
+    ///
+    /// v2 widened the body by the own slot's ephemeral decapsulation key, its
+    /// presence flag, and the re-rooted ratchet generation. Without the version
+    /// in the magic a v1 body read under this layout simply runs out of bytes
+    /// and reports [`ResumeError::Truncated`] — which names a corruption that
+    /// did not happen and hides that the record is intact and merely older.
+    ///
+    /// Refused rather than read with the missing fields defaulted, because one
+    /// of them has no truthful default: a v1 record whose own slot is occupied
+    /// carries a sealed `RE-EST` that will be re-emitted byte-identically, and
+    /// no value substitutes for the key that opens its answer.
+    #[test]
+    fn a_predecessor_layout_is_refused_by_name() {
+        let current = populated().encode();
+        assert_eq!(
+            &current[..RESUME_MAGIC.len()],
+            RESUME_MAGIC,
+            "records are written under the current magic"
+        );
+        assert!(
+            ResumeRecord::decode(&current).is_ok(),
+            "positive control: the current layout decodes"
+        );
+
+        // The same body under the predecessor's magic. Both magics are the same
+        // width, so nothing after the header moves and the only difference the
+        // decoder can be reacting to is the version.
+        assert_eq!(RESUME_MAGIC_V1.len(), RESUME_MAGIC.len());
+        let mut older = current.to_vec();
+        older[..RESUME_MAGIC_V1.len()].copy_from_slice(RESUME_MAGIC_V1);
+        assert_eq!(
+            ResumeRecord::decode(&older).err(),
+            Some(ResumeError::ObsoleteV1Layout),
+            "a v1 record must be refused by name rather than as a truncation"
+        );
+
+        // A genuinely v1-shaped body — the current one minus the three fields v2
+        // added — reaches the same refusal, so the name does not depend on the
+        // body happening to be the current width.
+        let mut short = older;
+        short.truncate(short.len() - (1 + ml_kem::DK_LEN + 4));
+        assert_eq!(
+            ResumeRecord::decode(&short).err(),
+            Some(ResumeError::ObsoleteV1Layout)
+        );
+
+        // And the control that the refusal is about v1 specifically: an
+        // unrecognised magic is still `BadMagic`, not this.
+        let mut alien = current.to_vec();
+        alien[0] ^= 1;
+        assert_eq!(
+            ResumeRecord::decode(&alien).err(),
+            Some(ResumeError::BadMagic)
         );
     }
 
@@ -3193,6 +3952,7 @@ mod tests {
                     own,
                     acceptance,
                     attempt_at_window_start: 2,
+                    reroot_ratchet_gen: 0,
                 },
                 Retention::none(),
                 SendFloor::new(4, 100),
@@ -3249,6 +4009,7 @@ mod tests {
                     own: None,
                     acceptance: Some(slot),
                     attempt_at_window_start: 0,
+                    reroot_ratchet_gen: 0,
                 },
                 Retention::none(),
                 SendFloor::new(4, 100),
@@ -3621,7 +4382,9 @@ mod tests {
         // A stamp with the flag clear: written by hand, since `assembled_full`
         // derives the flag from the `Option`.
         let mut bytes = assembled_full(0, &[], 0, &[], false, None, &[]);
-        let stamp_at = bytes.len() - 8 - 8 - 2 - 1 - 4 - 8 - 4 - 8;
+        let stamp_at = bytes.len() - 8 - 8 - 2 - 1 - 4 /* last_seen_re_est */
+            - 4 /* reroot_ratchet_gen */ - 4 /* attempt_at_window_start */
+            - 8 /* floor seq */ - 4 /* floor generation */ - 8 /* the stamp itself */;
         bytes[stamp_at..stamp_at + 8].copy_from_slice(&ANCHOR.to_be_bytes());
         assert_eq!(
             ResumeRecord::decode(&bytes).err(),
@@ -3708,6 +4471,7 @@ mod tests {
                 own: None,
                 acceptance: None,
                 attempt_at_window_start: 8,
+                reroot_ratchet_gen: 0,
             },
             Retention::none(),
             SendFloor::new(0, 0),
@@ -3955,6 +4719,7 @@ mod tests {
                 own: None,
                 acceptance: Some(acceptance_slot(5, 10, 0x66, 64)),
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             Retention {
                 retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
@@ -3982,6 +4747,7 @@ mod tests {
                 own: None,
                 acceptance: None,
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             Retention {
                 retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
@@ -4225,7 +4991,9 @@ mod tests {
         let base = assembled_full(0, &[], 0, &[], false, None, &[]);
         let own_gen_at = RESUME_MAGIC.len() + SUITE_ID_LEN + ml_dsa::SK_LEN + ml_dsa::PK_LEN
             + ROOT_KEY_LEN + 4 /* reconnect_gen */ + 4 /* attempt counter */;
-        for (offset, generation) in [(own_gen_at, 10u32), (own_gen_at + 8, 8u32)] {
+        let acc_gen_at = own_gen_at + 4 /* own slot generation */ + 4 /* own slot attempt */
+            + 1 /* ephemeral key present */ + ml_kem::DK_LEN;
+        for (offset, generation) in [(own_gen_at, 10u32), (acc_gen_at, 8u32)] {
             let mut bytes = base.clone();
             bytes[offset..offset + 4].copy_from_slice(&generation.to_be_bytes());
             assert_eq!(
@@ -4252,14 +5020,16 @@ mod tests {
             + ml_dsa::SK_LEN
             + ml_dsa::PK_LEN
             + ROOT_KEY_LEN
-            + 4
-            + 4
-            + 4
-            + 4
-            + 4
-            + 4
-            + 1
-            + 1;
+            + 4 /* reconnect_gen */
+            + 4 /* attempt counter */
+            + 4 /* own slot generation */
+            + 4 /* own slot attempt */
+            + 1 /* ephemeral key present */
+            + ml_kem::DK_LEN
+            + 4 /* acceptance generation */
+            + 4 /* acceptance attempt */
+            + 1 /* acceptance confirmed */
+            + 1 /* retained present */;
         bytes[root_at..root_at + ROOT_KEY_LEN].copy_from_slice(&pattern(0x55, ROOT_KEY_LEN));
         assert_eq!(
             ResumeRecord::decode(&bytes).err(),

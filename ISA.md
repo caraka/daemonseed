@@ -966,6 +966,25 @@ route taken to reach a decision are not recorded here — the git history and `C
   helper and a state type duplicated across the two front ends until they move to the shared home
   the network crate names for them.
 
+- **A re-established channel derives its identifier rather than retaining one.** Establishment
+  deletes the channel identifier along with the shared secret that produced it, so a channel resumed
+  after a restart has none to carry forward. It is derived as a second output of the extraction that
+  produces the successor retained root — two siblings, under distinct labels — so both parties reach
+  it from material they already hold and nothing new is kept at rest. The ratchet root the resumed
+  channel opens under is not a sibling of either: it comes from a separate extraction salted with
+  the retained root itself, so neither of these two yields it. The
+  alternative, retaining the identifier beside the retained address root, was rejected: it amends
+  the establishment-deletion rule and widens the at-rest set to buy a property the address root
+  already provides, since a party holding that root can already address the channel. The accepted
+  cost is that the answering party holds the superseded identifier in memory beside the superseded
+  receive-side ratchet state until the dead direction drains — the same bound, on the same terms, as
+  the state it belongs to. A sibling rather than a chain, for the reason every derivation here is:
+  the successor root is written to disk and the identifier is bound into every signature the resumed
+  channel writes, so a chain in either direction would let one yield the other.
+  The value is derived and returned but not yet consumed: the resumed-channel send path is unbuilt,
+  and the established-channel path binds the identifier derived at first contact. Binding this value
+  is an obligation on the path when it is built, not something the code does today.
+
 ## Changelog
 
 How the understanding of the ideal state has changed. Build history lives in `CHANGELOG.md` and the

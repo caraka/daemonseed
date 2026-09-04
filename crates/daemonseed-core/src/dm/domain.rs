@@ -376,6 +376,43 @@ dm_labels! {
     /// FROZEN.
     DM_CK = b"daemonseed/dm/ck/v2";
 
+    /// HKDF-Expand `info` for `RS_0`, the retained re-establishment root — the
+    /// FOURTH sibling of the extraction that yields [`DM_ADDR_ROOT`],
+    /// [`DM_CHAN_ID`] and [`DM_RATCHET_ROOT`]
+    /// (`docs/design/direct-messaging.md:714`).
+    ///
+    /// A sibling and not a chain, for the reason the other three are: `RS_0` is
+    /// retained at rest after establishment deletes `ss0`, so a chained
+    /// derivation would let the retained value regenerate the deleted ones and
+    /// cost the forward secrecy that deletion buys. FROZEN.
+    DM_REEST_ROOT = b"daemonseed/dm/reest/root/v1";
+
+    /// HKDF-Expand `info` for the successor retained root `RS_{n+1}`, expanded
+    /// from the extraction over `RS_n ‖ ss_new` under [`DM_REEST_SALT`]
+    /// (`docs/design/direct-messaging.md:724`).
+    ///
+    /// Distinct from [`DM_RATCHET_STEP`], which expands the ratchet root
+    /// `RK_0'` from a different extraction over the same two inputs: the two
+    /// outputs of one re-establishment must not be derivable from each other,
+    /// because one is retained at rest and the other is a live ratchet root
+    /// that is advanced and deleted. FROZEN.
+    DM_REEST_NEXT = b"daemonseed/dm/reest/next/v1";
+
+    /// HKDF-Expand `info` for the resumed channel's identifier
+    /// `chan_id_{n+1}`, expanded from the extraction over `RS_n ‖ ss_new` under
+    /// [`DM_REEST_SALT`] — **the one sibling of the successor root**
+    /// [`DM_REEST_NEXT`], which that extraction also yields. The ratchet root
+    /// the resumed channel opens under is not a sibling of either: it comes from
+    /// a separate extraction, salted with `RS_n` itself.
+    ///
+    /// Establishment deletes `chan_id` along with `ss0`
+    /// (`docs/design/direct-messaging.md:710`), so a resumed channel needs an
+    /// identifier that neither party retained. Deriving it beside the roots
+    /// rather than retaining the old one keeps the at-rest set unchanged: a
+    /// party that resumes holds `AR` and `RS_n` and nothing else about the
+    /// conversation's identity. FROZEN.
+    DM_REEST_CHAN_ID = b"daemonseed/dm/reest/chanid/v1";
+
     /// HKDF-Extract salt for every derivation rooted in a committed
     /// re-establishment root — the leg keys and the tiebreak coin alike. FROZEN.
     DM_REEST_SALT = b"daemonseed/dm/reest/salt/v1";
@@ -457,6 +494,9 @@ mod tests {
         assert_eq!(DM_CHAIN_STEP_SALT, b"daemonseed/dm/chain/step-salt/v1");
         assert_eq!(DM_MK, b"daemonseed/dm/mk/v2");
         assert_eq!(DM_CK, b"daemonseed/dm/ck/v2");
+        assert_eq!(DM_REEST_ROOT, b"daemonseed/dm/reest/root/v1");
+        assert_eq!(DM_REEST_CHAN_ID, b"daemonseed/dm/reest/chanid/v1");
+        assert_eq!(DM_REEST_NEXT, b"daemonseed/dm/reest/next/v1");
     }
 
     /// No label is a prefix of another.
@@ -534,7 +574,7 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 47] = [
+        let pinned: [(&[u8], &[u8]); 50] = [
             (DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3".as_slice()),
             (DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1".as_slice()),
             (
@@ -606,6 +646,12 @@ mod tests {
             (DM_RATCHET_ROOT, b"daemonseed/dm/ratchet/root/v2".as_slice()),
             (DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2".as_slice()),
             (DM_REEST_LEG, b"daemonseed/dm/reest/leg/v1".as_slice()),
+            (
+                DM_REEST_CHAN_ID,
+                b"daemonseed/dm/reest/chanid/v1".as_slice(),
+            ),
+            (DM_REEST_NEXT, b"daemonseed/dm/reest/next/v1".as_slice()),
+            (DM_REEST_ROOT, b"daemonseed/dm/reest/root/v1".as_slice()),
             (DM_REEST_SALT, b"daemonseed/dm/reest/salt/v1".as_slice()),
             (DM_REEST_SIG, b"daemonseed/dm/reest/sig/v1".as_slice()),
             (

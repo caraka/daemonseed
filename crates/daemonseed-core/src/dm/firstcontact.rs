@@ -158,17 +158,36 @@ const DIR_A2B: &[u8] = ratchet::Direction::AToB.label();
 /// Cheaper to add now than after the vectors harden.
 pub const FRAME_KIND_FIRST_CONTACT: &[u8] = b"fc";
 
-/// The two roots every conversation derives from `ss0`.
+/// The three roots every conversation derives from `ss0`.
 ///
 /// `ar` addresses the channel and is **retained** for its life — which is exactly
 /// why addressing is not forward-secret even though content is. `chan_id`
 /// identifies the conversation inside signatures and AAD and is **never
 /// serialized**: a receiver recomputes it from the record it derived. Putting it
 /// on the wire would collapse the address scatter it exists to protect.
+///
+/// `rs0` is the re-establishment root a party keeps at rest so a channel torn
+/// down by a restart can be resumed without a second doorbell knock
+/// (`docs/design/direct-messaging.md:710`, `:714`). It is a **fourth Expand
+/// sibling** of the same extraction that yields these two and the ratchet root
+/// [`RK0`](crate::dm::ratchet), never a value chained off any of them: `rs0`
+/// outlives `ss0`, which establishment deletes, so a chain would let the
+/// retained value regenerate the deleted one.
 #[derive(Clone, Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ChannelRoots {
     pub ar: [u8; ROOT_LEN],
     pub chan_id: [u8; ROOT_LEN],
+    /// The retained re-establishment root `RS_0`.
+    ///
+    /// Advanced by [`crate::dm::resume::reroot`] at every completed
+    /// re-establishment. The root it replaces does not vanish at that moment:
+    /// [`crate::dm::resume::ResumeRecord::commit_reestablished`] moves it into
+    /// [`Retention`](crate::dm::resume::Retention) with a **write-once**
+    /// `superseded_at_ms` stamp, and it is retired when the retirement ceiling
+    /// measured from that stamp expires. The retention is deliberate — frames
+    /// already published under the superseded root must still open while the
+    /// dead direction drains — and one root is retained at a time.
+    pub rs0: crate::dm::resume::CommittedRoot,
 }
 
 impl std::fmt::Debug for ChannelRoots {
@@ -269,26 +288,39 @@ impl From<EnvelopeError> for FirstContactError {
     }
 }
 
-/// Derive `AR` and `chan_id` from the encapsulated secret.
+/// Derive `AR`, `chan_id` and `RS_0` from the encapsulated secret.
 ///
 /// Both parties reach the same roots — the sender at compose time, the recipient
 /// after decapsulating — which is what lets them meet on a channel whose address
 /// no third party can derive.
+///
+/// All three are Expand siblings of ONE extraction over `ss0`, and so is the
+/// ratchet root [`RK0`](crate::dm::ratchet) that `dm::ratchet` derives from the
+/// same input. `roots_from_one_ss0_are_pinned_siblings` in that module pins all
+/// four outputs against an independently computed HKDF-SHA384, so re-plumbing
+/// any one of them into a chain changes those bytes and fails.
 pub fn derive_channel_roots(ss0: &[u8; SS0_LEN]) -> Result<ChannelRoots, FirstContactError> {
     let hkdf =
         HkdfSha384::extract(Some(domain::DM_ROOT_SALT), ss0).map_err(FirstContactError::Kdf)?;
-    // Both transients are cleared on every path: `[u8; N]` is `Copy` with no
+    // All three transients are cleared on every path: `[u8; N]` is `Copy` with no
     // `Drop`, so the struct's `ZeroizeOnDrop` covers only the copies that moved
     // into it and the originals would otherwise stay live in this frame (#135).
     let mut ar = [0u8; ROOT_LEN];
     let mut chan_id = [0u8; ROOT_LEN];
+    let mut rs0 = [0u8; crate::dm::ratchet::ROOT_KEY_LEN];
     let outcome = hkdf
         .expand(domain::DM_ADDR_ROOT, &mut ar)
         .and_then(|()| hkdf.expand(domain::DM_CHAN_ID, &mut chan_id))
-        .map(|()| ChannelRoots { ar, chan_id })
+        .and_then(|()| hkdf.expand(domain::DM_REEST_ROOT, &mut rs0))
+        .map(|()| ChannelRoots {
+            ar,
+            chan_id,
+            rs0: crate::dm::resume::CommittedRoot::from_bytes(&rs0),
+        })
         .map_err(FirstContactError::Kdf);
     ar.zeroize();
     chan_id.zeroize();
+    rs0.zeroize();
     outcome
 }
 

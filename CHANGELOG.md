@@ -26,6 +26,29 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed_core::dm::domain` — `DM_REEST_ROOT`, `DM_REEST_NEXT` and `DM_REEST_CHAN_ID`, the
+  domain labels for the retained re-establishment root, its successor, and a resumed channel's
+  identifier (#404).
+- `daemonseed_core::dm::firstcontact::ChannelRoots` — an `rs0` field carrying the retained
+  re-establishment root, the fourth Expand sibling of the `ss0` extraction (#404).
+- `daemonseed_core::dm::resume` — `Rerooted` and `reroot(&CommittedRoot, &[u8; SHARED_SECRET_LEN])`,
+  yielding the successor retained root, the re-rooted ratchet root and the resumed channel's
+  identifier from one call. `Rerooted::chan_id()` returns the identifier (#404).
+- `daemonseed_core::dm::reest` — `mint_ephemeral()`, `answer(&CommittedRoot, &ek)` and
+  `complete(&CommittedRoot, EphemeralDecapKey, &ct)`, the ML-KEM operations a re-establishment
+  performs. The shared secret does not leave the crate (#404).
+- `daemonseed_core::dm::resume::OwnSlot` — an `eph_dk` field holding the secret half of the
+  ephemeral its `RE-EST` published, sealed and zeroized with the slot. `OwnSlot::new` takes it
+  (#404).
+- `daemonseed_core::dm::ratchet` — `Ratchet::reestablished` and `ReconnectSide`, opening a ratchet
+  on a re-rooted root with the clear generation and the send sequence continuing. Both
+  `ReconnectSide` variants carry `last_persisted_generation`; a generation that is not ahead of it is
+  refused with `RatchetError::ReestablishedGenerationNotAhead` on either side (#404).
+- `daemonseed_core::dm::outbox` — `Outbox::sweep_dead_chain(u32)`, `Outbox::next_send_seq()`,
+  `Outbox::last_clear_gen()` and `OutboxEntry::sealed_under_gen()` (#404).
+- `daemonseed_core::dm::resume` — `ResumeRecord::commit_reestablished(Rerooted, u32, i64) ->
+  Zeroizing<[u8; ROOT_KEY_LEN]>`, returning the resumed channel's identifier, and
+  `ResumeRecord::reroot_ratchet_gen()`; `ReEstState` gains `reroot_ratchet_gen` (#404).
 - `daemonseed_core::dm::reest` — the three A9 channel re-establishment legs. A leg is one
   AES-256-GCM envelope over a plaintext padded to 8192 bytes, `LEG_LEN` on the wire for all three
   kinds, with no clear kind, generation, seq, attempt or direction field and no AAD. The seal key is
@@ -566,6 +589,19 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed_core::dm::outbox` at-rest format v5 (`daemonseed/dm/outbox/v5\0`): the header carries
+  `next_send_seq` and `last_clear_gen`, each entry carries `sealed_under_gen`. v4, v3 and v2 are
+  read with the new fields zero; v1 is still refused. `Outbox::publish` and `Outbox::enqueue_sealed`
+  take the sealing generation (#404).
+- `daemonseed_core::dm::resume` at-rest format v2 (`daemonseed/dm/resume/v2\0`): the own slot carries
+  its ephemeral decapsulation key behind a presence flag, and the record carries
+  `reroot_ratchet_gen`. `RESUME_MAGIC_V1` is refused with `ResumeError::ObsoleteV1Layout` (#404).
+- `daemonseed_core::dm::resume::ResumeRecord::commit_reestablished` re-qualifies the send floor by
+  the re-rooted ratchet generation, carrying its sequence across unchanged (#404).
+- `daemonseed_core::dm::outbox::Outbox::sweep_dead_chain` leaves `OutboxTarget::Doorbell` entries
+  alone; `Outbox::enqueue_awaiting_key` raises `next_send_seq` (#404).
+- `daemonseed_core::dm::resume::CommittedRoot::from_bytes` and
+  `daemonseed_core::dm::ratchet::RootKey::from_bytes` borrow their bytes (#404).
 - `daemonseed_core::dm::contact_cache::ContactRecord` holds `pk_pc` as `Option`: `new` takes
   `Option<Box<[u8; ml_dsa::PK_LEN]>>` and `pk_pc()` returns `Option<&[u8; ml_dsa::PK_LEN]>`. The
   at-rest form gains a presence byte before the key, which keeps its width when absent;

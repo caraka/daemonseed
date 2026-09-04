@@ -332,7 +332,30 @@ pub const GIVE_UP_MS: i64 = GIVE_UP.as_secs() as i64 * 1_000;
 /// At-rest magic. The version is **inside** it, so a decoder compares one thing
 /// and cannot read a v1 body under a v2 header — the shape
 /// [`crate::dm::provisional`] uses.
-pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v4\0";
+pub const OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/outbox/v5\0";
+
+/// The v4 magic, which [`Outbox::decode`] **reads**, defaulting the three fields
+/// v5 adds to zero: the header's [`Outbox::next_send_seq`] and
+/// [`Outbox::last_clear_gen`], and each entry's
+/// [`OutboxEntry::sealed_under_gen`].
+///
+/// **Zero is the truthful default for two of the three.** A v4 record predates
+/// any re-establishment on this correspondence, so every entry in it was sealed
+/// under the original chain — which is exactly what `sealed_under_gen` of zero
+/// says, and it is what makes [`Outbox::sweep_dead_chain`] end those entries at
+/// the first re-establishment rather than leaving them re-seeding into a chain
+/// the peer has destroyed. `last_clear_gen` of zero says the same thing about
+/// the header.
+///
+/// **`next_send_seq` is the third, and its default is weaker.** The counter is a
+/// stored monotonic field (`docs/design/direct-messaging.md:1056`), and a v4
+/// body cannot supply it, so a migrated record reports zero until an enqueue
+/// raises it. Nothing is reissued in the meantime: every enqueue path raises the
+/// counter past the sequence it spends, and the enqueue gate independently
+/// refuses a sequence the record still holds or has pruned past
+/// ([`Outbox::pruned_high_water`]) — that pair, not this field, is what stops a
+/// write-once slot being claimed twice.
+pub const OUTBOX_MAGIC_V4: &[u8] = b"daemonseed/dm/outbox/v4\0";
 
 /// The v3 magic, which [`Outbox::decode`] **reads**, defaulting
 /// [`Outbox::pruned_high_water`] to zero — a v3 record pruned nothing, so every
@@ -398,13 +421,15 @@ pub const SUITE_ID_LEN: usize = 2;
 /// its own.
 ///
 /// The high-water is v4's addition (#323); a v3 record has 8 fewer header bytes and
-/// is read with the field defaulted to zero.
-const OUTBOX_HEADER_LEN: usize = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1 + 8 + 4;
+/// is read with the field defaulted to zero. The send counter and the clear
+/// ratchet generation are v5's (`docs/design/direct-messaging.md:1056`); a v4
+/// record has 12 fewer header bytes again.
+const OUTBOX_HEADER_LEN: usize = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1 + 8 + 8 + 4 + 4;
 
 /// Bytes an entry costs regardless of its target or lifecycle: sequence (8),
-/// composed-at (8), rung (4), next-due (8), and the acceptance, surfacing and
-/// lifecycle tags (1 each).
-const ENTRY_FIXED_LEN: usize = 8 + 8 + 4 + 8 + 1 + 1 + 1;
+/// composed-at (8), rung (4), next-due (8), sealed-under generation (4), and the
+/// acceptance, surfacing and lifecycle tags (1 each).
+const ENTRY_FIXED_LEN: usize = 8 + 8 + 4 + 8 + 4 + 1 + 1 + 1;
 
 /// Bytes the target costs: the tag, plus a `u16` slot for a doorbell.
 const fn target_encoded_len(target: OutboxTarget) -> usize {
@@ -943,9 +968,27 @@ pub struct OutboxEntry {
     lifecycle: Lifecycle,
     surfacing: Surfacing,
     acceptance: Acceptance,
+    sealed_under_gen: u32,
 }
 
 impl OutboxEntry {
+    /// The clear ratchet generation this entry's frame was sealed under, or `0`
+    /// while it is still [`Lifecycle::AwaitingKey`] and holds no frame.
+    ///
+    /// **This is the entry's sealing-chain provenance**
+    /// (`docs/design/direct-messaging.md:929`, A3.12), and it is what makes the
+    /// dead-chain sweep a derivation rather than a transaction: whether an entry
+    /// died with a restart is decidable from this number and the committed
+    /// re-establishment generation, two facts that are each persisted in one
+    /// record, so [`Outbox::sweep_dead_chain`] can be re-run at every load
+    /// instead of having to have committed atomically with something else.
+    ///
+    /// Zero is not a sentinel — generation zero is the conversation's first
+    /// chain, a real value — but an `AwaitingKey` entry has no chain at all, and
+    /// the sweep only ever consults entries that hold a frame.
+    pub fn sealed_under_gen(&self) -> u32 {
+        self.sealed_under_gen
+    }
     /// The sequence number. One monotonic space per direction across the whole
     /// conversation, the doorbell knock included.
     pub fn seq(&self) -> u64 {
@@ -1081,7 +1124,12 @@ impl OutboxEntry {
     /// [`Outbox::insert`] where the enqueue gate lives. Reaching this through
     /// [`Outbox::entry_mut`] would therefore walk straight past the capacity check —
     /// so the public door is [`Outbox::publish`], which prices the growth first.
-    pub(crate) fn publish(&mut self, now_ms: i64, frame: SealedFrame) -> Result<(), OutboxError> {
+    pub(crate) fn publish(
+        &mut self,
+        now_ms: i64,
+        frame: SealedFrame,
+        sealed_under_gen: u32,
+    ) -> Result<(), OutboxError> {
         if !matches!(self.lifecycle, Lifecycle::AwaitingKey) {
             return Err(OutboxError::AlreadyPublished(self.seq));
         }
@@ -1089,6 +1137,10 @@ impl OutboxEntry {
             return Err(OutboxError::GaveUp(self.seq));
         }
         self.lifecycle = Lifecycle::AwaitingCollection(frame);
+        // Recorded by the same call that installs the frame, so provenance and
+        // the bytes it describes cannot be set apart — an entry holding a frame
+        // always names the chain that sealed it.
+        self.sealed_under_gen = sealed_under_gen;
         Ok(())
     }
 
@@ -1316,6 +1368,29 @@ pub struct Outbox {
     /// indistinguishable from having pruned it. Reading this as an exclusive lower
     /// bound makes the empty case honest: 0 admits everything.
     pruned_high_water: u64,
+    /// The next sequence number this direction will send, stored rather than
+    /// derived (`docs/design/direct-messaging.md:1056`, A4.8).
+    ///
+    /// **Homed here because compose writes here.** Composing a frame consumes a
+    /// sequence and advances the counter, and both have to land together or a
+    /// crash between them reissues a sequence — two ciphertexts at one
+    /// write-once slot — or leaves a hole the receiver's contiguous cursor waits
+    /// on for ever. The counter is intra-record with the entry that consumes it,
+    /// so a compose is one record's write.
+    ///
+    /// **Not `max(seq over entries) + 1`.** That derivation regresses the moment
+    /// a terminal entry is pruned, which is exactly what [`Self::prune`] does.
+    next_send_seq: u64,
+    /// The highest clear ratchet generation a frame on this direction has been
+    /// sealed under (`docs/design/direct-messaging.md:1043`, A4.7).
+    ///
+    /// **Per-send, not per-reconnect.** The clear generation advances on every
+    /// direction switch, so persisting it only at a re-establishment boundary
+    /// leaves it stale: a session that ran to generation 40 in memory would
+    /// resume at one past the last *persisted* value, and a page co-host would
+    /// see the counter jump backwards — the marker A3.9 exists to remove. It
+    /// rides the per-send write this record already performs.
+    last_clear_gen: u32,
 }
 
 impl Outbox {
@@ -1331,7 +1406,20 @@ impl Outbox {
             direction,
             entries: std::collections::BTreeMap::new(),
             pruned_high_water: 0,
+            next_send_seq: 0,
+            last_clear_gen: 0,
         }
+    }
+
+    /// The next sequence number this direction will send. See the field.
+    pub fn next_send_seq(&self) -> u64 {
+        self.next_send_seq
+    }
+
+    /// The highest clear ratchet generation a frame here has been sealed under.
+    /// See the field.
+    pub fn last_clear_gen(&self) -> u32 {
+        self.last_clear_gen
     }
 
     /// Which direction every entry here is on.
@@ -1391,11 +1479,19 @@ impl Outbox {
     /// computed before anything is mutated, so a refusal leaves the entry exactly as
     /// it was — the frame is handed back to the caller by being dropped un-installed,
     /// and the entry remains `AwaitingKey` with its give-up clock still running.
+    /// `sealed_under_gen` is the clear ratchet generation the frame was sealed
+    /// under — [`Outbound::header`](crate::dm::ratchet::Outbound)'s `generation`
+    /// at the moment of the seal. It is taken here rather than read back from
+    /// the ratchet because the ratchet has moved on by the time anything asks:
+    /// the number the sweep needs is the one that was current when these bytes
+    /// were produced. It also raises [`Self::last_clear_gen`], which is the
+    /// header's copy of the same fact.
     pub fn publish(
         &mut self,
         seq: u64,
         now_ms: i64,
         frame: SealedFrame,
+        sealed_under_gen: u32,
     ) -> Result<(), OutboxError> {
         let entry = self
             .entries
@@ -1414,31 +1510,126 @@ impl Outbox {
         self.entries
             .get_mut(&seq)
             .ok_or(OutboxError::UnknownSequence(seq))?
-            .publish(now_ms, frame)
+            .publish(now_ms, frame, sealed_under_gen)?;
+        // A raise, never a set: the counter is monotone, and an entry published
+        // out of order must not pull it back.
+        self.last_clear_gen = self.last_clear_gen.max(sealed_under_gen);
+        // Past the sequence just published, so a stored counter cannot name a
+        // position this record already holds.
+        self.next_send_seq = self.next_send_seq.max(seq.saturating_add(1));
+        Ok(())
+    }
+
+    /// End every entry still awaiting collection under a chain the peer's
+    /// restart destroyed.
+    ///
+    /// A restart deletes the restarted party's **receive** chains, so frames
+    /// this sender already published under an earlier chain can never be opened,
+    /// even though `AR` keeps their addresses valid
+    /// (`docs/design/direct-messaging.md:734`, Clause 3). They are marked
+    /// undelivered at once and re-seeding stops. They are **not** re-sealed: one
+    /// logical message never gets a second distinct ciphertext, and the outbox
+    /// has one frame-installing edge with no edge back.
+    ///
+    /// **A derivation, not a transaction** (A3.12, `:929`). The condition is
+    /// decidable from two persisted facts — the entry's
+    /// [`OutboxEntry::sealed_under_gen`] and the resume record's committed
+    /// `reroot_ratchet_gen` — so this is idempotent and re-run at every load. A
+    /// crash between the resume record's commit and this sweep is healed at the
+    /// next boot rather than prevented by a cross-record transaction, and the
+    /// give-up backstops it regardless.
+    ///
+    /// **Strictly below, and that boundary is the whole rule.** An entry sealed
+    /// *at* `reroot_ratchet_gen` was sealed under the re-rooted chain and is
+    /// perfectly deliverable; ending it would destroy live messages. Only
+    /// entries below it hang from a chain that no longer exists.
+    ///
+    /// Entries that hold no frame ([`Lifecycle::AwaitingKey`]) are untouched:
+    /// they were never sealed under any chain, so a re-establishment does not
+    /// kill them — they seal against the new one when their key fetch succeeds.
+    ///
+    /// **[`OutboxTarget::Doorbell`] entries are untouched for the same reason,
+    /// stated differently.** A doorbell knock is the conversation's opening
+    /// write: it is sealed to the recipient's published static key, hangs from
+    /// no ratchet chain, and names generation zero because zero is what it
+    /// precedes. That is below every re-rooted generation, so a sweep reading
+    /// the generation alone would end every outstanding knock at the first
+    /// re-establishment — marking `Undelivered` a first-contact entry that is
+    /// still perfectly collectible, and owing a surfacing for it. The target,
+    /// not the generation, is what separates the two populations.
+    ///
+    /// Returns the sequences that just became [`Lifecycle::Undelivered`], each
+    /// also carrying [`Surfacing::Owed`], so a dropped list is re-offered by
+    /// [`Self::owed_surfacings`] rather than lost.
+    #[must_use = "a discarded teardown list is the silent abandonment the design forbids"]
+    pub fn sweep_dead_chain(&mut self, reroot_ratchet_gen: u32) -> Vec<u64> {
+        let mut fired = Vec::new();
+        for entry in self.entries.values_mut() {
+            if matches!(entry.lifecycle, Lifecycle::AwaitingCollection(_))
+                && !matches!(entry.target, OutboxTarget::Doorbell { .. })
+                && entry.sealed_under_gen < reroot_ratchet_gen
+            {
+                entry.end(Lifecycle::Undelivered);
+                fired.push(entry.seq);
+            }
+        }
+        fired
     }
 
     /// Enqueue a message whose recipient's key record could not be fetched:
     /// [`Lifecycle::AwaitingKey`], no bytes, the give-up clock already running
     /// from `now_ms`.
+    ///
+    /// **The sequence is spent here, not when the frame arrives**, so
+    /// [`Self::next_send_seq`] rises now. The entry occupies `seq` from this
+    /// moment: a repeat of it is [`OutboxError::DuplicateSequence`], and the
+    /// page slot it addresses is write-once. A counter left behind would hand the next caller
+    /// a sequence this record already holds, which the enqueue gate then
+    /// refuses — turning a bookkeeping omission into a refusal at compose time
+    /// (A4.8, `docs/design/direct-messaging.md:1056`).
     pub fn enqueue_awaiting_key(
         &mut self,
         seq: u64,
         target: OutboxTarget,
         now_ms: i64,
     ) -> Result<&mut OutboxEntry, OutboxError> {
-        self.insert(seq, target, now_ms, Lifecycle::AwaitingKey)
+        // No frame, so no sealing chain to name. `Outbox::publish` records the
+        // generation when the frame finally arrives. The `?` drops the entry
+        // borrow, so a refusal leaves the counter untouched.
+        self.insert(seq, target, now_ms, Lifecycle::AwaitingKey, 0)?;
+        self.next_send_seq = self.next_send_seq.max(seq.saturating_add(1));
+        self.entries
+            .get_mut(&seq)
+            .ok_or(OutboxError::UnknownSequence(seq))
     }
 
     /// Enqueue a message that was sealed at compose — the ordinary path. The
     /// give-up clock runs from `now_ms`.
+    ///
+    /// `sealed_under_gen` is the clear ratchet generation the frame was sealed
+    /// under; see [`OutboxEntry::sealed_under_gen`] for what reads it.
     pub fn enqueue_sealed(
         &mut self,
         seq: u64,
         target: OutboxTarget,
         now_ms: i64,
         frame: SealedFrame,
+        sealed_under_gen: u32,
     ) -> Result<&mut OutboxEntry, OutboxError> {
-        self.insert(seq, target, now_ms, Lifecycle::AwaitingCollection(frame))
+        // The `?` drops the entry borrow, so a refusal leaves both counters
+        // untouched and returns the gate's own error rather than a substitute.
+        self.insert(
+            seq,
+            target,
+            now_ms,
+            Lifecycle::AwaitingCollection(frame),
+            sealed_under_gen,
+        )?;
+        self.last_clear_gen = self.last_clear_gen.max(sealed_under_gen);
+        self.next_send_seq = self.next_send_seq.max(seq.saturating_add(1));
+        self.entries
+            .get_mut(&seq)
+            .ok_or(OutboxError::UnknownSequence(seq))
     }
 
     /// Whether this outbox could take a sealed entry of `frame_len` bytes at
@@ -1557,6 +1748,7 @@ impl Outbox {
         target: OutboxTarget,
         now_ms: i64,
         lifecycle: Lifecycle,
+        sealed_under_gen: u32,
     ) -> Result<&mut OutboxEntry, OutboxError> {
         self.admits(seq, target, lifecycle_payload_len(&lifecycle))?;
         let entry = OutboxEntry {
@@ -1565,6 +1757,7 @@ impl Outbox {
             composed_at_ms: now_ms,
             schedule: ReseedSchedule::new(now_ms),
             lifecycle,
+            sealed_under_gen,
             // A new entry has not changed state, so nothing is outstanding.
             surfacing: Surfacing::Clear,
             // Nothing has been written yet on either path: an `AwaitingKey`
@@ -1582,10 +1775,11 @@ impl Outbox {
     /// ever inserted. A terminal entry sheds its sealed frame but keeps its fixed
     /// fields for ever, so the record grows with *lifetime* messages rather than
     /// owed ones, and at [`crate::storage::dm_store::OUTBOX_CAPACITY`] that wall is
-    /// around 65 500 — `(2 MiB − 39)/32`, for a channel-page entry at the
-    /// crate-private `ENTRY_FIXED_LEN` (31) plus its one target byte; de-linked
-    /// because this doc is public and that constant is not. (It read 52 000 until
-    /// 2026-09-01, which prices a 40-byte entry this format no longer has.) It is
+    /// around 58 200 — `(2 MiB − 51)/36`, for a channel-page entry at the
+    /// crate-private `ENTRY_FIXED_LEN` (35) plus its one target byte; de-linked
+    /// because this doc is public and that constant is not. The number is a
+    /// function of the entry width and the header width, so it moves whenever a
+    /// field is added to either. It is
     /// permanent rather than a hiccup: the persist path is
     /// read-modify-write and always writes, so past the wall every future write
     /// fails — no enqueue, no sweep, no settle — for the life of the correspondence,
@@ -1967,6 +2161,10 @@ impl Outbox {
         // Before the count, so the header stays fixed-width and `encoded_len` can
         // price a candidate entry without knowing how many are already stored.
         out.extend_from_slice(&self.pruned_high_water.to_be_bytes());
+        // v5's two continuity counters, both fixed-width and both ahead of the
+        // count for the same reason the high-water is.
+        out.extend_from_slice(&self.next_send_seq.to_be_bytes());
+        out.extend_from_slice(&self.last_clear_gen.to_be_bytes());
         out.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
         for entry in self.entries.values() {
             out.extend_from_slice(&entry.seq.to_be_bytes());
@@ -1980,6 +2178,7 @@ impl Outbox {
             out.extend_from_slice(&entry.composed_at_ms.to_be_bytes());
             out.extend_from_slice(&entry.schedule.rung.to_be_bytes());
             out.extend_from_slice(&entry.schedule.next_due_ms.to_be_bytes());
+            out.extend_from_slice(&entry.sealed_under_gen.to_be_bytes());
             // Before the lifecycle, so the one variable-length field stays last
             // in the entry.
             out.push(entry.acceptance.tag());
@@ -2028,15 +2227,18 @@ impl Outbox {
         // v3 carries an acceptance byte per entry and v2 does not, so the
         // version has to survive the header read rather than being checked and
         // dropped.
-        // v3 and v4 carry an acceptance byte per entry and v2 does not; v4 alone
-        // carries the pruned high-water. Both facts have to survive the header read
-        // rather than being checked and dropped.
-        let (has_acceptance, has_high_water) = if magic == OUTBOX_MAGIC {
-            (true, true)
+        // v3, v4 and v5 carry an acceptance byte per entry and v2 does not; v4 and
+        // v5 carry the pruned high-water; v5 alone carries the two continuity
+        // counters and the per-entry sealing generation. All three facts have to
+        // survive the header read rather than being checked and dropped.
+        let (has_acceptance, has_high_water, has_continuity) = if magic == OUTBOX_MAGIC {
+            (true, true, true)
+        } else if magic == OUTBOX_MAGIC_V4 {
+            (true, true, false)
         } else if magic == OUTBOX_MAGIC_V3 {
-            (true, false)
+            (true, false, false)
         } else if magic == OUTBOX_MAGIC_V2 {
-            (false, false)
+            (false, false, false)
         } else if magic == OUTBOX_MAGIC_V1 {
             return Err(OutboxError::UnsupportedVersion);
         } else {
@@ -2065,9 +2267,21 @@ impl Outbox {
         } else {
             0
         };
+        // v5 only. `OUTBOX_MAGIC_V4` carries what a zero means for each of these
+        // and how far that default can be trusted.
+        let (next_send_seq, last_clear_gen) = if has_continuity {
+            (
+                u64::from_be_bytes(r.array()?),
+                u32::from_be_bytes(r.array()?),
+            )
+        } else {
+            (0, 0)
+        };
         let count = u32::from_be_bytes(r.array()?);
         let mut out = Self::new(direction);
         out.pruned_high_water = pruned_high_water;
+        out.next_send_seq = next_send_seq;
+        out.last_clear_gen = last_clear_gen;
         for _ in 0..count {
             let seq = u64::from_be_bytes(r.array()?);
             let target = match r.byte()? {
@@ -2129,6 +2343,15 @@ impl Outbox {
             // emission landed near it, so the old clamp to that boundary
             // rewrote correct records as readily as corrupt ones.
             let next_due_ms = i64::from_be_bytes(r.array()?);
+            // A pre-v5 body has no field here. Zero is truthful for it: such a
+            // record predates any re-establishment on this correspondence, so
+            // every frame in it was sealed under the original chain, which is
+            // what `sweep_dead_chain` must conclude about them.
+            let sealed_under_gen = if has_continuity {
+                u32::from_be_bytes(r.array()?)
+            } else {
+                0
+            };
             // A v2 body has no byte here, and every entry in one defaults to
             // `Unconfirmed` — the understating direction. `OUTBOX_MAGIC_V2`
             // carries why that is the right default rather than reconstructing
@@ -2198,6 +2421,7 @@ impl Outbox {
                     lifecycle,
                     surfacing,
                     acceptance,
+                    sealed_under_gen,
                 },
             );
         }
@@ -2403,7 +2627,7 @@ mod tests {
         let mut accepted = 0u64;
         for seq in 1..=1_000u64 {
             let asked = ob.room_for(seq, OutboxTarget::ChannelPage, WORST_CASE_SEALED_FRAME_LEN);
-            match ob.enqueue_sealed(seq, OutboxTarget::ChannelPage, T0, worst()) {
+            match ob.enqueue_sealed(seq, OutboxTarget::ChannelPage, T0, worst(), 0) {
                 Ok(_) => {
                     assert!(
                         asked.is_ok(),
@@ -2448,7 +2672,7 @@ mod tests {
     #[test]
     fn room_for_refuses_a_sequence_the_enqueue_would_refuse() {
         let mut ob = empty();
-        ob.enqueue_sealed(7, OutboxTarget::ChannelPage, T0, frame(1))
+        ob.enqueue_sealed(7, OutboxTarget::ChannelPage, T0, frame(1), 0)
             .expect("the first entry fits");
         assert_eq!(
             ob.room_for(7, OutboxTarget::ChannelPage, 16),
@@ -2466,20 +2690,283 @@ mod tests {
         );
     }
 
-    /// Turn a freshly-encoded v4 record into the v2 bytes a pre-#278 build wrote.
+    /// **The dead-chain sweep ends what the restart killed and nothing else.**
     ///
-    /// Two fields have to come back out, and naming them here rather than at each
-    /// call site is why this exists: v4's 8-byte pruned high-water (#323) and v3's
-    /// per-entry acceptance byte (#278). An earlier version of these fixtures
-    /// removed only the acceptance byte, so when v4 arrived they produced a record
-    /// that was neither version and failed with `TrailingBytes` — a fixture wrong in
-    /// a way that looks like a decoder bug.
-    fn downgrade_v4_to_v2(v4: &[u8]) -> Vec<u8> {
-        let mut out = v4.to_vec();
-        // The acceptance byte first: it sits after the high-water, so removing the
-        // earlier field would shift it.
-        out.remove(SURFACING_AT - 1);
+    /// `docs/design/direct-messaging.md:734` (Clause 3) marks every entry sealed
+    /// under a chain the peer's restart destroyed undelivered at once. The
+    /// boundary is strict: an entry sealed *at* the re-rooted generation was
+    /// sealed under the new chain and is perfectly deliverable.
+    ///
+    /// **The `==` row is a mirror control, not decoration.** Without it a sweep
+    /// written with `<=` — which ends live messages — passes every other
+    /// assertion here.
+    ///
+    /// **The doorbell row is the second mirror control.** A knock is sealed to
+    /// the recipient's published static key, hangs from no ratchet chain, and
+    /// names generation zero — below every re-rooted generation. A sweep reading
+    /// the generation alone ends it, marking a first-contact entry undelivered
+    /// while it is still collectible.
+    #[test]
+    fn the_dead_chain_sweep_ends_below_the_reroot_and_leaves_the_rest() {
+        let mut ob = empty();
+        // Below, at, and above the re-rooted generation, plus one entry that
+        // holds no frame at all and one knock on the doorbell plane.
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 3).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 6).unwrap();
+        ob.enqueue_sealed(3, channel(), T0, frame(0x33), 7).unwrap();
+        ob.enqueue_awaiting_key(4, channel(), T0).unwrap();
+        ob.enqueue_sealed(5, OutboxTarget::Doorbell { slot: 9 }, T0, frame(0x55), 0)
+            .unwrap();
+
+        let fired = ob.sweep_dead_chain(6);
+        assert_eq!(fired, vec![1], "the sweep took the wrong set");
+        assert_eq!(
+            ob.entry(1).unwrap().delivery_state(),
+            DeliveryState::Undelivered
+        );
+        assert_eq!(
+            ob.entry(1).unwrap().surfacing(),
+            Surfacing::Owed,
+            "an ending the user is never told about is the silent abandonment the design forbids"
+        );
+        // The mirror control: sealed AT the re-rooted generation, still live.
+        assert!(
+            ob.entry(2).unwrap().lifecycle().is_pending(),
+            "an entry sealed under the re-rooted chain was destroyed"
+        );
+        assert!(ob.entry(3).unwrap().lifecycle().is_pending());
+        assert!(
+            ob.entry(4).unwrap().lifecycle().is_pending(),
+            "an entry holding no frame hangs from no chain and cannot have died with one"
+        );
+        assert!(
+            ob.entry(5).unwrap().lifecycle().is_pending(),
+            "a doorbell knock hangs from no ratchet chain and cannot have died with one"
+        );
+        assert_eq!(
+            ob.entry(5).unwrap().surfacing(),
+            Surfacing::Clear,
+            "a knock the sweep left alone owes nothing"
+        );
+
+        // Idempotent: the sweep is a derivation re-run at every load, so a second
+        // pass must report nothing rather than re-owing a surfacing.
+        assert!(
+            ob.sweep_dead_chain(6).is_empty(),
+            "the sweep is not idempotent, so every boot would re-notify"
+        );
+        ob.record_surfaced(&[1]);
+        assert_eq!(ob.entry(1).unwrap().surfacing(), Surfacing::Clear);
+        assert!(
+            ob.sweep_dead_chain(6).is_empty(),
+            "a re-run re-owed a surfacing the user has already been shown"
+        );
+
+        // Positive control: a higher re-root does reach the entries left above,
+        // so the emptiness assertions are about the generation and not about a
+        // sweep that never fires.
+        assert_eq!(ob.sweep_dead_chain(8), vec![2, 3]);
+        assert!(
+            ob.entry(5).unwrap().lifecycle().is_pending(),
+            "the doorbell knock survives a sweep that does reach the channel entries, \
+             so its exemption is the target rather than the generation"
+        );
+    }
+
+    /// **A non-zero sealing generation survives the round trip.**
+    ///
+    /// Every other assertion about this field in this module reads it back as
+    /// zero — the fresh-entry default, the awaiting-key default and the
+    /// v4-migration default all agree on that value — so an encoder that wrote a
+    /// constant zero for every entry would satisfy all of them. Seven rather
+    /// than one, because one is also what a fencepost slip produces.
+    #[test]
+    fn a_non_zero_sealing_generation_survives_the_round_trip() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 7).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 4).unwrap();
+        assert_eq!(ob.entry(1).unwrap().sealed_under_gen(), 7);
+
+        let back = round_trip(&ob);
+        assert_eq!(
+            back.entry(1).unwrap().sealed_under_gen(),
+            7,
+            "the entry's sealing generation did not survive the encoding"
+        );
+        assert_eq!(
+            back.entry(2).unwrap().sealed_under_gen(),
+            4,
+            "two entries came back with one generation, so the field is per-record not per-entry"
+        );
+
+        // The sweep is the consumer, and it reads the decoded value: an encoder
+        // writing a constant would end both entries here or neither.
+        let mut back = back;
+        assert_eq!(
+            back.sweep_dead_chain(5),
+            vec![2],
+            "the sweep took the wrong set from the decoded provenances"
+        );
+    }
+
+    /// **Generation zero is a real chain, not a sentinel.**
+    ///
+    /// A v4 record migrates with every entry at `sealed_under_gen` zero, and the
+    /// first re-establishment must end those entries — they were sealed under the
+    /// original chain, which the restart destroyed. A build that treated zero as
+    /// "unknown, leave alone" would re-seed them for the full give-up window
+    /// while reporting them in flight.
+    #[test]
+    fn the_sweep_ends_entries_migrated_from_a_pre_v5_record() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
+        let v5 = ob.encode();
+        // The v4 downgrade: drop the entry's sealing generation and the two v5
+        // header counters, back to front.
+        let mut v4 = v5.clone();
+        let gen_at = SURFACING_AT - 1 - 4;
+        v4.drain(gen_at..gen_at + 4);
         let hw = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1;
+        v4.drain(hw + 8..hw + 8 + 12);
+        v4[..OUTBOX_MAGIC_V4.len()].copy_from_slice(OUTBOX_MAGIC_V4);
+
+        let mut decoded = Outbox::decode(&v4, T0).expect("a v4 record must still be readable");
+        assert_eq!(decoded.entry(1).unwrap().sealed_under_gen(), 0);
+        assert_eq!(
+            decoded.next_send_seq(),
+            0,
+            "a v4 body cannot supply the counter"
+        );
+        assert_eq!(decoded.last_clear_gen(), 0);
+        assert_eq!(
+            decoded.entry(1).unwrap().frame(),
+            ob.entry(1).unwrap().frame(),
+            "the frame is the field a desynchronised read corrupts first"
+        );
+        assert_eq!(
+            decoded.sweep_dead_chain(1),
+            vec![1],
+            "a migrated entry survived a re-establishment it could not have survived"
+        );
+    }
+
+    /// **Both continuity counters are stored, and both survive the round trip.**
+    ///
+    /// `docs/design/direct-messaging.md:1056` (A4.8) homes them here rather than
+    /// in the resume record so a compose is one record's write, and requires the
+    /// send counter be stored rather than derived from the entry set — a
+    /// derivation regresses the moment `prune` removes a terminal entry.
+    #[test]
+    fn the_continuity_counters_are_stored_and_survive_a_prune() {
+        let mut ob = empty();
+        ob.enqueue_sealed(4, channel(), T0, frame(0x11), 12)
+            .unwrap();
+        assert_eq!(ob.next_send_seq(), 5, "one past the sequence just spent");
+        assert_eq!(ob.last_clear_gen(), 12);
+
+        let back = round_trip(&ob);
+        assert_eq!(back.next_send_seq(), 5);
+        assert_eq!(back.last_clear_gen(), 12);
+
+        // The regression a derived counter would suffer: prune the only entry and
+        // the entry set no longer names the sequence that was spent.
+        let _ = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
+        ob.record_surfaced(&[4]);
+        ob.prune();
+        assert!(ob.is_empty(), "the fixture did not prune");
+        assert_eq!(
+            ob.next_send_seq(),
+            5,
+            "the counter regressed with the entry set, which would reissue a spent sequence"
+        );
+        assert_eq!(ob.last_clear_gen(), 12);
+    }
+
+    /// **Every enqueue path raises the send counter, including the one that
+    /// takes no frame.**
+    ///
+    /// A sequence is spent when an entry claims it, not when a frame arrives for
+    /// it: the entry occupies the number from that moment, the enqueue gate
+    /// refuses a repeat of it, and the page slot it addresses is write-once. A
+    /// path that spent a sequence without raising the counter would hand the
+    /// next caller a number this record already holds — a refusal at compose
+    /// time, on a message the user has just written (A4.8,
+    /// `docs/design/direct-messaging.md:1056`).
+    #[test]
+    fn every_enqueue_path_raises_the_send_counter() {
+        let mut ob = empty();
+        assert_eq!(ob.next_send_seq(), 0, "a fresh outbox has spent nothing");
+
+        ob.enqueue_awaiting_key(4, channel(), T0).unwrap();
+        assert_eq!(
+            ob.next_send_seq(),
+            5,
+            "an entry awaiting a key has spent its sequence just as a sealed one has"
+        );
+
+        // A raise, never a set — the shape the sealed path already has.
+        ob.enqueue_awaiting_key(2, channel(), T0).unwrap();
+        assert_eq!(
+            ob.next_send_seq(),
+            5,
+            "an earlier sequence pulled the counter back"
+        );
+
+        // And it survives the round trip, because the counter is stored rather
+        // than derived from the entry set.
+        assert_eq!(round_trip(&ob).next_send_seq(), 5);
+
+        // A refused enqueue leaves the counter alone: the sequence was not spent.
+        assert!(ob.enqueue_awaiting_key(4, channel(), T0).is_err());
+        assert_eq!(ob.next_send_seq(), 5);
+    }
+
+    /// A raise, never a set: an entry published out of order must not pull the
+    /// header's generation back to its own.
+    #[test]
+    fn the_clear_generation_is_raised_and_never_lowered() {
+        let mut ob = empty();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 9).unwrap();
+        ob.enqueue_awaiting_key(2, channel(), T0).unwrap();
+        ob.publish(2, T0, frame(0x22), 4).unwrap();
+        assert_eq!(
+            ob.last_clear_gen(),
+            9,
+            "a later publish at an earlier generation pulled the header back"
+        );
+        assert_eq!(
+            ob.entry(2).unwrap().sealed_under_gen(),
+            4,
+            "the entry must keep its own provenance, not the header's high-water"
+        );
+    }
+
+    /// Turn a freshly-encoded v5 record into the v2 bytes a pre-#278 build wrote.
+    ///
+    /// Four fields have to come back out, and naming them here rather than at each
+    /// call site is why this exists: v5's per-entry sealing generation and its two
+    /// header counters, v4's 8-byte pruned high-water (#323), and v3's per-entry
+    /// acceptance byte (#278). An earlier version of these fixtures removed only
+    /// the acceptance byte, so when v4 arrived they produced a record that was
+    /// neither version and failed with `TrailingBytes` — a fixture wrong in a way
+    /// that looks like a decoder bug.
+    ///
+    /// **Back to front, and that ordering is the whole correctness of it.** Each
+    /// offset below is stated against the v5 layout, so removing an earlier field
+    /// first would shift every later one.
+    ///
+    /// One entry only: every caller builds a single-entry record, and a second
+    /// entry's fields sit at offsets this helper does not compute.
+    fn downgrade_v5_to_v2(v5: &[u8]) -> Vec<u8> {
+        let mut out = v5.to_vec();
+        // The acceptance byte, last of the four in layout order.
+        out.remove(SURFACING_AT - 1);
+        // The entry's sealing generation, immediately ahead of it.
+        let gen_at = SURFACING_AT - 1 - 4;
+        out.drain(gen_at..gen_at + 4);
+        // The two v5 header counters, then the v4 high-water they follow.
+        let hw = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1;
+        out.drain(hw + 8..hw + 8 + 12);
         out.drain(hw..hw + 8);
         out[..OUTBOX_MAGIC_V2.len()].copy_from_slice(OUTBOX_MAGIC_V2);
         out
@@ -2492,12 +2979,15 @@ mod tests {
         + SUITE_ID_LEN
         + 1 /* direction */
         + 8 /* pruned high-water, v4 (#323) */
+        + 8 /* next_send_seq, v5 */
+        + 4 /* last_clear_gen, v5 */
         + 4 /* count */
         + 8 /* seq */
         + 1 /* a ChannelPage target tag */
         + 8 /* composed_at_ms */
         + 4 /* rung */
         + 8 /* next_due_ms */
+        + 4 /* sealed_under_gen, v5 */
         + 1 /* acceptance */;
 
     const CHANNEL: OutboxTarget = OutboxTarget::ChannelPage;
@@ -2548,7 +3038,7 @@ mod tests {
 
         let mut ob = empty();
         for seq in 1..=AT_WORST {
-            ob.enqueue_sealed(seq, worst_target, T0, worst_frame())
+            ob.enqueue_sealed(seq, worst_target, T0, worst_frame(), 0)
                 .unwrap_or_else(|e| panic!("entry {seq} of {AT_WORST} must still fit: {e}"));
         }
         let at = ob.encode().len();
@@ -2564,7 +3054,7 @@ mod tests {
         // ties `encoded_len` — which the gate consults — to `encode` at exactly the
         // count where being one byte out changes the answer.
         let err = ob
-            .enqueue_sealed(AT_WORST + 1, worst_target, T0, worst_frame())
+            .enqueue_sealed(AT_WORST + 1, worst_target, T0, worst_frame(), 0)
             .expect_err("the entry past the claimed count must be refused, not accepted");
         assert!(
             matches!(
@@ -2622,7 +3112,7 @@ mod tests {
         let mut refused_at = None;
         for seq in 1..=500 {
             let frame = SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]);
-            if let Err(e) = ob.publish(seq, T0, frame) {
+            if let Err(e) = ob.publish(seq, T0, frame, 0) {
                 assert!(
                     matches!(e, OutboxError::Full { seq: s, .. } if s == seq),
                     "the refusal must be Full and name the sequence: {e:?}"
@@ -2681,12 +3171,12 @@ mod tests {
     fn prune_takes_only_entries_that_are_finished_and_already_surfaced() {
         let mut ob = empty();
         // 1: terminal and surfaced — the only shape that may go.
-        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
         // 2: terminal but still OWES a surfacing.
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         // 3: composed one millisecond before the sweep, so it is inside its window
         // and genuinely live — this is the entry the terminality half protects.
-        ob.enqueue_sealed(3, channel(), T0 + GIVE_UP_MS, frame(0x33))
+        ob.enqueue_sealed(3, channel(), T0 + GIVE_UP_MS, frame(0x33), 0)
             .unwrap();
 
         let given_up = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
@@ -2741,13 +3231,13 @@ mod tests {
     fn the_last_representable_sequence_is_refused() {
         let mut ob = empty();
         assert_eq!(
-            ob.enqueue_sealed(u64::MAX, channel(), T0, frame(0x11)),
+            ob.enqueue_sealed(u64::MAX, channel(), T0, frame(0x11), 0),
             Err(OutboxError::SequenceExhausted),
             "accepting u64::MAX leaves the pruned high-water unable to exclude it"
         );
         // The neighbour is fine, so this is a boundary rather than a range refusal.
         assert!(
-            ob.enqueue_sealed(u64::MAX - 1, channel(), T0, frame(0x22))
+            ob.enqueue_sealed(u64::MAX - 1, channel(), T0, frame(0x22), 0)
                 .is_ok()
         );
         // And the successor of the largest ACCEPTED sequence is representable, which
@@ -2757,7 +3247,7 @@ mod tests {
         assert_eq!(ob.prune(), 1);
         assert_eq!(ob.pruned_high_water(), u64::MAX);
         assert_eq!(
-            ob.enqueue_sealed(u64::MAX - 1, channel(), T0, frame(0x33)),
+            ob.enqueue_sealed(u64::MAX - 1, channel(), T0, frame(0x33), 0),
             Err(OutboxError::DuplicateSequence(u64::MAX - 1)),
             "the reclaimed sequence must still be excluded at the very top of the space"
         );
@@ -2772,7 +3262,7 @@ mod tests {
     #[test]
     fn a_pruned_sequence_is_still_refused_as_a_duplicate() {
         let mut ob = empty();
-        ob.enqueue_sealed(7, channel(), T0, frame(0x11)).unwrap();
+        ob.enqueue_sealed(7, channel(), T0, frame(0x11), 0).unwrap();
         let _ = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
         ob.record_surfaced(&[7]);
         assert_eq!(ob.prune(), 1);
@@ -2780,13 +3270,13 @@ mod tests {
         assert_eq!(ob.pruned_high_water(), 8, "one past the pruned sequence");
 
         assert_eq!(
-            ob.enqueue_sealed(7, channel(), T0, frame(0x22)),
+            ob.enqueue_sealed(7, channel(), T0, frame(0x22), 0),
             Err(OutboxError::DuplicateSequence(7)),
             "a pruned sequence was accepted again — a second ciphertext at a \
              write-once slot"
         );
         // And everything at or above the mark is still admissible.
-        assert!(ob.enqueue_sealed(8, channel(), T0, frame(0x33)).is_ok());
+        assert!(ob.enqueue_sealed(8, channel(), T0, frame(0x33), 0).is_ok());
     }
 
     /// **The high-water survives the at-rest round trip, and a v3 record reads as
@@ -2797,7 +3287,7 @@ mod tests {
     #[test]
     fn the_pruned_high_water_is_durable_and_v3_defaults_to_zero() {
         let mut ob = empty();
-        ob.enqueue_sealed(4, channel(), T0, frame(0x11)).unwrap();
+        ob.enqueue_sealed(4, channel(), T0, frame(0x11), 0).unwrap();
         let _ = ob.sweep_give_ups(T0 + GIVE_UP_MS + 1);
         ob.record_surfaced(&[4]);
         ob.prune();
@@ -2814,10 +3304,16 @@ mod tests {
 
         // A v3 record carries no such field. Zero is the truthful reading — it
         // pruned nothing — and it must not be mistaken for a corrupt one.
-        let v4 = ob.encode();
-        let mut v3 = v4.clone();
+        // `prune` emptied the record, so only the header has to come out — there
+        // is no entry here to strip a sealing generation from.
+        assert!(
+            ob.is_empty(),
+            "the fixture must be entry-free, or the header-only downgrade below is wrong"
+        );
+        let v5 = ob.encode();
+        let mut v3 = v5.clone();
         let hw = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1;
-        v3.drain(hw..hw + 8);
+        v3.drain(hw..hw + 8 + 12);
         v3[..OUTBOX_MAGIC_V3.len()].copy_from_slice(OUTBOX_MAGIC_V3);
         let decoded =
             Outbox::decode(&v3, T0 + 10 * GIVE_UP_MS).expect("a v3 record must still be readable");
@@ -2840,7 +3336,7 @@ mod tests {
     fn pruning_shrinks_what_the_capacity_gates_price() {
         let mut ob = empty();
         for seq in 1..=20 {
-            ob.enqueue_sealed(seq, channel(), T0, frame(seq as u8))
+            ob.enqueue_sealed(seq, channel(), T0, frame(seq as u8), 0)
                 .unwrap();
         }
         let before = ob.encoded_len();
@@ -2887,15 +3383,15 @@ mod tests {
         ob.enqueue_awaiting_key(2, channel, T0).unwrap();
         assert_eq!(ob.encoded_len(), ob.encode().len(), "awaiting-key channel");
 
-        ob.enqueue_sealed(3, doorbell, T0, frame(0x11)).unwrap();
+        ob.enqueue_sealed(3, doorbell, T0, frame(0x11), 0).unwrap();
         assert_eq!(ob.encoded_len(), ob.encode().len(), "sealed doorbell");
 
-        ob.enqueue_sealed(4, channel, T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(4, channel, T0, frame(0x22), 0).unwrap();
         assert_eq!(ob.encoded_len(), ob.encode().len(), "sealed channel");
 
         // A frame of a different length must move both counts by the same amount —
         // the check that the length prefix is accounted for and not just the bytes.
-        ob.enqueue_sealed(5, channel, T0, SealedFrame::new(vec![0x33; 4_096]))
+        ob.enqueue_sealed(5, channel, T0, SealedFrame::new(vec![0x33; 4_096]), 0)
             .unwrap();
         assert_eq!(ob.encoded_len(), ob.encode().len(), "sealed, longer frame");
 
@@ -2930,7 +3426,7 @@ mod tests {
     /// One sealed entry at sequence 1, composed at [`T0`].
     fn sealed_outbox() -> Outbox {
         let mut ob = empty();
-        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
         ob
     }
 
@@ -3024,12 +3520,12 @@ mod tests {
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
         let e = ob.entry_mut(1).unwrap();
-        e.publish(T0, frame(0x11)).unwrap();
+        e.publish(T0, frame(0x11), 0).unwrap();
         assert_eq!(e.frame().unwrap(), &frame_bytes(0x11)[..]);
         // A different frame, so a refusal that silently kept the old one is
         // distinguishable from one that swapped it.
         assert_eq!(
-            e.publish(T0, frame(0x22)),
+            e.publish(T0, frame(0x22), 0),
             Err(OutboxError::AlreadyPublished(1)),
             "a second frame was accepted"
         );
@@ -3083,7 +3579,7 @@ mod tests {
             for drive in ALL_DRIVES {
                 let mut ob = empty();
                 if sealed {
-                    ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+                    ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
                 } else {
                     ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
                 }
@@ -3108,7 +3604,7 @@ mod tests {
                         let _ = ob.entry_mut(1).unwrap().emit(T0);
                     }
                     Drive::Publish => {
-                        let _ = ob.entry_mut(1).unwrap().publish(T0, frame(0x22));
+                        let _ = ob.entry_mut(1).unwrap().publish(T0, frame(0x22), 0);
                     }
                     Drive::RetryKeyFetch => {
                         let _ = ob.entry_mut(1).unwrap().retry_key_fetch(T0);
@@ -3138,7 +3634,10 @@ mod tests {
         // publish: AwaitingKey -> AwaitingCollection, the one install edge.
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
-        ob.entry_mut(1).unwrap().publish(T0, frame(0x11)).unwrap();
+        ob.entry_mut(1)
+            .unwrap()
+            .publish(T0, frame(0x11), 0)
+            .unwrap();
         assert_eq!(
             ob.entry(1).unwrap().frame().unwrap(),
             &frame_bytes(0x11)[..],
@@ -3606,8 +4105,8 @@ mod tests {
     #[test]
     fn a_settled_position_never_carries_its_neighbour() {
         let mut ob = empty();
-        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         for seq in [1, 2] {
             let entry = ob.entry_mut(seq).unwrap();
             entry.emit(T0).unwrap();
@@ -3708,7 +4207,7 @@ mod tests {
     #[test]
     fn a_teardown_leaves_the_published_outbox_intact() {
         let mut ob = sealed_outbox();
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         ob.entry_mut(1).unwrap().emit(T0).unwrap();
         let before = ob.clone();
 
@@ -3734,7 +4233,7 @@ mod tests {
     fn a_teardown_surfaces_what_it_can_never_seal() {
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         let entry = ob.entry_mut(2).unwrap();
         entry.emit(T0).unwrap();
         entry.confirm_written(T0).unwrap();
@@ -3760,7 +4259,7 @@ mod tests {
     fn an_unreadable_store_declares_nothing_lost() {
         let mut ob = empty();
         ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         let before = ob.clone();
 
         let outcome = ob.channel_torn_down(&TeardownCause::StoreUnreadable("EIO".into()), T0);
@@ -3854,7 +4353,7 @@ mod tests {
 
             let mut ob = empty();
             ob.enqueue_awaiting_key(1, channel(), T0).unwrap();
-            ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+            ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
             let outcome = ob.channel_torn_down(cause, T0);
 
             let mut want_surfaced = Vec::new();
@@ -3896,7 +4395,7 @@ mod tests {
             TeardownCause::StoreUnreadable("EIO".into()),
         ] {
             let mut ob = empty();
-            ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+            ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
             ob.entry_mut(1).unwrap().emit(T0).unwrap();
 
             // Inside the window the same call retains it, so the clock is what
@@ -3971,6 +4470,9 @@ mod tests {
                 // A confirmed write — the `Unconfirmed` sealed entry is
                 // deliberately `Composed`, which its own test covers.
                 acceptance: Acceptance::Confirmed,
+                // The first chain. `delivery_state` never reads this field; the
+                // dead-chain sweep is what does, and it has its own tests.
+                sealed_under_gen: 0,
             };
             assert_eq!(entry.delivery_state(), *expected);
         }
@@ -4031,8 +4533,8 @@ mod tests {
     fn one_outbox_is_one_direction() {
         let mut a = Outbox::new(Direction::AToB);
         let mut b = Outbox::new(Direction::BToA);
-        a.enqueue_sealed(5, channel(), T0, frame(0x11)).unwrap();
-        b.enqueue_sealed(5, channel(), T0, frame(0x22)).unwrap();
+        a.enqueue_sealed(5, channel(), T0, frame(0x11), 0).unwrap();
+        b.enqueue_sealed(5, channel(), T0, frame(0x22), 0).unwrap();
         assert_ne!(a.direction(), b.direction(), "fixture is degenerate");
 
         // The same sequence number, two different messages. An ack settling 5
@@ -4119,7 +4621,7 @@ mod tests {
             entry.schedule().rung() > 0,
             "the retry did not advance the rung, so this proves nothing"
         );
-        entry.publish(T0, frame(0x11)).unwrap();
+        entry.publish(T0, frame(0x11), 0).unwrap();
         assert_eq!(
             entry.delivery_state(),
             DeliveryState::Composed,
@@ -4163,7 +4665,7 @@ mod tests {
         // afterwards and look.
         let entry = ob.entry_mut(1).unwrap();
         assert_eq!(entry.acceptance(), Acceptance::Unconfirmed);
-        entry.publish(T0, frame(0x11)).unwrap();
+        entry.publish(T0, frame(0x11), 0).unwrap();
         assert_eq!(
             entry.delivery_state(),
             DeliveryState::Composed,
@@ -4307,7 +4809,7 @@ mod tests {
             inside
                 .entry_mut(1)
                 .unwrap()
-                .publish(T0 + GIVE_UP_MS - 1, frame(0x11))
+                .publish(T0 + GIVE_UP_MS - 1, frame(0x11), 0)
                 .is_ok(),
             "a publish one millisecond inside the window was refused"
         );
@@ -4315,7 +4817,7 @@ mod tests {
         assert_eq!(
             ob.entry_mut(1)
                 .unwrap()
-                .publish(T0 + GIVE_UP_MS, frame(0x11)),
+                .publish(T0 + GIVE_UP_MS, frame(0x11), 0),
             Err(OutboxError::GaveUp(1)),
             "a frame was installed on a message already past its give-up"
         );
@@ -4423,7 +4925,7 @@ mod tests {
     #[test]
     fn a_bad_boot_clock_cannot_corrupt_the_stored_compose_time() {
         let mut ob = sealed_outbox();
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         let on_disk = ob.encode();
 
         // Boot with an RTC reading ten days early. Every entry is "in the
@@ -4459,10 +4961,10 @@ mod tests {
         // in the file and tells the user they failed.
         let mut clamped = Outbox::new(Direction::AToB);
         clamped
-            .enqueue_sealed(1, channel(), dead_rtc, frame(0x11))
+            .enqueue_sealed(1, channel(), dead_rtc, frame(0x11), 0)
             .unwrap();
         clamped
-            .enqueue_sealed(2, channel(), dead_rtc, frame(0x22))
+            .enqueue_sealed(2, channel(), dead_rtc, frame(0x22), 0)
             .unwrap();
         assert_eq!(
             clamped.sweep_give_ups(T0),
@@ -4521,9 +5023,9 @@ mod tests {
     #[test]
     fn the_doorbell_knock_and_the_channel_share_one_sequence_space() {
         let mut ob = empty();
-        ob.enqueue_sealed(0, OutboxTarget::Doorbell { slot: 7 }, T0, frame(0x01))
+        ob.enqueue_sealed(0, OutboxTarget::Doorbell { slot: 7 }, T0, frame(0x01), 0)
             .unwrap();
-        ob.enqueue_sealed(1, channel(), T0, frame(0x02)).unwrap();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x02), 0).unwrap();
         assert_eq!(
             ob.entry(0).unwrap().position(),
             None,
@@ -4549,7 +5051,8 @@ mod tests {
     #[test]
     fn a_channel_entrys_position_carries_its_page_and_not_only_its_slot() {
         let mut ob = empty();
-        ob.enqueue_sealed(57, channel(), T0, frame(0x03)).unwrap();
+        ob.enqueue_sealed(57, channel(), T0, frame(0x03), 0)
+            .unwrap();
         let at = ob
             .entry(57)
             .unwrap()
@@ -4564,7 +5067,7 @@ mod tests {
     fn a_sequence_number_is_enqueued_once() {
         let mut ob = sealed_outbox();
         assert_eq!(
-            ob.enqueue_sealed(1, channel(), T0, frame(0x22))
+            ob.enqueue_sealed(1, channel(), T0, frame(0x22), 0)
                 .err()
                 .unwrap(),
             OutboxError::DuplicateSequence(1)
@@ -4609,14 +5112,14 @@ mod tests {
     #[test]
     fn the_at_rest_form_round_trips_every_state() {
         let mut ob = empty();
-        ob.enqueue_sealed(0, OutboxTarget::Doorbell { slot: 5 }, T0, frame(0x01))
+        ob.enqueue_sealed(0, OutboxTarget::Doorbell { slot: 5 }, T0, frame(0x01), 0)
             .unwrap();
         ob.enqueue_awaiting_key(1, channel(), T0 + 1).unwrap();
-        ob.enqueue_sealed(2, channel(), T0 + 2, frame(0x03))
+        ob.enqueue_sealed(2, channel(), T0 + 2, frame(0x03), 0)
             .unwrap();
-        ob.enqueue_sealed(3, channel(), T0 + 3, frame(0x04))
+        ob.enqueue_sealed(3, channel(), T0 + 3, frame(0x04), 0)
             .unwrap();
-        ob.enqueue_sealed(4, channel(), T0 + 4, frame(0x05))
+        ob.enqueue_sealed(4, channel(), T0 + 4, frame(0x05), 0)
             .unwrap();
         ob.entry_mut(3).unwrap().emit(T0).unwrap();
         let mut ack = AckState::new();
@@ -4645,13 +5148,16 @@ mod tests {
         const SUITE: usize = OUTBOX_MAGIC.len();
         const DIR_TAG: usize = SUITE + SUITE_ID_LEN;
         const HIGH_WATER: usize = DIR_TAG + 1;
-        const COUNT: usize = HIGH_WATER + 8;
+        const NEXT_SEND_SEQ: usize = HIGH_WATER + 8;
+        const LAST_CLEAR_GEN: usize = NEXT_SEND_SEQ + 8;
+        const COUNT: usize = LAST_CLEAR_GEN + 4;
         const SEQ: usize = COUNT + 4;
         const TARGET_TAG: usize = SEQ + 8;
         const COMPOSED: usize = TARGET_TAG + 1; // a ChannelPage target is one byte
         const RUNG: usize = COMPOSED + 8;
         const DUE: usize = RUNG + 4;
-        const ACCEPTANCE: usize = DUE + 8;
+        const SEALED_UNDER_GEN: usize = DUE + 8;
+        const ACCEPTANCE: usize = SEALED_UNDER_GEN + 4;
         const SURFACING: usize = ACCEPTANCE + 1;
         const LIFE_TAG: usize = SURFACING + 1;
         const FRAME_LEN: usize = LIFE_TAG + 1;
@@ -4715,7 +5221,7 @@ mod tests {
         // A doorbell slot outside the record is refused on the way back in, not
         // only at the door.
         let mut ob = empty();
-        ob.enqueue_sealed(0, OutboxTarget::Doorbell { slot: 3 }, T0, frame(0x01))
+        ob.enqueue_sealed(0, OutboxTarget::Doorbell { slot: 3 }, T0, frame(0x01), 0)
             .unwrap();
         let mut bad_slot = ob.encode();
         bad_slot[TARGET_TAG + 1..TARGET_TAG + 3].copy_from_slice(&DOORBELL_SLOTS.to_be_bytes());
@@ -4727,7 +5233,8 @@ mod tests {
         // A duplicate sequence number in the file is refused rather than
         // collapsing two entries into one.
         let mut dup = empty();
-        dup.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+        dup.enqueue_sealed(1, channel(), T0, frame(0x11), 0)
+            .unwrap();
         let one = dup.encode();
         let mut two = one.clone();
         two[COUNT..COUNT + 4].copy_from_slice(&2u32.to_be_bytes());
@@ -4743,17 +5250,23 @@ mod tests {
     #[test]
     fn the_at_rest_form_carries_only_ciphertext_and_scheduling() {
         let mut ob = empty();
-        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
         let encoded = ob.encode();
         // Every byte accounted for, named: nothing is left over to be anything
         // else — in particular there is nowhere a message body could be hiding.
-        let header =
-            OUTBOX_MAGIC.len() + 2 /* suite id */ + 1 /* direction */ + 8 /* high-water */ + 4 /* count */;
+        let header = OUTBOX_MAGIC.len()
+            + 2 /* suite id */
+            + 1 /* direction */
+            + 8 /* high-water */
+            + 8 /* next_send_seq */
+            + 4 /* last_clear_gen */
+            + 4 /* count */;
         let entry = 8 /* seq */
             + 1 /* target tag */
             + 8 /* composed_at_ms */
             + 4 /* rung */
             + 8 /* next_due_ms */
+            + 4 /* sealed_under_gen */
             + 1 /* acceptance tag */
             + 1 /* surfacing tag */
             + 1 /* lifecycle tag */
@@ -4775,7 +5288,7 @@ mod tests {
     #[test]
     fn a_transition_lost_with_its_return_value_is_re_offered_after_a_restart() {
         let mut ob = sealed_outbox();
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         let mut ack = AckState::new();
         ack.collect(1).unwrap();
 
@@ -4871,9 +5384,13 @@ mod tests {
         // And the converse: a live entry owes nothing, however it is driven.
         let mut live = empty();
         live.enqueue_awaiting_key(1, channel(), T0).unwrap();
-        live.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        live.enqueue_sealed(2, channel(), T0, frame(0x22), 0)
+            .unwrap();
         live.entry_mut(1).unwrap().retry_key_fetch(T0).unwrap();
-        live.entry_mut(1).unwrap().publish(T0, frame(0x11)).unwrap();
+        live.entry_mut(1)
+            .unwrap()
+            .publish(T0, frame(0x11), 0)
+            .unwrap();
         live.entry_mut(2).unwrap().emit(T0).unwrap();
         let retained = live.channel_torn_down(&TeardownCause::StoreUnreadable("EIO".into()), T0);
         assert_eq!(retained.retained, vec![1, 2], "fixture ended an entry");
@@ -4892,8 +5409,8 @@ mod tests {
     #[test]
     fn record_surfaced_clears_only_what_it_was_given() {
         let mut ob = empty();
-        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         assert_eq!(ob.sweep_give_ups(T0 + GIVE_UP_MS), vec![1, 2]);
         assert_eq!(ob.owed_surfacings(), vec![1, 2]);
 
@@ -5089,7 +5606,7 @@ mod tests {
             "the acceptance byte is not where the layout says it is"
         );
 
-        let v2 = downgrade_v4_to_v2(&v3);
+        let v2 = downgrade_v5_to_v2(&v3);
         assert_eq!(
             OUTBOX_MAGIC.len(),
             OUTBOX_MAGIC_V2.len(),
@@ -5125,8 +5642,8 @@ mod tests {
     #[test]
     fn a_multi_entry_v2_record_is_read_entry_by_entry() {
         let mut ob = empty();
-        ob.enqueue_sealed(1, channel(), T0, frame(0x11)).unwrap();
-        ob.enqueue_sealed(2, channel(), T0, frame(0x22)).unwrap();
+        ob.enqueue_sealed(1, channel(), T0, frame(0x11), 0).unwrap();
+        ob.enqueue_sealed(2, channel(), T0, frame(0x22), 0).unwrap();
         for seq in [1, 2] {
             let entry = ob.entry_mut(seq).unwrap();
             entry.emit(T0).unwrap();
@@ -5138,30 +5655,36 @@ mod tests {
             "the entries are different sizes, so a fixed stride is meaningless"
         );
 
-        let v3 = ob.encode();
+        let v5 = ob.encode();
         let header = OUTBOX_MAGIC.len()
             + SUITE_ID_LEN
             + 1 /* direction */
             + 8 /* high-water */
+            + 8 /* next_send_seq */
+            + 4 /* last_clear_gen */
             + 4 /* count */;
-        let stride = (v3.len() - header) / 2;
+        let stride = (v5.len() - header) / 2;
         let first = SURFACING_AT - 1;
         let second = first + stride;
         for at in [first, second] {
             assert_eq!(
-                v3[at],
+                v5[at],
                 Acceptance::Confirmed.tag(),
                 "the acceptance byte is not where the derived stride says it is"
             );
         }
 
-        let mut v2 = v3.clone();
-        // Later byte first, so removing it does not move the earlier offset.
+        let mut v2 = v5.clone();
+        // Strictly back to front: every offset is stated against the v5 layout,
+        // so any earlier removal would move the ones after it.
         v2.remove(second);
+        v2.drain(second - 4..second);
         v2.remove(first);
-        // And v4's pruned high-water, which this record's version never carried.
+        v2.drain(first - 4..first);
+        // Then v5's two header counters, then v4's pruned high-water — neither of
+        // which this record's version carried.
         let hw = OUTBOX_MAGIC.len() + SUITE_ID_LEN + 1;
-        v2.drain(hw..hw + 8);
+        v2.drain(hw..hw + 8 + 12);
         v2[..OUTBOX_MAGIC_V2.len()].copy_from_slice(OUTBOX_MAGIC_V2);
 
         let decoded =

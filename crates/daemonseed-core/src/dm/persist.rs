@@ -2901,7 +2901,9 @@ fn erase(persist: &DmPersist, correspondence: CorrespondenceLabel) -> Result<(),
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+    use crate::dm::eph_dk_fixture;
     use std::path::Path;
 
     use crate::dm::block_list::BLOCK_LIST_MAX_ENTRIES;
@@ -3604,6 +3606,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 now,
                 SealedFrame::new(vec![0xAB; 12]),
+                0,
             )?;
             Ok(Mutation::Changed(()))
         })
@@ -3644,6 +3647,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 now,
                 SealedFrame::new(vec![0xCD; 12]),
+                0,
             )?;
             Ok(Mutation::Changed(()))
         })
@@ -3703,7 +3707,13 @@ mod tests {
         );
 
         p.update_outbox(&l, Direction::BToA, now, |outbox| {
-            outbox.enqueue_sealed(1, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![7]))?;
+            outbox.enqueue_sealed(
+                1,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![7]),
+                0,
+            )?;
             Ok(Mutation::Changed(()))
         })
         .expect("the other direction is accepted: nothing recorded the first");
@@ -3734,6 +3744,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 now,
                 SealedFrame::new(vec![0x22; 8]),
+                0,
             )?;
             // The lie: a real mutation reported as no change at all.
             Ok(Mutation::Unchanged(()))
@@ -3759,6 +3770,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 now,
                 SealedFrame::new(vec![0x11; 8]),
+                0,
             )?;
             Ok(Mutation::Changed(()))
         })
@@ -3819,6 +3831,8 @@ mod tests {
         raw.extend_from_slice(&Registry::default_write_suite().get().to_be_bytes());
         raw.push(1); // direction tag: BToA
         raw.extend_from_slice(&0u64.to_be_bytes()); // pruned high-water: nothing pruned
+        raw.extend_from_slice(&0u64.to_be_bytes()); // next_send_seq: nothing sent
+        raw.extend_from_slice(&0u32.to_be_bytes()); // last_clear_gen: the first chain
         raw.extend_from_slice(&0u32.to_be_bytes()); // no entries
         p.store()
             .critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Outbox, &raw))
@@ -3847,7 +3861,13 @@ mod tests {
         // stored direction for the second call to contradict and the refusal
         // under test could never fire.
         p.update_outbox(&l, Direction::AToB, now, |outbox| {
-            outbox.enqueue_sealed(1, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![9]))?;
+            outbox.enqueue_sealed(
+                1,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![9]),
+                0,
+            )?;
             Ok(Mutation::Changed(()))
         })
         .expect("updates");
@@ -3873,17 +3893,35 @@ mod tests {
         let now = 1_700_000_000_000i64;
 
         p.update_outbox(&l, Direction::AToB, now, |outbox| {
-            outbox.enqueue_sealed(1, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![1]))?;
+            outbox.enqueue_sealed(
+                1,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![1]),
+                0,
+            )?;
             Ok(Mutation::Changed(()))
         })
         .expect("updates");
         let before = std::fs::read(record_path(&p, &l, "outbox.bin")).expect("reads");
 
         let err = p.update_outbox(&l, Direction::AToB, now, |outbox| {
-            outbox.enqueue_sealed(2, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![2]))?;
+            outbox.enqueue_sealed(
+                2,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![2]),
+                0,
+            )?;
             // A duplicate: the module's own refusal, raised after a change was
             // already made to the in-memory copy.
-            outbox.enqueue_sealed(1, OutboxTarget::ChannelPage, now, SealedFrame::new(vec![3]))?;
+            outbox.enqueue_sealed(
+                1,
+                OutboxTarget::ChannelPage,
+                now,
+                SealedFrame::new(vec![3]),
+                0,
+            )?;
             Ok(Mutation::Changed(()))
         });
         assert!(matches!(
@@ -3919,6 +3957,7 @@ mod tests {
                     OutboxTarget::ChannelPage,
                     composed,
                     SealedFrame::new(vec![0x5A; 8]),
+                    0,
                 )?;
                 Ok(Mutation::Changed(()))
             })
@@ -3957,7 +3996,11 @@ mod tests {
     /// `ChannelPage` tag, with no frame because a terminal entry has shed it.
     /// Spelled out rather than imported so a change to either constant shows up
     /// here as a failure instead of being tracked silently.
-    const TERMINAL_ENTRY_LEN: usize = (8 + 8 + 4 + 8 + 1 + 1 + 1) + 1;
+    const TERMINAL_ENTRY_LEN: usize =
+        (8 /* seq */ + 8 /* composed_at_ms */ + 4 /* rung */ + 8 /* next_due_ms */
+            + 4 /* sealed_under_gen */ + 1 /* acceptance */ + 1 /* surfacing */
+            + 1 /* lifecycle */)
+            + 1 /* a ChannelPage target tag */;
 
     /// How many prunable entries the fixtures below plant.
     ///
@@ -4000,6 +4043,7 @@ mod tests {
                     OutboxTarget::ChannelPage,
                     later,
                     SealedFrame::new(vec![0xA5; 100_000]),
+                    0,
                 )
                 .expect("enqueues");
             seq += 1;
@@ -4187,7 +4231,7 @@ mod tests {
                 let mut seq = plant_over_threshold(outbox, t0, later);
                 loop {
                     let frame = SealedFrame::new(vec![0x5A; 4_096]);
-                    match outbox.enqueue_sealed(seq, OutboxTarget::ChannelPage, later, frame) {
+                    match outbox.enqueue_sealed(seq, OutboxTarget::ChannelPage, later, frame, 0) {
                         Ok(_) => seq += 1,
                         Err(OutboxError::Full { .. }) => break,
                         Err(e) => return Err(e.into()),
@@ -4204,6 +4248,7 @@ mod tests {
             OutboxTarget::ChannelPage,
             later,
             SealedFrame::new(vec![0x5A; 4_096]),
+            0,
         );
         assert!(
             matches!(refused, Err(OutboxError::Full { .. })),
@@ -4217,6 +4262,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 later,
                 SealedFrame::new(vec![0x5A; 4_096]),
+                0,
             )?;
             Ok(Mutation::Changed(()))
         })
@@ -4244,6 +4290,7 @@ mod tests {
                     OutboxTarget::ChannelPage,
                     later,
                     SealedFrame::new(vec![0xA5; 100_000]),
+                    0,
                 )
                 .expect("enqueues");
             pad += 1;
@@ -4348,6 +4395,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 t0,
                 SealedFrame::new(vec![0x11; 8]),
+                0,
             )
             .expect("enqueues");
         let gone = outbox.sweep_give_ups(later);
@@ -4358,6 +4406,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 later,
                 SealedFrame::new(vec![0x22; 8]),
+                0,
             )
             .expect("enqueues");
 
@@ -4374,7 +4423,8 @@ mod tests {
                         burnt,
                         OutboxTarget::ChannelPage,
                         later,
-                        SealedFrame::new(vec![0x33; 8])
+                        SealedFrame::new(vec![0x33; 8]),
+                        0
                     ),
                     Err(OutboxError::DuplicateSequence(_))
                 ),
@@ -4387,6 +4437,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 later,
                 SealedFrame::new(vec![0x44; 8]),
+                0,
             )
             .expect("a monotonic allocator's next sequence is at the mark, and is accepted");
     }
@@ -4423,6 +4474,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 later,
                 SealedFrame::new(vec![0x77; 8]),
+                0,
             )
             .expect("enqueues");
         let collected = outbox.settle_from_ack(&ack, later);
@@ -4482,6 +4534,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 later,
                 SealedFrame::new(vec![0x01; 8]),
+                0,
             )?;
             Ok(Mutation::Changed(()))
         });
@@ -4530,6 +4583,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 t0,
                 SealedFrame::new(vec![0xEE; 4_096]),
+                0,
             )
             .expect("enqueues");
         assert_eq!(
@@ -4577,6 +4631,7 @@ mod tests {
                     OutboxTarget::ChannelPage,
                     later,
                     SealedFrame::new(vec![0xA5; 100_000]),
+                    0,
                 )?;
                 seq += 1;
             }
@@ -4589,6 +4644,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 later,
                 SealedFrame::new(vec![0x5A; gap - (TERMINAL_ENTRY_LEN + 8)]),
+                0,
             )?;
             Ok(Mutation::Changed(()))
         })
@@ -5118,7 +5174,7 @@ mod tests {
             Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
             Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
             crate::dm::resume::CommittedRoot::from_bytes(
-                [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
+                &[0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
             crate::dm::resume::ReEstState {
                 reconnect_gen: 0,
@@ -5131,9 +5187,11 @@ mod tests {
                         vec![seal; 256].into_boxed_slice(),
                     )
                     .expect("within MAX_FRAME_LEN"),
+                    eph_dk_fixture(),
                 )),
                 acceptance: None,
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             crate::dm::resume::Retention::none(),
             floor,
@@ -5260,6 +5318,87 @@ mod tests {
         );
     }
 
+    /// **A re-establishment cannot carry the send floor's generation backwards
+    /// either, and the persist guard is what stops it.**
+    ///
+    /// `ResumeRecord::commit_reestablished` writes the floor with a plain
+    /// `SendFloor::new(ratchet_gen, seq)` rather than through
+    /// `SendFloor::advance_to`, so the type itself refuses nothing at that
+    /// point — a caller handing it a ratchet generation below the stored floor's
+    /// spells a rollback the record would happily hold. What refuses it is
+    /// `commit_resume`'s `SendFloor::admits` gate, which requires **both**
+    /// components non-decreasing.
+    ///
+    /// This is the mirror of `a_generation_bump_may_not_carry_the_sequence_backwards`:
+    /// that one drops the sequence under a rising generation, this one drops the
+    /// generation while the sequence stands still. Both are rollbacks and both
+    /// must be refused, and neither test catches the other's direction.
+    #[test]
+    fn a_reestablishment_may_not_carry_the_floor_generation_backwards() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = persist(dir.path());
+        let l = label(0x5E);
+        let now = 1_700_000_000_000i64;
+
+        p.commit_resume(&l, &resume_record(1, SendFloor::new(5, 100)))
+            .expect("first commit");
+        let before = p.read_resume(&l).expect("reads").expect("there");
+        let before_root = before.committed_root().as_bytes().to_vec();
+        let before_gen = before.reconnect_gen();
+        assert_eq!(before.send_floor(), SendFloor::new(5, 100));
+
+        let rerooted = || {
+            crate::dm::resume::reroot(
+                &crate::dm::resume::CommittedRoot::from_bytes(
+                    &[0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
+                ),
+                &[0x09u8; 32],
+            )
+            .expect("the module is operational")
+        };
+
+        // The re-rooted chain opens at a generation BELOW the stored floor's.
+        let mut rolled_back = resume_record(1, SendFloor::new(5, 100));
+        let _chan_id = rolled_back.commit_reestablished(rerooted(), 3, now);
+        assert_eq!(
+            rolled_back.send_floor(),
+            SendFloor::new(3, 100),
+            "the record itself does not refuse the rollback, which is why the guard must"
+        );
+        let err = p
+            .commit_resume(&l, &rolled_back)
+            .expect_err("a floor generation rollback was persisted");
+        assert!(
+            matches!(
+                err,
+                DmPersistError::Resume(ResumeError::FloorWouldRollBack { .. })
+            ),
+            "wrong error: {err:?}"
+        );
+
+        // And the refused write left the record exactly as it was.
+        let after = p.read_resume(&l).expect("reads").expect("there");
+        assert_eq!(after.send_floor(), SendFloor::new(5, 100));
+        assert_eq!(after.committed_root().as_bytes().to_vec(), before_root);
+        assert_eq!(after.reconnect_gen(), before_gen);
+
+        // Positive control: the same act at a generation above the floor's is
+        // admitted, so the refusal is about the direction rather than about a
+        // guard that refuses every re-establishment.
+        let mut forward = resume_record(1, SendFloor::new(5, 100));
+        let _chan_id = forward.commit_reestablished(rerooted(), 7, now);
+        p.commit_resume(&l, &forward)
+            .expect("a forward re-establishment must be admitted");
+        assert_eq!(
+            p.read_resume(&l)
+                .expect("reads")
+                .expect("there")
+                .send_floor(),
+            SendFloor::new(7, 100)
+        );
+    }
+
     /// A9.1: a persisted attempt is re-emitted as the byte-identical persisted
     /// seal, so committing **different** bytes under one is refused.
     ///
@@ -5365,7 +5504,7 @@ mod tests {
             Box::new(*ours.secret_key()),
             Box::new(*theirs.public_key()),
             crate::dm::resume::CommittedRoot::from_bytes(
-                [0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
+                &[0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
             crate::dm::resume::ReEstState::first_establishment(),
             crate::dm::resume::Retention::none(),
@@ -5386,7 +5525,7 @@ mod tests {
             Box::new(*ours.secret_key()),
             Box::new(*theirs.public_key()),
             crate::dm::resume::CommittedRoot::from_bytes(
-                [0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
+                &[0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
             crate::dm::resume::ReEstState {
                 reconnect_gen: 0,
@@ -5399,9 +5538,11 @@ mod tests {
                         vec![0xA5u8; 256].into_boxed_slice(),
                     )
                     .expect("within MAX_FRAME_LEN"),
+                    eph_dk_fixture(),
                 )),
                 acceptance: None,
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             crate::dm::resume::Retention::none(),
             floor,
@@ -5722,7 +5863,7 @@ mod tests {
             Box::new(*pseudonym(0x15).secret_key()),
             Box::new(*different.pk_pc()),
             crate::dm::resume::CommittedRoot::from_bytes(
-                [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
+                &[0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
             crate::dm::resume::ReEstState {
                 reconnect_gen: different.reconnect_gen(),
@@ -5736,10 +5877,12 @@ mod tests {
                             s.bytes().to_vec().into_boxed_slice(),
                         )
                         .expect("within MAX_FRAME_LEN"),
+                        eph_dk_fixture(),
                     )
                 }),
                 acceptance: None,
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             crate::dm::resume::Retention::none(),
             floor,
@@ -7201,6 +7344,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 now,
                 SealedFrame::new(vec![0x5C; 8]),
+                0,
             )?;
             Ok(Mutation::Changed(()))
         })
@@ -7529,6 +7673,7 @@ mod tests {
                 OutboxTarget::ChannelPage,
                 now,
                 SealedFrame::new(vec![0x77; 4]),
+                0,
             )?;
             Ok(Mutation::Changed(()))
         })
@@ -7952,7 +8097,7 @@ mod tests {
             Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
             Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
             crate::dm::resume::CommittedRoot::from_bytes(
-                [0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
+                &[0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
             ),
             handshake,
             retention,
@@ -7983,6 +8128,7 @@ mod tests {
                 vec![seal; 128].into_boxed_slice(),
             )
             .expect("within MAX_FRAME_LEN"),
+            eph_dk_fixture(),
         )
     }
 
@@ -8030,6 +8176,7 @@ mod tests {
                         own: None,
                         acceptance: Some(acceptance(7, 5, 0xC1).confirm()),
                         attempt_at_window_start: 0,
+                        reroot_ratchet_gen: 0,
                     },
                     crate::dm::resume::Retention::none(),
                     floor,
@@ -8086,6 +8233,7 @@ mod tests {
                         own: None,
                         acceptance: Some(acceptance(7, 5, 0xC1)),
                         attempt_at_window_start: 0,
+                        reroot_ratchet_gen: 0,
                     },
                     crate::dm::resume::Retention::none(),
                     floor,
@@ -8139,6 +8287,7 @@ mod tests {
                 own: Some(own(5, 3, 0xA1)),
                 acceptance: None,
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             crate::dm::resume::Retention::none(),
             floor,
@@ -8154,6 +8303,7 @@ mod tests {
                 own: None,
                 acceptance: None,
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             crate::dm::resume::Retention::none(),
             floor,
@@ -8182,6 +8332,7 @@ mod tests {
                 own: None,
                 acceptance: Some(acceptance(5, 1, 0xB2)),
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             crate::dm::resume::Retention::none(),
             floor,
@@ -8236,6 +8387,7 @@ mod tests {
                     own: Some(own(5, 5, 0xA1)),
                     acceptance: None,
                     attempt_at_window_start: 0,
+                    reroot_ratchet_gen: 0,
                 },
                 crate::dm::resume::Retention::none(),
                 floor,
@@ -8254,6 +8406,7 @@ mod tests {
                     own: None,
                     acceptance: None,
                     attempt_at_window_start: 5,
+                    reroot_ratchet_gen: 0,
                 },
                 crate::dm::resume::Retention::none(),
                 floor,
@@ -8281,6 +8434,7 @@ mod tests {
                         own: Some(own(6, 1, 0xA2)),
                         acceptance: None,
                         attempt_at_window_start: 0,
+                        reroot_ratchet_gen: 0,
                     },
                     crate::dm::resume::Retention::none(),
                     floor,
@@ -8308,6 +8462,7 @@ mod tests {
                     own: Some(own(6, 6, 0xA2)),
                     acceptance: None,
                     attempt_at_window_start: 5,
+                    reroot_ratchet_gen: 0,
                 },
                 crate::dm::resume::Retention::none(),
                 floor,
@@ -8342,6 +8497,7 @@ mod tests {
                     own: None,
                     acceptance: None,
                     attempt_at_window_start: 0,
+                    reroot_ratchet_gen: 0,
                 },
                 crate::dm::resume::Retention::none(),
                 floor,
@@ -8397,6 +8553,7 @@ mod tests {
                     own: None,
                     acceptance: slot,
                     attempt_at_window_start: 0,
+                    reroot_ratchet_gen: 0,
                 },
                 crate::dm::resume::Retention::none(),
                 floor,
@@ -8491,7 +8648,7 @@ mod tests {
                 crate::dm::resume::Retention {
                     retained: Some(crate::dm::resume::RetainedRoot::new(
                         crate::dm::resume::CommittedRoot::from_bytes(
-                            [seed; crate::dm::ratchet::ROOT_KEY_LEN],
+                            &[seed; crate::dm::ratchet::ROOT_KEY_LEN],
                         ),
                         stamp,
                     )),
@@ -8542,7 +8699,7 @@ mod tests {
         let l = label(0x80);
         let floor = SendFloor::new(0, 0);
         let root = |seed: u8| {
-            crate::dm::resume::CommittedRoot::from_bytes([seed; crate::dm::ratchet::ROOT_KEY_LEN])
+            crate::dm::resume::CommittedRoot::from_bytes(&[seed; crate::dm::ratchet::ROOT_KEY_LEN])
         };
         let retaining = |entries: u32, seed: u8| {
             let mut dedup = crate::dm::resume::DedupMemory::new();
@@ -8636,7 +8793,7 @@ mod tests {
                 crate::dm::resume::Retention {
                     retained: Some(crate::dm::resume::RetainedRoot::new(
                         crate::dm::resume::CommittedRoot::from_bytes(
-                            [0x91; crate::dm::ratchet::ROOT_KEY_LEN],
+                            &[0x91; crate::dm::ratchet::ROOT_KEY_LEN],
                         ),
                         1_700_000_000_000,
                     )),
@@ -8694,6 +8851,7 @@ mod tests {
                     own: None,
                     acceptance: slot,
                     attempt_at_window_start: 0,
+                    reroot_ratchet_gen: 0,
                 },
                 crate::dm::resume::Retention::none(),
                 floor,
@@ -8772,7 +8930,7 @@ mod tests {
                 crate::dm::resume::Retention {
                     retained: Some(crate::dm::resume::RetainedRoot::new(
                         crate::dm::resume::CommittedRoot::from_bytes(
-                            [0x91; crate::dm::ratchet::ROOT_KEY_LEN],
+                            &[0x91; crate::dm::ratchet::ROOT_KEY_LEN],
                         ),
                         1_700_000_000_000,
                     )),

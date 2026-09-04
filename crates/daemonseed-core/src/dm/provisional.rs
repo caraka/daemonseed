@@ -30,11 +30,12 @@
 //! ## What the record stores, and what it recomputes
 //!
 //! `{version, ss0, eph_ek, eph_dk}` — and **not** `AR`, **not** `chan_id`, **not**
-//! the ratchet root `RK`. All three are pure functions of `ss0`:
-//! [`derive_channel_roots`] HKDF-expands `ar` and `chan_id` from an extract over
-//! `ss0`, and the root comes from the same extract under
-//! [`domain::DM_RATCHET_ROOT`] — three siblings of one extraction, which
-//! `ratchet`'s own `the_three_roots_from_ss0_are_independent` pins.
+//! `RS_0`, **not** the ratchet root `RK`. All four are pure functions of `ss0`:
+//! [`derive_channel_roots`] HKDF-expands `ar`, `chan_id` and `rs0` from an
+//! extract over `ss0`, and the root comes from the same extract under
+//! [`domain::DM_RATCHET_ROOT`] — four siblings of one extraction. `ratchet`'s
+//! `roots_from_one_ss0_are_pinned_siblings` pins all four outputs for a fixed
+//! `ss0`, so re-plumbing the derivation changes those bytes and fails.
 //!
 //! So they are recomputed on restore rather than stored. That is not only fewer
 //! secret bytes at rest and a smaller fixed-size record: it makes an

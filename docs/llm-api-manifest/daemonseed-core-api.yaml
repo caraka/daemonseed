@@ -971,7 +971,25 @@ modules:
       RootKey, ChainKey and MessageKey are zeroize-on-drop redacting newtypes and
       every derivation zeroizes its transient buffer on both paths. Ratchet is the
       live state machine: initiator(ss0, eph_ek, eph_dk) and recipient(ss0,
-      peer_eph_ek) open it from a verified first contact; send_next() takes a
+      peer_eph_ek) open it from a verified first contact;
+      reestablished(rerooted: &resume::Rerooted, role: Role, side: ReconnectSide,
+      generation: u32, next_send_seq: u64, ar: &[u8; firstcontact::ROOT_LEN]) ->
+      Result<Ratchet, RatchetError> opens it again on a re-rooted root after a
+      restart. ReconnectSide { Initiated { last_persisted_generation: u32 },
+      Answered { last_persisted_generation: u32, peer_next_send_seq: u64 } } says
+      which end of the handshake this party was: the RE-EST sender owns the first
+      chain and mints a fresh ephemeral for its RE-CONFIRM, the answering side
+      receives on that chain and mints none. generation and next_send_seq
+      continue rather than restart; either side offered a generation at or below
+      its last_persisted_generation is refused with
+      RatchetError::ReestablishedGenerationNotAhead { offered, persisted }, whose
+      natural source is outbox::Outbox::last_clear_gen(). gen_ct
+      is None, because the root came from the RE-EST/RE-ACK exchange rather than
+      from a ciphertext on a frame. chan_id is not a parameter: a Ratchet binds
+      its conversation by ar_fingerprint(ar) alone. A resumed channel's
+      identifier is resume::Rerooted::chan_id(), bound one layer up where sealing
+      happens; no caller reads it, because the resumed-channel send path is not
+      built. send_next() takes a
       generation step when the peer has published an ephemeral newer than the one
       last stepped against, mints a fresh ephemeral, and returns Outbound { key,
       header, eph_ct, eph_ek } — eph_ct repeats on EVERY message of a generation
@@ -1017,11 +1035,17 @@ modules:
       (borrowing, and therefore copying eph_dk) are both pub(crate) — outside
       the crate, dm::persist's PendingHandshake is the only path from a record
       to a ratchet. Both go through Ratchet::initiator, which re-derives
-      the root — so neither AR nor RK nor chan_id is stored, and no byte
-      constructor for RootKey exists at any visibility. address_root() does not
+      the root — so neither AR nor RK nor chan_id is stored.
+      ratchet::RootKey::from_bytes(&[u8; ROOT_KEY_LEN]) is pub(crate) with one
+      caller, resume::reroot; there is no byte constructor for RootKey outside
+      the crate. address_root() does not
       return chan_id with AR; channel_roots() -> Result<ChannelRoots,
       FirstContactError> recomputes both, for a caller resuming a handshake that
-      must open a frame as well as address it.
+      must open a frame as well as address it. ChannelRoots { ar: [u8; ROOT_LEN],
+      chan_id: [u8; ROOT_LEN], rs0: resume::CommittedRoot } carries three Expand
+      siblings of one HKDF-Extract over ss0 under DM_ROOT_SALT: DM_ADDR_ROOT,
+      DM_CHAN_ID and DM_REEST_ROOT. rs0 is the retained re-establishment root,
+      advanced by resume::reroot at every completed re-establishment.
       eph_ek() borrows the public half. The record is not Clone, renders no bytes
       in Debug, and has no Drop of its own so both ephemeral halves move out.
       RecordContext { recipient_keyrec_addr: &[u8; DM_KEYREC_OWNER_SEED_LEN],
@@ -1602,14 +1626,14 @@ modules:
       doorbell knock at sequence 0 and every channel message after it;
       direction() reads it and there is no Default, because a sequence number
       means nothing without a direction and an acknowledgement is per-direction.
-      enqueue_sealed(seq, target, now_ms, frame) and
+      enqueue_sealed(seq, target, now_ms, frame, sealed_under_gen) and
       enqueue_awaiting_key(seq, target, now_ms) -> Result<&mut
       OutboxEntry, OutboxError> add one, taking the caller's clock as the compose
       time; a repeat is OutboxError::DuplicateSequence, and a message the record
       could not then hold is OutboxError::Full { seq, needed, capacity } with
       needed the would-be total and Display rendering the excess. publish(seq,
-      now_ms, frame) installs the sealed frame on an AwaitingKey entry and is the
-      only public way to do so — OutboxEntry::publish is pub(crate) — because
+      now_ms, frame, sealed_under_gen) installs the sealed frame on an AwaitingKey
+      entry and is the only public way to do so — OutboxEntry::publish is pub(crate) — because
       installing a frame is the other edge that grows the record and is gated the
       same way; an unknown seq is OutboxError::UnknownSequence. Both gates price
       the candidate before mutating, so a refusal leaves the outbox byte-identical.
@@ -1643,14 +1667,30 @@ modules:
       consumption it records. channel_torn_down's retained set is not flagged:
       those entries are unchanged and are re-reported on their own merits.
       encode/decode carry the flag; the at-rest form is
-      daemonseed/dm/outbox/v3\0 plus a 2-byte suite id. v2 (OUTBOX_MAGIC_V2) is
-      read, with every entry defaulting to Acceptance::Unconfirmed; v1
-      (OUTBOX_MAGIC_V1) is refused as OutboxError::UnsupportedVersion. Sealing,
+      daemonseed/dm/outbox/v5\0 plus a 2-byte suite id. The v5 header carries
+      next_send_seq: u64 and last_clear_gen: u32 after the pruned high-water, and
+      each entry carries sealed_under_gen: u32 after next_due_ms. v4
+      (OUTBOX_MAGIC_V4) is read with those three fields zero; v3
+      (OUTBOX_MAGIC_V3) additionally reads with the pruned high-water zero; v2
+      (OUTBOX_MAGIC_V2) additionally defaults every entry to
+      Acceptance::Unconfirmed; v1 (OUTBOX_MAGIC_V1) is refused as
+      OutboxError::UnsupportedVersion. next_send_seq() -> u64 and
+      last_clear_gen() -> u32 read the two header counters, never lowered:
+      next_send_seq is raised by every enqueue path including
+      enqueue_awaiting_key, and last_clear_gen by publish and enqueue_sealed; OutboxEntry::sealed_under_gen()
+      -> u32 is the entry's sealing-chain provenance, 0 while it holds no frame.
+      sweep_dead_chain(reroot_ratchet_gen: u32) -> Vec<u64> ends, via
+      OutboxEntry::end(Undelivered), exactly the AwaitingCollection entries whose
+      target is OutboxTarget::ChannelPage and whose sealed_under_gen is strictly
+      below the argument; an OutboxTarget::Doorbell entry is left alone. It
+      marks each ended entry Surfacing::Owed
+      and returns their sequences; it is #[must_use], idempotent, and a
+      derivation re-runnable at every load rather than a transaction. Sealing,
       padding and the fixed on-disk size belong to
       storage::dm_store (#279). SealedFrame::new(Vec<u8>) wraps sealed bytes
       and exposes as_bytes/len/is_empty only; there is no mutating accessor.
-      Outbox::publish(seq, now_ms, frame) is the only edge that installs a frame
-      and accepts only AwaitingKey, returning OutboxError::AlreadyPublished
+      Outbox::publish(seq, now_ms, frame, sealed_under_gen) is the only edge that
+      installs a frame and accepts only AwaitingKey, returning OutboxError::AlreadyPublished
       otherwise; OutboxEntry::publish is pub(crate) so the frame install cannot
       bypass the capacity check. emit(now_ms) -> Result<&[u8], OutboxError>
       returns the stored bytes borrowed and advances the schedule;
@@ -1698,7 +1738,7 @@ modules:
       so the obligation travels with the value rather than only binding at the
       call. encode() / decode(bytes, now_ms) ->
       Result<Outbox, OutboxError> are the at-rest form under OUTBOX_MAGIC
-      (daemonseed/dm/outbox/v3\0), plaintext, carrying no key material and no
+      (daemonseed/dm/outbox/v5\0), plaintext, carrying no key material and no
       message text; encode always writes the current version. decode rejects a
       wrong magic, a truncation, an unknown tag, a doorbell slot outside the
       record, a duplicate sequence and trailing bytes.
@@ -1719,7 +1759,8 @@ modules:
       the frame-length invariants. The two struct arguments group the fields that
       move together in one write. ReEstState { reconnect_gen: u32, attempt: u32,
       last_seen_re_est: u32, own: Option<OwnSlot>,
-      acceptance: Option<AcceptanceSlot>, attempt_at_window_start: u32 } is
+      acceptance: Option<AcceptanceSlot>, attempt_at_window_start: u32,
+      reroot_ratchet_gen: u32 } is
       A3.14's two handshake slots plus A3.4's generation, A5.2's monotone attempt
       counter, A6.1's RE-EST window base and A7.3's window anchor;
       ReEstState::first_establishment() is all of it empty. The counter is its
@@ -1734,10 +1775,15 @@ modules:
       standing empty, which is what a record written at first establishment
       carries; at rest a slot is attempt 0 and a zero-length frame, and None
       orders below every Attempt.
-      OwnSlot::new(generation: u32, sealed: SealedReEst) with generation(),
-      attempt() -> Attempt and sealed() -> &SealedReEst is our own pending
-      initiation; the generation is the one it is trying to reach, which A3.4
-      distinguishes from the committed reconnect_gen.
+      OwnSlot::new(generation: u32, sealed: SealedReEst, eph_dk:
+      ratchet::EphemeralDecapKey) with generation(), attempt() -> Attempt,
+      sealed() -> &SealedReEst and eph_dk() -> &ratchet::EphemeralDecapKey is our
+      own pending initiation; the generation is the one it is trying to reach,
+      which A3.4 distinguishes from the committed reconnect_gen. The
+      decapsulation key opens the RE-ACK answering the RE-EST the slot re-emits,
+      and is stored with it: decode refuses an occupied slot without one
+      (ResumeError::OccupiedSlotHasNoEphemeralKey) and an empty slot with one
+      (ResumeError::EphemeralKeyWithoutSlot).
       AcceptanceSlot::accept(generation: u32, attempt: Attempt, sealed_re_ack:
       Box<[u8]>) -> Result<AcceptanceSlot, ResumeError> is the peer initiation we
       accepted, refusing ResumeError::FrameTooLong { len } above
@@ -1766,6 +1812,35 @@ modules:
       several tokens for one successor. decode rebuilds a SealedReEst from
       at-rest bytes with no token, so holding one is not proof a token authorised
       it. DmPersist::commit_resume is the enforcement point in all cases.
+      reroot(previous: &CommittedRoot, ss_new: &[u8; ml_kem::SHARED_SECRET_LEN])
+      -> Result<Rerooted, ratchet::RatchetError> derives all three outputs of one
+      re-establishment from one call: Rerooted::next() -> &CommittedRoot is
+      RS_n+1 = Expand(Extract(DM_REEST_SALT, RS_n || ss_new), DM_REEST_NEXT);
+      Rerooted::chan_id() -> &[u8; ROOT_KEY_LEN] is the resumed channel's
+      identifier, Expand of the same extraction under DM_REEST_CHAN_ID — the
+      value such a channel's frames bind into the authorship-signature preimage
+      and the seal AAD. No caller reads it: the resumed-channel send path is not
+      built. The re-rooted ratchet root RK_0' = advance_root(RS_n, ss_new) is
+      crate-private, so a caller outside
+      the crate holds a re-establishment result without holding the root the
+      resumed channel's message keys descend from. Rerooted is Clone, Zeroize and
+      ZeroizeOnDrop, and renders redacted.
+      ResumeRecord::commit_reestablished(next: Rerooted, ratchet_gen: u32,
+      now_ms: i64) -> Zeroizing<[u8; ROOT_KEY_LEN]> applies the whole transition
+      in one act: the successor becomes
+      the committed root, the root it replaces moves into Retention with
+      superseded_at_ms written once, reconnect_gen advances by one,
+      reroot_ratchet_gen is set, send_floor is re-qualified as
+      SendFloor::new(ratchet_gen, previous seq), and both handshake slots empty.
+      It returns the resumed channel's identifier, which is not stored: chan_id
+      is absent from every at-rest encoding, and the re-established identifier is
+      session-lifetime in-memory state, re-minted by the next re-establishment.
+      The caller binds it into the authorship-signature preimage and the seal AAD
+      of every frame on the resumed channel. It takes a
+      Rerooted rather than a CommittedRoot so RS_n+1 cannot be committed without
+      its RK_0' having been held. reroot_ratchet_gen() -> u32 reads the clear
+      ratchet generation the resumed chain opened at, which
+      outbox::Outbox::sweep_dead_chain compares each entry's provenance against.
       Accessors s_pc/pk_pc/committed_root/reconnect_gen/attempt/send_floor/
       attempt_at_window_start/own_slot/acceptance/retained/dedup/
       retained_but_stopped/sealed/sealed_re_est borrow; sealed_re_est returns the
@@ -1817,9 +1892,9 @@ modules:
       two different-attempt RE-ESTs share gen and seq. Leg is ReEst / ReAck /
       ReConfirm, carried here rather than in dm::reest because the key is durable
       state in this record. s_pc and committed_root zero on drop and Debug
-      renders both redacted. CommittedRoot::from_bytes([u8;
-      ROOT_KEY_LEN]) is a redacted secret newtype distinct from
-      ratchet::RootKey. SendFloor::new(generation: u32, seq: u64) orders
+      renders both redacted. CommittedRoot::from_bytes(&[u8; ROOT_KEY_LEN]) is a
+      redacted secret newtype distinct from ratchet::RootKey; it borrows its
+      bytes. SendFloor::new(generation: u32, seq: u64) orders
       lexicographically by generation then seq; advance_to(offered) ->
       Result<SendFloor, ResumeError> requires a strict advance and returns
       ResumeError::FloorWouldRollBack { stored, offered }. admits(offered) ->
@@ -1828,9 +1903,11 @@ modules:
       and admitting that would discard spent sequences. encode() ->
       Zeroizing<Vec<u8>> and decode(bytes) -> Result<ResumeRecord, ResumeError>
       are the
-      at-rest form under RESUME_MAGIC (daemonseed/dm/resume/v1\0) plus a 2-byte
+      at-rest form under RESUME_MAGIC (daemonseed/dm/resume/v2\0) plus a 2-byte
       suite id, plaintext; storage::dm_store seals and pads it. decode takes no
-      clock: no stored value here drives a terminal transition. It rejects a
+      clock: no stored value here drives a terminal transition. RESUME_MAGIC_V1
+      (daemonseed/dm/resume/v1\0) is recognised only to be refused by name as
+      ResumeError::ObsoleteV1Layout. It rejects a
       wrong magic, a truncation, a frame length above MAX_FRAME_LEN checked
       before any allocation, a sentinel or unknown suite id, trailing bytes,
       ResumeError::EmptySlotHasFrame { len } for attempt 0 beside a non-empty
@@ -1881,7 +1958,22 @@ modules:
       ReAckAuthority, eph_ct: &[u8; ml_kem::CT_LEN], s_pc) takes a
       ReAckAuthority, which carries the generation and attempt it answers and is
       minted only by OpenedReEst::answer(self); it is neither Clone nor Copy, so
-      one opened RE-EST authorises one RE-ACK. seal_re_confirm(root, dir,
+      mint_ephemeral() -> Result<(Box<[u8; ml_kem::EK_LEN]>,
+      ratchet::EphemeralDecapKey), ReEstError> mints the keypair a RE-EST
+      publishes, both halves from one call. answer(root: &CommittedRoot,
+      peer_eph_ek: &[u8; ml_kem::EK_LEN]) -> Result<(resume::Rerooted, Box<[u8;
+      ml_kem::CT_LEN]>), ReEstError> is the responder's half: it encapsulates and
+      re-roots in one call. complete(root: &CommittedRoot, eph_dk:
+      ratchet::EphemeralDecapKey, eph_ct: &[u8; ml_kem::CT_LEN]) ->
+      Result<resume::Rerooted, ReEstError> is the initiator's, consuming the
+      decapsulation key so an ephemeral answers one RE-ACK and the secret half is
+      zeroized on return. The shared secret does not cross the crate boundary:
+      each folding call zeroizes it before returning. A wrong decapsulation key
+      does not error — ML-KEM uses implicit rejection — and yields a Rerooted that
+      differs from the responder's, which surfaces at the first frame under the
+      re-rooted chain. ReEstError::Reroot(Box<ratchet::RatchetError>) carries a
+      derivation fault verbatim. one opened RE-EST authorises one RE-ACK.
+      seal_re_confirm(root, dir,
       generation, seq, attempt: Attempt, s_pc) takes a plain Attempt: it
       encapsulates nothing, so it cannot spell a fresh ciphertext under an
       unchanged key. Each sealer returns Vec<u8> of LEG_LEN.

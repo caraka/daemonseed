@@ -3150,6 +3150,7 @@ mod tests {
                             OutboxTarget::ChannelPage,
                             now,
                             SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]),
+                            0,
                         )
                         .is_ok(),
                 ))
@@ -3724,6 +3725,7 @@ mod tests {
                             target,
                             wall.load(Ordering::SeqCst),
                             daemonseed_core::dm::outbox::SealedFrame::new(knock_bytes.clone()),
+                            0,
                         )?;
                         Ok(daemonseed_core::dm::persist::Mutation::Changed(()))
                     },

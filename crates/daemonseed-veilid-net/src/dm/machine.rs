@@ -1998,6 +1998,10 @@ impl DmMachine {
         // The piggybacked acknowledgement rides for free: `seal` reads the
         // collection's own state, so a message going out carries what has come
         // in without a second record, a second write, or a second signature.
+        // Read before the seal, which consumes the outbound. This is the entry's
+        // sealing-chain provenance, and the ratchet will have moved past it by
+        // the time anything asks.
+        let sealed_under_gen = outbound.header.generation;
         let sealed = match frame::seal(
             outbound,
             &channel.chan_id,
@@ -2020,6 +2024,7 @@ impl DmMachine {
                 OutboxTarget::ChannelPage,
                 now_ms,
                 SealedFrame::new(sealed),
+                sealed_under_gen,
             )?;
             Ok(Mutation::Changed(()))
         });
@@ -4001,6 +4006,9 @@ impl DmMachine {
             seq, FIRST_RECIPIENT_CHANNEL_SEQ,
             "the acceptance is the acceptor's first channel write"
         );
+        // Read before the seal, which consumes the outbound — see the sibling
+        // read on the ordinary send path.
+        let sealed_under_gen = outbound.header.generation;
         let sealed = match frame::seal_accept(
             outbound,
             &channel.chan_id,
@@ -4022,6 +4030,7 @@ impl DmMachine {
                 OutboxTarget::ChannelPage,
                 now_ms,
                 SealedFrame::new(sealed),
+                sealed_under_gen,
             )?;
             Ok(Mutation::Changed(()))
         });
@@ -4514,6 +4523,10 @@ impl DmMachine {
                     OutboxTarget::Doorbell { slot },
                     now_ms,
                     SealedFrame::new(entry.clone()),
+                    // The knock is the conversation's opening write and hangs
+                    // from no ratchet chain, so it names generation zero — the
+                    // first chain, which is what it precedes.
+                    0,
                 )?;
                 Ok(Mutation::Changed(()))
             });
@@ -6293,7 +6306,7 @@ mod tests {
                 &ResumeRecord::new(
                     Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
                     Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
-                    CommittedRoot::from_bytes([0x33u8; ROOT_KEY_LEN]),
+                    CommittedRoot::from_bytes(&[0x33u8; ROOT_KEY_LEN]),
                     ReEstState::first_establishment(),
                     Retention::none(),
                     SendFloor::new(0, 0),
@@ -6479,6 +6492,7 @@ mod tests {
                                 OutboxTarget::ChannelPage,
                                 BASE_MS,
                                 SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]),
+                                0,
                             )
                             .is_ok(),
                     ))
@@ -9546,6 +9560,94 @@ mod tests {
             .frame()
             .expect("the entry holds its bytes")
             .to_vec()
+    }
+
+    /// The sealing generation the outbox recorded for one queued entry.
+    fn queued_sealing_gen(m: &DmMachine, label: &CorrespondenceLabel, seq: u64) -> u32 {
+        m.persist
+            .read_outbox(label, BASE_MS)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .entry(seq)
+            .unwrap_or_else(|| panic!("sequence {seq} is queued"))
+            .sealed_under_gen()
+    }
+
+    /// **Both send paths record the generation the frame was actually sealed
+    /// under, not a constant.**
+    ///
+    /// The value is what `Outbox::sweep_dead_chain` compares against the
+    /// re-rooted generation, so an entry filed under the wrong one is either
+    /// destroyed while live or re-seeded into a chain the peer has torn down.
+    /// Every other assertion about the field reads it back as zero — the
+    /// fresh-entry, awaiting-key and migration defaults all agree on that — so a
+    /// send path writing a literal zero satisfies all of them. Both paths are
+    /// checked here against a **non-zero** generation read off the ratchet
+    /// itself.
+    #[test]
+    fn both_send_paths_record_the_generation_they_sealed_under() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        // The acceptance path: B's first channel write, at sequence zero.
+        let label_b = sole_label(&b);
+        let accept_gen = queued_sealing_gen(&b, &label_b, 0);
+        assert_ne!(
+            accept_gen, 0,
+            "the fixture's acceptance sealed under generation zero, so this case cannot \
+             tell the recorded value from the default"
+        );
+        assert_eq!(
+            accept_gen,
+            b.correspondences[0]
+                .ratchet
+                .as_ref()
+                .expect("B holds a live ratchet")
+                .generation(),
+            "the acceptance was filed under a generation its ratchet never sealed at"
+        );
+
+        // The ordinary send path: A's first channel message, at sequence one.
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "the first channel message".into(),
+            },
+        );
+        let label_a = sole_label(&a);
+        let send_gen = queued_sealing_gen(&a, &label_a, 1);
+        assert_ne!(
+            send_gen, 0,
+            "the fixture's send sealed under generation zero, so this case cannot tell \
+             the recorded value from the default"
+        );
+        assert_eq!(
+            send_gen,
+            a.correspondences[0]
+                .ratchet
+                .as_ref()
+                .expect("A holds a live ratchet")
+                .generation(),
+            "the message was filed under a generation its ratchet never sealed at"
+        );
+
+        // And the header the sweep's peer will read agrees with what was filed,
+        // so the two sides of the comparison come from one number.
+        assert_eq!(
+            a.persist
+                .read_outbox(&label_a, BASE_MS)
+                .expect("reads")
+                .expect("exists")
+                .last_clear_gen(),
+            send_gen,
+            "the header counter and the entry's provenance disagree"
+        );
     }
 
     /// The initiator's conversation fingerprint.

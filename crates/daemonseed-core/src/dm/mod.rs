@@ -87,3 +87,18 @@ pub mod reest;
 pub mod resume;
 pub mod spent_store;
 pub mod token;
+
+/// A stand-in ephemeral decapsulation key for the resume-record fixtures.
+///
+/// A fixed pattern rather than a real ML-KEM keypair: every test that uses it
+/// exercises the record's encoding and its guards, neither of which
+/// decapsulates anything. The tests that do complete a handshake mint a real
+/// keypair through [`reest::mint_ephemeral`].
+///
+/// One definition, read by `dm::resume`, `dm::reest` and `dm::persist`, so the
+/// bytes a record is written with and the bytes it is asserted against cannot
+/// drift apart.
+#[cfg(test)]
+pub(crate) fn eph_dk_fixture() -> ratchet::EphemeralDecapKey {
+    ratchet::EphemeralDecapKey::new(Box::new([0x3du8; oxicrypt_ml_kem::DK_LEN]))
+}

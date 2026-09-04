@@ -72,13 +72,29 @@
 //! the position it fetched from — and without it a captured leg could be
 //! re-filed at another position on the same plane.
 //!
+//! ## The KEM seam, and where the shared secret is allowed to exist
+//!
+//! [`mint_ephemeral`], [`answer`] and [`complete`] are the three ML-KEM
+//! operations a re-establishment performs: the returning party mints a keypair
+//! and publishes the encapsulation key in its `RE-EST`; the peer encapsulates to
+//! it and re-roots; the returning party decapsulates the `RE-ACK`'s ciphertext
+//! and reaches the same pair.
+//!
+//! **`ss_new` never crosses the crate boundary.** Each of the two folding calls
+//! encapsulates or decapsulates and hands the secret straight to
+//! [`crate::dm::resume::reroot`] inside one function, zeroizing it before
+//! returning. A caller receives a [`Rerooted`] and, on the answering side, a
+//! ciphertext — neither of which yields the secret. A seam that returned
+//! `ss_new` for the caller to fold later would make it possible to commit a root
+//! whose ciphertext was never sent, or to send a ciphertext whose secret was
+//! dropped, and both leave the two parties on roots that will never agree.
+//!
 //! ## What this module does not do
 //!
-//! It encapsulates nothing and holds no state across a restart. The ML-KEM
-//! material travels through it as bytes: `RE-EST` carries an encapsulation key,
-//! `RE-ACK` carries the ciphertext that answers it, and folding either into a
-//! root is [`crate::dm::ratchet`]'s. Persisting the sealed bytes is
-//! [`crate::dm::resume`]'s, and nothing here writes a record.
+//! It holds no state across a restart. The sealed leg bytes and the ephemeral's
+//! secret half are persisted by [`crate::dm::resume`], and nothing here writes a
+//! record. Deriving the resumed channel's chains from the re-rooted root is
+//! [`crate::dm::ratchet`]'s.
 
 use std::num::NonZeroU32;
 
@@ -89,8 +105,8 @@ use oxicrypt_ml_kem as ml_kem;
 use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
-use crate::dm::ratchet::Direction;
-use crate::dm::resume::{Attempt, CommittedRoot, FreshAttempt, ResumeRecord};
+use crate::dm::ratchet::{Direction, EphemeralDecapKey};
+use crate::dm::resume::{Attempt, CommittedRoot, FreshAttempt, Rerooted, ResumeRecord, reroot};
 use crate::dm::{LEN_PREFIX, domain, pad_to_bucket, push_lp, unpad};
 use crate::identity::keys::verify_signature;
 
@@ -256,6 +272,15 @@ pub enum ReEstError {
     Sealing(ModeError),
     /// The system entropy source failed while sealing.
     EntropySource,
+    /// Folding an encapsulated secret into a re-rooted pair failed.
+    ///
+    /// Carries the cause verbatim rather than flattening it into
+    /// [`Self::Kdf`]: [`crate::dm::resume::reroot`] performs two separate
+    /// derivations and a fault in either is a sick crypto module, which a
+    /// reader has to be able to tell from a leg that merely did not open.
+    /// Boxed to keep this enum small, the way `dm::ratchet` boxes the
+    /// first-contact error it carries.
+    Reroot(Box<crate::dm::ratchet::RatchetError>),
 }
 
 impl std::fmt::Display for ReEstError {
@@ -274,6 +299,7 @@ impl std::fmt::Display for ReEstError {
             Self::Module(e) => write!(f, "crypto module unavailable: {e:?}"),
             Self::Sealing(e) => write!(f, "the re-establishment seal reported a fault: {e}"),
             Self::EntropySource => write!(f, "the entropy source failed while sealing a leg"),
+            Self::Reroot(e) => write!(f, "re-rooting the channel failed: {e}"),
         }
     }
 }
@@ -659,6 +685,123 @@ pub fn seal_re_confirm(
         &[],
         s_pc,
     )
+}
+
+/// Mint the fresh ML-KEM keypair a `RE-EST` carries.
+///
+/// The returning party generates this, publishes the encapsulation key in its
+/// `RE-EST`, and keeps the decapsulation key to open the `RE-ACK` that answers
+/// it. Both halves come back from one call for the reason
+/// [`crate::dm::firstcontact::build`] gives about the opening ratchet
+/// ephemeral: a caller that could keep the public half and drop the secret one
+/// would lose the ability to re-root at all, and nothing on the wire would show
+/// it.
+///
+/// The secret half must reach disk with the sealed `RE-EST` it belongs to —
+/// [`crate::dm::resume::OwnSlot`] is where it goes — because a crash after the
+/// commit re-emits the stored leg and must still be able to open the answer
+/// (`docs/design/direct-messaging.md:1351`, A9.1(a)).
+pub fn mint_ephemeral() -> Result<(Box<[u8; ml_kem::EK_LEN]>, EphemeralDecapKey), ReEstError> {
+    let mut d = [0u8; ml_kem::SEED_LEN];
+    let mut z = [0u8; ml_kem::SEED_LEN];
+    getrandom::fill(&mut d).map_err(|_| ReEstError::EntropySource)?;
+    getrandom::fill(&mut z).map_err(|_| ReEstError::EntropySource)?;
+    let mut generated = ml_kem::keygen(&d, &z);
+    d.zeroize();
+    z.zeroize();
+    // **The `Result` is wiped where it lies, not destructured.** `keygen`
+    // returns the secret half inside a `Result`, and moving a `Copy` array out
+    // of one copies rather than takes — so `let (ek, dk) = generated?` leaves
+    // the `Result`'s own copy of the decapsulation key on this frame with
+    // nothing able to reach it. Binding by reference keeps it reachable, and
+    // `zeroize` runs before the `Result` goes out of scope.
+    //
+    // Nothing tests this shape, here or at the sibling sites in `answer`,
+    // `complete` and `Ratchet::reestablished`. `tests/secret_zeroize_on_drop.rs`
+    // hooks the global allocator and reads heap blocks as they are freed; a
+    // `Copy` secret on a stack frame is never allocated, so no case there can go
+    // red on it. Review is the guard for this class.
+    match generated {
+        Ok((ref ek, ref mut dk)) => {
+            let out = (Box::new(*ek), EphemeralDecapKey::new(Box::new(*dk)));
+            dk.zeroize();
+            Ok(out)
+        }
+        Err(e) => Err(ReEstError::Module(e)),
+    }
+}
+
+/// Answer a `RE-EST`: encapsulate to the ephemeral it carried, and re-root.
+///
+/// This is the **responder's** half. It produces the ciphertext the `RE-ACK`
+/// carries and the re-rooted pair the responder commits, in one call, because
+/// the shared secret must not outlive the call that folds it — a caller handed
+/// `ss_new` to fold later could commit a root without its ciphertext, or a
+/// ciphertext whose secret it no longer holds.
+///
+/// `ss_new` never leaves this function. That is what keeps the KEM secret inside
+/// the crate: a caller receives a [`Rerooted`] and a ciphertext, neither of which
+/// yields it.
+pub fn answer(
+    root: &CommittedRoot,
+    peer_eph_ek: &[u8; ml_kem::EK_LEN],
+) -> Result<(Rerooted, Box<[u8; ml_kem::CT_LEN]>), ReEstError> {
+    let mut m = [0u8; ml_kem::SEED_LEN];
+    getrandom::fill(&mut m).map_err(|_| ReEstError::EntropySource)?;
+    let mut encapsulated = ml_kem::encapsulate(peer_eph_ek, &m);
+    m.zeroize();
+    // **The `Result` is wiped where it lies, not destructured.** `encapsulate`
+    // returns the shared secret inside a `Result`, and moving a `Copy` array out
+    // of one copies rather than takes — so the `Result`'s own copy of `ss_new`
+    // would stay on this frame with nothing able to reach it. Binding by
+    // reference folds the secret in place and wipes it before the `Result` goes
+    // out of scope.
+    match encapsulated {
+        Ok((ref mut ss, ref ct)) => {
+            let folded = reroot(root, ss).map_err(|e| ReEstError::Reroot(Box::new(e)));
+            let ct = Box::new(*ct);
+            ss.zeroize();
+            folded.map(|rerooted| (rerooted, ct))
+        }
+        Err(e) => Err(ReEstError::Module(e)),
+    }
+}
+
+/// Complete a re-establishment: decapsulate the `RE-ACK`'s ciphertext under the
+/// ephemeral this party published, and re-root.
+///
+/// This is the **initiator's** half, and it reaches the same [`Rerooted`] the
+/// responder's [`answer`] produced, because both derive from the same
+/// `(RS_n, ss_new)` pair.
+///
+/// **The decapsulation key is consumed**, so the ephemeral cannot be used twice
+/// and the secret half is zeroized when this call returns
+/// ([`EphemeralDecapKey`] wipes on drop). An ephemeral answers exactly one
+/// `RE-ACK`; a later attempt carries a new one.
+///
+/// **A wrong key does not fail here.** ML-KEM decapsulation uses implicit
+/// rejection: a ciphertext that does not belong to this key yields a
+/// pseudorandom secret rather than an error, so this call succeeds and produces
+/// a root that simply differs from the responder's. The divergence surfaces when
+/// the first frame under the re-rooted chain does not open, which is where a
+/// receiver can attribute it.
+pub fn complete(
+    root: &CommittedRoot,
+    eph_dk: EphemeralDecapKey,
+    eph_ct: &[u8; ml_kem::CT_LEN],
+) -> Result<Rerooted, ReEstError> {
+    let mut decapsulated = ml_kem::decapsulate(eph_dk.as_bytes(), eph_ct);
+    // Wiped where it lies rather than moved out, for the reason [`answer`]
+    // records: a `Copy` array taken out of a `Result` leaves the `Result`'s copy
+    // behind, and this one is the fresh shared secret.
+    match decapsulated {
+        Ok(ref mut ss) => {
+            let folded = reroot(root, ss).map_err(|e| ReEstError::Reroot(Box::new(e)));
+            ss.zeroize();
+            folded
+        }
+        Err(e) => Err(ReEstError::Module(e)),
+    }
 }
 
 /// A `RE-EST` that opened and verified. Only constructible by [`scan_re_est`],
@@ -1333,7 +1476,93 @@ impl AttemptBudget {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The two sides of one handshake reach the same re-rooted pair.**
+    ///
+    /// The returning party mints an ephemeral and publishes the encapsulation
+    /// key; the peer encapsulates to it and re-roots; the returning party
+    /// decapsulates and re-roots. Both outputs must agree, or the resumed channel
+    /// derives its message keys from two different roots and every frame fails to
+    /// open with no way back.
+    #[test]
+    fn a_kem_round_trip_reaches_one_rerooted_pair_on_both_sides() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let root = CommittedRoot::from_bytes(&[0x5c; 32]);
+
+        let (ek, dk) = mint_ephemeral().expect("the module is operational");
+        let (answered, ct) = answer(&root, &ek).expect("the responder encapsulates");
+        let completed = complete(&root, dk, &ct).expect("the initiator decapsulates");
+
+        assert_eq!(
+            completed.next().as_bytes(),
+            answered.next().as_bytes(),
+            "the two sides committed different retained roots"
+        );
+        assert_eq!(
+            completed.ratchet_root().as_bytes(),
+            answered.ratchet_root().as_bytes(),
+            "the two sides opened the resumed channel on different ratchet roots"
+        );
+    }
+
+    /// **A wrong decapsulation key yields a different root rather than an
+    /// error**, and the test says so rather than expecting a refusal.
+    ///
+    /// ML-KEM uses implicit rejection: a ciphertext that does not belong to the
+    /// key produces a pseudorandom secret, constant-time, with nothing to
+    /// observe. So `complete` succeeds and the divergence is only visible at the
+    /// first frame under the re-rooted chain. Asserting a refusal here would pin
+    /// behaviour the primitive does not have.
+    #[test]
+    fn a_wrong_decapsulation_key_diverges_silently_rather_than_failing() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let root = CommittedRoot::from_bytes(&[0x5c; 32]);
+
+        // The matching key is dropped unused on purpose: this case is about the
+        // one that does not match.
+        let (ek, _dk) = mint_ephemeral().expect("operational");
+        let (_other_ek, wrong_dk) = mint_ephemeral().expect("operational");
+        let (answered, ct) = answer(&root, &ek).expect("operational");
+
+        let diverged = complete(&root, wrong_dk, &ct).expect("implicit rejection does not error");
+        assert_ne!(
+            diverged.ratchet_root().as_bytes(),
+            answered.ratchet_root().as_bytes(),
+            "a wrong key reached the right root, so the secret is not reaching the derivation"
+        );
+
+        // Positive control: the right key does agree, so the assertion above is
+        // about the key rather than about `complete` being broken for everyone.
+        let (ek, dk) = mint_ephemeral().expect("operational");
+        let (answered, ct) = answer(&root, &ek).expect("operational");
+        assert_eq!(
+            complete(&root, dk, &ct)
+                .expect("operational")
+                .ratchet_root()
+                .as_bytes(),
+            answered.ratchet_root().as_bytes()
+        );
+    }
+
+    /// **A different committed root reaches a different resumed channel**, which
+    /// is what makes `RS_n` load-bearing rather than decorative: a party that
+    /// holds the fresh KEM secret but not the retained root cannot re-root.
+    #[test]
+    fn the_committed_root_is_an_input_to_the_resumed_channel() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let (ek, dk) = mint_ephemeral().expect("operational");
+        let (answered, ct) = answer(&CommittedRoot::from_bytes(&[0x5c; 32]), &ek).expect("ok");
+        let under_other_root = complete(&CommittedRoot::from_bytes(&[0x5d; 32]), dk, &ct)
+            .expect("implicit rejection does not error");
+        assert_ne!(
+            under_other_root.ratchet_root().as_bytes(),
+            answered.ratchet_root().as_bytes(),
+            "the retained root is not reaching the derivation"
+        );
+    }
+
     use super::*;
+    use crate::dm::eph_dk_fixture;
     use crate::identity::keys::{ML_DSA_SEED_LEN, SignKeypair};
 
     /// Power the crypto module on. Every derivation here refuses at
@@ -1349,11 +1578,11 @@ mod tests {
     const SEQ: u64 = 42;
 
     fn root() -> CommittedRoot {
-        CommittedRoot::from_bytes([3u8; 32])
+        CommittedRoot::from_bytes(&[3u8; 32])
     }
 
     fn other_root() -> CommittedRoot {
-        CommittedRoot::from_bytes([4u8; 32])
+        CommittedRoot::from_bytes(&[4u8; 32])
     }
 
     fn keypair(tag: u8) -> SignKeypair {
@@ -2757,7 +2986,7 @@ mod tests {
             (14, 0x05, false),
             (15, 0xAB, false),
         ];
-        let root = CommittedRoot::from_bytes([3u8; 32]);
+        let root = CommittedRoot::from_bytes(&[3u8; 32]);
         for (generation, byte, a_to_b) in KAT {
             assert_eq!(
                 tiebreak_bytes(&root, generation).unwrap(),
@@ -3048,7 +3277,7 @@ mod tests {
             while fresh.attempt().get() < own_attempt {
                 fresh = fresh.attempt().advance().expect("far below u32::MAX");
             }
-            OwnSlot::new(generation, seal_stub(fresh))
+            OwnSlot::new(generation, seal_stub(fresh), eph_dk_fixture())
         });
         ResumeRecord::new(
             Box::new([0x11; ml_dsa::SK_LEN]),
@@ -3064,6 +3293,7 @@ mod tests {
                 own,
                 acceptance: Some(slot),
                 attempt_at_window_start: anchor,
+                reroot_ratchet_gen: 0,
             },
             Retention::none(),
             SendFloor::new(0, 0),
@@ -3199,6 +3429,7 @@ mod tests {
                 own: None,
                 acceptance: None,
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             Retention::none(),
             SendFloor::new(0, 0),
@@ -3246,6 +3477,7 @@ mod tests {
                 own: None,
                 acceptance: Some(slot),
                 attempt_at_window_start: 0,
+                reroot_ratchet_gen: 0,
             },
             Retention::none(),
             SendFloor::new(0, 0),

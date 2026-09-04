@@ -65,6 +65,14 @@
 //! copies made before the drop, or about registers and stack spills the
 //! optimiser may hold — no test in safe Rust can reach those. The companion
 //! bound assertion in `secret_seed.rs` covers breadth, this covers depth.
+//!
+//! **Stack copies are outside this harness entirely.** `assert_zeroed_when_freed`
+//! is a global-allocator hook: it watches a heap block and reads it at the moment
+//! that block is handed back. A `Copy` secret sitting on a stack frame — a
+//! `[u8; 32]` shared secret or a `[u8; DK_LEN]` decapsulation key inside a
+//! `Result` a function has not yet returned from — is never allocated and never
+//! freed, so nothing here observes it. That class is held by the in-place wipes
+//! in `dm::reest` and `dm::ratchet`; no case in this file can go red on it.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Mutex;
@@ -79,7 +87,7 @@ use daemonseed_core::dm::ratchet::EphemeralDecapKey;
 use daemonseed_core::dm::ratchet::ROOT_KEY_LEN;
 use daemonseed_core::dm::resume::{
     CommittedRoot, DedupMemory, FreshAttempt, OwnSlot, ReEstState, ResumeRecord, RetainedRoot,
-    Retention, SealedReEst, SendFloor,
+    Retention, SealedReEst, SendFloor, reroot,
 };
 use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
@@ -721,16 +729,21 @@ fn boxed_arm_secrets_are_zeroed_before_their_memory_is_released() {
 fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
     init();
 
-    // Deliberately outside the `GATE` window, and safe there. These two lines are
-    // heavy allocation churn that runs concurrently with another test's armed
-    // watch, but a watch is armed only while the secret it points at is still
-    // LIVE — so no allocation this thread frees can be a block containing that
-    // address, and containment matching therefore cannot fire on it. Address reuse
-    // only becomes possible after the watched block is freed, by which point
-    // `dealloc` has already disarmed. Moving them inside the gate is not possible
-    // anyway: one derivation feeds all three cases below.
-    let mnemonic = Mnemonic::generate().unwrap();
-    let keys = derive_identity_keys(&mnemonic, Identity::Primary).unwrap();
+    // **Under `GATE`, released before the cases below take it.** These two lines
+    // are heavy allocation churn, and the reasoning that once excused running
+    // them concurrently covers ADDRESS-armed watches only: such a watch is armed
+    // only while its secret is live, so no free on this thread can match it.
+    // `freed_bytes_of_decode_sized_block` arms on a block SIZE instead, and any
+    // thread's free of that size satisfies the match — which made this churn a
+    // real source of stolen captures once the file grew enough cases to overlap
+    // it. Holding the gate across all three cases below would deadlock, since
+    // each takes it itself; holding it for the derivation alone does not, and
+    // one derivation still feeds all three.
+    let keys = {
+        let _churn_gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mnemonic = Mnemonic::generate().unwrap();
+        derive_identity_keys(&mnemonic, Identity::Primary).unwrap()
+    };
 
     // An `inline` secret is the whole of its `Box`, so the block is the newtype's
     // own size and the array sits at its start.
@@ -771,6 +784,11 @@ fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
 ///   as the load-bearing case for the derive: nothing but the derive wipes it, so
 ///   removing `Zeroize, ZeroizeOnDrop` from the struct leaves the whole suite green
 ///   but for this case. It stands in for the secret field somebody adds next.
+/// - `ChannelRoots::rs0` is the retained re-establishment root — the one root of
+///   the four that outlives establishment, and therefore the one a copy left in
+///   freed memory would hand an attacker. It is the struct's last field, so the
+///   watched range runs from its offset to the end of the struct and covers no
+///   neighbour; what stands behind the case is the offset, not a filler contrast.
 /// - `VerifiedFirstContact::ss0` is a bare `[u8; SS0_LEN]`, wiped only by the
 ///   derive. Removing the derive, or marking the field `#[zeroize(skip)]`, leaves
 ///   the whole suite green but for this case.
@@ -825,6 +843,41 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
             PersistedCircle::new(phrase, circle_label())
         },
         |c| at(c.label.as_bytes()),
+    );
+
+    // `ChannelRoots::rs0` is the retained re-establishment root, and it is the
+    // one root of the four that survives establishment — `ss0` is deleted, and
+    // with it the ratchet root, so `rs0` is what a copy of this struct left in
+    // freed memory would hand an attacker: channel-resume authority for the rest
+    // of the correspondence.
+    //
+    // Watched as a range inside the boxed struct's own block, the way `ss0` is,
+    // with the offset taken structurally rather than assumed. `rs0` is the last
+    // field, so the range from its offset to the end of the struct is the field
+    // itself plus any tail padding — no neighbour falls inside it, and the
+    // distinct fillers on `ar` and `chan_id` are not doing work here. The
+    // structural offset is what holds the case: an accessor that drifted to
+    // another field would report an address outside the watched range.
+    //
+    // Two wipes stand behind this case — `CommittedRoot`'s own `ZeroizeOnDrop`
+    // and the struct's derive — so it is a weaker mutation signal than a
+    // single-wipe case. It goes red on the shape that actually threatens it:
+    // storing the root as a bare `[u8; ROOT_KEY_LEN]`, which has no wipe of its
+    // own and which the struct's derive is then the only thing covering.
+    assert_zeroed_when_freed(
+        "ChannelRoots::rs0",
+        (
+            std::mem::offset_of!(ChannelRoots, rs0),
+            size_of::<ChannelRoots>(),
+        ),
+        || {
+            Box::new(ChannelRoots {
+                ar: [0x44u8; ROOT_LEN],
+                chan_id: [0x55u8; ROOT_LEN],
+                rs0: CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
+            })
+        },
+        |r| at(r.rs0.as_bytes()),
     );
 
     // `ss0` is an inline `[u8; SS0_LEN]` field, so it is watched as a range at a
@@ -1005,8 +1058,132 @@ fn verified_first_contact(body: String) -> VerifiedFirstContact {
         ChannelRoots {
             ar: [0x44u8; ROOT_LEN],
             chan_id: [0x55u8; ROOT_LEN],
+            rs0: CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
         },
     )
+}
+
+/// **`Rerooted`'s two publicly reachable secret halves wipe before their storage
+/// is released, and its `Debug` renders none of them.**
+///
+/// A re-establishment's outputs are the successor retained root and the resumed
+/// channel's identifier; the third, the re-rooted ratchet root, has no accessor
+/// outside the crate and so cannot be located from here — it is a
+/// `dm::ratchet::RootKey`, held by that type's own inline-arm wipe and by the
+/// compile-time bound in `secret_seed.rs`.
+///
+/// **The structural control here is weaker than the `ss0` case's, deliberately
+/// and unavoidably.** `Rerooted`'s fields are private, so `offset_of!` cannot
+/// reach them from an integration test; the offsets below are measured off the
+/// accessors on a probe instance. That means a mislocated accessor would agree
+/// with its own measurement. What the case still holds is that the two fields
+/// occupy *different, non-overlapping* ranges inside one struct and that each is
+/// zero when the struct's block is freed — so a build that dropped either wipe,
+/// or aliased the two fields onto one value, fails here.
+#[test]
+fn a_rerooted_pairs_secret_halves_are_zeroed_before_their_memory_is_released() {
+    init();
+
+    let make = || {
+        Box::new(
+            reroot(
+                &CommittedRoot::from_bytes(&[0x5cu8; ROOT_KEY_LEN]),
+                &[0x09u8; 32],
+            )
+            .expect("the crypto module is operational"),
+        )
+    };
+
+    // Offsets measured on a probe, then asserted to be distinct and inside the
+    // struct — see the note above on why they are not taken from `offset_of!`.
+    //
+    // **Under `GATE`, and that is not optional.** Building a probe allocates,
+    // and `a_later_parse_error_does_not_strand_the_decoded_circle_entropy` arms
+    // its watch on a block SIZE rather than an address — so an allocation of
+    // that size from any other thread can satisfy its match and steal the
+    // capture. The `inline_arm` case's note about churn being safe outside the
+    // gate holds only for address-armed watches. The guard is dropped before
+    // `assert_zeroed_when_freed`, which takes the same lock itself.
+    let probe_gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let probe = make();
+    let base = std::ptr::from_ref::<daemonseed_core::dm::resume::Rerooted>(&*probe) as usize;
+    let next_at = probe.next().as_bytes().as_ptr() as usize - base;
+    let chan_at = probe.chan_id().as_ptr() as usize - base;
+    let width = size_of::<daemonseed_core::dm::resume::Rerooted>();
+    assert_ne!(next_at, chan_at, "the two outputs alias one range");
+    assert!(
+        next_at + ROOT_KEY_LEN <= width && chan_at + ROOT_KEY_LEN <= width,
+        "an output falls outside the struct: next at {next_at}, chan_id at {chan_at}, \
+         struct {width} bytes"
+    );
+    assert_ne!(
+        probe.next().as_bytes().as_slice(),
+        probe.chan_id().as_slice(),
+        "the successor root and the channel identifier are one value"
+    );
+    drop(probe);
+    drop(probe_gate);
+
+    assert_zeroed_when_freed("Rerooted::next", (next_at, width), make, |r| {
+        at(r.next().as_bytes())
+    });
+    assert_zeroed_when_freed("Rerooted::chan_id", (chan_at, width), make, |r| {
+        at(r.chan_id())
+    });
+}
+
+/// **Neither multi-secret re-establishment type renders its contents.**
+///
+/// A `Debug` that printed a root would put it in every log line and every panic
+/// message that carried the value, which is a disclosure path no wipe reaches.
+/// Both types hand-write `Debug` rather than deriving it, so this is the test
+/// that a derive re-added later fails.
+#[test]
+fn the_re_establishment_types_render_redacted() {
+    init();
+    // Held for the whole body: rendering and deriving both allocate, and a
+    // size-armed watch in another case can be satisfied by any thread's
+    // allocation of the right size. See the note in the case above.
+    let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let rerooted = reroot(
+        &CommittedRoot::from_bytes(&[0x5cu8; ROOT_KEY_LEN]),
+        &[0x09u8; 32],
+    )
+    .expect("the crypto module is operational");
+    let rendered = format!("{rerooted:?}");
+    assert_eq!(rendered, "Rerooted(<redacted>)");
+    for (name, bytes) in [
+        ("next", rerooted.next().as_bytes().as_slice()),
+        ("chan_id", rerooted.chan_id().as_slice()),
+    ] {
+        assert!(
+            !rendered.contains(&hex_of(bytes)),
+            "Rerooted's Debug rendered {name}"
+        );
+    }
+
+    let roots = ChannelRoots {
+        ar: [0x44u8; ROOT_LEN],
+        chan_id: [0x55u8; ROOT_LEN],
+        rs0: CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
+    };
+    let rendered = format!("{roots:?}");
+    assert_eq!(rendered, "ChannelRoots(<redacted>)");
+    for (name, bytes) in [
+        ("ar", roots.ar.as_slice()),
+        ("chan_id", roots.chan_id.as_slice()),
+        ("rs0", roots.rs0.as_bytes().as_slice()),
+    ] {
+        assert!(
+            !rendered.contains(&hex_of(bytes)),
+            "ChannelRoots's Debug rendered {name}"
+        );
+    }
+
+    // Positive control: `hex_of` really does produce the needle these assertions
+    // look for, so a rendering that DID leak would be caught rather than missed.
+    assert!(hex_of(&[0x44u8; ROOT_LEN]).contains("4444"));
 }
 
 /// The `realloc` disarm is itself a control, so hold it to being live.
@@ -1095,7 +1272,7 @@ fn resume_record() -> ResumeRecord {
     ResumeRecord::new(
         Box::new([0xA7; ML_DSA_SK_LEN]),
         Box::new([0xB3; PK_LEN]),
-        CommittedRoot::from_bytes([0xC5; ROOT_KEY_LEN]),
+        CommittedRoot::from_bytes(&[0xC5; ROOT_KEY_LEN]),
         ReEstState {
             reconnect_gen: 9,
             attempt: 1,
@@ -1104,13 +1281,15 @@ fn resume_record() -> ResumeRecord {
                 10,
                 SealedReEst::seal(FreshAttempt::first(), vec![0xD1; 64].into_boxed_slice())
                     .expect("a 64-byte frame is inside MAX_FRAME_LEN"),
+                EphemeralDecapKey::new(Box::new([0x3d; DK_LEN])),
             )),
             acceptance: None,
             attempt_at_window_start: 2,
+            reroot_ratchet_gen: 0,
         },
         Retention {
             retained: Some(RetainedRoot::new(
-                CommittedRoot::from_bytes([0xE9; ROOT_KEY_LEN]),
+                CommittedRoot::from_bytes(&[0xE9; ROOT_KEY_LEN]),
                 1_700_000_000_000,
             )),
             dedup: DedupMemory::new(),

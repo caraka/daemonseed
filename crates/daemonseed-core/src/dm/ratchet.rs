@@ -251,10 +251,89 @@ impl Role {
     }
 }
 
+/// Which end of a re-establishment handshake this party was.
+///
+/// `docs/design/direct-messaging.md:887` (A3.2) gives the handshake three legs —
+/// `RE-EST`, `RE-ACK`, `RE-CONFIRM` — and the party that sent the `RE-EST` owns
+/// the first chain under the re-rooted root, because `RE-CONFIRM` is its first
+/// frame there. So the two sides open the resumed channel holding different
+/// halves, and this says which.
+///
+/// **Both variants carry the generation floor; only the answering side carries
+/// a peer sequence.** A3.9's non-regression rule binds either party, and each
+/// has a source for its own floor: the initiating side's is its own last
+/// persisted generation, which [`crate::dm::outbox::Outbox::last_clear_gen`]
+/// homes, and the answering side's is the same value on its own record. What is
+/// one-sided is the peer's next send sequence, which only the answering party
+/// reads — off the position it fetched the `RE-EST` from — so it sits inside the
+/// variant that has it rather than in the parameter list, where a number
+/// meaningful on one side only gets passed wrongly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectSide {
+    /// This party sent the `RE-EST`, so it owns the first chain and sends the
+    /// `RE-CONFIRM` that opens it.
+    Initiated {
+        /// The highest clear ratchet generation this party has persisted, which
+        /// the offered generation must be strictly ahead of.
+        ///
+        /// The natural source is [`crate::dm::outbox::Outbox::last_clear_gen`].
+        /// **A record migrated from an outbox layout that predates that field
+        /// reports zero**, which is a floor every real generation clears — so
+        /// the check does not fire spuriously on a migrated record, and it does
+        /// not protect one either. That is the same weakness the outbox's own
+        /// migration note records, not a second one.
+        last_persisted_generation: u32,
+    },
+    /// This party answered a peer's `RE-EST` with the `RE-ACK`, so the first
+    /// chain is the one it receives on.
+    Answered {
+        /// The highest clear ratchet generation this party has persisted.
+        ///
+        /// `docs/design/direct-messaging.md:917` (A3.9) has the clear generation
+        /// counter continue across a re-establishment and never regress, so the
+        /// generation offered by the peer's first frame is adopted only if it is
+        /// strictly ahead of this. Refused otherwise, with
+        /// [`RatchetError::ReestablishedGenerationNotAhead`] — a generation that
+        /// repeated would put two different roots on one number and rewrite a
+        /// write-once page slot.
+        last_persisted_generation: u32,
+        /// The sequence number the peer's first frame under the re-rooted chain
+        /// will carry.
+        ///
+        /// Known to the answering side because a `RE-EST` rides the outbox at
+        /// its own sequence position and is fetched from the address that
+        /// position names (see [`crate::dm::reest`]), so the peer's counter is
+        /// read off the fetch rather than carried in the leg. Distinct from this
+        /// party's own `next_send_seq`, which counts the other direction.
+        peer_next_send_seq: u64,
+    },
+}
+
 redacted_secret_newtype! {
     /// A ratchet root. Advanced by encapsulating to the peer's fresh ephemeral,
     /// and destroyed as soon as its successor exists.
     inline pub struct RootKey([u8; ROOT_KEY_LEN]);
+}
+
+impl RootKey {
+    /// Rebuild a root from bytes the crate already holds.
+    ///
+    /// **Crate-private, and that is the whole of its safety.** Every other root
+    /// in this module comes from [`derive_root`] or [`advance_root`], so a
+    /// public constructor would let a caller install arbitrary bytes as a
+    /// ratchet root and derive message keys under them.
+    /// [`crate::dm::resume::reroot`] needs it because the value a
+    /// re-establishment advances from is at rest as a
+    /// [`CommittedRoot`](crate::dm::resume::CommittedRoot), which is a distinct
+    /// type on purpose.
+    ///
+    /// **Borrowed, not taken by value.** A `[u8; 32]` is `Copy`, so a by-value
+    /// parameter would leave the caller's copy of a root key on the caller's
+    /// frame with nothing to wipe it. Borrowing lets the caller keep the bytes
+    /// in something that zeroizes and hand over a reference to them.
+    pub(crate) fn from_bytes(bytes: &[u8; ROOT_KEY_LEN]) -> Self {
+        Self(*bytes)
+    }
 }
 
 redacted_secret_newtype! {
@@ -337,6 +416,14 @@ pub enum RatchetError {
     /// setting a downstream build could turn off. A cursor wrapping to zero would
     /// rewrite the write-once page slot sequence zero already owns.
     SequenceExhausted { seq: u64 },
+    /// A re-established channel was offered a clear ratchet generation at or
+    /// below the highest this party has persisted.
+    ///
+    /// `docs/design/direct-messaging.md:917` (A3.9) has the counter continue
+    /// across a re-establishment and never regress. Accepting a repeat would put
+    /// two different roots on one generation number, which collides the
+    /// skipped-key cache's slots and rewrites a write-once page slot.
+    ReestablishedGenerationNotAhead { offered: u32, persisted: u32 },
     /// A frame sits further ahead on its chain than [`MAX_CATCH_UP`] — further
     /// than a receiver will walk in one step. Not recoverable by retrying the
     /// same frame; the conversation re-anchors at the peer's next ratchet step.
@@ -388,6 +475,11 @@ impl std::fmt::Display for RatchetError {
                 f,
                 "sequence {seq} is the last there is, and the chain cannot step past it"
             ),
+            Self::ReestablishedGenerationNotAhead { offered, persisted } => write!(
+                f,
+                "a re-established channel was offered generation {offered}, which is not \
+                 ahead of the persisted {persisted}"
+            ),
             Self::BacklogTooWide { gap, max } => write!(
                 f,
                 "a frame sits {gap} positions ahead, beyond the {max} one catch-up walks"
@@ -406,13 +498,13 @@ impl std::error::Error for RatchetError {}
 
 /// Derive the initial ratchet root from the encapsulated first-contact secret.
 ///
-/// A third sibling of the extraction that produces `AR` and `chan_id` in
+/// One sibling of the extraction that produces `AR`, `chan_id` and `RS_0` in
 /// [`super::firstcontact::derive_channel_roots`] — same PRK, distinct label. The
-/// three are siblings rather than a chain so that no one of them is derivable
-/// from another: `AR` is retained for the life of the conversation and outlives
-/// both the ratchet root and `ss0`, which establishment deletes, so a chain would
-/// make the retained value regenerate the deleted ones and cost the forward
-/// secrecy that deletion buys.
+/// four are siblings rather than a chain so that no one of them is derivable
+/// from another: `AR` and `RS_0` are retained and outlive both the ratchet root
+/// and `ss0`, which establishment deletes, so a chain would make a retained
+/// value regenerate the deleted ones and cost the forward secrecy that deletion
+/// buys.
 ///
 /// That claim rests on two things, and only one of them is a test.
 ///
@@ -421,16 +513,17 @@ impl std::error::Error for RatchetError {}
 /// assumption, which no unit test in this crate can establish; a test can only
 /// ever fail to refute it.
 ///
-/// **Tested.** That the code still derives the three as siblings of ONE
+/// **Tested.** That the code still derives the four as siblings of ONE
 /// extraction rather than as a chain — the structure the assumption is applied
-/// to. `roots_from_one_ss0_are_pinned_siblings` pins all three outputs for a
+/// to. `roots_from_one_ss0_are_pinned_siblings` pins all four outputs for a
 /// fixed `ss0`, so re-plumbing the derivation (chaining `AR` off `RK0`, changing
 /// an extraction's salt or IKM, changing a label) changes those bytes and fails.
 ///
-/// `the_three_roots_from_ss0_are_independent` sits alongside as a cheap
-/// label-collision guard. It asserts distinctness only: it passes for any three
-/// distinct labels, including a chained derivation, so it never held the
-/// structural property this comment previously cited it for (#282).
+/// `the_four_roots_from_ss0_are_independent` sits alongside as a cheap
+/// label-collision guard. It asserts that all four are pairwise distinct, and
+/// nothing more: it passes for any four distinct labels, including a chained
+/// derivation, so it never held the structural property this comment previously
+/// cited it for (#282).
 pub(crate) fn derive_root(ss0: &[u8; 32]) -> Result<RootKey, RatchetError> {
     let hkdf = HkdfSha384::extract(Some(domain::DM_ROOT_SALT), ss0).map_err(RatchetError::Kdf)?;
     expand_secret::<ROOT_KEY_LEN, _>(|b| hkdf.expand(domain::DM_RATCHET_ROOT, b), RootKey)
@@ -1104,6 +1197,154 @@ impl Ratchet {
         })
     }
 
+    /// Open the ratchet again on a channel a restart tore down, under the root a
+    /// completed re-establishment produced.
+    ///
+    /// **The re-rooted root replaces the whole ratchet, not one generation of
+    /// it.** `docs/design/direct-messaging.md:722` derives `RK_0'` from the
+    /// retained root and a fresh encapsulated secret, so it descends from
+    /// nothing the previous session held: the old chains, the old skipped keys
+    /// and the old ephemerals are gone with the restart and none of them is
+    /// recoverable from here. What continues is the two counters, and only
+    /// those.
+    ///
+    /// **One chain exists at first, and `side` says which** (A3.2, `:887`). The
+    /// party that sent the `RE-EST` owns it, because its `RE-CONFIRM` is the
+    /// first frame written under the re-rooted root; the answering party holds
+    /// the same chain as its receive chain and cannot send until that frame
+    /// arrives and publishes an ephemeral to step against.
+    ///
+    /// **`generation` and `next_send_seq` continue; neither restarts** (A3.9,
+    /// `:917`; A4.8, `:1056`). The initiating party passes one past its last
+    /// persisted generation; the answering party passes the generation the
+    /// peer's frame declares. **Both sides carry their own floor and both are
+    /// checked here rather than by the caller** — a regression is refused
+    /// whichever side offers it, so the counter cannot go backwards on either.
+    /// `next_send_seq` is always **this party's own** next send position, which
+    /// the outbox homes.
+    ///
+    /// **A fresh ephemeral is minted on the initiating side and nowhere else**
+    /// (A4.7, `:1043`): `RE-CONFIRM` is the first frame of the re-rooted chain
+    /// and carries that chain's ratchet ephemeral, distinct from the handshake
+    /// ephemeral the `RE-EST` published. The answering side mints none, because
+    /// it has nothing to publish until it replies.
+    ///
+    /// **`gen_ct` is `None`.** The root came from the `RE-EST`/`RE-ACK`
+    /// exchange, not from a ciphertext on a frame, so there is no generation
+    /// ciphertext to repeat; the frame layer fills the `eph_ct`-shaped field
+    /// with CSPRNG bytes, which an ML-KEM ciphertext is indistinguishable from
+    /// at that length (A4.7).
+    ///
+    /// **`chan_id` is not taken, because this type does not hold one.** A
+    /// ratchet binds its conversation by the fingerprint of `AR`
+    /// ([`Self::ar_fingerprint`]) and nothing else; `chan_id` is bound by the
+    /// frame layer, at the layer that seals. A resumed channel's identifier is
+    /// [`crate::dm::resume::Rerooted::chan_id`] — the value such a channel's
+    /// frames would bind. Nothing reads it yet: the resumed-channel send path is
+    /// not built.
+    pub fn reestablished(
+        rerooted: &crate::dm::resume::Rerooted,
+        role: Role,
+        side: ReconnectSide,
+        generation: u32,
+        next_send_seq: u64,
+        ar: &[u8; crate::dm::firstcontact::ROOT_LEN],
+    ) -> Result<Self, RatchetError> {
+        let last_persisted_generation = match side {
+            ReconnectSide::Initiated {
+                last_persisted_generation,
+            }
+            | ReconnectSide::Answered {
+                last_persisted_generation,
+                ..
+            } => last_persisted_generation,
+        };
+        if generation <= last_persisted_generation {
+            return Err(RatchetError::ReestablishedGenerationNotAhead {
+                offered: generation,
+                persisted: last_persisted_generation,
+            });
+        }
+
+        let root = rerooted.ratchet_root().clone();
+        let ar_fingerprint =
+            crate::dm::firstcontact::ar_fingerprint(ar).map_err(RatchetError::Module)?;
+
+        // The one chain that exists, in the direction the `RE-EST` sender sends,
+        // based where that party's own sequence numbers had reached.
+        let (send, recv) = match side {
+            ReconnectSide::Initiated { .. } => {
+                let dir = role.send_dir();
+                let chain = Chain {
+                    generation,
+                    direction: dir,
+                    key: chain_key(&root, dir)?,
+                    base: next_send_seq,
+                    next: next_send_seq,
+                };
+                (Some(chain), None)
+            }
+            ReconnectSide::Answered {
+                peer_next_send_seq, ..
+            } => {
+                let dir = role.recv_dir();
+                let chain = Chain {
+                    generation,
+                    direction: dir,
+                    key: chain_key(&root, dir)?,
+                    base: peer_next_send_seq,
+                    next: peer_next_send_seq,
+                };
+                (None, Some(chain))
+            }
+        };
+
+        let mut ephemerals = VecDeque::with_capacity(EPHEMERAL_WINDOW);
+        if matches!(side, ReconnectSide::Initiated { .. }) {
+            let mut d = [0u8; ml_kem::SEED_LEN];
+            let mut z = [0u8; ml_kem::SEED_LEN];
+            getrandom::fill(&mut d).map_err(|_| RatchetError::EntropySource)?;
+            getrandom::fill(&mut z).map_err(|_| RatchetError::EntropySource)?;
+            let mut generated = ml_kem::keygen(&d, &z);
+            d.zeroize();
+            z.zeroize();
+            // **The `Result` is wiped where it lies, not destructured.**
+            // `keygen` returns the secret half inside a `Result`, and moving a
+            // `Copy` array out of one copies rather than takes — so a
+            // `let (ek, dk) = generated?` leaves the `Result`'s own copy of the
+            // decapsulation key on this frame with nothing to reach it. Binding
+            // by reference keeps it reachable, and `zeroize` runs before the
+            // `Result` goes out of scope.
+            match generated {
+                Ok((ref ek, ref mut dk)) => {
+                    ephemerals.push_back(Ephemeral {
+                        generation,
+                        ek: Box::new(*ek),
+                        dk: EphemeralDecapKey(Box::new(*dk)),
+                    });
+                    dk.zeroize();
+                }
+                Err(e) => return Err(RatchetError::Module(e)),
+            }
+        }
+
+        Ok(Self {
+            role,
+            generation,
+            root,
+            send,
+            recv,
+            ephemerals,
+            peer_eph: None,
+            consumed_peer_generation: None,
+            ar_fingerprint,
+            gen_ct: None,
+            next_send_seq,
+            skipped: SkippedKeys::new(),
+            abandoned: 0,
+        })
+    }
+
     /// This conversation's binding — the fingerprint of its address root `AR`.
     ///
     /// Exposed so [`crate::dm::paging::DmPageAddress`] can refuse a root from a
@@ -1520,6 +1761,57 @@ mod tests {
         );
     }
 
+    /// All four roots of one `ss0`, pinned against vectors an independent
+    /// implementation produced.
+    ///
+    /// **The vectors do not come from this code.** They were computed by a short
+    /// HKDF-SHA384 written directly on Python's `hashlib`/`hmac`, sharing no line
+    /// with `oxicrypt` — because a vector taken from the code under test pins
+    /// only that the code has not changed, never that it computes what the
+    /// protocol says. That script, and the output this test carries:
+    ///
+    /// ```text
+    /// import hashlib, hmac
+    ///
+    /// def extract(salt, ikm):
+    ///     return hmac.new(salt, ikm, hashlib.sha384).digest()
+    ///
+    /// def expand(prk, info, length):
+    ///     out, t, i = b"", b"", 1
+    ///     while len(out) < length:
+    ///         t = hmac.new(prk, t + info + bytes([i]), hashlib.sha384).digest()
+    ///         out += t
+    ///         i += 1
+    ///     return out[:length]
+    ///
+    /// ss0 = bytes((0x11 ^ ((i * 7 + 0x5b) & 0xFF)) & 0xFF for i in range(32))
+    /// prk = extract(b"daemonseed/dm/root/salt/v1", ss0)
+    /// for name, info in (("rk0",     b"daemonseed/dm/ratchet/root/v2"),
+    ///                    ("ar",      b"daemonseed/dm/addr/root/v3"),
+    ///                    ("chan_id", b"daemonseed/dm/chanid/v2"),
+    ///                    ("rs0",     b"daemonseed/dm/reest/root/v1")):
+    ///     print(name, expand(prk, info, 32).hex())
+    ///
+    /// rk0     a8042dbc77f2303ad708b1131d05e05a8382822ce9845c4285e5593d1b7e26dc
+    /// ar      b3542adb99810ee17a4470e760a78c9a009a46c4ecf6122af21119d1fdd84673
+    /// chan_id 2698f400a59d484ac4f123fc0219c174913f7eb18078890aba8096e0e193eeed
+    /// rs0     cab767f116e55b9a9be2bcb931c266c12eb44eb1c959ae1c5d2a5ecb619c0e88
+    /// ```
+    ///
+    /// The first three lines reproduce values this crate already shipped, which
+    /// is the control on the script itself: an independent implementation that
+    /// disagreed with three known-good outputs would be the thing at fault, and
+    /// its fourth value would be worth nothing.
+    ///
+    /// **What this catches that a distinctness test cannot.** All four are Expand
+    /// siblings of ONE extraction over `ss0`. A distinctness assertion passes for
+    /// any four distinct labels, including a build that chained one root off
+    /// another — and a chained `rs0` is the defect that matters, because `rs0` is
+    /// retained at rest after `ss0` is deleted, so a chain would let the retained
+    /// value regenerate the deleted ratchet root and silently void the whole
+    /// forward-secrecy story. These bytes change under any re-plumbing: a
+    /// different label, a different salt, a different IKM, or a fan-out turned
+    /// into a chain.
     #[test]
     fn roots_from_one_ss0_are_pinned_siblings() {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
@@ -1537,6 +1829,10 @@ mod tests {
         assert_eq!(
             hex::encode(roots.chan_id),
             "2698f400a59d484ac4f123fc0219c174913f7eb18078890aba8096e0e193eeed"
+        );
+        assert_eq!(
+            hex::encode(roots.rs0.as_bytes()),
+            "cab767f116e55b9a9be2bcb931c266c12eb44eb1c959ae1c5d2a5ecb619c0e88"
         );
     }
 
@@ -1642,25 +1938,33 @@ mod tests {
         );
     }
 
-    /// One `ss0`, three outputs, pairwise DISTINCT — and no more than that. This
+    /// One `ss0`, four outputs, pairwise DISTINCT — and no more than that. This
     /// is the label-collision guard: without it, two purposes accidentally sharing
     /// a label would be pinned by the KATs as if that were correct, since a KAT
     /// pins whatever the implementation does.
     ///
-    /// It says nothing about the three being siblings rather than a chain — it
-    /// passes for any three distinct labels, chained or not. That property is
+    /// It says nothing about the four being siblings rather than a chain — it
+    /// passes for any four distinct labels, chained or not. That property is
     /// `roots_from_one_ss0_are_pinned_siblings`, above; this test was cited for it
     /// until #282.
     #[test]
-    fn the_three_roots_from_ss0_are_independent() {
+    fn the_four_roots_from_ss0_are_independent() {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let ss0 = ss(0x11);
         let rk = derive_root(&ss0).unwrap();
         let roots = crate::dm::firstcontact::derive_channel_roots(&ss0).unwrap();
 
-        assert_ne!(rk.as_bytes(), &roots.ar);
-        assert_ne!(rk.as_bytes(), &roots.chan_id);
-        assert_ne!(roots.ar, roots.chan_id);
+        let all: [(&str, &[u8; ROOT_KEY_LEN]); 4] = [
+            ("rk0", rk.as_bytes()),
+            ("ar", &roots.ar),
+            ("chan_id", &roots.chan_id),
+            ("rs0", roots.rs0.as_bytes()),
+        ];
+        for (i, (left_name, left)) in all.iter().enumerate() {
+            for (right_name, right) in &all[i + 1..] {
+                assert_ne!(left, right, "{left_name} and {right_name} share a label");
+            }
+        }
     }
 
     /// Distinct conversations must not share a root.
@@ -1943,6 +2247,305 @@ mod tests {
             &got,
             out.key.as_bytes(),
             "the two ends derived different keys"
+        );
+    }
+
+    /// A re-rooted pair, as the two parties stand the moment a re-establishment
+    /// commits: the `RE-EST` sender owns the first chain, the answering side
+    /// receives on it.
+    ///
+    /// `AR` is the same on both sides because it survives a restart; `chan_id` is
+    /// not passed at all, because the ratchet holds none.
+    fn reestablished_pair(
+        generation: u32,
+        initiator_seq: u64,
+        answerer_seq: u64,
+    ) -> (Ratchet, Ratchet) {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let rerooted = crate::dm::resume::reroot(
+            &crate::dm::resume::CommittedRoot::from_bytes(&[0x5c; ROOT_KEY_LEN]),
+            &[0x09; 32],
+        )
+        .expect("the module is operational");
+        let ar = [0x71u8; crate::dm::firstcontact::ROOT_LEN];
+        let initiator = Ratchet::reestablished(
+            &rerooted,
+            Role::Initiator,
+            ReconnectSide::Initiated {
+                last_persisted_generation: generation - 1,
+            },
+            generation,
+            initiator_seq,
+            &ar,
+        )
+        .expect("the initiating side opens");
+        let answerer = Ratchet::reestablished(
+            &rerooted,
+            Role::Recipient,
+            ReconnectSide::Answered {
+                last_persisted_generation: generation - 1,
+                peer_next_send_seq: initiator_seq,
+            },
+            generation,
+            answerer_seq,
+            &ar,
+        )
+        .expect("the answering side opens");
+        (initiator, answerer)
+    }
+
+    /// **A resumed channel carries traffic both ways, with both counters
+    /// continuing.**
+    ///
+    /// `docs/design/direct-messaging.md:887` (A3.2) gives the first chain to the
+    /// `RE-EST` sender — its `RE-CONFIRM` is the first frame under the re-rooted
+    /// root — and `:917` (A3.9) has the clear generation and the sequence
+    /// numbers continue rather than restart. Both are asserted on the wire here,
+    /// because a build that restarted either would still pass a round trip
+    /// between two ratchets that made the same mistake.
+    #[test]
+    fn a_reestablished_pair_exchanges_a_frame_each_way() {
+        let (mut initiator, mut answerer) = reestablished_pair(41, 900, 250);
+
+        // The RE-CONFIRM: the initiating side's first frame under the new root.
+        let confirm = initiator.send_next().unwrap();
+        assert_eq!(
+            confirm.header.generation, 41,
+            "the clear generation did not carry the value the commit chose"
+        );
+        assert_eq!(
+            confirm.header.seq, 900,
+            "the sequence restarted, which rewrites a write-once page slot"
+        );
+        assert!(
+            confirm.eph_ct.is_none(),
+            "a re-rooted generation has no ciphertext to repeat; the frame layer fills that field"
+        );
+        deliver_ok(&mut answerer, &confirm);
+
+        // And the answering side replies, which is a generation step against the
+        // ephemeral the RE-CONFIRM published.
+        let reply = answerer.send_next().unwrap();
+        assert_eq!(
+            reply.header.seq, 250,
+            "the answering side's own sequence did not continue"
+        );
+        assert!(
+            reply.header.generation > 41,
+            "the reply must step past the generation it answers"
+        );
+        deliver_ok(&mut initiator, &reply);
+    }
+
+    /// **A different `ss_new` reaches a different channel**, so the fresh KEM
+    /// secret is genuinely an input to the resumed root rather than decoration.
+    ///
+    /// Without this, a build that dropped `ss_new` from the derivation would let
+    /// a holder of the retained root alone read the resumed channel — the exact
+    /// property `docs/design/direct-messaging.md:722` exists to establish — and
+    /// every round-trip test in this file would stay green.
+    #[test]
+    fn a_receiver_built_from_a_different_secret_cannot_open_the_frame() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let ar = [0x71u8; crate::dm::firstcontact::ROOT_LEN];
+        let root = crate::dm::resume::CommittedRoot::from_bytes(&[0x5c; ROOT_KEY_LEN]);
+        let mine = crate::dm::resume::reroot(&root, &[0x09; 32]).expect("operational");
+        let theirs = crate::dm::resume::reroot(&root, &[0x0a; 32]).expect("operational");
+
+        let mut initiator = Ratchet::reestablished(
+            &mine,
+            Role::Initiator,
+            ReconnectSide::Initiated {
+                last_persisted_generation: 40,
+            },
+            41,
+            900,
+            &ar,
+        )
+        .unwrap();
+        let mut wrong = Ratchet::reestablished(
+            &theirs,
+            Role::Recipient,
+            ReconnectSide::Answered {
+                last_persisted_generation: 40,
+                peer_next_send_seq: 900,
+            },
+            41,
+            250,
+            &ar,
+        )
+        .unwrap();
+
+        let out = initiator.send_next().unwrap();
+        let derived = deliver(&mut wrong, &out)
+            .expect("the key schedule still runs")
+            .expect("the closure here cannot refuse");
+        assert_ne!(
+            &derived,
+            out.key.as_bytes(),
+            "a receiver on a different ss_new derived the sender's key"
+        );
+
+        // Positive control: the right secret does agree, so the assertion above
+        // is about the secret and not about a constructor that never works.
+        let (mut initiator, mut answerer) = reestablished_pair(41, 900, 250);
+        let out = initiator.send_next().unwrap();
+        deliver_ok(&mut answerer, &out);
+    }
+
+    /// **The initiating side refuses a generation at or below the one it has
+    /// persisted, on the same boundary as the answering side.**
+    ///
+    /// `docs/design/direct-messaging.md:917` (A3.9) binds either party: the
+    /// clear generation counter continues across a re-establishment and never
+    /// regresses. A check on one side only leaves the other free to reopen a
+    /// generation it has already used, which puts two different roots on one
+    /// number — and the initiating side is the one that *chooses* the number, so
+    /// it is the side where a wrong choice originates rather than arrives.
+    ///
+    /// The initiating party's natural source for its floor is
+    /// [`crate::dm::outbox::Outbox::last_clear_gen`].
+    #[test]
+    fn the_initiating_side_refuses_a_generation_that_is_not_ahead() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let ar = [0x71u8; crate::dm::firstcontact::ROOT_LEN];
+        let rerooted = crate::dm::resume::reroot(
+            &crate::dm::resume::CommittedRoot::from_bytes(&[0x5c; ROOT_KEY_LEN]),
+            &[0x09; 32],
+        )
+        .expect("operational");
+
+        for offered in [40u32, 41] {
+            let err = Ratchet::reestablished(
+                &rerooted,
+                Role::Initiator,
+                ReconnectSide::Initiated {
+                    last_persisted_generation: 41,
+                },
+                offered,
+                900,
+                &ar,
+            )
+            .err();
+            assert!(
+                matches!(
+                    err,
+                    Some(RatchetError::ReestablishedGenerationNotAhead {
+                        offered: got,
+                        persisted: 41,
+                    }) if got == offered
+                ),
+                "generation {offered} was admitted over a persisted 41"
+            );
+        }
+
+        // Positive control: one past the persisted value is admitted, so the two
+        // refusals above are about the boundary rather than about a constructor
+        // that refuses everything.
+        assert!(
+            Ratchet::reestablished(
+                &rerooted,
+                Role::Initiator,
+                ReconnectSide::Initiated {
+                    last_persisted_generation: 41,
+                },
+                42,
+                900,
+                &ar,
+            )
+            .is_ok()
+        );
+
+        // A zero floor — what a record migrated from an outbox layout with no
+        // `last_clear_gen` reports — admits every real generation. Asserted so
+        // the weakness is a stated property rather than a surprise.
+        assert!(
+            Ratchet::reestablished(
+                &rerooted,
+                Role::Initiator,
+                ReconnectSide::Initiated {
+                    last_persisted_generation: 0,
+                },
+                1,
+                900,
+                &ar,
+            )
+            .is_ok()
+        );
+    }
+
+    /// **The answering side refuses a generation at or below the one it has
+    /// persisted.**
+    ///
+    /// `docs/design/direct-messaging.md:917` has the counter continue and never
+    /// regress. A repeat would put two different roots on one generation number,
+    /// which collides the skipped-key cache's slots and rewrites a write-once
+    /// page slot — so it is refused at construction rather than left to surface
+    /// as an unopenable frame later.
+    #[test]
+    fn the_answering_side_refuses_a_generation_that_is_not_ahead() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let ar = [0x71u8; crate::dm::firstcontact::ROOT_LEN];
+        let rerooted = crate::dm::resume::reroot(
+            &crate::dm::resume::CommittedRoot::from_bytes(&[0x5c; ROOT_KEY_LEN]),
+            &[0x09; 32],
+        )
+        .expect("operational");
+
+        for offered in [40u32, 41] {
+            let err = Ratchet::reestablished(
+                &rerooted,
+                Role::Recipient,
+                ReconnectSide::Answered {
+                    last_persisted_generation: 41,
+                    peer_next_send_seq: 900,
+                },
+                offered,
+                250,
+                &ar,
+            )
+            .err();
+            assert!(
+                matches!(
+                    err,
+                    Some(RatchetError::ReestablishedGenerationNotAhead {
+                        offered: got,
+                        persisted: 41,
+                    }) if got == offered
+                ),
+                "generation {offered} was admitted over a persisted 41"
+            );
+        }
+
+        // Positive control: one past the persisted value is admitted, so the two
+        // refusals above are about the boundary rather than about a constructor
+        // that refuses everything.
+        assert!(
+            Ratchet::reestablished(
+                &rerooted,
+                Role::Recipient,
+                ReconnectSide::Answered {
+                    last_persisted_generation: 41,
+                    peer_next_send_seq: 900,
+                },
+                42,
+                250,
+                &ar,
+            )
+            .is_ok()
+        );
+    }
+
+    /// The conversation binding comes from the `AR` the caller supplies, so a
+    /// resumed ratchet still refuses a page address belonging to another
+    /// conversation.
+    #[test]
+    fn a_reestablished_ratchet_binds_the_ar_it_was_given() {
+        let (initiator, _answerer) = reestablished_pair(41, 900, 250);
+        assert_eq!(
+            initiator.ar_fingerprint(),
+            &crate::dm::firstcontact::ar_fingerprint(&[0x71u8; crate::dm::firstcontact::ROOT_LEN])
+                .expect("operational")
         );
     }
 
