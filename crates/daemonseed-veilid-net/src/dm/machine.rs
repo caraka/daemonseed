@@ -8813,6 +8813,7 @@ mod tests {
             outcome: crate::SweepOutcome {
                 attempted: 32,
                 failed: 0,
+                timed_out: 0,
                 found,
             },
         }
@@ -10327,6 +10328,7 @@ mod tests {
             outcome: crate::SweepOutcome {
                 attempted: u32::from(PAGE_SLOTS),
                 failed: 0,
+                timed_out: 0,
                 found: 0,
             },
         })
@@ -10663,6 +10665,7 @@ mod tests {
                     outcome: crate::SweepOutcome {
                         attempted: 0,
                         failed: 0,
+                        timed_out: 0,
                         found: 0,
                     },
                 })),
@@ -12679,6 +12682,7 @@ mod tests {
                     outcome: crate::SweepOutcome {
                         attempted: u32::from(PAGE_SLOTS),
                         failed: 0,
+                        timed_out: 0,
                         found,
                     },
                 })),

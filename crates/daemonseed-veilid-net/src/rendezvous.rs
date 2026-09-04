@@ -31,6 +31,7 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use futures_util::stream::StreamExt;
 use tokio::sync::mpsc;
 use veilid_core::{
     DHTSchema, KeyPair, PublicKey, RecordKey, RoutingContext, SetDHTValueOptions, VeilidAPI,
@@ -1197,16 +1198,65 @@ pub async fn publish_at_subkey(
     .map_err(|e| VeilidNetError::Send(e.to_string()))
 }
 
-/// Per-sweep GET accounting. `attempted` counts every subkey GET issued; `failed`
-/// counts GETs that errored (distinct from an empty slot — the observability the old
-/// `.ok().flatten()` swallowed); `found` counts populated slots handed to `on_slot`.
+/// How long one subkey GET inside a sweep may run before it is abandoned (#397).
+///
+/// The bound sits above the slowest routine DHT operation the design record prices:
+/// `open_or_create` at 6–10s (`docs/design/direct-messaging.md`; the route's hop count is
+/// `NetConfig::hop_count`, D5). A single GET is a fraction of that —
+/// `docs/design/consumer-route-self-heal.md` §RS-1.2 budgets a whole repair, the open plus
+/// the re-watch plus 64 GETs, at 30–60s. 15s therefore never cuts off a read that is
+/// merely slow, while a read that is not coming back does not hold the sweep open. With
+/// [`SWEEP_READ_FANOUT`], a sweep of an `o_cnt`-subkey record none of whose reads answer
+/// spends at most `o_cnt.div_ceil(SWEEP_READ_FANOUT) × 15s` on those reads — 240s at the
+/// 64-subkey rendezvous shape, 120s and 60s at the 32- and 16-subkey direct-message
+/// shapes. Time queued for a read permit is on top of that, and is bounded by whatever
+/// else is drawing on the pool rather than by this constant.
+///
+/// The bound also caps how long a sweep's GET occupies the read-pool permit it holds for
+/// that GET's duration. That is a ceiling on the occupancy and not on the wait for it:
+/// `acquire_read` is awaited outside the bound, so a sweep can still queue indefinitely
+/// for a permit. Nor does it reach read-lane sites outside a sweep, which acquire from
+/// the same pool and are not governed by this constant.
+///
+/// A GET cut off here counts in both `SweepOutcome::failed` and
+/// `SweepOutcome::timed_out` — see [`SweepOutcome`].
+pub const SWEEP_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How many of a sweep's subkey GETs may be in flight at once (#397).
+///
+/// Four at a time costs a 64-subkey record 16 round trips' worth of latency rather than
+/// one per slot, so a record's later slots are not held behind its earlier ones. The
+/// *set* of reads does not depend on it — every slot is read exactly once, whatever it
+/// holds, which is what keeps the sweep's traffic shape independent of the record's
+/// contents (WB-0).
+///
+/// Sized to stay well inside the read partition it draws from: the shared
+/// [`DhtGate`]'s read pool is 9 permits (WB-5.1 §I5″.1, `chat 2 · floor 1 · write 2 ·
+/// read 9`), and each in-flight GET holds one for its duration. Read occupancy is
+/// bounded by that pool rather than by this number, so concurrent sweeps of several
+/// records stay within the partition however wide the fan-out is; the fan-out only
+/// decides how quickly one sweep can consume its share.
+pub const SWEEP_READ_FANOUT: usize = 4;
+
+/// Per-sweep GET accounting. `attempted` counts every subkey GET whose result the sweep
+/// read — every GET it issues, except on `sweep_gated`'s early stop, where the reads
+/// still in flight are dropped rather than awaited for a count nobody will use; `failed`
+/// counts GETs that did not deliver an answer — an error from the GET itself, or a read
+/// abandoned at the per-GET bound `SWEEP_GET_TIMEOUT` — as distinct from an empty slot;
+/// `timed_out` is the subset of
+/// `failed` that was abandoned at the bound rather than reported as an error; `found`
+/// counts populated slots handed to `on_slot`.
 /// Surfacing `failed` separately from empty/`found` is the enabling signal for
 /// consumer-side session-health tracking (CRSH-ISC-1): an erroring record session
-/// produces `failed > 0` sweeps instead of silent zero-yield ones.
+/// produces `failed > 0` sweeps instead of silent zero-yield ones. A wedged session is
+/// the same signal reached a different way, which is why an abandoned read counts in
+/// `failed` too and `timed_out` only splits out *why* — a consumer reading `failed`
+/// keeps the meaning it was written against.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SweepOutcome {
     pub attempted: u32,
     pub failed: u32,
+    pub timed_out: u32,
     pub found: u32,
 }
 
@@ -1243,6 +1293,10 @@ pub async fn sweep(
 /// uses this directly: it awaits the re-sweep under the record lock and resets the tracker
 /// itself at dispatch, so a duplicate SweepHealth from the repair's own sweep would only
 /// muddy the K-consecutive stream. Each GET rides a per-GET read permit (WB-5.1 / I5″.2).
+///
+/// Traces on both edges — the record, its slot count, the fan-out and the per-GET bound
+/// before the first GET, and the counts on completion — so a sweep that is in flight is
+/// distinguishable in a log from one that was never spawned.
 pub async fn sweep_collect(
     gate: &Arc<DhtGate>,
     rc: &RoutingContext,
@@ -1250,9 +1304,20 @@ pub async fn sweep_collect(
     ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
 ) -> SweepOutcome {
     let key = handle.key().clone();
+    let slots = handle.shape().o_cnt();
+    // Traced BEFORE the first GET, so a sweep in flight is distinguishable in a log from
+    // one that was never spawned. A sweep is bounded but not instant — its reads alone
+    // can take `slots.div_ceil(SWEEP_READ_FANOUT) × SWEEP_GET_TIMEOUT` — so a record
+    // whose reads all go unanswered prints nothing between these two lines. Naming the
+    // fan-out and the bound here is what makes that gap readable as a duration rather
+    // than as an absence.
+    crate::vtrace!(
+        "sweep: starting on key={key:?}, {slots} slot(s), {SWEEP_READ_FANOUT} at a time, each bounded at {}s",
+        SWEEP_GET_TIMEOUT.as_secs()
+    );
     let outcome = sweep_gated(
         gate,
-        handle.shape().o_cnt(),
+        slots,
         // The backlog ignores its slot: a rendezvous message lands wherever the
         // ring put it, so the position carries no meaning to the receiver.
         |_subkey, bytes| ev_tx.send(VeilidNetEvent::Inbound { bytes }).is_ok(),
@@ -1277,10 +1342,11 @@ pub async fn sweep_collect(
     )
     .await;
     crate::vtrace!(
-        "sweep: done, {} backlog slot(s) emitted ({} attempted, {} failed)",
-        outcome.found,
+        "sweep: done, {} attempted, {} found and emitted, {} failed ({} of them timed out)",
         outcome.attempted,
-        outcome.failed
+        outcome.found,
+        outcome.failed,
+        outcome.timed_out
     );
     outcome
 }
@@ -1308,8 +1374,28 @@ pub async fn sweep_collect(
 /// `Option`-only surface conflated (CRSH-ISC-1). A per-subkey GET error increments
 /// `failed` and the sweep continues (a GET error is per-record health signal, not a
 /// reason to abort the sweep); the receiver-dropped early return still applies only via
-/// `on_slot` returning `false`. Returns a [`SweepOutcome`] with `attempted`/`failed`/
-/// `found` counts.
+/// `on_slot` returning `false`. Returns a [`SweepOutcome`] with
+/// `attempted`/`failed`/`timed_out`/`found` counts.
+///
+/// **Every GET is bounded by [`SWEEP_GET_TIMEOUT`] and up to [`SWEEP_READ_FANOUT`] of
+/// them are in flight at once** (#397). Neither changes *which* subkeys are read: the
+/// sweep still reads `0..subkey_count` exactly once each, in index order, whatever the
+/// record holds. That slot-blindness is a privacy property (WB-0: a read pattern that
+/// varies with content is a content oracle to the storage host), so the bound and the
+/// fan-out are applied uniformly to every slot, including empty ones.
+///
+/// The GETs are driven by `buffered`, which preserves index order in the results, so
+/// `on_slot` is still called in ascending subkey order and from this one task — no
+/// spawn, so `get`'s futures need be neither `Send` nor `'static`. A permit is acquired
+/// inside each GET's own future and released when that GET ends, so per-GET granularity
+/// is unchanged and read occupancy stays bounded by `gate`'s read partition however
+/// wide the fan-out is (WB-5.1 §I5″.1: the partition is the cap, by construction).
+///
+/// On the early stop the whole stream is dropped, which cancels the reads still in
+/// flight and drops the permits they hold with them. That release is what keeps the
+/// early stop from costing the read pool anything: without it, a sweep that stopped on
+/// slot 2 of 64 would strand up to `SWEEP_READ_FANOUT − 1` permits for the process's
+/// lifetime, and the pool would narrow by that much on every stopped sweep.
 pub async fn sweep_gated<Fut>(
     gate: &Arc<DhtGate>,
     subkey_count: u16,
@@ -1321,25 +1407,45 @@ where
     // failed GET, distinct from `Ok(None)` (empty slot) and `Ok(Some(_))` (populated).
     Fut: Future<Output = std::result::Result<Option<Vec<u8>>, ()>>,
 {
-    let mut outcome = SweepOutcome::default();
-    for subkey in 0..u32::from(subkey_count) {
-        let got = {
-            // The read permit is scoped to THIS GET: acquired here, dropped at the end
-            // of the block before the next iteration (RAII — releases even on unwind,
-            // #168). This is the per-GET granularity that bounds read occupancy.
+    let get = &get;
+    let mut reads = futures_util::stream::iter(0..u32::from(subkey_count))
+        .map(|subkey| async move {
+            // The read permit is scoped to THIS GET: acquired inside the GET's own
+            // future and dropped when that future ends (RAII — releases even on unwind,
+            // #168, and on the early return below, which drops the whole stream).
             let _read_permit = gate.acquire_read().await;
-            get(subkey).await
-        };
+            (
+                subkey,
+                tokio::time::timeout(SWEEP_GET_TIMEOUT, get(subkey)).await,
+            )
+        })
+        .buffered(SWEEP_READ_FANOUT);
+
+    let mut outcome = SweepOutcome::default();
+    while let Some((subkey, got)) = reads.next().await {
         outcome.attempted += 1;
         match got {
-            Ok(Some(bytes)) => {
+            Ok(Ok(Some(bytes))) => {
                 outcome.found += 1;
                 if !on_slot(subkey, bytes) {
                     return outcome; // receiver dropped — stop sweeping
                 }
             }
-            Ok(None) => {}
-            Err(()) => outcome.failed += 1, // failed GET: per-record health signal, keep sweeping
+            Ok(Ok(None)) => {}
+            Ok(Err(())) => outcome.failed += 1, // failed GET: per-record health signal, keep sweeping
+            Err(_elapsed) => {
+                // A GET that did not answer within the bound. Counted in `failed` as
+                // well, because every consumer of `failed` asks the same question a
+                // timeout also answers — did this record serve its reads? — and a
+                // record whose GETs hang is exactly the ill health the repair arm is
+                // watching for (`daemonseed_core::session_health`).
+                outcome.failed += 1;
+                outcome.timed_out += 1;
+                crate::vtrace!(
+                    "sweep: GET on subkey {subkey} exceeded {}s, abandoned",
+                    SWEEP_GET_TIMEOUT.as_secs()
+                );
+            }
         }
     }
     outcome
@@ -2459,8 +2565,16 @@ mod tests {
     /// active sweep — impossible if the sweep held the permit across its whole run.
     /// With a 1-permit read pool and FIFO fairness the permit ping-pongs, so a
     /// competitor's acquisition interleaves before the sweep finishes.
+    ///
+    /// The sweep must have MORE slots than [`SWEEP_READ_FANOUT`] for this to prove
+    /// anything: the sweep queues one permit request per in-flight GET, so a sweep no
+    /// longer than the fan-out has every one of its requests queued ahead of the
+    /// competitor's, and the competitor would come last however briefly each permit is
+    /// held. The slot count is derived from the fan-out so that widening the fan-out
+    /// keeps the probe honest instead of quietly disarming it.
     #[tokio::test]
     async fn wb_isc_21_read_permit_is_per_get_not_per_sweep() {
+        let slots = u16::try_from(SWEEP_READ_FANOUT + 4).expect("a small slot count");
         let gate = DhtGate::with_pools(2, 1, 2, 1); // read pool = 1 (the contended permit)
         let log: Arc<Mutex<Vec<char>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -2479,11 +2593,11 @@ mod tests {
             })
         };
 
-        // Sweep: three GETs, each records 's' while holding the read permit, yielding
-        // so the FIFO-queued competitor can take the permit once it is released.
+        // Sweep: each GET records 's' while holding the read permit, then yields so the
+        // FIFO-queued competitor can take the permit once it is released.
         let outcome = sweep_gated(
             &gate,
-            3,
+            slots,
             |_subkey, _bytes| true,
             |_subkey| {
                 let log = log.clone();
@@ -2496,7 +2610,7 @@ mod tests {
         )
         .await;
         comp.await.unwrap();
-        assert_eq!(outcome.found, 3, "all three slots populated");
+        assert_eq!(outcome.found, u32::from(slots), "every slot populated");
 
         let log = log.lock().unwrap();
         let first_c = log.iter().position(|&c| c == 'c');
@@ -2592,6 +2706,189 @@ mod tests {
             "subkeys 0,3,6 errored (not counted as empty)"
         );
         assert_eq!(outcome.found, 3, "subkeys 1,4,7 populated");
+    }
+
+    // ── #397: one unanswered slot must not hold the sweep open for ever ───────
+    /// A GET that never answers is abandoned at [`SWEEP_GET_TIMEOUT`], so the sweep
+    /// finishes and every other slot is still delivered. The counts say exactly what
+    /// happened: `attempted` covers all eight slots, `timed_out` names the one that was
+    /// abandoned, and `failed` counts it too, so the session-health rule written against
+    /// `failed` reads a wedged record as ill exactly as it reads an erroring one.
+    ///
+    /// Runs on tokio's paused clock: the elapsed figure asserted is virtual time
+    /// advanced by the sweep's own timer, so the asserted figure is exact and does not
+    /// depend on wall-clock time. The outer
+    /// timeout is what turns a sweep that never returns into a failed assertion instead
+    /// of a test that hangs.
+    #[tokio::test(start_paused = true)]
+    async fn sweep_abandons_a_get_that_never_answers() {
+        const WEDGED_SLOT: u32 = 3;
+        let gate = DhtGate::with_pools(2, 1, 2, 9);
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            SWEEP_GET_TIMEOUT + std::time::Duration::from_secs(30),
+            sweep_gated(
+                &gate,
+                8,
+                |_subkey, _bytes| true,
+                |subkey| async move {
+                    if subkey == WEDGED_SLOT {
+                        std::future::pending::<()>().await; // never answers
+                    }
+                    Ok(Some(vec![1u8]))
+                },
+            ),
+        )
+        .await
+        .expect("the sweep finished — an unanswered GET is abandoned, not awaited for ever");
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome.attempted, 8, "every slot is still attempted");
+        assert_eq!(outcome.found, 7, "the seven answering slots are delivered");
+        assert_eq!(
+            outcome.timed_out, 1,
+            "exactly the unanswered slot timed out"
+        );
+        assert_eq!(
+            outcome.failed, 1,
+            "an abandoned read counts as a failed read for record health"
+        );
+        assert!(
+            elapsed >= SWEEP_GET_TIMEOUT,
+            "the unanswered slot was given its full bound before being abandoned: {elapsed:?}"
+        );
+        assert!(
+            elapsed < SWEEP_GET_TIMEOUT + std::time::Duration::from_secs(1),
+            "the sweep ended at the bound, not later: {elapsed:?}"
+        );
+    }
+
+    // ── #397: a sweep's reads run several at a time ───────────────────────────
+    /// Both populated slots of a 64-subkey record reach the caller inside ONE sweep,
+    /// and the sweep costs `ceil(64 / SWEEP_READ_FANOUT)` read latencies rather than 64.
+    ///
+    /// The record's shape is the real one: two slots hold payloads and the other 62 are
+    /// empty. Every slot costs the same fixed second to read whatever it holds, so the
+    /// elapsed figure measures round trips and nothing else — and the sweep still reads
+    /// all 64, which is what keeps its traffic shape independent of the contents.
+    #[tokio::test(start_paused = true)]
+    async fn sweep_reads_fan_out_and_delivers_every_populated_slot() {
+        const SLOTS: u16 = 64;
+        const POPULATED: [u32; 2] = [21, 31];
+        const READ_LATENCY: std::time::Duration = std::time::Duration::from_secs(1);
+        let gate = DhtGate::with_pools(2, 1, 2, 9);
+        let mut delivered: Vec<(u32, Vec<u8>)> = Vec::new();
+
+        let started = tokio::time::Instant::now();
+        let outcome = sweep_gated(
+            &gate,
+            SLOTS,
+            |subkey, bytes| {
+                delivered.push((subkey, bytes));
+                true
+            },
+            |subkey| async move {
+                tokio::time::sleep(READ_LATENCY).await;
+                if POPULATED.contains(&subkey) {
+                    Ok(Some(vec![
+                        u8::try_from(subkey).expect("slot index fits a byte")
+                    ]))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            delivered,
+            vec![(21, vec![21u8]), (31, vec![31u8])],
+            "both populated slots delivered, in slot order, within one sweep"
+        );
+        assert_eq!(outcome.attempted, u32::from(SLOTS), "all 64 slots are read");
+        assert_eq!(
+            outcome.found, 2,
+            "exactly the two populated slots are found"
+        );
+        assert_eq!(outcome.failed, 0, "no read errored");
+        assert_eq!(outcome.timed_out, 0, "no read hit the bound");
+
+        // 16 = 64 slots read four at a time. Written as a literal rather than derived
+        // from `SWEEP_READ_FANOUT`, so that changing the fan-out fails this assertion
+        // instead of quietly moving the bound it is measured against. Equality, not a
+        // ceiling: a ceiling is satisfied by any narrower sweep too, so it would pass on
+        // a fan-out of 5 or 8 as readily as on 4 and pin nothing but the direction.
+        const EXPECTED_ROUNDS: u32 = 16;
+        assert_eq!(
+            elapsed,
+            READ_LATENCY * EXPECTED_ROUNDS,
+            "the sweep cost {EXPECTED_ROUNDS} read latencies, one per fan-out round"
+        );
+    }
+
+    // ── #397: stopping early must cost the read pool nothing ──────────────────
+    /// A sweep stopped by `on_slot` stops issuing reads, and every permit its in-flight
+    /// reads held is back in the pool by the time it returns.
+    ///
+    /// Both halves matter only because reads run several at a time: some are always in
+    /// flight when the stop lands, and they are cancelled by dropping the stream rather
+    /// than awaited. The permit count is the half that would fail silently — a sweep that
+    /// stranded permits would still return the right counts, and the read pool would
+    /// simply narrow by a few permits per stopped sweep until reads stopped being served
+    /// at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_sweep_issues_no_more_reads_and_strands_no_permit() {
+        const SLOTS: u16 = 64;
+        const LAST_WANTED: u32 = 2;
+        const READ_POOL: usize = 9;
+        const READ_LATENCY: std::time::Duration = std::time::Duration::from_secs(1);
+        let gate = DhtGate::with_pools(2, 1, 2, READ_POOL);
+        let issued = Arc::new(AtomicUsize::new(0));
+        let mut delivered: Vec<u32> = Vec::new();
+
+        let outcome = sweep_gated(
+            &gate,
+            SLOTS,
+            |subkey, _bytes| {
+                delivered.push(subkey);
+                subkey < LAST_WANTED
+            },
+            |_subkey| {
+                let issued = issued.clone();
+                async move {
+                    issued.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(READ_LATENCY).await;
+                    Ok(Some(vec![1u8]))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            delivered,
+            vec![0, 1, 2],
+            "delivery stops at the slot whose callback answered false"
+        );
+        assert_eq!(
+            outcome.attempted, 3,
+            "only the reads the sweep took a result from are counted"
+        );
+
+        let issued = issued.load(Ordering::SeqCst);
+        assert!(
+            issued < usize::from(SLOTS),
+            "the stop ends the sweep — it did not read all {SLOTS} slots ({issued} issued)"
+        );
+        assert!(
+            issued <= outcome.attempted as usize + SWEEP_READ_FANOUT,
+            "reads run ahead of the stop by at most one buffer's worth ({issued} issued)"
+        );
+        assert_eq!(
+            gate.available_read(),
+            READ_POOL,
+            "the cancelled reads gave their permits back"
+        );
     }
 
     /// The index handed to the callback is the slot the bytes were READ from, not a
@@ -2858,6 +3155,7 @@ mod tests {
                     SweepOutcome {
                         attempted: 1,
                         failed: 0,
+                        timed_out: 0,
                         found: 1,
                     }
                 }

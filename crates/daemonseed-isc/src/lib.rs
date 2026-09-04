@@ -385,6 +385,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("CRSH-ISC-27", IscClass::Positive), // a rotated route re-imports even when the catalog folds Unchanged: a same-timestamp re-advert (sharer restart/route-death, only route_blob rotated) re-imports the new blob, stamps a fresh generation to arm the parked retry, and keeps the share Unresolved — un-wedging the consumer without a restart; an identical re-read (no rotation) still folds with no generation churn (§RS-1.4/§RS-3, #180 — the CRSH-ISC-12 wedge)
     ("CRSH-ISC-28", IscClass::Positive), // manual Refresh re-indexes each own published root (ShareContent::index_dir) and re-announces under the SAME deterministic share_id, so a file added mid-session becomes fetchable without a relaunch; the own-share list upserts by share_id (no duplicate on repeated Refresh); gated on Connected, never on the 3 s liveness poll (#195)
     ("CRSH-ISC-29", IscClass::Positive), // chat NetCommand processed before an in-flight ConfirmFetch (chunk download) resolves — the download is spawned off the actor loop and folded on-loop (mark/clear-Unresolved), mirroring the CRSH-ISC-8 FetchShare restructure (#197, §RS-2)
+    ("CRSH-ISC-30", IscClass::Positive), // a sweep terminates whatever the record does: every GET bounded by SWEEP_GET_TIMEOUT, SWEEP_READ_FANOUT of them at once, so o_cnt.div_ceil(fanout) × timeout bounds a wholly unanswering record; an abandoned read counts in timed_out and failed, reaching the CRSH-ISC-2 rule as an erroring one does; the read set stays 0..o_cnt exactly once in index order (WB-0), and an early stop cancels the in-flight reads and releases their permits (#397)
     // Download-subsystem redesign (docs/design/download-subsystem.md). The
     // DL-ISC-* family registers incrementally as each step builds its slice.
     ("DL-ISC-10", IscClass::Positive), // the share-fetch boundary types transient / integrity / not-served / local failures apart; SHA-384 mismatch is Integrity (step 1 error taxonomy, #205)
@@ -429,7 +430,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 244;
+pub const TOTAL: usize = 245;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -621,7 +622,7 @@ mod tests {
         //                                  chat-never-waits / panic-recovery /
         //                                  telemetry-only / single-permit), #159/#168/#157)
         //                                  consumer route self-heal (#180):
-        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10/13/21/22/23/24/25/26/27/28/29 pos (sweep
+        //                                  CRSH-ISC-1/2/9/3/18/5/6/19/8/10/13/21/22/23/24/25/26/27/28/29/30 pos (sweep
         //                                  accounting, K-detection, weather gating,
         //                                  record_lock repair, chat serialization,
         //                                  Unresolved-not-prune, parked retry, generation,
@@ -632,7 +633,8 @@ mod tests {
         //                                  Unresolved, withdraw releases+drops imported route,
         //                                  route-rotation re-import on catalog-Unchanged,
         //                                  Refresh re-indexes own roots,
-        //                                  chat-before-download #197) +
+        //                                  chat-before-download #197,
+        //                                  bounded sweep termination #397) +
         //                                  CRSH-ISC-11/14/17/4/15/7/16/20 neg (network-state-only
         //                                  input, margin limiter, no-nested-permit,
         //                                  zero-network reactive, retry decorrelation,
@@ -665,12 +667,12 @@ mod tests {
         //                                  verify, highest-version-wins rollback
         //                                  guard) — the rest of the DM family
         //                                  registers per build slice.
-        //   total   160 pos + 84 neg = 244
+        //   total   161 pos + 84 neg = 245
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs. A-C43 was
         //    added with the TLS-stack removal: daemonseed's own envelopes never
         //    fall below CNSA 2.0 even though the transport under them is not.)
-        assert_eq!(pos, 160, "positive count drift");
+        assert_eq!(pos, 161, "positive count drift");
         assert_eq!(neg, 84, "negative count drift");
     }
 

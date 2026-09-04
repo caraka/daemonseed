@@ -455,6 +455,7 @@ impl MockDht {
                 outcome: SweepOutcome {
                     attempted: u32::from(DOORBELL_SLOTS),
                     failed: 0,
+                    timed_out: 0,
                     found,
                 },
             });
@@ -614,6 +615,7 @@ impl DmDht for MockDht {
                     outcome: SweepOutcome {
                         attempted: u32::from(DOORBELL_SLOTS),
                         failed: 0,
+                        timed_out: 0,
                         found,
                     },
                 }
@@ -735,18 +737,21 @@ impl DmDht for MockDht {
             SweepOutcome {
                 attempted: 0,
                 failed: 0,
+                timed_out: 0,
                 found: 0,
             }
         } else if self.partial_sweeps {
             SweepOutcome {
                 attempted: u32::from(PAGE_SLOTS) - 1,
                 failed: 0,
+                timed_out: 0,
                 found,
             }
         } else {
             SweepOutcome {
                 attempted: u32::from(PAGE_SLOTS),
                 failed: 0,
+                timed_out: 0,
                 found,
             }
         };

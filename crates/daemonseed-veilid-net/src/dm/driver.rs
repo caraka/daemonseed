@@ -1904,6 +1904,7 @@ mod tests {
                 outcome: crate::SweepOutcome {
                     attempted: 32,
                     failed: 2,
+                    timed_out: 0,
                     found: 1,
                 },
                 admission: Default::default(),

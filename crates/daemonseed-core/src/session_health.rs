@@ -77,7 +77,10 @@ pub enum WatchState {
 pub struct SweepHealthInput {
     /// Subkey GETs issued this pass (`SweepOutcome::attempted`).
     pub attempted: u32,
-    /// Subkey GETs that errored this pass (`SweepOutcome::failed`) — the L1 signal.
+    /// Subkey GETs that returned no answer this pass (`SweepOutcome::failed`) — the L1
+    /// signal. A read the sweep abandoned at its per-GET bound counts here alongside one
+    /// that errored: both say the record did not serve the read, which is the question
+    /// this rung asks.
     pub failed: u32,
     /// Populated slots yielded this pass (`SweepOutcome::found`).
     pub found: u32,

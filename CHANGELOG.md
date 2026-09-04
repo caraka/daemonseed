@@ -577,6 +577,11 @@ work lives in the maintainer's own planning notes, not here.
   strands: the acceptance is collected and the correspondent's messages are delivered, where before
   nothing mapped their identity key to the correspondence and every message they composed re-emitted
   to the outbox's seven-day give-up. (#402)
+- Bounded each rendezvous sweep GET at `SWEEP_GET_TIMEOUT` (15s), with `SWEEP_READ_FANOUT` (4) in
+  flight at once, so a sweep of an `o_cnt`-subkey record spends at most `o_cnt.div_ceil(4) × 15s`
+  on its reads however many go unanswered; every slot is still read exactly once in index order.
+  `SweepOutcome` gains `timed_out`, a subset of `failed`, and the rendezvous sweep traces its
+  start as well as its counts on completion. (#397)
 - The terminal client shows a direct-message channel torn down for want of a stored handshake
   record as "conversation ended — start a new one" in the status badge and Trust History,
   through `trust_persistent_text`, rather than printing the event key

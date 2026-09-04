@@ -3595,6 +3595,7 @@ async fn sweep_dm_page(
             rendezvous::SweepOutcome {
                 attempted: 0,
                 failed: 0,
+                timed_out: 0,
                 found: 0,
             },
         ));
@@ -3638,12 +3639,13 @@ async fn sweep_dm_page(
     )
     .await;
     crate::vtrace!(
-        "sweep_dm_page: key={:?} page={} attempted={} found={} failed={}",
+        "sweep_dm_page: key={:?} page={} attempted={} found={} failed={} timed_out={}",
         handle.key(),
         address.page(),
         outcome.attempted,
         outcome.found,
-        outcome.failed
+        outcome.failed,
+        outcome.timed_out
     );
     // Each subkey becomes a checked position on the address's OWN page, so a
     // collector never re-does the arithmetic and never has to be told which page the
@@ -4048,6 +4050,7 @@ async fn sweep_doorbell(
             outcome: rendezvous::SweepOutcome {
                 attempted: 0,
                 failed: 0,
+                timed_out: 0,
                 found: 0,
             },
         });
@@ -4100,11 +4103,12 @@ async fn sweep_doorbell(
     )
     .await;
     crate::vtrace!(
-        "sweep_doorbell: key={:?} attempted={} found={} failed={}",
+        "sweep_doorbell: key={:?} attempted={} found={} failed={} timed_out={}",
         handle.key(),
         outcome.attempted,
         outcome.found,
-        outcome.failed
+        outcome.failed,
+        outcome.timed_out
     );
     let slots = doorbell_place_swept(raw)?;
     Ok(DoorbellSweep { slots, outcome })
@@ -6742,6 +6746,7 @@ mod tests {
                         outcome: rendezvous::SweepOutcome {
                             attempted: 32,
                             failed: 0,
+                            timed_out: 0,
                             found: 1,
                         },
                     }));

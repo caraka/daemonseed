@@ -248,7 +248,7 @@ types:
       - name: ValueChanged
         description: A watched DHT value changed (circles / shares).
       - name: SweepHealth
-        description: Emitted once per completed rendezvous sweep, carrying per-record GET accounting (attempted / failed / found) so a consumer can drive session-health / self-heal detection. Does not change the on-slot Inbound emission.
+        description: Emitted once per completed rendezvous sweep, carrying per-record GET accounting (attempted / failed / timed_out / found) so a consumer can drive session-health / self-heal detection. timed_out is the subset of failed whose reads were abandoned at the sweep's per-GET time bound rather than returning an error. Does not change the on-slot Inbound emission.
   - name: RouteAdvertSigner
     module: daemonseed_veilid_net::discovery
     kind: trait
