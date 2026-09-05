@@ -164,6 +164,39 @@ pub enum TrustEventKey {
     /// so the queue does not keep trying, it stops, and the user is told it
     /// stopped rather than watching it run out the seven-day give-up.
     DmCorrespondentStateLost,
+    /// A correspondent re-presented a re-establishment attempt this side has
+    /// already settled, and it opened under a root still retained
+    /// (`docs/design/direct-messaging.md:913`, A3.8 *peer state regressed*;
+    /// `:1369` row 14).
+    ///
+    /// The peer is speaking under state older than the exchange both sides
+    /// completed — a party that crashed after committing an establishment and
+    /// came back holding the attempt it had already sent. The frame is deduped
+    /// and causes nothing; what the key carries is that recovery is under way,
+    /// which A3.8 requires be *loud* rather than absorbed. Distinct from
+    /// [`Self::DmCorrespondentStateLost`]: that one means the correspondent's
+    /// at-rest state is gone and the queue stops, and this one means the
+    /// correspondent is behind and catching up.
+    DmPeerStateRegressed,
+    /// A re-establishment handshake leg reached its give-up unanswered
+    /// (`docs/design/direct-messaging.md:913`, A3.8 *re-establishment failed*).
+    ///
+    /// Not terminal: A3.13 forbids a dead end, so the attempt is released and a
+    /// fresh one opens. The key exists because a channel that has been
+    /// re-establishing for a week must not render as healthy.
+    DmReestablishmentFailed,
+    /// The retained superseded root reached `T_RETIRE` with no confirming
+    /// observation (A3.8 *re-establishment unconfirmed*, A3.5).
+    ///
+    /// The root is retired regardless, so an actor able to suppress frames buys
+    /// at most the retention window of extended exposure and pays with this.
+    DmReestablishmentUnconfirmed,
+    /// This side declined to answer a correspondent's re-establishment because
+    /// it has already answered as many as it admits (A3.8 *re-establishment
+    /// backoff engaged*, A8.4's answer-side emission bound).
+    ///
+    /// Nothing was accepted, so the same attempt is admissible later.
+    DmReestablishmentBackoffEngaged,
 }
 
 /// Every key, in declaration order. Used by exhaustiveness tests and any caller
@@ -192,6 +225,10 @@ pub const ALL_EVENT_KEYS: &[TrustEventKey] = &[
     TrustEventKey::DmProvisionalRecordUnreadable,
     TrustEventKey::DmRecordErasureBlocked,
     TrustEventKey::DmCorrespondentStateLost,
+    TrustEventKey::DmPeerStateRegressed,
+    TrustEventKey::DmReestablishmentFailed,
+    TrustEventKey::DmReestablishmentUnconfirmed,
+    TrustEventKey::DmReestablishmentBackoffEngaged,
 ];
 
 /// The affordance class for a key (ISC-C28 per-event assignment table). Total
@@ -246,6 +283,18 @@ pub const fn class_of(key: TrustEventKey) -> TrustEventClass {
         // the new first contact is a separate offer with its own accept/decline
         // gate, and there is nothing here to hold back.
         DmCorrespondentStateLost => PersistentNonBlocking,
+        // A3.8's class for every loud anomaly, and *peer state regressed* is one
+        // of the five it names. Not `Blocking`: the recovery is mechanical and
+        // there is nothing for the user to decide, but a surface that could drop
+        // the notice would render a conversation mid-recovery as an ordinary
+        // healthy one.
+        DmPeerStateRegressed => PersistentNonBlocking,
+        // A3.8's class for every loud anomaly, and these are three of the five
+        // it names. None is `Blocking`: each recovery is mechanical and bounded,
+        // and there is nothing for the user to decide.
+        DmReestablishmentFailed => PersistentNonBlocking,
+        DmReestablishmentUnconfirmed => PersistentNonBlocking,
+        DmReestablishmentBackoffEngaged => PersistentNonBlocking,
     }
 }
 
@@ -278,6 +327,10 @@ pub const fn event_key_string(key: TrustEventKey) -> &'static str {
         DmProvisionalRecordUnreadable => "dm-provisional-record-unreadable",
         DmRecordErasureBlocked => "dm-record-erasure-blocked",
         DmCorrespondentStateLost => "dm-correspondent-state-lost",
+        DmPeerStateRegressed => "dm-peer-state-regressed",
+        DmReestablishmentFailed => "dm-reestablishment-failed",
+        DmReestablishmentUnconfirmed => "dm-reestablishment-unconfirmed",
+        DmReestablishmentBackoffEngaged => "dm-reestablishment-backoff-engaged",
     }
 }
 
@@ -1094,7 +1147,11 @@ mod tests {
                 DmProvisionalHandshakeLost => DmProvisionalRecordUnreadable,
                 DmProvisionalRecordUnreadable => DmRecordErasureBlocked,
                 DmRecordErasureBlocked => DmCorrespondentStateLost,
-                DmCorrespondentStateLost => return None,
+                DmCorrespondentStateLost => DmPeerStateRegressed,
+                DmPeerStateRegressed => DmReestablishmentFailed,
+                DmReestablishmentFailed => DmReestablishmentUnconfirmed,
+                DmReestablishmentUnconfirmed => DmReestablishmentBackoffEngaged,
+                DmReestablishmentBackoffEngaged => return None,
             })
         }
 

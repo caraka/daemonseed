@@ -220,6 +220,35 @@ pub enum DmEvent {
         /// stated. Empty when the queue held nothing pending.
         surfaced: Vec<u64>,
     },
+    /// One of A3.8's loud re-establishment states, named by its classed key.
+    ///
+    /// **One variant for the family, because the key is the discriminator and
+    /// the affordance is the same.** A3.8
+    /// (`docs/design/direct-messaging.md:913`) enumerates the loud states a
+    /// re-establishment can reach, gives them all one class
+    /// (`PersistentNonBlocking`), and asks of every one of them only that the
+    /// user be told. Four are reachable here:
+    /// [`TrustEventKey::DmPeerStateRegressed`] (the divergence table's row 14 —
+    /// a correspondent re-presenting an exchange this side has settled),
+    /// [`TrustEventKey::DmReestablishmentFailed`] (a leg reached its give-up
+    /// unanswered), [`TrustEventKey::DmReestablishmentUnconfirmed`] (the
+    /// retention ceiling fired with no confirming observation) and
+    /// [`TrustEventKey::DmReestablishmentBackoffEngaged`] (this side declined to
+    /// answer another re-establishment in this session).
+    ///
+    /// **Not [`Self::ChannelLost`], and the difference is the remedy.** A
+    /// teardown says the correspondence cannot carry on and offers a fresh first
+    /// contact; every state here is recovering on its own, bounded by a window
+    /// or a ladder, with nothing for the user to do but know.
+    ReestablishmentAnomaly {
+        /// The correspondent's long-term identity key.
+        with: PkLt,
+        /// The classed trust event, carried beside the news for the reason
+        /// [`Self::ChannelLost`]'s own `event` field records: ISC-A-C12 forbids
+        /// a client skipping the audit entry, and a key a front end has to fetch
+        /// is a key a front end can forget.
+        event: TrustEventKey,
+    },
     /// A known correspondent knocked again and this side cannot say which
     /// direction its own outbox runs in.
     ///
@@ -367,6 +396,22 @@ pub enum DmEvent {
         /// cost is one rescan — but the record was tampered with or corrupted
         /// either way, which is why it is counted rather than only traced.
         cursor_records_repaired: u64,
+        /// Re-establishment legs that opened and whose fold could not finish.
+        ///
+        /// A store fault, a module fault or a counter that would not read, met
+        /// part way through a fold. Nothing was committed and the position was
+        /// left unsettled, so the correspondent's own re-seed brings the frame
+        /// back and the next sweep tries again. A rising count is a store or a
+        /// module in trouble, not a peer.
+        leg_folds_deferred: u64,
+        /// Queued re-establishment legs whose record address would not derive.
+        ///
+        /// The entry is not emitted and its re-seed ladder is not advanced, so a
+        /// derivation that starts working again finds the leg where it was
+        /// rather than at the end of a ladder it spent while nothing could be
+        /// written. Non-zero means the conversation's address root or the
+        /// fingerprint over it would not derive, which is a module fault.
+        leg_unaddressable: u64,
     },
 
     /// A contact lookup failed during a sweep, so knocks were dropped.
@@ -629,6 +674,13 @@ impl core::fmt::Debug for DmEvent {
                     ", cause: {cause:?}, event: {event:?}, surfaced: {surfaced:?} }}"
                 )
             }
+            DmEvent::ReestablishmentAnomaly { event, .. } => {
+                f.write_str("ReestablishmentAnomaly { with: ")?;
+                redacted_pk(f)?;
+                // The key names a kind of anomaly, never a correspondent, so it
+                // is printable where the identity above is not (ISC-C28).
+                write!(f, ", event: {event:?} }}")
+            }
             DmEvent::ChannelDirectionUnknown { .. } => {
                 f.write_str("ChannelDirectionUnknown { with: ")?;
                 redacted_pk(f)?;
@@ -653,6 +705,8 @@ impl core::fmt::Debug for DmEvent {
                 peer_acks_deferred,
                 peer_acks_clipped,
                 peer_acks_unverified,
+                leg_folds_deferred,
+                leg_unaddressable,
                 ..
             } => {
                 f.write_str("ChannelHealth { with: ")?;
@@ -663,7 +717,9 @@ impl core::fmt::Debug for DmEvent {
                      unopenable: {unopenable}, peer_pseudonym_unknown: {peer_pseudonym_unknown}, \
                      peer_acks_deferred: {peer_acks_deferred}, \
                      peer_acks_clipped: {peer_acks_clipped}, \
-                     peer_acks_unverified: {peer_acks_unverified} }}"
+                     peer_acks_unverified: {peer_acks_unverified}, \
+                     leg_folds_deferred: {leg_folds_deferred}, \
+                     leg_unaddressable: {leg_unaddressable} }}"
                 )
             }
             DmEvent::ContactLookupFailed => f.write_str("ContactLookupFailed"),

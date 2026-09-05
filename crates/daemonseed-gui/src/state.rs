@@ -604,6 +604,10 @@ pub struct DmChannelHealth {
     pub peer_acks_unverified: u64,
     /// Receive-cursor records found unreadable and replaced.
     pub cursor_records_repaired: u64,
+    /// Re-establishment legs that opened and whose fold could not finish.
+    pub leg_folds_deferred: u64,
+    /// Queued re-establishment legs whose record address would not derive.
+    pub leg_unaddressable: u64,
 }
 
 impl std::fmt::Debug for DmChannelHealth {
@@ -714,6 +718,8 @@ impl DmState {
                 peer_acks_clipped,
                 peer_acks_unverified,
                 cursor_records_repaired,
+                leg_folds_deferred,
+                leg_unaddressable,
             } => {
                 self.last_channel_health = Some(DmChannelHealth {
                     with: with.clone(),
@@ -725,6 +731,8 @@ impl DmState {
                     peer_acks_clipped: *peer_acks_clipped,
                     peer_acks_unverified: *peer_acks_unverified,
                     cursor_records_repaired: *cursor_records_repaired,
+                    leg_folds_deferred: *leg_folds_deferred,
+                    leg_unaddressable: *leg_unaddressable,
                 });
             }
             DmEvent::BlockListUnreadable => {
@@ -739,6 +747,10 @@ impl DmState {
             DmEvent::Message { .. }
             | DmEvent::AcceptFailed { .. }
             | DmEvent::ChannelDirectionUnknown { .. }
+            // Its audit entry is written above, where every classed key is. The
+            // fold adds nothing to `dm`: recovery is under way and bounded, and
+            // there is no per-correspondence state a reader could act on.
+            | DmEvent::ReestablishmentAnomaly { .. }
             | DmEvent::ContactLookupFailed
             | DmEvent::BlockListFull { .. }
             | DmEvent::BlockListProvisioned
@@ -942,14 +954,16 @@ impl GuiState {
 
     /// (#339) Fold one DM driver event. Renders nothing: no interface draws it.
     ///
-    /// A teardown is the one thing that leaves a record beyond `dm`: it arrives
-    /// carrying its classed key, and ISC-A-C12 forbids skipping the audit entry
-    /// the taxonomy owes it. It arrives two ways — as a lost channel, and as
-    /// the refusal an introduction ends in — and a refusal that tore nothing
-    /// down carries no key and folds nothing.
+    /// An event carrying a classed key is the one thing that leaves a record
+    /// beyond `dm`, and ISC-A-C12 forbids skipping the audit entry the taxonomy
+    /// owes it. Three arrive that way — a lost channel, the refusal an
+    /// introduction ends in, and A3.8's re-establishment anomalies, whose class
+    /// is `PersistentNonBlocking` exactly as a teardown's is. A refusal that
+    /// tore nothing down carries no key and folds nothing.
     pub fn on_dm_event(&mut self, event: &DmEvent) {
         match event {
             DmEvent::ChannelLost { event: key, .. }
+            | DmEvent::ReestablishmentAnomaly { event: key, .. }
             | DmEvent::Refused {
                 event: Some(key), ..
             } => self
@@ -3480,6 +3494,46 @@ mod tests {
     /// skipping the entry, and this fold is the only thing between the driver's
     /// classed key and the log. The undelivered queue is asserted alongside it,
     /// so a fold that logged the event and dropped the sequences would fail.
+    /// **A re-establishment anomaly reaches the audit log too**, and its class
+    /// is the same one a teardown's is.
+    ///
+    /// A3.8 gives every loud re-establishment state
+    /// `PersistentNonBlocking`, and ISC-A-C12 forbids the client dropping a
+    /// classed key on the way to the log. Nothing else about the event is folded
+    /// — recovery is under way and bounded — so the log entry is the whole of
+    /// what a front end owes it, and this is the only place that can be checked.
+    #[test]
+    fn dm_reestablishment_anomaly_is_audit_logged() {
+        use daemonseed_core::trust_events::{TrustEventClass, TrustEventKey, class_of};
+        let mut st = GuiState::lobby_only();
+        assert_eq!(st.trust_log().len(), 0, "the fixture starts empty");
+
+        st.on_dm_event(&DmEvent::ReestablishmentAnomaly {
+            with: dm_pk(9),
+            event: TrustEventKey::DmPeerStateRegressed,
+        });
+
+        let entries = st.trust_log().entries();
+        assert_eq!(entries.len(), 1, "the anomaly was not logged");
+        assert_eq!(entries[0].key, TrustEventKey::DmPeerStateRegressed);
+        assert_eq!(
+            class_of(TrustEventKey::DmPeerStateRegressed),
+            TrustEventClass::PersistentNonBlocking,
+            "the class the log entry is written at moved"
+        );
+        // ISC-C28 keeps the correspondence out of the log, exactly as it does
+        // for a teardown: the key is the whole statement.
+        assert!(entries[0].server_id.is_none());
+        assert!(entries[0].suite_id.is_none());
+        assert!(entries[0].record_kind.is_none());
+        assert!(entries[0].timestamp_unix_ms > 0, "the entry has no clock");
+        // And nothing else moved: the fold adds no per-correspondence state.
+        assert!(
+            !st.dm_state().correspondences.contains_key(&dm_pk(9)),
+            "the anomaly invented correspondence state a reader cannot act on"
+        );
+    }
+
     #[test]
     fn dm_channel_lost_is_audit_logged() {
         let mut st = GuiState::lobby_only();
@@ -3725,6 +3779,8 @@ mod tests {
             peer_acks_clipped: 0,
             peer_acks_unverified: 0,
             cursor_records_repaired: 0,
+            leg_folds_deferred: 0,
+            leg_unaddressable: 0,
         });
         let rendered = format!("{:?}", st.dm_state());
 

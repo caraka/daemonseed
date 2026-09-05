@@ -1257,6 +1257,7 @@ impl DmPersist {
                     }
                     Self::guard_reconnect_gen(record, &stored)?;
                     Self::guard_acceptance(record, &stored)?;
+                    Self::guard_confirm_slot(record, &stored)?;
                     Self::guard_retention(record, &stored)?;
                     if !stored.send_floor().admits(record.send_floor()) {
                         return Err(ResumeError::FloorWouldRollBack {
@@ -1485,6 +1486,69 @@ impl DmPersist {
             None => {}
         }
         Ok(())
+    }
+
+    /// The confirm slot's two guards, the mirror of what the own slot has.
+    ///
+    /// **The settling leg's bytes are the only copy, and dropping them strands
+    /// the peer.** A9.1(a) makes a `RE-CONFIRM` unreproducible from its inputs —
+    /// it is a randomized seal — and A3.15 row 4 has it re-seeding until the
+    /// answering side opens it. A write that emptied the slot while the exchange
+    /// it settles still stands would therefore leave the responder waiting for a
+    /// frame no later pass can rebuild: it retires at `T_RETIRE` while this side
+    /// has already advanced, which is the split-brain commit-then-emit exists to
+    /// remove. Every other durable slot on this record is guarded against
+    /// exactly that, and this one was not.
+    ///
+    /// **Two acts legitimately empty it, and both are recognisable.** A3.6's
+    /// confirming observation retires the leg with the retained root it belongs
+    /// to, so the write that clears the slot also clears the retention — that is
+    /// the shape [`ResumeRecord::retire_confirm`] produces, paired with
+    /// [`ResumeRecord::retire_retained`]. And a later exchange supersedes it: a
+    /// generation past the one the stored leg settles means the correspondence
+    /// has moved on, and no observation of the old leg can arrive any more.
+    /// Anything else is a record built from a read that predates the completion,
+    /// and it is refused.
+    ///
+    /// **No rollback within the slot**, on the terms
+    /// [`Self::guard_acceptance`] states for its own: a stored leg settling a
+    /// later generation is never replaced by one settling an earlier, and the
+    /// bytes at one generation are never re-sealed — the answering side dedups
+    /// on what it has already opened, so a second seal at one generation is a
+    /// frame it will refuse while this side waits on it.
+    fn guard_confirm_slot(
+        record: &ResumeRecord,
+        stored: &ResumeRecord,
+    ) -> Result<(), DmPersistError> {
+        let Some(held) = stored.confirm_slot() else {
+            return Ok(());
+        };
+        match record.confirm_slot() {
+            Some(offered) => {
+                if offered.generation() < held.generation() {
+                    return Err(ResumeError::ConfirmSlotWouldRollBack {
+                        stored: held.generation(),
+                        offered: offered.generation(),
+                    }
+                    .into());
+                }
+                if offered.generation() == held.generation() && offered.sealed() != held.sealed() {
+                    return Err(ResumeError::ConfirmResealed {
+                        generation: held.generation(),
+                    }
+                    .into());
+                }
+                Ok(())
+            }
+            // The confirming observation, which ends the retained root in the
+            // same write, or a later exchange the stored leg cannot belong to.
+            None if stored.retained().is_some() && record.retained().is_none() => Ok(()),
+            None if record.reconnect_gen() > held.generation() => Ok(()),
+            None => Err(ResumeError::ConfirmSlotDropped {
+                generation: held.generation(),
+            }
+            .into()),
+        }
     }
 
     /// The retained `RS_n`'s two guards.
@@ -5259,6 +5323,7 @@ mod tests {
                     eph_dk_fixture(),
                 )),
                 acceptance: None,
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },
@@ -5426,10 +5491,18 @@ mod tests {
             )
             .expect("the module is operational")
         };
+        let confirm_slot = |generation: u32| {
+            crate::dm::resume::ConfirmSlot::new(
+                generation,
+                200,
+                vec![0xCFu8; 64].into_boxed_slice(),
+            )
+            .expect("within the leg ceiling")
+        };
 
         // The re-rooted chain opens at a generation BELOW the stored floor's.
         let mut rolled_back = resume_record(1, SendFloor::new(5, 100));
-        let _chan_id = rolled_back.commit_reestablished(rerooted(), 3, now);
+        let _chan_id = rolled_back.commit_reestablished(rerooted(), 3, now, confirm_slot(3));
         assert_eq!(
             rolled_back.send_floor(),
             SendFloor::new(3, 100),
@@ -5456,7 +5529,7 @@ mod tests {
         // admitted, so the refusal is about the direction rather than about a
         // guard that refuses every re-establishment.
         let mut forward = resume_record(1, SendFloor::new(5, 100));
-        let _chan_id = forward.commit_reestablished(rerooted(), 7, now);
+        let _chan_id = forward.commit_reestablished(rerooted(), 7, now, confirm_slot(7));
         p.commit_resume(&l, &forward)
             .expect("a forward re-establishment must be admitted");
         assert_eq!(
@@ -5611,6 +5684,7 @@ mod tests {
                     eph_dk_fixture(),
                 )),
                 acceptance: None,
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },
@@ -5952,6 +6026,7 @@ mod tests {
                     )
                 }),
                 acceptance: None,
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },
@@ -8245,6 +8320,115 @@ mod tests {
     /// A record carrying whatever the caller wants in each group, with the
     /// pseudonym pair the other resume fixtures use — the pair guard refuses a
     /// change to it independently, so every fixture here must share one.
+    /// **The settling leg's slot is guarded like every other durable slot on the
+    /// record, and the gap it closes is a stranded peer.**
+    ///
+    /// A9.1(a) makes a `RE-CONFIRM` unreproducible from its inputs, and A3.15
+    /// row 4 has it re-seeding until the answering side opens it — so a write
+    /// built from a record read BEFORE the completion drops the only copy of a
+    /// frame the peer is still waiting for. The peer then retires at `T_RETIRE`
+    /// while this side has already advanced, which is the split-brain
+    /// commit-then-emit exists to remove.
+    ///
+    /// Three refusals and two admissions, because the two writes that
+    /// legitimately end the slot have to keep working: the confirming
+    /// observation, which retires the retained root in the same act, and a later
+    /// exchange the stored leg cannot belong to.
+    #[test]
+    fn the_settling_leg_may_not_be_dropped_re_sealed_or_rolled_back() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let p = persist(dir.path());
+        let l = label(0xB1);
+        let floor = SendFloor::new(0, 0);
+        let confirm = |generation: u32, seed: u8| {
+            crate::dm::resume::ConfirmSlot::new(generation, 200, vec![seed; 64].into_boxed_slice())
+                .expect("within the leg ceiling")
+        };
+        let state = |generation: u32, slot: Option<crate::dm::resume::ConfirmSlot>| {
+            crate::dm::resume::ReEstState {
+                reconnect_gen: generation,
+                confirm: slot,
+                ..crate::dm::resume::ReEstState::first_establishment()
+            }
+        };
+        let retained = || crate::dm::resume::Retention {
+            retained: Some(crate::dm::resume::RetainedRoot::new(
+                crate::dm::resume::CommittedRoot::from_bytes(
+                    &[0x55u8; crate::dm::ratchet::ROOT_KEY_LEN],
+                ),
+                1_700_000_000_000,
+            )),
+            dedup: crate::dm::resume::DedupMemory::new(),
+            stopped: false,
+        };
+
+        p.commit_resume(
+            &l,
+            &resume_with(state(4, Some(confirm(4, 0xC1))), retained(), floor),
+        )
+        .expect("the completion commits");
+
+        // The stale write: a record read before the completion, so its slot is
+        // empty and its generation has not moved.
+        assert_eq!(
+            p.commit_resume(&l, &resume_with(state(4, None), retained(), floor))
+                .err()
+                .map(|e| format!("{e}")),
+            Some(
+                "resume record: the settling leg of generation 4 may only be cleared by \
+                 its confirming observation or a later exchange"
+                    .to_string()
+            ),
+            "a stale write dropped the only copy of the settling leg"
+        );
+        // A second seal at one generation, which the peer dedups away.
+        assert_eq!(
+            p.commit_resume(
+                &l,
+                &resume_with(state(4, Some(confirm(4, 0xC2))), retained(), floor)
+            )
+            .err()
+            .map(|e| format!("{e}")),
+            Some(
+                "resume record: the settling leg of generation 4 is already persisted \
+                 under different sealed bytes"
+                    .to_string()
+            ),
+            "the settling leg was re-sealed at one generation"
+        );
+        // A leg for an earlier exchange.
+        assert_eq!(
+            p.commit_resume(
+                &l,
+                &resume_with(state(4, Some(confirm(3, 0xC3))), retained(), floor)
+            )
+            .err()
+            .map(|e| format!("{e}")),
+            Some(
+                "resume record: a settling leg for generation 3 is behind the stored 4".to_string()
+            ),
+            "the settling leg rolled back"
+        );
+
+        // **Both admissions, or the guard is a lock rather than a guard.** The
+        // confirming observation ends the leg and the retained root together;
+        // and a record whose generation has moved past the exchange the leg
+        // settles has left it behind.
+        p.commit_resume(
+            &l,
+            &resume_with(state(4, None), crate::dm::resume::Retention::none(), floor),
+        )
+        .expect("the confirming observation clears the slot");
+        p.commit_resume(
+            &l,
+            &resume_with(state(4, Some(confirm(4, 0xC1))), retained(), floor),
+        )
+        .expect("re-committing the same leg is admitted");
+        p.commit_resume(&l, &resume_with(state(5, None), retained(), floor))
+            .expect("a later exchange leaves the old leg behind");
+    }
+
     fn resume_with(
         handshake: crate::dm::resume::ReEstState,
         retention: crate::dm::resume::Retention,
@@ -8272,6 +8456,7 @@ mod tests {
         crate::dm::resume::AcceptanceSlot::accept(
             generation,
             attempt_of(attempt),
+            55,
             vec![seal; 128].into_boxed_slice(),
         )
         .expect("within MAX_SEALED_LEG_LEN")
@@ -8333,6 +8518,7 @@ mod tests {
                         last_seen_re_est: 0,
                         own: None,
                         acceptance: Some(acceptance(7, 5, 0xC1).confirm()),
+                        confirm: None,
                         attempt_at_window_start: 0,
                         reroot_ratchet_gen: 0,
                     },
@@ -8390,6 +8576,7 @@ mod tests {
                         last_seen_re_est: 0,
                         own: None,
                         acceptance: Some(acceptance(7, 5, 0xC1)),
+                        confirm: None,
                         attempt_at_window_start: 0,
                         reroot_ratchet_gen: 0,
                     },
@@ -8444,6 +8631,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: Some(own(5, 3, 0xA1)),
                 acceptance: None,
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },
@@ -8462,6 +8650,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: None,
                 acceptance: None,
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },
@@ -8491,6 +8680,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: Some(own(5, 3, 0xA1)),
                 acceptance: None,
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },
@@ -8536,6 +8726,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: None,
                 acceptance: Some(acceptance(5, 1, 0xB2)),
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },
@@ -8591,6 +8782,7 @@ mod tests {
                     last_seen_re_est: 0,
                     own: Some(own(5, 5, 0xA1)),
                     acceptance: None,
+                    confirm: None,
                     attempt_at_window_start: 0,
                     reroot_ratchet_gen: 0,
                 },
@@ -8610,6 +8802,7 @@ mod tests {
                     last_seen_re_est: 0,
                     own: None,
                     acceptance: None,
+                    confirm: None,
                     attempt_at_window_start: 5,
                     reroot_ratchet_gen: 0,
                 },
@@ -8638,6 +8831,7 @@ mod tests {
                         last_seen_re_est: 0,
                         own: Some(own(6, 1, 0xA2)),
                         acceptance: None,
+                        confirm: None,
                         attempt_at_window_start: 0,
                         reroot_ratchet_gen: 0,
                     },
@@ -8666,6 +8860,7 @@ mod tests {
                     last_seen_re_est: 0,
                     own: Some(own(6, 6, 0xA2)),
                     acceptance: None,
+                    confirm: None,
                     attempt_at_window_start: 5,
                     reroot_ratchet_gen: 0,
                 },
@@ -8701,6 +8896,7 @@ mod tests {
                     last_seen_re_est: 0,
                     own: None,
                     acceptance: None,
+                    confirm: None,
                     attempt_at_window_start: 0,
                     reroot_ratchet_gen: 0,
                 },
@@ -8757,6 +8953,7 @@ mod tests {
                     last_seen_re_est: 8,
                     own: None,
                     acceptance: slot,
+                    confirm: None,
                     attempt_at_window_start: 0,
                     reroot_ratchet_gen: 0,
                 },
@@ -9055,6 +9252,7 @@ mod tests {
                     last_seen_re_est: 0,
                     own: None,
                     acceptance: slot,
+                    confirm: None,
                     attempt_at_window_start: 0,
                     reroot_ratchet_gen: 0,
                 },

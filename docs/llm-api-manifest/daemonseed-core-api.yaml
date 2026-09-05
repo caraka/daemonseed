@@ -966,8 +966,17 @@ modules:
       keyed on KeySlot { generation, direction, seq }; insert replaces an occupied
       slot, insert_all takes a skip batch, take removes, evicted() counts
       permanently lost messages. Role { Initiator, Recipient } maps an end of the
+      ReconnectSide::Answered carries offered_generation, A3.9's sender-picks /
+      receiver-adopts rule: reestablished takes the higher of the generation the
+      answering side computed and what the peer's first frame declares. Nothing
+      carries an offer yet — a leg has no clear ratchet header — so that side
+      passes its own value and the adoption is a no-op until the resumed
+      channel's content path exists.
+      Role { Initiator, Recipient } maps an end of the
       conversation onto send_dir()/recv_dir(). Direction::label() is the sole
-      definition of the a2b/b2a wire literals, consumed by dm::firstcontact.
+      definition of the a2b/b2a wire literals, consumed by dm::firstcontact;
+      Direction::opposite() names the other direction of the same conversation,
+      for a caller holding a direction and no Role.
       RootKey, ChainKey and MessageKey are zeroize-on-drop redacting newtypes and
       every derivation zeroizes its transient buffer on both paths. Ratchet is the
       live state machine: initiator(ss0, eph_ek, eph_dk) and recipient(ss0,
@@ -1085,6 +1094,15 @@ modules:
       ordinary case for an established channel, and for a record the store lost),
       RecordUnusable(ProvisionalError), or StoreUnreadable(String) when the store
       itself could not be read; Teardown::event() maps those to
+      Four further DM keys carry A3.8's loud re-establishment states, all
+      PersistentNonBlocking and none belonging to a TeardownCause:
+      DmPeerStateRegressed ("dm-peer-state-regressed"), a correspondent speaking
+      under a root this side has superseded; DmReestablishmentFailed
+      ("dm-reestablishment-failed"), a leg past its give-up unanswered;
+      DmReestablishmentUnconfirmed ("dm-reestablishment-unconfirmed"), the
+      retention ceiling with no confirming observation; and
+      DmReestablishmentBackoffEngaged ("dm-reestablishment-backoff-engaged"),
+      this side declining to answer another re-establishment in this session.
       TrustEventKey::DmChannelTornDownOnRestart, DmProvisionalHandshakeLost and
       DmProvisionalRecordUnreadable, and Display renders the user-facing statement —
       StoreUnreadable's says nothing is known lost. A fourth cause,
@@ -1129,7 +1147,13 @@ modules:
       write, so a publish has no separate slot argument and page and slot cannot
       disagree; ::receiving(AR, &Ratchet, page) takes a bare page, since a sweep
       addresses the whole record. Both take the direction from the ratchet's own
-      send_direction / recv_direction, so no call site names one. receiving refuses a
+      send_direction / recv_direction, so no call site names one.
+      Direction::opposite() names the other direction of the same conversation.
+      ::sending_on(AR, Direction, PagePosition) and ::receiving_on(AR, Direction,
+      page) are the same derivations with the direction supplied instead, for a
+      correspondence that holds no Ratchet: they perform no conversation check,
+      because with no ratchet there is no second opinion to disagree with, and
+      the fingerprint is derived from AR alone. receiving refuses a
       page above MAX_PAGE with DmPageError::PageBeyondSequenceSpace; sending cannot
       be handed one, because PagePosition::new enforces that bound one type earlier.
       Both refuse a
@@ -1699,7 +1723,16 @@ modules:
       below the argument; OutboxTarget::Doorbell and
       OutboxTarget::ReEstablishmentLeg entries are left alone.
       sweep_give_ups(now_ms) likewise ends no OutboxTarget::ReEstablishmentLeg
-      entry, whatever its age. It
+      entry, whatever its age. That target has two terminal edges of its own, and
+      they record different facts. retire_leg(seq: u64) -> bool is the
+      COMPLETION's: it moves a pending leg to Lifecycle::ConfirmedCollected,
+      which the completion is the proof of. abandon_leg(seq: u64) -> bool is for
+      a leg nobody opened — one the contest coin conceded, or one past its
+      give-up — and moves it to Lifecycle::Undelivered, because
+      ConfirmedCollected would be a claim about the peer that no observation
+      supports. Both leave Surfacing::Clear, since the user composed nothing at a
+      leg's sequence, and both answer false for an absent sequence, another
+      target, or an already-terminal leg. It
       marks each ended entry Surfacing::Owed
       and returns their sequences; it is #[must_use], idempotent, and a
       derivation re-runnable at every load rather than a transaction. Sealing,
@@ -1880,7 +1913,49 @@ modules:
       The caller binds it into the authorship-signature preimage and the seal AAD
       of every frame on the resumed channel. It takes a
       Rerooted rather than a CommittedRoot so RS_n+1 cannot be committed without
-      its RK_0' having been held. reroot_ratchet_gen() -> u32 reads the clear
+      its RK_0' having been held. Its dedup memory travels into the new
+      retention: the root moving into retention is the one every recorded frame
+      was sealed under.
+      ResumeRecord::accept_peer_initiation(candidate: Rerooted, accepted:
+      AcceptanceSlot, abandon_own: bool, now_ms: i64) -> Zeroizing<[u8;
+      ROOT_KEY_LEN]> is the answering side's commit: the candidate becomes the
+      committed root, the acceptance slot is filled unconfirmed, the own slot
+      empties when abandon_own, the window base slides to the accepted attempt,
+      and reconnect_gen, send_floor and reroot_ratchet_gen all stand still. RS_n
+      moves into Retention with a fresh stamp only where no acceptance already
+      stood; a supersede of an unconfirmed candidate leaves the retention
+      untouched, so superseded_at_ms is written once per retained root. It
+      returns the resumed channel's identifier on the same terms
+      commit_reestablished does.
+      ResumeRecord::confirm_acceptance(ratchet_gen: u32) -> bool is that side's
+      completion: reconnect_gen advances, reroot_ratchet_gen is set, send_floor
+      is re-qualified, the retained root and its dedup memory retire, and both
+      slots empty. false, and nothing written, where no acceptance stands.
+      ResumeRecord::take_own_slot() -> Option<OwnSlot> consumes the slot, leaving
+      the attempt counter where it is, for the completion that spends the
+      ephemeral decapsulation key OwnSlot::into_eph_dk() yields.
+      ResumeRecord::set_window_anchor(anchor: u32) stores A7.3's anchor; it
+      raises only and never past the attempt counter, and the value comes from
+      reest::AttemptBudget::observe_peer_opened.
+      AcceptanceSlot::accept(generation, attempt, seq, sealed_re_ack) stores the
+      outbox position its answer was addressed to, read back by
+      AcceptanceSlot::seq(); seq is bound into the leg's seal key and signature,
+      so an answer re-queued anywhere else opens at an address the peer is not
+      reading. ConfirmSlot { generation, seq, sealed } is the same fact for the
+      settling leg — ConfirmSlot::new refuses an empty frame and one past
+      MAX_SEALED_LEG_LEN — and commit_reestablished takes one, which is what
+      forces the RE-CONFIRM to be sealed before the commit that advances the
+      record. ResumeRecord::confirm_slot() reads it and
+      ResumeRecord::retire_confirm() drops it on A3.6's confirming observation
+      for the initiator. commit_resume guards that slot as it guards the others:
+      a stored settling leg is refused a drop (ConfirmSlotDropped), a second seal
+      at one generation (ConfirmResealed) and a rollback to an earlier one
+      (ConfirmSlotWouldRollBack), and admits only the confirming observation —
+      recognised by the retained root going in the same write — or a record whose
+      generation has passed the exchange the leg settles.
+      T_RETIRE_MS is A3.5's retention ceiling at fourteen
+      days, the design's suggested value, measured against the write-once
+      RetainedRoot::superseded_at_ms. reroot_ratchet_gen() -> u32 reads the clear
       ratchet generation the resumed chain opened at, which
       outbox::Outbox::sweep_dead_chain compares each entry's provenance against.
       Accessors s_pc/pk_pc/committed_root/reconnect_gen/attempt/send_floor/

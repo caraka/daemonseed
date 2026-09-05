@@ -1261,6 +1261,10 @@ pub struct DmChannelHealth {
     pub peer_acks_unverified: u64,
     /// Receive-cursor records found unreadable and replaced.
     pub cursor_records_repaired: u64,
+    /// Re-establishment legs that opened and whose fold could not finish.
+    pub leg_folds_deferred: u64,
+    /// Queued re-establishment legs whose record address would not derive.
+    pub leg_unaddressable: u64,
 }
 
 impl std::fmt::Debug for DmChannelHealth {
@@ -1371,6 +1375,8 @@ impl DmState {
                 peer_acks_clipped,
                 peer_acks_unverified,
                 cursor_records_repaired,
+                leg_folds_deferred,
+                leg_unaddressable,
             } => {
                 self.last_channel_health = Some(DmChannelHealth {
                     with: with.clone(),
@@ -1382,6 +1388,8 @@ impl DmState {
                     peer_acks_clipped: *peer_acks_clipped,
                     peer_acks_unverified: *peer_acks_unverified,
                     cursor_records_repaired: *cursor_records_repaired,
+                    leg_folds_deferred: *leg_folds_deferred,
+                    leg_unaddressable: *leg_unaddressable,
                 });
             }
             DmEvent::BlockListUnreadable => {
@@ -1396,6 +1404,10 @@ impl DmState {
             DmEvent::Message { .. }
             | DmEvent::AcceptFailed { .. }
             | DmEvent::ChannelDirectionUnknown { .. }
+            // Its audit entry is written above, where every classed key is. The
+            // fold adds nothing to `dm`: recovery is under way and bounded, and
+            // there is no per-correspondence state a reader could act on.
+            | DmEvent::ReestablishmentAnomaly { .. }
             | DmEvent::ContactLookupFailed
             | DmEvent::BlockListFull { .. }
             | DmEvent::BlockListProvisioned
@@ -1944,16 +1956,18 @@ impl App {
             // No interface renders them yet, so the
             // screen is byte-identical before and after one is folded.
             //
-            // The exception is a teardown, which is raised loudly: the driver
-            // hands the classed key over on the event itself and ISC-A-C12
-            // forbids dropping it here, so it goes to the same audit log and
-            // the same affordance class as every other trust event. A teardown
-            // reaches here two ways — as a lost channel, and as the refusal an
-            // introduction ends in — and a refusal that tore nothing down
+            // The exceptions are the events that carry a classed key: the
+            // driver hands it over on the event itself and ISC-A-C12 forbids
+            // dropping it here, so each goes to the same audit log and the same
+            // affordance class as every other trust event. Three reach here — a
+            // lost channel, the refusal an introduction ends in, and A3.8's
+            // re-establishment anomalies, whose class is `PersistentNonBlocking`
+            // exactly as a teardown's is. A refusal that tore nothing down
             // carries no key and folds nothing.
             NetEvent::Dm(ref event) => {
                 match &**event {
                     DmEvent::ChannelLost { event: key, .. }
+                    | DmEvent::ReestablishmentAnomaly { event: key, .. }
                     | DmEvent::Refused {
                         event: Some(key), ..
                     } => self.fold_trust_event(TrustEventScope::bare(*key), None),
@@ -9214,6 +9228,45 @@ mod tests {
     /// log. The undelivered sequences still land in `dm`, so the two folds are
     /// asserted together — a change that routed the event and lost the queue
     /// would otherwise pass.
+    /// **A re-establishment anomaly reaches the audit log and the persistent
+    /// affordance**, on the same terms a teardown does.
+    ///
+    /// A3.8 gives every loud re-establishment state
+    /// `PersistentNonBlocking`, and ISC-A-C12 forbids the client dropping a
+    /// classed key. Nothing else about the event is folded — recovery is under
+    /// way and bounded — so these two surfaces are the whole of what a front end
+    /// owes it, and this is the only place that can be checked.
+    #[test]
+    fn dm_reestablishment_anomaly_is_audit_logged_at_its_class() {
+        let mut app = App::new();
+        assert_eq!(app.trust_log().len(), 0, "the fixture starts empty");
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(
+            DmEvent::ReestablishmentAnomaly {
+                with: dm_pk(9),
+                event: TrustEventKey::DmReestablishmentFailed,
+            },
+        )));
+
+        let entries = app.trust_log().entries();
+        assert_eq!(entries.len(), 1, "the anomaly was not logged");
+        assert_eq!(entries[0].key, TrustEventKey::DmReestablishmentFailed);
+        assert!(entries[0].server_id.is_none());
+        assert!(entries[0].suite_id.is_none());
+        assert!(entries[0].record_kind.is_none());
+        assert!(entries[0].timestamp_unix_ms > 0, "the entry has no clock");
+
+        assert_eq!(
+            class_of(TrustEventKey::DmReestablishmentFailed),
+            TrustEventClass::PersistentNonBlocking
+        );
+        assert_eq!(app.persistent.len(), 1, "the affordance did not surface");
+        assert_eq!(
+            app.persistent[0].key,
+            TrustEventKey::DmReestablishmentFailed
+        );
+    }
+
     #[test]
     fn dm_channel_lost_is_audit_logged_at_its_class() {
         let mut app = App::new();
@@ -9529,6 +9582,8 @@ mod tests {
             peer_acks_clipped: 0,
             peer_acks_unverified: 0,
             cursor_records_repaired: 0,
+            leg_folds_deferred: 0,
+            leg_unaddressable: 0,
         })));
         let rendered = format!("{:?}", app.dm_state());
 

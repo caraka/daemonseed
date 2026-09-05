@@ -546,6 +546,25 @@ moment it is hand-maintained in two places, so it lives only where it cannot dri
 Decisions in force, with the reasoning that makes each hard to vary. Superseded amendments and the
 route taken to reach a decision are not recorded here — the git history and `CHANGELOG.md` hold those.
 
+- **A re-establishment leg that opens under the SUPERSEDED root is scanned at the generation the
+  open exchange is at, not at the committed one.** A3.5 says retention buys *"the ability to open the
+  peer's frames at the superseded generation"* and names one generation; the build needs two, because
+  which one the peer is speaking at depends on whether an exchange is open. An answering party
+  commits its candidate the moment it answers, so its committed root moves while the peer — which has
+  seen no answer — goes on sealing under the root the exchange started from, at that exchange's
+  generation. A scan pinned to the committed generation therefore opens nothing, which makes A3.4's
+  idempotent re-serve and A5.1's supersede both unreachable. With no exchange open, the same
+  candidate at the committed generation is the divergence table's row 14. The reading was chosen over
+  amending A3.5 because the amendment would say only what A3.4 and A5.1 already require; the design
+  line stands as written.
+
+- **A5.3's processed-frame memory travels with the root into retention.** A5.3 gates eviction on
+  *"actual `RS_n` retirement"*, and the root moving into retention at a completion is the one every
+  recorded frame was sealed under — so its memory has not reached the gate. Emptying it there, as the
+  first build did, made the very frame the completion folded byte-novel again and reopened the alarm
+  a co-host can re-fire by re-serving captured bytes. What bounds the set instead is the window base
+  sliding past a position the scan would reject anyway, and what ends it is retirement.
+
 - **A rendezvous record's owner is modelled by possession, not by record class.** `RendezvousOwner`
   has two arms — `Held`, carrying the owner seed, and `PublicOnly`, carrying only the owner's public
   key — and a party's arm says what that party can do, not what kind of record it is. Record-class

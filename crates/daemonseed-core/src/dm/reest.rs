@@ -3268,6 +3268,7 @@ mod tests {
         let slot = AcceptanceSlot::accept(
             generation,
             Attempt::from_nonzero(NonZeroU32::new(attempt).expect("a real attempt")),
+            55,
             vec![0xC3; 64].into_boxed_slice(),
         )
         .expect("inside MAX_SEALED_LEG_LEN");
@@ -3292,6 +3293,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own,
                 acceptance: Some(slot),
+                confirm: None,
                 attempt_at_window_start: anchor,
                 reroot_ratchet_gen: 0,
             },
@@ -3428,6 +3430,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: None,
                 acceptance: None,
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },
@@ -3464,7 +3467,7 @@ mod tests {
     #[test]
     fn the_floor_does_not_swallow_a_re_serve() {
         use crate::dm::resume::{AcceptanceSlot, ReEstState, Retention, SendFloor};
-        let slot = AcceptanceSlot::accept(5, Attempt::FIRST, vec![0xC3; 64].into_boxed_slice())
+        let slot = AcceptanceSlot::accept(5, Attempt::FIRST, 55, vec![0xC3; 64].into_boxed_slice())
             .expect("inside MAX_SEALED_LEG_LEN");
         let record = ResumeRecord::new(
             Box::new([0x11; ml_dsa::SK_LEN]),
@@ -3476,6 +3479,7 @@ mod tests {
                 last_seen_re_est: 0,
                 own: None,
                 acceptance: Some(slot),
+                confirm: None,
                 attempt_at_window_start: 0,
                 reroot_ratchet_gen: 0,
             },

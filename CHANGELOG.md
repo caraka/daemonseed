@@ -90,9 +90,63 @@ work lives in the maintainer's own planning notes, not here.
   re-root generation, and — where the outbox holds pending mail — seals a `RE-EST` under the
   committed re-establishment root, commits it to the resume record, and queues it on its own
   direction record under `OutboxTarget::ReEstablishmentLeg` with a first dispatch drawn from A5.5's
-  reconnect-cadence band. **Nothing dispatches a queued leg yet** — the emission loop skips that
-  target, so the entry waits with its re-seed ladder and its give-up clock untouched. A persisted attempt is re-emitted as the stored bytes at the sequence the
+  reconnect-cadence band. A persisted attempt is re-emitted as the stored bytes at the sequence the
   own slot records, never resealed (#404).
+- `daemonseed_veilid_net::dm` — the re-establishment exchange. A queued leg is published to this
+  side's direction record at `msg_addr(dir, seq)`, derived from the address root and the outbox's
+  stored direction rather than from a key schedule. A swept slot the ratchet cannot open, or that
+  arrives at a correspondence holding no key schedule, is trial-decrypted as the leg kinds the
+  resume record says this side expects: `RE-ACK` while an initiation stands, `RE-CONFIRM` while an
+  unconfirmed acceptance stands, `RE-EST` at one past the committed generation, and `RE-EST` under
+  the retained root at the generation an open exchange is at. An opened `RE-EST` is deduped, put to
+  the contest coin, admitted through `ReEstGate` under a per-session response-emission cap, answered
+  with a `RE-ACK` sealed under the root it opened under, committed, and then queued. An opened
+  `RE-ACK` at or above the current attempt completes: the record advances, the settling `RE-CONFIRM`
+  is sealed and queued, and the resumed ratchet opens one position past it. An opened `RE-CONFIRM`
+  settles the exchange this side answered, advancing the generation and retiring the superseded
+  root. A completion runs the dead-chain sweep and ends the legs the exchange finished with. A
+  correspondence with no key schedule sweeps its receiving pages, and an acceptor's knock position
+  is re-settled at load. Every tick runs one idempotent upkeep pass per established correspondence:
+  the retention ceiling, the initiating side's confirming observation, a re-queue of any stored leg
+  whose entry is absent, the retirement of a leg no slot names, and the give-up of a leg unanswered
+  for seven days. A fold that opened a leg and could not finish leaves the position unsettled and
+  writes nothing. **Ordinary mail after a re-establishment is NOT sealed** — a channel frame
+  binds this side's own `PK_pc`, which no record holds after a restart (#404).
+- `daemonseed_core::dm::paging` — `DmPageAddress::sending_on` and `DmPageAddress::receiving_on`,
+  taking an explicit `Direction` in place of a `Ratchet` (#404).
+- `daemonseed_core::dm::ratchet::Direction::opposite()` (#404).
+- `daemonseed_core::dm::resume` — `ResumeRecord::accept_peer_initiation(Rerooted, AcceptanceSlot,
+  bool, i64) -> Zeroizing<[u8; ROOT_KEY_LEN]>`, `ResumeRecord::confirm_acceptance(u32) -> bool`,
+  `ResumeRecord::take_own_slot() -> Option<OwnSlot>`, `ResumeRecord::set_window_anchor(u32)` and
+  `OwnSlot::into_eph_dk()` (#404).
+- `daemonseed_core::dm::outbox` — `Outbox::retire_leg(u64) -> bool` ends a leg the handshake
+  finished with (`ConfirmedCollected`); `Outbox::abandon_leg(u64) -> bool` ends one that will never
+  be opened — a conceded initiation or a leg past its give-up — as `Undelivered`. Both leave
+  `Surfacing::Clear` and refuse any entry that is not a pending leg (#404).
+- `daemonseed_core::dm::resume` — `ConfirmSlot`, the sealed `RE-CONFIRM` a completed exchange
+  persists, with `ResumeRecord::confirm_slot()` and `ResumeRecord::retire_confirm()`;
+  `AcceptanceSlot::accept` takes the outbox sequence its answer was addressed to and
+  `AcceptanceSlot::seq()` reads it; `ResumeRecord::commit_reestablished` takes the `ConfirmSlot`.
+  The at-rest v2 body gains the acceptance slot's `seq`, the confirm slot's generation and sequence,
+  and the sealed `RE-CONFIRM`, extended in place because no released build has written the layout
+  (#404).
+- `daemonseed_core::dm::resume::T_RETIRE_MS` — A3.5's retention ceiling at fourteen days, the
+  design's suggested value (#404).
+- `daemonseed_core::dm::persist::DmPersist::commit_resume` guards the confirm slot: a stored
+  settling leg is not dropped, re-sealed at one generation, or rolled back to an earlier one, except
+  by its confirming observation — which retires the retained root in the same write — or by a later
+  exchange. `ResumeError::ConfirmSlotDropped`, `ConfirmResealed` and `ConfirmSlotWouldRollBack`
+  (#404).
+- `daemonseed_core::dm::ratchet::ReconnectSide::Answered` — an `offered_generation` field carrying
+  A3.9's *sender picks, receiver adopts if above its own*; `Ratchet::reestablished` adopts it on the
+  answering side only (#404).
+- `daemonseed_core::trust_events::TrustEventKey` — `DmPeerStateRegressed`,
+  `DmReestablishmentFailed`, `DmReestablishmentUnconfirmed` and `DmReestablishmentBackoffEngaged`,
+  A3.8's loud re-establishment states, all `PersistentNonBlocking` (#404).
+- `daemonseed_veilid_net::dm::DmEvent::ReestablishmentAnomaly { with, event }` — one variant for
+  that family, named by its classed key; routed to the audit log by both front ends (#404).
+- `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` — `leg_folds_deferred` and
+  `leg_unaddressable` (#404).
 - `daemonseed_tui::net` / `daemonseed_gui::net` — the front-end DM contract. `NetCommand::Connect`
   carries `dm_session_keys: Option<DmSessionKeys>` (the full identity KEM keypair, the doorbell slot
   secret and the profile at-rest key); the net actor moves it into `DmDriverParts` and spawns a
@@ -616,6 +670,10 @@ work lives in the maintainer's own planning notes, not here.
   path-dependency, so a build needs only `../oxicrypt` checked out.
 
 ### Changed
+
+- `daemonseed_core::dm::resume` — `ResumeRecord::commit_reestablished` carries the dedup memory into
+  the new retention rather than emptying it: the root moving into retention is the one every
+  recorded frame was sealed under, so A5.3's retirement gate has not fired for them (#404).
 
 - `daemonseed_core::dm::persist::DmPersist::accept_first_contact` takes the acceptor's own
   per-correspondent signing key and writes the correspondence's resume record before its contact

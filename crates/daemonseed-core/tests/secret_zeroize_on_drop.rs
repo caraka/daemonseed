@@ -1285,6 +1285,7 @@ fn resume_record() -> ResumeRecord {
                 EphemeralDecapKey::new(Box::new([0x3d; DK_LEN])),
             )),
             acceptance: None,
+            confirm: None,
             attempt_at_window_start: 2,
             reroot_ratchet_gen: 0,
         },

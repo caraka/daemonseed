@@ -784,10 +784,13 @@ pub enum OutboxTarget {
     /// like an ordinary frame"* (A3.9) and rides *"at its own sequence
     /// position"* (A3.2), so [`OutboxEntry::position`] answers for it.
     ///
-    /// **Nothing publishes an entry with this target yet.** The re-establishment
-    /// slice queues one and stops there; deriving its page address needs the
-    /// resumed channel's own addressing, which is not built. An entry here is
-    /// committed state waiting for that, not a write in flight.
+    /// **Addressed without a key schedule**, which is the whole reason the
+    /// target exists as its own kind rather than as a channel entry. A party
+    /// publishing a leg has just come back from the restart that destroyed its
+    /// ratchet, so the ratchet-bound page derivation is unavailable to it;
+    /// [`DmPageAddress::sending_on`](crate::dm::paging::DmPageAddress::sending_on)
+    /// is what the driver uses, off the address root and the outbox's own stored
+    /// direction.
     ReEstablishmentLeg,
 }
 
@@ -2108,6 +2111,80 @@ impl Outbox {
         confirmed
     }
 
+    /// End a re-establishment leg the handshake has finished with.
+    ///
+    /// **A leg has no give-up and no user, so it needs its own ending.** Both
+    /// sweeps skip [`OutboxTarget::ReEstablishmentLeg`] — the dead-chain one
+    /// because a leg hangs off no ratchet chain, the seven-day one because a
+    /// give-up on a leg would report a delivery failure for a message the user
+    /// never sent — which leaves exactly one entry kind with no terminal edge at
+    /// all. What ends a leg is the exchange it belongs to completing, and this is
+    /// that edge.
+    ///
+    /// **[`Lifecycle::ConfirmedCollected`], and the state has to be earned.** A
+    /// leg whose exchange completed was demonstrably opened by the correspondent
+    /// — the completion is the proof — so this is the honest state rather than a
+    /// convenient one, and it is why the caller is the COMPLETION and nothing
+    /// else. A leg nobody opened is [`Self::abandon_leg`]'s, not this one's:
+    /// reporting a conceded or given-up leg as collected would put a claim on
+    /// the record that no observation supports.
+    ///
+    /// [`Surfacing`] stays [`Surfacing::Clear`] because the user has nothing to
+    /// be told: this is a protocol frame at a sequence they never composed
+    /// anything at, and owing a surfacing for it would put a delivery report in
+    /// front of them for a message that does not exist. That is the same
+    /// argument [`Self::sweep_give_ups`] makes for skipping legs, applied to the
+    /// other end of the entry's life.
+    ///
+    /// `false`, and nothing changed, for a sequence that holds no entry, holds
+    /// one of another target, or holds a leg that is already terminal — so a
+    /// caller that cannot tell whether it has already retired one may call it
+    /// either way.
+    pub fn retire_leg(&mut self, seq: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(&seq) else {
+            return false;
+        };
+        if !matches!(entry.target, OutboxTarget::ReEstablishmentLeg)
+            || !entry.lifecycle.is_pending()
+        {
+            return false;
+        }
+        entry.lifecycle = Lifecycle::ConfirmedCollected;
+        true
+    }
+
+    /// End a re-establishment leg that will never be opened.
+    ///
+    /// **The other terminal edge, and it is a different fact from
+    /// [`Self::retire_leg`]'s.** Two states reach it: an initiation the contest
+    /// coin conceded (A3.7's loser abandons its own handshake), and a leg that
+    /// went unanswered to its give-up (A3.8's *re-establishment failed*).
+    /// Neither was collected, and neither is knowably uncollected either — what
+    /// is known is that this side has stopped waiting. [`Lifecycle::Undelivered`]
+    /// is that, and `ConfirmedCollected` would be a claim about the peer that no
+    /// observation supports.
+    ///
+    /// [`Surfacing`] stays [`Surfacing::Clear`] for the reason
+    /// [`Self::retire_leg`] gives: the user composed nothing at this sequence,
+    /// so there is no delivery to report. What the user IS owed for a failed
+    /// re-establishment is A3.8's own classed event, which is a different
+    /// surface with a different remedy.
+    ///
+    /// `false`, and nothing changed, for an absent sequence, another target, or
+    /// a leg that is already terminal.
+    pub fn abandon_leg(&mut self, seq: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(&seq) else {
+            return false;
+        };
+        if !matches!(entry.target, OutboxTarget::ReEstablishmentLeg)
+            || !entry.lifecycle.is_pending()
+        {
+            return false;
+        }
+        entry.lifecycle = Lifecycle::Undelivered;
+        true
+    }
+
     /// Sequences whose ending has not been recorded as shown to the user, in
     /// sequence order.
     ///
@@ -2733,6 +2810,90 @@ mod tests {
     use super::*;
 
     const T0: i64 = 1_700_000_000_000;
+
+    /// **Both leg-terminal edges refuse everything that is not a pending leg**,
+    /// and neither touches the entry it refuses.
+    ///
+    /// Three refusals each, because each is a different way a caller could reach
+    /// for the wrong entry: a channel page (a user's message, which has its own
+    /// give-up and its own surfacing), a leg that is already terminal (a second
+    /// call would restate a verdict), and a sequence that holds nothing.
+    #[test]
+    fn ending_a_leg_refuses_every_entry_that_is_not_a_pending_leg() {
+        let mut outbox = Outbox::new(Direction::AToB);
+        outbox
+            .enqueue_sealed(
+                0,
+                OutboxTarget::ChannelPage,
+                T0,
+                SealedFrame::new(vec![1u8; 8]),
+                3,
+            )
+            .expect("room");
+        outbox
+            .enqueue_sealed(
+                1,
+                OutboxTarget::ReEstablishmentLeg,
+                T0,
+                SealedFrame::new(vec![2u8; 8]),
+                0,
+            )
+            .expect("room");
+        outbox
+            .enqueue_sealed(
+                2,
+                OutboxTarget::ReEstablishmentLeg,
+                T0,
+                SealedFrame::new(vec![3u8; 8]),
+                0,
+            )
+            .expect("room");
+
+        for (name, seq) in [("a channel page", 0u64), ("an absent sequence", 99)] {
+            assert!(!outbox.retire_leg(seq), "retire_leg took {name}");
+            assert!(!outbox.abandon_leg(seq), "abandon_leg took {name}");
+        }
+        assert_eq!(
+            outbox.entry(0).expect("still there").delivery_state(),
+            DeliveryState::Composed,
+            "a refused call moved the channel entry anyway"
+        );
+
+        // Positive controls: each edge takes its own pending leg, once.
+        assert!(outbox.retire_leg(1), "retire_leg refused a pending leg");
+        assert_eq!(
+            outbox.entry(1).expect("still there").delivery_state(),
+            DeliveryState::ConfirmedCollected
+        );
+        assert_eq!(
+            outbox.entry(1).expect("still there").surfacing(),
+            Surfacing::Clear,
+            "a retired leg owes the user a delivery report for a message they never sent"
+        );
+        assert!(!outbox.retire_leg(1), "a terminal leg was retired twice");
+        assert!(
+            !outbox.abandon_leg(1),
+            "a terminal leg was abandoned after retirement"
+        );
+
+        assert!(outbox.abandon_leg(2), "abandon_leg refused a pending leg");
+        assert_eq!(
+            outbox.entry(2).expect("still there").delivery_state(),
+            DeliveryState::Undelivered,
+            "an abandoned leg was reported collected, which no observation supports"
+        );
+        assert_eq!(
+            outbox.entry(2).expect("still there").surfacing(),
+            Surfacing::Clear,
+            "an abandoned leg owes the user a delivery report"
+        );
+        assert!(!outbox.abandon_leg(2), "a terminal leg was abandoned twice");
+        assert!(
+            outbox.owed_surfacings().is_empty(),
+            "ending two legs put a delivery report in front of the user: {:?}",
+            outbox.owed_surfacings()
+        );
+    }
 
     /// Byte-distinct so a comparison that sliced or transposed would not pass by
     /// coincidence, and long enough that a single flipped byte is not the only

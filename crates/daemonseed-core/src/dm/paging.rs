@@ -542,6 +542,34 @@ impl DmPageAddress<Sending> {
     ) -> Result<Self, DmPageError> {
         Self::derive(address_root, ratchet, at.page(), at)
     }
+
+    /// The address of one page of the stream `direction` **sends** on, for a
+    /// correspondence that holds no key schedule.
+    ///
+    /// A re-establishment leg is *"shaped exactly like an ordinary frame"* and
+    /// rides *"at its own sequence position"*
+    /// (`docs/design/direct-messaging.md:887`, `:917`), so it is addressed by the
+    /// same `msg_addr(dir, seq)` an ordinary frame uses — and a party writing one
+    /// has just come back from a restart, which is precisely the state in which
+    /// no [`Ratchet`] exists. [`Self::sending`] cannot serve it: the role-to-
+    /// direction mapping it reads lives on the key schedule the restart destroyed.
+    ///
+    /// `direction` is the direction this party sends on, which the outbox stores
+    /// per correspondence ([`Outbox::direction`](crate::dm::outbox::Outbox::direction)).
+    ///
+    /// **The conversation check [`Self::sending`] performs has no subject here.**
+    /// That check refuses a root and a ratchet naming different conversations;
+    /// with no ratchet there is no second opinion to disagree with, so the
+    /// fingerprint is derived from the root alone and kept for the caller to tag
+    /// results with. What replaces the check is that the direction comes from the
+    /// same correspondence's own record as the root.
+    pub fn sending_on(
+        address_root: &[u8; ADDRESS_ROOT_LEN],
+        direction: Direction,
+        at: PagePosition,
+    ) -> Result<Self, DmPageError> {
+        Self::derive_on(address_root, direction, at.page(), at)
+    }
 }
 
 impl DmPageAddress<Sending> {
@@ -570,22 +598,38 @@ impl DmPageAddress<Receiving> {
     ) -> Result<Self, DmPageError> {
         Self::derive(address_root, ratchet, page, ())
     }
+
+    /// The address of one page of the stream `direction` **carries toward this
+    /// party**, for a correspondence that holds no key schedule.
+    ///
+    /// The receiving counterpart of [`DmPageAddress::sending_on`], and it exists
+    /// for the same state: a party whose channel a restart tore down still has to
+    /// read the plane its correspondent writes, because that is where the
+    /// re-establishment legs arrive. `direction` is the direction the peer sends
+    /// on — the opposite of the one this party's outbox is keyed to.
+    pub fn receiving_on(
+        address_root: &[u8; ADDRESS_ROOT_LEN],
+        direction: Direction,
+        page: u64,
+    ) -> Result<Self, DmPageError> {
+        Self::derive_on(address_root, direction, page, ())
+    }
 }
 
 impl<D: PageDirection> DmPageAddress<D> {
-    /// The shared body of both constructors — one derivation, so the two named
-    /// entry points differ in nothing but which of the ratchet's directions they
-    /// ask for.
+    /// The ratchet-bound constructors' shared body: the conversation check, then
+    /// [`Self::derive_on`].
     fn derive(
         address_root: &[u8; ADDRESS_ROOT_LEN],
         ratchet: &Ratchet,
         page: u64,
         placement: D::Placement,
     ) -> Result<Self, DmPageError> {
-        // Refused BEFORE the derivation, so an address never names a page that
-        // holds no position: it is what lets a sweep of this address treat a
-        // `PagePosition::new` failure as the record shape's fault alone
-        // (ISC-C100) rather than as an ambiguity between shape and page.
+        // Refused BEFORE the conversation check as well as inside the derivation,
+        // so a page above the bound reports the bound rather than whichever of the
+        // two arguments the caller mispaired. It is what lets a sweep of this
+        // address treat a `PagePosition::new` failure as the record shape's fault
+        // alone (ISC-C100) rather than as an ambiguity between shape and page.
         if page > MAX_PAGE {
             return Err(DmPageError::PageBeyondSequenceSpace { page });
         }
@@ -602,16 +646,36 @@ impl<D: PageDirection> DmPageAddress<D> {
         if &offered != ratchet.ar_fingerprint() {
             return Err(DmPageError::ConversationMismatch);
         }
-        let direction = D::of(ratchet);
+        Self::derive_on(address_root, D::of(ratchet), page, placement)
+    }
+
+    /// The derivation itself, with the direction supplied rather than read off a
+    /// ratchet.
+    ///
+    /// [`Self::derive`] is this call plus the conversation check, which is the
+    /// only thing a ratchet contributes: every other input is the root, the
+    /// direction and the page. Splitting them is what lets a correspondence with
+    /// no key schedule address the plane its legs travel on without a second
+    /// copy of the derivation to drift against.
+    fn derive_on(
+        address_root: &[u8; ADDRESS_ROOT_LEN],
+        direction: Direction,
+        page: u64,
+        placement: D::Placement,
+    ) -> Result<Self, DmPageError> {
+        if page > MAX_PAGE {
+            return Err(DmPageError::PageBeyondSequenceSpace { page });
+        }
         Ok(Self {
             owner_seed: derive_owner_seed(address_root, direction, page)?,
             page,
             direction,
-            // The fingerprint just checked, kept rather than dropped (#270). One
-            // derivation feeds both the refusal above and the tag a sweep hands
-            // back, so the tag on a result cannot disagree with the check that
-            // let the address exist.
-            conversation: offered,
+            // The fingerprint the caller tags results with (#270). One derivation
+            // feeds both the refusal in `derive` and the tag a sweep hands back,
+            // so the tag on a result cannot disagree with the check that let the
+            // address exist.
+            conversation: crate::dm::firstcontact::ar_fingerprint(address_root)
+                .map_err(DmPageError::Module)?,
             placement,
             stream: PhantomData,
         })
@@ -741,6 +805,75 @@ mod tests {
     // implementation, so they guard against DRIFT. They cannot tell us the
     // derivation was right to begin with — only the design doc and review do
     // that.
+
+    /// **The direction-explicit constructors derive the same record as the
+    /// ratchet-bound ones**, and the fingerprint they carry is the same value.
+    ///
+    /// That equality is what makes them usable at all: a party with no key
+    /// schedule addresses the plane its correspondent is already writing to, so
+    /// a derivation that differed by a byte would send its re-establishment legs
+    /// to a record nobody reads. The ratchet-bound call is the reference because
+    /// it is the one every established conversation already uses.
+    #[test]
+    fn a_direction_explicit_address_is_the_ratchet_bound_one() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let root = ar(0x41);
+        for page in [0u64, 1, 4096] {
+            for dir in [Direction::AToB, Direction::BToA] {
+                let at = PagePosition::new(page, 0).expect("inside MAX_PAGE");
+                let sending = DmPageAddress::<Sending>::sending_on(&root, dir, at)
+                    .expect("a real page addresses");
+                let receiving = DmPageAddress::<Receiving>::receiving_on(&root, dir, page)
+                    .expect("a real page addresses");
+                let expected = derive_owner_seed(&root, dir, page).expect("derives");
+                assert_eq!(
+                    sending.with_owner_seed(|b| *b),
+                    *expected.as_bytes(),
+                    "sending_on derived a different record"
+                );
+                assert_eq!(
+                    receiving.with_owner_seed(|b| *b),
+                    *expected.as_bytes(),
+                    "receiving_on derived a different record"
+                );
+                assert_eq!(sending.direction(), dir);
+                assert_eq!(sending.at(), at);
+                assert_eq!(receiving.page(), page);
+                assert_eq!(
+                    sending.conversation(),
+                    receiving.conversation(),
+                    "the two halves disagree about which conversation they address"
+                );
+                assert_eq!(
+                    sending.conversation(),
+                    &crate::dm::firstcontact::ar_fingerprint(&root).expect("fingerprints"),
+                    "the tag is not the address root's own fingerprint"
+                );
+            }
+        }
+    }
+
+    /// **`receiving_on` refuses a page above `MAX_PAGE`**, which no position can
+    /// live on — the same refusal `receiving` gives, and the one bound
+    /// `sending_on` cannot be handed because `PagePosition::new` enforces it a
+    /// type earlier.
+    #[test]
+    fn a_direction_explicit_receiving_address_refuses_a_page_past_the_bound() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let page = MAX_PAGE + 1;
+        assert_eq!(
+            DmPageAddress::<Receiving>::receiving_on(&ar(0x41), Direction::AToB, page).err(),
+            Some(DmPageError::PageBeyondSequenceSpace { page })
+        );
+        assert!(
+            PagePosition::new(page, 0).is_none(),
+            "the earlier bound moved"
+        );
+        // Positive control: the highest page a position can live on addresses.
+        assert!(
+            DmPageAddress::<Receiving>::receiving_on(&ar(0x41), Direction::AToB, MAX_PAGE).is_ok()
+        );
+    }
 
     #[test]
     fn page_addresses_are_pinned() {

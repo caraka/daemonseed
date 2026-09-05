@@ -328,8 +328,13 @@ types:
       frame emits DmEvent::Message and advances the persisted receive cursor when
       the contiguous prefix moved, bounded by the pages this session has swept. A
       correspondence found on disk at startup is listed with no ratchet — a
-      ratchet has no at-rest record — so it sweeps nothing and a Send to it is
-      refused with NotEstablishedThisSession. On the first tick after a load, an
+      ratchet has no at-rest record — and a Send to it is refused with
+      NotEstablishedThisSession, which a completed re-establishment does not
+      lift: a channel frame binds this side's own PK_pc, and no record holds it
+      after a restart. Such a correspondence DOES sweep its receiving pages,
+      addressed by DmPageAddress::receiving_on off the stored address root and
+      the opposite of the outbox's stored direction, because that plane is where
+      a re-establishment leg arrives. On the first tick after a load, an
       established correspondence runs one re-establishment pass: the dead-chain
       sweep against its resume record's reroot_ratchet_gen, ending every entry
       sealed below it and leaving each owing the surfacing the same tick then
@@ -338,9 +343,9 @@ types:
       re-establishment root at the outbox's next sequence, committed to the resume
       record and only then queued on this side's direction record as an
       OutboxTarget::ReEstablishmentLeg with its first dispatch drawn from A5.5's
-      reconnect-cadence band. Nothing dispatches a queued leg: the emission loop
-      skips that target before OutboxEntry::emit, so the entry's ladder does not
-      advance and its give-up does not run down. Pending mail means an UNSEALED entry
+      reconnect-cadence band. A queued leg is published to this side's direction
+      record at DmPageAddress::sending_on(AR, direction, position_of(seq)) — the
+      stored bytes, never resealed — on the ordinary ladder. Pending mail means an UNSEALED entry
       (Lifecycle::AwaitingKey): a sealed one re-seeds on its own ladder and needs
       no handshake. A resume record already carrying an attempt is re-emitted as
       its stored bytes at the sequence its own slot records, queued only if the
@@ -355,7 +360,24 @@ types:
       correspondence, a stored attempt whose sequence has been spent, and a
       re-initiation window with no attempts left. A resume record that will not
       read is DmProvisionalRecordUnreadable, emitted once per session while the
-      pass keeps retrying. The same cadence carries the
+      pass keeps retrying. A swept slot that is not an openable channel frame,
+      and every slot of a correspondence holding no key schedule, is
+      trial-decrypted as the leg kinds the resume record says this side expects:
+      RE-ACK while an own slot stands, RE-CONFIRM while an unconfirmed acceptance
+      stands, RE-EST at one past the committed generation, and RE-EST under the
+      retained root at the generation an open exchange is at. An opened RE-EST is
+      recorded in the dedup memory, put to contest_outcome, admitted through
+      ReEstGate under a per-session response-emission cap, answered with a RE-ACK
+      sealed under the root it opened under, committed, and then queued; a repeat
+      changes nothing. An opened RE-ACK at or above the current attempt completes
+      the exchange, seals and queues the settling RE-CONFIRM, and opens the
+      resumed ratchet one position past it. An opened RE-CONFIRM settles the
+      exchange this side answered, advancing the generation and retiring the
+      superseded root. Either completion runs the dead-chain sweep and retires
+      every finished leg. An RE-EST opened under the retained root at an already
+      committed generation is deduped and reported once per session as
+      DmEvent::ReestablishmentAnomaly carrying
+      TrustEventKey::DmPeerStateRegressed. The same cadence carries the
       acknowledgement plane. As a receiver the driver holds one
       daemonseed_core::dm::ack_cadence::StandaloneAckCadence per correspondence,
       keyed on the sent_unix_ms each collected frame asserted CLAMPED to the
@@ -472,7 +494,8 @@ types:
       What the driver tells a frontend — ContactRequest{request,from,body,sent_unix_ms},
       Message{from,seq,body,sent_unix_ms}, Delivery{to,seq,state},
       Refused{to,acceptance,reason,event}, AcceptFailed{request,from,reason},
-      ChannelLost{with,cause,event,surfaced}, ChannelDirectionUnknown{with},
+      ChannelLost{with,cause,event,surfaced}, ReestablishmentAnomaly{with,event},
+      ChannelDirectionUnknown{with},
       DoorbellHealth{outcome,admission,pending_full},
       ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified,cursor_records_repaired},
       ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
@@ -493,13 +516,23 @@ types:
       the highest sequence this side has sent, and peer_acks_unverified counts
       fetched records that did not decode or did not verify.
       cursor_records_repaired counts receive-cursor records found unreadable and
-      replaced with this session's own page. Refused covers a channel send as well as
+      replaced with this session's own page. leg_folds_deferred counts
+      re-establishment legs that opened and whose fold could not finish, whose
+      positions are left unsettled for the peer's own re-seed to bring back, and
+      leg_unaddressable counts queued legs whose record address would not derive
+      and which were therefore not emitted and did not spend a rung. Refused covers a channel send as well as
 
       a first contact, and Refused
       carries a RefusalReason plus event, an
       Option<daemonseed_core::trust_events::TrustEventKey>: Some where the refusal
       is a teardown, from Teardown::event, and None where it ends no channel.
-      AcceptFailed carries an AcceptFailure; ChannelLost
+      AcceptFailed carries an AcceptFailure; ReestablishmentAnomaly is one
+      variant for A3.8's loud re-establishment states, named by its classed key —
+      DmPeerStateRegressed, DmReestablishmentFailed,
+      DmReestablishmentUnconfirmed or DmReestablishmentBackoffEngaged. Each fires
+      once per session per correspondence, nothing is asked of the user, and both
+      front ends route it to the audit log exactly as they route a teardown.
+      ChannelLost
       carries the surfaced sequence numbers the user is owed and the
       TrustEventKey the teardown is classed under
       (Teardown::event, ISC-C28). A front end writes either key to its audit log; DoorbellHealth

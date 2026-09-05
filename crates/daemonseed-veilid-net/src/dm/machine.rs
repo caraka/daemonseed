@@ -59,9 +59,14 @@ use daemonseed_core::dm::persist::{
 };
 use daemonseed_core::dm::pow;
 use daemonseed_core::dm::provisional::{RecordContext, TeardownCause};
-use daemonseed_core::dm::ratchet::{Direction, Ratchet, RatchetError, FIRST_RECIPIENT_CHANNEL_SEQ};
-use daemonseed_core::dm::reest::{self, AttemptBudget};
-use daemonseed_core::dm::resume::{ReEstState, ResumeRecord, Retention, SealedReEst, SendFloor};
+use daemonseed_core::dm::ratchet::{
+    Direction, Ratchet, RatchetError, ReconnectSide, Role, FIRST_RECIPIENT_CHANNEL_SEQ,
+};
+use daemonseed_core::dm::reest::{self, AttemptBudget, ContestOutcome, ReEstAdmission, ReEstGate};
+use daemonseed_core::dm::resume::{
+    AcceptanceSlot, Attempt, CommittedRoot, ConfirmSlot, DedupKey, Leg, Novelty, OwnSlot,
+    ReEstState, Rerooted, ResumeRecord, Retention, SealedReEst, SendFloor, T_RETIRE_MS,
+};
 use daemonseed_core::dm::token::SpentTokenSet;
 use daemonseed_core::identity::keys::{SignKeypair, IDENTITY_PK_LEN, ML_DSA_SEED_LEN};
 use daemonseed_core::storage::dm_store::CorrespondenceLabel;
@@ -680,19 +685,22 @@ struct Introduction {
 
 /// One correspondence this session holds, and what it needs to speak on it.
 ///
-/// **This state does not survive a restart, and that is a real gap rather than
-/// an oversight.** The design homes our own `S_pc` and the correspondent's
-/// `PK_pc` in the resume record (A4.8 / A9.2), and the store writes one at
-/// first establishment —
-/// [`PendingHandshake::establish_with_resume`](daemonseed_core::dm::persist::PendingHandshake::establish_with_resume)
-/// commits the pair and then erases the provisional record. This driver does
-/// not call it: it establishes through
-/// [`PendingHandshake::commit`](daemonseed_core::dm::persist::PendingHandshake::commit)
-/// and builds no [`ResumeRecord`](daemonseed_core::dm::resume::ResumeRecord),
-/// so a correspondence established in this process can be signed and verified
-/// for as long as this process lives, and a restart loses the pseudonym pair —
-/// the correspondence is on disk, and nothing can speak on it. Closing it is a
-/// wiring change in this driver.
+/// **What survives a restart and what does not, because the split decides what
+/// a recovered correspondence can do.** The resume record carries this side's
+/// `S_pc` and the correspondent's `PK_pc`, so a correspondence read back from
+/// disk can sign and verify every re-establishment leg, and the address root
+/// comes back with it — which is what makes the whole exchange reachable. The
+/// key schedule and the channel identifier do not survive and are not meant to:
+/// a completed re-establishment mints both again.
+///
+/// **The one thing that does not come back is this side's own pseudonym
+/// KEYPAIR.** [`SignKeypair`] holds a secret half and a public half, and only
+/// the secret half is at rest — the record enumerates `S_pc` and the *peer's*
+/// `PK_pc`, and ML-DSA offers no way to recover a public key from a private
+/// one. Legs are unaffected, because a leg's signature preimage binds no public
+/// key. An ordinary channel frame binds this side's own `PK_pc`
+/// ([`frame::seal`]), so composing one after a restart is not reachable; see
+/// [`DmMachine::send`], which refuses it.
 struct Correspondence {
     /// The correspondent's long-term identity key.
     pk_lt: PkLt,
@@ -736,13 +744,73 @@ struct Correspondence {
     /// at-rest home is the resume record (A4.8 / A9.2), this driver writes
     /// none, and a restart loses it.
     peer_pk_pc: Option<Box<[u8; IDENTITY_PK_LEN]>>,
-    /// The conversation's address root and channel id, derived from `ss0`.
+    /// The conversation's channel id, derived from `ss0` at establishment or
+    /// from the re-rooted secret at a re-establishment.
     ///
     /// `None` alongside a `None` ratchet on an established correspondence,
     /// because nothing at rest carries `ss0` once the handshake is over. Before
     /// the acceptance the provisional record still holds it, so both are
-    /// recomputed — see [`DmMachine::rearm_handshake`].
+    /// recomputed — see [`DmMachine::rearm_handshake`]; after a completed
+    /// re-establishment the identifier is the one
+    /// [`ResumeRecord::commit_reestablished`] returns.
     channel: Option<ChannelRoots>,
+    /// The conversation's address root — every page and acknowledgement record
+    /// this correspondence will ever use hangs off it.
+    ///
+    /// **Known for the life of the correspondence, unlike everything else that
+    /// addresses it.** `AR` is written into the contact record at establishment
+    /// and read back at every load, and a re-establishment does not re-root it
+    /// (`docs/design/direct-messaging.md:1481`). So a correspondence whose key
+    /// schedule a restart destroyed can still address the plane its
+    /// re-establishment legs travel on, which is what makes recovery reachable
+    /// at all.
+    address_root: [u8; ADDRESS_ROOT_LEN],
+    /// The candidate this side committed when it answered a peer's `RE-EST`,
+    /// held until the `RE-CONFIRM` settles it.
+    ///
+    /// **In memory, and only in memory.** The record at rest carries the
+    /// candidate root itself; what this holds is the pair the resumed channel is
+    /// opened on — the ratchet root and the channel identifier — and A5.4 keeps
+    /// both out of every at-rest encoding. A restart inside the window between
+    /// answering and confirming therefore loses the resumed channel's
+    /// identifier: the record still settles correctly and the generation still
+    /// advances, and the channel comes back addressable but not speakable until
+    /// the next re-establishment.
+    candidate: Option<Rerooted>,
+    /// How many `RE-ACK`s this session has composed for this correspondence.
+    ///
+    /// A8.4's answer-side emission cap, counted here because the design bounds
+    /// the *response* rate and nothing else: see [`RESPONSE_EMISSION_CAP`] for
+    /// what this is and what it is not.
+    re_acks_answered: u32,
+    /// Whether this session has already said the retention ceiling fired with
+    /// no confirming observation.
+    ///
+    /// The ceiling is a wall clock, so the condition stays true for ever once it
+    /// is met; one event per session names it without repeating on every tick.
+    retire_ceiling_surfaced: bool,
+    /// Whether this session has already said a re-establishment leg reached its
+    /// give-up unanswered.
+    ///
+    /// A3.13 forbids a terminal state, so the correspondence goes on opening
+    /// fresh attempts and each may reach its own give-up; one event per session
+    /// names the condition rather than each occurrence.
+    leg_give_up_surfaced: bool,
+    /// Whether this session has already said it will answer no more
+    /// re-establishments for this correspondence.
+    ///
+    /// A8.4's cap refuses without accepting anything, so a correspondent that
+    /// keeps trying keeps being refused; one event per session names the state
+    /// without turning a bounded refusal into a per-frame stream.
+    response_cap_surfaced: bool,
+    /// Whether this session has already surfaced that the correspondent is
+    /// re-presenting an exchange this side has settled.
+    ///
+    /// A3.8 has every anomaly loud and A3.13 forbids a terminal state, so the
+    /// peer keeps re-emitting and this side keeps deduping; one event per
+    /// session names the condition without turning a bounded recovery into a
+    /// per-sweep stream.
+    peer_regression_surfaced: bool,
     /// What has been collected on the receiving direction.
     collection: Collection,
     /// The highest page this session has actually swept — the corroboration
@@ -925,11 +993,18 @@ struct Correspondence {
 /// it across ticks.
 type ProvisionalContext = [u8; DM_KEYREC_OWNER_SEED_LEN];
 
-/// The conversation's two derived roots, held together because they are derived
-/// together and are meaningless apart.
+/// The identifier a live channel's frames bind.
+///
+/// **The address root is NOT here**, and its absence is what keeps one answer to
+/// one question. A conversation's address plane outlives its key schedule: `AR`
+/// is written into the contact record at establishment and re-read at every
+/// load, while `chan_id` is session-lifetime state a restart destroys and only a
+/// completed re-establishment re-mints. Holding both in one struct meant a
+/// restarted correspondence had neither, so the plane it must read to recover
+/// was unaddressable — and a copy kept beside the durable one would be a second
+/// answer free to disagree with it. The root lives on
+/// [`Correspondence::address_root`], for the life of the correspondence.
 struct ChannelRoots {
-    /// The address root every page and acknowledgement record hangs off.
-    address_root: [u8; ADDRESS_ROOT_LEN],
     /// The channel id every frame's seal and signature bind. Never serialized
     /// (§ v4 minor invariant).
     chan_id: [u8; ROOT_LEN],
@@ -947,6 +1022,8 @@ struct ChannelCounters {
     peer_acks_clipped: u64,
     peer_acks_unverified: u64,
     cursor_records_repaired: u64,
+    leg_folds_deferred: u64,
+    leg_unaddressable: u64,
 }
 
 impl core::fmt::Debug for Correspondence {
@@ -977,23 +1054,19 @@ impl Correspondence {
         }
     }
 
-    /// What it takes to READ this correspondence's pages: the ratchet and the
-    /// channel roots, without this side's own pseudonym keypair.
+    /// The conversation every record of this correspondence is tagged with.
     ///
-    /// **Sending needs a signing key and receiving does not**, and the two come
-    /// apart for one party in one window. An initiator whose process ended
-    /// before its entry was accepted has lost the pseudonym keypair it signed
-    /// that entry with — the key is minted from the CSPRNG and its at-rest
-    /// home, the resume record, does not exist until establishment — while the
-    /// ratchet and the roots are recomputable from the stored handshake. Such a
-    /// correspondence can still open the acceptance it is waiting for, which is
-    /// what its queued opening message depends on, so a page sweep asks this
-    /// rather than [`Self::live`].
-    fn receiving(&self) -> Option<(&Ratchet, &ChannelRoots)> {
-        match (&self.ratchet, &self.channel) {
-            (Some(r), Some(ch)) => Some((r, ch)),
-            _ => None,
-        }
+    /// **Derived from the address root, never read off the ratchet**, so one
+    /// correspondence has one answer whether or not a key schedule exists. The
+    /// two are the same value — a ratchet carries a fingerprint of the `AR` it
+    /// was opened on — but only this one survives a restart, and a tag that
+    /// changed shape with the key schedule would route a re-establishment leg's
+    /// outcome to no correspondence at all.
+    ///
+    /// `None` only where the hash itself fails, which is a module fault rather
+    /// than a state.
+    fn conversation(&self) -> Option<[u8; AR_FINGERPRINT_LEN]> {
+        firstcontact::ar_fingerprint(&self.address_root).ok()
     }
 
     /// Record that a frame asserting `sent_unix_ms` was collected at `now_ms`.
@@ -1054,6 +1127,8 @@ impl Correspondence {
             peer_acks_clipped: self.health.peer_acks_clipped,
             peer_acks_unverified: self.health.peer_acks_unverified,
             cursor_records_repaired: self.health.cursor_records_repaired,
+            leg_folds_deferred: self.health.leg_folds_deferred,
+            leg_unaddressable: self.health.leg_unaddressable,
         }))
     }
 }
@@ -1258,6 +1333,15 @@ pub(crate) struct DmMachine {
     /// correspondence carries a fingerprint this set has never seen. A collision
     /// would need two conversations to share a first-contact secret.
     torn_down: std::collections::BTreeSet<[u8; AR_FINGERPRINT_LEN]>,
+    /// How many leg-scan candidates every swept slot has cost, cumulative.
+    ///
+    /// **The instrument for A3.9's bounded-trial-cost claim.** Each candidate
+    /// costs at most `MAX_GAP + 1` AEAD opens, so this number times that one is
+    /// the whole trial-decryption cost a correspondent can drive by writing
+    /// bytes that are not legs. It is counted rather than reasoned about because
+    /// the bound is what makes the scan safe to run on unauthenticated input,
+    /// and a candidate added later would raise it silently.
+    leg_scan_candidates: u64,
 }
 
 impl DmMachine {
@@ -1302,6 +1386,7 @@ impl DmMachine {
             open_recv_pages: std::collections::BTreeSet::new(),
             open_send_pages: std::collections::BTreeSet::new(),
             torn_down: std::collections::BTreeSet::new(),
+            leg_scan_candidates: 0,
         }
     }
 
@@ -1382,6 +1467,10 @@ impl DmMachine {
                 // Before the give-up sweep, which is what surfaces whatever the
                 // dead-chain sweep inside this call just ended.
                 out.extend(self.resume_channel(now_ms, index));
+                // After the load pass, because that is what writes the record
+                // this one keeps up, and before the emission scan, because a leg
+                // it re-queues is due on the same tick.
+                out.extend(self.reest_upkeep(now_ms, index));
                 out.extend(self.repair_cursor(index));
                 out.extend(self.give_ups(now_ms, index));
                 out.extend(self.due_emissions(now_ms, index));
@@ -1642,7 +1731,6 @@ impl DmMachine {
                 }
             };
             correspondence.channel = Some(ChannelRoots {
-                address_root: roots.ar,
                 chan_id: roots.chan_id,
             });
             correspondence.ratchet = Some(ratchet);
@@ -2319,10 +2407,17 @@ impl DmMachine {
     /// after this in the same tick — is what reads that obligation and tells the
     /// front end.
     ///
-    /// **The leg this queues is not dispatched.** Its page address needs the
-    /// resumed channel's own addressing, which a later slice builds, so
-    /// [`Self::due_emissions`] skips the target and the entry waits with its
-    /// ladder and its give-up clock untouched.
+    /// **What happens to the leg this queues.** It is published by
+    /// [`Self::due_emissions`] like any other entry, addressed by
+    /// `msg_addr(dir, seq)` off the address root and the outbox's stored
+    /// direction rather than off a key schedule the restart destroyed, and it
+    /// re-seeds on the ordinary ladder from a first dispatch drawn out of A5.5's
+    /// reconnect-cadence band. Its give-up clock runs from the enqueue like
+    /// every other entry's: what a leg is exempt from is the give-up *sweep*,
+    /// which reports a message that failed to arrive, and
+    /// [`Self::reest_upkeep`] is what ends it instead — through
+    /// [`Outbox::abandon_leg`], with A3.8's *re-establishment failed* rather
+    /// than a delivery report at a sequence the user composed nothing at.
     fn resume_channel(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
         if !self.correspondences[index].resume_owed {
             return Vec::new();
@@ -2381,6 +2476,27 @@ impl DmMachine {
                 return self.resume_fault(now_ms, index);
             }
         };
+        // **The acceptor's knock position is re-settled here, and it has to be
+        // somewhere.** `collection_accepting_a_knock` settles sequence zero of
+        // the receiving plane at the moment a knock is accepted, because the
+        // knock arrived by doorbell and no page will ever hold it — and a
+        // collection rebuilt from a stored cursor loses that, so the contiguous
+        // prefix would never start and every acknowledgement this side writes
+        // would carry a permanent hole under it. It was unreachable while a
+        // resumed correspondence swept nothing; it is reachable now.
+        //
+        // The acceptor is the side whose outbox sends `b2a`; the initiator's own
+        // sequence zero is the acceptance, which is a real page frame and must
+        // stay unsettled until it opens. Idempotent, so the retry a store fault
+        // earns costs nothing.
+        if direction == Direction::BToA {
+            if let Err(e) = self.correspondences[index]
+                .collection
+                .collected(position_of(KNOCK_CHANNEL_SEQ))
+            {
+                crate::vtrace!("dm driver: the knock's own position would not re-settle: {e}");
+            }
+        }
         let held = record
             .own_slot()
             .map(|slot| (slot.seq(), slot.sealed().bytes().to_vec()));
@@ -2489,8 +2605,15 @@ impl DmMachine {
                 return cannot_resume(&self.correspondences[index], owed);
             }
             (Some(LegState::Missing), Some((seq, bytes))) => {
-                if let Err(e) = enqueue_leg(&self.persist, &label, direction, now_ms, seq, &bytes) {
-                    crate::vtrace!("dm driver: the stored leg would not re-queue: {e}");
+                if !requeue_leg(
+                    &self.persist,
+                    &label,
+                    direction,
+                    now_ms,
+                    seq,
+                    &bytes,
+                    LegDispatch::ReconnectBand,
+                ) {
                     return self.resume_fault(now_ms, index);
                 }
                 self.correspondences[index].resume_owed = false;
@@ -2591,16 +2714,227 @@ impl DmMachine {
             crate::vtrace!("dm driver: the opened attempt would not commit: {e}");
             return self.resume_fault(now_ms, index);
         }
-        if let Err(e) = enqueue_leg(&self.persist, &label, direction, now_ms, next_seq, &bytes) {
+        if !requeue_leg(
+            &self.persist,
+            &label,
+            direction,
+            now_ms,
+            next_seq,
+            &bytes,
+            LegDispatch::ReconnectBand,
+        ) {
             // The record holds the attempt and the wire has seen nothing, which
             // is exactly the crash window the re-emit path recovers: the next
             // pass finds the slot occupied and its sequence unspent, and queues
             // the same bytes. So this is owed, not settled.
-            crate::vtrace!("dm driver: the re-establishment leg would not queue: {e}");
             return self.resume_fault(now_ms, index);
         }
         self.correspondences[index].resume_owed = false;
         Vec::new()
+    }
+
+    /// One correspondence's per-tick re-establishment upkeep: no stored leg is
+    /// lost, no leg lives for ever, and no retained root outlives its ceiling.
+    ///
+    /// **Idempotent, and run at every tick rather than once at load**, on the
+    /// same reasoning A3.12 gives the dead-chain sweep: every decision here is a
+    /// derivation from two durable facts — the record's slots and the outbox's
+    /// entries — so re-running it costs a read and changes nothing, and a crash
+    /// between any commit and the enqueue that should have followed it is
+    /// repaired by the next pass instead of being prevented by a transaction.
+    ///
+    /// Five things, in an order that matters only where noted:
+    ///
+    /// 1. **`T_RETIRE`** (A3.5): a retained `RS_n` past its write-once
+    ///    `superseded_at_ms` plus the ceiling is retired with the dedup memory
+    ///    scoped to it, and A3.8's *re-establishment unconfirmed* is raised. An
+    ///    actor able to suppress frames therefore buys at most the window, and
+    ///    pays with an event.
+    /// 2. **The initiator's confirming observation** (A3.6): *"the ordinary
+    ///    acknowledgement settling `RE-CONFIRM`'s sequence position within its
+    ///    give-up window"*. When the stored settling leg's own entry has been
+    ///    confirmed collected inside that window, the leg is released and the
+    ///    retained root retires with it.
+    /// 3. **Stored legs go back on the wire** (A9.1(a)): a slot holding sealed
+    ///    bytes whose outbox entry is absent is re-queued at the sequence the
+    ///    slot records. This is the crash-between-commit-and-enqueue recovery,
+    ///    and it covers all three legs — the own slot's `RE-EST` on the
+    ///    reconnect band, the acceptance slot's `RE-ACK` and the confirm slot's
+    ///    `RE-CONFIRM` on the ordinary ladder.
+    /// 4. **Orphan legs are retired** (A3.12): a pending leg entry whose
+    ///    sequence matches no live slot belongs to an exchange the record has
+    ///    moved past, and nothing will ever answer it.
+    /// 5. **Leg give-up** (A3.8's *re-establishment failed*): a leg unanswered
+    ///    for `GIVE_UP` ends — not on the user-facing undelivered list, which is
+    ///    for messages, but through [`Outbox::abandon_leg`] — and where it was
+    ///    this side's own initiation the attempt is released so the next pass
+    ///    opens its successor. A3.13 forbids a terminal state, so the pass is
+    ///    left owed rather than stopped.
+    ///
+    /// Step 3 runs after steps 1 and 2 so a leg retired by either is not
+    /// re-queued in the same pass; step 5 runs last so a leg re-queued by step 3
+    /// is judged on the give-up clock it actually carries.
+    fn reest_upkeep(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        let label = self.correspondences[index].label;
+        // An unestablished correspondence has no resume record and nothing to
+        // keep up; `resume_channel` owns the loud paths for one that should.
+        if self.correspondences[index].peer_pk_pc.is_none() {
+            return Vec::new();
+        }
+        let Some(direction) = self.stored_direction(&label, now_ms) else {
+            return Vec::new();
+        };
+        let Ok(Some(mut record)) = self.persist.read_resume(&label) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut dirty = false;
+
+        // ── 1. the retention ceiling ─────────────────────────────────────────
+        let expired = record
+            .retained()
+            .is_some_and(|held| now_ms.saturating_sub(held.superseded_at_ms()) >= T_RETIRE_MS);
+        if expired {
+            record.retire_retained();
+            dirty = true;
+            if !self.correspondences[index].retire_ceiling_surfaced {
+                self.correspondences[index].retire_ceiling_surfaced = true;
+                out.push(DmEffect::Emit(DmEvent::ReestablishmentAnomaly {
+                    with: Box::new(*self.correspondences[index].pk_lt),
+                    event: TrustEventKey::DmReestablishmentUnconfirmed,
+                }));
+            }
+        }
+
+        // ── 2. the initiator's confirming observation ────────────────────────
+        if let Some(confirm) = record.confirm_slot() {
+            // **A store that would not answer is not an observation.** Folding
+            // the fault into `false` reads the same as *the peer has not
+            // collected it yet*, which is the safe direction here — the leg
+            // stays owed — but it is still a fault worth a line, on the terms
+            // every sibling read in this pass states. The verdict itself is
+            // deliberately conservative: an absent entry means the leg was
+            // pruned or never queued, and neither is a confirming observation.
+            let settled = match self.persist.read_outbox(&label, now_ms) {
+                Ok(Some(outbox)) => outbox.entry(confirm.seq()).is_some_and(|entry| {
+                    entry.delivery_state() == DeliveryState::ConfirmedCollected
+                }),
+                Ok(None) => false,
+                Err(e) => {
+                    crate::vtrace!(
+                        "dm driver: the outbox would not read for the confirming \
+                         observation: {e}"
+                    );
+                    false
+                }
+            };
+            if settled {
+                record.retire_confirm();
+                // A3.6 makes this the same observation the retention ceiling was
+                // the fallback for, so the root goes with the leg.
+                record.retire_retained();
+                dirty = true;
+            }
+        }
+
+        // ── 3. every stored leg is queued, or re-queued ──────────────────────
+        let mut stored: Vec<(u64, Vec<u8>, LegDispatch)> = Vec::new();
+        if let Some(slot) = record.own_slot() {
+            stored.push((
+                slot.seq(),
+                slot.sealed().bytes().to_vec(),
+                LegDispatch::ReconnectBand,
+            ));
+        }
+        if let Some(slot) = record.acceptance() {
+            stored.push((
+                slot.seq(),
+                slot.sealed_re_ack().to_vec(),
+                LegDispatch::Ladder,
+            ));
+        }
+        if let Some(slot) = record.confirm_slot() {
+            stored.push((slot.seq(), slot.sealed().to_vec(), LegDispatch::Ladder));
+        }
+        let live: Vec<u64> = stored.iter().map(|(seq, _, _)| *seq).collect();
+        for (seq, bytes, dispatch) in &stored {
+            requeue_leg(
+                &self.persist,
+                &label,
+                direction,
+                now_ms,
+                *seq,
+                bytes,
+                *dispatch,
+            );
+        }
+
+        // ── 4 and 5. orphans, and the give-up ────────────────────────────────
+        let swept = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                let pending: Vec<(u64, bool)> = outbox
+                    .iter()
+                    .filter(|entry| {
+                        matches!(entry.target(), OutboxTarget::ReEstablishmentLeg)
+                            && entry.lifecycle().is_pending()
+                    })
+                    .map(|entry| (entry.seq(), entry.is_given_up(now_ms)))
+                    .collect();
+                let mut given_up = Vec::new();
+                let mut changed = false;
+                for (seq, past_give_up) in pending {
+                    if !live.contains(&seq) {
+                        changed |= outbox.retire_leg(seq);
+                    } else if past_give_up {
+                        changed |= outbox.abandon_leg(seq);
+                        given_up.push(seq);
+                    }
+                }
+                Ok(if changed {
+                    Mutation::Changed(given_up)
+                } else {
+                    Mutation::Unchanged(given_up)
+                })
+            });
+        let given_up = match swept {
+            Ok(given_up) => given_up,
+            Err(e) => {
+                crate::vtrace!("dm driver: the leg sweep did not run: {e}");
+                Vec::new()
+            }
+        };
+        if !given_up.is_empty() {
+            // **The own slot is released, so the next pass opens a successor.**
+            // A3.13 forbids a dead end and A5.2 keeps the counter monotone, so
+            // the abandoned number is never reused.
+            if record
+                .own_slot()
+                .is_some_and(|slot| given_up.contains(&slot.seq()))
+            {
+                record.abandon_attempt();
+                dirty = true;
+                self.correspondences[index].resume_owed = true;
+                self.correspondences[index].resume_retry_due_ms = None;
+            }
+            if !self.correspondences[index].leg_give_up_surfaced {
+                self.correspondences[index].leg_give_up_surfaced = true;
+                out.push(DmEffect::Emit(DmEvent::ReestablishmentAnomaly {
+                    with: Box::new(*self.correspondences[index].pk_lt),
+                    event: TrustEventKey::DmReestablishmentFailed,
+                }));
+            }
+        }
+
+        if dirty {
+            if let Err(e) = self.persist.commit_resume(&label, &record) {
+                // Every change above is a derivation from durable state, so a
+                // refused commit costs one pass: the next tick reads the same facts
+                // and reaches the same answers.
+                crate::vtrace!("dm driver: the re-establishment upkeep would not commit: {e}");
+            }
+        }
+        out
     }
 
     /// Keep the load-time pass owed after a store fault, widen the retry, and
@@ -2762,10 +3096,12 @@ impl DmMachine {
         let live = self.correspondences[index]
             .live()
             .is_some_and(|(r, _, _)| !self.torn_down.contains(r.ar_fingerprint()));
+        let address_root = self.correspondences[index].address_root;
         let emitted = self
             .persist
             .update_outbox(&label, direction, now_ms, |outbox| {
                 let mut out: Vec<(u64, OutboxTarget, Vec<u8>)> = Vec::new();
+                let mut unaddressable = 0u64;
                 for seq in outbox.due(now_ms) {
                     let Some(entry) = outbox.entry_mut(seq) else {
                         continue;
@@ -2774,17 +3110,20 @@ impl DmMachine {
                     if matches!(target, OutboxTarget::ChannelPage) && !live {
                         continue;
                     }
-                    // **A re-establishment leg is not emitted, and skipping it
-                    // BEFORE `emit` is the whole of it.** `emit` advances the
-                    // ladder whether or not the caller can do anything with the
-                    // bytes, so a leg picked up here on every due tick would
-                    // walk `RESEED_LADDER` end to end against a dispatch that
-                    // does not exist — spending emissions on nothing, and
-                    // leaving a record whose schedule says it has been trying
-                    // for a week. Its page address needs the resumed channel's own
-                    // addressing, which is a later slice; until then the entry
-                    // waits with its ladder untouched.
-                    if matches!(target, OutboxTarget::ReEstablishmentLeg) {
+                    // **A leg whose record address will not derive is skipped
+                    // BEFORE `emit`, and that is the whole of it.** `emit`
+                    // advances the jittered ladder whatever the caller then does
+                    // with the bytes, so a leg picked up while its address is
+                    // underivable would walk `RESEED_LADDER` end to end against
+                    // a write that never happens — and a derivation that starts
+                    // working again would find the entry on the hourly rung with
+                    // its give-up nearly spent. Counted, not silent: the address
+                    // is a pure function of the address root, so a refusal here
+                    // is a module fault rather than a state.
+                    if matches!(target, OutboxTarget::ReEstablishmentLeg)
+                        && !leg_addressable(&address_root, direction, seq)
+                    {
+                        unaddressable += 1;
                         continue;
                     }
                     // A refusal here is `NothingToEmit` or `GaveUp`; the first
@@ -2798,23 +3137,25 @@ impl DmMachine {
                     }
                 }
                 Ok(if out.is_empty() {
-                    Mutation::Unchanged(out)
+                    Mutation::Unchanged((out, unaddressable))
                 } else {
-                    Mutation::Changed(out)
+                    Mutation::Changed((out, unaddressable))
                 })
             });
-        let emitted = match emitted {
-            Ok(emitted) => emitted,
+        let (emitted, unaddressable) = match emitted {
+            Ok(pair) => pair,
             Err(e) => {
                 crate::vtrace!("dm driver: the due-entry scan failed: {e}");
                 return Vec::new();
             }
         };
+        self.correspondences[index].health.leg_unaddressable += unaddressable;
         let correspondence = &self.correspondences[index];
-        // A conversation tag only exists where a ratchet does; a doorbell
-        // re-seed on a restored correspondence is attributed by its recipient
-        // instead, which is what the write's own outcome carries back.
-        let conversation = correspondence.live().map(|(r, _, _)| *r.ar_fingerprint());
+        let torn_down = &self.torn_down;
+        // Derived from the address root, so a correspondence read back from disk
+        // tags its writes with the same conversation a live one does — which is
+        // what routes a re-establishment leg's own outcome back to it.
+        let conversation = correspondence.conversation();
         // Collected rather than inserted in the loop: `correspondence` is borrowed
         // from `self` for the whole of it, so the sets cannot be reached until it
         // ends.
@@ -2823,11 +3164,11 @@ impl DmMachine {
         for (seq, target, frame) in emitted {
             match target {
                 OutboxTarget::ChannelPage => {
-                    let Some((ratchet, _, channel)) = correspondence.live() else {
+                    let Some((ratchet, _, _)) = correspondence.live() else {
                         continue;
                     };
                     let address = match DmPageAddress::sending(
-                        &channel.address_root,
+                        &correspondence.address_root,
                         ratchet,
                         position_of(seq),
                     ) {
@@ -2857,11 +3198,49 @@ impl DmMachine {
                         frame,
                     }));
                 }
-                // Unreachable: the scan above skips this target before `emit`,
-                // so no leg reaches the publish loop. Written out rather than
-                // wildcarded so a dispatch added later has to be classified
-                // here on purpose.
-                OutboxTarget::ReEstablishmentLeg => {}
+                // **A leg is published exactly where an ordinary frame of the
+                // same sequence would be, and without a key schedule.** It is
+                // *"shaped exactly like an ordinary frame"* and rides *"at its
+                // own sequence position"*
+                // (`docs/design/direct-messaging.md:917`, `:887`), so its record
+                // is `msg_addr(dir, seq)` off the same address root; what it
+                // cannot use is the ratchet-bound derivation, because the party
+                // writing a leg has just come back from the restart that
+                // destroyed its ratchet.
+                //
+                // **The bytes are the stored bytes.** `emit` above borrowed them
+                // out of the entry and nothing re-seals them, which is A9.1(a)'s
+                // byte-identical re-emit reaching the wire.
+                OutboxTarget::ReEstablishmentLeg => {
+                    let Some(conversation) = conversation else {
+                        continue;
+                    };
+                    if torn_down.contains(&conversation) {
+                        continue;
+                    }
+                    let address =
+                        match DmPageAddress::sending_on(&address_root, direction, position_of(seq))
+                        {
+                            Ok(address) => address,
+                            Err(e) => {
+                                crate::vtrace!("dm driver: leg address derivation failed: {e}");
+                                continue;
+                            }
+                        };
+                    let page = address.at().page();
+                    opened_send.push((conversation, page));
+                    out.push(DmEffect::Dht(DhtOp::PublishPage {
+                        tag: OpTag {
+                            conversation: Some(conversation),
+                            seq: Some(seq),
+                            page: Some(page),
+                            correspondent: Some(Box::new(*correspondence.pk_lt)),
+                            introduction: None,
+                        },
+                        address,
+                        frame,
+                    }));
+                }
                 // The knock, re-seeded. Its bytes come back from the outbox
                 // unchanged, which is the whole reason it is queued there: a
                 // second `firstcontact::build` would encapsulate a fresh `ss0`
@@ -2951,6 +3330,13 @@ impl DmMachine {
         index: usize,
         block_list: Option<&BlockList>,
     ) -> Vec<DmEffect> {
+        // Read before the destructure below borrows the whole machine, and read
+        // for every correspondence rather than only the ratchet-less ones: the
+        // outbox is the one place the correspondence's direction is durable, so
+        // it is the only source a restarted party has.
+        let peer_direction = self
+            .stored_direction(&self.correspondences[index].label, now_ms)
+            .map(Direction::opposite);
         let Self {
             correspondences,
             sweeping_pages,
@@ -2959,7 +3345,19 @@ impl DmMachine {
             ..
         } = self;
         let correspondence = &mut correspondences[index];
-        if correspondence.receiving().is_none() {
+        // **A correspondence with no key schedule still sweeps, and that is what
+        // makes a restart recoverable.** The plane the correspondent writes is
+        // where a re-establishment leg arrives, and a party that stopped reading
+        // it until it had a ratchet would be waiting for a frame it had made
+        // itself unable to receive. What it can *open* is decided per slot by
+        // `on_page`; what it can *address* is the address root, which outlives
+        // every restart.
+        //
+        // The two states that sweep are a live channel and an established
+        // correspondence read back from disk — the second recognised by the
+        // correspondent's pseudonym being on record, which is the same test
+        // `seed_from_store` uses to decide a resume record exists.
+        if correspondence.ratchet.is_none() && correspondence.peer_pk_pc.is_none() {
             return Vec::new();
         }
         let Some(block_list) = block_list else {
@@ -2974,26 +3372,38 @@ impl DmMachine {
         let Some(plan) = correspondence.collection.probe_plan(probe_ms(now_ms)) else {
             return Vec::new();
         };
-        // **An initiator that has not yet seen the acceptance still sweeps**,
-        // because the acceptance itself arrives by sweep: it is an ordinary
-        // channel frame at the acceptor's sequence zero. What it cannot do is
-        // open anything later than that, which `on_page` decides per slot.
-        let Some((ratchet, channel)) = correspondence.receiving() else {
+        let Some(conversation) = correspondence.conversation() else {
+            crate::vtrace!("dm driver: the conversation fingerprint would not derive");
             return Vec::new();
         };
-        let conversation = *ratchet.ar_fingerprint();
         // A torn-down conversation plans nothing. The pages were handed back at
         // teardown, and re-planning them would re-open the very records that were
         // released — see `Self::torn_down`.
         if torn_down.contains(&conversation) {
             return Vec::new();
         }
+        let address_root = correspondence.address_root;
+        // **An initiator that has not yet seen the acceptance still sweeps**,
+        // because the acceptance itself arrives by sweep: it is an ordinary
+        // channel frame at the acceptor's sequence zero. What it cannot do is
+        // open anything later than that, which `on_page` decides per slot.
+        let ratchet = correspondence.ratchet.as_ref();
         let mut out = Vec::new();
         for page in plan {
             if sweeping_pages.contains(&(conversation, page)) {
                 continue;
             }
-            match DmPageAddress::receiving(&channel.address_root, ratchet, page) {
+            let derived = match (ratchet, peer_direction) {
+                (Some(ratchet), _) => DmPageAddress::receiving(&address_root, ratchet, page),
+                (None, Some(direction)) => {
+                    DmPageAddress::receiving_on(&address_root, direction, page)
+                }
+                // No key schedule and no stored outbox to read a direction from,
+                // so there is no plane to name. A correspondence in this state
+                // has never queued anything, which is also nothing to recover.
+                (None, None) => continue,
+            };
+            match derived {
                 Ok(address) => {
                     sweeping_pages.insert((conversation, page));
                     // Recorded here and nowhere else: this is the only site that
@@ -3085,10 +3495,11 @@ impl DmMachine {
         let correspondence = &correspondences[index];
         // No ratchet, no address to derive. A correspondence with no live channel
         // opened no page this session, so there is nothing of its to hand back.
-        let Some((ratchet, _, channel)) = correspondence.live() else {
+        let Some((ratchet, _, _)) = correspondence.live() else {
             return Vec::new();
         };
         let conversation = *ratchet.ar_fingerprint();
+        let address_root = correspondence.address_root;
         let mut out = Vec::new();
 
         let retiring: Vec<u64> = open_recv_pages
@@ -3098,7 +3509,7 @@ impl DmMachine {
             .filter(|page| !sweeping_pages.contains(&(conversation, *page)))
             .collect();
         for page in retiring {
-            match DmPageAddress::receiving(&channel.address_root, ratchet, page) {
+            match DmPageAddress::receiving(&address_root, ratchet, page) {
                 Ok(address) => {
                     open_recv_pages.remove(&(conversation, page));
                     out.push(DmEffect::Dht(DhtOp::ClosePage {
@@ -3128,7 +3539,7 @@ impl DmMachine {
                 crate::vtrace!("dm driver: a sending page held no position to close");
                 continue;
             };
-            match DmPageAddress::sending(&channel.address_root, ratchet, at) {
+            match DmPageAddress::sending(&address_root, ratchet, at) {
                 Ok(address) => {
                     open_send_pages.remove(&(conversation, page));
                     out.push(DmEffect::Dht(DhtOp::ClosePage {
@@ -3302,6 +3713,12 @@ impl DmMachine {
                 return Vec::new();
             }
         }
+        // Read before the destructure below borrows the machine, and read from the
+        // outbox because that is where the correspondence's direction is durable:
+        // a page a restarted party sweeps has no ratchet to ask.
+        let peer_direction = self
+            .stored_direction(&self.correspondences[index].label, now_ms)
+            .map(Direction::opposite);
         let Self {
             identity,
             persist,
@@ -3362,6 +3779,11 @@ impl DmMachine {
             }
         }
 
+        // Read lazily and once, then threaded through every leg fold on this
+        // page — see the leg arm below.
+        let mut resume: Option<Option<ResumeRecord>> = None;
+        let mut scans: u64 = 0;
+        let mut scan_faults: u64 = 0;
         let recipient = match recipient_hash(identity.signing.public_key()) {
             Ok(h) => h,
             Err(e) => {
@@ -3374,195 +3796,297 @@ impl DmMachine {
             let Some(encoded) = bytes.get(&at) else {
                 continue;
             };
-            let parsed = match frame::parse(encoded) {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    crate::vtrace!("dm driver: a swept slot is not a frame: {e}");
-                    correspondence.health.unopenable += 1;
-                    continue;
-                }
-            };
-            // **Before the acceptance, only the acceptance can be opened.** An
-            // initiator holds no pseudonym for its correspondent until the
-            // ACCEPT lands, so a frame at any later sequence is refused as
-            // *pending* — the slot is left unsettled, nothing is offered to the
-            // ratchet, and the sweep after the acceptance retries it. Counted,
-            // not silent: `peer_pseudonym_unknown` is what says a conversation
-            // is waiting on its acceptance rather than idle.
-            let accepting = correspondence.peer_pk_pc.is_none();
-            if accepting && at.seq() != FIRST_RECIPIENT_CHANNEL_SEQ {
-                correspondence.health.peer_pseudonym_unknown += 1;
-                continue;
-            }
-            // `break`, never `return`: messages already opened from earlier
-            // slots of this same page are in `out`, and the cursor advance and
-            // the health event below are owed whatever stopped the loop.
-            let (Some(ratchet), Some(channel)) = (
-                correspondence.ratchet.as_mut(),
-                correspondence.channel.as_ref(),
-            ) else {
-                break;
-            };
-            let direction = ratchet.recv_direction();
-            // Nested on purpose: the outer result is the ratchet's verdict on
-            // the position and the inner one this frame's own authentication.
-            // The ratchet commits nothing when the inner one fails, so a frame
-            // that does not authenticate has not spent its key — which is what
-            // makes a forged acceptance cost one refused open rather than a
-            // conversation.
-            let opened = if accepting {
-                ratchet.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |key| {
-                    parsed
-                        .open_accept(
-                            key,
-                            &channel.chan_id,
-                            direction,
-                            at,
-                            &recipient,
-                            &peer_pk_lt,
-                        )
-                        .map(|accepted| (accepted.frame, Some(accepted.peer_pk_pc)))
-                })
-            } else {
-                let author = AuthorKeys {
-                    pc: correspondence
-                        .peer_pk_pc
-                        .as_ref()
-                        .expect("the pseudonym is known on this branch"),
-                    lt: &peer_pk_lt,
+            // **Set by every path that hands the slot to the re-establishment
+            // scan, and read once below.** A leg is not a channel frame — it is
+            // a fixed-length AEAD blob under a key derived from the retained
+            // root — so it reaches this loop as bytes that do not parse, or that
+            // parse and do not open, or that arrive at a correspondence with no
+            // key schedule at all. Those are three different-looking failures of
+            // one attempt, and the flag is what keeps the answer to *"is this a
+            // leg?"* in one place rather than three.
+            let mut unopened = false;
+            'frame: {
+                let parsed = match frame::parse(encoded) {
+                    Ok(parsed) => parsed,
+                    Err(e) => {
+                        crate::vtrace!("dm driver: a swept slot is not a frame: {e}");
+                        unopened = true;
+                        break 'frame;
+                    }
                 };
-                ratchet.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |key| {
-                    parsed
-                        .open(key, &channel.chan_id, direction, at, &recipient, author)
-                        .map(|verified| (verified, None))
-                })
-            };
-            match opened {
-                Ok(Ok((verified, installed))) => {
-                    // **One act: install the pseudonym, and erase the record
-                    // that existed only until it arrived.** Past this point the
-                    // conversation is verifiable and `ss0` — which roots `RK0`
-                    // — has no further use, so keeping it would be the
-                    // forward-secrecy claim inverted. It runs only here,
-                    // after a verified acceptance: a failed open leaves the
-                    // ratchet, the record and the slot exactly as they were.
-                    if let Some(pk_pc) = installed {
-                        // **The record is written first, and the handshake
-                        // record is erased only if that write succeeded.** The
-                        // contact record was created when the entry was sent
-                        // and has held no pseudonym since; this is the one
-                        // transition it makes. Erasing the handshake record
-                        // regardless would destroy the only state a restart
-                        // could re-arm from while leaving the pseudonym
-                        // unrecorded — a correspondence that comes back
-                        // waiting for an acceptance it can no longer open, and
-                        // no later frame could ever establish it. So a refused
-                        // write keeps both the handle and the record, and the
-                        // tick retries the pair.
-                        match persist.record_correspondent_pseudonym(
-                            &correspondence.label,
-                            pk_pc.clone(),
-                            now_ms,
-                        ) {
-                            Ok(_) => {
-                                // **The pseudonym stays owed until the resume
-                                // record lands.** The two writes are not one
-                                // act, and the contact record's pseudonym is
-                                // what every later lookup reads as
-                                // *established* — so a store fault between them
-                                // would leave a correspondence that reads as
-                                // established and holds no `S_pc`, with nothing
-                                // owing the write that would fix it. Keeping the
-                                // flag set is what puts the pair back in front
-                                // of the next tick.
-                                match establish_provisional(persist, correspondence, &pk_pc, now_ms)
-                                {
-                                    Establishment::Complete => {}
-                                    Establishment::Retry => {
-                                        correspondence.pseudonym_unwritten = true;
-                                    }
-                                    Establishment::Unrecoverable => {
-                                        let owed =
-                                            pending_seqs(persist, &correspondence.label, now_ms);
-                                        out.extend(cannot_resume(correspondence, owed));
-                                        // **A handshake record the erase could
-                                        // not reach goes onto the retry list,
-                                        // not into the dark.** The
-                                        // correspondence is finished either way,
-                                        // but the record still holds `ss0` —
-                                        // which roots `RK0` — and the context
-                                        // beside it is the only thing that can
-                                        // ever open it again. Dropping the
-                                        // handle here would turn a transient
-                                        // store fault into a permanent leak of
-                                        // the secret the establishment exists to
-                                        // destroy.
-                                        if let Some((keyrec_addr, fc_epoch)) =
-                                            correspondence.provisional.take()
-                                        {
-                                            owed_erase =
-                                                Some((correspondence.label, keyrec_addr, fc_epoch));
+                // **Before the acceptance, only the acceptance can be opened.** An
+                // initiator holds no pseudonym for its correspondent until the
+                // ACCEPT lands, so a frame at any later sequence is refused as
+                // *pending* — the slot is left unsettled, nothing is offered to the
+                // ratchet, and the sweep after the acceptance retries it. Counted,
+                // not silent: `peer_pseudonym_unknown` is what says a conversation
+                // is waiting on its acceptance rather than idle.
+                let accepting = correspondence.peer_pk_pc.is_none();
+                if accepting && at.seq() != FIRST_RECIPIENT_CHANNEL_SEQ {
+                    correspondence.health.peer_pseudonym_unknown += 1;
+                    // Not `unopened`: a correspondence still waiting for its
+                    // acceptance has no resume record and no retained root, so
+                    // there is no leg the scan below could open and the trial
+                    // decryption would be work spent to reach the same answer.
+                    break 'frame;
+                }
+                // **No key schedule is a re-establishment case, not a stop.** This
+                // used to leave the loop, on the reading that a correspondence
+                // without a ratchet can open nothing — which is true of channel
+                // frames and false of the legs that arrive precisely because the
+                // ratchet is gone. The slot goes to the scan below instead.
+                let (Some(ratchet), Some(channel)) = (
+                    correspondence.ratchet.as_mut(),
+                    correspondence.channel.as_ref(),
+                ) else {
+                    unopened = true;
+                    break 'frame;
+                };
+                let direction = ratchet.recv_direction();
+                // Nested on purpose: the outer result is the ratchet's verdict on
+                // the position and the inner one this frame's own authentication.
+                // The ratchet commits nothing when the inner one fails, so a frame
+                // that does not authenticate has not spent its key — which is what
+                // makes a forged acceptance cost one refused open rather than a
+                // conversation.
+                let opened = if accepting {
+                    ratchet.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |key| {
+                        parsed
+                            .open_accept(
+                                key,
+                                &channel.chan_id,
+                                direction,
+                                at,
+                                &recipient,
+                                &peer_pk_lt,
+                            )
+                            .map(|accepted| (accepted.frame, Some(accepted.peer_pk_pc)))
+                    })
+                } else {
+                    let author = AuthorKeys {
+                        pc: correspondence
+                            .peer_pk_pc
+                            .as_ref()
+                            .expect("the pseudonym is known on this branch"),
+                        lt: &peer_pk_lt,
+                    };
+                    ratchet.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |key| {
+                        parsed
+                            .open(key, &channel.chan_id, direction, at, &recipient, author)
+                            .map(|verified| (verified, None))
+                    })
+                };
+                match opened {
+                    Ok(Ok((verified, installed))) => {
+                        // **One act: install the pseudonym, and erase the record
+                        // that existed only until it arrived.** Past this point the
+                        // conversation is verifiable and `ss0` — which roots `RK0`
+                        // — has no further use, so keeping it would be the
+                        // forward-secrecy claim inverted. It runs only here,
+                        // after a verified acceptance: a failed open leaves the
+                        // ratchet, the record and the slot exactly as they were.
+                        if let Some(pk_pc) = installed {
+                            // **The record is written first, and the handshake
+                            // record is erased only if that write succeeded.** The
+                            // contact record was created when the entry was sent
+                            // and has held no pseudonym since; this is the one
+                            // transition it makes. Erasing the handshake record
+                            // regardless would destroy the only state a restart
+                            // could re-arm from while leaving the pseudonym
+                            // unrecorded — a correspondence that comes back
+                            // waiting for an acceptance it can no longer open, and
+                            // no later frame could ever establish it. So a refused
+                            // write keeps both the handle and the record, and the
+                            // tick retries the pair.
+                            match persist.record_correspondent_pseudonym(
+                                &correspondence.label,
+                                pk_pc.clone(),
+                                now_ms,
+                            ) {
+                                Ok(_) => {
+                                    // **The pseudonym stays owed until the resume
+                                    // record lands.** The two writes are not one
+                                    // act, and the contact record's pseudonym is
+                                    // what every later lookup reads as
+                                    // *established* — so a store fault between them
+                                    // would leave a correspondence that reads as
+                                    // established and holds no `S_pc`, with nothing
+                                    // owing the write that would fix it. Keeping the
+                                    // flag set is what puts the pair back in front
+                                    // of the next tick.
+                                    match establish_provisional(
+                                        persist,
+                                        correspondence,
+                                        &pk_pc,
+                                        now_ms,
+                                    ) {
+                                        Establishment::Complete => {}
+                                        Establishment::Retry => {
+                                            correspondence.pseudonym_unwritten = true;
+                                        }
+                                        Establishment::Unrecoverable => {
+                                            let owed = pending_seqs(
+                                                persist,
+                                                &correspondence.label,
+                                                now_ms,
+                                            );
+                                            out.extend(cannot_resume(correspondence, owed));
+                                            // **A handshake record the erase could
+                                            // not reach goes onto the retry list,
+                                            // not into the dark.** The
+                                            // correspondence is finished either way,
+                                            // but the record still holds `ss0` —
+                                            // which roots `RK0` — and the context
+                                            // beside it is the only thing that can
+                                            // ever open it again. Dropping the
+                                            // handle here would turn a transient
+                                            // store fault into a permanent leak of
+                                            // the secret the establishment exists to
+                                            // destroy.
+                                            if let Some((keyrec_addr, fc_epoch)) =
+                                                correspondence.provisional.take()
+                                            {
+                                                owed_erase = Some((
+                                                    correspondence.label,
+                                                    keyrec_addr,
+                                                    fc_epoch,
+                                                ));
+                                            }
                                         }
                                     }
                                 }
+                                Err(e) => {
+                                    crate::vtrace!(
+                                        "dm driver: the pseudonym would not record: {e}"
+                                    );
+                                    correspondence.pseudonym_unwritten = true;
+                                }
                             }
-                            Err(e) => {
-                                crate::vtrace!("dm driver: the pseudonym would not record: {e}");
-                                correspondence.pseudonym_unwritten = true;
-                            }
+                            correspondence.peer_pk_pc = Some(pk_pc);
                         }
-                        correspondence.peer_pk_pc = Some(pk_pc);
+                        if correspondence.collection.collected(at).is_err() {
+                            correspondence.owed_acks.push(at);
+                        } else {
+                            // The floor: the first standalone acknowledgement after
+                            // new messages goes whatever the curve says, so a
+                            // conversation that has been quiet for days still
+                            // confirms the message that broke the silence at once.
+                            correspondence.ack_cadence.on_collected();
+                        }
+                        // The frame's own asserted send time, clamped to now; see
+                        // `note_pending` for both halves of why.
+                        correspondence.note_pending(verified.sent_unix_ms, now_ms);
+                        // The piggybacked half of the fold. It takes the identical
+                        // decode-verify-merge path a standalone record takes; only
+                        // what authenticated it differs, and that already happened
+                        // above, inside the open.
+                        if let Some(peer) = verified.peer_ack {
+                            out.extend(fold_peer_ack(persist, correspondence, now_ms, peer));
+                        }
+                        out.push(DmEffect::Emit(DmEvent::Message {
+                            from: Box::new(*correspondence.pk_lt),
+                            seq: verified.seq,
+                            body: verified.body,
+                            sent_unix_ms: verified.sent_unix_ms,
+                        }));
                     }
+                    // Ordinary under re-seeds: the sender re-presents a frame this
+                    // side has already opened, and will until an acknowledgement
+                    // reaches it.
+                    Err(RatchetError::AlreadyConsumed { .. }) => {
+                        correspondence.health.already_consumed += 1;
+                    }
+                    // **The slot is left unsettled, never abandoned.** Abandonment
+                    // settles a position permanently and is the sender's give-up
+                    // signal, not a reader's verdict on bytes it could not open.
+                    // Page owner-write authority is symmetric, so anyone can write
+                    // a slot; the authorship signature is what separates the
+                    // correspondent's writes from everybody else's, and a frame
+                    // that fails it says nothing about the frame that may yet
+                    // arrive.
+                    Err(e) => {
+                        crate::vtrace!("dm driver: the ratchet refused a swept frame: {e}");
+                        unopened = true;
+                    }
+                    Ok(Err(e)) => {
+                        crate::vtrace!("dm driver: a swept frame did not authenticate: {e}");
+                        correspondence.health.unopenable += 1;
+                    }
+                }
+            }
+            if !unopened {
+                continue;
+            }
+            // **The one place a re-establishment leg is recognised.** Nothing on
+            // the wire says a frame is one (A3.9), so what happens here is a
+            // bounded trial decryption against the leg kinds this side's own
+            // record says it is waiting for — and a slot that is not one of them
+            // is counted unopenable exactly as it was before.
+            let Some(peer_direction) = peer_direction else {
+                correspondence.health.unopenable += 1;
+                continue;
+            };
+            // **The record is opened once per page, not once per slot.** It is a
+            // sealed blob carrying a signing key, and a page holding one leg
+            // among sixteen frames would otherwise pay the AEAD open sixteen
+            // times. The outer `None` is *not read yet*; the inner one is *there
+            // is no record*, which is the state `resume_channel` surfaces as
+            // unresumable and in which no leg can have been sealed.
+            if resume.is_none() {
+                resume = Some(match persist.read_resume(&correspondence.label) {
+                    Ok(record) => record,
+                    Err(e) => {
+                        crate::vtrace!(
+                            "dm driver: the resume record will not read for a leg scan: {e}"
+                        );
+                        None
+                    }
+                });
+            }
+            let Some(record) = resume.as_mut().and_then(Option::as_mut) else {
+                correspondence.health.unopenable += 1;
+                continue;
+            };
+            let fold = fold_leg(
+                persist,
+                correspondence,
+                record,
+                now_ms,
+                at,
+                encoded,
+                peer_direction,
+                &mut scans,
+                &mut scan_faults,
+            );
+            out.extend(fold.effects);
+            match fold.outcome {
+                LegOutcome::NotALeg => correspondence.health.unopenable += 1,
+                // **The position stays unsettled and nothing was written.** The
+                // fold decided nothing, so settling here would walk past the
+                // only copy of a frame this side still owes an answer to; the
+                // correspondent's own re-seed is what brings it back.
+                LegOutcome::Retry => correspondence.health.leg_folds_deferred += 1,
+                // **A consumed leg settles its position, and the alternative is
+                // worse than it looks.** A leg rides the outbox at its own
+                // sequence in the same space every message uses, so a position
+                // left unsettled pins the contiguous prefix under it for the
+                // life of the correspondence: every later message is reported
+                // beyond the prefix, the run set grows toward its cap, and the
+                // sender re-seeds a leg nothing will ever confirm.
+                LegOutcome::Consumed => {
                     if correspondence.collection.collected(at).is_err() {
                         correspondence.owed_acks.push(at);
-                    } else {
-                        // The floor: the first standalone acknowledgement after
-                        // new messages goes whatever the curve says, so a
-                        // conversation that has been quiet for days still
-                        // confirms the message that broke the silence at once.
-                        correspondence.ack_cadence.on_collected();
                     }
-                    // The frame's own asserted send time, clamped to now; see
-                    // `note_pending` for both halves of why.
-                    correspondence.note_pending(verified.sent_unix_ms, now_ms);
-                    // The piggybacked half of the fold. It takes the identical
-                    // decode-verify-merge path a standalone record takes; only
-                    // what authenticated it differs, and that already happened
-                    // above, inside the open.
-                    if let Some(peer) = verified.peer_ack {
-                        out.extend(fold_peer_ack(persist, correspondence, now_ms, peer));
-                    }
-                    out.push(DmEffect::Emit(DmEvent::Message {
-                        from: Box::new(*correspondence.pk_lt),
-                        seq: verified.seq,
-                        body: verified.body,
-                        sent_unix_ms: verified.sent_unix_ms,
-                    }));
-                }
-                // Ordinary under re-seeds: the sender re-presents a frame this
-                // side has already opened, and will until an acknowledgement
-                // reaches it.
-                Err(RatchetError::AlreadyConsumed { .. }) => {
-                    correspondence.health.already_consumed += 1;
-                }
-                // **The slot is left unsettled, never abandoned.** Abandonment
-                // settles a position permanently and is the sender's give-up
-                // signal, not a reader's verdict on bytes it could not open.
-                // Page owner-write authority is symmetric, so anyone can write
-                // a slot; the authorship signature is what separates the
-                // correspondent's writes from everybody else's, and a frame
-                // that fails it says nothing about the frame that may yet
-                // arrive.
-                Err(e) => {
-                    crate::vtrace!("dm driver: the ratchet refused a swept frame: {e}");
-                    correspondence.health.unopenable += 1;
-                }
-                Ok(Err(e)) => {
-                    crate::vtrace!("dm driver: a swept frame did not authenticate: {e}");
-                    correspondence.health.unopenable += 1;
                 }
             }
         }
+        correspondence.health.leg_folds_deferred += scan_faults;
+        // A3.9's bound, asserted where it is spent rather than described
+        // elsewhere: one slot is scanned against at most this many leg kinds.
+        debug_assert!(
+            scans <= LEG_SCAN_CANDIDATES * u64::from(PAGE_SLOTS),
+            "a swept page scanned more leg candidates than the bound allows"
+        );
 
         // The cursor moves only on the contiguous prefix, and only as far as the
         // page that prefix now reaches — bounded by what this session has
@@ -3591,6 +4115,7 @@ impl DmMachine {
             }
         }
         out.extend(correspondence.health_event(before));
+        self.leg_scan_candidates = self.leg_scan_candidates.saturating_add(scans);
         if let Some(entry) = owed_erase {
             self.pending_erase.push(entry);
         }
@@ -3609,12 +4134,16 @@ impl DmMachine {
     }
 
     /// The correspondence one channel-plane operation belongs to.
+    ///
+    /// **Matched on the address root's fingerprint, not on the ratchet's copy of
+    /// it.** The two are the same value, and only one of them survives a restart
+    /// — so a lookup that read the ratchet would route every outcome of a
+    /// re-establishment sweep or leg publish to no correspondence at all, which
+    /// is the exact state the operation exists to leave.
     fn index_of_conversation(&self, conversation: &[u8; AR_FINGERPRINT_LEN]) -> Option<usize> {
-        self.correspondences.iter().position(|c| {
-            c.ratchet
-                .as_ref()
-                .is_some_and(|r| r.ar_fingerprint() == conversation)
-        })
+        self.correspondences
+            .iter()
+            .position(|c| c.conversation().as_ref() == Some(conversation))
     }
 
     // ---- the channel plane: acknowledging ----------------------------------
@@ -3647,7 +4176,7 @@ impl DmMachine {
         block_list: Option<&BlockList>,
     ) -> Vec<DmEffect> {
         let correspondence = &self.correspondences[index];
-        let Some((ratchet, _, channel)) = correspondence.live() else {
+        let Some((ratchet, _, _)) = correspondence.live() else {
             return Vec::new();
         };
         // A torn-down conversation asks nothing of its correspondent's records, on
@@ -3691,14 +4220,16 @@ impl DmMachine {
         if !outstanding {
             return Vec::new();
         }
-        let address =
-            match DmAckAddress::for_direction(&channel.address_root, ratchet.send_direction()) {
-                Ok(address) => address,
-                Err(e) => {
-                    crate::vtrace!("dm driver: ack address derivation failed: {e}");
-                    return Vec::new();
-                }
-            };
+        let address = match DmAckAddress::for_direction(
+            &correspondence.address_root,
+            ratchet.send_direction(),
+        ) {
+            Ok(address) => address,
+            Err(e) => {
+                crate::vtrace!("dm driver: ack address derivation failed: {e}");
+                return Vec::new();
+            }
+        };
         vec![DmEffect::Dht(DhtOp::FetchAck {
             tag: OpTag::channel(*ratchet.ar_fingerprint(), None, None),
             address,
@@ -3765,7 +4296,7 @@ impl DmMachine {
                 &record,
                 &channel.chan_id,
                 ratchet.send_direction(),
-                &channel.address_root,
+                &correspondence.address_root,
                 peer_pk_pc,
             )
         };
@@ -3928,7 +4459,7 @@ impl DmMachine {
             correspondence.collection.ack(),
             &channel.chan_id,
             direction,
-            &channel.address_root,
+            &correspondence.address_root,
             signing_pc,
         ) {
             Ok(record) => record,
@@ -3937,7 +4468,7 @@ impl DmMachine {
                 return Vec::new();
             }
         };
-        let address = match DmAckAddress::for_direction(&channel.address_root, direction) {
+        let address = match DmAckAddress::for_direction(&correspondence.address_root, direction) {
             Ok(address) => address,
             Err(e) => {
                 crate::vtrace!("dm driver: ack address derivation failed: {e}");
@@ -4296,9 +4827,9 @@ impl DmMachine {
         // either can be read — and without them the channel has no address and
         // no seal binding.
         let channel = ChannelRoots {
-            address_root: held.knock.roots().ar,
             chan_id: held.knock.roots().chan_id,
         };
+        let address_root = held.knock.roots().ar;
 
         // **The recoverable refusals are taken here, before the knock is
         // consumed.** `accept_first_contact` moves the `VerifiedFirstContact`
@@ -4385,6 +4916,7 @@ impl DmMachine {
                     existing.signing_pc = Some(signing_pc);
                     existing.peer_pk_pc = Some(peer_pk_pc);
                     existing.channel = Some(channel);
+                    existing.address_root = address_root;
                     existing.provisional = None;
                     if let Some((keyrec_addr, fc_epoch)) = leftover {
                         self.pending_erase.push((old_label, keyrec_addr, fc_epoch));
@@ -4397,6 +4929,13 @@ impl DmMachine {
                         signing_pc: Some(signing_pc),
                         peer_pk_pc: Some(peer_pk_pc),
                         channel: Some(channel),
+                        address_root,
+                        candidate: None,
+                        re_acks_answered: 0,
+                        response_cap_surfaced: false,
+                        retire_ceiling_surfaced: false,
+                        leg_give_up_surfaced: false,
+                        peer_regression_surfaced: false,
                         collection: collection_accepting_a_knock(),
                         read_through: 0,
                         cursor_unreadable: false,
@@ -4889,9 +5428,9 @@ impl DmMachine {
         // both from `ss0` and hands back neither, and `chan_id` is never
         // serialized at all (§ v4 minor invariant).
         let channel = ChannelRoots {
-            address_root: state.roots().ar,
             chan_id: state.roots().chan_id,
         };
+        let address_root = state.roots().ar;
         let record = match state.into_provisional() {
             Ok(r) => r,
             Err(e) => {
@@ -4927,7 +5466,7 @@ impl DmMachine {
         if let Err(e) = self.persist.record_first_contact_sent(
             &label,
             Box::new(*recipient),
-            zeroize::Zeroizing::new(channel.address_root),
+            zeroize::Zeroizing::new(address_root),
             now_ms,
         ) {
             crate::vtrace!("dm driver: contact record write failed: {e}");
@@ -5050,6 +5589,7 @@ impl DmMachine {
             existing.ratchet = Some(ratchet);
             existing.signing_pc = Some(signing_pc);
             existing.channel = Some(channel);
+            existing.address_root = address_root;
             existing.provisional = Some((recipient_keyrec_addr, fc_epoch));
         } else {
             self.correspondences.push(Correspondence {
@@ -5061,6 +5601,13 @@ impl DmMachine {
                 // that carries a pseudonym. See the field.
                 peer_pk_pc: None,
                 channel: Some(channel),
+                address_root,
+                candidate: None,
+                re_acks_answered: 0,
+                response_cap_surfaced: false,
+                retire_ceiling_surfaced: false,
+                leg_give_up_surfaced: false,
+                peer_regression_surfaced: false,
                 collection: Collection::new(),
                 read_through: 0,
                 cursor_unreadable: false,
@@ -5448,9 +5995,19 @@ fn settle_from_own_ack(
     let ack = correspondence.own_ack.clone();
     let settled = persist.update_outbox(&label, direction, now_ms, |outbox| {
         let settled = outbox.settle_from_ack(&ack, now_ms);
+        // **A settled re-establishment leg is not a delivery, and is filtered
+        // out here rather than at the front end.** A leg rides the outbox at its
+        // own sequence position, so a peer's acknowledgement settles it exactly
+        // as it settles a message — but the user composed nothing at that
+        // sequence, and reporting one would put a delivery for a message that
+        // does not exist in front of them. Same argument
+        // `Outbox::sweep_give_ups` makes for skipping legs, at the other end of
+        // the entry's life.
         let states: Vec<(u64, DeliveryState)> = settled
             .iter()
-            .filter_map(|&seq| outbox.entry(seq).map(|entry| (seq, entry.delivery_state())))
+            .filter_map(|&seq| outbox.entry(seq).map(|entry| (seq, entry)))
+            .filter(|(_, entry)| !matches!(entry.target(), OutboxTarget::ReEstablishmentLeg))
+            .map(|(seq, entry)| (seq, entry.delivery_state()))
             .collect();
         Ok(if settled.is_empty() {
             Mutation::Unchanged(states)
@@ -5503,14 +6060,12 @@ fn settle_from_own_ack(
 /// for one position by construction — and is traced rather than propagated so the
 /// accept, which has already established the channel, is not undone by it.
 ///
-/// ⚠️ **The resume path must re-apply this, and does not yet.** `seed_from_store`
-/// rebuilds a correspondence with a fresh [`AckState`], so a restart loses the
-/// settled knock position exactly as it loses the rest of the collection. It is
-/// unreachable today for an unrelated reason — a resumed correspondence has no
-/// key schedule, so it opens nothing and acknowledges nothing — which is why it
-/// is named here rather than fixed: whatever restores a live correspondence
-/// across a restart has to restore this position with it, or the first
-/// acknowledgement written after a restart re-opens the hole under the prefix.
+/// **The resume path re-applies it**, in [`DmMachine::resume_channel`], because
+/// `seed_from_store` rebuilds a correspondence with a fresh [`AckState`] and
+/// would otherwise lose the settled knock position with the rest of the
+/// collection. The acceptor is the side whose outbox sends `b2a`, which is what
+/// that pass keys on; an initiator's own sequence zero is the acceptance, a real
+/// page frame that must stay unsettled until it opens.
 fn collection_accepting_a_knock() -> Collection {
     let mut collection = Collection::new();
     if let Err(e) = collection.collected(position_of(KNOCK_CHANNEL_SEQ)) {
@@ -5563,34 +6118,564 @@ fn erase_provisional(persist: &DmPersist, correspondence: &mut Correspondence) -
     outcome
 }
 
-/// Queue one sealed re-establishment leg at `seq` on this side's direction
-/// record, with its first dispatch drawn off the instant it was queued.
+/// When a queued leg's **first** emission is due.
 ///
-/// A3.2 has every leg ride *"the ordinary outbox machinery (ladder, ack,
-/// give-up) at its own sequence position"*, so this is an ordinary enqueue and
-/// the leg is re-seeded, given up on and addressed exactly as a message is.
+/// **Two bands, because the design gives the two halves of the handshake
+/// different reasons to wait.** They are not a tuning choice: one of them is a
+/// metadata requirement and the other is an availability requirement, and
+/// applying either to the other's leg breaks the property it was written for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegDispatch {
+    /// A wide randomized delay at reconnect-cadence scale
+    /// (`docs/design/direct-messaging.md:1152`, A5.5).
+    ///
+    /// The `RE-EST` this side opens at load is *gated on the restart by
+    /// construction* — an entry composed offline to a quiet peer can only
+    /// first-dispatch after a boot — so k of them share one instant, and a
+    /// minute-scale spread around it *"satisfies I6's letter and fails its
+    /// purpose"*.
+    ReconnectBand,
+    /// The ordinary re-seed ladder's first rung.
+    ///
+    /// The answering and settling legs are not gated on a boot: they are
+    /// composed when an exchange reaches them, at whatever moment that is, so
+    /// there is no shared instant for a wide band to spread. A3.10 says so for
+    /// the `RE-ACK` in terms — *"the ladder's first rung is the latency floor"*
+    /// — and A8.4 makes it load-bearing rather than incidental, bounding the
+    /// answering side's quiet window *"below the expected overlap so recovery is
+    /// mechanical"*. A reconnect-band delay here would put hours between an
+    /// opened `RE-EST` and its answer, which is the availability failure A8.4
+    /// exists to refuse. A4.3 puts `RE-CONFIRM` on the same footing: *"composed
+    /// and persisted immediately, and dispatched through the jittered funnel
+    /// like every other leg, with no promptness requirement."*
+    Ladder,
+}
+
+/// How many `RE-ACK`s one correspondence may compose in one session.
 ///
-/// **The entry's provenance is its TARGET, not a generation number.** A3.12
-/// (`docs/design/direct-messaging.md:927`) asks provenance to exempt an entry
-/// composed during a reconnect from the dead-chain sweep, and
-/// [`OutboxTarget::ReEstablishmentLeg`] is that exemption: a leg hangs off no
-/// ratchet chain, so every number it could carry is either a fiction or one the
-/// next completed re-establishment sweeps the leg away by. The generation
-/// recorded beside it is zero and reads no differently for it.
+/// **A8.4's answer-side emission cap, and no more than that.** The design splits
+/// two rates: *"the bound applies only to post-openability response emission"*,
+/// while *"A3.13's unbounded backoff is retained on pre-authentication
+/// open-attempt work"*. Only the real correspondent can produce an openable
+/// `RE-EST`, so a low cap here bounds what the genuine peer can ask for and
+/// nothing an attacker can drive — the trial-decryption work an unopenable frame
+/// costs is bounded separately, by the scan window.
 ///
-/// **The first dispatch is drawn from A5.5's wide band**
-/// (`docs/design/direct-messaging.md:1152`): a device that comes back with
-/// several interrupted correspondences enqueues one leg for each in one pass,
-/// and an immediate due time would put all of them on the wire at one instant.
-fn enqueue_leg(
+/// **What this is NOT, said plainly because the design names something larger.**
+/// A3.13 specifies *participation backoff*: a growing delay on the K-th
+/// completed re-establishment inside a sliding 24-hour window, decaying as the
+/// window slides. Neither the delay nor the decay is built. This is a flat
+/// count, held in memory and reset by a restart, that refuses past its ceiling
+/// and says so once — the emission bound A8.4 asks for, and not the rate-shaping
+/// A3.13 asks for.
+///
+/// Set at [`reest::ATTEMPT_CEILING`] because the two count the same exchanges
+/// from opposite ends: a correspondent whose window admits `C` initiations
+/// cannot legitimately ask for more than `C` answers in it.
+const RESPONSE_EMISSION_CAP: u32 = reest::ATTEMPT_CEILING;
+
+/// The most leg kinds one otherwise-unopenable slot is scanned against.
+///
+/// **This bounds the CANDIDATES, and each candidate bounds its own opens.**
+/// [`reest::scan_re_est`] and its siblings walk an attempt window of at most
+/// `MAX_GAP + 1` and refuse anything beyond it, which is their claim and is
+/// tested where they are; this one is the count of times that walk is entered
+/// for one slot. The product is the whole trial-decryption cost of a slot that
+/// is not a leg. It is a bound the tests assert rather than a knob.
+const LEG_SCAN_CANDIDATES: u64 = 4;
+
+/// What one slot's trial decryption as a re-establishment leg came to.
+///
+/// **Three answers, because "a leg opened" and "the fold finished" are different
+/// facts and the position depends on the second.** A slot the fold consumed is
+/// settled; a slot whose fold stopped part way is not, because the frame still
+/// has work to do and settling it would walk past the only copy of it. The
+/// earlier two-state version conflated them, so a store fault mid-fold silently
+/// discarded a peer initiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegOutcome {
+    /// No leg kind this side expects opened these bytes. Still a channel frame
+    /// that may open later, and counted unopenable exactly as before.
+    NotALeg,
+    /// A leg opened and the fold ran to its end. The position settles and
+    /// whatever the fold recorded is on disk.
+    Consumed,
+    /// A leg opened and the fold could not finish — a store fault, a module
+    /// fault, a counter that would not read. Nothing was committed, the position
+    /// stays unsettled, and the peer's own re-seed brings the frame back.
+    ///
+    /// **Bounded by the peer's ladder, not by anything here.** The frame is
+    /// re-presented until the peer's leg gives up (A3.8), which is the same
+    /// clock every other unopened position runs on.
+    Retry,
+}
+
+/// What a leg fold did, and what the front end is owed for it.
+struct LegFold {
+    outcome: LegOutcome,
+    effects: Vec<DmEffect>,
+}
+
+impl LegFold {
+    /// No leg here.
+    fn not_a_leg() -> Self {
+        Self {
+            outcome: LegOutcome::NotALeg,
+            effects: Vec::new(),
+        }
+    }
+
+    /// A leg opened, the fold finished, and there is nothing to tell the user.
+    fn consumed() -> Self {
+        Self {
+            outcome: LegOutcome::Consumed,
+            effects: Vec::new(),
+        }
+    }
+
+    /// A leg opened and the fold stopped part way.
+    fn retry() -> Self {
+        Self {
+            outcome: LegOutcome::Retry,
+            effects: Vec::new(),
+        }
+    }
+}
+
+/// One leg, opened and verified, with every borrow of the resume record already
+/// released.
+///
+/// **Owned rather than borrowed, and that is what the enum is for.** Choosing
+/// which leg kind to try reads the record — the slots, the roots, the window
+/// bases — and acting on what opened writes it. Carrying the result out as owned
+/// values ends the read before the write begins, so the two phases cannot be
+/// interleaved by accident.
+enum OpenedLeg {
+    /// The answer to an initiation of ours (step 5).
+    ReAck(reest::OpenedReAck),
+    /// The settlement of an exchange we answered (step 6).
+    ReConfirm(reest::OpenedReConfirm),
+    /// A peer initiation this side must answer (step 4).
+    ///
+    /// **The root travels with it, because there are two it can arrive under.**
+    /// A peer at rest seals under this side's committed root; a peer still
+    /// pushing an exchange this side has already answered seals under the root
+    /// that exchange started from, which by then is the *retained* one. The
+    /// answer has to be sealed under whichever it was, or the initiator opens
+    /// nothing.
+    ReEst {
+        /// The opened leg.
+        opened: reest::OpenedReEst,
+        /// The root it opened under, and the one its answer is sealed under.
+        root: CommittedRoot,
+    },
+    /// A peer initiation at a generation this side has already committed,
+    /// opened under the root it still retains (step 8, divergence row 14).
+    Regressed {
+        /// The committed generation the frame was sealed at.
+        generation: u32,
+        /// The attempt it re-presents.
+        attempt: Attempt,
+    },
+}
+
+/// Run one scan candidate, telling an ordinary miss apart from a fault.
+///
+/// **`.ok()` collapsed three different answers into one.** A leg that simply
+/// did not open under this candidate's key is the ordinary case and says
+/// nothing; a signature that did not verify is A3.8's anomaly — only a party
+/// holding the committed root can produce one — and a module or derivation fault
+/// is a sick crypto module. Silently trying the next candidate for all three
+/// hides the two that matter behind the one that does not.
+fn scanned<T>(result: Result<T, reest::ReEstError>, faults: &mut u64) -> Option<T> {
+    match result {
+        Ok(opened) => Some(opened),
+        // The bytes are not this leg kind, or not a leg at all. The scan's own
+        // uniform close-shape (ISC-A-S12) is deliberate and nothing is inferred
+        // from it.
+        Err(reest::ReEstError::DidNotOpen | reest::ReEstError::Truncated) => None,
+        Err(e) => {
+            *faults = faults.saturating_add(1);
+            crate::vtrace!("dm driver: a leg scan candidate faulted: {e}");
+            None
+        }
+    }
+}
+
+/// Try one otherwise-unopenable slot as the re-establishment leg (or legs) this
+/// side's own state expects.
+///
+/// **Every discriminator comes from this side's record; nothing is announced on
+/// the wire** (A3.9, `docs/design/direct-messaging.md:917`). A leg carries no
+/// clear field naming its kind, its generation or its attempt: the reader
+/// supplies the first two from what it is waiting for and the scan recovers the
+/// third by trial decryption over a window of at most `MAX_GAP + 1` attempts
+/// ascending from `last_seen` (A5.2).
+///
+/// **The candidate list, and why it is not always one.** A3.9 allows *"one
+/// bounded AEAD attempt per otherwise-unopenable frame with the expected
+/// generation's key, plus the contest key while a contest is live"*, and A3.5
+/// says what retention buys: *"the ability to open the peer's frames at the
+/// superseded generation"*. So:
+///
+/// 1. **`RE-ACK`, while our own initiation stands.** An occupied own slot means
+///    we are waiting for exactly this.
+/// 2. **`RE-CONFIRM`, while an acceptance of ours stands unconfirmed.** We
+///    answered a peer initiation and the exchange settles when its third leg
+///    arrives. Ahead of the `RE-EST` candidate because it is the more specific
+///    state: A5.1(ii)'s lock is about this exchange, and a party holding an
+///    unconfirmed candidate is waiting on its settlement rather than on a fresh
+///    initiation.
+/// 3. **`RE-EST` at one past our committed generation.** The at-rest case, and
+///    A3.9's *"contest key"* when candidate 1 also applies — a party holding its
+///    own initiation must still be able to open the peer's, or A3.7's coin never
+///    fires and both sides wait for each other.
+/// 4. **`RE-EST` at the generation an open exchange is at, under the retained
+///    `RS_n`.** A3.5 retains the superseded root for exactly this. It is what
+///    makes A3.4's idempotent re-serve and A5.1's supersede reachable at all —
+///    this side's committed root moves at the answer while the peer keeps
+///    sealing under the root the exchange started from — and, once the exchange
+///    is over, it is how the divergence table's row 14 is reached.
+///
+/// [`LEG_SCAN_CANDIDATES`] is the count, and each costs at most `MAX_GAP + 1`
+/// opens, so an unopenable slot costs a bounded constant however many arrive.
+///
+/// The record is read ONCE per swept page by the caller and threaded through
+/// here: it is a sealed blob carrying a signing key, and opening it per slot
+/// would pay that cost sixteen times for a page holding one leg.
+// Nine parameters against clippy's threshold of seven. Grouping them behind a
+// struct would name the same values twice — every one is a distinct input the
+// scan or the fold reads, and the two counters are out-parameters the caller
+// aggregates per page.
+#[allow(clippy::too_many_arguments)]
+fn fold_leg(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    record: &mut ResumeRecord,
+    now_ms: i64,
+    at: PagePosition,
+    encoded: &[u8],
+    peer_direction: Direction,
+    scans: &mut u64,
+    faults: &mut u64,
+) -> LegFold {
+    if encoded.len() != reest::LEG_LEN {
+        return LegFold::not_a_leg();
+    }
+    let seq = at.seq();
+    let peer_pk_pc = *record.pk_pc();
+    let opened = {
+        let dir = peer_direction;
+        let mut found = None;
+        if let Some(slot) = record.own_slot() {
+            *scans += 1;
+            found = scanned(
+                reest::scan_re_ack(
+                    record.committed_root(),
+                    dir,
+                    slot.generation(),
+                    seq,
+                    record.last_seen_re_ack(),
+                    encoded,
+                    &peer_pk_pc,
+                ),
+                faults,
+            )
+            .map(OpenedLeg::ReAck);
+        }
+        if found.is_none() {
+            if let Some(acceptance) = record.acceptance().filter(|a| !a.confirmed()) {
+                *scans += 1;
+                found = scanned(
+                    reest::scan_re_confirm(
+                        record.committed_root(),
+                        dir,
+                        acceptance.generation(),
+                        seq,
+                        record.last_seen_re_est(),
+                        encoded,
+                        &peer_pk_pc,
+                    ),
+                    faults,
+                )
+                .map(OpenedLeg::ReConfirm);
+            }
+        }
+        if found.is_none() {
+            *scans += 1;
+            found = scanned(
+                reest::scan_re_est(
+                    record.committed_root(),
+                    dir,
+                    record.reconnect_gen().saturating_add(1),
+                    seq,
+                    record.last_seen_re_est(),
+                    encoded,
+                    &peer_pk_pc,
+                ),
+                faults,
+            )
+            .map(|opened| OpenedLeg::ReEst {
+                opened,
+                root: record.committed_root().clone(),
+            });
+        }
+        if found.is_none() {
+            if let Some(retained) = record.retained() {
+                // **Which generation the retained root is speaking at depends on
+                // whether an exchange is open under it.** With an unconfirmed
+                // acceptance standing, this side has committed a candidate and
+                // its committed root has moved on — but the peer has not, and
+                // goes on re-emitting and re-attempting under `RS_n` at the
+                // exchange's own generation. With no acceptance standing, the
+                // exchange is over and a frame under `RS_n` is row 14.
+                let generation = record
+                    .acceptance()
+                    .map_or_else(|| record.reconnect_gen(), AcceptanceSlot::generation);
+                let root = retained.root().clone();
+                *scans += 1;
+                found = scanned(
+                    reest::scan_re_est(
+                        &root,
+                        dir,
+                        generation,
+                        seq,
+                        record.last_seen_re_est(),
+                        encoded,
+                        &peer_pk_pc,
+                    ),
+                    faults,
+                )
+                .map(|opened| {
+                    if generation > record.reconnect_gen() {
+                        OpenedLeg::ReEst { opened, root }
+                    } else {
+                        OpenedLeg::Regressed {
+                            generation,
+                            attempt: opened.attempt(),
+                        }
+                    }
+                });
+            }
+        }
+        found
+    };
+    let Some(opened) = opened else {
+        return LegFold::not_a_leg();
+    };
+    match opened {
+        OpenedLeg::ReAck(opened) => fold_re_ack(
+            persist,
+            correspondence,
+            record,
+            now_ms,
+            seq,
+            peer_direction,
+            opened,
+        ),
+        OpenedLeg::ReConfirm(opened) => fold_re_confirm(
+            persist,
+            correspondence,
+            record,
+            now_ms,
+            seq,
+            peer_direction,
+            opened,
+        ),
+        OpenedLeg::ReEst { opened, root } => fold_re_est(
+            persist,
+            correspondence,
+            record,
+            now_ms,
+            seq,
+            peer_direction,
+            opened,
+            &root,
+        ),
+        OpenedLeg::Regressed {
+            generation,
+            attempt,
+        } => fold_regressed(
+            persist,
+            correspondence,
+            record,
+            generation,
+            attempt,
+            seq,
+            peer_direction,
+        ),
+    }
+}
+
+/// The two counters a re-establishment reads off the outbox: the highest clear
+/// ratchet generation this side has persisted, and the sequence its next write
+/// takes.
+///
+/// **Read together, under one lock, because the pair is what the re-rooted
+/// ratchet is opened on.** Read apart they can straddle another write, and a
+/// generation paired with a sequence from a different moment opens a chain at a
+/// position the outbox has already spent.
+fn outbox_counters(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    direction: Direction,
+    now_ms: i64,
+) -> Option<(u32, u64)> {
+    match persist.update_outbox(label, direction, now_ms, |outbox| {
+        Ok(Mutation::Unchanged((
+            outbox.last_clear_gen(),
+            outbox.next_send_seq(),
+        )))
+    }) {
+        Ok(counters) => Some(counters),
+        Err(e) => {
+            crate::vtrace!("dm driver: the outbox counters would not read: {e}");
+            None
+        }
+    }
+}
+
+/// End every re-establishment leg still queued on this direction, and run the
+/// dead-chain sweep.
+///
+/// **Called at a completion, on both sides, and it is one of a leg's two
+/// terminal edges.** Both outbox sweeps skip legs, so an exchange that finished
+/// would otherwise leave its `RE-EST` and `RE-ACK` re-seeding on the ladder for
+/// the life of the record — writes for a handshake nobody is waiting on.
+/// [`Outbox::retire_leg`] is the right edge here and not
+/// [`Outbox::abandon_leg`]: the completion is proof the correspondent opened
+/// these legs.
+///
+/// **The settling leg is enqueued after this call, never before.** A
+/// `RE-CONFIRM` composed at the same completion is the one leg that still has
+/// work to do; retiring it in the same pass would end the exchange from the
+/// peer's point of view before the frame that tells the peer so had been sent.
+///
+/// **The dead-chain sweep rides the same lock, and it is not a second job.**
+/// A3.12 makes the sweep *"a derivation, not a transaction"*: entries sealed
+/// under a chain older than the committed re-root generation can never be
+/// opened, so they end Undelivered, and the condition is decidable from two
+/// persisted facts. Running it here is running it at the moment the second fact
+/// changed; `resume_channel` runs the identical derivation at every load, which
+/// is what makes a crash between the resume-record commit and this one heal
+/// itself rather than needing a transaction. The entries it ends carry
+/// `Surfacing::Owed`, so what the user is told is the next tick's `give_ups`
+/// re-offer rather than anything returned from here.
+fn retire_finished_legs(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    direction: Direction,
+    now_ms: i64,
+    reroot_ratchet_gen: u32,
+) {
+    let retired = persist.update_outbox(label, direction, now_ms, |outbox| {
+        let ended_chain = outbox.sweep_dead_chain(reroot_ratchet_gen);
+        let legs: Vec<u64> = outbox
+            .iter()
+            .filter(|entry| {
+                matches!(entry.target(), OutboxTarget::ReEstablishmentLeg)
+                    && entry.lifecycle().is_pending()
+            })
+            .map(OutboxEntry::seq)
+            .collect();
+        let mut ended = 0usize;
+        for seq in legs {
+            if outbox.retire_leg(seq) {
+                ended += 1;
+            }
+        }
+        Ok(if ended == 0 && ended_chain.is_empty() {
+            Mutation::Unchanged(ended)
+        } else {
+            Mutation::Changed(ended)
+        })
+    });
+    if let Err(e) = retired {
+        // The legs stay queued and keep re-seeding, which costs writes and loses
+        // nothing: the exchange is already committed, and the next completion or
+        // the next load offers them again.
+        crate::vtrace!("dm driver: the finished legs would not retire: {e}");
+    }
+}
+
+/// Whether a leg at `seq` has a record address on this side's plane.
+///
+/// Asked before [`OutboxEntry::emit`] spends a rung, and asked with the same
+/// derivation the publish below performs — the derivation is pure, so the two
+/// cannot disagree, and the alternative was carrying an address out of a closure
+/// that holds the record's lock.
+fn leg_addressable(address_root: &[u8; ADDRESS_ROOT_LEN], direction: Direction, seq: u64) -> bool {
+    match DmPageAddress::sending_on(address_root, direction, position_of(seq)) {
+        Ok(_) => true,
+        Err(e) => {
+            crate::vtrace!("dm driver: a queued leg has no derivable address: {e}");
+            false
+        }
+    }
+}
+
+/// Which end of the conversation a party sending on `direction` is.
+///
+/// The ratchet's own mapping run backwards, for the one caller that holds a
+/// direction and no key schedule: `AToB` is the party that knocked.
+fn role_for(send_direction: Direction) -> Role {
+    match send_direction {
+        Direction::AToB => Role::Initiator,
+        Direction::BToA => Role::Recipient,
+    }
+}
+
+/// Persist a record whose dedup memory a fold has just written to.
+///
+/// **Only a DISPOSITIONED path calls this**, and the distinction is A5.3's.
+/// Recording a frame as processed is the statement *this side has decided what
+/// this frame means* — dropped, locked, conceded to the coin. A fold that
+/// stopped on a store fault or a module fault decided nothing, and committing
+/// the key there would make the peer's re-seed inert while this side never
+/// answered it: the exchange would stall in silence, which A3.15 does not admit.
+/// Those paths return [`LegOutcome::Retry`] and write nothing.
+///
+/// `false` where the commit was refused, so the caller can leave the position
+/// unsettled rather than settling one whose memory did not land.
+fn commit_after_dedup(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    record: &ResumeRecord,
+) -> bool {
+    match persist.commit_resume(label, record) {
+        Ok(_) => true,
+        Err(e) => {
+            crate::vtrace!("dm driver: the processed-frame memory would not commit: {e}");
+            false
+        }
+    }
+}
+
+/// Queue a leg's stored bytes at the position they were sealed for, if the
+/// outbox does not already hold that position.
+///
+/// The re-emit half of A9.1(a), shared by every stored leg: the own slot's
+/// `RE-EST`, the acceptance slot's `RE-ACK` and the confirm slot's
+/// `RE-CONFIRM`. `true` where the entry is there afterwards, whether this call
+/// put it there or found it.
+fn requeue_leg(
     persist: &DmPersist,
     label: &CorrespondenceLabel,
     direction: Direction,
     now_ms: i64,
     seq: u64,
     bytes: &[u8],
-) -> Result<(), DmPersistError> {
-    persist.update_outbox(label, direction, now_ms, |outbox| {
+    dispatch: LegDispatch,
+) -> bool {
+    let queued = persist.update_outbox(label, direction, now_ms, |outbox| {
+        if outbox.entry(seq).is_some() {
+            return Ok(Mutation::Unchanged(true));
+        }
+        // The sequence was spent and its entry pruned. The bytes are bound to
+        // that position and cannot move to another, so there is no re-emit.
+        if outbox.next_send_seq() > seq {
+            return Ok(Mutation::Unchanged(false));
+        }
         let entry = outbox.enqueue_sealed(
             seq,
             OutboxTarget::ReEstablishmentLeg,
@@ -5598,9 +6683,531 @@ fn enqueue_leg(
             SealedFrame::new(bytes.to_vec()),
             0,
         )?;
-        entry.defer_first_dispatch(now_ms)?;
-        Ok(Mutation::Changed(()))
-    })
+        if matches!(dispatch, LegDispatch::ReconnectBand) {
+            entry.defer_first_dispatch(now_ms)?;
+        }
+        Ok(Mutation::Changed(true))
+    });
+    match queued {
+        Ok(queued) => queued,
+        Err(e) => {
+            crate::vtrace!("dm driver: a stored leg would not re-queue: {e}");
+            false
+        }
+    }
+}
+
+/// Step 4 and step 7: a peer `RE-EST` opened at a generation this side answers.
+///
+/// The order is the design's and is fixed
+/// (`docs/design/direct-messaging.md:893`, A5.3, A3.7, A9.4(ii), A3.14):
+/// `note_processed` → the contest → `ReEstGate::admit` with the response-emission
+/// budget → the answer → **commit** → enqueue. Nothing is emitted here; the
+/// enqueue puts the `RE-ACK` on this side's own ladder, which is what A4.2 means
+/// by *"reading updates local state and emits nothing in the same turn"*.
+#[allow(clippy::too_many_arguments)]
+fn fold_re_est(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    record: &mut ResumeRecord,
+    now_ms: i64,
+    seq: u64,
+    peer_direction: Direction,
+    opened: reest::OpenedReEst,
+    root: &CommittedRoot,
+) -> LegFold {
+    let label = correspondence.label;
+    let our_direction = peer_direction.opposite();
+    let generation = opened.generation();
+    let attempt = opened.attempt();
+    let key = DedupKey::new(generation, attempt, Leg::ReEst, peer_direction, seq);
+    let novelty = match record.note_processed(key) {
+        Ok(novelty) => novelty,
+        Err(e) => {
+            crate::vtrace!("dm driver: a peer initiation would not be recorded as seen: {e}");
+            return LegFold::retry();
+        }
+    };
+    if novelty == Novelty::Repeat {
+        // **A3.4: an accepted generation is inert, and the re-serve is the
+        // stored bytes on their own ladder.** Normally that ladder already holds
+        // them and this read causes nothing, which is A4.2. What it must not do
+        // is answer *quiet* while the answer is not queued at all: a crash
+        // between the commit that accepted the initiation and the enqueue leaves
+        // the only copy of the `RE-ACK` in the slot, and the peer's re-seed is
+        // the one thing that will ever ask for it again.
+        if let Some(slot) = record
+            .acceptance()
+            .filter(|slot| slot.generation() == generation && slot.attempt() == attempt)
+        {
+            let (slot_seq, bytes) = (slot.seq(), slot.sealed_re_ack().to_vec());
+            requeue_leg(
+                persist,
+                &label,
+                our_direction,
+                now_ms,
+                slot_seq,
+                &bytes,
+                LegDispatch::Ladder,
+            );
+        }
+        return LegFold::consumed();
+    }
+    let contest = match reest::contest_outcome(
+        root,
+        generation,
+        our_direction,
+        record.own_slot().map(OwnSlot::generation),
+    ) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            crate::vtrace!("dm driver: the tiebreak coin would not expand: {e}");
+            return LegFold::retry();
+        }
+    };
+    if contest == ContestOutcome::WeSurvive {
+        // A3.7: the coin's winner does nothing with the loser's frame and keeps
+        // waiting for the answer to its own. That is a disposition, so the
+        // memory of having seen it is owed to disk.
+        if !commit_after_dedup(persist, &label, record) {
+            return LegFold::retry();
+        }
+        return LegFold::consumed();
+    }
+    let answered = correspondence.re_acks_answered;
+    let mut charged = false;
+    let mut gate = ReEstGate::from_record(record);
+    let admission = gate.admit(generation, attempt, || {
+        if answered >= RESPONSE_EMISSION_CAP {
+            return false;
+        }
+        charged = true;
+        true
+    });
+    if admission == ReEstAdmission::Withheld {
+        // **Neither deduped nor settled**, because the admission's own contract
+        // says *"nothing was accepted, so the same attempt may be admitted
+        // later"*. Recording the key would make the very attempt the cap
+        // deferred inert when the cap frees, and settling the position would
+        // walk past the frame that carries it.
+        let mut effects = Vec::new();
+        if !correspondence.response_cap_surfaced {
+            correspondence.response_cap_surfaced = true;
+            effects.push(DmEffect::Emit(DmEvent::ReestablishmentAnomaly {
+                with: Box::new(*correspondence.pk_lt),
+                event: TrustEventKey::DmReestablishmentBackoffEngaged,
+            }));
+        }
+        return LegFold {
+            outcome: LegOutcome::Retry,
+            effects,
+        };
+    }
+    if admission != ReEstAdmission::Emit {
+        // Dropped, Locked and ReServe are dispositions: this side has decided
+        // what the frame means and will decide the same way next time.
+        crate::vtrace!("dm driver: a peer initiation was not admitted: {admission:?}");
+        if !commit_after_dedup(persist, &label, record) {
+            return LegFold::retry();
+        }
+        return LegFold::consumed();
+    }
+    let Some((_, our_seq)) = outbox_counters(persist, &label, our_direction, now_ms) else {
+        return LegFold::retry();
+    };
+    let eph_ek = *opened.eph_ek();
+    let authority = opened.answer();
+    let (rerooted, eph_ct) = match reest::answer(root, &eph_ek) {
+        Ok(pair) => pair,
+        Err(e) => {
+            crate::vtrace!("dm driver: the re-establishment answer would not encapsulate: {e}");
+            return LegFold::retry();
+        }
+    };
+    // **Sealed under the root the initiation opened under, which the scan
+    // carried here.** For a first answer that is this side's committed root, and
+    // the candidate committed below replaces it; for a supersede it is the
+    // retained `RS_n`, because the peer never saw the candidate and is still
+    // sealing under the root the exchange started from.
+    let re_ack = match reest::seal_re_ack(
+        root,
+        our_direction,
+        our_seq,
+        authority,
+        &eph_ct,
+        record.s_pc(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            crate::vtrace!("dm driver: the RE-ACK would not seal: {e}");
+            return LegFold::retry();
+        }
+    };
+    let slot = match AcceptanceSlot::accept(
+        generation,
+        attempt,
+        our_seq,
+        re_ack.clone().into_boxed_slice(),
+    ) {
+        Ok(slot) => slot,
+        Err(e) => {
+            crate::vtrace!("dm driver: the acceptance slot would not take the answer: {e}");
+            return LegFold::retry();
+        }
+    };
+    let abandon_own = contest == ContestOutcome::WeAbandon;
+    // **Read before the slot is emptied, and abandoned after the commit.** A3.7's
+    // loser *"abandons its own handshake"*, and the handshake is not only the
+    // slot: the leg it published is an outbox entry with its own ladder, which
+    // would go on re-seeding an initiation this side has just conceded. The
+    // coin's outcome is what ends it, because nothing else can — the give-up
+    // sweep skips legs.
+    let abandoned = abandon_own
+        .then(|| record.own_slot().map(OwnSlot::seq))
+        .flatten();
+    drop(record.accept_peer_initiation(rerooted.clone(), slot, abandon_own, now_ms));
+    if let Err(e) = persist.commit_resume(&label, record) {
+        // Nothing is on the wire and nothing is queued, so the peer's ladder
+        // re-presents the same initiation and the next sweep answers it.
+        crate::vtrace!("dm driver: the answered initiation would not commit: {e}");
+        return LegFold::retry();
+    }
+    if charged {
+        correspondence.re_acks_answered = answered.saturating_add(1);
+    }
+    if let Some(seq) = abandoned {
+        let ended = persist.update_outbox(&label, our_direction, now_ms, |outbox| {
+            let ended = outbox.abandon_leg(seq);
+            Ok(if ended {
+                Mutation::Changed(ended)
+            } else {
+                Mutation::Unchanged(ended)
+            })
+        });
+        if let Err(e) = ended {
+            crate::vtrace!("dm driver: the conceded initiation's leg would not end: {e}");
+        }
+    }
+    // **Held for the settlement, and only in memory.** The record at rest
+    // carries the candidate root; the ratchet root and the resumed channel's
+    // identifier are what A5.4 keeps out of every at-rest encoding, so the
+    // exchange has to reach its `RE-CONFIRM` inside one session for the channel
+    // to come back speakable.
+    correspondence.candidate = Some(rerooted);
+    requeue_leg(
+        persist,
+        &label,
+        our_direction,
+        now_ms,
+        our_seq,
+        &re_ack,
+        LegDispatch::Ladder,
+    );
+    LegFold::consumed()
+}
+
+/// Step 5: the answer to an initiation of ours opened.
+///
+/// A5.1(iii) first — an answer below our current attempt names a superseded
+/// exchange and is discarded, *"otherwise a late `RE-ACK` from a superseded
+/// attempt would let the initiator lock a root the responder has already
+/// discarded"*. Then the completion, in an order the two crash windows decide:
+/// the settling `RE-CONFIRM` is **sealed before the commit and persisted by
+/// it**, so a seal that fails leaves the record and the ratchet exactly as they
+/// were and the exchange is still drivable, and a crash after the commit
+/// re-emits stored bytes rather than needing bytes nobody can rebuild (A9.1(a)).
+/// The ratchet is installed last, after the leg is on disk.
+fn fold_re_ack(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    record: &mut ResumeRecord,
+    now_ms: i64,
+    seq: u64,
+    peer_direction: Direction,
+    opened: reest::OpenedReAck,
+) -> LegFold {
+    let label = correspondence.label;
+    let our_direction = peer_direction.opposite();
+    let generation = opened.generation();
+    let attempt = opened.attempt();
+    let key = DedupKey::new(generation, attempt, Leg::ReAck, peer_direction, seq);
+    match record.note_processed(key) {
+        Ok(Novelty::Novel) => {}
+        Ok(Novelty::Repeat) => return LegFold::consumed(),
+        Err(e) => {
+            crate::vtrace!("dm driver: an answer would not be recorded as seen: {e}");
+            return LegFold::retry();
+        }
+    }
+    let current = record.attempt().map_or(0, Attempt::get);
+    if attempt.get() < current {
+        crate::vtrace!(
+            "dm driver: an answer at attempt {} is below the current {current}",
+            attempt.get()
+        );
+        if !commit_after_dedup(persist, &label, record) {
+            return LegFold::retry();
+        }
+        return LegFold::consumed();
+    }
+    let Some((last_clear_gen, our_seq)) = outbox_counters(persist, &label, our_direction, now_ms)
+    else {
+        return LegFold::retry();
+    };
+    let Some(slot) = record.take_own_slot() else {
+        crate::vtrace!("dm driver: an answer arrived with no initiation to complete");
+        if !commit_after_dedup(persist, &label, record) {
+            return LegFold::retry();
+        }
+        return LegFold::consumed();
+    };
+    let rerooted =
+        match reest::complete(record.committed_root(), slot.into_eph_dk(), opened.eph_ct()) {
+            Ok(rerooted) => rerooted,
+            Err(e) => {
+                crate::vtrace!("dm driver: the answer would not decapsulate: {e}");
+                return LegFold::retry();
+            }
+        };
+    // **Ahead of the highest generation either record remembers.** The outbox
+    // carries the clear counter for frames it has sealed and the resume record
+    // carries the one a previous re-establishment opened at; a channel that has
+    // re-established without sending anything since has the second and not the
+    // first, so the floor is the larger of the two. A repeated generation would
+    // put two different roots on one number and rewrite a write-once page slot
+    // (A3.9, `docs/design/direct-messaging.md:917`).
+    let floor_gen = last_clear_gen.max(record.reroot_ratchet_gen());
+    let ratchet_gen = floor_gen.saturating_add(1);
+    let settled_generation = record.reconnect_gen().saturating_add(1);
+    // **Sealed BEFORE the commit, and under values the commit has not applied
+    // yet**: the successor root the commit is about to install, and the
+    // generation it is about to reach. A seal that fails here has changed
+    // nothing — the record still holds the initiation, the ratchet is still
+    // absent, and the peer's `RE-ACK` re-seeds into a later sweep that completes
+    // the exchange.
+    let confirm_bytes = match reest::seal_re_confirm(
+        rerooted.next(),
+        our_direction,
+        settled_generation,
+        our_seq,
+        attempt,
+        record.s_pc(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            crate::vtrace!("dm driver: the RE-CONFIRM would not seal: {e}");
+            return LegFold::retry();
+        }
+    };
+    let confirm = match ConfirmSlot::new(
+        settled_generation,
+        our_seq,
+        confirm_bytes.clone().into_boxed_slice(),
+    ) {
+        Ok(slot) => slot,
+        Err(e) => {
+            crate::vtrace!("dm driver: the settling leg would not bind to its position: {e}");
+            return LegFold::retry();
+        }
+    };
+    // A8.2's window rollover: the peer has opened one of our attempts, which is
+    // the one observation that moves the anchor.
+    let rolled = AttemptBudget::from_record(record).observe_peer_opened(attempt);
+    record.set_window_anchor(rolled.anchor());
+    let chan_id = record.commit_reestablished(rerooted.clone(), ratchet_gen, now_ms, confirm);
+    if let Err(e) = persist.commit_resume(&label, record) {
+        // The wire has seen nothing and the record on disk is unchanged, so the
+        // peer's `RE-ACK` re-seeds and a later sweep completes the exchange from
+        // the slot the next load reads back.
+        crate::vtrace!("dm driver: the completed re-establishment would not commit: {e}");
+        return LegFold::retry();
+    }
+    // Before the settling leg is queued, never after: the `RE-CONFIRM` is the
+    // one leg of this exchange that still has work to do.
+    retire_finished_legs(persist, &label, our_direction, now_ms, ratchet_gen);
+    requeue_leg(
+        persist,
+        &label,
+        our_direction,
+        now_ms,
+        our_seq,
+        &confirm_bytes,
+        LegDispatch::Ladder,
+    );
+    // **The chain opens one past the settling leg's own position.** A
+    // `RE-CONFIRM` rides the outbox at its own sequence, so the first content
+    // frame of the resumed channel takes the next one.
+    let ratchet = match Ratchet::reestablished(
+        &rerooted,
+        role_for(our_direction),
+        ReconnectSide::Initiated {
+            last_persisted_generation: floor_gen,
+        },
+        ratchet_gen,
+        our_seq.saturating_add(1),
+        &correspondence.address_root,
+    ) {
+        Ok(ratchet) => ratchet,
+        Err(e) => {
+            crate::vtrace!("dm driver: the resumed ratchet would not open: {e}");
+            return LegFold::consumed();
+        }
+    };
+    correspondence.ratchet = Some(ratchet);
+    correspondence.channel = Some(ChannelRoots { chan_id: *chan_id });
+    correspondence.candidate = None;
+    LegFold::consumed()
+}
+
+/// Step 6: the settlement of an exchange this side answered.
+///
+/// A3.6's confirming observation on the answering side, and A3.5's retirement
+/// fires with it: the candidate is confirmed, `reconnect_gen` advances, `RS_n`
+/// and the memory scoped to it go together, and both handshake slots empty — one
+/// act, one write.
+fn fold_re_confirm(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    record: &mut ResumeRecord,
+    now_ms: i64,
+    seq: u64,
+    peer_direction: Direction,
+    opened: reest::OpenedReConfirm,
+) -> LegFold {
+    let label = correspondence.label;
+    let our_direction = peer_direction.opposite();
+    let generation = opened.generation();
+    let attempt = opened.attempt();
+    let key = DedupKey::new(generation, attempt, Leg::ReConfirm, peer_direction, seq);
+    match record.note_processed(key) {
+        Ok(Novelty::Novel) => {}
+        Ok(Novelty::Repeat) => return LegFold::consumed(),
+        Err(e) => {
+            crate::vtrace!("dm driver: a settlement would not be recorded as seen: {e}");
+            return LegFold::retry();
+        }
+    }
+    let settles = record
+        .acceptance()
+        .is_some_and(|slot| slot.generation() == generation && slot.attempt() == attempt);
+    if !settles {
+        crate::vtrace!("dm driver: a settlement named an exchange this side is not holding");
+        if !commit_after_dedup(persist, &label, record) {
+            return LegFold::retry();
+        }
+        return LegFold::consumed();
+    }
+    let Some((last_clear_gen, our_seq)) = outbox_counters(persist, &label, our_direction, now_ms)
+    else {
+        return LegFold::retry();
+    };
+    let floor_gen = last_clear_gen.max(record.reroot_ratchet_gen());
+    let ratchet_gen = floor_gen.saturating_add(1);
+    if !record.confirm_acceptance(ratchet_gen) {
+        if !commit_after_dedup(persist, &label, record) {
+            return LegFold::retry();
+        }
+        return LegFold::consumed();
+    }
+    if let Err(e) = persist.commit_resume(&label, record) {
+        crate::vtrace!("dm driver: the settled re-establishment would not commit: {e}");
+        return LegFold::retry();
+    }
+    retire_finished_legs(persist, &label, our_direction, now_ms, ratchet_gen);
+    // **Without the candidate the record is correct and the channel is not
+    // speakable.** A restart between answering and settling loses the ratchet
+    // root and the resumed channel's identifier, which A5.4 keeps out of every
+    // at-rest encoding; the generation advanced and the retained root retired
+    // regardless. The pass is left owed so the next tick opens a fresh attempt,
+    // rather than the correspondence sitting addressable and mute until a
+    // restart.
+    let Some(candidate) = correspondence.candidate.take() else {
+        crate::vtrace!(
+            "dm driver: an exchange settled with no candidate in memory, so a fresh \
+             attempt is owed"
+        );
+        correspondence.resume_owed = true;
+        correspondence.resume_retry_due_ms = None;
+        return LegFold::consumed();
+    };
+    let ratchet = match Ratchet::reestablished(
+        &candidate,
+        role_for(our_direction),
+        ReconnectSide::Answered {
+            last_persisted_generation: floor_gen,
+            // The settling leg rode the peer's outbox at this position, so the
+            // first content frame of the resumed chain takes the next one.
+            peer_next_send_seq: seq.saturating_add(1),
+            // **What the peer's first frame under the re-rooted chain offers.**
+            // A leg carries no clear ratchet header, so nothing has offered a
+            // generation yet and this side passes its own; the offer arrives
+            // with the first content frame, which is unbuilt. The adoption rule
+            // lives in `Ratchet::reestablished` so the value has one meaning
+            // whichever side supplies it.
+            offered_generation: ratchet_gen,
+        },
+        ratchet_gen,
+        our_seq,
+        &correspondence.address_root,
+    ) {
+        Ok(ratchet) => ratchet,
+        Err(e) => {
+            crate::vtrace!("dm driver: the resumed ratchet would not open: {e}");
+            return LegFold::consumed();
+        }
+    };
+    correspondence.ratchet = Some(ratchet);
+    correspondence.channel = Some(ChannelRoots {
+        chan_id: *candidate.chan_id(),
+    });
+    LegFold::consumed()
+}
+
+/// Step 8, the divergence table's row 14: a peer initiation at a generation this
+/// side has already committed, opened under the root it still retains.
+///
+/// **Deduped, and loud once.** The exchange is settled here, so there is nothing
+/// to answer and nothing to supersede: the acceptance slot the frame names was
+/// zeroed by the completion. A3.8 classes *peer state regressed*
+/// `PersistentNonBlocking` and A3.15 admits no silent row, so the state is
+/// reported — but only on a **novel** frame. A5.3's memory is durable precisely
+/// so a co-host re-serving captured bytes cannot re-fire the alarm; surfacing
+/// before consulting it would hand that oracle straight back.
+fn fold_regressed(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    record: &mut ResumeRecord,
+    generation: u32,
+    attempt: Attempt,
+    seq: u64,
+    peer_direction: Direction,
+) -> LegFold {
+    let label = correspondence.label;
+    let key = DedupKey::new(generation, attempt, Leg::ReEst, peer_direction, seq);
+    match record.note_processed(key) {
+        Ok(Novelty::Novel) => {}
+        // Already seen at this position, so the frame is inert and says nothing
+        // new about the peer.
+        Ok(Novelty::Repeat) => return LegFold::consumed(),
+        Err(e) => {
+            crate::vtrace!("dm driver: a regressed initiation would not be recorded as seen: {e}");
+            return LegFold::retry();
+        }
+    }
+    if !commit_after_dedup(persist, &label, record) {
+        return LegFold::retry();
+    }
+    if correspondence.peer_regression_surfaced {
+        return LegFold::consumed();
+    }
+    correspondence.peer_regression_surfaced = true;
+    LegFold {
+        outcome: LegOutcome::Consumed,
+        effects: vec![DmEffect::Emit(DmEvent::ReestablishmentAnomaly {
+            with: Box::new(*correspondence.pk_lt),
+            event: TrustEventKey::DmPeerStateRegressed,
+        })],
+    }
 }
 
 /// Where the resume record's stored attempt stands against the outbox.
@@ -6106,6 +7713,15 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             // conversation as verifiable.
             peer_pk_pc: record.pk_pc().map(|pk_pc| Box::new(*pk_pc)),
             channel: None,
+            // The one addressing fact that survives a restart, and what makes
+            // the re-establishment plane reachable at all — see the field.
+            address_root: record.address_root(),
+            candidate: None,
+            re_acks_answered: 0,
+            response_cap_surfaced: false,
+            retire_ceiling_surfaced: false,
+            leg_give_up_surfaced: false,
+            peer_regression_surfaced: false,
             collection: Collection::resuming_from_page(page),
             read_through: 0,
             cursor_unreadable,
@@ -7375,9 +8991,9 @@ mod tests {
         let pk_lt: PkLt = Box::new(*knock.pk_lt());
         let peer_pk_pc = Box::new(*knock.pk_pc());
         let channel = ChannelRoots {
-            address_root: knock.roots().ar,
             chan_id: knock.roots().chan_id,
         };
+        let address_root = knock.roots().ar;
         let (label, ratchet) = m
             .persist
             .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
@@ -7389,6 +9005,13 @@ mod tests {
             signing_pc: Some(mint_pseudonym().expect("pseudonym")),
             peer_pk_pc: Some(peer_pk_pc),
             channel: Some(channel),
+            address_root,
+            candidate: None,
+            re_acks_answered: 0,
+            response_cap_surfaced: false,
+            retire_ceiling_surfaced: false,
+            leg_give_up_surfaced: false,
+            peer_regression_surfaced: false,
             collection: Collection::new(),
             read_through: 0,
             cursor_unreadable: false,
@@ -7495,9 +9118,9 @@ mod tests {
         let pk_lt: PkLt = Box::new(*knock.pk_lt());
         let peer_pk_pc = Box::new(*knock.pk_pc());
         let channel = ChannelRoots {
-            address_root: knock.roots().ar,
             chan_id: knock.roots().chan_id,
         };
+        let address_root = knock.roots().ar;
         let (label, ratchet) = m
             .persist
             .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
@@ -7511,6 +9134,13 @@ mod tests {
             signing_pc: Some(mint_pseudonym().expect("pseudonym")),
             peer_pk_pc: Some(peer_pk_pc),
             channel: Some(channel),
+            address_root,
+            candidate: None,
+            re_acks_answered: 0,
+            response_cap_surfaced: false,
+            retire_ceiling_surfaced: false,
+            leg_give_up_surfaced: false,
+            peer_regression_surfaced: false,
             collection: Collection::new(),
             read_through: 0,
             cursor_unreadable: false,
@@ -9511,11 +11141,7 @@ mod tests {
             );
             assert_eq!(
                 record.address_root(),
-                a.correspondences[0]
-                    .channel
-                    .as_ref()
-                    .expect("the knock opened a channel")
-                    .address_root,
+                a.correspondences[0].address_root,
                 "the record addresses a channel this driver is not using"
             );
             // The correspondent answers while this side is still running, so
@@ -10271,9 +11897,9 @@ mod tests {
         let pk_lt: PkLt = Box::new(*knock.pk_lt());
         let peer_pk_pc = Box::new(*knock.pk_pc());
         let channel = ChannelRoots {
-            address_root: knock.roots().ar,
             chan_id: knock.roots().chan_id,
         };
+        let address_root = knock.roots().ar;
         let (label, _ratchet) = m
             .persist
             .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
@@ -10287,6 +11913,13 @@ mod tests {
             signing_pc: None,
             peer_pk_pc: Some(peer_pk_pc),
             channel: Some(channel),
+            address_root,
+            candidate: None,
+            re_acks_answered: 0,
+            response_cap_surfaced: false,
+            retire_ceiling_surfaced: false,
+            leg_give_up_surfaced: false,
+            peer_regression_surfaced: false,
             collection: Collection::new(),
             read_through: 0,
             cursor_unreadable: false,
@@ -10676,7 +12309,7 @@ mod tests {
             &state,
             &channel.chan_id,
             ratchet.recv_direction(),
-            &channel.address_root,
+            &correspondence.address_root,
             signing_pc,
         )
         .expect("the record builds")
@@ -10696,7 +12329,7 @@ mod tests {
             &state,
             &channel.chan_id,
             ratchet.recv_direction(),
-            &channel.address_root,
+            &correspondence.address_root,
             &impostor,
         )
         .expect("the record builds")
@@ -12694,8 +14327,22 @@ mod tests {
 
     /// The sequence numbers whose queued frame is exactly `bytes`.
     fn queued_at_bytes(m: &DmMachine, label: &CorrespondenceLabel, bytes: &[u8]) -> Vec<u64> {
+        queued_at_bytes_at(m, label, bytes, BASE_MS)
+    }
+
+    /// The same, read at a named instant.
+    ///
+    /// [`queued_at_bytes`] pins the read at [`BASE_MS`]; an entry composed later
+    /// than that is refused as composed in the future, which is the store
+    /// correctly declining to read a record against a clock behind it.
+    fn queued_at_bytes_at(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        bytes: &[u8],
+        now_ms: i64,
+    ) -> Vec<u64> {
         m.persist
-            .read_outbox(label, BASE_MS)
+            .read_outbox(label, now_ms)
             .expect("the outbox reads")
             .expect("the outbox exists")
             .iter()
@@ -12799,6 +14446,39 @@ mod tests {
                 .map(daemonseed_core::dm::resume::OwnSlot::seq),
             Some(held_seq),
             "the record's stored sequence moved under a re-emit"
+        );
+
+        // **And the bytes that reach the wire are the same bytes.** The
+        // assertions above are about the record and the outbox; A9.1(a) is about
+        // what is published, and the publish is a separate step that could
+        // re-derive rather than re-send. The clock runs past the reconnect band
+        // because a leg's first dispatch is drawn from it (A5.5).
+        let mut clock = BASE_MS;
+        let mut published: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..4 {
+            clock += duration_as_ms(daemonseed_core::dm::outbox::RECONNECT_FIRST_DISPATCH) * 2;
+            published.extend(a.on_tick(clock).iter().filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::PublishPage { tag, frame, .. })
+                    if tag.seq == Some(held_seq) =>
+                {
+                    Some(frame.clone())
+                }
+                _ => None,
+            }));
+            if !published.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            published.len(),
+            1,
+            "the re-emitted leg was published {} times in the window",
+            published.len()
+        );
+        assert_eq!(
+            published[0],
+            after.sealed_re_est().expect("the slot holds its bytes"),
+            "the leg on the wire is not the leg in the record"
         );
     }
 
@@ -13398,17 +15078,19 @@ mod tests {
         );
     }
 
-    /// M54. **A queued leg does not burn its re-seed ladder while nothing can
-    /// dispatch it.**
+    /// M54. **A queued leg is published to this side's own direction record, and
+    /// never surfaces as a message that failed to arrive.**
     ///
-    /// `OutboxEntry::emit` advances the rung whatever the caller does with the
-    /// bytes, so a leg picked up by the due loop would walk `RESEED_LADDER` end
-    /// to end against a dispatch that does not exist. The clock here runs past
-    /// `GIVE_UP_MS`, which is where the second half of the claim lives: the
-    /// give-up sweep spares the target too, so the leg does not turn up as a
-    /// message that failed to arrive at a sequence the user never sent.
+    /// Three claims, and the clock runs past `GIVE_UP_MS` so all three are
+    /// reachable. The leg reaches the wire: it is addressed by
+    /// `msg_addr(dir, seq)` off the address root alone, which is the derivation a
+    /// party with no key schedule has (A3.2, A3.9). Its ladder advances, because
+    /// it is now a write like any other. And the give-up sweep still spares it,
+    /// so it does not turn up as a delivery failure at a sequence the user never
+    /// sent — the unsealed entry beside it is the control that says the sweep
+    /// ran at all.
     #[test]
-    fn a_queued_leg_does_not_advance_its_ladder() {
+    fn a_queued_leg_is_published_and_never_surfaced_as_a_lost_message() {
         let dir = tempfile::tempdir().expect("temp dir");
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let (a, _b, label) = established_initiator(&dir, &dir_b);
@@ -13435,10 +15117,21 @@ mod tests {
         // surfacing a user reads as a lost message.
         let mut clock = BASE_MS;
         let mut surfaced: Vec<u64> = Vec::new();
+        let mut published: Vec<u64> = Vec::new();
         while clock < BASE_MS + GIVE_UP_MS * 2 {
             clock += duration_as_ms(daemonseed_core::dm::outbox::RECONNECT_FIRST_DISPATCH) * 2;
-            surfaced.extend(undelivered_seqs(&a.on_tick(clock)));
+            let effects = a.on_tick(clock);
+            surfaced.extend(undelivered_seqs(&effects));
+            published.extend(effects.iter().filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::PublishPage { tag, .. }) if tag.seq == Some(seq) => Some(seq),
+                _ => None,
+            }));
         }
+        assert!(
+            !published.is_empty(),
+            "the leg was never published, so the ladder assertion below is about \
+             a write that does not happen"
+        );
         assert!(
             clock > BASE_MS + GIVE_UP_MS,
             "the clock never reached the give-up, so half this test is vacuous"
@@ -13461,15 +15154,1569 @@ mod tests {
             .expect("reads")
             .expect("there");
         let entry = outbox.entry(seq).expect("the leg is still queued");
-        assert_eq!(
-            entry.schedule().rung(),
-            0,
-            "the leg spent rungs of a ladder nothing is dispatching it on"
+        assert!(
+            entry.schedule().rung() > 0,
+            "the leg never spent a rung, so nothing dispatched it"
         );
         assert_eq!(
-            entry.delivery_state(),
+            published.len(),
+            entry.schedule().rung() as usize,
+            "the number of page writes and the rungs the ladder spent disagree, so \
+             something other than the dispatch moved one of them: {published:?}"
+        );
+    }
+
+    // ---- the re-establishment exchange, end to end (A3.2, A5.1, A3.7) ------
+
+    /// Everything one side needs to drive a re-establishment by hand: its
+    /// machine, its store label, and the direction its own outbox sends on.
+    struct Side {
+        machine: DmMachine,
+        label: CorrespondenceLabel,
+        /// Every sequence this side has reported Undelivered, across every tick
+        /// of the exchange.
+        ///
+        /// **Accumulated rather than read off one tick, because the report is
+        /// one-shot per session.** `give_ups` suppresses a repeat with
+        /// `offered_this_session`, so a fixture that ticks to drive the
+        /// handshake and then asks a later tick what was surfaced is asking
+        /// after the answer has already been given — and reads *nothing was
+        /// surfaced* for an entry that was.
+        surfaced: Vec<u64>,
+    }
+
+    impl Side {
+        /// The conversation both sides' records are tagged with.
+        fn conversation(&self) -> [u8; AR_FINGERPRINT_LEN] {
+            self.machine.correspondences[0]
+                .conversation()
+                .expect("the address root fingerprints")
+        }
+
+        /// This side's resume record.
+        fn resume(&self) -> ResumeRecord {
+            read_resume(&self.machine, &self.label)
+        }
+    }
+
+    /// Establish A and B, queue one message A cannot seal, then drop both
+    /// machines and rebuild them over the same stores.
+    ///
+    /// **The mail is queued before the drop and unsealed on purpose.** A4.2's
+    /// cause 2 is the only standing cause that opens a re-establishment: *"an
+    /// entry composed while no chain exists"*. Without one the load-time pass
+    /// finds nothing owed and opens no attempt, and every assertion below would
+    /// be about a handshake that never started.
+    fn restart_both(
+        dir_a: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+        pending_seq: u64,
+    ) -> (Side, Side) {
+        let (a, b, label_a) = established_initiator(dir_a, dir_b);
+        let label_b = b.correspondences[0].label;
+        queue_unsealed(&a, &label_a, Direction::AToB, pending_seq);
+        drop(a);
+        drop(b);
+
+        let machine_a = machine(dir_a);
+        machine_a
+            .persist
+            .provision_block_list()
+            .expect("provision A");
+        let machine_b = machine_as(peer_identity(), dir_b);
+        machine_b
+            .persist
+            .provision_block_list()
+            .expect("provision B");
+        assert_eq!(
+            machine_a.correspondences.len(),
+            1,
+            "A's store did not seed its correspondence back"
+        );
+        assert_eq!(
+            machine_b.correspondences.len(),
+            1,
+            "B's store did not seed its correspondence back"
+        );
+        assert!(
+            machine_a.correspondences[0].ratchet.is_none()
+                && machine_b.correspondences[0].ratchet.is_none(),
+            "a rebuilt machine came back holding a key schedule, so this is not a restart"
+        );
+        (
+            Side {
+                machine: machine_a,
+                label: label_a,
+                surfaced: Vec::new(),
+            },
+            Side {
+                machine: machine_b,
+                label: label_b,
+                surfaced: Vec::new(),
+            },
+        )
+    }
+
+    /// Long enough for a leg drawn from the reconnect band to be due.
+    ///
+    /// The band is `RECONNECT_FIRST_DISPATCH ± RECONNECT_JITTER_FRAC`, so its
+    /// top edge is the base plus three quarters of it; twice the base clears
+    /// that with room and does not depend on the draw.
+    fn past_the_reconnect_band(from_ms: i64) -> i64 {
+        from_ms + duration_as_ms(daemonseed_core::dm::outbox::RECONNECT_FIRST_DISPATCH) * 2
+    }
+
+    /// Every page write one batch of effects asks for, as `(seq, page, bytes)`.
+    fn page_writes(effects: &[DmEffect]) -> Vec<(u64, u64, Vec<u8>)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::PublishPage { tag, frame, .. }) => {
+                    Some((tag.seq?, tag.page?, frame.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Tick `from` until it writes a page, then hand every one of those writes
+    /// to `to` as a swept page and return what `to` made of them.
+    ///
+    /// **The clock is the sender's own, and it is advanced past the reconnect
+    /// band on the first tick and by the ladder's rungs after that.** A leg's
+    /// first dispatch is drawn from a band of hours (A5.5), so a fixture ticking
+    /// at second scale would report *"no leg was published"* for a leg that is
+    /// simply not due yet.
+    fn carry_one_leg(from: &mut Side, to: &mut Side, at_ms: i64) -> (Vec<DmEffect>, i64) {
+        let mut clock = at_ms;
+        let mut writes = Vec::new();
+        for _ in 0..8 {
+            clock = past_the_reconnect_band(clock);
+            let effects = from.machine.on_tick(clock);
+            from.surfaced.extend(undelivered_seqs(&effects));
+            writes = page_writes(&effects);
+            if !writes.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            writes.len(),
+            1,
+            "expected exactly one page write to carry, got {}",
+            writes.len()
+        );
+        let (seq, page, bytes) = writes.remove(0);
+        let conversation = to.conversation();
+        let folded = fold_page_at(
+            &mut to.machine,
+            clock,
+            conversation,
+            page,
+            vec![(position_of(seq), bytes)],
+        );
+        (folded, clock)
+    }
+
+    /// M68. **A correspondence survives a restart of BOTH stores: three legs,
+    /// one committed root on each side, and the retained root retired on the
+    /// answering side's confirming observation.**
+    ///
+    /// Nothing here is a fixture past the establishment. The `RE-EST` B opens is
+    /// the frame A's load-time pass sealed and published; the `RE-ACK` A opens is
+    /// the one B's answer sealed; the `RE-CONFIRM` B settles on is the one A's
+    /// completion sealed. Every discriminator each side needs — the leg kind, the
+    /// generation, the attempt — comes from its own record, because a leg carries
+    /// none of them (A3.9).
+    ///
+    /// **What is asserted, and why each one:**
+    ///
+    /// - both sides reach `reconnect_gen` 1, which is A3.4's *"advances only by a
+    ///   completed handshake"* observed from both ends;
+    /// - both hold a key schedule again, so the exchange produced a channel and
+    ///   not merely a record;
+    /// - B's retained `RS_0` is **gone**, which is A3.5's retirement at the
+    ///   confirming observation, and A's is **still held**, because its own
+    ///   confirming observation is an acknowledgement that has not happened;
+    /// - both handshake slots are empty on both sides (A3.14);
+    /// - the entry sealed under the dead chain ends Undelivered exactly once
+    ///   (A3.12), and the pending unsealed entry does not — it was never sealed
+    ///   under any chain.
+    #[test]
+    fn two_drivers_survive_a_restart_of_both_stores() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        // Sealed under the chain the restart destroyed, so the sweep must end it
+        // once the re-root generation is committed. Queued at a sequence above
+        // the pending one so the leg's own position is not the one under test.
+        queue_at_generation(&a.machine, &a.label, Direction::AToB, 2, 0);
+
+        // ── A opens an attempt at load, and publishes it a band later ────────
+        a.machine.on_tick(BASE_MS);
+        let opened = a.resume();
+        assert_eq!(
+            opened.attempt().map(Attempt::get),
+            Some(1),
+            "A's load-time pass opened no attempt, so there is no handshake to carry"
+        );
+
+        // ── leg 1: A → B, the RE-EST ─────────────────────────────────────────
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let answered = b.resume();
+        let acceptance = answered
+            .acceptance()
+            .expect("B did not answer A's initiation");
+        assert_eq!(
+            (acceptance.generation(), acceptance.attempt().get()),
+            (1, 1),
+            "B accepted an exchange other than the one A opened"
+        );
+        assert!(
+            !acceptance.confirmed(),
+            "B locked the candidate before any frame opened under the re-rooted chain"
+        );
+        assert_eq!(
+            answered.reconnect_gen(),
+            0,
+            "B advanced its generation on an exchange it had only answered"
+        );
+        assert!(
+            answered.retained().is_some(),
+            "B committed a candidate without retaining the root it supersedes"
+        );
+
+        // ── leg 2: B → A, the RE-ACK ─────────────────────────────────────────
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        let completed = a.resume();
+        assert_eq!(
+            completed.reconnect_gen(),
+            1,
+            "A did not complete on the answer to its own initiation"
+        );
+        assert!(
+            completed.own_slot().is_none(),
+            "A completed and kept its initiation slot"
+        );
+        assert!(
+            a.machine.correspondences[0].ratchet.is_some(),
+            "A committed a root and opened no chain on it"
+        );
+        assert!(
+            completed.retained().is_some(),
+            "A retired RS_0 with no confirming observation of its own"
+        );
+
+        // ── leg 3: A → B, the RE-CONFIRM ─────────────────────────────────────
+        let (_, t3) = carry_one_leg(&mut a, &mut b, t2);
+        let settled = b.resume();
+        assert_eq!(
+            settled.reconnect_gen(),
+            1,
+            "B did not advance its generation on the settling leg"
+        );
+        assert!(
+            settled.acceptance().is_none(),
+            "B settled the exchange and kept the acceptance slot"
+        );
+        assert!(
+            settled.retained().is_none(),
+            "B kept RS_0 past its confirming observation"
+        );
+        assert!(
+            b.machine.correspondences[0].ratchet.is_some(),
+            "B settled the exchange and opened no chain"
+        );
+        assert_eq!(
+            settled.committed_root().as_bytes(),
+            completed.committed_root().as_bytes(),
+            "the two sides committed different roots"
+        );
+
+        // ── the dead chain is surfaced exactly once ──────────────────────────
+        //
+        // **Across every tick, not the last one.** The sweep fires inside the
+        // fold that completed the exchange, so the report goes out on the next
+        // tick of the run — which is one of the ticks that carried the third
+        // leg. Asking afterwards asks after the answer.
+        for _ in 0..3 {
+            let effects = a.machine.on_tick(t3 + 1);
+            a.surfaced.extend(undelivered_seqs(&effects));
+        }
+        assert_eq!(
+            a.surfaced,
+            vec![2],
+            "the entry sealed under the dead chain was not surfaced exactly once: {:?}",
+            a.surfaced
+        );
+
+        // ── no leg outlives the exchange ─────────────────────────────────────
+        //
+        // Both outbox sweeps skip legs, so a completion that did not end them
+        // leaves the handshake re-seeding for the life of the record. The tick
+        // loop past the give-up is the positive control: it would publish them
+        // if any were still pending, and it is also where a leg-scoped give-up
+        // would fire if one had been left behind.
+        assert_eq!(
+            outbox_state(&a.machine, &a.label, 1, t3 + 1),
             DeliveryState::Composed,
-            "the leg reported a delivery state a user message would report"
+            "the unsealed entry was ended by a sweep it hangs off no chain for"
+        );
+
+        // The answering side is finished with every leg the moment it settles.
+        assert_eq!(
+            pending_legs(&b.machine, &b.label, t3 + 1),
+            Vec::<u64>::new(),
+            "the settling side left a leg re-seeding after the exchange completed"
+        );
+        // The initiating side keeps exactly one: the settling leg it is still
+        // owed a confirming observation for (A3.6). Its `RE-EST` is finished
+        // with, and so is everything before it.
+        let owed = a
+            .resume()
+            .confirm_slot()
+            .expect("the completion persisted a settling leg")
+            .seq();
+        assert_eq!(
+            pending_legs(&a.machine, &a.label, t3 + 1),
+            vec![owed],
+            "the initiating side kept a leg the exchange finished with"
+        );
+
+        // Past the give-up, nothing is pending on either side and nothing is
+        // published: A3.13 forbids a terminal state, so the last leg ends
+        // through its own give-up rather than re-seeding for ever.
+        let mut clock = t3 + 1;
+        let mut leg_writes = 0usize;
+        for _ in 0..4 {
+            clock += GIVE_UP_MS / 2;
+            for side in [&mut a, &mut b] {
+                let effects = side.machine.on_tick(clock);
+                leg_writes += effects
+                    .iter()
+                    .filter(|e| {
+                        matches!(e, DmEffect::Dht(DhtOp::PublishPage { tag, .. })
+                            if tag.seq == Some(owed))
+                    })
+                    .count();
+            }
+        }
+        assert!(
+            leg_writes <= 1,
+            "the settling leg was published {leg_writes} times past its give-up"
+        );
+        for side in [&a, &b] {
+            assert_eq!(
+                pending_legs(&side.machine, &side.label, clock),
+                Vec::<u64>::new(),
+                "a leg outlived its give-up"
+            );
+        }
+    }
+
+    /// Tick one side until it writes a page, and hand back every write with the
+    /// clock it happened at. The other half of [`carry_one_leg`], for the cases
+    /// that need both sides to write before either reads.
+    fn publish_one_leg(side: &mut Side, at_ms: i64) -> (u64, u64, Vec<u8>, i64) {
+        let mut clock = at_ms;
+        let mut writes = Vec::new();
+        for _ in 0..8 {
+            clock = past_the_reconnect_band(clock);
+            let effects = side.machine.on_tick(clock);
+            side.surfaced.extend(undelivered_seqs(&effects));
+            writes = page_writes(&effects);
+            if !writes.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(writes.len(), 1, "expected exactly one page write");
+        let (seq, page, bytes) = writes.remove(0);
+        (seq, page, bytes, clock)
+    }
+
+    /// Deliver one already-published leg to a side as a swept page.
+    fn deliver(to: &mut Side, at_ms: i64, seq: u64, page: u64, bytes: Vec<u8>) -> Vec<DmEffect> {
+        let conversation = to.conversation();
+        fold_page_at(
+            &mut to.machine,
+            at_ms,
+            conversation,
+            page,
+            vec![(position_of(seq), bytes)],
+        )
+    }
+
+    /// M56. **Simultaneous initiation is decided by the coin: one side abandons
+    /// and answers, the other ignores, and both end on one root.**
+    ///
+    /// A3.7's contest, reached the way the design says it is reached — *"a party
+    /// consults its own resume record; if it holds a pending initiation at the
+    /// same generation, the contest fires at that moment, locally"*. Both sides
+    /// hold mail they cannot seal, so both open an attempt at load and both
+    /// publish before either reads.
+    ///
+    /// **The asymmetry is the assertion.** The coin is a function of the shared
+    /// retained root and the generation, so both sides compute the same winner
+    /// without exchanging anything — which means exactly one acceptance slot is
+    /// occupied after the two frames cross. Asserting *"one of the two"* rather
+    /// than naming a side is deliberate: the winner depends on the root the
+    /// fixture's establishment produced, and pinning it would be pinning the
+    /// fixture rather than the rule.
+    #[test]
+    fn simultaneous_initiation_is_decided_by_the_coin() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        queue_unsealed(&b.machine, &b.label, Direction::BToA, 1);
+
+        a.machine.on_tick(BASE_MS);
+        b.machine.on_tick(BASE_MS);
+        assert_eq!(
+            (
+                a.resume().attempt().map(Attempt::get),
+                b.resume().attempt().map(Attempt::get)
+            ),
+            (Some(1), Some(1)),
+            "both sides must have opened an attempt, or there is no contest to decide"
+        );
+
+        // Both publish before either reads, which is the crossing case.
+        let (a_seq, a_page, a_bytes, t1) = publish_one_leg(&mut a, BASE_MS);
+        let (b_seq, b_page, b_bytes, t2) = publish_one_leg(&mut b, BASE_MS);
+        let at = t1.max(t2);
+        deliver(&mut b, at, a_seq, a_page, a_bytes);
+        deliver(&mut a, at, b_seq, b_page, b_bytes);
+
+        let a_after = a.resume();
+        let b_after = b.resume();
+        let answered: Vec<&str> = [("A", &a_after), ("B", &b_after)]
+            .into_iter()
+            .filter(|(_, r)| r.acceptance().is_some())
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            answered.len(),
+            1,
+            "the coin left {} sides answering, so both or neither committed a \
+             candidate: {answered:?}",
+            answered.len()
+        );
+        let (loser, winner) = if answered == ["A"] {
+            (&mut a, &mut b)
+        } else {
+            (&mut b, &mut a)
+        };
+        assert!(
+            loser.resume().own_slot().is_none(),
+            "the coin's loser answered and kept its own initiation"
+        );
+        assert!(
+            winner.resume().own_slot().is_some(),
+            "the coin's winner dropped the initiation it is still waiting on"
+        );
+
+        // The winner's own exchange completes: the loser's RE-ACK, then the
+        // winner's RE-CONFIRM.
+        let (_, t3) = carry_one_leg(loser, winner, at);
+        let (_, _t4) = carry_one_leg(winner, loser, t3);
+        assert_eq!(
+            (
+                winner.resume().reconnect_gen(),
+                loser.resume().reconnect_gen()
+            ),
+            (1, 1),
+            "the contest did not converge on one completed handshake"
+        );
+        assert_eq!(
+            winner.resume().committed_root().as_bytes(),
+            loser.resume().committed_root().as_bytes(),
+            "the two sides committed different roots out of one contest"
+        );
+
+        // **The winner's memory of the frame it ignored is DURABLE.** A3.7 has
+        // the winner do nothing with the loser's `RE-EST`, and A5.3 makes doing
+        // nothing a decision that has to survive a restart: without the key on
+        // disk the same bytes are byte-novel again at the next load, and a
+        // co-host holding them can drive the alarm the memory exists to refuse.
+        // Read back through a rebuilt machine, because an in-memory check would
+        // pass for a record that was never written.
+        let winner_dir = if answered == ["A"] { &dir_b } else { &dir_a };
+        let reloaded = read_resume(
+            &machine_as(
+                if answered == ["A"] {
+                    peer_identity()
+                } else {
+                    keys()
+                },
+                winner_dir,
+            ),
+            &winner.label,
+        );
+        assert!(
+            reloaded
+                .dedup()
+                .keys()
+                .iter()
+                .any(|key| key.leg() == Leg::ReEst),
+            "the coin's winner did not persist the initiation it ignored: {:?}",
+            reloaded.dedup().keys()
+        );
+    }
+
+    /// M57. **A replayed first leg is deduped: no second answer is sealed, and
+    /// the stored one is untouched.**
+    ///
+    /// A3.4 in two halves. *"A byte-identical replay of an accepted generation's
+    /// `RE-EST` is answered idempotently: the stored `RE-ACK` is re-served,
+    /// byte-identical"* — so the bytes in the acceptance slot must be the same
+    /// after the replay as before it, because they are the only copy and the leg
+    /// carries a randomized ML-KEM ciphertext that cannot be reproduced. And
+    /// A4.2: *"reading updates local state and emits nothing in the same turn"*
+    /// — so the replay must not put a second `RE-ACK` in the outbox, however
+    /// many times it arrives.
+    ///
+    /// **The dedup memory's own count is the positive control.** Without it,
+    /// *"no second answer"* is satisfied by a machine that never looked at the
+    /// second frame at all.
+    #[test]
+    fn a_replayed_first_leg_is_deduped_and_answered_from_the_stored_bytes() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (seq, page, bytes, t1) = publish_one_leg(&mut a, BASE_MS);
+
+        deliver(&mut b, t1, seq, page, bytes.clone());
+        let first = b.resume();
+        let stored = first
+            .acceptance()
+            .expect("B did not answer the initiation")
+            .sealed_re_ack()
+            .to_vec();
+        let seen_once = first.dedup().len();
+        let first_keys = first.dedup().keys().to_vec();
+        assert_eq!(
+            seen_once, 1,
+            "the answer recorded {seen_once} processed frames, so the memory the \
+             replay must hit is not the one under test"
+        );
+        let queued_once = leg_entries(&b.machine, &b.label, t1);
+        assert_eq!(
+            queued_once.len(),
+            1,
+            "B queued {} legs for one initiation: {queued_once:?}",
+            queued_once.len()
+        );
+
+        // **B is restarted before the replay, and that is what puts the durable
+        // memory in the path rather than the collection.** Inside one session a
+        // settled position is filtered out of every later sweep, so the same
+        // bytes never reach the scan at all — the exactly-once property there
+        // belongs to `Collection`, not to A5.3. The memory is *durable*
+        // precisely for the case the collection cannot cover: a restart rebuilds
+        // the collection from the stored cursor, the position comes back
+        // unsettled, and the replay does reach the scan.
+        b.machine = machine_as(peer_identity(), &dir_b);
+        b.machine
+            .persist
+            .provision_block_list()
+            .expect("provision B");
+        assert_eq!(
+            b.resume().dedup().len(),
+            seen_once,
+            "the processed-frame memory did not survive the restart, so the replay \
+             below meets an empty one and the dedup is not what refuses it"
+        );
+
+        // The identical bytes, at the identical position, twice.
+        //
+        // **The replay must actually OPEN, or every assertion below is
+        // vacuous.** B committed a candidate when it answered, so its committed
+        // root has moved past the one these bytes were sealed under; the frame
+        // reaches the dedup only because the scan also tries the retained root
+        // at the generation the exchange is at. `unopenable` is what says it
+        // did: a slot the scan could not place counts there, and a leg it placed
+        // does not.
+        let before_unopenable = b.machine.correspondences[0].health.unopenable;
+        let before_scans = b.machine.leg_scan_candidates;
+        // Every slot this stretch of the test hands to the scan, so the bound
+        // below is measured against what actually happened.
+        let mut delivered: Vec<u64> = Vec::new();
+        let replay_one = deliver(&mut b, t1, seq, page, bytes.clone());
+        delivered.push(seq);
+        let replay_two = deliver(&mut b, t1, seq, page, bytes.clone());
+        delivered.push(seq);
+        assert_eq!(
+            b.machine.correspondences[0].health.unopenable, before_unopenable,
+            "the replayed leg was not opened at all, so nothing below is a test of \
+             what happens when it is"
+        );
+        // **A4.2: reading emits nothing in the same turn.** A replay that put an
+        // operation on the wire would be the page-to-page confirmation oracle
+        // A4.2 exists to remove, whatever it did to the record.
+        let writes: Vec<&DmEffect> = replay_one
+            .iter()
+            .chain(replay_two.iter())
+            .filter(|e| matches!(e, DmEffect::Dht(_)))
+            .collect();
+        assert!(
+            writes.is_empty(),
+            "the replay caused {} operation(s) in the same turn: {writes:?}",
+            writes.len()
+        );
+        // **The positive control for `unopenable`.** Without it, "the count did
+        // not move" is satisfied by a machine that never scanned at all. A
+        // leg-length run of bytes that is not a leg is exactly what the scan is
+        // asked to reject, and it is the only shape that reaches every
+        // candidate.
+        let garbage = position_of(seq).seq() + 1;
+        deliver(
+            &mut b,
+            t1,
+            garbage,
+            position_of(garbage).page(),
+            vec![0xA5u8; daemonseed_core::dm::reest::LEG_LEN],
+        );
+        delivered.push(garbage);
+        assert_eq!(
+            b.machine.correspondences[0].health.unopenable,
+            before_unopenable + 1,
+            "a leg-length slot that is not a leg was not counted unopenable, so the \
+             count above proves nothing"
+        );
+        // **A3.9's bounded trial cost, counted in CANDIDATES.** What is measured
+        // here is how many leg kinds one slot is scanned against; each of those
+        // bounds its own attempt window inside `reest`, which is a separate
+        // claim with its own tests there and is not asserted from this layer.
+        //
+        // The slot count is derived from the deliveries above rather than
+        // written down beside them: a fixture that grew a delivery and left a
+        // literal behind would raise the real cost and keep passing.
+        let slots = u64::try_from(delivered.len()).expect("a small fixture");
+        assert_eq!(slots, 3, "the fixture's deliveries and its count disagree");
+        assert!(
+            b.machine.leg_scan_candidates - before_scans <= LEG_SCAN_CANDIDATES * slots,
+            "{slots} swept slots cost {} leg-scan candidates, above the bound of {}",
+            b.machine.leg_scan_candidates - before_scans,
+            LEG_SCAN_CANDIDATES * slots
+        );
+
+        let after = b.resume();
+        // **The KEYS, not the count.** A memory that dropped one position and
+        // added another keeps its length and loses the entry that stops a
+        // co-host re-firing the alarm — which is the shrink A5.3 forbids while
+        // the root is retained, arriving through a comparison that cannot see
+        // it.
+        assert_eq!(
+            after.dedup().keys(),
+            first_keys.as_slice(),
+            "a byte-identical replay changed the processed-frame memory"
+        );
+        assert_eq!(after.dedup().len(), seen_once);
+        assert_eq!(
+            after
+                .acceptance()
+                .expect("the acceptance survived the replay")
+                .sealed_re_ack(),
+            stored.as_slice(),
+            "the replay re-sealed the answer instead of leaving the stored bytes alone"
+        );
+        assert_eq!(
+            leg_entries(&b.machine, &b.label, t1),
+            queued_once,
+            "the replay queued a second answer"
+        );
+    }
+
+    /// The sequences of every re-establishment leg still awaiting collection.
+    fn pending_legs(m: &DmMachine, label: &CorrespondenceLabel, now_ms: i64) -> Vec<u64> {
+        m.persist
+            .read_outbox(label, now_ms)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .iter()
+            .filter(|entry| {
+                matches!(entry.target(), OutboxTarget::ReEstablishmentLeg)
+                    && entry.lifecycle().is_pending()
+            })
+            .map(OutboxEntry::seq)
+            .collect()
+    }
+
+    /// The sequences of every re-establishment leg queued on one side.
+    fn leg_entries(m: &DmMachine, label: &CorrespondenceLabel, now_ms: i64) -> Vec<u64> {
+        m.persist
+            .read_outbox(label, now_ms)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .iter()
+            .filter(|entry| matches!(entry.target(), OutboxTarget::ReEstablishmentLeg))
+            .map(OutboxEntry::seq)
+            .collect()
+    }
+
+    /// Move the acceptance slot's stored answer onto an unspent sequence,
+    /// leaving its bytes alone, and hand back the sequence.
+    ///
+    /// **This is what a crash between the accepting commit and the enqueue looks
+    /// like from the record's side.** The slot names a position and the outbox
+    /// has not spent it, which is the only state a re-queue can recover: a
+    /// position the outbox HAS spent is `LegState::Stale`, where the bytes are
+    /// bound to a number they can never go back to. Retiring the queued entry
+    /// instead would produce the second state while claiming to test the first.
+    fn reseat_acceptance(m: &DmMachine, label: &CorrespondenceLabel, seq: u64) -> u64 {
+        let stored = read_resume(m, label);
+        let slot = stored.acceptance().expect("an acceptance to move");
+        let moved = rebuilt(
+            &stored,
+            ReEstState {
+                reconnect_gen: stored.reconnect_gen(),
+                attempt: stored.attempt().map_or(0, Attempt::get),
+                last_seen_re_est: stored.last_seen_re_est(),
+                own: None,
+                acceptance: Some(
+                    AcceptanceSlot::accept(
+                        slot.generation(),
+                        slot.attempt(),
+                        seq,
+                        slot.sealed_re_ack().to_vec().into_boxed_slice(),
+                    )
+                    .expect("within the ceiling"),
+                ),
+                confirm: None,
+                attempt_at_window_start: stored.attempt_at_window_start(),
+                reroot_ratchet_gen: stored.reroot_ratchet_gen(),
+            },
+        );
+        m.persist
+            .commit_resume(label, &moved)
+            .expect("moving a slot's position commits");
+        seq
+    }
+
+    /// The same, for the settling leg's slot.
+    fn reseat_confirm(m: &DmMachine, label: &CorrespondenceLabel, seq: u64) -> u64 {
+        let stored = read_resume(m, label);
+        let slot = stored.confirm_slot().expect("a settling leg to move");
+        let moved = rebuilt(
+            &stored,
+            ReEstState {
+                reconnect_gen: stored.reconnect_gen(),
+                attempt: stored.attempt().map_or(0, Attempt::get),
+                last_seen_re_est: stored.last_seen_re_est(),
+                own: None,
+                acceptance: None,
+                confirm: Some(
+                    ConfirmSlot::new(
+                        slot.generation(),
+                        seq,
+                        slot.sealed().to_vec().into_boxed_slice(),
+                    )
+                    .expect("within the ceiling"),
+                ),
+                attempt_at_window_start: stored.attempt_at_window_start(),
+                reroot_ratchet_gen: stored.reroot_ratchet_gen(),
+            },
+        );
+        m.persist
+            .commit_resume(label, &moved)
+            .expect("moving a slot's position commits");
+        seq
+    }
+
+    /// One record with a replacement handshake state, every other field carried
+    /// across so the store's guards compare like with like.
+    fn rebuilt(stored: &ResumeRecord, handshake: ReEstState) -> ResumeRecord {
+        ResumeRecord::new(
+            Box::new(*stored.s_pc()),
+            Box::new(*stored.pk_pc()),
+            stored.committed_root().clone(),
+            handshake,
+            Retention {
+                retained: stored.retained().map(|held| {
+                    daemonseed_core::dm::resume::RetainedRoot::new(
+                        held.root().clone(),
+                        held.superseded_at_ms(),
+                    )
+                }),
+                dedup: stored.dedup().clone(),
+                stopped: stored.retained_but_stopped(),
+            },
+            stored.send_floor(),
+        )
+    }
+
+    /// Every effect in a batch that is a re-establishment anomaly, with its key.
+    fn anomalies(effects: &[DmEffect]) -> Vec<TrustEventKey> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::ReestablishmentAnomaly { event, .. }) => Some(*event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M58. **A leg unanswered to its give-up ends, says so once, and the next
+    /// pass opens the successor attempt.**
+    ///
+    /// A3.8's *re-establishment failed*, with A3.13's *"no terminal state"* as
+    /// the second half: the entry leaves the wire, the attempt counter stands so
+    /// the successor cannot reuse a number the peer may have answered, and the
+    /// load-time pass is left owed rather than stopped. The user is told through
+    /// the classed event and NOT through the undelivered list — a leg sits at a
+    /// sequence they composed nothing at.
+    #[test]
+    fn a_leg_that_reaches_its_give_up_ends_and_the_next_pass_re_opens() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, _b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let opened = a.resume();
+        let seq = opened.own_slot().expect("an attempt is open").seq();
+        assert_eq!(opened.attempt().map(Attempt::get), Some(1));
+
+        // Nobody ever answers. Past the seven days the leg's own entry carries.
+        let past = BASE_MS + GIVE_UP_MS + 1;
+        let effects = a.machine.on_tick(past);
+        assert_eq!(
+            anomalies(&effects),
+            vec![TrustEventKey::DmReestablishmentFailed],
+            "the give-up was silent: {effects:?}"
+        );
+        // The unsealed message beside it IS a user message and gives up at seven
+        // days like any other, which is the control that says the sweep ran at
+        // all. The leg's own sequence must not be in that list.
+        let surfaced = undelivered_seqs(&effects);
+        assert!(
+            surfaced.contains(&1),
+            "the give-up sweep never fired, so the leg's absence proves nothing"
+        );
+        assert!(
+            !surfaced.contains(&seq),
+            "the leg was reported as a message that failed to arrive: {surfaced:?}"
+        );
+        assert_eq!(
+            outbox_state(&a.machine, &a.label, seq, past),
+            DeliveryState::Undelivered,
+            "the leg is still pending after its give-up"
+        );
+        assert!(
+            a.resume().own_slot().is_none(),
+            "the given-up attempt kept its slot, which is A3.13's dead end"
+        );
+        assert!(
+            a.machine.correspondences[0].resume_owed,
+            "the pass was not left owed, so a replacement waits for a restart"
+        );
+        // Mail waiting again, queued BEFORE the next tick: A4.2's cause 2 is the
+        // only standing cause that opens an attempt, and the entry the fixture
+        // started with gave up on the same tick the leg did — a tick with no
+        // mail settles the pass and there is nothing left to re-open.
+        a.machine
+            .persist
+            .update_outbox(&a.label, Direction::AToB, past, |outbox| {
+                let next = outbox.next_send_seq();
+                outbox.enqueue_awaiting_key(next, OutboxTarget::ChannelPage, past)?;
+                Ok(Mutation::Changed(()))
+            })
+            .expect("the fixture queues");
+        // Said once, not once per tick.
+        assert_eq!(
+            anomalies(&a.machine.on_tick(past + 1)),
+            Vec::new(),
+            "the give-up repeated itself on the next tick"
+        );
+        // And the successor opens rather than reusing the abandoned number.
+        assert_eq!(
+            a.resume().attempt().map(Attempt::get),
+            Some(2),
+            "the pass after a give-up did not open the abandoned attempt's successor"
+        );
+    }
+
+    /// M59. **The retention ceiling fires, retires the root with the memory
+    /// scoped to it, and says so once.**
+    ///
+    /// A3.5's `T_RETIRE`: *"at the ceiling without confirmation the party retires
+    /// `RS_n` regardless and surfaces the unconfirmed re-establishment"*. Measured
+    /// from the write-once supersede stamp, so a re-attempt cannot slide it.
+    #[test]
+    fn the_retention_ceiling_retires_the_root_and_is_loud_once() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        assert!(
+            b.resume().retained().is_some(),
+            "B did not retain a root, so there is no ceiling to fire"
+        );
+        let stamp = b.resume().retained().expect("retained").superseded_at_ms();
+
+        // One tick short of the ceiling changes nothing — the control that says
+        // the assertion below is about the ceiling and not about time passing.
+        // Other anomalies fire in this window — every leg's own seven-day
+        // give-up is well inside fourteen days — so the control is on the
+        // ceiling's own key rather than on silence.
+        let effects = b.machine.on_tick(stamp + T_RETIRE_MS - 1);
+        assert!(
+            b.resume().retained().is_some(),
+            "the root retired before its ceiling: {effects:?}"
+        );
+        assert!(
+            !anomalies(&effects).contains(&TrustEventKey::DmReestablishmentUnconfirmed),
+            "the ceiling fired a tick early: {effects:?}"
+        );
+
+        let effects = b.machine.on_tick(stamp + T_RETIRE_MS);
+        assert!(
+            anomalies(&effects).contains(&TrustEventKey::DmReestablishmentUnconfirmed),
+            "the ceiling fired silently: {effects:?}"
+        );
+        let after = b.resume();
+        assert!(after.retained().is_none(), "the root outlived its ceiling");
+        assert!(
+            after.dedup().is_empty(),
+            "the memory scoped to the retired root outlived it"
+        );
+        assert!(
+            !anomalies(&b.machine.on_tick(stamp + T_RETIRE_MS + 1))
+                .contains(&TrustEventKey::DmReestablishmentUnconfirmed),
+            "the ceiling repeated itself on the next tick"
+        );
+        let _ = t1;
+    }
+
+    /// M60. **A crash between the commit that accepted an initiation and the
+    /// enqueue that queued the answer re-queues the stored bytes.**
+    ///
+    /// A9.1(a) at the answering side: the `RE-ACK` carries a randomized ML-KEM
+    /// ciphertext and the acceptance slot is its only copy, so the recovery has
+    /// to be a re-queue of the stored bytes at the stored sequence and cannot be
+    /// a fresh seal. Without the sequence in the slot there is no position to
+    /// re-queue them to.
+    #[test]
+    fn a_crash_after_accepting_re_queues_the_stored_answer() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let slot = b.resume();
+        let slot = slot.acceptance().expect("B answered");
+        let (seq, stored) = (slot.seq(), slot.sealed_re_ack().to_vec());
+        assert_eq!(
+            queued_at_bytes_at(&b.machine, &b.label, &stored, t1),
+            vec![seq],
+            "the answer was not queued at the sequence the slot records"
+        );
+
+        // **The crash window spelled as the record spells it**: the commit
+        // landed naming a position, and the enqueue that would have spent that
+        // position never ran. Retiring the queued entry instead would spend the
+        // sequence, which is the different and genuinely unrecoverable state
+        // `LegState::Stale` names.
+        let unspent = reseat_acceptance(&b.machine, &b.label, seq + 7);
+        assert!(
+            queued_at_bytes_at(&b.machine, &b.label, &stored, t1) == vec![seq],
+            "the fixture moved the queued bytes as well as the slot"
+        );
+
+        b.machine.on_tick(t1 + 1);
+        assert_eq!(
+            queued_at_bytes_at(&b.machine, &b.label, &stored, t1 + 1),
+            vec![unspent],
+            "the stored answer did not go back to the sequence the slot records"
+        );
+        // The entry at the position the slot no longer names is an orphan, and
+        // the same pass ends it: nothing will ever answer a leg the record has
+        // moved past.
+        assert_eq!(
+            outbox_state(&b.machine, &b.label, seq, t1 + 1),
+            DeliveryState::ConfirmedCollected,
+            "the orphaned entry is still re-seeding"
+        );
+        assert_eq!(
+            b.resume()
+                .acceptance()
+                .expect("the slot survived")
+                .sealed_re_ack(),
+            stored.as_slice(),
+            "the recovery re-sealed the answer instead of re-queueing it"
+        );
+    }
+
+    /// M61. **A crash between the commit that completed an exchange and the
+    /// enqueue that queued the settling leg re-queues the stored bytes**, and a
+    /// `RE-CONFIRM` that will not seal installs nothing.
+    ///
+    /// The second half is the one that matters most: before the fix the fold
+    /// advanced the record and installed the ratchet whatever the seal did, so a
+    /// failure left this side speaking under a root the peer would never confirm
+    /// — one-way divergence, rendered healthy. The ordering closes it, and the
+    /// assertion here is that the settling leg is on disk before anything is
+    /// installed.
+    #[test]
+    fn a_crash_after_completing_re_queues_the_settling_leg() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        let confirm = a.resume();
+        let confirm = confirm
+            .confirm_slot()
+            .expect("the completion persisted its settling leg");
+        let (seq, stored) = (confirm.seq(), confirm.sealed().to_vec());
+        assert_eq!(
+            queued_at_bytes_at(&a.machine, &a.label, &stored, t2),
+            vec![seq],
+            "the settling leg was not queued at the sequence the slot records"
+        );
+
+        // The same crash window as the answering side's, at the third leg.
+        let unspent = reseat_confirm(&a.machine, &a.label, seq + 7);
+        a.machine.on_tick(t2 + 1);
+        assert_eq!(
+            queued_at_bytes_at(&a.machine, &a.label, &stored, t2 + 1),
+            vec![unspent],
+            "the stored settling leg did not go back to the sequence the slot records"
+        );
+        assert_eq!(
+            outbox_state(&a.machine, &a.label, seq, t2 + 1),
+            DeliveryState::ConfirmedCollected,
+            "the orphaned entry is still re-seeding"
+        );
+    }
+
+    /// M62. **An orphan leg — one at a sequence no slot names — is retired at
+    /// the next pass.**
+    ///
+    /// A3.12's derivation shape: the record's slots are the live set, so a
+    /// pending leg outside it belongs to an exchange the record has moved past
+    /// and nothing will ever answer it. Left alone it re-seeds for the life of
+    /// the correspondence, because both outbox sweeps skip legs.
+    #[test]
+    fn an_orphan_leg_is_retired_at_the_next_pass() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, _b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let live = a.resume().own_slot().expect("an attempt is open").seq();
+        // A leg at a sequence the record names nowhere.
+        let orphan = live + 5;
+        a.machine
+            .persist
+            .update_outbox(&a.label, Direction::AToB, BASE_MS, |outbox| {
+                outbox.enqueue_sealed(
+                    orphan,
+                    OutboxTarget::ReEstablishmentLeg,
+                    BASE_MS,
+                    SealedFrame::new(vec![0xAB; 64]),
+                    0,
+                )?;
+                Ok(Mutation::Changed(()))
+            })
+            .expect("the fixture queues");
+
+        a.machine.on_tick(BASE_MS + 1);
+        assert_eq!(
+            outbox_state(&a.machine, &a.label, orphan, BASE_MS + 1),
+            DeliveryState::ConfirmedCollected,
+            "the orphan leg is still pending"
+        );
+        assert_eq!(
+            outbox_state(&a.machine, &a.label, live, BASE_MS + 1),
+            DeliveryState::Composed,
+            "the sweep retired the leg the record still names"
+        );
+    }
+
+    /// M63. **A confirmed acceptance is not scanned for a `RE-CONFIRM`.**
+    ///
+    /// A5.1(ii) locks a confirmed candidate, and the scan's second candidate is
+    /// gated on the lock being open. Deleting that gate would keep offering the
+    /// settling-leg key for an exchange already settled — one wasted candidate
+    /// per slot for the life of the retention, and a settling leg for a
+    /// generation this side has left accepted where it should be inert.
+    #[test]
+    fn a_confirmed_acceptance_is_not_scanned_for_a_settlement() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        // A's settling leg, captured before it is delivered.
+        let confirm = a.resume();
+        let confirm = confirm.confirm_slot().expect("A completed");
+        let (seq, bytes) = (confirm.seq(), confirm.sealed().to_vec());
+        let page = position_of(seq).page();
+
+        // B's acceptance, locked by hand: the confirmed state is otherwise
+        // reached and left in one act, so nothing persists it.
+        let stored = b.resume();
+        let slot = stored.acceptance().expect("B answered");
+        let locked = ResumeRecord::new(
+            Box::new(*stored.s_pc()),
+            Box::new(*stored.pk_pc()),
+            stored.committed_root().clone(),
+            ReEstState {
+                reconnect_gen: stored.reconnect_gen(),
+                attempt: stored.attempt().map_or(0, Attempt::get),
+                last_seen_re_est: stored.last_seen_re_est(),
+                own: None,
+                acceptance: Some(
+                    AcceptanceSlot::accept(
+                        slot.generation(),
+                        slot.attempt(),
+                        slot.seq(),
+                        slot.sealed_re_ack().to_vec().into_boxed_slice(),
+                    )
+                    .expect("within the ceiling")
+                    .confirm(),
+                ),
+                confirm: None,
+                attempt_at_window_start: stored.attempt_at_window_start(),
+                reroot_ratchet_gen: stored.reroot_ratchet_gen(),
+            },
+            Retention {
+                retained: stored.retained().map(|held| {
+                    daemonseed_core::dm::resume::RetainedRoot::new(
+                        held.root().clone(),
+                        held.superseded_at_ms(),
+                    )
+                }),
+                dedup: stored.dedup().clone(),
+                stopped: stored.retained_but_stopped(),
+            },
+            stored.send_floor(),
+        );
+        drop(stored);
+        b.machine
+            .persist
+            .commit_resume(&b.label, &locked)
+            .expect("the lock commits");
+
+        let before = b.machine.correspondences[0].health.unopenable;
+        let conversation = b.conversation();
+        fold_page_at(
+            &mut b.machine,
+            t2,
+            conversation,
+            page,
+            vec![(position_of(seq), bytes)],
+        );
+        assert_eq!(
+            b.machine.correspondences[0].health.unopenable,
+            before + 1,
+            "a settling leg opened against an acceptance A5.1(ii) has locked"
+        );
+        assert_eq!(
+            b.resume().reconnect_gen(),
+            0,
+            "the locked exchange advanced its generation"
+        );
+    }
+
+    /// M64. **A correspondent speaking under a root this side has superseded is
+    /// reported once, changes nothing, and is inert on every later delivery.**
+    ///
+    /// A3.8's *peer state regressed*, and the state A3.5's retention exists to
+    /// make openable at all: *"the ability to open the peer's frames at the
+    /// superseded generation"*. The initiating side reaches it — it completes,
+    /// retains `RS_n`, and its own confirming observation has not arrived — so a
+    /// peer that rolled back to before the exchange goes on initiating at the
+    /// generation and under the root the exchange started from.
+    ///
+    /// **The frame is sealed from real records, not invented.** The signing key
+    /// is the peer's own `S_pc` and the root is the one this side retains, which
+    /// is exactly what a rolled-back peer holds; nothing else would open.
+    ///
+    /// **The second delivery is the other half.** A5.3's memory is durable
+    /// precisely so a co-host holding captured bytes cannot re-fire the alarm on
+    /// demand; a build that surfaced before consulting it would hand that oracle
+    /// straight back, and only a second delivery catches it.
+    #[test]
+    fn a_peer_under_a_superseded_root_is_reported_once() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        // B's signing key and the root both sides started from, read before the
+        // exchange moves either.
+        let b_s_pc = *b.resume().s_pc();
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        assert_eq!(
+            a.resume().reconnect_gen(),
+            1,
+            "A did not complete, so nothing below is about a superseded root"
+        );
+        let held = a.resume();
+        let retained_root = held
+            .retained()
+            .expect("A retains RS_n until its own confirming observation")
+            .root()
+            .clone();
+        drop(held);
+
+        // What a B rolled back to before its answer would send: a fresh attempt
+        // at the generation the exchange reached, under the root it started
+        // from. `attempt` 2 rather than 1, so the frame is byte-novel and the
+        // alarm is not refused by the memory of the first exchange.
+        let seq = 40u64;
+        let (eph_ek, _) = reest::mint_ephemeral().expect("the ephemeral mints");
+        let fresh = Attempt::FIRST.advance().expect("attempt space remains");
+        let leg = reest::seal_re_est(
+            &retained_root,
+            Direction::BToA,
+            1,
+            seq,
+            &fresh,
+            &eph_ek,
+            &b_s_pc,
+        )
+        .expect("the leg seals");
+
+        let page = position_of(seq).page();
+        let first = deliver(&mut a, t2 + 1, seq, page, leg.clone());
+        assert_eq!(
+            anomalies(&first),
+            vec![TrustEventKey::DmPeerStateRegressed],
+            "a peer under the superseded root was silent: {first:?}"
+        );
+        assert_eq!(
+            a.resume().reconnect_gen(),
+            1,
+            "a regressed initiation moved the committed generation"
+        );
+        assert!(
+            a.resume().acceptance().is_none(),
+            "a regressed initiation was answered"
+        );
+
+        // A is restarted, so the collection does not filter the position out
+        // before the scan sees it: the DURABLE memory is what must refuse the
+        // second delivery, and only a durable one can.
+        a.machine = machine(&dir_a);
+        a.machine
+            .persist
+            .provision_block_list()
+            .expect("provision A");
+        let again = deliver(&mut a, t2 + 2, seq, page, leg);
+        assert_eq!(
+            anomalies(&again),
+            Vec::new(),
+            "a replay re-fired the alarm, which is the oracle A5.3's durability closes"
+        );
+    }
+
+    /// M65. **The answer-side emission cap refuses without accepting, says so
+    /// once, and leaves the refused attempt admissible.**
+    ///
+    /// A8.4 bounds *"post-openability response emission"* and nothing else, and
+    /// [`ReEstAdmission::Withheld`]'s own contract is that *"nothing was
+    /// accepted, so the same attempt may be admitted later"* — so a withheld
+    /// frame must not be recorded as processed and must not settle its position,
+    /// or the attempt the cap deferred is inert when the cap frees.
+    ///
+    /// The initiations are sealed from real records — the peer's own `S_pc` and
+    /// the root both sides committed at establishment — because nothing else
+    /// opens. Ascending attempts at one generation are A5.1's supersede, which
+    /// is the cheapest way to reach the cap: each is admitted, each charges, and
+    /// only the count is under test.
+    #[test]
+    fn the_answer_side_cap_withholds_without_accepting_and_is_loud_once() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, b) = restart_both(&dir_a, &dir_b, 1);
+        let b_s_pc = *b.resume().s_pc();
+        let root = a.resume().committed_root().clone();
+
+        let seal_at = |attempt: u32, seq: u64| {
+            let (eph_ek, _) = reest::mint_ephemeral().expect("the ephemeral mints");
+            let mut fresh = Attempt::FIRST;
+            let mut token = daemonseed_core::dm::resume::FreshAttempt::first();
+            for _ in 1..attempt {
+                token = fresh.advance().expect("attempt space remains");
+                fresh = token.attempt();
+            }
+            reest::seal_re_est(&root, Direction::BToA, 1, seq, &token, &eph_ek, &b_s_pc)
+                .expect("the leg seals")
+        };
+
+        let mut surfacings = 0usize;
+        let mut admitted = 0u32;
+        for attempt in 1..=RESPONSE_EMISSION_CAP + 1 {
+            let seq = 100 + u64::from(attempt);
+            let effects = deliver(
+                &mut a,
+                BASE_MS,
+                seq,
+                position_of(seq).page(),
+                seal_at(attempt, seq),
+            );
+            surfacings += anomalies(&effects)
+                .iter()
+                .filter(|key| **key == TrustEventKey::DmReestablishmentBackoffEngaged)
+                .count();
+            if a.resume()
+                .acceptance()
+                .is_some_and(|slot| slot.attempt().get() == attempt)
+            {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, RESPONSE_EMISSION_CAP,
+            "the cap admitted {admitted} answers, not the {RESPONSE_EMISSION_CAP} it allows"
+        );
+        assert_eq!(
+            surfacings, 1,
+            "the cap surfaced {surfacings} times rather than once per session"
+        );
+        let withheld = RESPONSE_EMISSION_CAP + 1;
+        assert!(
+            a.resume()
+                .acceptance()
+                .is_some_and(|slot| slot.attempt().get() == RESPONSE_EMISSION_CAP),
+            "the withheld attempt was accepted anyway"
+        );
+        // **Neither deduped nor settled.** Both would make the deferred attempt
+        // inert when the cap frees: the memory would refuse it as a repeat, and
+        // the settled position would never be offered to the scan again.
+        assert!(
+            !a.resume()
+                .dedup()
+                .keys()
+                .iter()
+                .any(|key| key.attempt().get() == withheld),
+            "the withheld attempt was recorded as processed"
+        );
+        a.machine.correspondences[0].re_acks_answered = 0;
+        let seq = 100 + u64::from(withheld);
+        deliver(
+            &mut a,
+            BASE_MS,
+            seq,
+            position_of(seq).page(),
+            seal_at(withheld, seq),
+        );
+        assert!(
+            a.resume()
+                .acceptance()
+                .is_some_and(|slot| slot.attempt().get() == withheld),
+            "the attempt the cap deferred was not admissible once the cap freed"
+        );
+    }
+
+    /// M66. **A fold that opened a leg and could not finish leaves the position
+    /// unsettled, writes nothing, and is offered the frame again.**
+    ///
+    /// A4.2 says reading updates local state; it does not say a read that
+    /// FAILED may settle the position it could not act on. Settling one would
+    /// walk past the only copy of a frame this side still owes an answer to, and
+    /// no later sweep would offer it again — the exchange stalls in silence,
+    /// which A3.15's table does not admit.
+    ///
+    /// A full dedup memory is the reachable failure: A5.3 refuses an eviction
+    /// while the root is retained, so a memory at [`DEDUP_CAPACITY`] refuses the
+    /// insert rather than making room. Reaching it needs no fault injection,
+    /// which is why it is the one chosen.
+    #[test]
+    fn a_fold_that_could_not_finish_leaves_its_position_unsettled() {
+        use daemonseed_core::dm::resume::{DedupMemory, DEDUP_CAPACITY};
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (seq, page, bytes, t1) = publish_one_leg(&mut a, BASE_MS);
+
+        // B's memory, filled to its capacity with positions the window still
+        // reaches, so the insert the fold performs is refused.
+        let stored = b.resume();
+        let mut dedup = DedupMemory::new();
+        for n in 0..DEDUP_CAPACITY {
+            dedup
+                .insert(DedupKey::new(
+                    1,
+                    Attempt::FIRST,
+                    Leg::ReEst,
+                    Direction::AToB,
+                    9_000 + n as u64,
+                ))
+                .expect("inside the capacity");
+        }
+        assert_eq!(dedup.len(), DEDUP_CAPACITY, "the fixture must fill the set");
+        let filled = ResumeRecord::new(
+            Box::new(*stored.s_pc()),
+            Box::new(*stored.pk_pc()),
+            stored.committed_root().clone(),
+            ReEstState {
+                reconnect_gen: stored.reconnect_gen(),
+                attempt: stored.attempt().map_or(0, Attempt::get),
+                last_seen_re_est: stored.last_seen_re_est(),
+                own: None,
+                acceptance: None,
+                confirm: None,
+                attempt_at_window_start: stored.attempt_at_window_start(),
+                reroot_ratchet_gen: stored.reroot_ratchet_gen(),
+            },
+            Retention {
+                // A retained root is what makes the memory unshrinkable, which
+                // is what makes the insert refuse rather than evict.
+                retained: Some(daemonseed_core::dm::resume::RetainedRoot::new(
+                    stored.committed_root().clone(),
+                    BASE_MS,
+                )),
+                dedup,
+                stopped: false,
+            },
+            stored.send_floor(),
+        );
+        drop(stored);
+        b.machine
+            .persist
+            .commit_resume(&b.label, &filled)
+            .expect("the filled memory commits");
+
+        let before = b.machine.correspondences[0].health.leg_folds_deferred;
+        deliver(&mut b, t1, seq, page, bytes.clone());
+        assert_eq!(
+            b.machine.correspondences[0].health.leg_folds_deferred,
+            before + 1,
+            "the fold did not defer, so nothing below is about one that did"
+        );
+        assert!(
+            b.resume().acceptance().is_none(),
+            "a fold that could not finish committed an acceptance anyway"
+        );
+
+        // **Offered again**, which is the whole claim: a settled position is
+        // filtered out of every later sweep before the scan sees it, so a second
+        // deferral is only possible if the first left the position alone.
+        deliver(&mut b, t1, seq, page, bytes);
+        assert_eq!(
+            b.machine.correspondences[0].health.leg_folds_deferred,
+            before + 2,
+            "the deferred position was settled, so the frame was never offered again"
+        );
+    }
+
+    /// M67. **An exchange that settles with no candidate in memory owes a fresh
+    /// attempt rather than stalling.**
+    ///
+    /// A5.4 keeps the ratchet root and the resumed channel's identifier out of
+    /// every at-rest encoding, so a restart between answering and settling loses
+    /// both. The record still settles correctly — the generation advances and
+    /// the retained root retires — and the channel comes back addressable and
+    /// mute. Leaving the pass unowed there would make the next re-establishment
+    /// wait for a restart, which is A3.13's dead end reached by a different
+    /// road.
+    #[test]
+    fn settling_with_no_candidate_owes_a_fresh_attempt() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        let (seq, page, bytes, t3) = publish_one_leg(&mut a, t2);
+
+        // B restarts between answering and settling: the record survives, the
+        // candidate does not.
+        b.machine = machine_as(peer_identity(), &dir_b);
+        b.machine
+            .persist
+            .provision_block_list()
+            .expect("provision B");
+        assert!(
+            b.resume().acceptance().is_some(),
+            "the restart lost the acceptance, so this is not the window under test"
+        );
+        // One tick first, so the load-time pass settles and clears the flag: a
+        // freshly seeded correspondence owes that pass anyway, and asserting on
+        // a flag nothing has cleared would pass whatever the settlement did.
+        b.machine.on_tick(t3);
+        assert!(
+            !b.machine.correspondences[0].resume_owed,
+            "the load-time pass did not settle, so the flag below is not the \
+             settlement's doing"
+        );
+
+        deliver(&mut b, t3, seq, page, bytes);
+        let settled = b.resume();
+        assert_eq!(
+            settled.reconnect_gen(),
+            1,
+            "the settlement did not land without a candidate"
+        );
+        assert!(
+            settled.retained().is_none(),
+            "the retained root outlived it"
+        );
+        assert!(
+            b.machine.correspondences[0].ratchet.is_none(),
+            "a channel came back speakable with no candidate to open it on"
+        );
+        assert!(
+            b.machine.correspondences[0].resume_owed,
+            "the pass was not left owed, so the next attempt waits for a restart"
+        );
+    }
+
+    /// M69. **An absent outbox entry is not a confirming observation.**
+    ///
+    /// A3.6 gives the initiating side one: *"the ordinary acknowledgement
+    /// settling `RE-CONFIRM`'s sequence position within its give-up window"*. An
+    /// entry that is simply not there says nothing of the sort — it was pruned,
+    /// or a crash lost it before the enqueue — and reading it as a settlement
+    /// would drop the only copy of the settling leg and retire the retained root
+    /// with it, which is the split-brain A3.5's ceiling exists to bound. A store
+    /// that would not answer reaches the same verdict for the same reason, and
+    /// the same arm.
+    #[test]
+    fn an_absent_settling_entry_is_not_a_confirming_observation() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        let seq = a
+            .resume()
+            .confirm_slot()
+            .expect("the completion persisted its settling leg")
+            .seq();
+        assert!(
+            a.resume().retained().is_some(),
+            "A retired RS_n before any observation, so nothing below is a test of one"
+        );
+
+        // The entry vanishes without ever being collected — a prune, or a crash
+        // between the commit and the enqueue.
+        a.machine
+            .persist
+            .update_outbox(&a.label, Direction::AToB, t2, |outbox| {
+                assert!(
+                    outbox.retire_leg(seq),
+                    "the fixture must end the queued leg"
+                );
+                assert!(outbox.prune() > 0, "the fixture must remove it");
+                Ok(Mutation::Changed(()))
+            })
+            .expect("the fixture writes");
+
+        a.machine.on_tick(t2 + 1);
+        assert!(
+            a.resume().confirm_slot().is_some(),
+            "an absent entry was read as a settlement and the settling leg was dropped"
+        );
+        assert!(
+            a.resume().retained().is_some(),
+            "an absent entry retired the root the settling leg is retained for"
         );
     }
 
