@@ -1213,6 +1213,18 @@ mod tests {
         );
         assert_eq!(class_of(DmRecordErasureBlocked), PersistentNonBlocking);
         assert_eq!(class_of(DmCorrespondentStateLost), PersistentNonBlocking);
+        // A3.8's loud re-establishment states, all one class: the design gives
+        // them no severity ordering, only the requirement that none is silent.
+        assert_eq!(class_of(DmPeerStateRegressed), PersistentNonBlocking);
+        assert_eq!(class_of(DmReestablishmentFailed), PersistentNonBlocking);
+        assert_eq!(
+            class_of(DmReestablishmentUnconfirmed),
+            PersistentNonBlocking
+        );
+        assert_eq!(
+            class_of(DmReestablishmentBackoffEngaged),
+            PersistentNonBlocking
+        );
     }
 
     /// A teardown must reach the audit log, which is what makes it loud rather

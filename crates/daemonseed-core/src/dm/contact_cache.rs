@@ -759,7 +759,7 @@ mod tests {
     /// derivation, so a record that had kept it would be found.
     fn ar() -> [u8; ROOT_LEN] {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
-        derive_channel_roots(&ss0()).expect("derives").ar
+        derive_channel_roots(&ss0()).expect("derives").ar()
     }
 
     /// A second correspondence's root: a different `ss0`, which is the only way
@@ -768,7 +768,7 @@ mod tests {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut other = ss0();
         other[0] ^= 0xAA;
-        derive_channel_roots(&other).expect("derives").ar
+        derive_channel_roots(&other).expect("derives").ar()
     }
 
     /// The shared fixture.
@@ -874,7 +874,7 @@ mod tests {
         let at = 1 + 2 * ml_dsa::PK_LEN + PSEUDONYM_PRESENCE_LEN;
         assert_eq!(
             &encoded[at..at + ROOT_LEN],
-            roots.ar.as_slice(),
+            roots.ar().as_slice(),
             "the address root is not at its at-rest offset"
         );
 
@@ -884,8 +884,8 @@ mod tests {
         );
         assert!(
             !encoded
-                .windows(roots.chan_id.len())
-                .any(|w| w == roots.chan_id),
+                .windows(roots.chan_id().len())
+                .any(|w| w == roots.chan_id()),
             "the channel id is in the record"
         );
     }
@@ -1050,6 +1050,37 @@ mod tests {
                 "a {len}-byte record was not refused by length"
             );
         }
+    }
+
+    /// **A record written before the pseudonym-presence byte joined the layout
+    /// is refused by length, not misread.**
+    ///
+    /// The older record was `version ‖ pk_lt ‖ pk_pc ‖ AR ‖ first_seen ‖
+    /// last_seen` — 5233 bytes, one short of the current
+    /// [`CONTACT_RECORD_LEN`]. Everything before the flag sits at the same
+    /// offset in both, and everything after it is shifted by exactly one byte,
+    /// so a decoder that trusted the buffer would read a pseudonym one byte out
+    /// of place and an address root that ran a byte into the timestamps —
+    /// values that parse and are wrong. The length pre-check turns that into a
+    /// refusal naming both numbers, and this pins the one older buffer that
+    /// actually existed rather than an arbitrary short one.
+    #[test]
+    fn a_pre_presence_byte_record_is_refused_by_length() {
+        let legacy = CONTACT_RECORD_LEN - PSEUDONYM_PRESENCE_LEN;
+        assert_eq!(legacy, 5233, "the older layout's length moved");
+        let mut encoded = record().encode().to_vec();
+        // The flag sits between the long-term key and the pseudonym, so removing
+        // it is what turns the current layout back into the older one.
+        encoded.remove(1 + ml_dsa::PK_LEN);
+        assert_eq!(encoded.len(), legacy);
+        assert_eq!(
+            ContactRecord::decode(&Zeroizing::new(encoded)).unwrap_err(),
+            ContactCacheError::WrongLength {
+                expected: CONTACT_RECORD_LEN,
+                actual: legacy,
+            },
+            "a record from the older layout was not refused by length"
+        );
     }
 
     /// And an over-long one, which a `<` pre-check would let fall through to a

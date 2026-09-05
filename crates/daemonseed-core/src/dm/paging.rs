@@ -1118,7 +1118,7 @@ mod tests {
         );
         let other = crate::dm::firstcontact::derive_channel_roots(&[0xa3; 32])
             .expect("derive another conversation's roots")
-            .ar;
+            .ar();
         assert!(
             matches!(
                 DmPageAddress::sending(&other, &init, slot0(0)).unwrap_err(),
@@ -1146,7 +1146,7 @@ mod tests {
         // its root is a real `AR` and not merely 32 bytes that fail to match.
         let other = crate::dm::firstcontact::derive_channel_roots(&[0xa3; 32])
             .expect("derive another conversation's roots")
-            .ar;
+            .ar();
         assert_ne!(
             other,
             conversation_ar(),
@@ -1175,7 +1175,7 @@ mod tests {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         crate::dm::firstcontact::derive_channel_roots(&FIXTURE_SS0)
             .expect("derive the fixture conversation's roots")
-            .ar
+            .ar()
     }
 
     /// **Two independent paths must agree, and both are pinned.** Each assertion
@@ -1424,7 +1424,7 @@ mod tests {
         let other_ratchet =
             Ratchet::recipient(&other_ss0, Box::new([0x11; oxicrypt_ml_kem::EK_LEN]))
                 .expect("the second conversation's ratchet");
-        let other = DmPageAddress::receiving(&other_roots.ar, &other_ratchet, 0)
+        let other = DmPageAddress::receiving(&other_roots.ar(), &other_ratchet, 0)
             .expect("the second conversation's address");
         assert_ne!(
             other.conversation(),

@@ -3300,6 +3300,7 @@ mod tests {
             Retention::none(),
             SendFloor::new(0, 0),
         )
+        .expect("the fixture's pairings are coherent")
     }
 
     /// A sealed frame's worth of bytes bound to `fresh`. The gate and the budget
@@ -3399,7 +3400,8 @@ mod tests {
             ReEstState::first_establishment(),
             Retention::none(),
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         let gate = ReEstGate::from_record(&record);
         assert_eq!(gate.accepted(), None);
         assert!(!gate.is_confirmed());
@@ -3436,7 +3438,8 @@ mod tests {
             },
             Retention::none(),
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         let mut gate = ReEstGate::from_record(&record);
         assert!(gate.accepted().is_none(), "the slot is empty");
         assert_eq!(gate.floor(), 3);
@@ -3485,7 +3488,8 @@ mod tests {
             },
             Retention::none(),
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         let mut gate = ReEstGate::from_record(&record);
         assert_eq!(gate.floor(), 5, "the floor sits at the accepted generation");
         assert_eq!(

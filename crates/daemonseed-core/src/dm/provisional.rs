@@ -477,7 +477,7 @@ impl ProvisionalRecord {
     /// costs that caller one call and removes the invitation from every caller
     /// that only wanted an address.
     pub fn address_root(&self) -> Result<[u8; ROOT_LEN], FirstContactError> {
-        Ok(derive_channel_roots(&self.ss0)?.ar)
+        Ok(derive_channel_roots(&self.ss0)?.ar())
     }
 
     /// Both channel roots, recomputed — `AR` and `chan_id` together.
@@ -1216,13 +1216,13 @@ mod tests {
         );
 
         assert!(
-            !plaintext.windows(roots.ar.len()).any(|w| w == roots.ar),
+            !plaintext.windows(roots.ar().len()).any(|w| w == roots.ar()),
             "the address root is in the record"
         );
         assert!(
             !plaintext
-                .windows(roots.chan_id.len())
-                .any(|w| w == roots.chan_id),
+                .windows(roots.chan_id().len())
+                .any(|w| w == roots.chan_id()),
             "the channel id is in the record"
         );
     }

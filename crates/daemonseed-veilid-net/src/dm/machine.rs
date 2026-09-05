@@ -1731,7 +1731,7 @@ impl DmMachine {
                 }
             };
             correspondence.channel = Some(ChannelRoots {
-                chan_id: roots.chan_id,
+                chan_id: roots.chan_id(),
             });
             correspondence.ratchet = Some(ratchet);
             correspondence.provisional = Some((keyrec_addr, fc_epoch));
@@ -2422,6 +2422,17 @@ impl DmMachine {
         if !self.correspondences[index].resume_owed {
             return Vec::new();
         }
+        // **A torn-down conversation re-establishes nothing**, on the terms
+        // [`Self::probe`] and [`Self::due_emissions_only`] already state: its
+        // page records were handed back, and opening an attempt would seal a leg
+        // for a record nobody is reading and put the correspondence back on a
+        // ladder the teardown stopped. The fingerprint survives a
+        // re-establishment — `AR` is not re-rooted — so the durable one this
+        // side already holds is the one the set was keyed on.
+        if self.torn_down_conversation(index) {
+            self.correspondences[index].resume_owed = false;
+            return Vec::new();
+        }
         // A3.15 row 6's backoff: a pass that faulted is not asked again until
         // its rung comes round. Nothing is owed to a correspondence that has
         // never faulted, so the first pass runs on the tick that finds it.
@@ -2781,6 +2792,12 @@ impl DmMachine {
         if self.correspondences[index].peer_pk_pc.is_none() {
             return Vec::new();
         }
+        // Same gate as the load-time pass above: a torn-down conversation has no
+        // handshake to keep up, and every act here writes to a record family
+        // whose pages were handed back.
+        if self.torn_down_conversation(index) {
+            return Vec::new();
+        }
         let Some(direction) = self.stored_direction(&label, now_ms) else {
             return Vec::new();
         };
@@ -3096,6 +3113,12 @@ impl DmMachine {
         let live = self.correspondences[index]
             .live()
             .is_some_and(|(r, _, _)| !self.torn_down.contains(r.ar_fingerprint()));
+        // **A leg's own gate, because `live` is not it.** A leg is written by a
+        // correspondence with no key schedule, so `live` is `false` for exactly
+        // the party that has one to send — the teardown has to be asked about
+        // directly, and asked before `emit`, or a torn-down conversation spends
+        // its ladder on writes the publish arm below then declines to make.
+        let leg_torn_down = self.torn_down_conversation(index);
         let address_root = self.correspondences[index].address_root;
         let emitted = self
             .persist
@@ -3108,6 +3131,9 @@ impl DmMachine {
                     };
                     let target = entry.target();
                     if matches!(target, OutboxTarget::ChannelPage) && !live {
+                        continue;
+                    }
+                    if matches!(target, OutboxTarget::ReEstablishmentLeg) && leg_torn_down {
                         continue;
                     }
                     // **A leg whose record address will not derive is skipped
@@ -3151,7 +3177,6 @@ impl DmMachine {
         };
         self.correspondences[index].health.leg_unaddressable += unaddressable;
         let correspondence = &self.correspondences[index];
-        let torn_down = &self.torn_down;
         // Derived from the address root, so a correspondence read back from disk
         // tags its writes with the same conversation a live one does — which is
         // what routes a re-establishment leg's own outcome back to it.
@@ -3212,12 +3237,11 @@ impl DmMachine {
                 // out of the entry and nothing re-seals them, which is A9.1(a)'s
                 // byte-identical re-emit reaching the wire.
                 OutboxTarget::ReEstablishmentLeg => {
+                    // The teardown was asked about before `emit` spent a rung;
+                    // what is left here is the conversation tag the write needs.
                     let Some(conversation) = conversation else {
                         continue;
                     };
-                    if torn_down.contains(&conversation) {
-                        continue;
-                    }
                     let address =
                         match DmPageAddress::sending_on(&address_root, direction, position_of(seq))
                         {
@@ -3830,11 +3854,11 @@ impl DmMachine {
                     // decryption would be work spent to reach the same answer.
                     break 'frame;
                 }
-                // **No key schedule is a re-establishment case, not a stop.** This
-                // used to leave the loop, on the reading that a correspondence
-                // without a ratchet can open nothing — which is true of channel
-                // frames and false of the legs that arrive precisely because the
-                // ratchet is gone. The slot goes to the scan below instead.
+                // **No key schedule is a re-establishment case, not a stop.** A
+                // correspondence without a ratchet can open no channel frame, but
+                // the legs that restore one arrive precisely because the ratchet
+                // is gone — so the slot is marked `unopened` and handed to the
+                // scan below rather than ending the loop.
                 let (Some(ratchet), Some(channel)) = (
                     correspondence.ratchet.as_mut(),
                     correspondence.channel.as_ref(),
@@ -4043,14 +4067,37 @@ impl DmMachine {
                     }
                 });
             }
-            let Some(record) = resume.as_mut().and_then(Option::as_mut) else {
+            let Some(record) = resume.as_ref().and_then(Option::as_ref) else {
                 correspondence.health.unopenable += 1;
                 continue;
+            };
+            // **Each fold works on its own copy, and only a consumed one
+            // survives.** A fold mutates the record as it goes — the dedup
+            // memory, the slots, the roots — and decides only at its end whether
+            // that state is owed to disk, so a copy is what keeps an abandoned
+            // decision off the commit the next leg on this page performs, and
+            // what makes a `Retry` cost nothing at all.
+            //
+            // A round trip through the at-rest form rather than a `Clone`: the
+            // record holds a sealed frame bound to its attempt and an ephemeral
+            // key bound to its slot, neither of which is `Clone` on purpose, and
+            // the encoding is the one copy of this record the build already
+            // trusts to be exact. The per-page read above still buys the
+            // expensive half — the store read and the AEAD open happen once,
+            // while what each slot pays is an encode and a decode of plaintext
+            // already in hand.
+            let mut working = match ResumeRecord::decode(&record.encode()) {
+                Ok(working) => working,
+                Err(e) => {
+                    crate::vtrace!("dm driver: the resume record would not copy: {e}");
+                    correspondence.health.unopenable += 1;
+                    continue;
+                }
             };
             let fold = fold_leg(
                 persist,
                 correspondence,
-                record,
+                &mut working,
                 now_ms,
                 at,
                 encoded,
@@ -4073,7 +4120,13 @@ impl DmMachine {
                 // life of the correspondence: every later message is reported
                 // beyond the prefix, the run set grows toward its cap, and the
                 // sender re-seeds a leg nothing will ever confirm.
+                // **A consumed fold's copy becomes the page's record.** Every
+                // path that reaches here either committed the copy or changed
+                // nothing in it, so writing it back is what lets a later leg on
+                // the same page see the state its predecessor persisted rather
+                // than the state the page was read at.
                 LegOutcome::Consumed => {
+                    resume = Some(Some(working));
                     if correspondence.collection.collected(at).is_err() {
                         correspondence.owed_acks.push(at);
                     }
@@ -4131,6 +4184,21 @@ impl DmMachine {
         self.correspondences
             .iter()
             .position(|c| c.pk_lt.as_slice() == pk_lt.as_slice())
+    }
+
+    /// Whether this correspondence's conversation has been torn down in this
+    /// session.
+    ///
+    /// **Keyed on the address root's fingerprint, which is what the set holds.**
+    /// A re-establishment does not re-root `AR`
+    /// (`docs/design/direct-messaging.md:1481`), so the resumed channel's
+    /// conversation is the same value the teardown recorded — a lookup through
+    /// the live ratchet would answer `false` for exactly the correspondences
+    /// that have none.
+    fn torn_down_conversation(&self, index: usize) -> bool {
+        self.correspondences[index]
+            .conversation()
+            .is_some_and(|conversation| self.torn_down.contains(&conversation))
     }
 
     /// The correspondence one channel-plane operation belongs to.
@@ -4827,9 +4895,9 @@ impl DmMachine {
         // either can be read — and without them the channel has no address and
         // no seal binding.
         let channel = ChannelRoots {
-            chan_id: held.knock.roots().chan_id,
+            chan_id: held.knock.roots().chan_id(),
         };
-        let address_root = held.knock.roots().ar;
+        let address_root = held.knock.roots().ar();
 
         // **The recoverable refusals are taken here, before the knock is
         // consumed.** `accept_first_contact` moves the `VerifiedFirstContact`
@@ -5428,9 +5496,9 @@ impl DmMachine {
         // both from `ss0` and hands back neither, and `chan_id` is never
         // serialized at all (§ v4 minor invariant).
         let channel = ChannelRoots {
-            chan_id: state.roots().chan_id,
+            chan_id: state.roots().chan_id(),
         };
-        let address_root = state.roots().ar;
+        let address_root = state.roots().ar();
         let record = match state.into_provisional() {
             Ok(r) => r,
             Err(e) => {
@@ -6637,6 +6705,22 @@ fn role_for(send_direction: Direction) -> Role {
 ///
 /// `false` where the commit was refused, so the caller can leave the position
 /// unsettled rather than settling one whose memory did not land.
+/// Record a frame as processed, and say whether the memory took it.
+///
+/// A5.3's memory is bounded and refuses rather than evicting while its root is
+/// retained, so the insert is fallible — and a fold that could not record what
+/// it decided has decided nothing durable, which is a deferral rather than a
+/// disposition.
+fn record_processed(record: &mut ResumeRecord, key: DedupKey) -> bool {
+    match record.note_processed(key) {
+        Ok(_) => true,
+        Err(e) => {
+            crate::vtrace!("dm driver: a handshake frame would not be recorded as seen: {e}");
+            false
+        }
+    }
+}
+
 fn commit_after_dedup(
     persist: &DmPersist,
     label: &CorrespondenceLabel,
@@ -6700,11 +6784,22 @@ fn requeue_leg(
 /// Step 4 and step 7: a peer `RE-EST` opened at a generation this side answers.
 ///
 /// The order is the design's and is fixed
-/// (`docs/design/direct-messaging.md:893`, A5.3, A3.7, A9.4(ii), A3.14):
-/// `note_processed` → the contest → `ReEstGate::admit` with the response-emission
-/// budget → the answer → **commit** → enqueue. Nothing is emitted here; the
-/// enqueue puts the `RE-ACK` on this side's own ladder, which is what A4.2 means
-/// by *"reading updates local state and emits nothing in the same turn"*.
+/// (`docs/design/direct-messaging.md:893`, A5.3, A3.7, A9.4(ii), A3.14): the
+/// dedup memory is CONSULTED, then the contest, then `ReEstGate::admit` with the
+/// response-emission budget, then the answer, then **commit**, then enqueue.
+/// Nothing is emitted here; the enqueue puts the `RE-ACK` on this side's own
+/// ladder, which is what A4.2 means by *"reading updates local state and emits
+/// nothing in the same turn"*.
+///
+/// **Consulting the memory and WRITING to it are two steps, and the cap sits
+/// between them.** A5.3's memory records what this side has *decided about*, and
+/// a withheld attempt is the one frame this side has decided nothing about —
+/// [`ReEstAdmission::Withheld`]'s contract is that *"the same attempt may be
+/// admitted later"*, which a recorded key would make impossible. So the key is
+/// written on the paths that dispose of the frame and on no other. A9.4(ii)'s
+/// ordering is untouched by this: the dedup it puts before the budget is A3.4's
+/// acceptance slot, which [`ReEstGate::admit`] evaluates before it calls the
+/// budget closure, and that is a different memory with a different key.
 #[allow(clippy::too_many_arguments)]
 fn fold_re_est(
     persist: &DmPersist,
@@ -6721,14 +6816,7 @@ fn fold_re_est(
     let generation = opened.generation();
     let attempt = opened.attempt();
     let key = DedupKey::new(generation, attempt, Leg::ReEst, peer_direction, seq);
-    let novelty = match record.note_processed(key) {
-        Ok(novelty) => novelty,
-        Err(e) => {
-            crate::vtrace!("dm driver: a peer initiation would not be recorded as seen: {e}");
-            return LegFold::retry();
-        }
-    };
-    if novelty == Novelty::Repeat {
+    if record.dedup().contains(key) {
         // **A3.4: an accepted generation is inert, and the re-serve is the
         // stored bytes on their own ladder.** Normally that ladder already holds
         // them and this read causes nothing, which is A4.2. What it must not do
@@ -6769,7 +6857,7 @@ fn fold_re_est(
         // A3.7: the coin's winner does nothing with the loser's frame and keeps
         // waiting for the answer to its own. That is a disposition, so the
         // memory of having seen it is owed to disk.
-        if !commit_after_dedup(persist, &label, record) {
+        if !record_processed(record, key) || !commit_after_dedup(persist, &label, record) {
             return LegFold::retry();
         }
         return LegFold::consumed();
@@ -6802,6 +6890,11 @@ fn fold_re_est(
             outcome: LegOutcome::Retry,
             effects,
         };
+    }
+    // Past the cap, so the frame is one this side has decided about and the
+    // memory is owed the key — on the dispositions below and on the answer.
+    if !record_processed(record, key) {
+        return LegFold::retry();
     }
     if admission != ReEstAdmission::Emit {
         // Dropped, Locked and ReServe are dispositions: this side has decided
@@ -6954,21 +7047,39 @@ fn fold_re_ack(
     else {
         return LegFold::retry();
     };
-    let Some(slot) = record.take_own_slot() else {
+    let Some(held) = record.own_slot() else {
         crate::vtrace!("dm driver: an answer arrived with no initiation to complete");
         if !commit_after_dedup(persist, &label, record) {
             return LegFold::retry();
         }
         return LegFold::consumed();
     };
-    let rerooted =
-        match reest::complete(record.committed_root(), slot.into_eph_dk(), opened.eph_ct()) {
-            Ok(rerooted) => rerooted,
-            Err(e) => {
-                crate::vtrace!("dm driver: the answer would not decapsulate: {e}");
-                return LegFold::retry();
-            }
-        };
+    // **The decapsulation runs on a scoped copy of the key, and the slot is
+    // emptied only once it has succeeded.** [`reest::complete`] consumes the key
+    // so an ephemeral answers exactly one `RE-ACK`, which is right — but taking
+    // the slot to satisfy that and then failing would leave a record naming an
+    // initiation it can no longer complete. The copy is a
+    // [`EphemeralDecapKey`](daemonseed_core::dm::ratchet::EphemeralDecapKey),
+    // which wipes on drop, and it lives for one call; what it buys is that a
+    // failure here leaves the slot exactly where it was.
+    //
+    // `duplicate` rather than a box built from a dereference, so the copy is
+    // made on the heap and no unwiped 3 168-byte array is left on this frame.
+    // The zeroize witness cannot see that difference — a temporary that is never
+    // created leaves no address to read afterwards — so what holds the property
+    // is the call itself, and the type is the whole of the check.
+    let eph_dk = held.eph_dk().duplicate();
+    let rerooted = match reest::complete(record.committed_root(), eph_dk, opened.eph_ct()) {
+        Ok(rerooted) => rerooted,
+        Err(e) => {
+            crate::vtrace!("dm driver: the answer would not decapsulate: {e}");
+            return LegFold::retry();
+        }
+    };
+    // The ephemeral is spent, so the slot that held it is emptied by the same
+    // act — and the attempt counter stands, so the next initiation mints the
+    // successor rather than reusing a number the peer has answered (A5.2).
+    drop(record.take_own_slot());
     // **Ahead of the highest generation either record remembers.** The outbox
     // carries the clear counter for frames it has sealed and the resume record
     // carries the one a previous re-establishment opened at; a channel that has
@@ -7457,14 +7568,20 @@ fn establish_record(
                     return Establishment::Retry;
                 }
             };
-            let resume = ResumeRecord::new(
+            let resume = match ResumeRecord::new(
                 Box::new(*signing_pc.secret_key()),
                 Box::new(*peer_pk_pc),
-                roots.rs0.clone(),
+                roots.rs0().clone(),
                 ReEstState::first_establishment(),
                 Retention::none(),
                 floor,
-            );
+            ) {
+                Ok(resume) => resume,
+                Err(e) => {
+                    crate::vtrace!("dm driver: the resume record would not assemble: {e}");
+                    return Establishment::Retry;
+                }
+            };
             match pending.commit_with_resume(&resume) {
                 Ok(()) => Establishment::Complete,
                 Err(e) => {
@@ -8717,7 +8834,7 @@ mod tests {
                             seeded.ss0_for_test(),
                         )
                         .expect("derives")
-                        .ar,
+                        .ar(),
                     );
                     Ok(daemonseed_core::dm::contact_cache::ContactRecord::new(
                         Box::new(*seeded.pk_lt()),
@@ -8859,7 +8976,8 @@ mod tests {
                     ReEstState::first_establishment(),
                     Retention::none(),
                     SendFloor::new(0, 0),
-                ),
+                )
+                .expect("the fixture's pairings are coherent"),
             )
             .expect("commits");
 
@@ -8991,9 +9109,9 @@ mod tests {
         let pk_lt: PkLt = Box::new(*knock.pk_lt());
         let peer_pk_pc = Box::new(*knock.pk_pc());
         let channel = ChannelRoots {
-            chan_id: knock.roots().chan_id,
+            chan_id: knock.roots().chan_id(),
         };
-        let address_root = knock.roots().ar;
+        let address_root = knock.roots().ar();
         let (label, ratchet) = m
             .persist
             .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
@@ -9118,9 +9236,9 @@ mod tests {
         let pk_lt: PkLt = Box::new(*knock.pk_lt());
         let peer_pk_pc = Box::new(*knock.pk_pc());
         let channel = ChannelRoots {
-            chan_id: knock.roots().chan_id,
+            chan_id: knock.roots().chan_id(),
         };
-        let address_root = knock.roots().ar;
+        let address_root = knock.roots().ar();
         let (label, ratchet) = m
             .persist
             .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
@@ -11897,9 +12015,9 @@ mod tests {
         let pk_lt: PkLt = Box::new(*knock.pk_lt());
         let peer_pk_pc = Box::new(*knock.pk_pc());
         let channel = ChannelRoots {
-            chan_id: knock.roots().chan_id,
+            chan_id: knock.roots().chan_id(),
         };
-        let address_root = knock.roots().ar;
+        let address_root = knock.roots().ar();
         let (label, _ratchet) = m
             .persist
             .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
@@ -14234,7 +14352,8 @@ mod tests {
             },
             Retention::none(),
             stored.send_floor(),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         m.persist
             .commit_resume(label, &rewritten)
             .expect("the rewritten record commits");
@@ -14754,7 +14873,8 @@ mod tests {
                             ReEstState::first_establishment(),
                             Retention::none(),
                             SendFloor::new(0, floor_seq),
-                        ),
+                        )
+                        .expect("the fixture's pairings are coherent"),
                     )
                     .expect("the floor commits");
                 label
@@ -14866,11 +14986,11 @@ mod tests {
     /// M55. **A handshake record whose erase failed goes onto the retry list,
     /// even when the correspondence it belonged to is finished.**
     ///
-    /// The lost-`S_pc` path answers `Unrecoverable` whatever the erase did, so a
-    /// store fault there used to drop the handle with the record still on disk —
-    /// and that record holds `ss0`, which roots `RK0`, addressable only by the
-    /// context the handle carried. The correspondence being unrecoverable is not
-    /// a reason to stop erasing its opening secret.
+    /// The lost-`S_pc` path answers `Unrecoverable` whatever the erase did, so
+    /// the handle survives that answer rather than being dropped with its record
+    /// still on disk: the record holds `ss0`, which roots `RK0`, and it is
+    /// addressable only by the context the handle carried. The correspondence
+    /// being unrecoverable is not a reason to stop erasing its opening secret.
     ///
     /// The fault is the provisional record itself: corrupted, `restart_channel`
     /// answers `RecordUnusable`, which is the erase's retry case. Restored, the
@@ -15943,6 +16063,7 @@ mod tests {
             },
             stored.send_floor(),
         )
+        .expect("the fixture's pairings are coherent")
     }
 
     /// Every effect in a batch that is a re-establishment anomaly, with its key.
@@ -16292,7 +16413,8 @@ mod tests {
                 stopped: stored.retained_but_stopped(),
             },
             stored.send_floor(),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         drop(stored);
         b.machine
             .persist
@@ -16575,7 +16697,8 @@ mod tests {
                 stopped: false,
             },
             stored.send_floor(),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         drop(stored);
         b.machine
             .persist
@@ -16786,7 +16909,8 @@ mod tests {
                         },
                         Retention::none(),
                         stored.send_floor(),
-                    ),
+                    )
+                    .expect("the fixture's pairings are coherent"),
                 )
                 .expect("the exhausted window commits");
             label
@@ -16960,6 +17084,250 @@ mod tests {
             vec![RefusalReason::NotEstablishedThisSession],
             "a send on a ratchet-less correspondence was not refused: {out:?}"
         );
+    }
+
+    /// M70. **A page's later leg reads the state its predecessor committed.**
+    ///
+    /// A page can carry more than one leg, and each fold works on its own copy
+    /// of the record. A fold that commits hands that copy on, so the leg behind
+    /// it is judged against what was just decided rather than against the state
+    /// the page was read at.
+    ///
+    /// The pair is one initiation delivered twice at two positions: the first is
+    /// answered, and the second names the pair already accepted, which A3.4
+    /// makes an idempotent re-serve — no second answer, and the frame recorded
+    /// as seen. A fold reading the state the page opened at instead answers it a
+    /// second time, and the store refuses the resealed acceptance, so the leg
+    /// ends deferred with its position unsettled and its key unwritten.
+    #[test]
+    fn a_committing_fold_hands_its_record_to_the_next_leg_on_the_page() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, b) = restart_both(&dir_a, &dir_b, 1);
+        let b_s_pc = *b.resume().s_pc();
+        let root = a.resume().committed_root().clone();
+
+        // Ascending attempts at one generation are A5.1's supersede, which is
+        // the cheapest pair of initiations that are both answered.
+        let seal_at = |attempt: u32, seq: u64| {
+            let (eph_ek, _) = reest::mint_ephemeral().expect("the ephemeral mints");
+            let mut fresh = Attempt::FIRST;
+            let mut token = daemonseed_core::dm::resume::FreshAttempt::first();
+            for _ in 1..attempt {
+                token = fresh.advance().expect("attempt space remains");
+                fresh = token.attempt();
+            }
+            reest::seal_re_est(&root, Direction::BToA, 1, seq, &token, &eph_ek, &b_s_pc)
+                .expect("the initiation seals")
+        };
+
+        let first_seq = 20u64;
+        let second_seq = 21u64;
+        let page = position_of(first_seq).page();
+        assert_eq!(
+            position_of(second_seq).page(),
+            page,
+            "the two initiations must share a page"
+        );
+        let conversation = a.conversation();
+        fold_page_at(
+            &mut a.machine,
+            BASE_MS,
+            conversation,
+            page,
+            vec![
+                (position_of(first_seq), seal_at(1, first_seq)),
+                (position_of(second_seq), seal_at(1, second_seq)),
+            ],
+        );
+
+        let after = a.resume();
+        // **The positive control comes first**: an answered initiation, so the
+        // second fold below had something to be judged against.
+        assert_eq!(
+            after
+                .acceptance()
+                .map(|slot| (slot.generation(), slot.attempt().get())),
+            Some((1, 1)),
+            "the first initiation on the page was not answered"
+        );
+        let seen: Vec<u64> = after
+            .dedup()
+            .keys()
+            .iter()
+            .filter(|key| key.leg() == Leg::ReEst)
+            .map(|key| key.seq())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![first_seq, second_seq],
+            "the page's record did not carry the first fold's decision into the second"
+        );
+        assert_eq!(
+            a.machine.correspondences[0].health.leg_folds_deferred, 0,
+            "the re-serve was refused, which is what answering it twice looks like"
+        );
+    }
+
+    /// Establish a pair, then make the far side knock from a machine that lost
+    /// its state, which tears this side's conversation down while its key
+    /// schedule survives.
+    ///
+    /// The key schedule surviving is the point: a teardown releases the pages
+    /// and records the conversation, and every planner still reads a ratchet
+    /// and channel roots that are exactly as they were.
+    fn established_then_torn_down(
+        dir_a: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+    ) -> (DmMachine, CorrespondenceLabel) {
+        let (mut a, _b, label) = established_initiator(dir_a, dir_b);
+        let dir_b2 = tempfile::tempdir().expect("temp dir B2");
+        let mut b2 = machine_as(peer_identity(), &dir_b2);
+        b2.persist.provision_block_list().expect("provision B2");
+        let (_, entry) = knock_as_initiator(&mut b2, &keys());
+        let out = a.on_doorbell(BASE_MS, sweep_of(vec![(11, entry)]));
+        assert!(
+            out.iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::ChannelLost { .. }))),
+            "the re-knock did not tear the channel down: {out:?}"
+        );
+        (a, label)
+    }
+
+    /// M71. **A torn-down conversation opens no re-establishment.**
+    ///
+    /// The pages are handed back at the teardown, so an attempt opened after it
+    /// would seal a leg for a record nobody is reading and put the
+    /// correspondence back on the ladder the teardown stopped. The flag the
+    /// pass reads is what a load sets; a teardown does not clear it.
+    ///
+    /// The control is the same fixture without the teardown, which must open an
+    /// attempt — a pass that opened nothing either way would prove nothing.
+    #[test]
+    fn a_torn_down_conversation_opens_no_re_establishment() {
+        for torn_down in [false, true] {
+            let dir_a = tempfile::tempdir().expect("temp dir A");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let (mut a, label) = if torn_down {
+                established_then_torn_down(&dir_a, &dir_b)
+            } else {
+                let (a, _b, label) = established_initiator(&dir_a, &dir_b);
+                (a, label)
+            };
+            // A4.2's cause 2, the only standing cause that opens a
+            // re-establishment: an entry composed while no chain can seal it.
+            queue_unsealed(&a, &label, Direction::AToB, 1);
+            let before = read_resume(&a, &label).attempt().map(Attempt::get);
+            a.correspondences[0].resume_owed = true;
+
+            let effects = a.on_tick(BASE_MS);
+
+            let record = read_resume(&a, &label);
+            assert_eq!(
+                record.own_slot().is_some(),
+                !torn_down,
+                "torn_down={torn_down}: the pass made the wrong call on the attempt"
+            );
+            if torn_down {
+                assert_eq!(
+                    record.attempt().map(Attempt::get),
+                    before,
+                    "the attempt counter moved for a torn-down conversation"
+                );
+                assert!(
+                    !effects.iter().any(|e| matches!(
+                        e,
+                        DmEffect::Emit(DmEvent::ReestablishmentAnomaly {
+                            event: TrustEventKey::DmReestablishmentFailed,
+                            ..
+                        })
+                    )),
+                    "a torn-down conversation reported a failed re-establishment: {effects:?}"
+                );
+            }
+        }
+    }
+
+    /// M72. **A torn-down conversation's queued leg spends no rung.**
+    ///
+    /// A leg is written by a correspondence with no key schedule, so the
+    /// liveness test every other emitter is filtered by answers `false` for
+    /// exactly the party that has a leg to send. The teardown has to be asked
+    /// about directly, and asked before the entry is offered its dispatch, or a
+    /// torn-down conversation walks its ladder toward the give-up on writes the
+    /// publish arm then declines to make.
+    ///
+    /// **The leg is queued AFTER the teardown, and that is what makes this a
+    /// probe rather than a tautology.** The teardown this fixture uses ends
+    /// every entry the outbox was holding, so a leg queued before it is terminal
+    /// and never offered a dispatch whatever the filter does. What reaches the
+    /// filter is a leg queued afterwards — a page whose sweep was already in
+    /// flight can fold a leg and re-queue its answer on the way past.
+    ///
+    /// The control is the same fixture without the teardown, whose rung must
+    /// move over the same ticks.
+    #[test]
+    fn a_torn_down_conversations_leg_spends_no_rung() {
+        for torn_down in [false, true] {
+            let dir_a = tempfile::tempdir().expect("temp dir A");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let (mut a, _b, label) = established_initiator(&dir_a, &dir_b);
+
+            if torn_down {
+                let dir_b2 = tempfile::tempdir().expect("temp dir B2");
+                let mut b2 = machine_as(peer_identity(), &dir_b2);
+                b2.persist.provision_block_list().expect("provision B2");
+                let (_, entry) = knock_as_initiator(&mut b2, &keys());
+                let out = a.on_doorbell(BASE_MS, sweep_of(vec![(11, entry)]));
+                assert!(
+                    out.iter()
+                        .any(|e| matches!(e, DmEffect::Emit(DmEvent::ChannelLost { .. }))),
+                    "the re-knock did not tear the channel down: {out:?}"
+                );
+            }
+
+            // The attempt is opened first and the entry queued against its own
+            // slot, because a leg whose sequence matches no live slot is an
+            // orphan and the upkeep pass retires it before any ladder runs.
+            let (leg_seq, bytes) = crash_after_committing_an_attempt(&a, &label, Direction::AToB);
+            a.persist
+                .update_outbox(&label, Direction::AToB, BASE_MS, |outbox| {
+                    outbox.enqueue_sealed(
+                        leg_seq,
+                        OutboxTarget::ReEstablishmentLeg,
+                        BASE_MS,
+                        SealedFrame::new(bytes.clone()),
+                        0,
+                    )?;
+                    Ok(Mutation::Changed(()))
+                })
+                .expect("the leg queues");
+
+            let rung_of = |m: &DmMachine, at: i64| -> u32 {
+                m.persist
+                    .read_outbox(&label, at)
+                    .expect("the outbox reads")
+                    .expect("the outbox exists")
+                    .iter()
+                    .find(|entry| entry.seq() == leg_seq)
+                    .expect("the leg is queued")
+                    .schedule()
+                    .rung()
+            };
+            let before = rung_of(&a, BASE_MS);
+
+            let mut clock = BASE_MS;
+            for _ in 0..4 {
+                clock = past_the_reconnect_band(clock);
+                a.on_tick(clock);
+            }
+            let after = rung_of(&a, clock);
+            assert_eq!(
+                after == before,
+                torn_down,
+                "torn_down={torn_down}: the leg's rung went {before} -> {after}"
+            );
+        }
     }
 
     /// Every page a batch of effects asks the transport to close.

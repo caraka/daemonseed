@@ -173,10 +173,22 @@ pub const FRAME_KIND_FIRST_CONTACT: &[u8] = b"fc";
 /// [`RK0`](crate::dm::ratchet), never a value chained off any of them: `rs0`
 /// outlives `ss0`, which establishment deletes, so a chain would let the
 /// retained value regenerate the deleted one.
-#[derive(Clone, Zeroize, zeroize::ZeroizeOnDrop)]
+/// **Not `Clone`, and the fields are private.** Two of the three are secrets —
+/// `chan_id` is bound into every signature and seal the channel writes, and
+/// `rs0` is the resume authority for the whole correspondence — and this type
+/// zeroizes on drop, which a clone quietly doubles the lifetime of: the copy
+/// wipes when it drops, and until then there are two of it and only one that
+/// any caller is tracking. Nothing needed one, so nothing has one. `rs0` is
+/// borrowed for that reason. `ar` and `chan_id` are handed out by value because
+/// every caller needs an owned address root or channel identifier to derive
+/// from; both are addressing material a correspondent already holds rather than
+/// key material, so a copy is a value to keep out of a memory dump rather than
+/// a secret escaping — a caller that cares wraps what it gets and wipes the
+/// bare copy, as `record_first_contact_accepted` does.
+#[derive(Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ChannelRoots {
-    pub ar: [u8; ROOT_LEN],
-    pub chan_id: [u8; ROOT_LEN],
+    ar: [u8; ROOT_LEN],
+    chan_id: [u8; ROOT_LEN],
     /// The retained re-establishment root `RS_0`.
     ///
     /// Advanced by [`crate::dm::resume::reroot`] at every completed
@@ -187,7 +199,75 @@ pub struct ChannelRoots {
     /// measured from that stamp expires. The retention is deliberate — frames
     /// already published under the superseded root must still open while the
     /// dead direction drains — and one root is retained at a time.
-    pub rs0: crate::dm::resume::CommittedRoot,
+    rs0: crate::dm::resume::CommittedRoot,
+}
+
+impl ChannelRoots {
+    /// Build the three roots one extraction yields.
+    ///
+    /// `pub(crate)` because the only honest producer is
+    /// [`derive_channel_roots`]: the three are siblings of one extraction, and a
+    /// caller assembling them from elsewhere would be pairing an address plane
+    /// with a channel identifier and a resume authority that belong to a
+    /// different conversation.
+    pub(crate) fn new(
+        ar: [u8; ROOT_LEN],
+        chan_id: [u8; ROOT_LEN],
+        rs0: crate::dm::resume::CommittedRoot,
+    ) -> Self {
+        Self { ar, chan_id, rs0 }
+    }
+
+    /// The address root every page and acknowledgement record hangs off.
+    ///
+    /// **By value, unlike [`Self::rs0`], and the difference is what the caller
+    /// does with it.** Every consumer of these two is a derivation that wants
+    /// the bytes — a page address, an acknowledgement address, a signature
+    /// preimage — so a borrow would only move the copy to the call site. The
+    /// retained root is different: it is the resume authority, it has a type
+    /// that wipes itself, and lending it keeps that property intact.
+    pub fn ar(&self) -> [u8; ROOT_LEN] {
+        self.ar
+    }
+
+    /// The channel identifier every frame's signature and seal bind. Never
+    /// serialized (§ v4 minor invariant).
+    pub fn chan_id(&self) -> [u8; ROOT_LEN] {
+        self.chan_id
+    }
+
+    /// The retained re-establishment root `RS_0`.
+    pub fn rs0(&self) -> &crate::dm::resume::CommittedRoot {
+        &self.rs0
+    }
+
+    /// Build the three roots from chosen bytes, for the out-of-crate zeroize
+    /// witness.
+    ///
+    /// The witness has to place a known pattern at a known offset and then read
+    /// the freed block back, which needs a producer that is not the derivation —
+    /// and [`Self::new`] is crate-private for the reason its own docs give. Same
+    /// shape, and same reason, as
+    /// [`VerifiedFirstContact::ss0_offset_for_test`].
+    #[cfg(any(test, feature = "testing"))]
+    pub fn new_for_test(
+        ar: [u8; ROOT_LEN],
+        chan_id: [u8; ROOT_LEN],
+        rs0: crate::dm::resume::CommittedRoot,
+    ) -> Self {
+        Self::new(ar, chan_id, rs0)
+    }
+
+    /// Where `rs0` sits inside the struct.
+    ///
+    /// `offset_of!` cannot see a private field from outside the crate, and
+    /// without the offset the witness's containment match would accept the
+    /// secret being freed at *any* offset in the record — which is the drift the
+    /// control exists to catch.
+    #[cfg(any(test, feature = "testing"))]
+    pub const fn rs0_offset_for_test() -> usize {
+        core::mem::offset_of!(Self, rs0)
+    }
 }
 
 impl std::fmt::Debug for ChannelRoots {
@@ -312,10 +392,12 @@ pub fn derive_channel_roots(ss0: &[u8; SS0_LEN]) -> Result<ChannelRoots, FirstCo
         .expand(domain::DM_ADDR_ROOT, &mut ar)
         .and_then(|()| hkdf.expand(domain::DM_CHAN_ID, &mut chan_id))
         .and_then(|()| hkdf.expand(domain::DM_REEST_ROOT, &mut rs0))
-        .map(|()| ChannelRoots {
-            ar,
-            chan_id,
-            rs0: crate::dm::resume::CommittedRoot::from_bytes(&rs0),
+        .map(|()| {
+            ChannelRoots::new(
+                ar,
+                chan_id,
+                crate::dm::resume::CommittedRoot::from_bytes(&rs0),
+            )
         })
         .map_err(FirstContactError::Kdf);
     ar.zeroize();
@@ -475,7 +557,7 @@ pub fn conversation_binding(
     ss0: &[u8; SS0_LEN],
 ) -> Result<[u8; AR_FINGERPRINT_LEN], FirstContactError> {
     let roots = derive_channel_roots(ss0)?;
-    ar_fingerprint(&roots.ar).map_err(FirstContactError::Module)
+    ar_fingerprint(&roots.ar()).map_err(FirstContactError::Module)
 }
 
 /// Pad an encoded body to the smallest bucket that holds it. See
@@ -729,7 +811,7 @@ pub fn build(
     let msg_sig = signing_pc
         .sign(&msg_sig_input(
             FRAME_KIND_FIRST_CONTACT,
-            &roots.chan_id,
+            &roots.chan_id(),
             DIR_A2B,
             seq,
             eph_ek,
@@ -1302,7 +1384,7 @@ where
         &pk_pc,
         &msg_sig_input(
             FRAME_KIND_FIRST_CONTACT,
-            &roots.chan_id,
+            &roots.chan_id(),
             DIR_A2B,
             body.seq,
             &eph_ek,
@@ -1491,7 +1573,7 @@ mod tests {
             msg_sig: signer_pc
                 .sign(&msg_sig_input(
                     FRAME_KIND_FIRST_CONTACT,
-                    &roots.chan_id,
+                    &roots.chan_id(),
                     DIR_A2B,
                     seq,
                     eph_ek,
@@ -1591,7 +1673,7 @@ mod tests {
         // the channel's opening secret that #255 exists to prevent, and it is why
         // the fields are private. `ar` is a derived, non-secret root, so copying
         // it is fine.
-        let ar = k.state.roots().ar;
+        let ar = k.state.roots().ar();
 
         let record = k.state.into_provisional().expect("a matched pair");
 
@@ -1645,10 +1727,11 @@ mod tests {
         let k = knock("hi", EPOCH);
         let v = open_at(&k, EPOCH).unwrap();
         assert_eq!(v.ss0, *k.state.ss0);
-        assert_eq!(v.roots.ar, k.state.roots.ar);
-        assert_eq!(v.roots.chan_id, k.state.roots.chan_id);
+        assert_eq!(v.roots.ar(), k.state.roots.ar());
+        assert_eq!(v.roots.chan_id(), k.state.roots.chan_id());
         assert_ne!(
-            k.state.roots.ar, k.state.roots.chan_id,
+            k.state.roots.ar(),
+            k.state.roots.chan_id(),
             "the address root and the channel id must be independent derivations"
         );
     }
@@ -1669,7 +1752,7 @@ mod tests {
         );
         assert!(rendered.contains("<redacted>"));
         assert!(!format!("{:?}", k.state).contains(&hex::encode(v.ss0)));
-        assert!(!format!("{:?}", v.roots).contains(&hex::encode(v.roots.ar)));
+        assert!(!format!("{:?}", v.roots).contains(&hex::encode(v.roots.ar())));
     }
 
     /// The decrypted message is a secret too, and for a longer stretch than `ss0`:
@@ -2261,11 +2344,11 @@ mod tests {
 
         let roots = derive_channel_roots(&[7u8; SS0_LEN]).unwrap();
         assert_eq!(
-            hex::encode(roots.ar),
+            hex::encode(roots.ar()),
             "ac73f35ba0c469f8e3cee6708294ab9ac48bfbacea82b7393ec174287beb53ac"
         );
         assert_eq!(
-            hex::encode(roots.chan_id),
+            hex::encode(roots.chan_id()),
             "c1724ec000d212dedaa8769ce618a9da5be6c3f30c3618b1f97381e8ebc20232"
         );
         assert_eq!(

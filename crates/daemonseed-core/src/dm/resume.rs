@@ -422,6 +422,24 @@ pub enum ResumeError {
     /// copy of a frame the peer is still waiting for, and the peer then retires
     /// at `T_RETIRE` while this side has already advanced.
     ConfirmSlotDropped { generation: u32 },
+    /// A record whose settling leg names a generation the record has not
+    /// completed.
+    ///
+    /// The confirm slot is written by the completion that advanced
+    /// `reconnect_gen` to that same generation, so a higher one names an
+    /// exchange this record has never settled.
+    ConfirmSlotAheadOfGeneration { generation: u32, reconnect_gen: u32 },
+    /// A record whose acceptance slot names a generation the record has
+    /// already moved past.
+    ///
+    /// A3.4 has `reconnect_gen` advance only by a completed handshake, so an
+    /// acceptance BELOW it names an exchange this record has left behind — and a
+    /// completion zeroes the slot rather than carrying it forward. The equal
+    /// case is left alone deliberately: [`crate::dm::reest::ReEstGate`] carries
+    /// a re-serve carve-out for an accepted pair sitting at its own floor, and
+    /// refusing the record would make that carve-out unreachable rather than
+    /// merely unreached.
+    AcceptanceBelowGeneration { generation: u32, reconnect_gen: u32 },
     /// A record offering an earlier `RE-EST` window base than the stored one.
     ///
     /// A6.1 has the window *"slide with observed traffic"*, forward only. The
@@ -692,6 +710,22 @@ impl std::fmt::Display for ResumeError {
                 f,
                 "the settling leg of generation {generation} may only be cleared by its \
                  confirming observation or a later exchange"
+            ),
+            Self::ConfirmSlotAheadOfGeneration {
+                generation,
+                reconnect_gen,
+            } => write!(
+                f,
+                "a settling leg for generation {generation} sits on a record committed at \
+                 {reconnect_gen}"
+            ),
+            Self::AcceptanceBelowGeneration {
+                generation,
+                reconnect_gen,
+            } => write!(
+                f,
+                "an acceptance at generation {generation} sits on a record already \
+                 committed past it at {reconnect_gen}"
             ),
             Self::ReEstBaseWouldRegress { stored, offered } => write!(
                 f,
@@ -2130,12 +2164,12 @@ impl ResumeRecord {
     /// the fields have to agree with each other, so the only way to have a
     /// record is to have supplied every part of one at the same moment.
     ///
-    /// **Infallible, where it used to return a `Result`.** Its one failure mode
-    /// was a sealed frame past [`MAX_FRAME_LEN`], and that ceiling now belongs to
-    /// [`SealedReEst`] — holding one is already proof the length was checked, so
-    /// there is nothing left here to refuse. The attempt arrives inside the same
-    /// value for the reason [`SealedReEst`] gives: the pairing is fixed at
-    /// sealing time and this call cannot restate it.
+    /// **Fallible, and what it refuses is the pairings between the two groups**
+    /// — see the checks at the head of the body. Frame length is not among them:
+    /// that ceiling belongs to [`SealedReEst`], so holding one is already proof
+    /// it was checked. The attempt arrives inside the same value for the reason
+    /// [`SealedReEst`] gives: the pairing is fixed at sealing time and this call
+    /// cannot restate it.
     ///
     /// **Both slots are `None` at first establishment.** The keys, the committed
     /// root and the floor are known the moment a correspondence exists; a sealed
@@ -2156,7 +2190,58 @@ impl ResumeRecord {
         handshake: ReEstState,
         retention: Retention,
         send_floor: SendFloor,
-    ) -> Self {
+    ) -> Result<Self, ResumeError> {
+        // **The pairings, checked here because this is the other door.** Of the
+        // four below, [`Self::decode`] refuses two on the way in from disk — the
+        // own slot against the attempt counter, and a half-present retention —
+        // and neither of the two generation comparisons, which no encoding
+        // constrains. So a caller assembling the two groups by hand can offer a
+        // record `decode` would never return, and the store's guards compare a
+        // stored record against an offered one without asking whether the
+        // offered one is coherent at all.
+        //
+        // **Validating here rather than behind a constructor per group.** The
+        // pairings that matter span the fields: the own slot's attempt against
+        // the counter beside it, and both the acceptance and the settling leg
+        // against the committed generation. A constructor per group would have
+        // to be handed the other group's values to ask the same questions, which
+        // is this call with extra steps — and this call is the one door every
+        // record that is not decoded comes through. The groups stay plain data,
+        // because plain data is what they are.
+        if let Some(slot) = handshake.own.as_ref()
+            && slot.attempt().get() != handshake.attempt
+        {
+            return Err(ResumeError::AttemptSlotDisagrees {
+                field: handshake.attempt,
+                slot: slot.attempt().get(),
+            });
+        }
+        if let Some(slot) = handshake.acceptance.as_ref()
+            && slot.generation() < handshake.reconnect_gen
+        {
+            return Err(ResumeError::AcceptanceBelowGeneration {
+                generation: slot.generation(),
+                reconnect_gen: handshake.reconnect_gen,
+            });
+        }
+        if let Some(slot) = handshake.confirm.as_ref()
+            && slot.generation() > handshake.reconnect_gen
+        {
+            return Err(ResumeError::ConfirmSlotAheadOfGeneration {
+                generation: slot.generation(),
+                reconnect_gen: handshake.reconnect_gen,
+            });
+        }
+        // A3.5 runs the retention ceiling from the stamp, so a retained root
+        // without one has no ceiling at all — the same pairing `decode` refuses
+        // as half a retention.
+        if retention
+            .retained
+            .as_ref()
+            .is_some_and(|held| held.superseded_at_ms() <= 0)
+        {
+            return Err(ResumeError::RetentionHalfPresent { present: true });
+        }
         let mut record = Self {
             s_pc,
             pk_pc,
@@ -2185,7 +2270,7 @@ impl ResumeRecord {
         // Idempotent, so running it here costs nothing when the caller has
         // already run it and closes the gap when the caller has not.
         record.evict_dedup_below_window();
-        record
+        Ok(record)
     }
 
     /// Record that a peer `RE-EST` at `attempt` was accepted, sliding A6.1's
@@ -3387,7 +3472,10 @@ mod tests {
                 attempt: 7,
                 last_seen_re_est: 0,
                 own: Some(own_slot(10, 7, 0x44, 512)),
-                acceptance: Some(acceptance_slot(8, 5, 0x66, 256).confirm()),
+                // Ahead of the committed generation, which every real
+                // acceptance is: `ReEstGate` drops what is at or below it, and a
+                // completion zeroes the slot rather than leaving it behind.
+                acceptance: Some(acceptance_slot(11, 5, 0x66, 256).confirm()),
                 confirm: None,
                 attempt_at_window_start: 2,
                 reroot_ratchet_gen: 0,
@@ -3395,6 +3483,7 @@ mod tests {
             full_retention(),
             SendFloor::new(4, 100),
         )
+        .expect("the fixture's pairings are coherent")
     }
 
     /// The same record with both window bases set, so an eviction test can say
@@ -3424,7 +3513,8 @@ mod tests {
                 stopped: false,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         for key in record.dedup().keys() {
             rebuilt
                 .note_processed(*key)
@@ -3446,6 +3536,7 @@ mod tests {
             Retention::none(),
             SendFloor::new(0, 0),
         )
+        .expect("the fixture's pairings are coherent")
     }
 
     /// **Opening an attempt moves the counter and the slot in one act, and puts
@@ -3553,7 +3644,8 @@ mod tests {
             },
             Retention::none(),
             SendFloor::new(4, 100),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
 
         let refused = record.open_attempt(
             78,
@@ -3769,7 +3861,7 @@ mod tests {
         } else {
             [0x3du8; ml_kem::DK_LEN]
         });
-        out.extend_from_slice(&if acc_attempt == 0 { 0u32 } else { 8 }.to_be_bytes());
+        out.extend_from_slice(&if acc_attempt == 0 { 0u32 } else { 11 }.to_be_bytes());
         out.extend_from_slice(&acc_attempt.to_be_bytes());
         out.extend_from_slice(&if acc_attempt == 0 { 0u64 } else { 55 }.to_be_bytes());
         out.push(u8::from(acc_confirmed));
@@ -3870,7 +3962,7 @@ mod tests {
         expected.extend_from_slice(&77u64.to_be_bytes()); // own slot seq
         expected.push(1); // own slot ephemeral decapsulation key present
         expected.extend_from_slice(&[0x3d; ml_kem::DK_LEN]); // that key
-        expected.extend_from_slice(&8u32.to_be_bytes()); // acceptance generation
+        expected.extend_from_slice(&11u32.to_be_bytes()); // acceptance generation
         expected.extend_from_slice(&5u32.to_be_bytes()); // acceptance attempt
         expected.extend_from_slice(&55u64.to_be_bytes()); // acceptance seq
         expected.push(1); // acceptance confirmed
@@ -3927,7 +4019,8 @@ mod tests {
             ReEstState::first_establishment(),
             Retention::none(),
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         let first = reroot(&root(0x33), &[0x09; ROOT_KEY_LEN]).expect("operational");
         let rs_n = record.committed_root().as_bytes().to_vec();
         drop(record.accept_peer_initiation(first, acceptance_slot(1, 1, 0x66, 64), false, 1_000));
@@ -3988,7 +4081,8 @@ mod tests {
                 stopped: false,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         assert!(!record.confirm_acceptance(9), "there is nothing to settle");
         assert_eq!(record.reconnect_gen(), 0, "the generation advanced anyway");
         assert_eq!(record.reroot_ratchet_gen(), 0);
@@ -4012,7 +4106,8 @@ mod tests {
                 stopped: false,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         assert!(settled.confirm_acceptance(9));
         assert_eq!(settled.reconnect_gen(), 1);
         assert_eq!(settled.reroot_ratchet_gen(), 9);
@@ -4108,6 +4203,9 @@ mod tests {
             pk_pc(0x22),
             root(0x33),
             ReEstState {
+                // The settling leg names the generation the completion that
+                // wrote it advanced to, so the record is committed there too.
+                reconnect_gen: 4,
                 confirm: Some(
                     ConfirmSlot::new(4, 900, pattern(0x77, 128).into_boxed_slice())
                         .expect("within the ceiling"),
@@ -4116,7 +4214,8 @@ mod tests {
             },
             Retention::none(),
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         let back = ResumeRecord::decode(&record.encode()).expect("decodes");
         let slot = back.confirm_slot().expect("the slot survived");
         assert_eq!((slot.generation(), slot.seq()), (4, 900));
@@ -4130,6 +4229,153 @@ mod tests {
         assert_eq!(
             ResumeRecord::decode(&bytes).err(),
             Some(ResumeError::SlotGenerationWithoutAttempt { generation: 4 })
+        );
+    }
+
+    /// **`ResumeRecord::new` refuses the pairings `decode` refuses**, so the two
+    /// producers of a record agree about what one is.
+    ///
+    /// Until it did, a caller assembling [`ReEstState`] and [`Retention`] by hand
+    /// could build a record `decode` would never return — and the store's guards
+    /// compare a stored record against an offered one without ever asking
+    /// whether the offered one is coherent on its own terms.
+    ///
+    /// Four refusals and their controls, because each names a different pairing
+    /// and a check that fired for all of them would be a check for none.
+    #[test]
+    fn a_record_whose_groups_disagree_is_refused_at_construction() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let build = |handshake: ReEstState, retention: Retention| {
+            ResumeRecord::new(
+                s_pc(0x11),
+                pk_pc(0x22),
+                root(0x33),
+                handshake,
+                retention,
+                SendFloor::new(0, 0),
+            )
+        };
+
+        // The own slot's attempt against the counter beside it: a record whose
+        // slot names an attempt the counter does not would re-emit under a key
+        // neither number names.
+        assert_eq!(
+            build(
+                ReEstState {
+                    attempt: 6,
+                    own: Some(own_slot(1, 7, 0x44, 64)),
+                    ..ReEstState::first_establishment()
+                },
+                Retention::none(),
+            )
+            .err(),
+            Some(ResumeError::AttemptSlotDisagrees { field: 6, slot: 7 })
+        );
+
+        // An acceptance below the committed generation: an exchange this record
+        // has moved past, which a completion would have zeroed.
+        assert_eq!(
+            build(
+                ReEstState {
+                    reconnect_gen: 9,
+                    acceptance: Some(acceptance_slot(8, 5, 0x66, 64)),
+                    ..ReEstState::first_establishment()
+                },
+                Retention::none(),
+            )
+            .err(),
+            Some(ResumeError::AcceptanceBelowGeneration {
+                generation: 8,
+                reconnect_gen: 9
+            })
+        );
+
+        // A settling leg ahead of the committed generation: the completion that
+        // writes one advances to that same generation, so a higher one names an
+        // exchange this record has never settled.
+        assert_eq!(
+            build(
+                ReEstState {
+                    reconnect_gen: 3,
+                    confirm: Some(
+                        ConfirmSlot::new(4, 200, vec![0xCF; 64].into_boxed_slice())
+                            .expect("within the ceiling"),
+                    ),
+                    ..ReEstState::first_establishment()
+                },
+                Retention::none(),
+            )
+            .err(),
+            Some(ResumeError::ConfirmSlotAheadOfGeneration {
+                generation: 4,
+                reconnect_gen: 3
+            })
+        );
+
+        // A retained root with no stamp: A3.5 runs the ceiling from the stamp,
+        // so such a root has no ceiling at all.
+        assert_eq!(
+            build(
+                ReEstState::first_establishment(),
+                Retention {
+                    retained: Some(RetainedRoot::new(root(0x55), 0)),
+                    dedup: DedupMemory::new(),
+                    stopped: false,
+                },
+            )
+            .err(),
+            Some(ResumeError::RetentionHalfPresent { present: true })
+        );
+
+        // **The controls, one per refusal.** Each is the same record with the
+        // one disagreeing value corrected, so a check that refused everything
+        // would fail here rather than reading as four working guards.
+        assert!(
+            build(
+                ReEstState {
+                    attempt: 7,
+                    own: Some(own_slot(1, 7, 0x44, 64)),
+                    ..ReEstState::first_establishment()
+                },
+                Retention::none(),
+            )
+            .is_ok()
+        );
+        assert!(
+            build(
+                ReEstState {
+                    reconnect_gen: 9,
+                    acceptance: Some(acceptance_slot(10, 5, 0x66, 64)),
+                    ..ReEstState::first_establishment()
+                },
+                Retention::none(),
+            )
+            .is_ok()
+        );
+        assert!(
+            build(
+                ReEstState {
+                    reconnect_gen: 4,
+                    confirm: Some(
+                        ConfirmSlot::new(4, 200, vec![0xCF; 64].into_boxed_slice())
+                            .expect("within the ceiling"),
+                    ),
+                    ..ReEstState::first_establishment()
+                },
+                Retention::none(),
+            )
+            .is_ok()
+        );
+        assert!(
+            build(
+                ReEstState::first_establishment(),
+                Retention {
+                    retained: Some(RetainedRoot::new(root(0x55), ANCHOR)),
+                    dedup: DedupMemory::new(),
+                    stopped: false,
+                },
+            )
+            .is_ok()
         );
     }
 
@@ -4599,7 +4845,7 @@ mod tests {
                 )),
                 acceptance: Some(
                     AcceptanceSlot::accept(
-                        0,
+                        1,
                         Attempt::FIRST,
                         u64::MAX,
                         pattern(0x66, MAX_SEALED_LEG_LEN).into_boxed_slice(),
@@ -4623,7 +4869,8 @@ mod tests {
                 stopped: true,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         assert_eq!(at_ceiling.encode().len(), MAX_ENCODED_LEN);
     }
 
@@ -4880,10 +5127,10 @@ mod tests {
         let states: [(Option<OwnSlot>, Option<AcceptanceSlot>); 4] = [
             (None, None),
             (Some(own_slot(10, 7, 0x44, 512)), None),
-            (None, Some(acceptance_slot(8, 5, 0x66, 256))),
+            (None, Some(acceptance_slot(11, 5, 0x66, 256))),
             (
                 Some(own_slot(10, 7, 0x44, 512)),
-                Some(acceptance_slot(8, 5, 0x66, 256)),
+                Some(acceptance_slot(11, 5, 0x66, 256)),
             ),
         ];
         assert_eq!(states.len(), 4, "every occupancy of two slots");
@@ -4906,7 +5153,8 @@ mod tests {
                 },
                 Retention::none(),
                 SendFloor::new(4, 100),
-            );
+            )
+            .expect("the fixture's pairings are coherent");
             let after =
                 ResumeRecord::decode(&before.encode()).expect("a fresh encoding must decode");
             assert_eq!(after.own_slot().is_some(), own_seen);
@@ -4945,7 +5193,7 @@ mod tests {
     #[test]
     fn the_confirmation_flag_survives_the_round_trip_in_both_states() {
         for confirmed in [false, true] {
-            let slot = acceptance_slot(8, 5, 0x66, 256);
+            let slot = acceptance_slot(11, 5, 0x66, 256);
             let slot = if confirmed { slot.confirm() } else { slot };
             assert_eq!(slot.confirmed(), confirmed);
             let before = ResumeRecord::new(
@@ -4964,7 +5212,8 @@ mod tests {
                 },
                 Retention::none(),
                 SendFloor::new(4, 100),
-            );
+            )
+            .expect("the fixture's pairings are coherent");
             let after = ResumeRecord::decode(&before.encode()).expect("decodes");
             assert_eq!(
                 after
@@ -5155,7 +5404,8 @@ mod tests {
                 stopped: true,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         record.observe_accepted(at(8));
         assert_eq!(record.last_seen_re_est(), 8);
 
@@ -5213,7 +5463,8 @@ mod tests {
                     stopped: false,
                 },
                 SendFloor::new(0, 0),
-            );
+            )
+            .expect("the fixture's pairings are coherent");
             assert_eq!(record.dedup().len(), 1, "the base is 0, so nothing evicts");
             // Raise the base WITHOUT the entry going: `observe_accepted` would
             // evict it, so the base is moved by rebuilding, which is what a
@@ -5427,7 +5678,8 @@ mod tests {
             },
             Retention::none(),
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         assert!(record.acceptance().is_none(), "the fixture accepts nothing");
         assert!(record.own_slot().is_none(), "and holds no sealed frame");
         assert_eq!(record.last_seen_re_ack(), two_c);
@@ -5498,7 +5750,8 @@ mod tests {
                 stopped: false,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         let mut recorded = 0usize;
         for window in 0..3u32 {
             for step in 1..=C {
@@ -5533,7 +5786,8 @@ mod tests {
                     stopped: false,
                 },
                 SendFloor::new(0, 0),
-            );
+            )
+            .expect("the fixture's pairings are coherent");
             assert_eq!(record.last_seen_re_est(), base);
             assert_eq!(record.last_seen_re_ack(), base);
             assert!(
@@ -5680,7 +5934,8 @@ mod tests {
                 stopped: false,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         assert_eq!(
             accepted.last_seen_re_est(),
             10,
@@ -5709,7 +5964,8 @@ mod tests {
                 stopped: false,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         assert!(completed.acceptance().is_none(), "the fixture completed");
         assert_eq!(
             completed.last_seen_re_est(),
@@ -5764,7 +6020,8 @@ mod tests {
                 stopped: false,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
 
         assert_eq!(record.last_seen_re_est(), 9);
         assert_eq!(
@@ -5803,7 +6060,8 @@ mod tests {
                 stopped: false,
             },
             SendFloor::new(0, 0),
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         for attempt in [3, 9] {
             record
                 .note_processed(DedupKey::new(

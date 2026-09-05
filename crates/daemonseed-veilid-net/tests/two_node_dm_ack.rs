@@ -223,7 +223,7 @@ async fn an_acknowledgement_published_by_one_node_merges_at_the_other() {
     // pure, which is what makes re-deriving the right answer rather than a
     // workaround.
     let addr = |direction| {
-        DmAckAddress::for_direction(&roots.ar, direction).expect("derive an ack-record address")
+        DmAckAddress::for_direction(&roots.ar(), direction).expect("derive an ack-record address")
     };
     {
         let from_a = addr(ratchet_a.recv_direction());
@@ -241,9 +241,9 @@ async fn an_acknowledgement_published_by_one_node_merges_at_the_other() {
     let state = fixture_state();
     let record = ack_record::build_encoded(
         &state,
-        &roots.chan_id,
+        &roots.chan_id(),
         acknowledged,
-        &roots.ar,
+        &roots.ar(),
         &pc_a.signing,
     )
     .expect("A builds its acknowledgement");
@@ -272,9 +272,14 @@ async fn an_acknowledgement_published_by_one_node_merges_at_the_other() {
     // Decode → verify → merge, in that order and with no shortcut: a `PeerAck`
     // answers no question about settlement until it has been bounded by what this
     // end has actually sent.
-    let peer =
-        ack_record::decode_and_verify(&fetched, &roots.chan_id, acknowledged, &roots.ar, &peer_pk)
-            .expect("the fetched record verifies against A's pseudonym key");
+    let peer = ack_record::decode_and_verify(
+        &fetched,
+        &roots.chan_id(),
+        acknowledged,
+        &roots.ar(),
+        &peer_pk,
+    )
+    .expect("the fetched record verifies against A's pseudonym key");
 
     let mut ours = AckState::new();
     assert_eq!(
@@ -289,9 +294,14 @@ async fn an_acknowledgement_published_by_one_node_merges_at_the_other() {
     // Re-decoded from the same fetched bytes: the clip is a property of the merge,
     // and a record that only ever meets a generous ceiling exercises the union
     // algebra while saying nothing about the bound.
-    let peer_again =
-        ack_record::decode_and_verify(&fetched, &roots.chan_id, acknowledged, &roots.ar, &peer_pk)
-            .expect("the same record verifies twice");
+    let peer_again = ack_record::decode_and_verify(
+        &fetched,
+        &roots.chan_id(),
+        acknowledged,
+        &roots.ar(),
+        &peer_pk,
+    )
+    .expect("the same record verifies twice");
     let mut clipped = AckState::new();
     assert_eq!(
         clipped
@@ -314,9 +324,9 @@ async fn an_acknowledgement_published_by_one_node_merges_at_the_other() {
     assert!(
         ack_record::decode_and_verify(
             &fetched,
-            &roots.chan_id,
+            &roots.chan_id(),
             acknowledged,
-            &roots.ar,
+            &roots.ar(),
             pseudonym().signing.public_key(),
         )
         .is_err(),
@@ -361,9 +371,9 @@ fn both_ends_derive_the_same_acknowledgement_record() {
     daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
 
     let (roots, ratchet_a, ratchet_b) = conversation();
-    let writer = DmAckAddress::for_direction(&roots.ar, ratchet_a.recv_direction())
+    let writer = DmAckAddress::for_direction(&roots.ar(), ratchet_a.recv_direction())
         .expect("A derives the record it writes");
-    let reader = DmAckAddress::for_direction(&roots.ar, ratchet_b.send_direction())
+    let reader = DmAckAddress::for_direction(&roots.ar(), ratchet_b.send_direction())
         .expect("B derives the record it reads");
     assert_eq!(
         writer.owner_seed().as_bytes(),
@@ -373,7 +383,7 @@ fn both_ends_derive_the_same_acknowledgement_record() {
 
     // And the other half of the conversation must be a DIFFERENT record, or the
     // live test's unwritten-record probe would be reading the one just published.
-    let other = DmAckAddress::for_direction(&roots.ar, ratchet_b.recv_direction())
+    let other = DmAckAddress::for_direction(&roots.ar(), ratchet_b.recv_direction())
         .expect("the other direction's record");
     assert_ne!(other.direction(), writer.direction());
     assert_ne!(
@@ -402,18 +412,18 @@ fn the_fixture_round_trips_and_clips_without_a_network() {
 
     let record = ack_record::build_encoded(
         &fixture_state(),
-        &roots.chan_id,
+        &roots.chan_id(),
         acknowledged,
-        &roots.ar,
+        &roots.ar(),
         &pc.signing,
     )
     .expect("the fixture builds a record");
 
     let peer = ack_record::decode_and_verify(
         &record,
-        &roots.chan_id,
+        &roots.chan_id(),
         acknowledged,
-        &roots.ar,
+        &roots.ar(),
         pc.signing.public_key(),
     )
     .expect("the fixture verifies");
@@ -427,9 +437,9 @@ fn the_fixture_round_trips_and_clips_without_a_network() {
 
     let peer_again = ack_record::decode_and_verify(
         &record,
-        &roots.chan_id,
+        &roots.chan_id(),
         acknowledged,
-        &roots.ar,
+        &roots.ar(),
         pc.signing.public_key(),
     )
     .expect("the fixture verifies twice");

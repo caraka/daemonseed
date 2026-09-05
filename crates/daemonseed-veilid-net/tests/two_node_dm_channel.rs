@@ -177,11 +177,13 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     let roots_a = derive_channel_roots(&ss0).expect("A derives the channel roots");
     let roots_b = derive_channel_roots(&ss0).expect("B derives the channel roots");
     assert_eq!(
-        roots_a.ar, roots_b.ar,
+        roots_a.ar(),
+        roots_b.ar(),
         "both ends must derive the same address root from ss0 alone"
     );
     assert_eq!(
-        roots_a.chan_id, roots_b.chan_id,
+        roots_a.chan_id(),
+        roots_b.chan_id(),
         "both ends must derive the same channel id from ss0 alone"
     );
 
@@ -261,7 +263,7 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
 
         let frame_bytes = frame::seal(
             outbound,
-            &roots_a.chan_id,
+            &roots_a.chan_id(),
             &alice_pc.signing,
             alice.signing.public_key(),
             &rcpt_hash,
@@ -275,7 +277,7 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
         // number by construction (#269). There is nothing left for the transport
         // to re-check: a page from one sequence number and a slot from another is
         // no longer a pair that can be built.
-        let address = DmPageAddress::sending(&roots_a.ar, &ratchet_a, at)
+        let address = DmPageAddress::sending(&roots_a.ar(), &ratchet_a, at)
             .expect("A derives its sending page address");
         node_a
             .publish_dm_page(address, frame_bytes)
@@ -310,12 +312,12 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     // is the intended usage. B can only pass a RECEIVING address to a sweep, which
     // is the direction it wants — the type refuses the other one.
     let addr_b = || {
-        DmPageAddress::receiving(&roots_b.ar, &ratchet_b, page)
+        DmPageAddress::receiving(&roots_b.ar(), &ratchet_b, page)
             .expect("B derives its receiving page address")
     };
     assert_eq!(
         DmPageAddress::sending(
-            &roots_a.ar,
+            &roots_a.ar(),
             &ratchet_a,
             // Any slot on the page: the owner seed descends from the root, the
             // direction and the page, never the slot.
@@ -423,7 +425,7 @@ async fn sealed_channel_messages_round_trip_through_a_page_and_open_out_of_order
     // authenticate) — different failures, deliberately not flattened.
     let receive = |ratchet: &mut Ratchet, parsed: &ParsedFrame, found_at: PagePosition| {
         ratchet.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |mk| {
-            parsed.open(mk, &roots_b.chan_id, dir_b, found_at, &rcpt_hash, author)
+            parsed.open(mk, &roots_b.chan_id(), dir_b, found_at, &rcpt_hash, author)
         })
     };
 
@@ -598,7 +600,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
     let opening_eph = identity();
     let roots_a = derive_channel_roots(&ss0).expect("A derives the channel roots");
     let roots_b = derive_channel_roots(&ss0).expect("B derives the channel roots");
-    assert_eq!(roots_a.ar, roots_b.ar);
+    assert_eq!(roots_a.ar(), roots_b.ar());
 
     let mut ratchet_a = Ratchet::initiator(
         &ss0,
@@ -646,7 +648,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
     let accept_at = paging::position_of(accept_seq);
     let accept_bytes = frame::seal_accept(
         accept_out,
-        &roots_b.chan_id,
+        &roots_b.chan_id(),
         &bob_pc.signing,
         &bob.signing,
         &rcpt_a,
@@ -656,7 +658,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
     .expect("B seals its acceptance");
     node_b
         .publish_dm_page(
-            DmPageAddress::sending(&roots_b.ar, &ratchet_b, accept_at)
+            DmPageAddress::sending(&roots_b.ar(), &ratchet_b, accept_at)
                 .expect("B derives its sending page address"),
             accept_bytes.clone(),
         )
@@ -677,7 +679,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
     );
     let reply_bytes = frame::seal(
         reply_out,
-        &roots_b.chan_id,
+        &roots_b.chan_id(),
         &bob_pc.signing,
         bob.signing.public_key(),
         &rcpt_a,
@@ -688,7 +690,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
     .expect("B seals its reply");
     node_b
         .publish_dm_page(
-            DmPageAddress::sending(&roots_b.ar, &ratchet_b, reply_at)
+            DmPageAddress::sending(&roots_b.ar(), &ratchet_b, reply_at)
                 .expect("B derives its sending page address"),
             reply_bytes,
         )
@@ -698,7 +700,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
     // ── A sweeps the page it derived for itself ──────────────────────────────
     let page = accept_at.page();
     let addr_a = || {
-        DmPageAddress::receiving(&roots_a.ar, &ratchet_a, page)
+        DmPageAddress::receiving(&roots_a.ar(), &ratchet_a, page)
             .expect("A derives its receiving page address")
     };
     let mut swept: Vec<(PagePosition, Vec<u8>)> = Vec::new();
@@ -751,7 +753,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
             |key| {
                 parsed_flipped.open_accept(
                     key,
-                    &roots_a.chan_id,
+                    &roots_a.chan_id(),
                     dir,
                     accept_at,
                     &rcpt_a,
@@ -780,7 +782,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
             |key| {
                 parsed_accept.open_accept(
                     key,
-                    &roots_a.chan_id,
+                    &roots_a.chan_id(),
                     dir,
                     accept_at,
                     &rcpt_a,
@@ -814,7 +816,7 @@ async fn the_acceptors_first_reply_installs_its_pseudonym_at_the_initiator() {
             |key| {
                 parsed_reply.open(
                     key,
-                    &roots_a.chan_id,
+                    &roots_a.chan_id(),
                     dir,
                     reply_at,
                     &rcpt_a,

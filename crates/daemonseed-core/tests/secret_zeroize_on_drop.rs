@@ -867,17 +867,17 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
     assert_zeroed_when_freed(
         "ChannelRoots::rs0",
         (
-            std::mem::offset_of!(ChannelRoots, rs0),
+            ChannelRoots::rs0_offset_for_test(),
             size_of::<ChannelRoots>(),
         ),
         || {
-            Box::new(ChannelRoots {
-                ar: [0x44u8; ROOT_LEN],
-                chan_id: [0x55u8; ROOT_LEN],
-                rs0: CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
-            })
+            Box::new(ChannelRoots::new_for_test(
+                [0x44u8; ROOT_LEN],
+                [0x55u8; ROOT_LEN],
+                CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
+            ))
         },
-        |r| at(r.rs0.as_bytes()),
+        |r| at(r.rs0().as_bytes()),
     );
 
     // `ss0` is an inline `[u8; SS0_LEN]` field, so it is watched as a range at a
@@ -890,7 +890,7 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
     //
     // The distinct filler bytes are a WEAKER control than they look, which is why
     // the offset assertion above carries the load. They catch only a HIGH-side slip
-    // into `roots.ar` (0x44). A slip 1–7 bytes LOW lands in `body`'s length word —
+    // into `roots.ar()` (0x44). A slip 1–7 bytes LOW lands in `body`'s length word —
     // `18 00 00 00 00 00 00 00` for a 24-byte body — so the snapshot would read as
     // zeros plus a zeroized `ss0` and pass vacuously. What the fillers guarantee is
     // narrow: no neighbouring field is all-zero *above* `ss0`.
@@ -1055,11 +1055,11 @@ fn verified_first_contact(body: String) -> VerifiedFirstContact {
         1_700_000_000_000,
         body,
         [0xA5u8; SS0_LEN],
-        ChannelRoots {
-            ar: [0x44u8; ROOT_LEN],
-            chan_id: [0x55u8; ROOT_LEN],
-            rs0: CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
-        },
+        ChannelRoots::new_for_test(
+            [0x44u8; ROOT_LEN],
+            [0x55u8; ROOT_LEN],
+            CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
+        ),
     )
 }
 
@@ -1163,17 +1163,17 @@ fn the_re_establishment_types_render_redacted() {
         );
     }
 
-    let roots = ChannelRoots {
-        ar: [0x44u8; ROOT_LEN],
-        chan_id: [0x55u8; ROOT_LEN],
-        rs0: CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
-    };
+    let roots = ChannelRoots::new_for_test(
+        [0x44u8; ROOT_LEN],
+        [0x55u8; ROOT_LEN],
+        CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
+    );
     let rendered = format!("{roots:?}");
     assert_eq!(rendered, "ChannelRoots(<redacted>)");
     for (name, bytes) in [
-        ("ar", roots.ar.as_slice()),
-        ("chan_id", roots.chan_id.as_slice()),
-        ("rs0", roots.rs0.as_bytes().as_slice()),
+        ("ar", roots.ar().as_slice()),
+        ("chan_id", roots.chan_id().as_slice()),
+        ("rs0", roots.rs0().as_bytes().as_slice()),
     ] {
         assert!(
             !rendered.contains(&hex_of(bytes)),
@@ -1299,6 +1299,7 @@ fn resume_record() -> ResumeRecord {
         },
         SendFloor::new(7, 11),
     )
+    .expect("the fixture's pairings are coherent")
 }
 
 /// Where the retained root's bytes sit inside the record.

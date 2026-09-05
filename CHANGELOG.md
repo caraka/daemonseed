@@ -545,6 +545,12 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- A direct-message leg fold works on its own copy of the page's resume record and writes it back
+  only when it consumes its leg, so a fold that defers or refuses leaves nothing for a later fold on
+  the same page to commit; a withheld attempt is not recorded in the seen-frame memory; the own
+  slot is emptied only after decapsulation succeeds. (#404)
+- A torn-down direct-message conversation opens no re-establishment at load, gets no upkeep, and
+  its queued leg is skipped before the retry ladder advances. (#404)
 - A direct-message first-contact entry sent and then restarted before it was accepted no longer
   strands: the acceptance is collected and the correspondent's messages are delivered, where before
   nothing mapped their identity key to the correspondence and every message they composed re-emitted
@@ -671,6 +677,12 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed_core::dm::resume::ResumeRecord::new` returns `Result<Self, ResumeError>` and refuses
+  an own slot whose attempt disagrees with the counter, an acceptance below the committed
+  generation (`AcceptanceBelowGeneration`), a confirm slot ahead of it
+  (`ConfirmSlotAheadOfGeneration`), and a retained root without its stamp. (#404)
+- `daemonseed_core::dm::firstcontact::ChannelRoots` — fields private behind `ar()`, `chan_id()`
+  and `rs0()`; construction crate-private; `Clone` removed. (#404)
 - `daemonseed_core::dm::resume` — `ResumeRecord::commit_reestablished` carries the dedup memory into
   the new retention rather than emptying it: the root moving into retention is the one every
   recorded frame was sealed under, so A5.3's retirement gate has not fired for them (#404).

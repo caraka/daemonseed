@@ -1050,11 +1050,13 @@ modules:
       the crate. address_root() does not
       return chan_id with AR; channel_roots() -> Result<ChannelRoots,
       FirstContactError> recomputes both, for a caller resuming a handshake that
-      must open a frame as well as address it. ChannelRoots { ar: [u8; ROOT_LEN],
-      chan_id: [u8; ROOT_LEN], rs0: resume::CommittedRoot } carries three Expand
+      must open a frame as well as address it. ChannelRoots carries three Expand
       siblings of one HKDF-Extract over ss0 under DM_ROOT_SALT: DM_ADDR_ROOT,
-      DM_CHAN_ID and DM_REEST_ROOT. rs0 is the retained re-establishment root,
-      advanced by resume::reroot at every completed re-establishment.
+      DM_CHAN_ID and DM_REEST_ROOT, behind ar() -> [u8; ROOT_LEN], chan_id() ->
+      [u8; ROOT_LEN] and rs0() -> &resume::CommittedRoot; the fields are private,
+      construction is crate-private and the type is not Clone. rs0 is the
+      retained re-establishment root, advanced by resume::reroot at every
+      completed re-establishment.
       eph_ek() borrows the public half. The record is not Clone, renders no bytes
       in Debug, and has no Drop of its own so both ephemeral halves move out.
       RecordContext { recipient_keyrec_addr: &[u8; DM_KEYREC_OWNER_SEED_LEN],
@@ -1510,14 +1512,12 @@ modules:
       format and write suite on any write.
       commit_resume(&CorrespondenceLabel, &ResumeRecord) -> Result<Option<Vec<u8>>,
       DmPersistError> applies every ResumeRecord invariant this module owns and
-      writes the record inside one critical section. Note that DmPersist::store()
-      hands out a &DmStore whose critical_section takes &self and yields a mutable
-      guard, so a caller can reach Locked::replace(RecordKind::Resume, ...) around
-      those guards; the guards bound what this module's write path can do to the
-      record, not what any code in the process can do to the file. On a
-      successful write it returns the record's sealed RE-EST bytes, so the frame
-      is unreachable without a completed write; Ok(None) is a record whose
-      handshake slot is empty, which has nothing to emit. It refuses with DmPersistError::Resume(
+      writes the record inside one critical section. The guards bound this write
+      path, not the file: DmPersist::store() returns a &DmStore whose
+      critical_section takes &self and yields a mutable guard, and
+      Locked::replace(RecordKind::Resume, ...) reaches the record through it.
+      On a successful write it returns the record's sealed RE-EST bytes; Ok(None)
+      is a record whose handshake slot is empty. It refuses with DmPersistError::Resume(
       ResumeError::FloorWouldRollBack) when the stored send floor is ahead of
       the offered one, ResumeError::AttemptWouldRollBack { stored, offered } on
       an attempt regression, and ResumeError::AttemptResealed { attempt } when a
@@ -1810,10 +1810,14 @@ modules:
       Sub-module dm::resume is the A9.2 re-establishment resume record.
       ResumeRecord::new(s_pc: Box<[u8; ml_dsa::SK_LEN]>, pk_pc: Box<[u8;
       ml_dsa::PK_LEN]>, committed_root: CommittedRoot, handshake: ReEstState,
-      retention: Retention, send_floor: SendFloor) ->
-      ResumeRecord takes every field at once; there is no builder and no field
-      setter, and it is infallible because SealedReEst and AcceptanceSlot carry
-      the frame-length invariants. The two struct arguments group the fields that
+      retention: Retention, send_floor: SendFloor) -> Result<ResumeRecord,
+      ResumeError> takes every field at once; there is no builder and no field
+      setter. It refuses an own slot whose attempt disagrees with the counter
+      (AttemptSlotDisagrees), an acceptance below the committed generation
+      (AcceptanceBelowGeneration), a confirm slot ahead of it
+      (ConfirmSlotAheadOfGeneration), and a retained root without its stamp.
+      SealedReEst and AcceptanceSlot carry the frame-length invariants
+      themselves. The two struct arguments group the fields that
       move together in one write. ReEstState { reconnect_gen: u32, attempt: u32,
       last_seen_re_est: u32, own: Option<OwnSlot>,
       acceptance: Option<AcceptanceSlot>, attempt_at_window_start: u32,

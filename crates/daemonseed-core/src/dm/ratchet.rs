@@ -844,6 +844,26 @@ impl EphemeralDecapKey {
         Self(dk)
     }
 
+    /// Copy an existing key into a fresh allocation.
+    ///
+    /// **Through the heap, never through a stack array.** The obvious spelling
+    /// — boxing a dereferenced `[u8; DK_LEN]` — materialises 3 168 bytes of
+    /// decapsulation key on the caller's frame first, and that copy belongs to
+    /// no wiping type: it is left behind when the box outlives the expression.
+    /// `to_vec` allocates the destination directly and the conversion that
+    /// follows is a pointer cast, so the bytes exist in exactly one place.
+    pub fn duplicate(&self) -> Self {
+        let boxed: Box<[u8; ml_kem::DK_LEN]> = self
+            .as_bytes()
+            .to_vec()
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_: Box<[u8]>| {
+                unreachable!("a vector of DK_LEN bytes converts to a DK_LEN array")
+            });
+        Self(boxed)
+    }
+
     /// Whether this key is the secret half of `ek`.
     ///
     /// **Worth checking, because getting it wrong is silent.** ML-KEM
@@ -1774,9 +1794,13 @@ mod tests {
         ] {
             let ss0 = [ss0_tag; 32];
             let roots = crate::dm::firstcontact::derive_channel_roots(&ss0).unwrap();
-            assert_eq!(hex::encode(roots.ar), ar_hex, "AR moved for {ss0_tag:#04x}");
             assert_eq!(
-                hex::encode(crate::dm::firstcontact::ar_fingerprint(&roots.ar).unwrap()),
+                hex::encode(roots.ar()),
+                ar_hex,
+                "AR moved for {ss0_tag:#04x}"
+            );
+            assert_eq!(
+                hex::encode(crate::dm::firstcontact::ar_fingerprint(&roots.ar()).unwrap()),
                 fp_hex,
                 "the fingerprint of AR moved for {ss0_tag:#04x}"
             );
@@ -1867,15 +1891,15 @@ mod tests {
             "a8042dbc77f2303ad708b1131d05e05a8382822ce9845c4285e5593d1b7e26dc"
         );
         assert_eq!(
-            hex::encode(roots.ar),
+            hex::encode(roots.ar()),
             "b3542adb99810ee17a4470e760a78c9a009a46c4ecf6122af21119d1fdd84673"
         );
         assert_eq!(
-            hex::encode(roots.chan_id),
+            hex::encode(roots.chan_id()),
             "2698f400a59d484ac4f123fc0219c174913f7eb18078890aba8096e0e193eeed"
         );
         assert_eq!(
-            hex::encode(roots.rs0.as_bytes()),
+            hex::encode(*roots.rs0().as_bytes()),
             "cab767f116e55b9a9be2bcb931c266c12eb44eb1c959ae1c5d2a5ecb619c0e88"
         );
     }
@@ -2000,9 +2024,9 @@ mod tests {
 
         let all: [(&str, &[u8; ROOT_KEY_LEN]); 4] = [
             ("rk0", rk.as_bytes()),
-            ("ar", &roots.ar),
-            ("chan_id", &roots.chan_id),
-            ("rs0", roots.rs0.as_bytes()),
+            ("ar", &roots.ar()),
+            ("chan_id", &roots.chan_id()),
+            ("rs0", roots.rs0().as_bytes()),
         ];
         for (i, (left_name, left)) in all.iter().enumerate() {
             for (right_name, right) in &all[i + 1..] {

@@ -100,7 +100,7 @@ async fn frames_published_to_page_slots_sweep_back_in_the_slots_they_were_writte
     let ss0 = fresh_ss0();
     let address_root = derive_channel_roots(&ss0)
         .expect("derive this run's channel roots")
-        .ar;
+        .ar();
 
     // The two parties' ratchets over one first-contact secret: A knocked, B was
     // knocked at. They exist here only to supply the *direction* each end addresses

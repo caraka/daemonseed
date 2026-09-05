@@ -5472,7 +5472,7 @@ mod tests {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         daemonseed_core::dm::firstcontact::derive_channel_roots(&PAGE_FIXTURE_SS0)
             .expect("derive the fixture conversation's roots")
-            .ar
+            .ar()
     }
 
     /// A real derived sending address for `page`. Never hand-made: the seed inside
@@ -5553,7 +5553,7 @@ mod tests {
         )
         .expect("the second conversation's ratchet");
         let other_addr =
-            DmPageAddress::receiving(&other_roots.ar, &other_ratchet, PAGE_FIXTURE_PAGE)
+            DmPageAddress::receiving(&other_roots.ar(), &other_ratchet, PAGE_FIXTURE_PAGE)
                 .expect("the second conversation's address");
         let other_swept = DmPageSweep::for_address(&other_addr, Vec::new(), outcome);
         assert_ne!(

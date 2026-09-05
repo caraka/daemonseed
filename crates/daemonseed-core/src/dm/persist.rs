@@ -1999,7 +1999,7 @@ impl DmPersist {
         if contact.pk_pc().is_none() {
             return Ok(StateLoss::NoCorrespondence);
         }
-        if contact.addresses_same_channel(&knock.roots().ar) {
+        if contact.addresses_same_channel(&knock.roots().ar()) {
             return Ok(StateLoss::SameChannel(correspondence));
         }
         let teardown = Teardown::correspondent_state_lost();
@@ -2564,7 +2564,7 @@ impl DmPersist {
         // the way into the wrapper, and this module's own docs argue `AR` is
         // worth erasing.
         let roots = derive_channel_roots(&ss0)?;
-        let mut bare_ar = roots.ar;
+        let mut bare_ar = roots.ar();
         let ar = Zeroizing::new(bare_ar);
         bare_ar.zeroize();
         // **The resume record is written before the contact record, and the
@@ -2586,14 +2586,14 @@ impl DmPersist {
             &ResumeRecord::new(
                 Box::new(*s_pc),
                 pk_pc.clone(),
-                roots.rs0.clone(),
+                roots.rs0().clone(),
                 ReEstState::first_establishment(),
                 Retention::none(),
                 // Nothing has been sent on this channel: the acceptance is
                 // composed after this call returns. The floor rises at the first
                 // completed re-establishment.
                 SendFloor::new(0, 0),
-            ),
+            )?,
         )?;
         // Seeded, so the record is written whatever the mutator reports — see
         // `update_contact`. There is nothing to change about a record built
@@ -5330,6 +5330,7 @@ mod tests {
             crate::dm::resume::Retention::none(),
             floor,
         )
+        .expect("the fixture's pairings are coherent")
     }
 
     /// The commit returns the bytes to emit, and only after the record is on
@@ -5652,6 +5653,7 @@ mod tests {
             crate::dm::resume::Retention::none(),
             floor,
         )
+        .expect("the fixture's pairings are coherent")
     }
 
     /// A re-establishment record carrying the same pseudonym pair as
@@ -5691,6 +5693,7 @@ mod tests {
             crate::dm::resume::Retention::none(),
             floor,
         )
+        .expect("the fixture's pairings are coherent")
     }
 
     /// A correspondence established in one process can still sign and verify in
@@ -6032,7 +6035,8 @@ mod tests {
             },
             crate::dm::resume::Retention::none(),
             floor,
-        );
+        )
+        .expect("the fixture's pairings are coherent");
         let err = p
             .commit_resume(&l, &different)
             .expect_err("a new attempt carried a new signing key");
@@ -6206,7 +6210,7 @@ mod tests {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut secret = ss0();
         secret[0] ^= tag;
-        let ar = Zeroizing::new(derive_channel_roots(&secret).expect("derives").ar);
+        let ar = Zeroizing::new(derive_channel_roots(&secret).expect("derives").ar());
         ContactRecord::new(
             pk(tag),
             Some(pk(tag.wrapping_add(0x7F))),
@@ -6343,7 +6347,7 @@ mod tests {
         let l = label(0x71);
         let correspondent = pk(0x11);
         let their_pk_pc = pk(0x22);
-        let ar = derive_channel_roots(&ss0()).expect("derives").ar;
+        let ar = derive_channel_roots(&ss0()).expect("derives").ar();
 
         {
             let p = persist(dir.path());
@@ -6401,10 +6405,10 @@ mod tests {
         let l = label(0x72);
         let correspondent = pk(0x11);
 
-        let first = derive_channel_roots(&ss0()).expect("derives").ar;
+        let first = derive_channel_roots(&ss0()).expect("derives").ar();
         let mut retry_secret = ss0();
         retry_secret[0] ^= 0xAA;
-        let retry = derive_channel_roots(&retry_secret).expect("derives").ar;
+        let retry = derive_channel_roots(&retry_secret).expect("derives").ar();
         assert_ne!(first, retry, "the two entries address one channel");
 
         p.record_first_contact_sent(&l, correspondent.clone(), Zeroizing::new(first), FIRST_SEEN)
@@ -6437,7 +6441,7 @@ mod tests {
         let root = established.address_root();
         seed_contact(&p, &l, established);
 
-        let ar = derive_channel_roots(&ss0()).expect("derives").ar;
+        let ar = derive_channel_roots(&ss0()).expect("derives").ar();
         assert!(
             matches!(
                 p.record_first_contact_sent(&l, pk(0x01), Zeroizing::new(ar), LAST_SEEN),
@@ -6476,7 +6480,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = persist(dir.path());
         let l = label(0x74);
-        let ar = derive_channel_roots(&ss0()).expect("derives").ar;
+        let ar = derive_channel_roots(&ss0()).expect("derives").ar();
         p.record_first_contact_sent(&l, pk(0x11), Zeroizing::new(ar), FIRST_SEEN)
             .expect("the entry was not recorded");
 
@@ -7651,7 +7655,9 @@ mod tests {
         let now = FIRST_SEEN;
 
         // This side's entry, under one root.
-        let ours = derive_channel_roots(&ss0_tagged(0x11)).expect("derives").ar;
+        let ours = derive_channel_roots(&ss0_tagged(0x11))
+            .expect("derives")
+            .ar();
         p.record_first_contact_sent(&l, pk(0x11), Zeroizing::new(ours), FIRST_SEEN)
             .expect("the entry was not recorded");
         seed_two_pending(&p, &l, now);
@@ -7660,7 +7666,7 @@ mod tests {
         // carries, because the secret is theirs.
         let theirs = knock(0x11, ss0_tagged(0x22));
         assert_ne!(
-            theirs.roots().ar,
+            theirs.roots().ar(),
             ours,
             "the fixture's two entries address one channel, so the roots agree \
              for the wrong reason"
@@ -7693,7 +7699,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = persist(dir.path());
         let ours = label(0xB9);
-        let ar = derive_channel_roots(&ss0_tagged(0x33)).expect("derives").ar;
+        let ar = derive_channel_roots(&ss0_tagged(0x33))
+            .expect("derives")
+            .ar();
         p.record_first_contact_sent(&ours, pk(0x33), Zeroizing::new(ar), FIRST_SEEN)
             .expect("the entry was not recorded");
         assert_eq!(
@@ -7741,7 +7749,9 @@ mod tests {
         let p = persist(dir.path());
         let first = label(0xBA);
         let second = label(0xBB);
-        let ar = derive_channel_roots(&ss0_tagged(0x55)).expect("derives").ar;
+        let ar = derive_channel_roots(&ss0_tagged(0x55))
+            .expect("derives")
+            .ar();
 
         p.record_first_contact_sent(&first, pk(0x55), Zeroizing::new(ar), FIRST_SEEN)
             .expect("the entry was not recorded");
@@ -8038,7 +8048,7 @@ mod tests {
         // from the same value, so agreement here is agreement about which
         // secret was established.
         assert!(
-            stored.addresses_same_channel(&derive_channel_roots(&ss0()).expect("roots").ar),
+            stored.addresses_same_channel(&derive_channel_roots(&ss0()).expect("roots").ar()),
             "the stored record does not address the knock's channel"
         );
         assert_eq!(
@@ -8084,7 +8094,10 @@ mod tests {
         );
         assert_eq!(
             resume.committed_root().as_bytes(),
-            derive_channel_roots(&ss0()).expect("roots").rs0.as_bytes(),
+            derive_channel_roots(&ss0())
+                .expect("roots")
+                .rs0()
+                .as_bytes(),
             "the committed re-establishment root is not the sibling of the established secret"
         );
         assert_eq!(
@@ -8444,6 +8457,7 @@ mod tests {
             retention,
             floor,
         )
+        .expect("the fixture's pairings are coherent")
     }
 
     fn attempt_of(n: u32) -> crate::dm::resume::Attempt {

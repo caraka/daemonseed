@@ -840,7 +840,7 @@ mod tests {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         daemonseed_core::dm::firstcontact::derive_channel_roots(&FIXTURE_SS0)
             .expect("channel roots")
-            .ar
+            .ar()
     }
 
     /// A recipient's ratchet: it takes only the PUBLIC half of the opening

@@ -1670,7 +1670,7 @@ mod tests {
                     .signing
                     .sign(&firstcontact::msg_sig_input(
                         firstcontact::FRAME_KIND_FIRST_CONTACT,
-                        &roots.chan_id,
+                        &roots.chan_id(),
                         crate::dm::ratchet::Direction::AToB.label(),
                         0,
                         eph_ek,
