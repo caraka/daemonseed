@@ -348,8 +348,10 @@ mod tests {
 
     /// Every secret newtype the macro generates carries `ZeroizeOnDrop`.
     ///
-    /// This is a compile-time bound, so it proves the trait is implemented on all
-    /// nineteen key classes — and nothing more. A hand-written `impl
+    /// This is a compile-time bound, so it proves the trait is implemented on
+    /// every key class named below — and nothing more. The list is the count;
+    /// a figure written into this sentence would go stale the next time a class
+    /// is added. A hand-written `impl
     /// ZeroizeOnDrop for T {}` with no `Drop` would satisfy it while wiping
     /// nothing; closing that gap is what `tests/secret_zeroize_on_drop.rs` is
     /// for. The value here is breadth: it fails on the arm-level derive AND on
@@ -416,6 +418,12 @@ mod tests {
         assert_zeroize_on_drop::<crate::dm::keyrec::DmKeyRecordOwnerSeed>();
         assert_zeroize_on_drop::<crate::dm::paging::DmPageOwnerSeed>();
         assert_zeroize_on_drop::<crate::dm::ratchet::EphemeralDecapKey>();
+        // The per-correspondent signing key held by a provisional record. It is
+        // the widest secret in the sweep and the one with no re-derivation path
+        // of any kind, and `ProvisionalRecord` has no container `Drop` by
+        // design — so this newtype's own wipe is the only thing that clears the
+        // key when a handshake record is dropped.
+        assert_zeroize_on_drop::<crate::dm::provisional::SigningKeyPc>();
     }
 
     /// The two secret-bearing structs the macro does not generate also carry

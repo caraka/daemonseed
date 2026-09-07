@@ -2758,7 +2758,7 @@ mod tests {
     fn bucket_sizes_are_pinned() {
         // The provisional record's size is the module's, not a copy of it.
         assert_eq!(RecordKind::Provisional.capacity(), PROVISIONAL_RECORD_LEN);
-        assert_eq!(PROVISIONAL_RECORD_LEN, 4813, "the sealed record's size");
+        assert_eq!(PROVISIONAL_RECORD_LEN, 12_301, "the sealed record's size");
         assert_eq!(RecordKind::Resume.capacity(), 65_536);
         assert_eq!(RecordKind::Outbox.capacity(), 2_097_152);
         assert_eq!(RecordKind::ReceiveCursor.capacity(), 8);

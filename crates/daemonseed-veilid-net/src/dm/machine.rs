@@ -693,14 +693,14 @@ struct Introduction {
 /// key schedule and the channel identifier do not survive and are not meant to:
 /// a completed re-establishment mints both again.
 ///
-/// **The one thing that does not come back is this side's own pseudonym
-/// KEYPAIR.** [`SignKeypair`] holds a secret half and a public half, and only
-/// the secret half is at rest — the record enumerates `S_pc` and the *peer's*
-/// `PK_pc`, and ML-DSA offers no way to recover a public key from a private
-/// one. Legs are unaffected, because a leg's signature preimage binds no public
-/// key. An ordinary channel frame binds this side's own `PK_pc`
-/// ([`frame::seal`]), so composing one after a restart is not reachable; see
-/// [`DmMachine::send`], which refuses it.
+/// **This side's own pseudonym keypair is on disk and is not read back yet.**
+/// The record carries both halves — `S_pc` and this side's own `PK_pc`, which
+/// has to be stored because ML-DSA offers no way to recover a public key from a
+/// private one — but nothing here installs them on a correspondence rebuilt at
+/// startup. Legs are unaffected either way, because a leg's signature preimage
+/// binds no public key. An ordinary channel frame binds this side's own `PK_pc`
+/// ([`frame::seal`]), so composing one after a restart is still not reachable;
+/// see [`DmMachine::send`], which refuses it.
 struct Correspondence {
     /// The correspondent's long-term identity key.
     pk_lt: PkLt,
@@ -4925,14 +4925,16 @@ impl DmMachine {
             }
         };
 
-        // The pseudonym's secret half travels into the establishment because
+        // The whole pseudonym keypair travels into the establishment because
         // that write is its only at-rest home: it is minted from the CSPRNG here
         // and is not derivable from the mnemonic or the shared secret, so a
         // correspondence established without it could never sign a
-        // re-establishment leg.
+        // re-establishment leg. The verifying half goes with it for the reason
+        // the record's own docs give — ML-DSA has no public-from-private path,
+        // so a key that is not written down is gone.
         match self
             .persist
-            .accept_first_contact(*held.knock, signing_pc.secret_key(), now_ms)
+            .accept_first_contact(*held.knock, &signing_pc, now_ms)
         {
             Ok((label, ratchet)) => {
                 // **Updated in place where an entry already exists**, never
@@ -5499,7 +5501,7 @@ impl DmMachine {
             chan_id: state.roots().chan_id(),
         };
         let address_root = state.roots().ar();
-        let record = match state.into_provisional() {
+        let record = match state.into_provisional(&signing_pc) {
             Ok(r) => r,
             Err(e) => {
                 crate::vtrace!("dm driver: provisional record build failed: {e}");
@@ -7570,6 +7572,7 @@ fn establish_record(
             };
             let resume = match ResumeRecord::new(
                 Box::new(*signing_pc.secret_key()),
+                Box::new(*signing_pc.public_key()),
                 Box::new(*peer_pk_pc),
                 roots.rs0().clone(),
                 ReEstState::first_establishment(),
@@ -8026,6 +8029,17 @@ mod tests {
                 poisoned: false,
             },
         )
+    }
+
+    /// A per-correspondent keypair for a test that establishes behind the
+    /// machine's back.
+    ///
+    /// Derived from a fixed seed, so both halves belong together — the resume
+    /// record holds each of them, and a fixture pairing unrelated bytes would
+    /// write a record no mint produces.
+    fn test_pseudonym(tag: u8) -> SignKeypair {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        SignKeypair::from_ml_dsa_seed(&[tag; ML_DSA_SEED_LEN]).expect("the module is initialized")
     }
 
     /// A knock assembled without opening a seal, for the paths that never look
@@ -8524,7 +8538,7 @@ mod tests {
         // Establish that identity behind the machine's back, so the accept
         // meets `AlreadyEstablished` from the store rather than from a stub.
         m.persist
-            .accept_first_contact(*fake_knock(21), &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
+            .accept_first_contact(*fake_knock(21), &test_pseudonym(0x71), BASE_MS)
             .expect("the out-of-band establish succeeds");
 
         // Positive control: the request really is held before the accept.
@@ -8971,6 +8985,7 @@ mod tests {
                 &bystander,
                 &ResumeRecord::new(
                     Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
+                    Box::new([0x88u8; oxicrypt_ml_dsa::PK_LEN]),
                     Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
                     CommittedRoot::from_bytes(&[0x33u8; ROOT_KEY_LEN]),
                     ReEstState::first_establishment(),
@@ -9114,7 +9129,7 @@ mod tests {
         let address_root = knock.roots().ar();
         let (label, ratchet) = m
             .persist
-            .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
+            .accept_first_contact(*knock, &test_pseudonym(0x71), BASE_MS)
             .expect("the establish succeeds");
         m.correspondences.push(Correspondence {
             pk_lt,
@@ -9241,7 +9256,7 @@ mod tests {
         let address_root = knock.roots().ar();
         let (label, ratchet) = m
             .persist
-            .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
+            .accept_first_contact(*knock, &test_pseudonym(0x71), BASE_MS)
             .expect("the establish succeeds");
         // Established, and its acceptance never composed — the state a refused
         // `fire_accept` leaves behind.
@@ -12020,7 +12035,7 @@ mod tests {
         let address_root = knock.roots().ar();
         let (label, _ratchet) = m
             .persist
-            .accept_first_contact(*knock, &[0x71u8; oxicrypt_ml_dsa::SK_LEN], BASE_MS)
+            .accept_first_contact(*knock, &test_pseudonym(0x71), BASE_MS)
             .expect("the establish succeeds");
         // No ratchet: the correspondence exists and cannot be spoken on, which
         // is the state a restart leaves behind.
@@ -14343,6 +14358,7 @@ mod tests {
         let stored = read_resume(m, label);
         let rewritten = ResumeRecord::new(
             Box::new(*stored.s_pc()),
+            Box::new(*stored.own_pk_pc()),
             Box::new(*stored.pk_pc()),
             stored.committed_root().clone(),
             ReEstState {
@@ -14868,6 +14884,7 @@ mod tests {
                         &label,
                         &ResumeRecord::new(
                             Box::new(*stored.s_pc()),
+                            Box::new(*stored.own_pk_pc()),
                             Box::new(*stored.pk_pc()),
                             stored.committed_root().clone(),
                             ReEstState::first_establishment(),
@@ -16048,6 +16065,7 @@ mod tests {
     fn rebuilt(stored: &ResumeRecord, handshake: ReEstState) -> ResumeRecord {
         ResumeRecord::new(
             Box::new(*stored.s_pc()),
+            Box::new(*stored.own_pk_pc()),
             Box::new(*stored.pk_pc()),
             stored.committed_root().clone(),
             handshake,
@@ -16381,6 +16399,7 @@ mod tests {
         let slot = stored.acceptance().expect("B answered");
         let locked = ResumeRecord::new(
             Box::new(*stored.s_pc()),
+            Box::new(*stored.own_pk_pc()),
             Box::new(*stored.pk_pc()),
             stored.committed_root().clone(),
             ReEstState {
@@ -16674,6 +16693,7 @@ mod tests {
         assert_eq!(dedup.len(), DEDUP_CAPACITY, "the fixture must fill the set");
         let filled = ResumeRecord::new(
             Box::new(*stored.s_pc()),
+            Box::new(*stored.own_pk_pc()),
             Box::new(*stored.pk_pc()),
             stored.committed_root().clone(),
             ReEstState {
@@ -16901,6 +16921,7 @@ mod tests {
                     &label,
                     &ResumeRecord::new(
                         Box::new(*stored.s_pc()),
+                        Box::new(*stored.own_pk_pc()),
                         Box::new(*stored.pk_pc()),
                         stored.committed_root().clone(),
                         ReEstState {

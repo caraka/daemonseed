@@ -3282,6 +3282,7 @@ mod tests {
         });
         ResumeRecord::new(
             Box::new([0x11; ml_dsa::SK_LEN]),
+            Box::new([0x88; ml_dsa::PK_LEN]),
             Box::new([0x22; ml_dsa::PK_LEN]),
             root(),
             ReEstState {
@@ -3395,6 +3396,7 @@ mod tests {
         use crate::dm::resume::{ReEstState, Retention, SendFloor};
         let record = ResumeRecord::new(
             Box::new([0x11; ml_dsa::SK_LEN]),
+            Box::new([0x88; ml_dsa::PK_LEN]),
             Box::new([0x22; ml_dsa::PK_LEN]),
             root(),
             ReEstState::first_establishment(),
@@ -3424,6 +3426,7 @@ mod tests {
         use crate::dm::resume::{ReEstState, Retention, SendFloor};
         let record = ResumeRecord::new(
             Box::new([0x11; ml_dsa::SK_LEN]),
+            Box::new([0x88; ml_dsa::PK_LEN]),
             Box::new([0x22; ml_dsa::PK_LEN]),
             root(),
             ReEstState {
@@ -3474,6 +3477,7 @@ mod tests {
             .expect("inside MAX_SEALED_LEG_LEN");
         let record = ResumeRecord::new(
             Box::new([0x11; ml_dsa::SK_LEN]),
+            Box::new([0x88; ml_dsa::PK_LEN]),
             Box::new([0x22; ml_dsa::PK_LEN]),
             root(),
             ReEstState {

@@ -1038,8 +1038,13 @@ modules:
       dm::provisional.
       Sub-module dm::provisional holds what does survive a restart.
       ProvisionalRecord is the pre-establishment handshake record, the initiator's
-      {ss0, eph_ek, eph_dk}; new(Zeroizing<[u8; SS0_LEN]>, eph_ek, eph_dk) refuses
-      halves that are not a keypair. address_root() recomputes AR from ss0;
+      {ss0, eph_ek, eph_dk, s_pc, pk_pc}; new(Zeroizing<[u8; SS0_LEN]>, eph_ek,
+      eph_dk, SigningKeyPc, Box<[u8; ml_dsa::PK_LEN]>) refuses ephemeral halves
+      that are not a keypair (MismatchedEphemeral) and signing halves that do not
+      sign and verify (MismatchedSigningPair). s_pc() and pk_pc() borrow this
+      party's own per-correspondent signing keypair; SigningKeyPc wraps the secret
+      half, zeroizes on drop and renders no bytes in Debug, and SigningKeyPc::new
+      and SigningKeyPc::copy_from construct it. address_root() recomputes AR from ss0;
       into_ratchet() (consuming, no second copy of eph_dk) and to_ratchet()
       (borrowing, and therefore copying eph_dk) are both pub(crate) — outside
       the crate, dm::persist's PendingHandshake is the only path from a record
@@ -1067,7 +1072,7 @@ modules:
       &RecordContext) -> ProvisionalRecord are the at-rest form, always
       PROVISIONAL_RECORD_LEN bytes: nonce(12) ||
       AES-256-GCM(PROVISIONAL_RECORD_VERSION || binding_tag || ss0 || eph_ek ||
-      eph_dk) || tag(16), AAD daemonseed/dm/provisional/aad/v1 ||
+      eph_dk || s_pc || pk_pc) || tag(16), AAD daemonseed/dm/provisional/aad/v1 ||
       lp(recipient_keyrec_addr) || lp(fc_epoch_be). The BINDING_TAG_LEN (16) byte
       binding tag is HKDF-SHA-384(salt=daemonseed/dm/provisional/bind-salt/v1,
       ikm=ss0, info=daemonseed/dm/provisional/bind/v1||lp(eph_ek)), compared in
@@ -1605,14 +1610,15 @@ modules:
       a stored record whose channel roots would not derive. Only the outbox is
       touched; the entry itself is accepted or declined separately and no pending
       frame is migrated onto the new channel.
-      accept_first_contact(VerifiedFirstContact, s_pc: &[u8; ml_dsa::SK_LEN],
+      accept_first_contact(VerifiedFirstContact, signing_pc: &SignKeypair,
       now_ms) -> Result<(CorrespondenceLabel, Ratchet), DmPersistError> is the
       acceptor's establishment, the counterpart of PendingHandshake::establish: it
       mints a label, opens the recipient ratchet over the knock's ss0, writes the
-      resume record carrying s_pc, the knock's pk_pc and RS_0, and then writes the
+      resume record carrying both halves of signing_pc, the knock's pk_pc and RS_0,
+      and then writes the
       contact record carrying pk_lt, pk_pc and the address root derived from that
-      ss0, with both timestamps at now_ms, in one call. s_pc is the acceptor's own
-      per-correspondent signing key, minted by the caller; the resume record is its
+      ss0, with both timestamps at now_ms, in one call. signing_pc is the acceptor's own
+      per-correspondent keypair, minted by the caller; the resume record is its
       only at-rest home. The resume record is written first: the contact record's
       pseudonym is what every later lookup reads as established, so a crash in the
       other order leaves a correspondence that is established and cannot sign a
@@ -1808,11 +1814,15 @@ modules:
       far-future due time still sweeps and still surfaces. NOT YET AVAILABLE: the
       transport that emits from an outbox (#235 transport half).
       Sub-module dm::resume is the A9.2 re-establishment resume record.
-      ResumeRecord::new(s_pc: Box<[u8; ml_dsa::SK_LEN]>, pk_pc: Box<[u8;
+      ResumeRecord::new(s_pc: Box<[u8; ml_dsa::SK_LEN]>, own_pk_pc: Box<[u8;
+      ml_dsa::PK_LEN]>, pk_pc: Box<[u8;
       ml_dsa::PK_LEN]>, committed_root: CommittedRoot, handshake: ReEstState,
       retention: Retention, send_floor: SendFloor) -> Result<ResumeRecord,
       ResumeError> takes every field at once; there is no builder and no field
-      setter. It refuses an own slot whose attempt disagrees with the counter
+      setter. own_pk_pc is this party's own verifying key, stored because ML-DSA-87
+      has no public-from-private derivation, and read back by own_pk_pc(); an
+      all-zero one is OwnVerifyingKeyAbsent at new() and at decode(). It refuses an
+      own slot whose attempt disagrees with the counter
       (AttemptSlotDisagrees), an acceptance below the committed generation
       (AcceptanceBelowGeneration), a confirm slot ahead of it
       (ConfirmSlotAheadOfGeneration), and a retained root without its stamp.

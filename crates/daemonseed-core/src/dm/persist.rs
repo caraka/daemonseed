@@ -2499,19 +2499,25 @@ impl DmPersist {
     /// conversation, because the entry each of them sent is answered by the
     /// other.
     ///
-    /// `s_pc` is this side's own per-correspondent signing key, minted by the
+    /// `signing_pc` is this side's own per-correspondent keypair, minted by the
     /// caller for this conversation. It is taken here because establishment is
     /// the moment it acquires its only at-rest home: it is not derivable from
     /// the shared secret or from the mnemonic, so a correspondence established
     /// without writing it can never sign a re-establishment leg
     /// (`docs/design/direct-messaging.md:1056`, A4.8).
     ///
+    /// **The whole keypair rather than the signing half.** ML-DSA-87 has no
+    /// public-from-private derivation, so the verifying half has to be written
+    /// down beside the signing half or it is gone; taking the pair is what stops
+    /// a caller pairing one conversation's signing key with another's verifying
+    /// key at this call.
+    ///
     /// `now_ms` stamps both `first_seen_ms` and `last_seen_ms`: the knock is
     /// the first and so far only sighting.
     pub fn accept_first_contact(
         &self,
         verified: VerifiedFirstContact,
-        s_pc: &[u8; ml_dsa::SK_LEN],
+        signing_pc: &crate::identity::keys::SignKeypair,
         now_ms: i64,
     ) -> Result<(CorrespondenceLabel, Ratchet), DmPersistError> {
         // A second establishment for one identity is refused HERE, because
@@ -2584,7 +2590,8 @@ impl DmPersist {
         self.commit_resume(
             &label,
             &ResumeRecord::new(
-                Box::new(*s_pc),
+                Box::new(*signing_pc.secret_key()),
+                Box::new(*signing_pc.public_key()),
                 pk_pc.clone(),
                 roots.rs0().clone(),
                 ReEstState::first_establishment(),
@@ -3092,10 +3099,13 @@ mod tests {
     fn record() -> ProvisionalRecord {
         let (ek, dk) = ml_kem::keygen(&[0x33u8; ml_kem::SEED_LEN], &[0x44u8; ml_kem::SEED_LEN])
             .expect("keygen");
+        let signing = pseudonym(0x59);
         ProvisionalRecord::new(
             Zeroizing::new(ss0()),
             Box::new(ek),
             EphemeralDecapKey::new(Box::new(dk)),
+            crate::dm::provisional::SigningKeyPc::copy_from(signing.secret_key()),
+            Box::new(*signing.public_key()),
         )
         .expect("a matched pair")
     }
@@ -5258,13 +5268,14 @@ mod tests {
         resume_record_sealed(attempt, floor, 0xA5)
     }
 
-    /// The per-correspondent signing key an acceptance hands
+    /// The per-correspondent keypair an acceptance hands
     /// [`DmPersist::accept_first_contact`] to write into the resume record.
     ///
-    /// Fixed bytes rather than a keygen: the call stores the key and never signs
-    /// with it, so what these tests read back is whatever they passed in.
-    fn accepting_s_pc() -> [u8; ml_dsa::SK_LEN] {
-        [0x71u8; ml_dsa::SK_LEN]
+    /// A real keypair from a fixed seed rather than fixed bytes: the record
+    /// holds both halves, and a test reading them back has to be able to say
+    /// they belong together.
+    fn accepting_signing_pc() -> crate::identity::keys::SignKeypair {
+        pseudonym(0x71)
     }
 
     /// Walk to `attempt` the way a real caller must.
@@ -5304,6 +5315,7 @@ mod tests {
     fn resume_record_sealed(attempt: u32, floor: SendFloor, seal: u8) -> ResumeRecord {
         ResumeRecord::new(
             Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
+            Box::new([0x88u8; oxicrypt_ml_dsa::PK_LEN]),
             Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
             crate::dm::resume::CommittedRoot::from_bytes(
                 &[0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
@@ -5645,6 +5657,7 @@ mod tests {
     ) -> ResumeRecord {
         ResumeRecord::new(
             Box::new(*ours.secret_key()),
+            Box::new(*ours.public_key()),
             Box::new(*theirs.public_key()),
             crate::dm::resume::CommittedRoot::from_bytes(
                 &[0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
@@ -5667,6 +5680,7 @@ mod tests {
     ) -> ResumeRecord {
         ResumeRecord::new(
             Box::new(*ours.secret_key()),
+            Box::new(*ours.public_key()),
             Box::new(*theirs.public_key()),
             crate::dm::resume::CommittedRoot::from_bytes(
                 &[0x77u8; crate::dm::ratchet::ROOT_KEY_LEN],
@@ -6008,6 +6022,7 @@ mod tests {
         let mut different = resume_record_sealed(2, floor, 0x5A);
         different = ResumeRecord::new(
             Box::new(*pseudonym(0x15).secret_key()),
+            Box::new(*pseudonym(0x15).public_key()),
             Box::new(*different.pk_pc()),
             crate::dm::resume::CommittedRoot::from_bytes(
                 &[0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],
@@ -7711,7 +7726,11 @@ mod tests {
         );
 
         let (label, _ratchet) = p
-            .accept_first_contact(knock(0x33, ss0_tagged(0x44)), &accepting_s_pc(), LAST_SEEN)
+            .accept_first_contact(
+                knock(0x33, ss0_tagged(0x44)),
+                &accepting_signing_pc(),
+                LAST_SEEN,
+            )
             .expect("the acceptance was refused");
         assert_ne!(label, ours, "the acceptance reused the entry's own label");
 
@@ -8023,7 +8042,7 @@ mod tests {
         let knock = knock(9, ss0());
         let expected_pk_pc = *knock.pk_pc();
         let (label, ratchet) = p
-            .accept_first_contact(knock, &accepting_s_pc(), FIRST_SEEN)
+            .accept_first_contact(knock, &accepting_signing_pc(), FIRST_SEEN)
             .expect("accepts");
 
         assert_eq!(
@@ -8075,7 +8094,7 @@ mod tests {
         let knock = knock(9, ss0());
         let expected_pk_pc = *knock.pk_pc();
         let (label, _ratchet) = p
-            .accept_first_contact(knock, &accepting_s_pc(), FIRST_SEEN)
+            .accept_first_contact(knock, &accepting_signing_pc(), FIRST_SEEN)
             .expect("accepts");
 
         let resume = p
@@ -8084,8 +8103,13 @@ mod tests {
             .expect("the acceptance wrote a resume record");
         assert_eq!(
             resume.s_pc().as_slice(),
-            accepting_s_pc().as_slice(),
+            accepting_signing_pc().secret_key().as_slice(),
             "the signing key the caller minted is not the one on disk"
+        );
+        assert_eq!(
+            resume.own_pk_pc().as_slice(),
+            accepting_signing_pc().public_key().as_slice(),
+            "the record cannot say which key its own signatures verify under"
         );
         assert_eq!(
             resume.pk_pc().as_slice(),
@@ -8139,7 +8163,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = persist(tmp.path());
         let (label, _ratchet) = p
-            .accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN)
+            .accept_first_contact(knock(9, ss0()), &accepting_signing_pc(), FIRST_SEEN)
             .expect("accepts");
         assert!(p.read_resume(&label).expect("reads").is_some());
         assert!(p.read_contact(&label).expect("reads").is_some());
@@ -8153,7 +8177,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = persist(tmp.path());
         let (label, _ratchet) = p
-            .accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN)
+            .accept_first_contact(knock(9, ss0()), &accepting_signing_pc(), FIRST_SEEN)
             .expect("accepts");
 
         // Positive control: the contact record IS there, so the assertion below
@@ -8179,10 +8203,10 @@ mod tests {
         let mut other = ss0();
         other[0] ^= 0xFF;
         let (a, _) = p
-            .accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN)
+            .accept_first_contact(knock(9, ss0()), &accepting_signing_pc(), FIRST_SEEN)
             .expect("accepts");
         let (b, _) = p
-            .accept_first_contact(knock(11, other), &accepting_s_pc(), FIRST_SEEN)
+            .accept_first_contact(knock(11, other), &accepting_signing_pc(), FIRST_SEEN)
             .expect("accepts");
         assert_ne!(a, b, "each accept minted its own label");
         assert_eq!(p.store().correspondences().expect("list").len(), 2);
@@ -8200,7 +8224,7 @@ mod tests {
         let p = persist(tmp.path());
 
         let (first, _r) = p
-            .accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN)
+            .accept_first_contact(knock(9, ss0()), &accepting_signing_pc(), FIRST_SEEN)
             .expect("the first accept establishes");
 
         // A genuinely different knock from the same identity — a fresh `ss0`,
@@ -8208,7 +8232,7 @@ mod tests {
         let mut other = ss0();
         other[0] ^= 0xFF;
         let err = p
-            .accept_first_contact(knock(9, other), &accepting_s_pc(), FIRST_SEEN)
+            .accept_first_contact(knock(9, other), &accepting_signing_pc(), FIRST_SEEN)
             .expect_err("the second accept is refused");
         assert!(
             matches!(err, DmPersistError::AlreadyEstablished),
@@ -8249,7 +8273,7 @@ mod tests {
         perms.set_mode(0o500);
         std::fs::set_permissions(&root, perms).expect("chmod");
 
-        let result = p.accept_first_contact(knock(9, ss0()), &accepting_s_pc(), FIRST_SEEN);
+        let result = p.accept_first_contact(knock(9, ss0()), &accepting_signing_pc(), FIRST_SEEN);
 
         let mut perms = std::fs::metadata(&root).expect("metadata").permissions();
         perms.set_mode(0o700);
@@ -8449,6 +8473,7 @@ mod tests {
     ) -> ResumeRecord {
         ResumeRecord::new(
             Box::new([0x11u8; oxicrypt_ml_dsa::SK_LEN]),
+            Box::new([0x88u8; oxicrypt_ml_dsa::PK_LEN]),
             Box::new([0x22u8; oxicrypt_ml_dsa::PK_LEN]),
             crate::dm::resume::CommittedRoot::from_bytes(
                 &[0x33u8; crate::dm::ratchet::ROOT_KEY_LEN],

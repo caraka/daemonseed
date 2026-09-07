@@ -688,8 +688,17 @@ work lives in the maintainer's own planning notes, not here.
   recorded frame was sealed under, so A5.3's retirement gate has not fired for them (#404).
 
 - `daemonseed_core::dm::persist::DmPersist::accept_first_contact` takes the acceptor's own
-  per-correspondent signing key and writes the correspondence's resume record before its contact
-  record (#404).
+  per-correspondent keypair as a `SignKeypair` and writes the correspondence's resume record before
+  its contact record (#404).
+- `daemonseed_core::dm::resume::ResumeRecord` carries this party's own verifying key beside `s_pc`,
+  read by `own_pk_pc()` and taken by `ResumeRecord::new`. At rest it sits between `s_pc` and the
+  peer's `pk_pc`; the magic is unchanged. `ResumeError::OwnVerifyingKeyAbsent` refuses an all-zero
+  one at construction and at decode.
+- `daemonseed_core::dm::provisional::ProvisionalRecord` carries this party's own per-correspondent
+  signing keypair, read by `s_pc()` and `pk_pc()` and taken by `ProvisionalRecord::new` and
+  `FirstContactState::into_provisional`. `SigningKeyPc` is the secret half's zeroizing newtype,
+  `ProvisionalError::MismatchedSigningPair` refuses halves that do not sign and verify, and
+  `PROVISIONAL_RECORD_LEN` is 12301 bytes.
 - `daemonseed_core::dm::resume` at-rest v2 carries the own slot's `seq` between its attempt and the
   ephemeral-key presence flag. The magic is unchanged: no released build has written v2.
   `ResumeError::EmptySlotHasSequence` refuses a non-zero sequence beside an empty slot (#404).

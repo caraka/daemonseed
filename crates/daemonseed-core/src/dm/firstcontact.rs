@@ -654,8 +654,15 @@ impl FirstContactState {
     /// Consuming, so neither half of the ephemeral is ever duplicated. `roots` is
     /// dropped here rather than carried on: the record recomputes `ar` and
     /// `chan_id` from `ss0`, and `chan_id` must never be serialized at all.
+    ///
+    /// `signing_pc` is the per-contact keypair this knock was signed under, and
+    /// it is copied into the record because the record is its only at-rest home
+    /// until the conversation establishes. It is borrowed rather than moved: the
+    /// caller signs with it after this call and holds it for the life of the
+    /// correspondence.
     pub fn into_provisional(
         self,
+        signing_pc: &SignKeypair,
     ) -> Result<crate::dm::provisional::ProvisionalRecord, crate::dm::provisional::ProvisionalError>
     {
         let Self {
@@ -664,7 +671,13 @@ impl FirstContactState {
             eph_dk,
             roots: _,
         } = self;
-        crate::dm::provisional::ProvisionalRecord::new(ss0, eph_ek, eph_dk)
+        crate::dm::provisional::ProvisionalRecord::new(
+            ss0,
+            eph_ek,
+            eph_dk,
+            crate::dm::provisional::SigningKeyPc::copy_from(signing_pc.secret_key()),
+            Box::new(*signing_pc.public_key()),
+        )
     }
 }
 
@@ -1675,11 +1688,28 @@ mod tests {
         // it is fine.
         let ar = k.state.roots().ar();
 
-        let record = k.state.into_provisional().expect("a matched pair");
+        let record = k
+            .state
+            .into_provisional(&k.pc.signing)
+            .expect("a matched pair");
 
         // Same conversation on the far side of the move: `ar` is recomputed from
         // `ss0` rather than carried, so this also pins that recomputation.
         assert_eq!(record.address_root().unwrap(), ar);
+
+        // The keypair the record carries is the one it was handed, not merely a
+        // keypair: the entry publishes this verifying half, and a record holding
+        // some other pair would sign frames the correspondent discards.
+        assert_eq!(
+            record.s_pc().as_slice(),
+            k.pc.signing.secret_key().as_slice(),
+            "the record signs under a key the knock was not signed with"
+        );
+        assert_eq!(
+            record.pk_pc().as_slice(),
+            k.pc.signing.public_key().as_slice(),
+            "the record names a verifying key the entry never published"
+        );
 
         // And the ratchet it opens is the one `ss0` roots.
         let ratchet = record.into_ratchet().expect("opens a ratchet");
@@ -1705,7 +1735,7 @@ mod tests {
         // Positive control: the state as built DOES convert, so the refusal below
         // is the mismatch and not something else about the hand-built state.
         let good = knock("hi", EPOCH);
-        assert!(good.state.into_provisional().is_ok());
+        assert!(good.state.into_provisional(&good.pc.signing).is_ok());
 
         let spliced = FirstContactState {
             ss0: k.state.ss0.clone(),
@@ -1714,7 +1744,7 @@ mod tests {
             roots: k.state.roots,
         };
         assert_eq!(
-            spliced.into_provisional().unwrap_err(),
+            spliced.into_provisional(&k.pc.signing).unwrap_err(),
             crate::dm::provisional::ProvisionalError::MismatchedEphemeral
         );
     }

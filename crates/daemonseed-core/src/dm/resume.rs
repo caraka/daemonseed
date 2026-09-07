@@ -135,12 +135,14 @@ use oxicrypt_ml_kem as ml_kem;
 /// and cannot read an older body under a newer header — the shape
 /// [`crate::dm::outbox`] and [`crate::dm::provisional`] both use.
 ///
-/// **The v2 body was extended in place by the own slot's `seq`, rather than by
-/// a v3.** v2 has never been written by a released build, so no record of that
-/// layout exists to be read: a version bump would add a decoder arm for a
-/// population of zero, and `RESUME_MAGIC_V1`'s note gives the argument for why
-/// this module refuses predecessors rather than migrating them. The field order
-/// is `… own slot attempt · own slot seq · ephemeral key present …`, pinned by
+/// **The v2 body was extended in place — by the own slot's `seq`, and then by
+/// this party's own verifying key — rather than by a v3.** v2 has never been
+/// written by a released build, so no record of that layout exists to be read: a
+/// version bump would add a decoder arm for a population of zero, and
+/// `RESUME_MAGIC_V1`'s note gives the argument for why this module refuses
+/// predecessors rather than migrating them. The field order is
+/// `suite id · s_pc · own_pk_pc · pk_pc · … own slot attempt · own slot seq ·
+/// ephemeral key present …`, pinned by
 /// `the_at_rest_layout_is_byte_for_byte_what_it_was`.
 pub const RESUME_MAGIC: &[u8] = b"daemonseed/dm/resume/v2\0";
 
@@ -238,6 +240,7 @@ const DEDUP_ENTRY_LEN: usize = 4 + 4 + 1 + 1 + 8;
 const FIXED_LEN: usize = RESUME_MAGIC.len()
     + SUITE_ID_LEN
     + ml_dsa::SK_LEN /* s_pc */
+    + ml_dsa::PK_LEN /* own_pk_pc */
     + ml_dsa::PK_LEN /* pk_pc */
     + ROOT_KEY_LEN /* committed_root */
     + 4 /* reconnect_gen */
@@ -300,6 +303,21 @@ pub enum ResumeError {
     /// The suite id names no entry in this build's registry, so the record was
     /// written by a build whose primitives this one does not implement.
     UnknownSuite(SuiteId),
+    /// This party's own verifying key is all zeros.
+    ///
+    /// The field is fixed-width and always written, so it has no absent
+    /// spelling — an all-zero key is not a key ML-DSA keygen produces, it is the
+    /// zero fill a writer with nothing to put there leaves behind. Refused by
+    /// name at both doors, because the alternative is a record that loads and
+    /// then fails every frame it composes with nothing saying why: `frame::seal`
+    /// binds this key into the preimage the correspondent verifies, and ML-DSA
+    /// offers no way to recover it from the signing half, so a record carrying
+    /// zeros can never be repaired from what it holds.
+    ///
+    /// A record written under the layout that predates this field is shorter by
+    /// one ML-DSA-87 public key and ends inside a field, so it is
+    /// [`Self::Truncated`] rather than this.
+    OwnVerifyingKeyAbsent,
     /// A [`SendFloor`] that does not advance on the one it replaces. The stored
     /// floor is returned alongside so a caller can report both.
     FloorWouldRollBack {
@@ -622,6 +640,9 @@ impl std::fmt::Display for ResumeError {
             Self::SuiteIdSentinel(e) => write!(f, "resume suite_id: {e}"),
             Self::UnknownSuite(id) => {
                 write!(f, "resume suite {id} is not in this build's registry")
+            }
+            Self::OwnVerifyingKeyAbsent => {
+                write!(f, "the record carries no verifying key of its own")
             }
             Self::AttemptWouldRollBack { stored, offered } => {
                 write!(f, "attempt {offered} is behind the stored attempt {stored}")
@@ -2037,12 +2058,30 @@ impl Zeroize for Retention {
 /// unlike the long-term identity there is no re-derivation path — losing this
 /// record loses the ability to sign as that pseudonym at all, which is why the
 /// key is in it rather than being fetched from somewhere on resume.
+///
+/// **Both halves of this party's own keypair are here, not just the secret
+/// one.** ML-DSA-87 has no public-from-private derivation, so a record holding
+/// `s_pc` alone can sign but cannot say which key its signatures verify under —
+/// and [`crate::dm::frame::seal`] binds the sealer's own verifying key into
+/// every ordinary frame. A record carrying only the signing half therefore
+/// resumes a correspondence that can complete a re-establishment and cannot
+/// compose a message on the channel it re-establishes.
 #[derive(ZeroizeOnDrop)]
 pub struct ResumeRecord {
     /// **Ours**, and secret: the per-correspondent signing key `msg_sig` is
     /// produced under. Without it every leg we send after the restart is
     /// unsignable.
     s_pc: Box<[u8; ml_dsa::SK_LEN]>,
+    /// **Ours**, and public: the verifying key our own `msg_sig` is checked
+    /// against, and the key [`crate::dm::frame::seal`] binds into every ordinary
+    /// frame we compose. Stored rather than derived because ML-DSA-87 offers no
+    /// public-from-private path.
+    ///
+    /// `zeroize(skip)` for the reason the peer's is: a public key is not a
+    /// secret. It is redacted in [`Debug`](std::fmt::Debug) all the same, since
+    /// it names a person exactly as the peer's does.
+    #[zeroize(skip)]
+    own_pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
     /// **The peer's**, and public: the verifying key every inbound leg's
     /// `msg_sig` is checked against. Without it an inbound leg fails signature
     /// check and is indistinguishable from filler (A4.8).
@@ -2138,9 +2177,15 @@ impl std::fmt::Debug for ResumeRecord {
     /// Redacted by hand rather than derived: `s_pc` is a signing key and
     /// `committed_root` is a root, so one `debug!(?record)` would put both in a
     /// log — the defect `dm::firstcontact` records for a decrypted body.
+    ///
+    /// **Both verifying keys are redacted too, though neither is secret.** A
+    /// per-correspondent verifying key is the pseudonym one party speaks to the
+    /// other under, so a log line carrying it names the correspondence as
+    /// squarely as the peer's half does; the two are treated alike.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResumeRecord")
             .field("s_pc", &"<redacted>")
+            .field("own_pk_pc", &"<own verifying key>")
             .field("pk_pc", &"<peer verifying key>")
             .field("committed_root", &self.committed_root)
             .field("reconnect_gen", &self.reconnect_gen)
@@ -2164,8 +2209,9 @@ impl ResumeRecord {
     /// the fields have to agree with each other, so the only way to have a
     /// record is to have supplied every part of one at the same moment.
     ///
-    /// **Fallible, and what it refuses is the pairings between the two groups**
-    /// — see the checks at the head of the body. Frame length is not among them:
+    /// **Fallible, and what it refuses is an absent own verifying key and the
+    /// pairings between the two groups** — see the checks at the head of the
+    /// body. Frame length is not among them:
     /// that ceiling belongs to [`SealedReEst`], so holding one is already proof
     /// it was checked. The attempt arrives inside the same value for the reason
     /// [`SealedReEst`] gives: the pairing is fixed at sealing time and this call
@@ -2185,12 +2231,20 @@ impl ResumeRecord {
     /// [`Retention`] is what [`Self::retire_retained`] ends wholesale.
     pub fn new(
         s_pc: Box<[u8; ml_dsa::SK_LEN]>,
+        own_pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
         pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
         committed_root: CommittedRoot,
         handshake: ReEstState,
         retention: Retention,
         send_floor: SendFloor,
     ) -> Result<Self, ResumeError> {
+        // The one shape of own verifying key that has no honest writer. See
+        // [`ResumeError::OwnVerifyingKeyAbsent`]: the field is fixed-width and
+        // has no absent spelling, so a caller holding no key writes zeros, and
+        // those zeros are indistinguishable from a key at every later read.
+        if own_pk_pc.iter().all(|b| *b == 0) {
+            return Err(ResumeError::OwnVerifyingKeyAbsent);
+        }
         // **The pairings, checked here because this is the other door.** Of the
         // four below, [`Self::decode`] refuses two on the way in from disk — the
         // own slot against the attempt counter, and a half-present retention —
@@ -2244,6 +2298,7 @@ impl ResumeRecord {
         }
         let mut record = Self {
             s_pc,
+            own_pk_pc,
             pk_pc,
             committed_root,
             reconnect_gen: handshake.reconnect_gen,
@@ -2312,6 +2367,18 @@ impl ResumeRecord {
     #[cfg(any(test, feature = "testing"))]
     pub const fn committed_root_offset_for_test() -> usize {
         core::mem::offset_of!(Self, committed_root)
+    }
+
+    /// Our own per-correspondent verifying key — the public half of
+    /// [`Self::s_pc`].
+    ///
+    /// **Nothing in the driver reads this yet.** The record carries it so that a
+    /// correspondence restored from disk can be given back the keypair it
+    /// speaks under; wiring that restoration is separate work, and until it
+    /// lands a restored correspondence still refuses to compose an ordinary
+    /// frame.
+    pub fn own_pk_pc(&self) -> &[u8; ml_dsa::PK_LEN] {
+        &self.own_pk_pc
     }
 
     /// The peer's per-correspondent verifying key.
@@ -2954,6 +3021,7 @@ impl ResumeRecord {
         out.extend_from_slice(RESUME_MAGIC);
         out.extend_from_slice(&Registry::default_write_suite().get().to_be_bytes());
         out.extend_from_slice(self.s_pc.as_ref());
+        out.extend_from_slice(self.own_pk_pc.as_ref());
         out.extend_from_slice(self.pk_pc.as_ref());
         out.extend_from_slice(self.committed_root.as_bytes());
         out.extend_from_slice(&self.reconnect_gen.to_be_bytes());
@@ -3063,6 +3131,10 @@ impl ResumeRecord {
             .into_boxed_slice()
             .try_into()
             .map_err(|_| ResumeError::Truncated)?;
+        let own_pk_pc: Box<[u8; ml_dsa::PK_LEN]> = Box::new(r.array()?);
+        if own_pk_pc.iter().all(|b| *b == 0) {
+            return Err(ResumeError::OwnVerifyingKeyAbsent);
+        }
         let pk_pc: Box<[u8; ml_dsa::PK_LEN]> = Box::new(r.array()?);
         // **Through a zeroizing local, never a bare `[u8; ROOT_KEY_LEN]`.**
         // `r.array()` returns the root by value, and the copy the caller drops
@@ -3267,6 +3339,7 @@ impl ResumeRecord {
         retained_bytes.zeroize();
         Ok(Self {
             s_pc,
+            own_pk_pc,
             pk_pc,
             committed_root,
             reconnect_gen,
@@ -3465,6 +3538,7 @@ mod tests {
     fn populated() -> ResumeRecord {
         ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -3494,6 +3568,7 @@ mod tests {
     fn with_bases(record: ResumeRecord, re_est: u32, re_ack: u32) -> ResumeRecord {
         let mut rebuilt = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -3530,6 +3605,7 @@ mod tests {
     fn opening() -> ResumeRecord {
         ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState::first_establishment(),
@@ -3630,6 +3706,7 @@ mod tests {
         // leaves behind.
         let mut record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -3768,8 +3845,9 @@ mod tests {
         let acceptance = record.acceptance().expect("the fixture accepts");
         let named = RESUME_MAGIC.len()
             + SUITE_ID_LEN
-            + ml_dsa::SK_LEN
-            + ml_dsa::PK_LEN
+            + ml_dsa::SK_LEN /* s_pc */
+            + ml_dsa::PK_LEN /* our own pk_pc */
+            + ml_dsa::PK_LEN /* the peer's pk_pc */
             + ROOT_KEY_LEN
             + 4 /* reconnect_gen */
             + 4 /* attempt counter */
@@ -3841,6 +3919,7 @@ mod tests {
         out.extend_from_slice(RESUME_MAGIC);
         out.extend_from_slice(&crate::crypto::suite::CNSA_2_0.id.get().to_be_bytes());
         out.extend_from_slice(&pattern(0x11, ml_dsa::SK_LEN));
+        out.extend_from_slice(&pattern(0x88, ml_dsa::PK_LEN));
         out.extend_from_slice(&pattern(0x22, ml_dsa::PK_LEN));
         out.extend_from_slice(&pattern(0x33, ROOT_KEY_LEN));
         out.extend_from_slice(&9u32.to_be_bytes()); // reconnect_gen
@@ -3953,6 +4032,7 @@ mod tests {
         // so rather than follow along.
         expected.extend_from_slice(&crate::crypto::suite::CNSA_2_0.id.get().to_be_bytes());
         expected.extend_from_slice(&pattern(0x11, ml_dsa::SK_LEN));
+        expected.extend_from_slice(&pattern(0x88, ml_dsa::PK_LEN));
         expected.extend_from_slice(&pattern(0x22, ml_dsa::PK_LEN));
         expected.extend_from_slice(&pattern(0x33, ROOT_KEY_LEN));
         expected.extend_from_slice(&9u32.to_be_bytes()); // reconnect_gen
@@ -4002,6 +4082,99 @@ mod tests {
         );
     }
 
+    /// Where this party's own verifying key starts in the at-rest form, from the
+    /// widths of the fields before it rather than from a number.
+    const OWN_PK_AT: usize = RESUME_MAGIC.len() + SUITE_ID_LEN + ml_dsa::SK_LEN;
+
+    /// Where the committed root starts: past the header and all three key
+    /// fields. Every test below that pokes at a field by offset counts from
+    /// here, so a fourth key field moves them all at once.
+    const ROOT_AT: usize = OWN_PK_AT + 2 * ml_dsa::PK_LEN;
+
+    /// **This party's own verifying key comes back as itself**, distinct from
+    /// the peer's.
+    ///
+    /// The inequality is the half that matters: both keys are the same width and
+    /// sit next to each other, so a decoder reading one field into the other
+    /// would satisfy any assertion that only checked a key was present.
+    #[test]
+    fn the_record_carries_its_own_verifying_key_across_a_round_trip() {
+        let bytes = populated().encode();
+        let back = ResumeRecord::decode(&bytes).expect("the fixture encodes a legal record");
+        assert_eq!(
+            back.own_pk_pc(),
+            &*pk_pc(0x88),
+            "our own verifying key did not survive the round trip"
+        );
+        assert_eq!(
+            back.pk_pc(),
+            &*pk_pc(0x22),
+            "the peer's verifying key did not survive the round trip"
+        );
+        assert_ne!(
+            back.own_pk_pc(),
+            back.pk_pc(),
+            "the two verifying keys decoded to one value"
+        );
+    }
+
+    /// **An all-zero own verifying key is refused at both doors**, and a record
+    /// carrying a real one still passes each.
+    ///
+    /// The pair that passes is the positive control: a constructor that refused
+    /// everything, or a decoder that did, would satisfy the refusals alone.
+    #[test]
+    fn an_all_zero_own_verifying_key_is_refused_at_both_doors() {
+        assert_eq!(
+            ResumeRecord::new(
+                s_pc(0x11),
+                Box::new([0u8; ml_dsa::PK_LEN]),
+                pk_pc(0x22),
+                root(0x33),
+                ReEstState::first_establishment(),
+                Retention::none(),
+                SendFloor::new(0, 0),
+            )
+            .err(),
+            Some(ResumeError::OwnVerifyingKeyAbsent),
+            "the constructor built a record with no verifying key of its own"
+        );
+
+        let good = populated().encode();
+        let mut zeroed = good.to_vec();
+        zeroed[OWN_PK_AT..OWN_PK_AT + ml_dsa::PK_LEN].fill(0);
+        assert_eq!(
+            ResumeRecord::decode(&zeroed).err(),
+            Some(ResumeError::OwnVerifyingKeyAbsent),
+            "a record whose own verifying key is zero filled decoded"
+        );
+        assert!(
+            ResumeRecord::decode(&good).is_ok(),
+            "the untouched buffer must decode, or the refusal above proves nothing"
+        );
+    }
+
+    /// **At-rest bytes that end inside the own verifying key are a truncation**,
+    /// reported as one.
+    ///
+    /// This is the shape a record written before the field existed arrives in:
+    /// it is one ML-DSA-87 public key short of the layout, so the read runs out
+    /// of bytes. The record is refused either way; the name is what makes it
+    /// diagnosable rather than a puzzle.
+    #[test]
+    fn at_rest_bytes_ending_inside_the_own_verifying_key_are_truncated() {
+        let good = populated().encode();
+        assert_eq!(
+            ResumeRecord::decode(&good[..OWN_PK_AT + 1]).err(),
+            Some(ResumeError::Truncated),
+            "a buffer ending inside the own verifying key decoded"
+        );
+        assert!(
+            ResumeRecord::decode(&good).is_ok(),
+            "the whole buffer must decode, or the refusal above proves nothing"
+        );
+    }
+
     /// **`accept_peer_initiation` stamps the retention once and moves it never.**
     ///
     /// A5.1 lets a newer attempt supersede an unconfirmed candidate, so this
@@ -4014,6 +4187,7 @@ mod tests {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState::first_establishment(),
@@ -4072,6 +4246,7 @@ mod tests {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let mut record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState::first_establishment(),
@@ -4094,6 +4269,7 @@ mod tests {
         // four of those things.
         let mut settled = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -4200,6 +4376,7 @@ mod tests {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -4248,6 +4425,7 @@ mod tests {
         let build = |handshake: ReEstState, retention: Retention| {
             ResumeRecord::new(
                 s_pc(0x11),
+                pk_pc(0x88),
                 pk_pc(0x22),
                 root(0x33),
                 handshake,
@@ -4676,15 +4854,13 @@ mod tests {
         // would write.
         let frame = pattern(0x44, 64);
         let mut bytes = assembled_full(7, &frame, 0, &[], false, None, &[]);
-        let flag_at = RESUME_MAGIC.len()
-            + SUITE_ID_LEN
-            + ml_dsa::SK_LEN
-            + ml_dsa::PK_LEN
+        let flag_at = ROOT_AT
             + ROOT_KEY_LEN
             + 4 /* reconnect_gen */
             + 4 /* attempt counter */
             + 4 /* own slot generation */
-            + 4 /* own slot attempt */;
+            + 4 /* own slot attempt */
+            + 8 /* own slot seq */;
         bytes[flag_at] = 0;
         bytes[flag_at + 1..flag_at + 1 + ml_kem::DK_LEN].fill(0);
         assert_eq!(
@@ -4827,6 +5003,7 @@ mod tests {
         assert_eq!(dedup.len(), DEDUP_CAPACITY, "the fixture must fill the set");
         let at_ceiling = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -5021,6 +5198,10 @@ mod tests {
             "the signing key field is not redacted: {shown}"
         );
         assert!(
+            shown.contains(r#"own_pk_pc: "<own verifying key>""#),
+            "our own verifying key field is not redacted: {shown}"
+        );
+        assert!(
             shown.contains("committed_root: CommittedRoot(<redacted>)"),
             "the committed root field is not redacted: {shown}"
         );
@@ -5056,19 +5237,35 @@ mod tests {
         // not.** It matched lowercase hex only, while Rust's derived `Debug` for
         // `[u8; N]` prints DECIMAL — so it missed exactly the rendering the
         // compiler emits by default, which is the one a mistake would produce.
-        let head = &record.s_pc()[..8];
-        for rendering in [
-            head.iter()
-                .map(|b| b.to_string())
-                .collect::<Vec<_>>()
-                .join(", "),
-            head.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            head.iter().map(|b| format!("{b:02X}")).collect::<String>(),
-        ] {
-            assert!(
-                !shown.contains(&rendering),
-                "the signing key's bytes reached the Debug output as {rendering}"
-            );
+        //
+        // **Our own verifying key is watched here too, not only the signing
+        // key.** The named assertions above pin the literals this impl writes
+        // and nothing more: an edit that kept a redaction label and rendered the
+        // key under some other name would satisfy every one of them.
+        //
+        // **The backstop cannot say WHICH key it caught, and the message does
+        // not claim to.** `pattern` advances by 31 per byte, which is coprime
+        // with 256, so every seed produces a rotation of one 256-long cycle and
+        // any short window of one key's bytes occurs inside a long rendering of
+        // another's, so a leak of any one key is caught by another key's
+        // window. That makes this a check on the class — no per-correspondent key material in the output —
+        // which is the property worth having; the named assertions are what
+        // attribute a failure to a field. Widening the window does not fix it,
+        // because the cycle is shorter than either key.
+        for head in [&record.s_pc()[..8], &record.own_pk_pc()[..8]] {
+            for rendering in [
+                head.iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                head.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                head.iter().map(|b| format!("{b:02X}")).collect::<String>(),
+            ] {
+                assert!(
+                    !shown.contains(&rendering),
+                    "per-correspondent key bytes reached the Debug output as {rendering}"
+                );
+            }
         }
     }
 
@@ -5139,6 +5336,7 @@ mod tests {
             let own_attempt = own.as_ref().map_or(0, |slot| slot.attempt().get());
             let before = ResumeRecord::new(
                 s_pc(0x11),
+                pk_pc(0x88),
                 pk_pc(0x22),
                 root(0x33),
                 ReEstState {
@@ -5198,6 +5396,7 @@ mod tests {
             assert_eq!(slot.confirmed(), confirmed);
             let before = ResumeRecord::new(
                 s_pc(0x11),
+                pk_pc(0x88),
                 pk_pc(0x22),
                 root(0x33),
                 ReEstState {
@@ -5395,6 +5594,7 @@ mod tests {
         let at = |n: u32| Attempt::from_nonzero(NonZeroU32::new(n).expect("non-zero"));
         let mut record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState::first_establishment(),
@@ -5454,6 +5654,7 @@ mod tests {
         let encoded = {
             let mut record = ResumeRecord::new(
                 s_pc(0x11),
+                pk_pc(0x88),
                 pk_pc(0x22),
                 root(0x33),
                 ReEstState::first_establishment(),
@@ -5664,6 +5865,7 @@ mod tests {
         let two_c = 16;
         let record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -5741,6 +5943,7 @@ mod tests {
         let legs = [Leg::ReEst, Leg::ReAck, Leg::ReConfirm];
         let mut record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState::first_establishment(),
@@ -5773,6 +5976,7 @@ mod tests {
             let carried = record.dedup().clone();
             record = ResumeRecord::new(
                 s_pc(0x11),
+                pk_pc(0x88),
                 pk_pc(0x22),
                 root(0x33),
                 ReEstState {
@@ -5916,6 +6120,7 @@ mod tests {
     fn the_re_est_base_survives_a_completion() {
         let accepted = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -5946,6 +6151,7 @@ mod tests {
         // retention carried across as the store carries it.
         let completed = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -6008,6 +6214,7 @@ mod tests {
 
         let record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState {
@@ -6051,6 +6258,7 @@ mod tests {
         let at = |n: u32| Attempt::from_nonzero(NonZeroU32::new(n).expect("non-zero"));
         let mut record = ResumeRecord::new(
             s_pc(0x11),
+            pk_pc(0x88),
             pk_pc(0x22),
             root(0x33),
             ReEstState::first_establishment(),
@@ -6203,8 +6411,8 @@ mod tests {
         // `assembled_full` derives each slot's generation from its attempt, so
         // the contradiction is written by hand.
         let base = assembled_full(0, &[], 0, &[], false, None, &[]);
-        let own_gen_at = RESUME_MAGIC.len() + SUITE_ID_LEN + ml_dsa::SK_LEN + ml_dsa::PK_LEN
-            + ROOT_KEY_LEN + 4 /* reconnect_gen */ + 4 /* attempt counter */;
+        let own_gen_at =
+            ROOT_AT + ROOT_KEY_LEN + 4 /* reconnect_gen */ + 4 /* attempt counter */;
         let acc_gen_at = own_gen_at + 4 /* own slot generation */ + 4 /* own slot attempt */
             + 8 /* own slot seq */ + 1 /* ephemeral key present */ + ml_kem::DK_LEN;
         for (offset, generation) in [(own_gen_at, 10u32), (acc_gen_at, 8u32)] {
@@ -6229,10 +6437,7 @@ mod tests {
     #[test]
     fn the_decoder_refuses_retained_bytes_under_a_clear_flag() {
         let mut bytes = assembled_full(0, &[], 0, &[], false, None, &[]);
-        let root_at = RESUME_MAGIC.len()
-            + SUITE_ID_LEN
-            + ml_dsa::SK_LEN
-            + ml_dsa::PK_LEN
+        let root_at = ROOT_AT
             + ROOT_KEY_LEN
             + 4 /* reconnect_gen */
             + 4 /* attempt counter */
@@ -6307,8 +6512,7 @@ mod tests {
     fn the_decoder_refuses_a_slot_that_disagrees_with_the_counter() {
         let frame = pattern(0x44, 64);
         let mut bytes = assembled_full(7, &frame, 0, &[], false, None, &[]);
-        let counter_at =
-            RESUME_MAGIC.len() + SUITE_ID_LEN + ml_dsa::SK_LEN + ml_dsa::PK_LEN + ROOT_KEY_LEN + 4;
+        let counter_at = ROOT_AT + ROOT_KEY_LEN + 4 /* reconnect_gen */;
         bytes[counter_at..counter_at + 4].copy_from_slice(&9u32.to_be_bytes());
         assert_eq!(
             ResumeRecord::decode(&bytes).err(),

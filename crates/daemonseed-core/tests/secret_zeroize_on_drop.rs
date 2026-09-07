@@ -83,6 +83,7 @@ use daemonseed_core::circle::key::{
 };
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::dm::firstcontact::{ChannelRoots, ROOT_LEN, SS0_LEN, VerifiedFirstContact};
+use daemonseed_core::dm::provisional::SigningKeyPc;
 use daemonseed_core::dm::ratchet::EphemeralDecapKey;
 use daemonseed_core::dm::ratchet::ROOT_KEY_LEN;
 use daemonseed_core::dm::resume::{
@@ -710,6 +711,31 @@ fn boxed_arm_secrets_are_zeroed_before_their_memory_is_released() {
     );
 }
 
+/// **`SigningKeyPc` is wiped before its memory is released.**
+///
+/// A case of its own rather than a fifth entry beside the four above, because the
+/// claim it answers is this type's rather than the arm's. `ProvisionalRecord`
+/// documents the field as wiping on drop and relies on that instead of a
+/// container `Drop` — the type has none, deliberately — so the wipe is the whole
+/// of the record's promise about the one long-lived signing key that has no
+/// re-derivation path. An arm-level case built on a different type is evidence
+/// about the macro and says nothing about which arm this field was written on.
+///
+/// Watched at offset 0 of a block exactly the signing key's size, which is what a
+/// `boxed` secret owning its whole allocation must present; a field that moved to
+/// an inline or borrowed shape fails on the offset rather than on the bytes.
+#[test]
+fn the_provisional_records_signing_key_is_zeroed_before_its_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "SigningKeyPc",
+        (0, ML_DSA_SK_LEN),
+        || SigningKeyPc::new(Box::new([0xC3u8; ML_DSA_SK_LEN])),
+        |s| at(s.as_bytes()),
+    );
+}
+
 /// The inline arm keeps its secret in the value itself, so it is observed by
 /// moving a real identity-rooted secret into a `Box`: that puts the inline
 /// `[u8; 32]` inside a heap block the witness can watch. The wrapper's `Drop`
@@ -1271,6 +1297,7 @@ fn a_watched_buffer_that_is_reallocated_disarms_the_watch() {
 fn resume_record() -> ResumeRecord {
     ResumeRecord::new(
         Box::new([0xA7; ML_DSA_SK_LEN]),
+        Box::new([0x8E; PK_LEN]),
         Box::new([0xB3; PK_LEN]),
         CommittedRoot::from_bytes(&[0xC5; ROOT_KEY_LEN]),
         ReEstState {
@@ -1407,6 +1434,12 @@ fn resume_record_secret_halves_are_zeroed_before_their_memory_is_released() {
 /// actually covers. `pk_pc` is the peer's PUBLIC verifying key and is deliberately
 /// skipped; its bytes must survive, and reading them back distinguishes "the
 /// secret was wiped" from "the whole record was blank".
+///
+/// **Both verifying keys are read, and against different fillers.** They are the
+/// same width and adjacent, so a control that read only one of them would pass
+/// on a record that had written that one twice — and this party's own verifying
+/// key is skipped for the same reason the peer's is, while being the one the
+/// record cannot re-derive if it is lost.
 #[test]
 fn the_record_is_populated_before_any_drop_so_the_wipe_cases_have_a_control() {
     init();
@@ -1415,6 +1448,17 @@ fn the_record_is_populated_before_any_drop_so_the_wipe_cases_have_a_control() {
         r.pk_pc().iter().all(|&b| b == 0xB3),
         "the skipped public field did not survive construction, so the zeroize \
          cases above have no control"
+    );
+    assert!(
+        r.own_pk_pc().iter().all(|&b| b == 0x8E),
+        "our own skipped verifying key did not survive construction, so the \
+         zeroize cases above have no control over it"
+    );
+    assert_ne!(
+        r.own_pk_pc().as_slice(),
+        r.pk_pc().as_slice(),
+        "the two verifying keys share a filler, so a read of one could pass on \
+         the other"
     );
     assert!(
         r.s_pc().iter().any(|&b| b != 0),

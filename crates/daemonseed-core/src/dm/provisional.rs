@@ -29,15 +29,32 @@
 //!
 //! ## What the record stores, and what it recomputes
 //!
-//! `{version, ss0, eph_ek, eph_dk}` — and **not** `AR`, **not** `chan_id`, **not**
-//! `RS_0`, **not** the ratchet root `RK`. All four are pure functions of `ss0`:
+//! `{version, ss0, eph_ek, eph_dk, s_pc, pk_pc}` — and **not** `AR`, **not**
+//! `chan_id`, **not** `RS_0`, **not** the ratchet root `RK`. All four are pure
+//! functions of `ss0`:
 //! [`derive_channel_roots`] HKDF-expands `ar`, `chan_id` and `rs0` from an
 //! extract over `ss0`, and the root comes from the same extract under
 //! [`domain::DM_RATCHET_ROOT`] — four siblings of one extraction. `ratchet`'s
 //! `roots_from_one_ss0_are_pinned_siblings` pins all four outputs for a fixed
 //! `ss0`, so re-plumbing the derivation changes those bytes and fails.
 //!
-//! So they are recomputed on restore rather than stored. That is not only fewer
+//! **The signing keypair is the one thing here that is stored because it cannot
+//! be anything else.** It is drawn from the CSPRNG when the knock is composed,
+//! descends from nothing, and the correspondent will verify every frame of the
+//! conversation under the public half the knock published. Between the knock and
+//! the establishment that writes a resume record there is no other record to
+//! hold it, so a party that restarts in that window comes back unable to sign as
+//! the pseudonym its own entry announced. Both halves are here: ML-DSA-87 has no
+//! public-from-private derivation, so the verifying key is not recoverable from
+//! the signing key it belongs to.
+//!
+//! **Nothing reads the pair back yet.** The record carries it and
+//! [`ProvisionalRecord::s_pc`] hands it over; installing it on a resumed
+//! handshake is separate work, so a restart in that window still ends in a
+//! conversation that cannot send.
+//!
+//! So the derivable four are recomputed on restore rather than stored. That is
+//! not only fewer
 //! secret bytes at rest and a smaller fixed-size record: it makes an
 //! internally-inconsistent record **impossible to construct** instead of
 //! something a validator has to catch. There is deliberately no `AR`/`RK`
@@ -50,16 +67,19 @@
 //!
 //! ## Whose record this is
 //!
-//! The initiator's. § v5 (V4-2) names it verbatim — `{ss0, A's opening ephemeral
-//! DK}` — and `ProvisionalRecord::into_ratchet` / `ProvisionalRecord::to_ratchet`
-//! are the construction paths from it. The recipient's half of § v4 4.1 (`PK_pc_A`, the peer pseudonym it
-//! must verify frames against) is **not** here and is not recomputable from
-//! `ss0`; its home is the ISC-C44 contact cache, which holds "long-term +
-//! pseudonym pubkeys" per contact.
+//! The initiator's. § v5 (V4-2) names `{ss0, A's opening ephemeral DK}` and the
+//! 2026-09-05 build note beside it adds the initiator's own signing keypair;
+//! `ProvisionalRecord::into_ratchet` / `ProvisionalRecord::to_ratchet` are the
+//! construction paths from it. The *correspondent's* pseudonym key (§ v4 4.1's
+//! `PK_pc_A`, the key an acceptor verifies the initiator's frames against) is
+//! **not** here and is not recomputable from `ss0`; its home is the ISC-C44
+//! contact cache, which holds "long-term + pseudonym pubkeys" per contact. Only
+//! this party's own pair is here.
 //!
 //! ## At rest
 //!
-//! `nonce(12) ‖ AES-256-GCM(version ‖ binding ‖ ss0 ‖ eph_ek ‖ eph_dk) ‖ tag(16)`
+//! `nonce(12) ‖ AES-256-GCM(version ‖ binding ‖ ss0 ‖ eph_ek ‖ eph_dk ‖ s_pc ‖
+//! pk_pc) ‖ tag(16)`
 //! — one fixed size, [`PROVISIONAL_RECORD_LEN`], for every record. The key is the
 //! caller's, derived by [`derive_seal_key`] from the profile's at-rest material
 //! and **never** from `ss0`: a record keyed on the secret it contains could not
@@ -67,9 +87,9 @@
 //!
 //! ## The two bindings, and what each one is for
 //!
-//! The seal key is per-**profile**, and the record's contents are three secrets
-//! that only mean anything together. Two distinct confusions follow from that,
-//! and each has its own binding.
+//! The seal key is per-**profile**, and the record's contents are secrets that
+//! only mean anything together. Two distinct confusions follow from that, and
+//! each has its own binding.
 //!
 //! **Which channel this record is** — [`RecordContext`], bound as AAD. Without
 //! it every provisional record in a profile is an interchangeable ciphertext:
@@ -96,6 +116,16 @@
 //! by the AEAD; the tag says the contents are internally one channel's and is
 //! checked after it. A splice assembled from two records of the *same* profile
 //! and channel context passes the first and fails the second.
+//!
+//! **The binding tag covers `ss0` and the opening ephemeral; it does not cover
+//! the signing keypair.** What ties that pair together is
+//! [`ProvisionalRecord::new`]'s sign-and-verify, which says the two halves
+//! belong to each other and says nothing about which channel they were minted
+//! for. The AAD is what scopes them: a record's context is `(correspondent,
+//! epoch)`, and a knock is idempotent within one of those, so two records that
+//! share a context are two attempts at one conversation rather than two
+//! conversations. Splicing a pair in from a *different* context fails the AEAD
+//! before any of this is read.
 //!
 //! **A fixed size is a privacy property, not tidiness.** A variable-length record
 //! would leak which of its optional parts a handshake had reached, and a
@@ -132,6 +162,7 @@
 
 use oxicrypt_aes::{Aes256Key, ModeError};
 use oxicrypt_kdf::HkdfSha384;
+use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_ml_kem as ml_kem;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -143,6 +174,7 @@ use crate::dm::firstcontact::{
 use crate::dm::paging::MAX_PAGE;
 use crate::dm::ratchet::{EphemeralDecapKey, Ratchet, RatchetError};
 use crate::dm::{domain, keyrec, push_lp};
+use crate::secret_seed::redacted_secret_newtype;
 use crate::storage::seeds::AEAD_KEY_LEN;
 use crate::trust_events::TrustEventKey;
 
@@ -166,16 +198,33 @@ pub const PROVISIONAL_RECORD_VERSION: u8 = 1;
 /// nothing can use.
 pub const BINDING_TAG_LEN: usize = 16;
 
-/// Plaintext length: the version byte, the binding tag, `ss0`, and both halves of
-/// the opening ephemeral. Fixed — every field is fixed-width, so there are no
-/// interior length prefixes able to disagree with what they describe.
-pub const PROVISIONAL_PLAINTEXT_LEN: usize =
-    1 + BINDING_TAG_LEN + SS0_LEN + ml_kem::EK_LEN + ml_kem::DK_LEN;
+/// Plaintext length: the version byte, the binding tag, `ss0`, both halves of
+/// the opening ephemeral, and both halves of this party's per-correspondent
+/// signing keypair. Fixed — every field is fixed-width, so there are no interior
+/// length prefixes able to disagree with what they describe.
+pub const PROVISIONAL_PLAINTEXT_LEN: usize = 1
+    + BINDING_TAG_LEN
+    + SS0_LEN
+    + ml_kem::EK_LEN
+    + ml_kem::DK_LEN
+    + ml_dsa::SK_LEN
+    + ml_dsa::PK_LEN;
 
 /// Sealed length: `nonce ‖ ciphertext ‖ tag`. One number for every record, which
 /// is what lets the store give this kind a fixed-size bucket —
 /// [`RecordKind::Provisional`](crate::storage::dm_store::RecordKind::Provisional)
 /// takes it verbatim as its capacity.
+///
+/// **A record written under an earlier field list is refused by size, not
+/// misread.** [`ProvisionalRecord::open`] compares the sealed length against
+/// this number before it does anything else, so a shorter record reports
+/// [`ProvisionalError::WrongLength`] naming both figures rather than reaching
+/// the AEAD. That ordering matters here: the plaintext is a run of fixed-width
+/// fields with no interior framing, so a decoder that got as far as parsing one
+/// would read `ss0` out of the binding tag's bytes and carry on. It cannot get
+/// that far — the length check is first, and the seal is over the whole
+/// plaintext, so even an equal-length record from another layout fails to
+/// authenticate.
 pub const PROVISIONAL_RECORD_LEN: usize = NONCE_LEN + PROVISIONAL_PLAINTEXT_LEN + TAG_LEN;
 
 /// Why a provisional record could not be built, sealed, or opened.
@@ -183,7 +232,13 @@ pub const PROVISIONAL_RECORD_LEN: usize = NONCE_LEN + PROVISIONAL_PLAINTEXT_LEN 
 pub enum ProvisionalError {
     /// HKDF failed — an unrecoverable crypto-module condition.
     Kdf,
-    /// An AES key-init or ML-KEM operation failed at the module boundary.
+    /// An AES key-init, ML-KEM or ML-DSA operation failed at the module
+    /// boundary.
+    ///
+    /// The ML-DSA arm is the signature and verification
+    /// [`ProvisionalRecord::new`] uses to check that the record's two signing
+    /// halves belong together: a module that will not sign says nothing about
+    /// the pairing, so it is a module condition and a caller may retry.
     Module,
     /// AES-256-GCM authentication failed. The uniform open-path failure: a wrong
     /// key, a wrong [`RecordContext`], a flipped bit and a tampered record are
@@ -209,6 +264,16 @@ pub enum ProvisionalError {
     /// opening ephemeral are not from one channel. A splice, or two records
     /// interleaved by a partial write.
     MismatchedBinding,
+    /// The record's two signing halves are not a keypair: a signature produced
+    /// under the secret half does not verify under the public one.
+    ///
+    /// Worth checking for the reason [`Self::MismatchedEphemeral`] is, arriving
+    /// by a different route. The correspondent takes this party's verifying key
+    /// from the first-contact entry and opens every later frame under it, so a
+    /// record whose halves disagree resumes a conversation that signs
+    /// unverifiably — and nothing on this side can tell, because signing
+    /// succeeds either way.
+    MismatchedSigningPair,
 }
 
 impl std::fmt::Display for ProvisionalError {
@@ -233,6 +298,9 @@ impl std::fmt::Display for ProvisionalError {
                 f,
                 "the record's secret and its opening ephemeral are not from one channel"
             ),
+            Self::MismatchedSigningPair => {
+                write!(f, "the record's signing halves are not a keypair")
+            }
         }
     }
 }
@@ -374,6 +442,68 @@ fn binding_tag(
     }
 }
 
+redacted_secret_newtype! {
+    /// The secret half of this party's per-correspondent signing keypair.
+    ///
+    /// A newtype rather than a bare box, on the same terms as
+    /// [`EphemeralDecapKey`]: it wipes itself when it drops, so
+    /// [`ProvisionalRecord`] keeps its container-`Drop`-free shape, and its
+    /// [`Debug`](core::fmt::Debug) cannot render the key.
+    boxed pub struct SigningKeyPc([u8; ml_dsa::SK_LEN]);
+}
+
+impl SigningKeyPc {
+    /// Take ownership of an already-boxed signing key.
+    pub fn new(bytes: Box<[u8; ml_dsa::SK_LEN]>) -> Self {
+        Self(bytes)
+    }
+
+    /// Copy a signing key straight onto the heap.
+    ///
+    /// The heap-first reason applies at full force here: `Box::new(*key)`
+    /// materialises 4 896 secret bytes in the caller's frame on the way to the
+    /// allocation and leaves them there.
+    pub fn copy_from(key: &[u8; ml_dsa::SK_LEN]) -> Self {
+        Self(boxed_from_slice(key))
+    }
+}
+
+/// Whether a signature produced under `s_pc` verifies under `pk_pc`.
+///
+/// **The pairing is checked by using it, because ML-DSA-87 offers nothing
+/// cheaper that is honest.** FIPS 203 embeds the encapsulation key inside the
+/// decapsulation key, which is what lets [`EphemeralDecapKey::matches`] be a
+/// memcmp; FIPS 204 has no such containment that a caller may rely on, so the
+/// only way to learn that two halves belong together is to sign and verify.
+///
+/// The message is a fixed label rather than anything from the record, and the
+/// signature is discarded on the spot: it never reaches the wire, the disk or a
+/// preimage anything else verifies, so it needs no domain separation from the
+/// protocol's own signatures — it is a self-test, not a statement. The empty
+/// FIPS-204 context matches [`crate::identity::keys::SignKeypair::sign`], so
+/// this exercises the same call the conversation will make.
+///
+/// **Only a signature that verifies false answers `false`.** `verify` reports a
+/// genuine verification failure as `InvalidInput` and reports a module that will
+/// not perform the service — not operational, a failed self-test, an algorithm
+/// the active profile forbids — as its own variant. Collapsing every error into
+/// "not a keypair" would make a module in its error state report every record on
+/// disk as corrupt: the caller would read `MismatchedSigningPair` about an intact
+/// record and have no way to tell it from the real thing. The module conditions
+/// are retryable and the pairing verdict is not, so they are kept apart.
+fn signing_halves_pair(
+    s_pc: &[u8; ml_dsa::SK_LEN],
+    pk_pc: &[u8; ml_dsa::PK_LEN],
+) -> Result<bool, ProvisionalError> {
+    const PROBE: &[u8] = b"daemonseed/dm/provisional/keypair-probe";
+    let signature = ml_dsa::sign(s_pc, PROBE, &[]).map_err(|_| ProvisionalError::Module)?;
+    match ml_dsa::verify(pk_pc, PROBE, &[], &signature) {
+        Ok(()) => Ok(true),
+        Err(oxicrypt_module::Error::InvalidInput) => Ok(false),
+        Err(_) => Err(ProvisionalError::Module),
+    }
+}
+
 /// Compare two binding tags without a data-dependent early return.
 ///
 /// The same construction as [`crate::storage::cas`]'s `ct_eq` and for the same
@@ -428,6 +558,17 @@ pub struct ProvisionalRecord {
     ss0: Zeroizing<[u8; SS0_LEN]>,
     eph_ek: Box<[u8; ml_kem::EK_LEN]>,
     eph_dk: EphemeralDecapKey,
+    /// **Ours**, and secret: the per-correspondent signing key every frame of
+    /// this conversation is signed under. It is drawn when the knock is composed
+    /// and is not derivable from `ss0`, from the mnemonic, or from anything else
+    /// — so between the knock and the establishment that writes a resume record,
+    /// this is its only at-rest home.
+    s_pc: SigningKeyPc,
+    /// **Ours**, and public: the verifying key the first-contact entry published
+    /// and the correspondent checks our frames against. Stored beside the secret
+    /// half because ML-DSA-87 has no public-from-private derivation, so a record
+    /// holding one half alone cannot produce the other.
+    pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
 }
 
 impl std::fmt::Debug for ProvisionalRecord {
@@ -447,19 +588,53 @@ impl ProvisionalRecord {
     /// `ss0` arrives already wrapped so it can be *moved* in. Taking a bare
     /// `[u8; SS0_LEN]` would copy it at the call site and leave that copy live in
     /// the caller's frame, which is the hazard the wrapper exists to close.
+    ///
+    /// **The signing halves are refused on the same terms**, by signing a fixed
+    /// probe and verifying it. Their failure is the mirror image of the
+    /// ephemeral's: signing under a secret half never fails either, so a
+    /// mismatched pair produces frames the correspondent silently discards. Both
+    /// doors into this type come through here — [`Self::open`] rebuilds a record
+    /// from bytes that can disagree — so one check covers construction and
+    /// restore.
+    ///
+    /// The signing check costs one ML-DSA-87 signature and one verification,
+    /// paid once when a knock is composed and once when a record is read back.
     pub fn new(
         ss0: Zeroizing<[u8; SS0_LEN]>,
         eph_ek: Box<[u8; ml_kem::EK_LEN]>,
         eph_dk: EphemeralDecapKey,
+        s_pc: SigningKeyPc,
+        pk_pc: Box<[u8; ml_dsa::PK_LEN]>,
     ) -> Result<Self, ProvisionalError> {
         if !eph_dk.matches(&eph_ek) {
             return Err(ProvisionalError::MismatchedEphemeral);
+        }
+        if !signing_halves_pair(s_pc.as_bytes(), &pk_pc)? {
+            return Err(ProvisionalError::MismatchedSigningPair);
         }
         Ok(Self {
             ss0,
             eph_ek,
             eph_dk,
+            s_pc,
+            pk_pc,
         })
+    }
+
+    /// Our per-correspondent signing key.
+    ///
+    /// **Nothing in the driver reads this yet.** The record carries it so that
+    /// a handshake resumed after a restart can be given back the keypair its
+    /// knock published; wiring that restoration is separate work, and until it
+    /// lands a resumed handshake still cannot compose a frame.
+    pub fn s_pc(&self) -> &[u8; ml_dsa::SK_LEN] {
+        self.s_pc.as_bytes()
+    }
+
+    /// Our per-correspondent verifying key — the public half of [`Self::s_pc`],
+    /// and the key the first-contact entry published.
+    pub fn pk_pc(&self) -> &[u8; ml_dsa::PK_LEN] {
+        &self.pk_pc
     }
 
     /// The channel's address root `AR`, recomputed.
@@ -533,10 +708,16 @@ impl ProvisionalRecord {
         // `ss0` is borrowed while the other two fields move out. That is only
         // legal because this type has no container `Drop` — the exact restriction
         // #255 was about.
+        // The signing pair is dropped here rather than carried: a ratchet is the
+        // key schedule, and the keypair the conversation signs under belongs to
+        // whatever holds the correspondence. Both halves destroy themselves —
+        // the secret one wipes on drop.
         let Self {
             ss0,
             eph_ek,
             eph_dk,
+            s_pc: _,
+            pk_pc: _,
         } = self;
         Ratchet::initiator(&ss0, eph_ek, eph_dk)
     }
@@ -590,6 +771,8 @@ impl ProvisionalRecord {
         plaintext.extend_from_slice(self.ss0.as_slice());
         plaintext.extend_from_slice(self.eph_ek.as_slice());
         plaintext.extend_from_slice(self.eph_dk.as_bytes());
+        plaintext.extend_from_slice(self.s_pc.as_bytes());
+        plaintext.extend_from_slice(self.pk_pc.as_slice());
         debug_assert_eq!(plaintext.len(), PROVISIONAL_PLAINTEXT_LEN);
 
         let sealed = seal_envelope(key, &seal_aad(ctx), &plaintext)?;
@@ -600,7 +783,7 @@ impl ProvisionalRecord {
     /// Read a sealed record back, refusing one that is not the channel `ctx`
     /// names.
     ///
-    /// Four checks, and deliberately no more:
+    /// Five checks, and deliberately no more:
     ///
     /// 1. **The AEAD open, under `ctx`'s AAD** — integrity and authenticity of
     ///    every byte, and *which channel's* record this is. A truncated record, a
@@ -614,6 +797,13 @@ impl ProvisionalRecord {
     /// 4. **`eph_dk` against `eph_ek`** via [`EphemeralDecapKey::matches`]. A
     ///    record whose halves disagree is corrupt in the one way the AEAD cannot
     ///    speak to — a pairing that was already wrong when it was written.
+    /// 5. **`s_pc` against `pk_pc`**, by signing and verifying. Same class as
+    ///    the fourth and the same reason it is worth paying for: a wrong pairing
+    ///    was already wrong when it was written, and every consequence of it is
+    ///    silent.
+    ///
+    /// A record written under an earlier field list never reaches any of them:
+    /// its length is wrong, and [`PROVISIONAL_RECORD_LEN`] is compared first.
     ///
     /// There is **no `AR`/`RK` cross-check**, and its absence is the design rather
     /// than a gap: both are recomputed from `ss0` on every restore, so a record
@@ -663,6 +853,12 @@ impl ProvisionalRecord {
         let eph_dk = EphemeralDecapKey::new(boxed_from_slice::<{ ml_kem::DK_LEN }>(
             &plaintext[at..at + ml_kem::DK_LEN],
         ));
+        at += ml_kem::DK_LEN;
+        let s_pc = SigningKeyPc::new(boxed_from_slice::<{ ml_dsa::SK_LEN }>(
+            &plaintext[at..at + ml_dsa::SK_LEN],
+        ));
+        at += ml_dsa::SK_LEN;
+        let pk_pc = boxed_from_slice::<{ ml_dsa::PK_LEN }>(&plaintext[at..at + ml_dsa::PK_LEN]);
 
         // Every exit from here on clears the bare `ss0` array: it is `Copy` with
         // no `Drop`, so the wrapper's copy is the only one anything protects and
@@ -670,7 +866,7 @@ impl ProvisionalRecord {
         let outcome = binding_tag(&ss0, &eph_ek).and_then(|expected| {
             if tags_match(&carried, &expected) {
                 // The wrapper takes a copy of the bare array read above.
-                Self::new(Zeroizing::new(ss0), eph_ek, eph_dk)
+                Self::new(Zeroizing::new(ss0), eph_ek, eph_dk, s_pc, pk_pc)
             } else {
                 Err(ProvisionalError::MismatchedBinding)
             }
@@ -1065,10 +1261,36 @@ mod tests {
         out
     }
 
+    /// This party's per-correspondent keypair, from a fixed seed so both halves
+    /// belong together.
+    fn signing() -> crate::identity::keys::SignKeypair {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        crate::identity::keys::SignKeypair::from_ml_dsa_seed(
+            &[0x77u8; crate::identity::keys::ML_DSA_SEED_LEN],
+        )
+        .expect("keygen")
+    }
+
+    /// A second, unrelated keypair — the mismatched half.
+    fn other_signing() -> crate::identity::keys::SignKeypair {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        crate::identity::keys::SignKeypair::from_ml_dsa_seed(
+            &[0x99u8; crate::identity::keys::ML_DSA_SEED_LEN],
+        )
+        .expect("keygen")
+    }
+
     fn record() -> ProvisionalRecord {
         let (ek, dk) = ephemeral();
-        ProvisionalRecord::new(Zeroizing::new(ss0()), ek, EphemeralDecapKey::new(dk))
-            .expect("a matched pair")
+        let signing = signing();
+        ProvisionalRecord::new(
+            Zeroizing::new(ss0()),
+            ek,
+            EphemeralDecapKey::new(dk),
+            SigningKeyPc::copy_from(signing.secret_key()),
+            Box::new(*signing.public_key()),
+        )
+        .expect("a matched pair")
     }
 
     // ---- the record round-trips ----------------------------------------------
@@ -1094,6 +1316,20 @@ mod tests {
         let (ek, _) = ephemeral();
         assert_eq!(reopened.eph_ek(), ek.as_ref());
 
+        // As did both halves of the signing keypair. The verifying half is
+        // checked against the keypair rather than against the other field, so a
+        // decoder that read one key twice fails here.
+        assert_eq!(
+            reopened.s_pc().as_slice(),
+            signing().secret_key().as_slice(),
+            "the signing key did not survive the round trip"
+        );
+        assert_eq!(
+            reopened.pk_pc().as_slice(),
+            signing().public_key().as_slice(),
+            "the verifying key did not survive the round trip"
+        );
+
         // The record can still do the one thing it exists for.
         let ratchet = reopened.into_ratchet().expect("opens a ratchet");
         assert_eq!(ratchet.role(), Role::Initiator);
@@ -1106,10 +1342,13 @@ mod tests {
     fn every_record_seals_to_one_length() {
         let key = key();
         let (ek, dk) = other_ephemeral();
+        let other_signing = other_signing();
         let other = ProvisionalRecord::new(
             Zeroizing::new([0u8; SS0_LEN]),
             ek,
             EphemeralDecapKey::new(dk),
+            SigningKeyPc::copy_from(other_signing.secret_key()),
+            Box::new(*other_signing.public_key()),
         )
         .unwrap();
         assert_eq!(
@@ -1238,9 +1477,16 @@ mod tests {
         let (_, other_dk) = other_ephemeral();
 
         // At construction.
+        let signing = signing();
         assert_eq!(
-            ProvisionalRecord::new(Zeroizing::new(ss0()), ek, EphemeralDecapKey::new(other_dk))
-                .unwrap_err(),
+            ProvisionalRecord::new(
+                Zeroizing::new(ss0()),
+                ek,
+                EphemeralDecapKey::new(other_dk),
+                SigningKeyPc::copy_from(signing.secret_key()),
+                Box::new(*signing.public_key()),
+            )
+            .unwrap_err(),
             ProvisionalError::MismatchedEphemeral
         );
 
@@ -1256,12 +1502,95 @@ mod tests {
         plaintext.extend_from_slice(&ss0());
         plaintext.extend_from_slice(other_ek.as_slice());
         plaintext.extend_from_slice(dk.as_slice());
+        plaintext.extend_from_slice(signing.secret_key().as_slice());
+        plaintext.extend_from_slice(signing.public_key().as_slice());
         let sealed = seal_envelope(&key, &seal_aad(&ctx()), &plaintext).unwrap();
 
         assert_eq!(
             ProvisionalRecord::open(&key, &sealed, &ctx()).unwrap_err(),
             ProvisionalError::MismatchedEphemeral,
             "a record whose eph_ek is not eph_dk's own half was accepted"
+        );
+    }
+
+    /// Check 5. The signing pair's own failure, which is the ephemeral's read
+    /// through a different primitive: signing under a mismatched secret half
+    /// succeeds, so the record would resume a conversation whose every frame the
+    /// correspondent discards.
+    #[test]
+    fn a_record_whose_signing_halves_disagree_is_refused() {
+        let (ek, dk) = ephemeral();
+        let signing = signing();
+        let other_signing = other_signing();
+
+        // Positive control on the premise: both keypairs are real, so what the
+        // refusal below catches is the pairing rather than a malformed key.
+        assert!(
+            signing_halves_pair(signing.secret_key(), signing.public_key()).unwrap(),
+            "the fixture's own halves do not pair, so the refusal proves nothing"
+        );
+
+        // At construction.
+        assert_eq!(
+            ProvisionalRecord::new(
+                Zeroizing::new(ss0()),
+                ek,
+                EphemeralDecapKey::new(dk),
+                SigningKeyPc::copy_from(signing.secret_key()),
+                Box::new(*other_signing.public_key()),
+            )
+            .unwrap_err(),
+            ProvisionalError::MismatchedSigningPair
+        );
+
+        // And on the way back in, from a record sealed with the halves crossed.
+        // Every earlier check passes: the length is right, the version is right,
+        // the binding tag is over this record's own `ss0` and `eph_ek`, and the
+        // ephemeral halves pair.
+        let key = key();
+        let (ek, dk) = ephemeral();
+        let mut plaintext = Vec::with_capacity(PROVISIONAL_PLAINTEXT_LEN);
+        plaintext.push(PROVISIONAL_RECORD_VERSION);
+        plaintext.extend_from_slice(&binding_tag(&ss0(), &ek).unwrap());
+        plaintext.extend_from_slice(&ss0());
+        plaintext.extend_from_slice(ek.as_slice());
+        plaintext.extend_from_slice(dk.as_slice());
+        plaintext.extend_from_slice(signing.secret_key().as_slice());
+        plaintext.extend_from_slice(other_signing.public_key().as_slice());
+        assert_eq!(
+            plaintext.len(),
+            PROVISIONAL_PLAINTEXT_LEN,
+            "the hand-built plaintext is not the shape the opener reads"
+        );
+        let sealed = seal_envelope(&key, &seal_aad(&ctx()), &plaintext).unwrap();
+        assert_eq!(
+            ProvisionalRecord::open(&key, &sealed, &ctx()).unwrap_err(),
+            ProvisionalError::MismatchedSigningPair,
+            "a record signing under a key its own verifying half rejects was accepted"
+        );
+    }
+
+    /// **A record written under an earlier field list is refused by size**, and
+    /// says so rather than arriving as the uniform authentication failure.
+    ///
+    /// The length check runs before the AEAD, so the shorter record never
+    /// reaches a parse: without it the fixed-width fields would be read at the
+    /// wrong offsets from whatever bytes happened to be there.
+    #[test]
+    fn a_record_of_an_earlier_size_is_refused_by_size() {
+        let key = key();
+        let sealed = record().seal(&key, &ctx()).expect("seals");
+        let shorter = &sealed[..sealed.len() - ml_dsa::SK_LEN - ml_dsa::PK_LEN];
+        assert_eq!(
+            ProvisionalRecord::open(&key, shorter, &ctx()).unwrap_err(),
+            ProvisionalError::WrongLength {
+                expected: PROVISIONAL_RECORD_LEN,
+                actual: shorter.len(),
+            }
+        );
+        assert!(
+            ProvisionalRecord::open(&key, &sealed, &ctx()).is_ok(),
+            "the whole record must open, or the refusal above proves nothing"
         );
     }
 
@@ -1290,6 +1619,8 @@ mod tests {
         // ...over another channel's ephemeral.
         plaintext.extend_from_slice(b_ek.as_slice());
         plaintext.extend_from_slice(b_dk.as_slice());
+        plaintext.extend_from_slice(signing().secret_key().as_slice());
+        plaintext.extend_from_slice(signing().public_key().as_slice());
         let sealed = seal_envelope(&key, &seal_aad(&ctx()), &plaintext).unwrap();
 
         assert_eq!(
@@ -1314,6 +1645,8 @@ mod tests {
         plaintext.extend_from_slice(&ss0());
         plaintext.extend_from_slice(ek.as_slice());
         plaintext.extend_from_slice(dk.as_slice());
+        plaintext.extend_from_slice(signing().secret_key().as_slice());
+        plaintext.extend_from_slice(signing().public_key().as_slice());
         let sealed = seal_envelope(&key, &seal_aad(&ctx()), &plaintext).unwrap();
 
         assert_eq!(
@@ -1376,6 +1709,8 @@ mod tests {
         plaintext.extend_from_slice(&ss0());
         plaintext.extend_from_slice(ek.as_slice());
         plaintext.extend_from_slice(dk.as_slice());
+        plaintext.extend_from_slice(signing().secret_key().as_slice());
+        plaintext.extend_from_slice(signing().public_key().as_slice());
         let sealed = seal_envelope(&key, &seal_aad(&ctx()), &plaintext).unwrap();
 
         assert_eq!(
