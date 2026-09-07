@@ -681,6 +681,26 @@ types:
       writes to that record. Constructed by OwnerSeed::new from a seed the caller
       derived in daemonseed-core; as_bytes yields the raw seed for
       rendezvous_owner_keypair. Debug is redacted; the type is not zeroize-on-drop.
+  - name: OperatorCredential
+    module: daemonseed_veilid_net::identity
+    kind: struct
+    description: >-
+      What the operator instance holds: the project-release signing keypair and the
+      announce record's owner seed, both derived from one runtime-loaded project seed and
+      both checked against the keys baked into the build before either is handed out.
+      Not Clone; Debug redacted. Held for the session by the instance that writes the
+      announce record; every other instance has none and subscribes on
+      PROJECT_ANNOUNCE_OWNER_PUBKEY alone.
+    security:
+      contains_secret: true
+  - name: OperatorCredentialError
+    module: daemonseed_veilid_net::identity
+    kind: enum
+    description: >-
+      Why an operator credential could not be built — Seed(ProjectReleaseSeedError),
+      Signer(KeyDerivationError), Owner(AnnounceOwnerError), NotTheBakedSigner (the seed
+      derives a signing key that is not the expected one), or NotTheBakedOwner (the seed
+      derives an announce owner key that is not the expected one).
   - name: OwnerPublic
     module: daemonseed_veilid_net::identity
     kind: struct
@@ -1745,6 +1765,80 @@ functions:
         as the record stays open. daemonseed opens a record once per session and holds it
         open, except a DM channel page, which a bounded LRU closes on eviction (#252). Use
         rendezvous_owner_public_bytes where only a record identity is needed.
+  - name: identity::OperatorCredential::load
+    module: daemonseed_veilid_net::identity
+    description: >-
+      Load the seed from the source, checked against the baked project_release_pubkey,
+      then derive the announce owner seed, checked against PROJECT_ANNOUNCE_OWNER_PUBKEY.
+      Ok(None) is an instance given no seed; every other failure is an error.
+    signature: "pub fn load(source: &ProjectReleaseSeedSource) -> Result<Option<(Self, SeedOrigin)>, OperatorCredentialError>"
+    parameters:
+      - name: source
+        type: "&ProjectReleaseSeedSource"
+        direction: in
+        description: The seed variable's value and the profile root's seed file.
+    returns:
+      type: "Result<Option<(OperatorCredential, SeedOrigin)>, OperatorCredentialError>"
+      description: The credential and where its seed came from, or None for an instance given no seed.
+      error_variants:
+        - name: Seed
+          condition: The seed could not be loaded or is not the project-release seed.
+        - name: Signer
+          condition: ML-DSA key derivation failed.
+        - name: Owner
+          condition: The owner-seed derivation failed.
+        - name: NotTheBakedSigner
+          condition: The seed derives a signing key other than the baked one.
+        - name: NotTheBakedOwner
+          condition: The seed derives an announce owner key other than the baked one.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: identity::OperatorCredential::from_seed
+    module: daemonseed_veilid_net::identity
+    description: >-
+      Derive both halves from the seed and check the signing key against expected_signer
+      and the owner key against expected_owner. Both checks run on every path that builds
+      a credential; the expectations are parameters so each check has a positive control
+      in tests, and load passes the baked constants.
+    signature: "pub fn from_seed(seed: &ProjectReleaseSeed, expected_signer: &[u8; IDENTITY_PK_LEN], expected_owner: &[u8; 32]) -> Result<Self, OperatorCredentialError>"
+    parameters:
+      - name: seed
+        type: "&ProjectReleaseSeed"
+        direction: in
+        description: A loaded project-release seed.
+      - name: expected_signer
+        type: "&[u8; IDENTITY_PK_LEN]"
+        direction: in
+        description: The ML-DSA-87 public key the seed must derive.
+      - name: expected_owner
+        type: "&[u8; 32]"
+        direction: in
+        description: The Ed25519 owner public key the seed must derive.
+    returns:
+      type: "Result<OperatorCredential, OperatorCredentialError>"
+      description: The credential.
+    preconditions:
+      - description: The oxicrypt module must be operational.
+
+  - name: identity::OperatorCredential::signer
+    module: daemonseed_veilid_net::identity
+    description: The keypair MOTD and announcements are signed with.
+    signature: "pub fn signer(&self) -> &SignKeypair"
+    parameters: []
+    returns:
+      type: "&SignKeypair"
+      description: The project-release signing keypair.
+
+  - name: identity::OperatorCredential::owner_seed
+    module: daemonseed_veilid_net::identity
+    description: The announce record's owner seed, for the write sites and for subscribing the record as its owner.
+    signature: "pub fn owner_seed(&self) -> &OwnerSeed"
+    parameters: []
+    returns:
+      type: "&OwnerSeed"
+      description: The owner seed.
+
   - name: identity::rendezvous_owner_public_bytes
     module: daemonseed_veilid_net::identity
     description: >-
@@ -1839,8 +1933,9 @@ constants:
       The 32-byte Ed25519 public key owning the project-announce/MOTD DHT record
       (ISC-15). owner_public_key turns it into the VLD0 PublicKey get_dht_record_key
       consumes, which names the record's DHT address. It confers no write capability —
-      the owner secret gates writes. Pinned equal to the runtime derivation by
-      baked_project_announce_owner_pubkey_matches_seed_derivation.
+      the owner secret gates writes. The operator instance checks its runtime-loaded
+      seed's derived owner key against this value (OperatorCredential::load) before
+      holding the credential; project_announce_owner_pubkey_kat pins the value.
   - name: GRACEFUL_CLOSE_BUDGET
     module: daemonseed_veilid_net::actor
     type: Duration

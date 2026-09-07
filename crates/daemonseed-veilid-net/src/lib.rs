@@ -163,7 +163,9 @@ pub use error::{FetchErrorClass, Result, VeilidNetError};
 pub use event::VeilidNetEvent;
 // The rendezvous-owner types travel in the handle's own signatures, so frontends
 // name them without reaching into the module.
-pub use identity::{OwnerPublic, OwnerSeed, RendezvousOwner};
+pub use identity::{
+    OperatorCredential, OperatorCredentialError, OwnerPublic, OwnerSeed, RendezvousOwner,
+};
 pub use rendezvous::SweepOutcome;
 pub use resweep::next_resweep_record;
 pub use route_budget::{

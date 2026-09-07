@@ -160,6 +160,12 @@ pub enum NetCommand {
         /// path — that session persists nothing, so a download simply gets no resume
         /// anchor (fail-closed: a later resume finds no digest and re-downloads fresh).
         profile_root: Option<PathBuf>,
+        /// The value of the project-release seed variable, if the process was
+        /// started with one — taken out of the environment at startup so no child
+        /// the client spawns inherits it, and handed to the actor here, which loads
+        /// the seed (variable first, else the file under `profile_root`) into its
+        /// operator credential. `None` for every instance that is not the operator.
+        project_release_seed: Option<daemonseed_core::public_space::ProjectReleaseSeedText>,
     },
     /// (#66) Update the presented display handle in place after a rename, without a
     /// reconnect. Sets the actor's `my_handle` exactly as a `Connect{display_handle}`
@@ -415,6 +421,11 @@ pub enum NetEvent {
     PublicSpaceSnapshot {
         view: AnnouncementsView,
         can_compose: bool,
+        /// Why this instance is not the operator although it was given a
+        /// project-release seed, if so. Rendered into the status line on every
+        /// snapshot, so a refused seed stays visible for the session; `None`
+        /// clears the line as a snapshot always did.
+        operator_fault: Option<String>,
     },
     /// (#91) A public-space fetch could not complete (not connected, a refused RPC,
     /// or a malformed whitelist). The previous pane content is left unchanged.

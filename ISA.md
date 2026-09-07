@@ -239,6 +239,7 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [x] ISC-A-S24: Anti: an announcement with an absent or non-48-byte `root_commitment` is hard-rejected at ingest with NO legacy / owner-binding-only fallback arm — proto3 has no `required`, so the reject is a code invariant. An empty-commitment announcement carrying a scraped victim `share_id` folds nothing on any ingest path (#156).
 - [x] ISC-A-S25: Anti: no publish path emits a `share_id` that is not `derive_share_id_v2(own_pubkey, root_commitment)`. All publish sites (gui/tui, Veilid) derive; `mint_share_id` is retired from the publish path — a randomly-minted id is rejected by a v2 receiver (availability cliff) and never occupies a victim's id (#156).
 - [x] ISC-A-S26: Anti: no wire field carries `root` cleartext, and the `root_commitment` of a known path is unconfirmable without the identity-scoped secret nonce — the commitment for an identical `root` differs across identities, so a peer cannot confirm a guessed folder path by recomputation (#156).
+- [x] ISC-A-S27: Anti: no byte in the source tree derives the project-release signing key or the announce record's owner key. The operator instance loads the project-release seed at runtime — from `DAEMONSEED_PROJECT_RELEASE_SEED`, else `<profile-root>/project-release.seed`, readable by its owner only — and both derived public keys are checked against the baked `project_release_pubkey()` and `PROJECT_ANNOUNCE_OWNER_PUBKEY` before the credential is held; every other instance holds the two public keys alone. Possession of the seed is the operator capability and there is no second gate (probe: `public_space::tests::load_refuses_a_seed_that_is_not_the_project_seed` and `load_refuses_a_seed_that_does_not_derive_the_expected_key`, `identity::tests::operator_credential_checks_the_owner_key_it_is_given`; a search of the tree for a seed constant finds none).
 - [ ] ISC-A-S16: Public-room content is never wire-cleartext. A posted message rides the Veilid DHT as AES-256-GCM ciphertext (sealed under the global room key, ISC-S22); the plaintext body must never appear in any `CotFrame.payload` on the wire. Public-readability (any party can derive the global key) is NOT plaintext-on-the-wire — the seal is mandatory even though any public-space party can open it.
 - [ ] ISC-A-S17: A public-room message whose embedded provenance signature (ISC-S24) does not verify under its embedded sender pubkey must never be surfaced to the user. Open-post (ISC-S22) does not weaken to open-forge: a recipient drops a forged-provenance message rather than rendering it.
 - [ ] ISC-A-S18: A public-room key must not collide with, or be derivable from, a circle key — the two derivation domains are disjoint (distinct HKDF salt and `info` template), so an identically-named public room and circle phrase yield independent keys. The public tier's public-readability must never bleed into the circle tier's secrecy.
@@ -547,6 +548,20 @@ moment it is hand-maintained in two places, so it lives only where it cannot dri
 
 Decisions in force, with the reasoning that makes each hard to vary. Superseded amendments and the
 route taken to reach a decision are not recorded here — the git history and `CHANGELOG.md` hold those.
+
+- **The project-release seed is not in the source tree, and possession of it is the operator
+  capability.** The operator instance loads the seed at runtime (`ProjectReleaseSeedSource`: the
+  environment variable first, else the owner-only-readable file under the profile root), and
+  `OperatorCredential::load` refuses any seed whose derived signing key or announce owner key is not
+  the one baked into the build, so a seed and a build that do not belong together fail at Connect,
+  on the operator, rather than signing under a key the fleet rejects. The credential is held for the
+  session, as the identity signing key is. There is no second gate: an environment flag beside the
+  cryptographic one is a gate that can disagree with it, and a desktop launch carries no environment
+  to set it in. The compile-time pins that compared each baked key to a derivation from an in-source
+  seed are replaced by that load-time check plus a KAT on each baked value; a rotation is verified
+  by launching the operator build with the new seed and reading its role trace. Rejected: loading
+  the seed per write, which costs a file read and an ML-DSA keygen on every command and lets the
+  composer flip mid-session.
 
 - **A re-establishment leg that opens under the SUPERSEDED root is scanned at the generation the
   open exchange is at, not at the committed one.** A3.5 says retention buys *"the ability to open the
@@ -1053,6 +1068,17 @@ git log; this records only shifts in what "done" means.
 
 Evidence that criteria hold, recorded as current state rather than as history. The mechanized
 authority is `cargo xtask isc-coverage`; this section records what that authority does *not* settle.
+
+**The operator credential's checks have a positive control without the project seed.**
+`ProjectReleaseSeedSource::load_checked` and `OperatorCredential::from_seed` take the expected key as
+a parameter: a test seed loads against its own derived keys and is refused against any other. The
+shipped one-line wrapper that passes the baked signing key is pinned by
+`load_refuses_a_seed_that_is_not_the_project_seed` — an implementation that computed its expectation
+from the seed under test would return `Ok` there. What no test can drive is the line of
+`OperatorCredential::load` that names `PROJECT_ANNOUNCE_OWNER_PUBKEY`: a test seed is refused one
+step earlier, at the signing key. That line is read by eye, and a rotation additionally launches the
+operator build with the new seed and reads its `this instance is the operator` trace before the
+constants are trusted.
 
 **ISC-C44's `ss0` exclusion is guarded in exactly one place, and it is not where the name suggests.**
 `ROOT_LEN` and `SS0_LEN` are both 32, so a caller writing `ss0` where the derived root belongs

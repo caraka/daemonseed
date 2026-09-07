@@ -26,6 +26,20 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-core`: `ProjectReleaseSeed`, `ProjectReleaseSeedText`, `ProjectReleaseSeedSource` and
+  `SeedOrigin` — the operator instance's project-release seed, loaded at runtime from
+  `DAEMONSEED_PROJECT_RELEASE_SEED` (read first) or `<profile-root>/project-release.seed`
+  (owner-readable only on Unix), 64 hex characters, and refused unless it derives the baked
+  `project_release_pubkey()`; `PROJECT_RELEASE_SEED_ENV`, `PROJECT_RELEASE_SEED_FILENAME`,
+  `PROJECT_RELEASE_SEED_LEN`; `ProjectReleaseSeedError`, `SeedHexError`.
+- `daemonseed-veilid-net`: `OperatorCredential` — the signing keypair and announce owner seed an
+  operator instance holds for the session, built from a loaded seed and refused unless the derived
+  keys are `project_release_pubkey()` and `PROJECT_ANNOUNCE_OWNER_PUBKEY`; `OperatorCredentialError`.
+  An example,
+  `project_release_pubkeys`, derives the two public keys a seed bakes (seed on standard input,
+  never printed).
+- `ISC-A-S27`: no byte in the source tree derives the project-release signing key or the announce
+  owner key.
 - `.github/workflows/ci.yml` — the Definition-of-Done gate on every pull request and on `main`,
   one job per gate group.
 - `cargo xtask gate` — runs the Definition-of-Done gate, `--group <preflight|dev-suite|release-suite>`
@@ -688,6 +702,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Removed
 
+- `daemonseed-core`: `PROJECT_RELEASE_SEED`, `dev_project_release_keypair`,
+  `dev_project_announce_veilid_owner_seed` — the seed is no longer in the source tree.
+- `daemonseed-gui`: `DAEMONSEED_OPERATOR` — possession of the project-release seed is the operator
+  capability; there is no second gate. Debug builds are no longer world-writable on the announce
+  record.
 - `daemonseed_veilid_net::dm::spawn_dm_ack_publish`. The DM driver owns when a standalone
   acknowledgement is written, and the helper decided nothing about it; no production caller
   existed. Building and addressing a record remains
@@ -712,6 +731,14 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-gui`: the operator credential is loaded once at Connect and held for the session; a
+  seed that is malformed, readable by others, or not the project-release seed is reported on the
+  announcements pane on every snapshot and at every write, rather than silently demoting the
+  instance to a reader. The composer, the keep-alive and every write read one predicate: whether
+  a credential was loaded. The seed variable's value is taken out of the process environment at
+  startup.
+- `daemonseed-veilid-net`: the two-node operator-record oracle draws a fresh project seed per run and
+  hands node B the derived owner public key as bytes; it no longer writes to the live announce record.
 - The pre-push hook runs `cargo xtask gate --group preflight`.
 - Gate steps carry a group and a child environment; the table runs `preflight`, then `dev-suite`,
   then `release-suite`.

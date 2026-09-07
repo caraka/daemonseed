@@ -26,6 +26,12 @@
 //!   `with_bytes` and not `Clone` (#271). It is the node identity, so a copy of it
 //!   is a copy of the whole process's standing on the network — unlike its two
 //!   siblings above, which root content keys and a slot index.
+//! - **The operator's runtime-loaded seed** — [`crate::public_space::ProjectReleaseSeed`]
+//!   on the `boxed` arm: not derived here at all but parsed from text the operator
+//!   supplies, then checked against the public keys baked into the build. It is the
+//!   one newtype that adds accessors beyond `as_bytes` — the two derivations it
+//!   roots, `signing_keypair` and `announce_owner_seed` — since a caller that holds
+//!   the seed holds both keys already.
 //!
 //! Consolidating the newtype boilerplate and the boxed-seed derivation into one
 //! place means the zeroize-on-drop / redacted-`Debug` / both-path stack-zeroize

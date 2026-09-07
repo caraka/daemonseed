@@ -10,7 +10,13 @@ use std::str::FromStr;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use daemonseed_core::identity::keys::VeilidNodeSeed;
+use daemonseed_core::identity::keys::{
+    KeyDerivationError, SignKeypair, VeilidNodeSeed, IDENTITY_PK_LEN,
+};
+use daemonseed_core::public_space::{
+    project_release_pubkey, AnnounceOwnerError, ProjectReleaseSeed, ProjectReleaseSeedError,
+    ProjectReleaseSeedSource, SeedOrigin,
+};
 use ed25519_dalek::SigningKey;
 use veilid_core::{
     BarePublicKey, KeyPair, PublicKey, PublicKeyGroup, SecretKeyGroup, CRYPTO_KIND_VLD0,
@@ -139,13 +145,155 @@ pub fn owner_public_key(owner_public: &[u8; 32]) -> PublicKey {
 /// key: they descend from one project seed through different derivations, so keeping
 /// them in different crates matches a split the design already enforces.
 ///
-/// Baked rather than derived so that the project seed can leave the source tree
-/// without this value moving with it. Pinned equal to the runtime derivation by
-/// `baked_project_announce_owner_pubkey_matches_seed_derivation`.
+/// Baked rather than derived: the project seed is not in the source tree. The one
+/// instance that holds it — the operator — checks its derived owner key against
+/// this constant when it loads the seed ([`OperatorCredential`]), so a seed and a
+/// constant that do not belong together are refused before the first write rather
+/// than pointing a fleet at a record nobody writes. `project_announce_owner_pubkey_kat`
+/// pins the value.
 pub const PROJECT_ANNOUNCE_OWNER_PUBKEY: [u8; 32] = [
     0x99, 0x0a, 0xd4, 0x3d, 0xc3, 0x74, 0x82, 0x2b, 0xe8, 0xc7, 0xa9, 0xb9, 0x84, 0x55, 0xcc, 0xd5,
     0xc6, 0x85, 0xe3, 0xe7, 0x72, 0x30, 0x39, 0x03, 0x34, 0x98, 0xd0, 0x97, 0xcf, 0x7e, 0xc4, 0xa7,
 ];
+
+// ── What the operator instance holds (F17 / ISC-15) ──────────────────────────
+
+/// The operator instance's credential: the project-release signing keypair and the
+/// announce record's owner seed, both derived from one runtime-loaded project
+/// seed and both checked against the keys baked into this build before either is
+/// handed out.
+///
+/// Held for the session by the instance that writes the announce record, the way
+/// the identity signing key is held; every other instance has no value of this
+/// type and subscribes the record on [`PROJECT_ANNOUNCE_OWNER_PUBKEY`] alone. It is
+/// deliberately not `Clone`, and `Debug` is redacted. The signer zeroes on drop
+/// (`SignKeypair`); the owner seed is the same [`OwnerSeed`] every write site
+/// already copies by value, whose doc records why wiping this copy would bound
+/// nothing.
+pub struct OperatorCredential {
+    signer: SignKeypair,
+    owner_seed: OwnerSeed,
+}
+
+impl fmt::Debug for OperatorCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OperatorCredential(<redacted>)")
+    }
+}
+
+impl OperatorCredential {
+    /// The shipped entry point: load the seed from `source`, checked against the
+    /// baked [`daemonseed_core::public_space::project_release_pubkey`], then derive
+    /// the owner seed, checked against [`PROJECT_ANNOUNCE_OWNER_PUBKEY`].
+    ///
+    /// `Ok(None)` is an instance given no seed — the ordinary reader. Every other
+    /// failure is an error an operator must see. The owner check is what a rotation
+    /// must satisfy: a rotation that restamped one constant and not the other fails
+    /// here, on the operator, at Connect.
+    ///
+    /// The two constants are named in this function and nowhere else on the load
+    /// path; a test can only reach the owner check through [`Self::from_seed`], so
+    /// what a rotation must additionally verify by hand is that the operator build
+    /// launched with the new seed reports itself as the operator.
+    pub fn load(
+        source: &ProjectReleaseSeedSource,
+    ) -> core::result::Result<Option<(Self, SeedOrigin)>, OperatorCredentialError> {
+        let Some((seed, origin)) = source.load().map_err(OperatorCredentialError::Seed)? else {
+            return Ok(None);
+        };
+        let credential = Self::from_seed(
+            &seed,
+            project_release_pubkey(),
+            &PROJECT_ANNOUNCE_OWNER_PUBKEY,
+        )?;
+        Ok(Some((credential, origin)))
+    }
+
+    /// Derive both halves from `seed` and check each against its expectation: the
+    /// signing key against `expected_signer`, the owner key against
+    /// `expected_owner`. Both checks run on every path that builds a credential, so
+    /// a value of this type always holds keys that were checked, whichever way it
+    /// was built.
+    ///
+    /// The expectations are parameters so the checks have a positive control: a test
+    /// seed builds a credential against its own derived keys and is refused against
+    /// any other. [`Self::load`] passes the baked constants. Requires the oxicrypt
+    /// module to be operational.
+    pub fn from_seed(
+        seed: &ProjectReleaseSeed,
+        expected_signer: &[u8; IDENTITY_PK_LEN],
+        expected_owner: &[u8; 32],
+    ) -> core::result::Result<Self, OperatorCredentialError> {
+        let signer = seed
+            .signing_keypair()
+            .map_err(OperatorCredentialError::Signer)?;
+        if signer.public_key() != expected_signer {
+            return Err(OperatorCredentialError::NotTheBakedSigner);
+        }
+        let owner = seed
+            .announce_owner_seed()
+            .map_err(OperatorCredentialError::Owner)?;
+        let owner_seed = OwnerSeed::new(*owner.as_bytes());
+        if &rendezvous_owner_public_bytes(owner_seed.as_bytes()) != expected_owner {
+            return Err(OperatorCredentialError::NotTheBakedOwner);
+        }
+        Ok(Self { signer, owner_seed })
+    }
+
+    /// The keypair MOTD and announcements are signed with.
+    pub fn signer(&self) -> &SignKeypair {
+        &self.signer
+    }
+
+    /// The announce record's owner seed, for the write sites and for subscribing
+    /// the record as its owner.
+    pub fn owner_seed(&self) -> &OwnerSeed {
+        &self.owner_seed
+    }
+}
+
+/// Why an operator credential could not be built.
+#[derive(Debug)]
+pub enum OperatorCredentialError {
+    /// The seed could not be loaded or is not the project-release seed.
+    Seed(ProjectReleaseSeedError),
+    /// The ML-DSA keygen over the seed failed.
+    Signer(KeyDerivationError),
+    /// The owner-seed derivation failed.
+    Owner(AnnounceOwnerError),
+    /// The seed derived a signing key that is not the one this build trusts.
+    NotTheBakedSigner,
+    /// The seed derived an owner key that is not the one baked into this build:
+    /// the seed and the constant do not belong together.
+    NotTheBakedOwner,
+}
+
+impl fmt::Display for OperatorCredentialError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Seed(e) => write!(f, "{e}"),
+            Self::Signer(e) => write!(f, "project-release signing key derivation failed: {e}"),
+            Self::Owner(e) => write!(f, "announce owner key derivation failed: {e}"),
+            Self::NotTheBakedSigner => f.write_str(
+                "the seed derives a project-release signing key that is not the one this build trusts",
+            ),
+            Self::NotTheBakedOwner => f.write_str(
+                "the seed derives an announce owner key that is not the one this build trusts",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OperatorCredentialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Seed(e) => Some(e),
+            Self::Signer(e) => Some(e),
+            Self::Owner(e) => Some(e),
+            Self::NotTheBakedSigner | Self::NotTheBakedOwner => None,
+        }
+    }
+}
 
 // ── How a party holds a rendezvous record's owner (#244) ─────────────────────
 
@@ -399,26 +547,147 @@ pub fn identity_groups(seed: &VeilidNodeSeed) -> Result<(PublicKeyGroup, SecretK
 mod tests {
     use super::*;
 
-    /// ISC-15 pin: the BAKED project-announce owner pubkey is byte-identical to the
-    /// key the project seed's derived owner seed produces.
-    ///
-    /// Every client addresses the announce record from the baked constant alone, and
-    /// no shipped path re-derives it, so this test is the only place the constant and
-    /// the derivation are compared. That makes it the check on a seed rotation: the
-    /// project seed and this constant must move together, and a mis-transcribed or
-    /// half-updated value fails here rather than pointing the whole fleet at a DHT
-    /// record nobody can write to — a failure with no error surface, since an empty
-    /// record and an unwritten one look identical to a reader.
-    #[test]
-    fn baked_project_announce_owner_pubkey_matches_seed_derivation() {
+    /// A fixed test project seed and the owner key it derives — the expectation
+    /// a credential is checked against, built the way a rotation builds the real one.
+    fn test_project_seed() -> (ProjectReleaseSeed, [u8; IDENTITY_PK_LEN], [u8; 32]) {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
-        let owner_seed = daemonseed_core::public_space::dev_project_announce_veilid_owner_seed()
-            .expect("derive the project-announce owner seed");
+        let seed = ProjectReleaseSeed::from_bytes([0x11; 32]);
+        let signer = *seed
+            .signing_keypair()
+            .expect("derive the signer")
+            .public_key();
+        let owner = seed.announce_owner_seed().expect("derive the owner seed");
+        (
+            seed,
+            signer,
+            rendezvous_owner_public_bytes(owner.as_bytes()),
+        )
+    }
+
+    /// The check a rotation must satisfy on both baked keys: the SAME seed that
+    /// builds a credential against its own derived keys is refused against another
+    /// signing key and against another owner key, each named by its own error. A
+    /// rotation that restamped one constant and not the other fails here, on the
+    /// operator, before any write.
+    #[test]
+    fn operator_credential_checks_the_owner_key_it_is_given() {
+        let (seed, signer, owner) = test_project_seed();
+        let credential =
+            OperatorCredential::from_seed(&seed, &signer, &owner).expect("positive control");
         assert_eq!(
-            rendezvous_owner_public_bytes(owner_seed.as_bytes()),
-            PROJECT_ANNOUNCE_OWNER_PUBKEY,
-            "baked project-announce owner pubkey differs from the derived owner key"
+            rendezvous_owner_public_bytes(credential.owner_seed().as_bytes()),
+            owner
         );
+        assert_eq!(credential.signer().public_key(), &signer);
+        let mut other_owner = owner;
+        other_owner[0] ^= 1;
+        assert!(matches!(
+            OperatorCredential::from_seed(&seed, &signer, &other_owner).unwrap_err(),
+            OperatorCredentialError::NotTheBakedOwner
+        ));
+        let mut other_signer = signer;
+        other_signer[0] ^= 1;
+        assert!(matches!(
+            OperatorCredential::from_seed(&seed, &other_signer, &owner).unwrap_err(),
+            OperatorCredentialError::NotTheBakedSigner
+        ));
+        // The baked constants refuse the test seed on both halves, so `load`'s
+        // arguments are not derived from the seed under test.
+        assert!(matches!(
+            OperatorCredential::from_seed(&seed, project_release_pubkey(), &owner).unwrap_err(),
+            OperatorCredentialError::NotTheBakedSigner
+        ));
+        assert!(matches!(
+            OperatorCredential::from_seed(&seed, &signer, &PROJECT_ANNOUNCE_OWNER_PUBKEY)
+                .unwrap_err(),
+            OperatorCredentialError::NotTheBakedOwner
+        ));
+    }
+
+    /// The shipped entry point refuses a seed that is not the project-release seed
+    /// and reports no operator when no seed is supplied. It cannot be driven past
+    /// the signing-key check without the real seed; the owner check is covered
+    /// through `from_seed` above.
+    #[test]
+    fn operator_credential_load_refuses_a_foreign_seed_and_reports_absence() {
+        let (seed, _, _) = test_project_seed();
+        let hex: String = seed.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let source = ProjectReleaseSeedSource::new(
+            Some(daemonseed_core::public_space::ProjectReleaseSeedText::from_os_string(hex.into())),
+            None,
+        );
+        assert!(matches!(
+            OperatorCredential::load(&source).unwrap_err(),
+            OperatorCredentialError::Seed(ProjectReleaseSeedError::NotTheProjectSeed { .. })
+        ));
+        let none = ProjectReleaseSeedSource::new(None, None);
+        assert!(OperatorCredential::load(&none).unwrap().is_none());
+    }
+
+    /// ISC-15 trust-anchor KAT for the transport half: the baked owner key clients
+    /// address the announce record with. Catches a half-done rotation that edited
+    /// the constant to a third value.
+    #[test]
+    fn project_announce_owner_pubkey_kat() {
+        let hex: String = PROJECT_ANNOUNCE_OWNER_PUBKEY
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex, "990ad43dc374822be8c7a9b98455ccd5c685e3e7723039033498d097cf7ec4a7",
+            "the announce owner key (record address) changed unexpectedly"
+        );
+    }
+
+    /// The record the former world-known dev placeholder seed owned is not the
+    /// baked one: the announce record moved off the seed every clone of the old
+    /// tree held.
+    #[test]
+    fn former_dev_owner_seed_record_is_orphaned() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let old =
+            daemonseed_core::public_space::derive_project_announce_veilid_owner_seed(&[0x5d; 32])
+                .unwrap();
+        assert_ne!(
+            rendezvous_owner_public_bytes(old.as_bytes()),
+            PROJECT_ANNOUNCE_OWNER_PUBKEY,
+            "the baked owner key must not be the dev placeholder's record"
+        );
+    }
+
+    /// The baked owner key is disjoint from every world-derivable rendezvous owner
+    /// (the lobby room, its presence sibling, and a circle named like it), so the
+    /// operator channel never shares a record with an open rendezvous.
+    #[test]
+    fn baked_owner_key_is_disjoint_from_world_derivable_owners() {
+        use daemonseed_core::circle::key::{
+            derive_circle_presence_veilid_owner_seed, derive_circle_veilid_owner_seed,
+        };
+        use daemonseed_core::crypto::suite::CNSA_2_0;
+        use daemonseed_core::public_room::{
+            derive_room_presence_veilid_owner_seed, derive_room_veilid_owner_seed,
+        };
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let world: [[u8; 32]; 4] = [
+            *derive_room_veilid_owner_seed("lobby", &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+            *derive_room_presence_veilid_owner_seed("lobby", &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+            *derive_circle_veilid_owner_seed("lobby", &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+            *derive_circle_presence_veilid_owner_seed("lobby", &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+        ];
+        for seed in world {
+            assert_ne!(
+                rendezvous_owner_public_bytes(&seed),
+                PROJECT_ANNOUNCE_OWNER_PUBKEY
+            );
+        }
     }
 
     /// **The two ways to reach a rendezvous owner's public key agree.**

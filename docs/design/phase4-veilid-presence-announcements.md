@@ -149,7 +149,8 @@ the maintainer-held project key (the existing F17 `project_release` anchor, ISC-
 **offline** seed derives both the ML-DSA content-signing key (F17, already present) and a sibling
 Veilid owner keypair (the DHT write-gate); **only the two public keys are baked into clients** — the
 exact F17 model already in code ("the placeholder is replaced by a baked-in real release public key
-whose secret stays offline"; the current `PROJECT_RELEASE_SEED` is a dev placeholder). Clients derive
+whose secret stays offline"; the operator instance loads that seed at runtime and it is not in the
+tree). Clients derive
 the record address from the baked owner pubkey, read/watch/verify, and cannot write. MVP
 "MOTD/announcements" = **maintainers → all users** ("v0.34 shipped, here's what's new") — exactly what
 #88 asked for. The relay-era *per-server operator* MOTD retires with the relay (no host to own it).

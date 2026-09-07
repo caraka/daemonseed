@@ -142,10 +142,11 @@ this.**
   whitelist, ISC-S8 (`ISA.md`): a flat list of ML-DSA-87 public keys or `name#hash`
   handles; "revocation is immediate on the next published whitelist", i.e. enforced by
   readers at verification time.
-- **Write authority** — who may *set a value* on the Veilid record. Today this is the
-  world-derivable `dev_project_announce_veilid_owner_seed`
-  (`crates/daemonseed-core/src/public_space.rs`), computed by every client at connect in
-  `subscribe_operator_space` (`crates/daemonseed-gui/src/veilid_net.rs`).
+- **Write authority** — who may *set a value* on the Veilid record. This is the announce
+  owner seed the operator instance derives from its runtime-loaded project-release seed
+  (`OperatorCredential`, `crates/daemonseed-veilid-net/src/identity.rs`); every other
+  client subscribes on the baked owner public key in `subscribe_operator_space`
+  (`crates/daemonseed-gui/src/veilid_net.rs`) and holds no seed.
 
 **A whitelist cannot stop republication.** A republisher re-emits already-signed operator
 bytes unchanged; the whitelist verifies them and accepts, correctly — they are authentic.
@@ -334,10 +335,11 @@ different reasons; announcements would want the secret-derived variant.
    from this. It also needs recording: the offline-seed design is currently the design of
    record in three places and the maintainer's stated intent differs, so the tree is
    misleading until this is settled and written down.
-2. **Is the `operator_write_enabled()` gate permanent?** Under A it eventually becomes
-   redundant (the crypto enforces it); under B and per-operator records it stays load-bearing
-   or becomes structurally unnecessary respectively. Cheap either way — keep as
-   defence-in-depth, since it stops the *attempt* and not merely the effect.
+2. **Is there an application gate beside the cryptographic one?** Answered: no. The
+   gate is possession of the runtime-loaded project-release seed (`OperatorCredential`),
+   which is the write-gate itself; the former environment flag is gone, because a second
+   gate beside the cryptographic one is a gate that can disagree with it. Under B or
+   per-operator records the same shape holds per channel — a seed per channel.
 3. **Limits on announcements.** What bounds `N`? The margin analysis above says retention
    safety degrades as `N` grows. Candidates: a hard cap, operator-driven tombstones (#191),
    age-based expiry, or paging. Interacts with ordering (#237) — a cap needs an eviction

@@ -1,36 +1,40 @@
 //! Integration test (Phase 4 — announcements/MOTD, A-b): the operator-owned
-//! announce record. A maintainer (node A, holding the project-announce owner seed)
-//! publishes an operator payload to a NAMED current-state slot (`"motd"`, and a
-//! content-addressed announcement item) on the owner-gated rendezvous record; a
-//! client (node B) subscribes to the same record from the baked owner PUBLIC key
-//! alone and reads each slot's bytes back byte-identical. This is the A-b transport
-//! oracle:
-//! it proves the operator record carries opaque payloads to stable, named
-//! last-writer-wins slots.
+//! announce record. A writer (node A, holding a project seed and the announce
+//! owner seed derived from it) publishes an operator payload to a NAMED
+//! current-state slot (`"motd"`, and a content-addressed announcement item) on the
+//! owner-gated rendezvous record; a reader (node B) subscribes to the same record
+//! from the owner PUBLIC key alone and reads each slot's bytes back byte-identical.
+//! This is the A-b transport oracle: it proves the operator record carries opaque
+//! payloads to stable, named last-writer-wins slots, and that a party holding
+//! nothing but the owner's public key reads them.
+//!
+//! The project seed is drawn fresh for each run. The record under test is therefore
+//! a new one, owned by nobody else, and the test needs no secret: node B is handed
+//! the owner public key as 32 bytes, exactly the shape in which a shipped client
+//! holds the baked `PROJECT_ANNOUNCE_OWNER_PUBKEY`. What this does NOT exercise is
+//! the real project identity — that the operator's runtime-loaded seed owns the
+//! baked record is checked at load (`OperatorCredential`), and is observed end to
+//! end by an operator instance and a second client on the live network.
 //!
 //! Layering: veilid-net moves OPAQUE bytes; the payload's content-provenance (the
 //! ML-DSA-87 `SignedArtifact` verified by `daemonseed_core::public_space::verify_artifact`
 //! against the operator whitelist) is a core concern, tested there — the app packs
 //! a `SignedArtifact` into these bytes. The **write-gate** (only a holder of the
 //! owner seed may place an owner-signed subkey) is the Veilid single-owner DFLT
-//! property; it is NOT exercised here, as node B never attempts a write. Node B does
-//! subscribe the way a shipped client does — `RendezvousOwner::PublicOnly` over the
-//! baked `PROJECT_ANNOUNCE_OWNER_PUBKEY`, holding no owner seed — so what this test
-//! proves is that a writerless reader reads the writer's published values.
+//! property; it is NOT exercised here, as node B never attempts a write.
 //!
 //! `#[ignore]` — it attaches to the public Veilid network and takes minutes, so it
 //! is opt-in rather than part of an ordinary test run:
 //!
 //!     cargo test -p daemonseed-veilid-net --test two_node_operator_record -- --ignored --nocapture
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity};
 use daemonseed_core::identity::mnemonic::Mnemonic;
-use daemonseed_core::public_space::dev_project_announce_veilid_owner_seed;
-use daemonseed_veilid_net::identity::PROJECT_ANNOUNCE_OWNER_PUBKEY;
+use daemonseed_core::public_space::derive_project_announce_veilid_owner_seed;
 use daemonseed_veilid_net::{
-    OwnerPublic, RendezvousOwner, VeilidNet, VeilidNetConfig, VeilidNetEvent,
+    OwnerPublic, OwnerSeed, RendezvousOwner, VeilidNet, VeilidNetConfig, VeilidNetEvent,
 };
 
 fn node_config(port: &str, dir: &std::path::Path) -> VeilidNetConfig {
@@ -49,13 +53,15 @@ async fn operator_record_slots_reach_a_second_node() {
     let base = std::env::temp_dir().join("daemonseed-veilid-net-op-record-it");
     let _ = std::fs::remove_dir_all(&base);
 
-    // The operator/announce record's owner seed (A1 write-gate), held by node A only.
-    // Node B addresses the same record from PROJECT_ANNOUNCE_OWNER_PUBKEY, which
-    // `baked_project_announce_owner_pubkey_matches_seed_derivation` pins to this seed's
-    // derived owner key.
-    let owner_seed = *dev_project_announce_veilid_owner_seed()
-        .expect("dev announce owner seed")
+    // A fresh project seed for this run, and the announce owner seed derived from it
+    // the way the operator derives its own. Held by node A only. Node B is handed the
+    // owner's PUBLIC key as bytes and nothing else.
+    let mut project_seed = [0u8; 32];
+    getrandom::fill(&mut project_seed).expect("draw a project seed");
+    let owner_seed = *derive_project_announce_veilid_owner_seed(&project_seed)
+        .expect("derive the announce owner seed")
         .as_bytes();
+    let owner_public = OwnerPublic::of_seed(&OwnerSeed::new(owner_seed));
 
     // Two distinct operator payloads: the MOTD (fixed slot) and one announcement
     // item (content-addressed slot). Opaque to this layer — the app packs a signed
@@ -79,8 +85,9 @@ async fn operator_record_slots_reach_a_second_node() {
     node_a.attach_and_wait(180).await.expect("A ready");
     node_b.attach_and_wait(180).await.expect("B ready");
 
-    // A (maintainer) writes both slots, then keeps re-writing so a created record
-    // becomes network-visible and B's watch fires (DHT propagation is tens of secs).
+    // A (the writer) creates the record on its first write, then keeps re-writing so
+    // the record becomes network-visible and B's watch fires (DHT propagation is
+    // tens of seconds).
     let publisher = {
         let a = node_a.clone();
         let seed = owner_seed;
@@ -96,13 +103,29 @@ async fn operator_record_slots_reach_a_second_node() {
         })
     };
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    node_b
-        .subscribe_room(RendezvousOwner::PublicOnly(OwnerPublic::baked(
-            PROJECT_ANNOUNCE_OWNER_PUBKEY,
-        )))
-        .await
-        .expect("B subscribe to operator record");
+    // B subscribes on the public key alone. A read-only subscribe of a record that
+    // is not yet visible to B is a clean `Ok(false)` with no watch registered, so
+    // the subscribe is retried until the record opens — and that is asserted on its
+    // own, so "the record never became visible" and "the payloads never arrived"
+    // are two different failures.
+    let reader = RendezvousOwner::PublicOnly(owner_public);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut opened = false;
+    while Instant::now() < deadline {
+        opened = node_b
+            .subscribe_room(reader.clone())
+            .await
+            .expect("B subscribe to operator record");
+        if opened {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    assert!(
+        opened,
+        "B must open the operator record from the owner public key alone within the window"
+    );
+    eprintln!("[oracle] B opened the record read-only from the owner public key");
 
     // Oracle: B must read BOTH the MOTD payload and the announcement payload back
     // byte-identical from the operator record within the window.
