@@ -26,7 +26,8 @@ pub use driver::{
 pub use machine::PENDING_REQUEST_CAP;
 pub use seam::{DmDht, DmDhtFuture};
 pub use types::{
-    AcceptFailure, DmCommand, DmEvent, DmIdentity, PkLt, RefusalReason, RequestId, WallClock,
+    AcceptFailure, Correspondent, CorrespondentState, DmCommand, DmEvent, DmIdentity, PkLt,
+    RefusalReason, RequestId, WallClock,
 };
 
 /// Publish this identity's DM key record, off the caller's loop (ISC-C40, #232).

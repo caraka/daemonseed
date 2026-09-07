@@ -26,6 +26,10 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `DmEvent::Roster { correspondents: Vec<Correspondent> }`, emitted once before the DM driver's
+  first tick: every correspondence on disk under `CorrespondentState::Established`, `Pending` or
+  `Blocked`. `DmEvent::BlockListUnreadable` rides alongside it where the block-list record would not
+  read. Both front ends fold it onto `DmCorrespondence::state`; nothing renders it.
 - `crates/daemonseed-veilid-net/tests/two_node_dm_restart.rs` — a two-node network oracle,
   `#[ignore]`: a sender that restarts between its knock and the acceptance composes a frame its
   correspondent opens, and a correspondence whose stores both restarted and then re-established on

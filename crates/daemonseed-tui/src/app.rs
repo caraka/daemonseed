@@ -22,7 +22,9 @@ use daemonseed_core::trust_events::{
     DismissalScope, TrustEventClass, TrustEventKey, TrustEventLog, TrustEventScope, class_of,
 };
 use daemonseed_veilid_net::SweepOutcome;
-use daemonseed_veilid_net::dm::{DmEvent, PENDING_REQUEST_CAP, PkLt, RefusalReason, RequestId};
+use daemonseed_veilid_net::dm::{
+    CorrespondentState, DmEvent, PENDING_REQUEST_CAP, PkLt, RefusalReason, RequestId,
+};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
 
@@ -1089,9 +1091,16 @@ pub struct App {
     dm: DmState,
 }
 
-/// (#339) One correspondence's delivery ledger, as the driver has reported it.
+/// (#339) One correspondence, as the driver has reported it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DmCorrespondence {
+    /// What the driver's startup DM roster said this correspondence is.
+    ///
+    /// `None` until a roster names it, which is every correspondence the driver
+    /// first heard of while running — an entry created by a delivery or a
+    /// teardown carries no state, because nothing has said what state it is in.
+    /// Absence is therefore "not stated", never a fourth state.
+    pub state: Option<CorrespondentState>,
     /// The last state reported per sequence number, newest wins.
     ///
     /// A map rather than a list because `Delivery` is a *replacement*: a seq
@@ -1325,6 +1334,18 @@ impl DmState {
                         }
                         self.requests.push(row);
                     }
+                }
+            }
+            DmEvent::Roster { correspondents } => {
+                for correspondent in correspondents {
+                    // Merged into the map rather than replacing it: a roster is
+                    // a statement about what is on disk, and an entry this
+                    // session made for a correspondence the store has not
+                    // recorded yet is not something the roster contradicts.
+                    self.correspondences
+                        .entry(correspondent.pk_lt.clone())
+                        .or_default()
+                        .state = Some(correspondent.state);
                 }
             }
             DmEvent::Delivery { to, seq, state } => {
@@ -9193,6 +9214,76 @@ mod tests {
             slot,
             entry_hash: [tag; daemonseed_core::dm::pow::ENTRY_HASH_LEN],
         }
+    }
+
+    /// The startup roster reaches `DmState` per correspondent, each carrying
+    /// the state the driver put it in.
+    ///
+    /// The three states are asserted separately rather than by count: a fold
+    /// that recorded the right number of correspondents under one state would
+    /// pass a count and be useless to a surface, which needs to know which
+    /// correspondence it may write to.
+    #[test]
+    fn dm_roster_states_each_correspondent() {
+        use daemonseed_veilid_net::dm::Correspondent;
+        let mut app = App::new();
+        assert!(app.dm_state().correspondences.is_empty());
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Roster {
+            correspondents: vec![
+                Correspondent {
+                    pk_lt: dm_pk(1),
+                    state: CorrespondentState::Established,
+                },
+                Correspondent {
+                    pk_lt: dm_pk(2),
+                    state: CorrespondentState::Pending,
+                },
+                Correspondent {
+                    pk_lt: dm_pk(3),
+                    state: CorrespondentState::Blocked,
+                },
+            ],
+        })));
+
+        let state_of = |tag: u8| {
+            app.dm_state()
+                .correspondences
+                .get(&dm_pk(tag))
+                .expect("the roster left out a correspondent")
+                .state
+        };
+        assert_eq!(state_of(1), Some(CorrespondentState::Established));
+        assert_eq!(state_of(2), Some(CorrespondentState::Pending));
+        assert_eq!(state_of(3), Some(CorrespondentState::Blocked));
+        assert_eq!(
+            app.dm_state().correspondences.len(),
+            3,
+            "the fold invented a correspondence the roster did not name"
+        );
+    }
+
+    /// A correspondence the driver reports on without a roster carries no
+    /// state: absence is "not stated", and a fold that guessed would say a
+    /// blocked correspondent is writable.
+    #[test]
+    fn a_delivery_alone_states_no_correspondent_state() {
+        let mut app = App::new();
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Delivery {
+            to: dm_pk(4),
+            seq: 0,
+            state: DeliveryState::Composed,
+        })));
+
+        assert_eq!(
+            app.dm_state()
+                .correspondences
+                .get(&dm_pk(4))
+                .expect("the delivery folded")
+                .state,
+            None
+        );
     }
 
     /// #339: a `Refused` reaches `DmState` whole — recipient, acceptance and

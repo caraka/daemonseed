@@ -558,7 +558,12 @@ async fn run<D: DmDht>(
     let mut jobs: std::collections::HashMap<tokio::task::Id, PanickedJob> =
         std::collections::HashMap::new();
 
-    if !apply(seed, &dht, &mut inflight, &mut jobs, &evt_tx, &probe).await {
+    // The roster goes out last of the startup effects and before the first
+    // wakeup, so a front end has the store's own list of correspondences before
+    // anything can report a change to one.
+    let mut startup = seed;
+    startup.extend(machine.roster());
+    if !apply(startup, &dht, &mut inflight, &mut jobs, &evt_tx, &probe).await {
         return;
     }
 
@@ -803,10 +808,18 @@ mod tests {
     use crate::actor::{DmPageRecord, DoorbellDispatch, VeilidNetHandle};
     use crate::dm::machine::{duration_as_ms, OpTag};
     use crate::dm::mock::{Method, MockCall, MockDht};
-    use crate::dm::types::RefusalReason;
+    use crate::dm::types::{CorrespondentState, RefusalReason};
     use crate::dm::RequestId;
 
     const IDLE_TICK: Duration = Duration::from_secs(30);
+    /// How long [`take_startup_roster`] waits before calling an absent roster
+    /// an absent roster.
+    ///
+    /// Well past anything the startup path does, and it costs no real time:
+    /// these oracles run on a paused clock, which advances to the next deadline
+    /// only once every task is parked — so this elapses exactly when nothing is
+    /// going to emit anything, which is the case it exists to catch.
+    const STARTUP_ROSTER_TIMEOUT: Duration = Duration::from_secs(5);
     /// The reduced proof-of-work difficulty every oracle here mints and
     /// verifies at.
     const TEST_POW_BITS: u32 = 4;
@@ -941,6 +954,7 @@ mod tests {
         let probe = Arc::new(DmDriverProbe::new());
         let (handle, mut evt_rx, task) =
             DmDriver::spawn_with_probe(parts(&dir, &wall, dht.clone()), probe.clone());
+        take_startup_roster(&mut evt_rx).await;
 
         for _ in 0..3 {
             advance(&wall, IDLE_TICK).await;
@@ -1028,6 +1042,7 @@ mod tests {
         let probe = Arc::new(DmDriverProbe::new());
         let (handle, mut evt_rx, task) =
             DmDriver::spawn_with_probe(parts(&dir, &wall, dht.clone()), probe.clone());
+        take_startup_roster(&mut evt_rx).await;
 
         run_to_a_hundred_seconds(&wall).await;
 
@@ -1171,6 +1186,7 @@ mod tests {
         let probe = Arc::new(DmDriverProbe::new());
         let (handle, mut evt_rx, task) =
             DmDriver::spawn_with_probe(parts(&dir, &wall, dht.clone()), probe.clone());
+        take_startup_roster(&mut evt_rx).await;
 
         run_to_a_hundred_seconds(&wall).await;
 
@@ -1208,6 +1224,7 @@ mod tests {
         let probe = Arc::new(DmDriverProbe::new());
         let (handle, mut evt_rx, task) =
             DmDriver::spawn_with_probe(parts(&dir, &wall, dht.clone()), probe.clone());
+        take_startup_roster(&mut evt_rx).await;
 
         run_to_a_hundred_seconds(&wall).await;
 
@@ -1245,6 +1262,7 @@ mod tests {
         let probe = Arc::new(DmDriverProbe::new());
         let (handle, mut evt_rx, task) =
             DmDriver::spawn_with_probe(parts(&dir, &wall, dht), probe.clone());
+        take_startup_roster(&mut evt_rx).await;
 
         // Four commands ten seconds apart: every one lands strictly inside the
         // thirty-second cadence, so none of them is itself a tick.
@@ -1780,6 +1798,7 @@ mod tests {
         let probe = Arc::new(DmDriverProbe::new());
         let (handle, mut evt_rx, task) =
             DmDriver::spawn_with_probe(parts(&dir, &wall, dht), probe.clone());
+        take_startup_roster(&mut evt_rx).await;
 
         settle().await;
         assert_eq!(
@@ -1814,6 +1833,7 @@ mod tests {
         let probe = Arc::new(DmDriverProbe::new());
         let (handle, mut evt_rx, task) =
             DmDriver::spawn_with_probe(parts(&dir, &wall, dht), probe.clone());
+        take_startup_roster(&mut evt_rx).await;
 
         drop(handle);
 
@@ -1845,6 +1865,7 @@ mod tests {
                 owner_seed: [2u8; 32],
             })],
         );
+        take_startup_roster(&mut evt_rx).await;
 
         // A hundred milliseconds: past the mock's latency, far short of the
         // thirty-second cadence, so a tick here could only be a mis-attribution.
@@ -1899,6 +1920,9 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+        // The seed is applied ahead of the roster, so the roster is what is
+        // left in the channel.
+        take_startup_roster(&mut evt_rx).await;
 
         handle.send(DmCommand::Shutdown).await.expect("shutdown");
         assert!(evt_rx.recv().await.is_none());
@@ -1920,6 +1944,7 @@ mod tests {
         let wall = Arc::new(AtomicI64::new(BASE_MS));
         let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
         let (handle, mut evt_rx) = DmDriver::spawn(parts(&dir, &wall, dht));
+        take_startup_roster(&mut evt_rx).await;
 
         handle.send(DmCommand::Shutdown).await.expect("shutdown");
         assert!(evt_rx.recv().await.is_none(), "the event channel closes");
@@ -2053,6 +2078,38 @@ mod tests {
             out.push(event);
         }
         out
+    }
+
+    /// Take the roster every driver states before its first tick, so a test
+    /// about what it says afterwards is not reading the startup statement.
+    ///
+    /// Awaited rather than drained: the roster is applied before the loop's
+    /// first wakeup, so a test that has not yet advanced its clock still finds
+    /// it. Asserting the shape here rather than skipping whatever arrives keeps
+    /// each of these oracles a control on the roster being emitted at all.
+    ///
+    /// **A leading [`DmEvent::BlockListUnreadable`] is taken with it**, because
+    /// that is the other half of one statement: a roster over a block-list
+    /// record that would not read is emitted behind that alarm, and a helper
+    /// that insisted on the roster arriving first would fail on a store fault
+    /// rather than on the thing under test.
+    ///
+    /// **Bounded, because a `recv` that never returns is the failure this is
+    /// most likely to meet.** A driver that emits no roster at all leaves the
+    /// await parked for ever, and under a paused clock that is indistinguishable
+    /// from a test that is merely slow — so the absence has to be a panic.
+    async fn take_startup_roster(rx: &mut mpsc::Receiver<DmEvent>) {
+        let mut alarm_taken = false;
+        loop {
+            let event = tokio::time::timeout(STARTUP_ROSTER_TIMEOUT, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no roster arrived within {STARTUP_ROSTER_TIMEOUT:?}"));
+            match event {
+                Some(DmEvent::Roster { .. }) => return,
+                Some(DmEvent::BlockListUnreadable) if !alarm_taken => alarm_taken = true,
+                other => panic!("a driver's first word was not its roster: {other:?}"),
+            }
+        }
     }
 
     /// The one contact request in `events`, or a panic naming what was there.
@@ -3834,6 +3891,220 @@ mod tests {
 
         handle_b3.send(DmCommand::Shutdown).await.expect("stop B3");
         task_b3.await.expect("B3 ends");
+    }
+
+    /// T31. A driver states the store's correspondences to the front end
+    /// before it says anything else.
+    ///
+    /// **The seeding is otherwise invisible from outside.** A restarted driver
+    /// recovers every correspondence on disk and then waits — nothing is
+    /// emitted about one until its correspondent writes, which may be never —
+    /// so a client that did not watch the correspondence being made has no list
+    /// at all. This is the entry point for that list, and the machine's own
+    /// roster is only reached through it.
+    #[tokio::test(start_paused = true)]
+    async fn a_driver_states_its_stored_correspondences_before_anything_else() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let dht_b = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let store_a = DmPersist::open(dir_a.path().join("dm"), &AT_REST).expect("persist A");
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_as(own_keys(), dir_a.path(), &wall, dht_a.clone()),
+            probe_a.clone(),
+        );
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(
+            parts_as(peer_keys(), dir_b.path(), &wall, dht_b.clone()),
+            probe_b.clone(),
+        );
+        // B's own first roster, over a store nothing has written: an empty list
+        // is a statement, and without it "no correspondences" and "no roster"
+        // are the same silence.
+        settle().await;
+        assert!(
+            matches!(
+                drain(&mut evt_b).first(),
+                Some(DmEvent::Roster { correspondents }) if correspondents.is_empty()
+            ),
+            "a driver over an empty store said nothing about it"
+        );
+
+        let _ = establish_as_initiator(&handle_a, &probe_a, &wall, &store_a, &b_keys).await;
+        drop(drain(&mut evt_a));
+        cadence(&wall).await;
+        let (request, _, _) = only_request(&drain(&mut evt_b));
+        handle_b
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle_steps(&probe_b, 3).await;
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+
+        // The restart, over the store the acceptance wrote.
+        let (handle_b2, mut evt_b2, task_b2) = DmDriver::spawn_with_probe(
+            parts_as(
+                peer_keys(),
+                dir_b.path(),
+                &wall,
+                Arc::new(MockDht::on(net.clone(), Duration::from_millis(50))),
+            ),
+            Arc::new(DmDriverProbe::new()),
+        );
+        settle().await;
+        let events = drain(&mut evt_b2);
+        let Some(DmEvent::Roster { correspondents }) = events.first() else {
+            panic!("the restarted driver's first word was not its roster: {events:?}");
+        };
+        assert_eq!(
+            correspondents.len(),
+            1,
+            "the roster did not name the stored correspondence: {events:?}"
+        );
+        assert_eq!(
+            correspondents[0].pk_lt.as_slice(),
+            a_keys.signing.public_key().as_slice(),
+            "the roster named an identity this store does not correspond with"
+        );
+        assert_eq!(
+            correspondents[0].state,
+            CorrespondentState::Established,
+            "an accepted correspondence came back as something else"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, DmEvent::Roster { .. }))
+                .count(),
+            1,
+            "the roster was stated more than once, so a reader cannot tell which is the list"
+        );
+
+        handle_b2.send(DmCommand::Shutdown).await.expect("stop B2");
+        task_b2.await.expect("B2 ends");
+    }
+
+    /// T32. A block-list record that will not read stops the driver starting,
+    /// so no roster is stated over one.
+    ///
+    /// **The startup ordering, pinned where it is decided.** Provisioning runs
+    /// on the caller's thread before the task exists and reads the record, so a
+    /// record that will not read is a refusal to start rather than a roster
+    /// with an empty blocked set. `DmMachine::roster` still reports an
+    /// unreadable list, for a read that fails after this check passed; nothing
+    /// on this path reaches it, and this test is what says so.
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_block_list_refuses_the_driver_rather_than_the_roster() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
+
+        // The store's key derivation needs the module, which the identity
+        // helpers would otherwise be the first to start.
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let store = DmPersist::open(dir.path().join("dm"), &AT_REST).expect("persist");
+        store.provision_block_list().expect("provision");
+        let record = store.store().root().join("block-list.bin");
+        assert!(
+            record.exists(),
+            "no block-list record at {}",
+            record.display()
+        );
+        std::fs::write(&record, b"not a block list").expect("the record is wrecked");
+        assert!(
+            store.read_block_list().is_err(),
+            "the fixture's bytes still decode, so nothing below is under test"
+        );
+
+        let started = DmDriver::try_spawn_seeded(
+            parts(&dir, &wall, dht),
+            Arc::new(DmDriverProbe::new()),
+            Vec::new(),
+        );
+        assert!(
+            matches!(started, Err(DmSpawnError::BlockList(_))),
+            "a driver started over a block-list record it cannot read"
+        );
+    }
+
+    /// T33. The seeded effects reach the front end ahead of the roster.
+    ///
+    /// **The ordering `DmMachine::roster` relies on, driven through the seam
+    /// that can produce it.** An unreadable block list makes the roster's
+    /// blocked set empty because it could not be computed, not because nobody
+    /// is blocked, and the alarm arriving first is the only thing separating
+    /// those two readings for a front end. T32 shows the startup check refuses
+    /// that store outright, so the pair is composed here from the seed instead
+    /// of from a wrecked record — the claim under test is the order the shell
+    /// applies effects in, which is the same either way.
+    #[tokio::test(start_paused = true)]
+    async fn a_seeded_event_is_stated_ahead_of_the_roster() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
+
+        let (handle, mut evt_rx, task) = DmDriver::spawn_seeded(
+            parts(&dir, &wall, dht),
+            Arc::new(DmDriverProbe::new()),
+            vec![DmEffect::Emit(DmEvent::BlockListUnreadable)],
+        );
+        settle().await;
+        let events = drain(&mut evt_rx);
+        assert!(
+            matches!(events.first(), Some(DmEvent::BlockListUnreadable)),
+            "the roster was stated ahead of a seeded event: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.get(1),
+                Some(DmEvent::Roster { correspondents }) if correspondents.is_empty()
+            ),
+            "the seeded event was not followed by the roster: {events:?}"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
+    }
+
+    /// The control on [`take_startup_roster`]'s own tolerance of that pair.
+    ///
+    /// Every other oracle here meets a bare roster, so the branch that steps
+    /// over a leading [`DmEvent::BlockListUnreadable`] would otherwise never
+    /// run — and an untaken branch in a helper ten oracles depend on is a
+    /// helper nobody has checked. The alarm is left where the helper consumed
+    /// it: a channel that still held it afterwards would fail the emptiness
+    /// assertion below.
+    #[tokio::test(start_paused = true)]
+    async fn the_startup_take_steps_over_a_leading_alarm() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
+
+        let (handle, mut evt_rx, task) = DmDriver::spawn_seeded(
+            parts(&dir, &wall, dht),
+            Arc::new(DmDriverProbe::new()),
+            vec![DmEffect::Emit(DmEvent::BlockListUnreadable)],
+        );
+        take_startup_roster(&mut evt_rx).await;
+        let left = drain(&mut evt_rx);
+        assert!(
+            left.is_empty(),
+            "the startup statement was not fully consumed: {left:?}"
+        );
+
+        handle.send(DmCommand::Shutdown).await.expect("shutdown");
+        task.await.expect("the driver task ends");
     }
 
     /// T29. A fresh store seeds no collection at all.

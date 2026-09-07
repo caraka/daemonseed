@@ -499,7 +499,8 @@ types:
     module: daemonseed_veilid_net::dm
     kind: enum
     description: >-
-      What the driver tells a frontend — ContactRequest{request,from,body,sent_unix_ms},
+      What the driver tells a frontend — Roster{correspondents},
+      ContactRequest{request,from,body,sent_unix_ms},
       Message{from,seq,body,sent_unix_ms}, Delivery{to,seq,state},
       Refused{to,acceptance,reason,event}, AcceptFailed{request,from,reason},
       ChannelLost{with,cause,event,surfaced}, ReestablishmentAnomaly{with,event},
@@ -507,7 +508,14 @@ types:
       DoorbellHealth{outcome,admission,pending_full},
       ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified,cursor_records_repaired},
       ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
-      BlockListUnreadable, SpentTokensNotPersisted. BlockListUnreadable says the
+      BlockListUnreadable, SpentTokensNotPersisted. Roster is emitted once, before
+      the driver's first tick, and names every correspondence on disk exactly once
+      as a Correspondent{pk_lt, state: CorrespondentState}; a label carrying no
+      contact record is not listed. BlockListUnreadable is emitted ahead of it
+      where the block-list record would not read, and every correspondence is then
+      stated from its own contact record; a record already unreadable at startup
+      fails DmDriver::try_spawn with DmSpawnError::BlockList instead, so that
+      pairing belongs to a read that stops working later. BlockListUnreadable says the
       profile's block-list record would not read on an idle tick, so no
       correspondent's channel was swept and no acknowledgement was fetched;
       emitted at most once per tick, and only on a tick whose correspondence list
@@ -549,6 +557,28 @@ types:
       daemonseed-core type or a String except DoorbellHealth, which carries this
       crate's rendezvous::SweepOutcome and core's AdmissionCounters. Given-up
       delivery is a DeliveryState on Delivery. Debug redacts as DmCommand's does.
+  - name: Correspondent
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: >-
+      One correspondence on DmEvent::Roster: pk_lt (PkLt — the correspondent's
+      long-term identity key) and state (CorrespondentState). Debug redacts
+      pk_lt and prints the state.
+  - name: CorrespondentState
+    module: daemonseed_veilid_net::dm
+    kind: enum
+    description: >-
+      What a stored correspondence is, as far as this side is concerned, and
+      every correspondence on disk is in exactly one of them. Established: the
+      contact record names the correspondent's pseudonym key. A send on one
+      established before this process began is still refused with
+      NotEstablishedThisSession until re-establishment mints a ratchet. Pending:
+      the contact record names no pseudonym key, so a first contact was sent and
+      no acceptance has verified; nothing but the acceptance can be opened.
+      Blocked: the correspondent is on the block list, reported ahead of the
+      other two whatever the contact record holds, because the block is what
+      decides whether either plane carries anything.
+    variants: [Established, Pending, Blocked]
   - name: RefusalReason
     module: daemonseed_veilid_net::dm
     kind: enum

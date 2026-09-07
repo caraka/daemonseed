@@ -75,7 +75,8 @@ use daemonseed_core::trust_events::TrustEventKey;
 use crate::actor::{DmPageRecord, DmPageSweep, DoorbellDispatch, DoorbellSweep};
 use crate::dm::driver::{DmDriverConfig, SpentTokenStore};
 use crate::dm::types::{
-    AcceptFailure, DmCommand, DmEvent, DmIdentity, PkLt, RefusalReason, RequestId,
+    AcceptFailure, Correspondent, CorrespondentState, DmCommand, DmEvent, DmIdentity, PkLt,
+    RefusalReason, RequestId,
 };
 
 /// How many verified knocks may be held awaiting an answer.
@@ -2043,6 +2044,57 @@ impl DmMachine {
     /// would pass whether or not the machine ever stored anything.
     pub(crate) fn last_tick_ms(&self) -> Option<i64> {
         self.last_tick_ms
+    }
+
+    /// Every correspondence this machine holds, with the state its records put
+    /// it in, plus whatever reading the block list owed.
+    ///
+    /// **Effects rather than a value, because the block-list read can fail and
+    /// the failure has to be said.** An unreadable record leaves every
+    /// correspondence stated from its own contact record alone, which is a
+    /// roster that cannot distinguish a blocked correspondent from an ordinary
+    /// one — so [`DmEvent::BlockListUnreadable`] rides out ahead of the roster
+    /// and a reader that sees it knows the blocked set is not a claim. The
+    /// alternative, refusing to emit a roster at all, would leave a front end
+    /// with no list on exactly the profile whose store is in trouble.
+    ///
+    /// **A record already unreadable when the driver starts does not reach
+    /// here**: provisioning reads it first and refuses to start over one, as
+    /// [`DmSpawnError::BlockList`](crate::dm::DmSpawnError::BlockList). The
+    /// failure this reports is a read that stops working after that check
+    /// passed.
+    ///
+    /// Called once, by the shell, on the machine as construction left it: a
+    /// constructor returns state and not effects, so this is where seeding from
+    /// the store becomes something a front end can see.
+    pub(crate) fn roster(&self) -> Vec<DmEffect> {
+        let mut out = Vec::new();
+        let block_list = match self.persist.read_block_list() {
+            Ok(list) => Some(list),
+            Err(e) => {
+                crate::vtrace!("dm driver: the block list will not read at load: {e}");
+                out.push(DmEffect::Emit(DmEvent::BlockListUnreadable));
+                None
+            }
+        };
+        let correspondents = self
+            .correspondences
+            .iter()
+            .map(|c| Correspondent {
+                pk_lt: c.pk_lt.clone(),
+                state: match &block_list {
+                    Some(list) if list.is_blocked(&c.pk_lt) => CorrespondentState::Blocked,
+                    // The pseudonym is what an acceptance writes down, so a
+                    // record holding one is a correspondence that was
+                    // established and a record holding none is one whose first
+                    // contact has not been answered.
+                    _ if c.peer_pk_pc.is_some() => CorrespondentState::Established,
+                    _ => CorrespondentState::Pending,
+                },
+            })
+            .collect();
+        out.push(DmEffect::Emit(DmEvent::Roster { correspondents }));
+        out
     }
 
     /// The sequence number the next channel send would take, when this session
@@ -10033,6 +10085,201 @@ mod tests {
             path.display()
         );
         path
+    }
+
+    /// The states the one roster in `effects` reported, keyed by identity.
+    fn roster_states(effects: &[DmEffect]) -> Vec<(Vec<u8>, CorrespondentState)> {
+        let mut rosters = effects.iter().filter_map(|e| match e {
+            DmEffect::Emit(DmEvent::Roster { correspondents }) => Some(correspondents),
+            _ => None,
+        });
+        let correspondents = rosters.next().expect("no roster was emitted");
+        assert!(
+            rosters.next().is_none(),
+            "more than one roster was emitted, so a reader cannot tell which is the list"
+        );
+        correspondents
+            .iter()
+            .map(|c| (c.pk_lt.to_vec(), c.state))
+            .collect()
+    }
+
+    /// A fourth correspondent, distinct from [`keys`], [`peer_identity`],
+    /// [`other_peer_identity`] and [`third_identity`].
+    fn fourth_identity() -> IdentityKeys {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        derive_identity_keys(
+            &Mnemonic::from_phrase(TEST_MNEMONIC).expect("mnemonic"),
+            Identity::Device {
+                uuid: uuid::Uuid::from_bytes([0x5Du8; 16]),
+            },
+        )
+        .expect("fourth identity")
+    }
+
+    /// A store holding four correspondences, and the identity keys they are
+    /// under, in established / pending / blocked-over-pending /
+    /// blocked-over-established order.
+    ///
+    /// **Two blocked entries, because one of them tests nothing about the
+    /// ordering.** A blocked correspondence whose record holds no pseudonym is
+    /// pending-shaped, so reporting it blocked is satisfied by a roster that
+    /// consulted the block list at all. The claim is that a block outranks
+    /// whatever the record says, and only an entry that would otherwise be
+    /// established can fail it.
+    ///
+    /// Written through the machine rather than into the records, so each state
+    /// is the one production leaves behind: a knock writes the pending record,
+    /// an acceptance's pseudonym is what turns it into an established one, and
+    /// a block is the command a user gives.
+    fn store_with_one_of_each_state(dir: &tempfile::TempDir) -> [Vec<u8>; 4] {
+        let established = peer_identity();
+        let pending = other_peer_identity();
+        let blocked_pending = third_identity();
+        let blocked_established = fourth_identity();
+
+        let mut a = machine(dir);
+        a.persist.provision_block_list().expect("provision");
+
+        // The pseudonym an acceptance would have written down.
+        let establish = |m: &mut DmMachine, peer: &IdentityKeys, tag: u8| {
+            knock_as_initiator(m, peer);
+            let label = m
+                .persist
+                .correspondence_for_pk_lt(peer.signing.public_key())
+                .expect("lookup")
+                .expect("the knock recorded no correspondence");
+            m.persist
+                .record_correspondent_pseudonym(
+                    &label,
+                    Box::new(*test_pseudonym(tag).public_key()),
+                    BASE_MS,
+                )
+                .expect("the acceptance's pseudonym is recorded");
+        };
+        establish(&mut a, &established, 0x51);
+        knock_as_initiator(&mut a, &pending);
+        knock_as_initiator(&mut a, &blocked_pending);
+        establish(&mut a, &blocked_established, 0x52);
+
+        for peer in [&blocked_pending, &blocked_established] {
+            a.on_command(
+                BASE_MS,
+                DmCommand::Block {
+                    pk_lt: Box::new(*peer.signing.public_key()),
+                },
+            );
+            assert!(
+                stored_block_list(&a).is_blocked(peer.signing.public_key()),
+                "the fixture did not block an identity it meant to"
+            );
+        }
+        // The block does not erase what the record holds, which is what makes
+        // the last entry a test of the ordering rather than of the record.
+        assert!(
+            a.persist
+                .read_contact(
+                    &a.persist
+                        .correspondence_for_pk_lt(blocked_established.signing.public_key())
+                        .expect("lookup")
+                        .expect("a correspondence")
+                )
+                .expect("reads")
+                .expect("a record")
+                .pk_pc()
+                .is_some(),
+            "the blocked correspondence lost its pseudonym, so it is no longer \
+             established and the ordering is untested"
+        );
+
+        [
+            established.signing.public_key().to_vec(),
+            pending.signing.public_key().to_vec(),
+            blocked_pending.signing.public_key().to_vec(),
+            blocked_established.signing.public_key().to_vec(),
+        ]
+    }
+
+    /// The startup roster names every stored correspondence once and puts each
+    /// in the state its records and the block list put it in.
+    ///
+    /// **Driven over a store a previous machine wrote, because that is the only
+    /// state the roster exists for.** A machine that established the
+    /// correspondences itself holds them in memory whatever the records say, so
+    /// a roster read out of one would pass with the seed doing none of the work.
+    #[test]
+    fn the_startup_roster_states_each_stored_correspondence_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let [established, pending, blocked_pending, blocked_established] =
+            store_with_one_of_each_state(&dir);
+
+        let states = roster_states(&machine(&dir).roster());
+
+        assert_eq!(
+            states.len(),
+            4,
+            "the roster did not name every stored correspondence: {states:?}"
+        );
+        let state_of = |pk: &[u8]| {
+            states
+                .iter()
+                .find(|(key, _)| key == pk)
+                .map(|(_, state)| *state)
+                .expect("the roster left out a stored correspondence")
+        };
+        assert_eq!(state_of(&established), CorrespondentState::Established);
+        assert_eq!(state_of(&pending), CorrespondentState::Pending);
+        assert_eq!(state_of(&blocked_pending), CorrespondentState::Blocked);
+        // The block outranks the record: this one's contact record names a
+        // pseudonym, so a roster that read the record first would call it
+        // established.
+        assert_eq!(
+            state_of(&blocked_established),
+            CorrespondentState::Blocked,
+            "a blocked correspondence was reported by its record instead"
+        );
+    }
+
+    /// An unreadable block list is said out loud beside the roster, so an empty
+    /// blocked set is never read as "nobody is blocked".
+    #[test]
+    fn a_roster_over_an_unreadable_block_list_reports_the_record() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let [_, _, blocked_pending, blocked_established] = store_with_one_of_each_state(&dir);
+
+        let m = machine(&dir);
+        std::fs::write(block_list_record(&m), b"not a block list").expect("the record is wrecked");
+        let effects = m.roster();
+
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::BlockListUnreadable))),
+            "the unreadable record was not reported: {effects:?}"
+        );
+        let states = roster_states(&effects);
+        assert_eq!(
+            states.len(),
+            4,
+            "the unreadable record cost the roster its correspondences: {states:?}"
+        );
+        assert!(
+            !states
+                .iter()
+                .any(|(_, state)| *state == CorrespondentState::Blocked),
+            "a block was claimed from a record that would not read: {states:?}"
+        );
+        // Both blocked identities are still listed, each by its own record —
+        // the alarm is what says the blocked set could not be computed, and
+        // dropping the rows would lose the correspondences with it.
+        assert_eq!(
+            states
+                .iter()
+                .filter(|(key, _)| key == &blocked_pending || key == &blocked_established)
+                .count(),
+            2,
+            "a correspondence whose identity is blocked was dropped: {states:?}"
+        );
     }
 
     /// The pages a batch of effects asked to sweep, in emission order.

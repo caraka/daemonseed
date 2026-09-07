@@ -99,6 +99,36 @@ pub enum DmCommand {
 ///
 /// Its [`Debug`] redacts the same way [`DmCommand`]'s does.
 pub enum DmEvent {
+    /// Every correspondence on disk, stated once, before the driver's first
+    /// tick.
+    ///
+    /// **The only statement a front end gets about a correspondence made
+    /// before this process started.** Every other event here reports something
+    /// that happened while the driver was running, so a correspondence
+    /// established last week is invisible until its correspondent writes
+    /// something — which may be never. This is the list that makes it visible
+    /// anyway.
+    ///
+    /// One entry per correspondence, and a correspondence appears at most once:
+    /// the store holds one label per identity, and [`CorrespondentState`] is
+    /// the whole of what separates them. A label carrying no contact record is
+    /// not listed — it names a handshake that was never established, and
+    /// nothing about it could be shown.
+    ///
+    /// **A blocked correspondent is reported blocked whatever else its records
+    /// hold**, because that is what the channel plane does with it: the block
+    /// is read first and the record's own state is not consulted. Where the
+    /// block-list record would not read, [`Self::BlockListUnreadable`] is
+    /// emitted ahead of this event and every correspondence is stated from its
+    /// own records alone — so an empty blocked set is a claim only when that
+    /// event is absent. A record that will not read when the driver starts
+    /// stops it starting instead, so that pairing belongs to a read that stops
+    /// working later.
+    Roster {
+        /// Each correspondence and the state its records put it in, in the
+        /// store's own enumeration order.
+        correspondents: Vec<Correspondent>,
+    },
     /// A verified knock awaiting accept / decline.
     ContactRequest {
         /// The request to answer.
@@ -462,6 +492,56 @@ pub enum DmEvent {
     SpentTokensNotPersisted,
 }
 
+/// One correspondence on [`DmEvent::Roster`], and the state it is in.
+///
+/// Its [`Debug`] redacts `pk_lt` the way every other identity key on this
+/// boundary is redacted: the key is 2592 bytes and names a person.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Correspondent {
+    /// The correspondent's long-term identity key.
+    pub pk_lt: PkLt,
+    /// The state the stored records and the block list put it in.
+    pub state: CorrespondentState,
+}
+
+impl core::fmt::Debug for Correspondent {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // The state names a kind of correspondence, never a correspondent, so
+        // it is printable where the identity is not.
+        f.write_str("Correspondent { pk_lt: ")?;
+        redacted_pk(f)?;
+        write!(f, ", state: {:?} }}", self.state)
+    }
+}
+
+/// What a stored correspondence is, as far as this side is concerned.
+///
+/// Three states, and every correspondence on disk is in exactly one of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CorrespondentState {
+    /// The contact record names the correspondent's pseudonym key, so the
+    /// correspondence was established and its channel is the ordinary one.
+    ///
+    /// It does not follow that a message can be sent right now. A ratchet has
+    /// no at-rest record, so a correspondence established before this process
+    /// began is refused with [`RefusalReason::NotEstablishedThisSession`] until
+    /// re-establishment mints one.
+    Established,
+    /// The contact record names no pseudonym key: a first contact was sent and
+    /// no acceptance has verified.
+    ///
+    /// Nothing can be sent on it and nothing but the acceptance can be opened.
+    Pending,
+    /// The correspondent is on the block list, so neither plane carries
+    /// anything either way.
+    ///
+    /// Reported ahead of the two above rather than beside them, because the
+    /// block is what decides the outcome: a blocked correspondence's channel is
+    /// not swept and its knock is not admitted, whichever of the two its
+    /// records would otherwise say.
+    Blocked,
+}
+
 /// Where a first contact stopped.
 ///
 /// [`Acceptance`] says how far the write got; this says why it went no
@@ -604,6 +684,21 @@ impl core::fmt::Debug for DmCommand {
 impl core::fmt::Debug for DmEvent {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            DmEvent::Roster { correspondents } => {
+                // Counts, not rows: a full list would print every
+                // correspondent's identity key, and how many are in each state
+                // is what a trace line is read for.
+                let count = |want: CorrespondentState| {
+                    correspondents.iter().filter(|c| c.state == want).count()
+                };
+                write!(
+                    f,
+                    "Roster {{ established: {}, pending: {}, blocked: {} }}",
+                    count(CorrespondentState::Established),
+                    count(CorrespondentState::Pending),
+                    count(CorrespondentState::Blocked)
+                )
+            }
             DmEvent::ContactRequest {
                 request,
                 body,

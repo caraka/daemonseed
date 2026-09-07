@@ -371,13 +371,13 @@ public_types:
     variants: [Idle, "Indexing { seen, total }", "Ready { entries }"]
   - name: daemonseed_tui::app::DmState
     kind: struct
-    description: "(#339) The DM state one session has accumulated from daemonseed_veilid_net::dm::DmEvent, folded by App::on_net_event from NetEvent::Dm: requests (Vec<DmContactRequest> — pending contact requests keyed by RequestId; a re-surfaced request replaces its row), correspondences (BTreeMap<PkLt, DmCorrespondence> — per-correspondent deliveries: BTreeMap<u64, DeliveryState> plus undelivered: Vec<u64> from a loud teardown), last_refusal (Option<DmRefusal> — to, acceptance, reason), last_doorbell_health (Option<DmDoorbellHealth> — outcome, admission, pending_full), last_channel_health (Option<DmChannelHealth> — the seven per-correspondence channel counters). RAM-only; the driver's DmPersist store is the durable half. Nothing is rendered from it."
+    description: "(#339) The DM state one session has accumulated from daemonseed_veilid_net::dm::DmEvent, folded by App::on_net_event from NetEvent::Dm: requests (Vec<DmContactRequest> — pending contact requests keyed by RequestId; a re-surfaced request replaces its row), correspondences (BTreeMap<PkLt, DmCorrespondence> — per-correspondent state: Option<CorrespondentState> from the driver's startup DM roster, deliveries: BTreeMap<u64, DeliveryState> and undelivered: Vec<u64> from a loud teardown), last_refusal (Option<DmRefusal> — to, acceptance, reason), last_doorbell_health (Option<DmDoorbellHealth> — outcome, admission, pending_full), last_channel_health (Option<DmChannelHealth> — the seven per-correspondence channel counters). RAM-only; the driver's DmPersist store is the durable half. Nothing is rendered from it."
   - name: daemonseed_tui::app::DmContactRequest
     kind: struct
     description: "(#339) A pending contact request as the user would answer it: request (RequestId — the doorbell slot plus the entry hash), from (PkLt), body, sent_unix_ms."
   - name: daemonseed_tui::app::DmCorrespondence
     kind: struct
-    description: "(#339) One correspondence's delivery ledger: deliveries (BTreeMap<u64, DeliveryState>, newest state per sequence number) and undelivered (Vec<u64>, sequence numbers a loud teardown surfaced)."
+    description: "(#339) One correspondence as the driver has reported it: state (Option<daemonseed_veilid_net::dm::CorrespondentState>, what the startup DM roster said this correspondence is; None until a roster names it), deliveries (BTreeMap<u64, DeliveryState>, newest state per sequence number) and undelivered (Vec<u64>, sequence numbers a loud teardown surfaced)."
   - name: daemonseed_tui::app::DmRefusal
     kind: struct
     description: "(#339) The last refusal, held whole: to (PkLt), acceptance (Acceptance — how far the send got), reason (RefusalReason — where it stopped)."
