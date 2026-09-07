@@ -82,7 +82,7 @@ use daemonseed_core::public_room::{
     seal_room_message,
 };
 use daemonseed_core::public_space::{
-    ProjectReleaseSeedSource, ProjectReleaseSeedText, Whitelist, content_address,
+    ProjectAnnounceSeedSource, ProjectAnnounceSeedText, Whitelist, content_address,
     first_operator_keepalive_interval, next_operator_keepalive_interval,
     random_announce_slot_cursor,
 };
@@ -395,7 +395,7 @@ struct OwnShare {
 /// The subscribed operator announce/MOTD record (Phase 4 A-c): the write-gate owner
 /// seed (dev-only — the in-source project seed) plus the accumulated, verified
 /// operator content. A0: ONE project-owned channel; the composer signs with the F17
-/// project-release key, so an empty [`Whitelist`] authorizes it and NO signer
+/// project-announce key, so an empty [`Whitelist`] authorizes it and NO signer
 /// whitelist distribution is needed. `motd` holds the current verified MOTD;
 /// `posts` maps a content-address hex slot → its verified announcement (dedup +
 /// stable order).
@@ -529,7 +529,7 @@ impl ShareState {
         }
     }
 
-    /// Whether this instance writes the announce record: it holds the project-release
+    /// Whether this instance writes the announce record: it holds the project-announce
     /// seed. This is the one predicate behind the composer, the keep-alive and every
     /// operator write, so the pane, the writes and the trace cannot disagree about
     /// the role.
@@ -1661,7 +1661,7 @@ async fn handle_command(
             stable_kem_encapsulation_key,
             dm_session_keys,
             profile_root,
-            project_release_seed,
+            project_announce_seed,
             ..
         } => {
             if let Some(h) = display_handle {
@@ -1671,10 +1671,10 @@ async fn handle_command(
             // verified resume anchors each fetch's manifest digest in the client's
             // own trusted state (a `ManifestDigestStore` under this dir).
             shares.profile_root = profile_root;
-            // The operator role, from the project-release seed if this instance was
+            // The operator role, from the project-announce seed if this instance was
             // given one. Loaded once per Connect and held for the session; a seed
             // added later is picked up by the next Connect.
-            load_operator_role(shares, evt_tx, project_release_seed);
+            load_operator_role(shares, evt_tx, project_announce_seed);
             // Capture the stable identity key (least-authority: kept behind an Arc
             // for sealing announcements + minting the route-advert capability; the
             // raw key never enters veilid-net).
@@ -2586,7 +2586,7 @@ fn announce_subscribe_owner(write_owner_seed: Option<[u8; 32]>) -> RendezvousOwn
 }
 
 /// What this instance is with respect to the announce record, decided once per
-/// Connect from the project-release seed it was or was not given.
+/// Connect from the project-announce seed it was or was not given.
 ///
 /// The two seedless cases are separate and must not be collapsed into one "not the
 /// operator". [`Self::Reader`] is an instance behaving exactly as intended;
@@ -2596,7 +2596,7 @@ fn announce_subscribe_owner(write_owner_seed: Option<[u8; 32]>) -> RendezvousOwn
 enum OperatorRole {
     /// Given no seed: reads the announce record and never writes it.
     Reader,
-    /// Holds the project-release credential: writes the record, and signs.
+    /// Holds the project-announce credential: writes the record, and signs.
     Operator(OperatorCredential),
     /// Given a seed that was refused, with the reason as the pane and the write
     /// sites report it.
@@ -2614,29 +2614,29 @@ enum OperatorRole {
 fn load_operator_role(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
-    seed_text: Option<ProjectReleaseSeedText>,
+    seed_text: Option<ProjectAnnounceSeedText>,
 ) {
-    let source = ProjectReleaseSeedSource::new(seed_text, shares.profile_root.as_deref());
+    let source = ProjectAnnounceSeedSource::new(seed_text, shares.profile_root.as_deref());
     shares.operator_role = match OperatorCredential::load(&source) {
         Ok(Some((credential, origin))) => {
             daemonseed_veilid_net::vtrace!(
-                "gui operator: project-release seed loaded from {origin}; \
+                "gui operator: project-announce seed loaded from {origin}; \
                  this instance is the operator"
             );
             OperatorRole::Operator(credential)
         }
         Ok(None) => {
             daemonseed_veilid_net::vtrace!(
-                "gui operator: no project-release seed; this instance reads the \
+                "gui operator: no project-announce seed; this instance reads the \
                  announce record and never writes it"
             );
             OperatorRole::Reader
         }
         Err(e) => {
             let reason = e.to_string();
-            daemonseed_veilid_net::vtrace!("gui operator: project-release seed refused: {reason}");
+            daemonseed_veilid_net::vtrace!("gui operator: project-announce seed refused: {reason}");
             let _ = evt_tx.send(NetEvent::PublicSpaceError {
-                message: format!("project-release seed refused: {reason}"),
+                message: format!("project-announce seed refused: {reason}"),
             });
             OperatorRole::Refused(reason)
         }
@@ -2666,7 +2666,7 @@ fn announce_write_owner_seed(shares: &ShareState) -> Option<[u8; 32]> {
 /// on every stored post on every inbound item — O(N²) post-quantum work on the event
 /// path during a backlog sweep (review finding). `can_compose` is passed in rather than
 /// read here — production callers hand it [`ShareState::is_operator`], whether this
-/// instance holds the project-release seed. Reading an ambient gate inside this
+/// instance holds the project-announce seed. Reading an ambient gate inside this
 /// projection once made the emitted `can_compose` a function of the *build profile*,
 /// so a test asserting on it passed in debug and failed in release (#274); as a
 /// parameter, the pane's read-only vs composable projection is testable in both profiles.
@@ -2738,7 +2738,7 @@ fn public_space_snapshot_event(
     let posts = rows.into_iter().map(|(_, row)| row).collect();
     NetEvent::PublicSpaceSnapshot {
         view: AnnouncementsView { motd, posts },
-        // The composer shows only on the instance that holds the project-release
+        // The composer shows only on the instance that holds the project-announce
         // seed; every other client gets a read-only pane.
         can_compose,
         operator_fault,
@@ -2782,7 +2782,7 @@ async fn refresh_public_space(
     }
 }
 
-/// (#92 / A-c) Sign a MOTD with the F17 project-release key ([`sign_motd`] enforces the
+/// (#92 / A-c) Sign a MOTD with the F17 project-announce key ([`sign_motd`] enforces the
 /// ISC-S9 single-line-plaintext rule BEFORE signing), publish it to the operator
 /// record's fixed `"motd"` slot, then fold it in locally + refresh. Guards mirror the
 /// relay path (not connected → a clean [`NetEvent::PublicSpaceError`], nothing
@@ -2810,12 +2810,12 @@ async fn set_motd(
         OperatorRole::Operator(credential) => credential,
         OperatorRole::Reader => {
             return err(
-                "the MOTD is read-only: this instance holds no project-release seed".to_owned(),
+                "the MOTD is read-only: this instance holds no project-announce seed".to_owned(),
             );
         }
         OperatorRole::Refused(reason) => {
             return err(format!(
-                "the MOTD is read-only: the project-release seed was refused: {reason}"
+                "the MOTD is read-only: the project-announce seed was refused: {reason}"
             ));
         }
     };
@@ -2849,7 +2849,7 @@ async fn set_motd(
     }
 }
 
-/// (#92 / A-c) Sign an announcement post with the F17 project-release key, publish it
+/// (#92 / A-c) Sign an announcement post with the F17 project-announce key, publish it
 /// to the operator record at its content-address slot, then fold it in locally +
 /// refresh. Same guards + F17 signing rationale as [`set_motd`].
 async fn upload_announcement(
@@ -2870,13 +2870,13 @@ async fn upload_announcement(
         OperatorRole::Operator(credential) => credential,
         OperatorRole::Reader => {
             return err(
-                "announcements are read-only: this instance holds no project-release seed"
+                "announcements are read-only: this instance holds no project-announce seed"
                     .to_owned(),
             );
         }
         OperatorRole::Refused(reason) => {
             return err(format!(
-                "announcements are read-only: the project-release seed was refused: {reason}"
+                "announcements are read-only: the project-announce seed was refused: {reason}"
             ));
         }
     };
@@ -2996,7 +2996,7 @@ fn next_operator_keepalive_item(
 /// Returns `false` when they are not an operator item, or fail to decode/verify
 /// (dropped; the caller logs them as unrecognized).
 ///
-/// A0 verification: an empty [`Whitelist`] authorizes the F17 project-release key the
+/// A0 verification: an empty [`Whitelist`] authorizes the F17 project-announce key the
 /// item is signed with, so no signer-whitelist distribution is needed. A MOTD uses
 /// [`verify_served_motd`]; an announcement uses [`verify_served_post`] (signature AND
 /// content-address). This runs AFTER the circle / lobby-chat / presence / discovery
@@ -3007,7 +3007,7 @@ fn apply_operator_item(
     evt_tx: &UnboundedSender<NetEvent>,
     bytes: &[u8],
     // The signers whose items fold. Production passes `Whitelist::default()`, which
-    // authorizes the project-release key and nothing else (A0); a test passes a
+    // authorizes the project-announce key and nothing else (A0); a test passes a
     // whitelist naming its own signer, since no test holds the project seed.
     whitelist: &Whitelist,
     // The write role, carried only so the snapshot this fold emits can report
@@ -4911,15 +4911,15 @@ mod tests {
     use super::*;
     use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
     use daemonseed_core::identity::mnemonic::Mnemonic;
-    use daemonseed_core::public_space::ProjectReleaseSeed;
+    use daemonseed_core::public_space::ProjectAnnounceSeed;
     use daemonseed_veilid_net::dm::{DmDhtFuture, DmSpawnError};
     use daemonseed_veilid_net::route_provenance_input;
     use tokio::sync::mpsc::unbounded_channel;
 
-    /// A signer for operator-item fixtures. No test holds the project-release
+    /// A signer for operator-item fixtures. No test holds the project-announce
     /// seed, so fixtures are signed by this key and folded through a whitelist that
     /// names it; the production fold passes `Whitelist::default()`, which names the
-    /// project-release key alone.
+    /// project-announce key alone.
     fn test_signer() -> SignKeypair {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[0x42; 32]).unwrap()
@@ -6710,9 +6710,9 @@ mod tests {
     /// A test project seed and a credential built against its own derived keys —
     /// what `OperatorCredential::load` would hold if the build's baked keys were
     /// this seed's.
-    fn test_credential() -> (ProjectReleaseSeed, OperatorCredential) {
+    fn test_credential() -> (ProjectAnnounceSeed, OperatorCredential) {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
-        let seed = ProjectReleaseSeed::from_bytes([0x11; 32]);
+        let seed = ProjectAnnounceSeed::from_bytes([0x11; 32]);
         let signer = *seed.signing_keypair().unwrap().public_key();
         let owner = daemonseed_veilid_net::identity::rendezvous_owner_public_bytes(
             seed.announce_owner_seed().unwrap().as_bytes(),
@@ -6755,7 +6755,7 @@ mod tests {
         assert!(matches!(shares.operator_role, OperatorRole::Reader));
         assert!(evt_rx.try_recv().is_err(), "a reader is not an error");
 
-        let malformed = ProjectReleaseSeedText::from_os_string("not a seed".into());
+        let malformed = ProjectAnnounceSeedText::from_os_string("not a seed".into());
         load_operator_role(&mut shares, &evt_tx, Some(malformed));
         let OperatorRole::Refused(reason) = &shares.operator_role else {
             panic!("a malformed seed must be a refusal");
@@ -6764,7 +6764,7 @@ mod tests {
         match evt_rx.try_recv() {
             Ok(NetEvent::PublicSpaceError { message }) => {
                 assert!(
-                    message.contains("project-release seed refused"),
+                    message.contains("project-announce seed refused"),
                     "{message}"
                 );
             }
@@ -6777,7 +6777,7 @@ mod tests {
         load_operator_role(
             &mut shares,
             &evt_tx,
-            Some(ProjectReleaseSeedText::from_os_string(foreign.into())),
+            Some(ProjectAnnounceSeedText::from_os_string(foreign.into())),
         );
         let OperatorRole::Refused(reason) = &shares.operator_role else {
             panic!("a foreign seed must be a refusal");
@@ -6809,7 +6809,7 @@ mod tests {
         match evt_rx.try_recv() {
             Ok(NetEvent::PublicSpaceError { message }) => {
                 assert!(
-                    message.contains("holds no project-release seed"),
+                    message.contains("holds no project-announce seed"),
                     "{message}"
                 );
             }

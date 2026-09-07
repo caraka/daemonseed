@@ -14,8 +14,8 @@ use daemonseed_core::identity::keys::{
     KeyDerivationError, SignKeypair, VeilidNodeSeed, IDENTITY_PK_LEN,
 };
 use daemonseed_core::public_space::{
-    project_release_pubkey, AnnounceOwnerError, ProjectReleaseSeed, ProjectReleaseSeedError,
-    ProjectReleaseSeedSource, SeedOrigin,
+    project_announce_pubkey, AnnounceOwnerError, ProjectAnnounceSeed, ProjectAnnounceSeedError,
+    ProjectAnnounceSeedSource, SeedOrigin,
 };
 use ed25519_dalek::SigningKey;
 use veilid_core::{
@@ -158,7 +158,7 @@ pub const PROJECT_ANNOUNCE_OWNER_PUBKEY: [u8; 32] = [
 
 // ── What the operator instance holds (F17 / ISC-15) ──────────────────────────
 
-/// The operator instance's credential: the project-release signing keypair and the
+/// The operator instance's credential: the project-announce signing keypair and the
 /// announce record's owner seed, both derived from one runtime-loaded project
 /// seed and both checked against the keys baked into this build before either is
 /// handed out.
@@ -183,7 +183,7 @@ impl fmt::Debug for OperatorCredential {
 
 impl OperatorCredential {
     /// The shipped entry point: load the seed from `source`, checked against the
-    /// baked [`daemonseed_core::public_space::project_release_pubkey`], then derive
+    /// baked [`daemonseed_core::public_space::project_announce_pubkey`], then derive
     /// the owner seed, checked against [`PROJECT_ANNOUNCE_OWNER_PUBKEY`].
     ///
     /// `Ok(None)` is an instance given no seed — the ordinary reader. Every other
@@ -196,14 +196,14 @@ impl OperatorCredential {
     /// what a rotation must additionally verify by hand is that the operator build
     /// launched with the new seed reports itself as the operator.
     pub fn load(
-        source: &ProjectReleaseSeedSource,
+        source: &ProjectAnnounceSeedSource,
     ) -> core::result::Result<Option<(Self, SeedOrigin)>, OperatorCredentialError> {
         let Some((seed, origin)) = source.load().map_err(OperatorCredentialError::Seed)? else {
             return Ok(None);
         };
         let credential = Self::from_seed(
             &seed,
-            project_release_pubkey(),
+            project_announce_pubkey(),
             &PROJECT_ANNOUNCE_OWNER_PUBKEY,
         )?;
         Ok(Some((credential, origin)))
@@ -220,7 +220,7 @@ impl OperatorCredential {
     /// any other. [`Self::load`] passes the baked constants. Requires the oxicrypt
     /// module to be operational.
     pub fn from_seed(
-        seed: &ProjectReleaseSeed,
+        seed: &ProjectAnnounceSeed,
         expected_signer: &[u8; IDENTITY_PK_LEN],
         expected_owner: &[u8; 32],
     ) -> core::result::Result<Self, OperatorCredentialError> {
@@ -255,8 +255,8 @@ impl OperatorCredential {
 /// Why an operator credential could not be built.
 #[derive(Debug)]
 pub enum OperatorCredentialError {
-    /// The seed could not be loaded or is not the project-release seed.
-    Seed(ProjectReleaseSeedError),
+    /// The seed could not be loaded or is not the project-announce seed.
+    Seed(ProjectAnnounceSeedError),
     /// The ML-DSA keygen over the seed failed.
     Signer(KeyDerivationError),
     /// The owner-seed derivation failed.
@@ -272,10 +272,10 @@ impl fmt::Display for OperatorCredentialError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Seed(e) => write!(f, "{e}"),
-            Self::Signer(e) => write!(f, "project-release signing key derivation failed: {e}"),
+            Self::Signer(e) => write!(f, "project-announce signing key derivation failed: {e}"),
             Self::Owner(e) => write!(f, "announce owner key derivation failed: {e}"),
             Self::NotTheBakedSigner => f.write_str(
-                "the seed derives a project-release signing key that is not the one this build trusts",
+                "the seed derives a project-announce signing key that is not the one this build trusts",
             ),
             Self::NotTheBakedOwner => f.write_str(
                 "the seed derives an announce owner key that is not the one this build trusts",
@@ -549,9 +549,9 @@ mod tests {
 
     /// A fixed test project seed and the owner key it derives — the expectation
     /// a credential is checked against, built the way a rotation builds the real one.
-    fn test_project_seed() -> (ProjectReleaseSeed, [u8; IDENTITY_PK_LEN], [u8; 32]) {
+    fn test_project_seed() -> (ProjectAnnounceSeed, [u8; IDENTITY_PK_LEN], [u8; 32]) {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
-        let seed = ProjectReleaseSeed::from_bytes([0x11; 32]);
+        let seed = ProjectAnnounceSeed::from_bytes([0x11; 32]);
         let signer = *seed
             .signing_keypair()
             .expect("derive the signer")
@@ -594,7 +594,7 @@ mod tests {
         // The baked constants refuse the test seed on both halves, so `load`'s
         // arguments are not derived from the seed under test.
         assert!(matches!(
-            OperatorCredential::from_seed(&seed, project_release_pubkey(), &owner).unwrap_err(),
+            OperatorCredential::from_seed(&seed, project_announce_pubkey(), &owner).unwrap_err(),
             OperatorCredentialError::NotTheBakedSigner
         ));
         assert!(matches!(
@@ -604,7 +604,7 @@ mod tests {
         ));
     }
 
-    /// The shipped entry point refuses a seed that is not the project-release seed
+    /// The shipped entry point refuses a seed that is not the project-announce seed
     /// and reports no operator when no seed is supplied. It cannot be driven past
     /// the signing-key check without the real seed; the owner check is covered
     /// through `from_seed` above.
@@ -612,15 +612,17 @@ mod tests {
     fn operator_credential_load_refuses_a_foreign_seed_and_reports_absence() {
         let (seed, _, _) = test_project_seed();
         let hex: String = seed.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let source = ProjectReleaseSeedSource::new(
-            Some(daemonseed_core::public_space::ProjectReleaseSeedText::from_os_string(hex.into())),
+        let source = ProjectAnnounceSeedSource::new(
+            Some(
+                daemonseed_core::public_space::ProjectAnnounceSeedText::from_os_string(hex.into()),
+            ),
             None,
         );
         assert!(matches!(
             OperatorCredential::load(&source).unwrap_err(),
-            OperatorCredentialError::Seed(ProjectReleaseSeedError::NotTheProjectSeed { .. })
+            OperatorCredentialError::Seed(ProjectAnnounceSeedError::NotTheProjectSeed { .. })
         ));
-        let none = ProjectReleaseSeedSource::new(None, None);
+        let none = ProjectAnnounceSeedSource::new(None, None);
         assert!(OperatorCredential::load(&none).unwrap().is_none());
     }
 

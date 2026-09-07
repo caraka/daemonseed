@@ -823,12 +823,12 @@ pub struct GuiState {
     /// was written to end, so the log lands before the affordance rather than
     /// after it.
     trust_log: TrustEventLog,
-    /// The project-release seed variable's value, if this process was launched
+    /// The project-announce seed variable's value, if this process was launched
     /// with one: taken out of the environment at startup and held here so every
     /// `Connect` can hand it to the net actor, which loads the operator credential
     /// from it (or from the seed file under the profile root). `None` on every
     /// instance that is not the operator.
-    project_release_seed: Option<daemonseed_core::public_space::ProjectReleaseSeedText>,
+    project_announce_seed: Option<daemonseed_core::public_space::ProjectAnnounceSeedText>,
 }
 
 impl GuiState {
@@ -862,7 +862,7 @@ impl GuiState {
             announcements_on_screen: AnnouncementsView::default(),
             dm: DmState::default(),
             trust_log: TrustEventLog::default(),
-            project_release_seed: None,
+            project_announce_seed: None,
         }
     }
 
@@ -926,20 +926,20 @@ impl GuiState {
         self.profile.as_ref().map(|p| p.root().to_path_buf())
     }
 
-    /// Hold the project-release seed variable's value for the session's Connects.
-    pub fn set_project_release_seed(
+    /// Hold the project-announce seed variable's value for the session's Connects.
+    pub fn set_project_announce_seed(
         &mut self,
-        value: Option<daemonseed_core::public_space::ProjectReleaseSeedText>,
+        value: Option<daemonseed_core::public_space::ProjectAnnounceSeedText>,
     ) {
-        self.project_release_seed = value;
+        self.project_announce_seed = value;
     }
 
-    /// The project-release seed variable's value, for `NetCommand::Connect`. A
+    /// The project-announce seed variable's value, for `NetCommand::Connect`. A
     /// clone is another zeroed-on-drop buffer.
-    pub fn project_release_seed(
+    pub fn project_announce_seed(
         &self,
-    ) -> Option<daemonseed_core::public_space::ProjectReleaseSeedText> {
-        self.project_release_seed.clone()
+    ) -> Option<daemonseed_core::public_space::ProjectAnnounceSeedText> {
+        self.project_announce_seed.clone()
     }
 
     /// (#92) The unlocked profile's STABLE persistent identity signing key
@@ -1672,7 +1672,7 @@ impl GuiState {
             announcements_on_screen: AnnouncementsView::default(),
             dm: DmState::default(),
             trust_log: TrustEventLog::default(),
-            project_release_seed: None,
+            project_announce_seed: None,
         }
     }
 }

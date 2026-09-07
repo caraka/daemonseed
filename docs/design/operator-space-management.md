@@ -143,7 +143,7 @@ this.**
   handles; "revocation is immediate on the next published whitelist", i.e. enforced by
   readers at verification time.
 - **Write authority** — who may *set a value* on the Veilid record. This is the announce
-  owner seed the operator instance derives from its runtime-loaded project-release seed
+  owner seed the operator instance derives from its runtime-loaded project-announce seed
   (`OperatorCredential`, `crates/daemonseed-veilid-net/src/identity.rs`); every other
   client subscribes on the baked owner public key in `subscribe_operator_space`
   (`crates/daemonseed-gui/src/veilid_net.rs`) and holds no seed.
@@ -336,7 +336,7 @@ different reasons; announcements would want the secret-derived variant.
    record in three places and the maintainer's stated intent differs, so the tree is
    misleading until this is settled and written down.
 2. **Is there an application gate beside the cryptographic one?** Answered: no. The
-   gate is possession of the runtime-loaded project-release seed (`OperatorCredential`),
+   gate is possession of the runtime-loaded project-announce seed (`OperatorCredential`),
    which is the write-gate itself; the former environment flag is gone, because a second
    gate beside the cryptographic one is a gate that can disagree with it. Under B or
    per-operator records the same shape holds per channel — a seed per channel.

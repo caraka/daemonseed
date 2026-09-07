@@ -172,9 +172,9 @@ impl FromStr for WhitelistEntry {
     }
 }
 
-// ── Project-release signer (F17 / ISC-15) ───────────────────────────────
+// ── Project-announce signer (F17 / ISC-15) ───────────────────────────────
 
-/// The baked ML-DSA-87 public key of the project-release signer (F17 / ISC-15).
+/// The baked ML-DSA-87 public key of the project-announce signer (F17 / ISC-15).
 ///
 /// Held as a separate binary file rather than an array literal because it is
 /// `ml_dsa::PK_LEN` bytes: the file is the artifact a reader diffs and a rotation
@@ -184,60 +184,61 @@ impl FromStr for WhitelistEntry {
 ///
 /// Baked, not derived: the seed it descends from is not in the source tree. The
 /// one instance that signs — the operator — loads that seed at runtime through
-/// [`ProjectReleaseSeedSource`], and the load refuses any seed that does not derive
+/// [`ProjectAnnounceSeedSource`], and the load refuses any seed that does not derive
 /// this exact key, so a client keeps only this constant and an operator cannot sign
 /// under a key the fleet would reject. `current_trust_anchors_kat` pins the value.
-const PROJECT_RELEASE_PUBKEY: [u8; ml_dsa::PK_LEN] = *include_bytes!("project_release_pubkey.bin");
+const PROJECT_ANNOUNCE_PUBKEY: [u8; ml_dsa::PK_LEN] =
+    *include_bytes!("project_announce_pubkey.bin");
 
-/// The full ML-DSA-87 public key of the project-release signer (F17 / ISC-15).
+/// The full ML-DSA-87 public key of the project-announce signer (F17 / ISC-15).
 ///
 /// This entry is merged into every [`Whitelist`] regardless of the operator's
 /// whitelist file, and there is no file syntax that removes it — that
 /// non-removability is the whole point of F17 (a self-host operator cannot
-/// silence project release announcements). Returns the baked
-/// `PROJECT_RELEASE_PUBKEY`: no derivation runs, so this needs no operational
+/// silence project announce announcements). Returns the baked
+/// `PROJECT_ANNOUNCE_PUBKEY`: no derivation runs, so this needs no operational
 /// oxicrypt module and cannot fail.
-pub fn project_release_pubkey() -> &'static [u8; ml_dsa::PK_LEN] {
-    &PROJECT_RELEASE_PUBKEY
+pub fn project_announce_pubkey() -> &'static [u8; ml_dsa::PK_LEN] {
+    &PROJECT_ANNOUNCE_PUBKEY
 }
 
-/// Length of the project-release seed — 32 bytes, an ML-DSA-87 keygen seed.
-pub const PROJECT_RELEASE_SEED_LEN: usize = 32;
+/// Length of the project-announce seed — 32 bytes, an ML-DSA-87 keygen seed.
+pub const PROJECT_ANNOUNCE_SEED_LEN: usize = 32;
 
-/// Environment variable that carries the project-release seed as 64 hex characters.
+/// Environment variable that carries the project-announce seed as 64 hex characters.
 ///
 /// The variable is read in preference to the seed file, so a terminal launch or a
 /// test rig can hand an instance the seed without touching its profile. A launcher
 /// that carries no shell environment — a desktop-file or double-click launch — can
 /// only supply the file.
-pub const PROJECT_RELEASE_SEED_ENV: &str = "DAEMONSEED_PROJECT_RELEASE_SEED";
+pub const PROJECT_ANNOUNCE_SEED_ENV: &str = "DAEMONSEED_PROJECT_ANNOUNCE_SEED";
 
-/// Name of the file, directly under the profile root, that holds the project-release
+/// Name of the file, directly under the profile root, that holds the project-announce
 /// seed as 64 hex characters. On Unix the file must not be readable by any user
 /// other than its owner, or it is refused; other platforms do not check the mode.
-pub const PROJECT_RELEASE_SEED_FILENAME: &str = "project-release.seed";
+pub const PROJECT_ANNOUNCE_SEED_FILENAME: &str = "project-announce.seed";
 
 redacted_secret_newtype! {
-    /// The project-release seed: the one secret from which the project-release
+    /// The project-announce seed: the one secret from which the project-announce
     /// signing key and the announce record's owner seed both descend (F17 / ISC-15).
     ///
     /// Held only by the operator instance, which loads it at runtime through
-    /// [`ProjectReleaseSeedSource`]; every other instance holds the two derived
+    /// [`ProjectAnnounceSeedSource`]; every other instance holds the two derived
     /// public keys and nothing else. The type carries the 32 bytes and their hygiene
     /// — zeroed on drop, `Debug` redacted (ISC-A-C1) — and nothing about whether
-    /// they are the project's seed: that is what [`ProjectReleaseSeedSource::load`]
+    /// they are the project's seed: that is what [`ProjectAnnounceSeedSource::load`]
     /// establishes for the value it returns, and what an operator credential checks
     /// again for both derived keys before holding one.
-    boxed pub struct ProjectReleaseSeed([u8; PROJECT_RELEASE_SEED_LEN]);
+    boxed pub struct ProjectAnnounceSeed([u8; PROJECT_ANNOUNCE_SEED_LEN]);
 }
 
-impl ProjectReleaseSeed {
+impl ProjectAnnounceSeed {
     /// Wrap a seed already held as bytes.
     ///
     /// Only for a caller that is about to check the seed — the loader, or a test
     /// building the expectation it will check against. A shipped path holds a seed
-    /// only through [`ProjectReleaseSeedSource::load`].
-    pub fn from_bytes(bytes: [u8; PROJECT_RELEASE_SEED_LEN]) -> Self {
+    /// only through [`ProjectAnnounceSeedSource::load`].
+    pub fn from_bytes(bytes: [u8; PROJECT_ANNOUNCE_SEED_LEN]) -> Self {
         Self(Box::new(bytes))
     }
 
@@ -245,16 +246,16 @@ impl ProjectReleaseSeed {
     /// ignored. The error never carries the text.
     pub fn parse_hex(text: &str) -> Result<Self, SeedHexError> {
         let trimmed = text.trim();
-        if trimmed.len() != 2 * PROJECT_RELEASE_SEED_LEN {
+        if trimmed.len() != 2 * PROJECT_ANNOUNCE_SEED_LEN {
             return Err(SeedHexError::Length(trimmed.len()));
         }
-        let mut bytes = Box::new([0u8; PROJECT_RELEASE_SEED_LEN]);
+        let mut bytes = Box::new([0u8; PROJECT_ANNOUNCE_SEED_LEN]);
         hex::decode_to_slice(trimmed, &mut bytes[..]).map_err(|_| SeedHexError::NotHex)?;
         Ok(Self(bytes))
     }
 
     /// The ML-DSA-87 keypair the operator signs MOTD and announcements with. Its
-    /// public key is [`project_release_pubkey`] for a seed the loader accepted.
+    /// public key is [`project_announce_pubkey`] for a seed the loader accepted.
     /// Requires the oxicrypt module to be operational.
     pub fn signing_keypair(&self) -> Result<SignKeypair, KeyDerivationError> {
         SignKeypair::from_ml_dsa_seed(&self.0)
@@ -287,7 +288,7 @@ impl fmt::Display for SeedHexError {
             Self::Length(n) => write!(
                 f,
                 "expected {} hex characters, found {n}",
-                2 * PROJECT_RELEASE_SEED_LEN
+                2 * PROJECT_ANNOUNCE_SEED_LEN
             ),
             Self::NotHex => f.write_str("not hexadecimal"),
         }
@@ -300,7 +301,7 @@ impl std::error::Error for SeedHexError {}
 /// error, so a misconfiguration points at the thing to fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeedOrigin {
-    /// [`PROJECT_RELEASE_SEED_ENV`].
+    /// [`PROJECT_ANNOUNCE_SEED_ENV`].
     Env,
     /// The seed file at this path.
     File(PathBuf),
@@ -309,7 +310,7 @@ pub enum SeedOrigin {
 impl fmt::Display for SeedOrigin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Env => write!(f, "environment variable {PROJECT_RELEASE_SEED_ENV}"),
+            Self::Env => write!(f, "environment variable {PROJECT_ANNOUNCE_SEED_ENV}"),
             Self::File(path) => write!(f, "file {}", path.display()),
         }
     }
@@ -319,9 +320,9 @@ impl fmt::Display for SeedOrigin {
 ///
 /// Every variant is a fault in an instance that was given a seed: a source that is
 /// simply absent is not an error but an ordinary reader, and
-/// [`ProjectReleaseSeedSource::load`] reports it as `Ok(None)`.
+/// [`ProjectAnnounceSeedSource::load`] reports it as `Ok(None)`.
 #[derive(Debug)]
-pub enum ProjectReleaseSeedError {
+pub enum ProjectAnnounceSeedError {
     /// The seed text did not parse.
     Malformed {
         /// Which source held it.
@@ -346,40 +347,43 @@ pub enum ProjectReleaseSeedError {
     /// The ML-DSA keygen over the seed failed.
     Derivation(KeyDerivationError),
     /// The seed parsed and derived a key, and that key is not the one this build
-    /// trusts: whatever was supplied is not the project-release seed.
+    /// trusts: whatever was supplied is not the project-announce seed.
     NotTheProjectSeed {
         /// Which source held it.
         origin: SeedOrigin,
     },
 }
 
-impl fmt::Display for ProjectReleaseSeedError {
+impl fmt::Display for ProjectAnnounceSeedError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Malformed { origin, reason } => {
-                write!(f, "project-release seed in {origin} is malformed: {reason}")
+                write!(
+                    f,
+                    "project-announce seed in {origin} is malformed: {reason}"
+                )
             }
             Self::Unreadable { path, source } => write!(
                 f,
-                "project-release seed file {} could not be read: {source}",
+                "project-announce seed file {} could not be read: {source}",
                 path.display()
             ),
             Self::Permissions { path, mode } => write!(
                 f,
-                "project-release seed file {} is readable by others (mode {mode:04o}); \
+                "project-announce seed file {} is readable by others (mode {mode:04o}); \
                  make it readable by its owner only",
                 path.display()
             ),
-            Self::Derivation(e) => write!(f, "project-release key derivation failed: {e}"),
+            Self::Derivation(e) => write!(f, "project-announce key derivation failed: {e}"),
             Self::NotTheProjectSeed { origin } => write!(
                 f,
-                "the seed in {origin} does not derive the project-release key this build trusts"
+                "the seed in {origin} does not derive the project-announce key this build trusts"
             ),
         }
     }
 }
 
-impl std::error::Error for ProjectReleaseSeedError {
+impl std::error::Error for ProjectAnnounceSeedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Unreadable { source, .. } => Some(source),
@@ -390,15 +394,15 @@ impl std::error::Error for ProjectReleaseSeedError {
     }
 }
 
-/// The value of [`PROJECT_RELEASE_SEED_ENV`] as it was taken out of the process
+/// The value of [`PROJECT_ANNOUNCE_SEED_ENV`] as it was taken out of the process
 /// environment: the seed in its text form, and therefore a secret. Held in a
 /// zeroed-on-drop buffer; `Clone` yields another such buffer; `Debug` is redacted.
 /// Exists so a front end can carry the value from startup to the point it hands
-/// it to [`ProjectReleaseSeedSource`] without ever holding it in a plain string.
+/// it to [`ProjectAnnounceSeedSource`] without ever holding it in a plain string.
 #[derive(Clone)]
-pub struct ProjectReleaseSeedText(Zeroizing<Vec<u8>>);
+pub struct ProjectAnnounceSeedText(Zeroizing<Vec<u8>>);
 
-impl ProjectReleaseSeedText {
+impl ProjectAnnounceSeedText {
     /// Take the variable's value. The `OsString` handed in is consumed; its bytes
     /// move into the zeroed-on-drop buffer.
     pub fn from_os_string(value: OsString) -> Self {
@@ -406,15 +410,15 @@ impl ProjectReleaseSeedText {
     }
 }
 
-impl fmt::Debug for ProjectReleaseSeedText {
+impl fmt::Debug for ProjectAnnounceSeedText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("ProjectReleaseSeedText(<redacted>)")
+        f.write_str("ProjectAnnounceSeedText(<redacted>)")
     }
 }
 
 /// Where an operator instance's seed may come from: the value of
-/// [`PROJECT_RELEASE_SEED_ENV`], read first, and the file
-/// [`PROJECT_RELEASE_SEED_FILENAME`] under the profile root.
+/// [`PROJECT_ANNOUNCE_SEED_ENV`], read first, and the file
+/// [`PROJECT_ANNOUNCE_SEED_FILENAME`] under the profile root.
 ///
 /// Both inputs are handed in rather than read here, so the code under test reads
 /// neither the environment nor the filesystem ambiently, and so the caller that
@@ -422,32 +426,32 @@ impl fmt::Debug for ProjectReleaseSeedText {
 ///
 /// The variable's value IS the seed, so this type is not `Clone` and its `Debug`
 /// names whether the variable was set, never what it held.
-pub struct ProjectReleaseSeedSource {
-    env: Option<ProjectReleaseSeedText>,
+pub struct ProjectAnnounceSeedSource {
+    env: Option<ProjectAnnounceSeedText>,
     file: Option<PathBuf>,
 }
 
-impl fmt::Debug for ProjectReleaseSeedSource {
+impl fmt::Debug for ProjectAnnounceSeedSource {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ProjectReleaseSeedSource")
+        f.debug_struct("ProjectAnnounceSeedSource")
             .field("env", &self.env.as_ref().map(|_| "<redacted>"))
             .field("file", &self.file)
             .finish()
     }
 }
 
-impl ProjectReleaseSeedSource {
+impl ProjectAnnounceSeedSource {
     /// A source from the variable's value, if it was set, and the seed file under
     /// `profile_root`. An instance with no profile root (an ephemeral session) can
     /// be given the seed only through the variable.
-    pub fn new(env: Option<ProjectReleaseSeedText>, profile_root: Option<&Path>) -> Self {
+    pub fn new(env: Option<ProjectAnnounceSeedText>, profile_root: Option<&Path>) -> Self {
         Self {
             env,
-            file: profile_root.map(|root| root.join(PROJECT_RELEASE_SEED_FILENAME)),
+            file: profile_root.map(|root| root.join(PROJECT_ANNOUNCE_SEED_FILENAME)),
         }
     }
 
-    /// Load the seed and check it against the baked [`project_release_pubkey`].
+    /// Load the seed and check it against the baked [`project_announce_pubkey`].
     ///
     /// The shipped entry point: [`Self::load_checked`] with the key this build
     /// trusts, and nothing else. It is exactly one line so that the only thing a
@@ -457,8 +461,8 @@ impl ProjectReleaseSeedSource {
     /// under test.
     pub fn load(
         &self,
-    ) -> Result<Option<(ProjectReleaseSeed, SeedOrigin)>, ProjectReleaseSeedError> {
-        self.load_checked(project_release_pubkey())
+    ) -> Result<Option<(ProjectAnnounceSeed, SeedOrigin)>, ProjectAnnounceSeedError> {
+        self.load_checked(project_announce_pubkey())
     }
 
     /// Load the seed and check it against `expected_pubkey`.
@@ -481,31 +485,31 @@ impl ProjectReleaseSeedSource {
     pub fn load_checked(
         &self,
         expected_pubkey: &[u8; ml_dsa::PK_LEN],
-    ) -> Result<Option<(ProjectReleaseSeed, SeedOrigin)>, ProjectReleaseSeedError> {
+    ) -> Result<Option<(ProjectAnnounceSeed, SeedOrigin)>, ProjectAnnounceSeedError> {
         let Some((text, origin)) = self.read()? else {
             return Ok(None);
         };
-        let seed = ProjectReleaseSeed::parse_hex(&text).map_err(|reason| {
-            ProjectReleaseSeedError::Malformed {
+        let seed = ProjectAnnounceSeed::parse_hex(&text).map_err(|reason| {
+            ProjectAnnounceSeedError::Malformed {
                 origin: origin.clone(),
                 reason,
             }
         })?;
         let keypair = seed
             .signing_keypair()
-            .map_err(ProjectReleaseSeedError::Derivation)?;
+            .map_err(ProjectAnnounceSeedError::Derivation)?;
         if keypair.public_key() != expected_pubkey {
-            return Err(ProjectReleaseSeedError::NotTheProjectSeed { origin });
+            return Err(ProjectAnnounceSeedError::NotTheProjectSeed { origin });
         }
         Ok(Some((seed, origin)))
     }
 
     /// The seed's text and where it came from, or `None` when neither source is
     /// present. The text is zeroed when dropped.
-    fn read(&self) -> Result<Option<(Zeroizing<String>, SeedOrigin)>, ProjectReleaseSeedError> {
+    fn read(&self) -> Result<Option<(Zeroizing<String>, SeedOrigin)>, ProjectAnnounceSeedError> {
         if let Some(value) = &self.env {
             let text = String::from_utf8(value.0.to_vec()).map_err(|_| {
-                ProjectReleaseSeedError::Malformed {
+                ProjectAnnounceSeedError::Malformed {
                     origin: SeedOrigin::Env,
                     reason: SeedHexError::NotText,
                 }
@@ -519,14 +523,14 @@ impl ProjectReleaseSeedSource {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => {
-                return Err(ProjectReleaseSeedError::Unreadable {
+                return Err(ProjectAnnounceSeedError::Unreadable {
                     path: path.clone(),
                     source,
                 });
             }
         };
         if !metadata.is_file() {
-            return Err(ProjectReleaseSeedError::Unreadable {
+            return Err(ProjectAnnounceSeedError::Unreadable {
                 path: path.clone(),
                 source: std::io::Error::other("not a regular file"),
             });
@@ -536,14 +540,14 @@ impl ProjectReleaseSeedSource {
             use std::os::unix::fs::PermissionsExt;
             let mode = metadata.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
-                return Err(ProjectReleaseSeedError::Permissions {
+                return Err(ProjectAnnounceSeedError::Permissions {
                     path: path.clone(),
                     mode,
                 });
             }
         }
         let text = std::fs::read_to_string(path).map_err(|source| {
-            ProjectReleaseSeedError::Unreadable {
+            ProjectAnnounceSeedError::Unreadable {
                 path: path.clone(),
                 source,
             }
@@ -560,7 +564,7 @@ redacted_secret_newtype! {
     /// The project-announce channel's Veilid **rendezvous-owner** seed (Phase 4 A1) —
     /// the DHT write-gate for the single project announcements/MOTD channel (A0). A
     /// **sibling** of the F17 content-signing key: both derive from the one
-    /// maintainer-held project-release seed, but the content key uses it as an ML-DSA
+    /// maintainer-held project-announce seed, but the content key uses it as an ML-DSA
     /// seed directly while this HKDF-expands it under a distinct label
     /// ([`info::PROJECT_ANNOUNCE_VEILID_OWNER`]), so transport-owner and
     /// content-signing material are domain-separated — possessing one never yields the
@@ -589,7 +593,7 @@ impl fmt::Display for AnnounceOwnerError {
 impl std::error::Error for AnnounceOwnerError {}
 
 /// Derive the project-announce channel's Veilid rendezvous-owner seed from the
-/// maintainer's project-release seed (A1 write-gate).
+/// maintainer's project-announce seed (A1 write-gate).
 ///
 /// ```text
 ///   owner_seed = HKDF-SHA-384(
@@ -601,8 +605,8 @@ impl std::error::Error for AnnounceOwnerError {}
 /// Domain-separated from the F17 content-signing key (which uses `project_seed`
 /// as an ML-DSA seed directly), so a holder of one cannot derive the other. The
 /// project seed is not in the source tree: the operator instance loads it at
-/// runtime ([`ProjectReleaseSeedSource`]) and reaches this through
-/// [`ProjectReleaseSeed::announce_owner_seed`]; every other instance holds only the
+/// runtime ([`ProjectAnnounceSeedSource`]) and reaches this through
+/// [`ProjectAnnounceSeed::announce_owner_seed`]; every other instance holds only the
 /// derived owner PUBLIC key, baked into the transport crate.
 pub fn derive_project_announce_veilid_owner_seed(
     project_seed: &[u8; 32],
@@ -650,7 +654,7 @@ pub fn random_announce_slot_cursor() -> String {
 /// refreshed every `N` hours for `N` standing announcements — an ~8x margin over the
 /// observed survival floor at `N = 3`, still 4x at `N = 6`.
 ///
-/// That is also the whole *fleet's* rate: only the instance holding the project-release
+/// That is also the whole *fleet's* rate: only the instance holding the project-announce
 /// seed re-seeds, in every build profile, so a fleet of any size puts one operator's
 /// writes on the record.
 ///
@@ -796,7 +800,7 @@ impl AnnounceFreshness {
 }
 
 /// The operator's signer whitelist (ISC-S8), plus the always-present
-/// project-release entry (F17 / ISC-15).
+/// project-announce entry (F17 / ISC-15).
 ///
 /// Authorization is the cheap gate run before any signature verification
 /// (ISC-12): an unknown key never reaches the ML-DSA verify path.
@@ -807,7 +811,7 @@ pub struct Whitelist {
 
 impl Whitelist {
     /// Build a whitelist from the operator's parsed file entries. The
-    /// project-release entry (F17) is *not* stored here — it is checked
+    /// project-announce entry (F17) is *not* stored here — it is checked
     /// unconditionally by [`Self::authorizes`], so no operator file content can
     /// remove it.
     pub fn from_entries(entries: Vec<WhitelistEntry>) -> Self {
@@ -822,14 +826,14 @@ impl Whitelist {
 
     /// Whether `pubkey` is authorized to sign posts / MOTDs (ISC-12 / ISC-S8).
     ///
-    /// The project-release key (F17) is always authorized. For operator
+    /// The project-announce key (F17) is always authorized. For operator
     /// entries: a `FullKey` matches by exact bytes; a `Handle` matches by
     /// hash-prefix against the arriving key (ISC-12), which is computed without
     /// touching the signature.
     pub fn authorizes(&self, pubkey: &[u8]) -> Result<bool, OxicryptError> {
-        // F17: the project-release signer is always authorized, regardless of
+        // F17: the project-announce signer is always authorized, regardless of
         // the operator's file (ISC-15).
-        if pubkey == project_release_pubkey().as_slice() {
+        if pubkey == project_announce_pubkey().as_slice() {
             return Ok(true);
         }
 
@@ -1180,15 +1184,15 @@ mod tests {
         assert!(!wl.authorizes(stranger.public_key()).unwrap());
     }
 
-    /// ISC-15 / F17: the project-release signer is authorized even when the
+    /// ISC-15 / F17: the project-announce signer is authorized even when the
     /// operator's whitelist file is empty — it can't be removed.
     #[test]
-    fn project_release_signer_authorized_with_empty_file() {
+    fn project_announce_signer_authorized_with_empty_file() {
         ensure_module();
         let wl = Whitelist::from_entries(vec![]);
         assert!(
-            wl.authorizes(project_release_pubkey().as_slice()).unwrap(),
-            "F17 project-release entry is non-removable"
+            wl.authorizes(project_announce_pubkey().as_slice()).unwrap(),
+            "F17 project-announce entry is non-removable"
         );
 
         let stranger = keypair(9);
@@ -1197,7 +1201,7 @@ mod tests {
 
     /// The former world-known dev seed `[0x5d; 32]` does not yield an authorized
     /// signer: an artifact signed under it is rejected against an empty whitelist,
-    /// while the project-release key stays non-removably authorized. The seed that
+    /// while the project-announce key stays non-removably authorized. The seed that
     /// replaced it is not in the tree, so the inequality is asserted on the derived
     /// keys, not on the seed itself.
     #[test]
@@ -1206,8 +1210,8 @@ mod tests {
         let old_dev = SignKeypair::from_ml_dsa_seed(&[0x5d; 32]).unwrap();
         assert_ne!(
             old_dev.public_key(),
-            project_release_pubkey(),
-            "the baked project-release key must not be the one the dev placeholder derives"
+            project_announce_pubkey(),
+            "the baked project-announce key must not be the one the dev placeholder derives"
         );
         let wl = Whitelist::from_entries(vec![]);
         assert!(
@@ -1215,35 +1219,35 @@ mod tests {
             "the former dev-seed signer must no longer authorize (old graffiti wiped)"
         );
         assert!(
-            wl.authorizes(project_release_pubkey().as_slice()).unwrap(),
-            "the current project-release key remains non-removably authorized"
+            wl.authorizes(project_announce_pubkey().as_slice()).unwrap(),
+            "the current project-announce key remains non-removably authorized"
         );
     }
 
-    /// ISC-15 trust-anchor KAT: pins the project-release pubkey clients actually
+    /// ISC-15 trust-anchor KAT: pins the project-announce pubkey clients actually
     /// trust (the whitelist anchor), by its SHA-384 since the raw key is `PK_LEN`
     /// bytes. `former_dev_seed_no_longer_authorized` catches a revert to the dev
     /// placeholder; this catches silent DRIFT to any third value — a half-done
-    /// rotation that replaced `project_release_pubkey.bin` with the wrong file. The
+    /// rotation that replaced `project_announce_pubkey.bin` with the wrong file. The
     /// announce owner key's pin lives with that key, in the transport crate.
     #[test]
     fn current_trust_anchors_kat() {
         ensure_module();
         assert_eq!(
-            hex::encode(sha384(project_release_pubkey().as_slice()).unwrap()),
+            hex::encode(sha384(project_announce_pubkey().as_slice()).unwrap()),
             "3cdf6f2b9c64e032557ef4f0e3bd67eec1b1a6c5f44c73759352e08c650a5fbaba6e495437dfb5c52cceaf2e645285a7",
-            "the project-release pubkey (client whitelist anchor) changed unexpectedly"
+            "the project-announce pubkey (client whitelist anchor) changed unexpectedly"
         );
     }
 
-    /// A retired project-release signing key is not the baked one, so an artifact
+    /// A retired project-announce signing key is not the baked one, so an artifact
     /// signed under a retired seed does not authorize. The retired key's digest is a
     /// public value, pinned here so a rotation cannot be half-reverted to it.
     #[test]
-    fn retired_project_release_pubkey_is_not_current() {
+    fn retired_project_announce_pubkey_is_not_current() {
         ensure_module();
         assert_ne!(
-            hex::encode(sha384(project_release_pubkey().as_slice()).unwrap()),
+            hex::encode(sha384(project_announce_pubkey().as_slice()).unwrap()),
             "9867a1eb67c3875972e475ba3c05764d1122c7500f8807b4199ae106782f3ac3f1acc8eddfe7f0983e0ea63db6469f2f"
         );
     }
@@ -1253,21 +1257,25 @@ mod tests {
     /// A fixed test seed, its hex form, and the public key it derives — the
     /// expectation a load is checked against, built the way a rotation would build
     /// the real one.
-    fn test_seed() -> ([u8; PROJECT_RELEASE_SEED_LEN], String, [u8; ml_dsa::PK_LEN]) {
+    fn test_seed() -> (
+        [u8; PROJECT_ANNOUNCE_SEED_LEN],
+        String,
+        [u8; ml_dsa::PK_LEN],
+    ) {
         ensure_module();
-        let bytes = [0x11; PROJECT_RELEASE_SEED_LEN];
+        let bytes = [0x11; PROJECT_ANNOUNCE_SEED_LEN];
         let pubkey = *SignKeypair::from_ml_dsa_seed(&bytes).unwrap().public_key();
         (bytes, hex::encode(bytes), pubkey)
     }
 
     /// The variable's value, as the front end hands it over.
-    fn env_text(value: &str) -> ProjectReleaseSeedText {
-        ProjectReleaseSeedText::from_os_string(OsString::from(value))
+    fn env_text(value: &str) -> ProjectAnnounceSeedText {
+        ProjectAnnounceSeedText::from_os_string(OsString::from(value))
     }
 
     /// A seed file under a fresh directory, owner-read-only.
     fn seed_file(dir: &std::path::Path, text: &str) -> PathBuf {
-        let path = dir.join(PROJECT_RELEASE_SEED_FILENAME);
+        let path = dir.join(PROJECT_ANNOUNCE_SEED_FILENAME);
         std::fs::write(&path, text).unwrap();
         #[cfg(unix)]
         {
@@ -1280,26 +1288,26 @@ mod tests {
     #[test]
     fn seed_hex_parses_64_characters_and_ignores_surrounding_whitespace() {
         let (bytes, hex, _) = test_seed();
-        let seed = ProjectReleaseSeed::parse_hex(&format!("  {hex}\n")).unwrap();
+        let seed = ProjectAnnounceSeed::parse_hex(&format!("  {hex}\n")).unwrap();
         assert_eq!(seed.as_bytes(), &bytes);
-        assert_eq!(format!("{seed:?}"), "ProjectReleaseSeed(<redacted>)");
+        assert_eq!(format!("{seed:?}"), "ProjectAnnounceSeed(<redacted>)");
     }
 
     #[test]
     fn seed_hex_rejects_wrong_length_and_non_hex() {
         let (_, hex, _) = test_seed();
         assert_eq!(
-            ProjectReleaseSeed::parse_hex(&hex[..62]).unwrap_err(),
+            ProjectAnnounceSeed::parse_hex(&hex[..62]).unwrap_err(),
             SeedHexError::Length(62)
         );
         assert_eq!(
-            ProjectReleaseSeed::parse_hex("").unwrap_err(),
+            ProjectAnnounceSeed::parse_hex("").unwrap_err(),
             SeedHexError::Length(0)
         );
         let mut bad = hex.clone();
         bad.replace_range(0..1, "g");
         assert_eq!(
-            ProjectReleaseSeed::parse_hex(&bad).unwrap_err(),
+            ProjectAnnounceSeed::parse_hex(&bad).unwrap_err(),
             SeedHexError::NotHex
         );
     }
@@ -1309,10 +1317,10 @@ mod tests {
     fn load_with_no_source_is_not_an_operator() {
         let (_, _, pubkey) = test_seed();
         let dir = tempfile::tempdir().unwrap();
-        let source = ProjectReleaseSeedSource::new(None, Some(dir.path()));
+        let source = ProjectAnnounceSeedSource::new(None, Some(dir.path()));
         assert!(source.load_checked(&pubkey).unwrap().is_none());
         assert!(source.load().unwrap().is_none());
-        let none_at_all = ProjectReleaseSeedSource::new(None, None);
+        let none_at_all = ProjectAnnounceSeedSource::new(None, None);
         assert!(none_at_all.load_checked(&pubkey).unwrap().is_none());
     }
 
@@ -1323,14 +1331,14 @@ mod tests {
     #[test]
     fn load_refuses_a_seed_that_is_not_the_project_seed() {
         let (_, hex, pubkey) = test_seed();
-        let source = ProjectReleaseSeedSource::new(Some(env_text(&hex)), None);
+        let source = ProjectAnnounceSeedSource::new(Some(env_text(&hex)), None);
         assert!(
             source.load_checked(&pubkey).unwrap().is_some(),
             "positive control"
         );
         assert!(matches!(
             source.load().unwrap_err(),
-            ProjectReleaseSeedError::NotTheProjectSeed {
+            ProjectAnnounceSeedError::NotTheProjectSeed {
                 origin: SeedOrigin::Env
             }
         ));
@@ -1342,31 +1350,31 @@ mod tests {
     #[test]
     fn seed_errors_never_render_the_seed() {
         let (_, hex, _) = test_seed();
-        let other = *SignKeypair::from_ml_dsa_seed(&[0x22; PROJECT_RELEASE_SEED_LEN])
+        let other = *SignKeypair::from_ml_dsa_seed(&[0x22; PROJECT_ANNOUNCE_SEED_LEN])
             .unwrap()
             .public_key();
         let dir = tempfile::tempdir().unwrap();
         let path = seed_file(dir.path(), &hex);
-        let file_source = ProjectReleaseSeedSource::new(None, Some(dir.path()));
+        let file_source = ProjectAnnounceSeedSource::new(None, Some(dir.path()));
         let mut bad_hex = hex.clone();
         bad_hex.replace_range(63..64, "g");
         let renderings = vec![
             format!(
                 "{:?}",
-                ProjectReleaseSeedSource::new(Some(env_text(&hex)), Some(dir.path()))
+                ProjectAnnounceSeedSource::new(Some(env_text(&hex)), Some(dir.path()))
             ),
             format!("{:?}", env_text(&hex)),
             file_source.load_checked(&other).unwrap_err().to_string(),
-            ProjectReleaseSeedSource::new(Some(env_text(&hex)), None)
+            ProjectAnnounceSeedSource::new(Some(env_text(&hex)), None)
                 .load_checked(&other)
                 .unwrap_err()
                 .to_string(),
-            ProjectReleaseSeedSource::new(Some(env_text(&bad_hex)), None)
+            ProjectAnnounceSeedSource::new(Some(env_text(&bad_hex)), None)
                 .load_checked(&other)
                 .unwrap_err()
                 .to_string(),
             SeedHexError::Length(63).to_string(),
-            ProjectReleaseSeedError::Permissions {
+            ProjectAnnounceSeedError::Permissions {
                 path: path.clone(),
                 mode: 0o644,
             }
@@ -1396,7 +1404,7 @@ mod tests {
         let (bytes, hex, pubkey) = test_seed();
         let dir = tempfile::tempdir().unwrap();
         let path = seed_file(dir.path(), &format!("{hex}\n"));
-        let source = ProjectReleaseSeedSource::new(None, Some(dir.path()));
+        let source = ProjectAnnounceSeedSource::new(None, Some(dir.path()));
         let (seed, origin) = source
             .load_checked(&pubkey)
             .unwrap()
@@ -1413,7 +1421,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // A file that would be refused if it were consulted.
         seed_file(dir.path(), "not a seed");
-        let source = ProjectReleaseSeedSource::new(Some(env_text(&hex)), Some(dir.path()));
+        let source = ProjectAnnounceSeedSource::new(Some(env_text(&hex)), Some(dir.path()));
         let (seed, origin) = source
             .load_checked(&pubkey)
             .unwrap()
@@ -1429,17 +1437,17 @@ mod tests {
     #[test]
     fn load_refuses_a_seed_that_does_not_derive_the_expected_key() {
         let (_, hex, pubkey) = test_seed();
-        let source = ProjectReleaseSeedSource::new(Some(env_text(&hex)), None);
+        let source = ProjectAnnounceSeedSource::new(Some(env_text(&hex)), None);
         assert!(
             source.load_checked(&pubkey).unwrap().is_some(),
             "positive control"
         );
-        let other = *SignKeypair::from_ml_dsa_seed(&[0x22; PROJECT_RELEASE_SEED_LEN])
+        let other = *SignKeypair::from_ml_dsa_seed(&[0x22; PROJECT_ANNOUNCE_SEED_LEN])
             .unwrap()
             .public_key();
         assert!(matches!(
             source.load_checked(&other).unwrap_err(),
-            ProjectReleaseSeedError::NotTheProjectSeed {
+            ProjectAnnounceSeedError::NotTheProjectSeed {
                 origin: SeedOrigin::Env
             }
         ));
@@ -1451,11 +1459,11 @@ mod tests {
     fn load_reports_a_malformed_variable_as_an_error_not_absence() {
         let (_, hex, pubkey) = test_seed();
         for value in ["", "   ", &hex[..10], "zz"] {
-            let source = ProjectReleaseSeedSource::new(Some(env_text(value)), None);
+            let source = ProjectAnnounceSeedSource::new(Some(env_text(value)), None);
             assert!(
                 matches!(
                     source.load_checked(&pubkey).unwrap_err(),
-                    ProjectReleaseSeedError::Malformed {
+                    ProjectAnnounceSeedError::Malformed {
                         origin: SeedOrigin::Env,
                         ..
                     }
@@ -1472,11 +1480,11 @@ mod tests {
     fn load_reports_a_non_text_variable_as_its_own_fault() {
         use std::os::unix::ffi::OsStringExt;
         let (_, _, pubkey) = test_seed();
-        let value = ProjectReleaseSeedText::from_os_string(OsString::from_vec(vec![0xff; 64]));
-        let source = ProjectReleaseSeedSource::new(Some(value), None);
+        let value = ProjectAnnounceSeedText::from_os_string(OsString::from_vec(vec![0xff; 64]));
+        let source = ProjectAnnounceSeedSource::new(Some(value), None);
         assert!(matches!(
             source.load_checked(&pubkey).unwrap_err(),
-            ProjectReleaseSeedError::Malformed {
+            ProjectAnnounceSeedError::Malformed {
                 origin: SeedOrigin::Env,
                 reason: SeedHexError::NotText
             }
@@ -1488,9 +1496,9 @@ mod tests {
         let (_, _, pubkey) = test_seed();
         let dir = tempfile::tempdir().unwrap();
         let path = seed_file(dir.path(), "not a seed\n");
-        let source = ProjectReleaseSeedSource::new(None, Some(dir.path()));
+        let source = ProjectAnnounceSeedSource::new(None, Some(dir.path()));
         match source.load_checked(&pubkey).unwrap_err() {
-            ProjectReleaseSeedError::Malformed { origin, reason } => {
+            ProjectAnnounceSeedError::Malformed { origin, reason } => {
                 assert_eq!(origin, SeedOrigin::File(path));
                 assert!(matches!(reason, SeedHexError::Length(_)));
             }
@@ -1507,7 +1515,7 @@ mod tests {
         let (_, hex, pubkey) = test_seed();
         let dir = tempfile::tempdir().unwrap();
         let path = seed_file(dir.path(), &hex);
-        let source = ProjectReleaseSeedSource::new(None, Some(dir.path()));
+        let source = ProjectAnnounceSeedSource::new(None, Some(dir.path()));
         assert!(
             source.load_checked(&pubkey).unwrap().is_some(),
             "positive control"
@@ -1517,7 +1525,7 @@ mod tests {
         for mode in [0o640, 0o604] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
             match source.load_checked(&pubkey).unwrap_err() {
-                ProjectReleaseSeedError::Permissions { path: p, mode: m } => {
+                ProjectAnnounceSeedError::Permissions { path: p, mode: m } => {
                     assert_eq!(p, path);
                     assert_eq!(m, mode);
                 }
@@ -1541,7 +1549,7 @@ mod tests {
         let root = dir.path().join("profile");
         std::fs::create_dir(&root).unwrap();
         seed_file(&root, &hex);
-        let source = ProjectReleaseSeedSource::new(None, Some(&root));
+        let source = ProjectAnnounceSeedSource::new(None, Some(&root));
         assert!(
             source.load_checked(&pubkey).unwrap().is_some(),
             "positive control"
@@ -1551,7 +1559,7 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(matches!(
             outcome.unwrap_err(),
-            ProjectReleaseSeedError::Unreadable { .. }
+            ProjectAnnounceSeedError::Unreadable { .. }
         ));
     }
 
@@ -1560,17 +1568,17 @@ mod tests {
     fn load_reports_an_unreadable_seed_path_as_an_error() {
         let (_, _, pubkey) = test_seed();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(PROJECT_RELEASE_SEED_FILENAME);
+        let path = dir.path().join(PROJECT_ANNOUNCE_SEED_FILENAME);
         std::fs::create_dir(&path).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let source = ProjectReleaseSeedSource::new(None, Some(dir.path()));
+        let source = ProjectAnnounceSeedSource::new(None, Some(dir.path()));
         assert!(matches!(
             source.load_checked(&pubkey).unwrap_err(),
-            ProjectReleaseSeedError::Unreadable { .. }
+            ProjectAnnounceSeedError::Unreadable { .. }
         ));
     }
 
@@ -1665,13 +1673,13 @@ mod tests {
     #[test]
     fn announce_owner_seed_disjoint_from_content_signing_seed() {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
-        let project_seed = [0x11; PROJECT_RELEASE_SEED_LEN];
+        let project_seed = [0x11; PROJECT_ANNOUNCE_SEED_LEN];
         let owner = derive_project_announce_veilid_owner_seed(&project_seed).unwrap();
         // The owner seed must not equal the raw project seed (the ML-DSA content
         // key's IKM) — else the transport owner would leak the content key's seed.
         assert_ne!(owner.as_bytes(), &project_seed);
         // And the operator's own accessor derives the identical seed.
-        let held = ProjectReleaseSeed::from_bytes(project_seed);
+        let held = ProjectAnnounceSeed::from_bytes(project_seed);
         assert_eq!(
             owner.as_bytes(),
             held.announce_owner_seed().unwrap().as_bytes()
@@ -1694,7 +1702,7 @@ mod tests {
         };
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let owner =
-            derive_project_announce_veilid_owner_seed(&[0x11; PROJECT_RELEASE_SEED_LEN]).unwrap();
+            derive_project_announce_veilid_owner_seed(&[0x11; PROJECT_ANNOUNCE_SEED_LEN]).unwrap();
         assert_ne!(
             owner.as_bytes(),
             derive_room_veilid_owner_seed("lobby", &CNSA_2_0)

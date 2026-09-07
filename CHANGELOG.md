@@ -26,19 +26,19 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
-- `daemonseed-core`: `ProjectReleaseSeed`, `ProjectReleaseSeedText`, `ProjectReleaseSeedSource` and
-  `SeedOrigin` — the operator instance's project-release seed, loaded at runtime from
-  `DAEMONSEED_PROJECT_RELEASE_SEED` (read first) or `<profile-root>/project-release.seed`
+- `daemonseed-core`: `ProjectAnnounceSeed`, `ProjectAnnounceSeedText`, `ProjectAnnounceSeedSource` and
+  `SeedOrigin` — the operator instance's project-announce seed, loaded at runtime from
+  `DAEMONSEED_PROJECT_ANNOUNCE_SEED` (read first) or `<profile-root>/project-announce.seed`
   (owner-readable only on Unix), 64 hex characters, and refused unless it derives the baked
-  `project_release_pubkey()`; `PROJECT_RELEASE_SEED_ENV`, `PROJECT_RELEASE_SEED_FILENAME`,
-  `PROJECT_RELEASE_SEED_LEN`; `ProjectReleaseSeedError`, `SeedHexError`.
+  `project_announce_pubkey()`; `PROJECT_ANNOUNCE_SEED_ENV`, `PROJECT_ANNOUNCE_SEED_FILENAME`,
+  `PROJECT_ANNOUNCE_SEED_LEN`; `ProjectAnnounceSeedError`, `SeedHexError`.
 - `daemonseed-veilid-net`: `OperatorCredential` — the signing keypair and announce owner seed an
   operator instance holds for the session, built from a loaded seed and refused unless the derived
-  keys are `project_release_pubkey()` and `PROJECT_ANNOUNCE_OWNER_PUBKEY`; `OperatorCredentialError`.
+  keys are `project_announce_pubkey()` and `PROJECT_ANNOUNCE_OWNER_PUBKEY`; `OperatorCredentialError`.
   An example,
-  `project_release_pubkeys`, derives the two public keys a seed bakes (seed on standard input,
+  `project_announce_pubkeys`, derives the two public keys a seed bakes (seed on standard input,
   never printed).
-- `ISC-A-S27`: no byte in the source tree derives the project-release signing key or the announce
+- `ISC-A-S27`: no byte in the source tree derives the project-announce signing key or the announce
   owner key.
 - `.github/workflows/ci.yml` — the Definition-of-Done gate on every pull request and on `main`,
   one job per gate group.
@@ -704,7 +704,7 @@ work lives in the maintainer's own planning notes, not here.
 
 - `daemonseed-core`: `PROJECT_RELEASE_SEED`, `dev_project_release_keypair`,
   `dev_project_announce_veilid_owner_seed` — the seed is no longer in the source tree.
-- `daemonseed-gui`: `DAEMONSEED_OPERATOR` — possession of the project-release seed is the operator
+- `daemonseed-gui`: `DAEMONSEED_OPERATOR` — possession of the project-announce seed is the operator
   capability; there is no second gate. Debug builds are no longer world-writable on the announce
   record.
 - `daemonseed_veilid_net::dm::spawn_dm_ack_publish`. The DM driver owns when a standalone
@@ -731,12 +731,18 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
-- The project-release identity is rotated: `project_release_pubkey()` and
+- `project_release_*` is renamed `project_announce_*` throughout `daemonseed-core` and
+  `daemonseed-veilid-net`: `project_announce_pubkey()`, `project_announce_pubkey.bin`,
+  `ProjectAnnounceSeed` / `ProjectAnnounceSeedText` / `ProjectAnnounceSeedSource`,
+  `PROJECT_ANNOUNCE_SEED_{ENV,FILENAME,LEN}`, the `project_announce_pubkeys` example. Operators supply
+  the seed as `DAEMONSEED_PROJECT_ANNOUNCE_SEED` or `<profile-root>/project-announce.seed`; the former
+  names are not read. No key-derivation label or wire value changes.
+- The project-announce identity is rotated: `project_announce_pubkey()` and
   `PROJECT_ANNOUNCE_OWNER_PUBKEY` are the keys of a new seed. Every client re-anchors to the new
   announce record on upgrade. Builds carrying the previous keys are untrusted and must be upgraded:
   they accept content signed under a seed that is no longer private.
 - `daemonseed-gui`: the operator credential is loaded once at Connect and held for the session; a
-  seed that is malformed, readable by others, or not the project-release seed is reported on the
+  seed that is malformed, readable by others, or not the project-announce seed is reported on the
   announcements pane on every snapshot and at every write, rather than silently demoting the
   instance to a reader. The composer, the keep-alive and every write read one predicate: whether
   a credential was loaded. The seed variable's value is taken out of the process environment at

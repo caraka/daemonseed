@@ -2609,35 +2609,35 @@ modules:
 # ─────────────────────────────────────────────────────────────────────
 
 types:
-  # ── public_space: the operator's project-release seed ───────────────
-  - name: ProjectReleaseSeed
+  # ── public_space: the operator's project-announce seed ───────────────
+  - name: ProjectAnnounceSeed
     module: daemonseed_core::public_space
     kind: struct
     description: >-
-      The project-release seed: the one secret the project-release signing key and the
+      The project-announce seed: the one secret the project-announce signing key and the
       announce record's owner seed both descend from. Held only by the operator instance,
-      loaded at runtime through ProjectReleaseSeedSource; a value of this type is a seed
+      loaded at runtime through ProjectAnnounceSeedSource; a value of this type is a seed
       that derived the public key its loader was told to expect. 32 bytes, boxed.
     security:
       contains_secret: true
       zeroize_on_drop: true
 
-  - name: ProjectReleaseSeedText
+  - name: ProjectAnnounceSeedText
     module: daemonseed_core::public_space
     kind: struct
     description: >-
-      The value of PROJECT_RELEASE_SEED_ENV as taken out of the process environment —
+      The value of PROJECT_ANNOUNCE_SEED_ENV as taken out of the process environment —
       the seed in text form. Zeroed-on-drop buffer; Clone yields another; Debug redacted.
     security:
       contains_secret: true
       zeroize_on_drop: true
 
-  - name: ProjectReleaseSeedSource
+  - name: ProjectAnnounceSeedSource
     module: daemonseed_core::public_space
     kind: struct
     description: >-
       Where an operator instance's seed may come from: the value of
-      PROJECT_RELEASE_SEED_ENV, read first, and the file PROJECT_RELEASE_SEED_FILENAME
+      PROJECT_ANNOUNCE_SEED_ENV, read first, and the file PROJECT_ANNOUNCE_SEED_FILENAME
       under the profile root. Both inputs are handed in rather than read ambiently.
       Not Clone; Debug names whether the variable was set, never its value.
 
@@ -2646,7 +2646,7 @@ types:
     kind: enum
     description: Where a loaded seed came from — Env, or File(path). Named in the operator's trace and in every error.
 
-  - name: ProjectReleaseSeedError
+  - name: ProjectAnnounceSeedError
     module: daemonseed_core::public_space
     kind: enum
     description: >-
@@ -4115,7 +4115,7 @@ types:
     module: daemonseed_core::public_space
     kind: struct
     description: >-
-      Operator entries plus the always-present, file-non-removable project-release
+      Operator entries plus the always-present, file-non-removable project-announce
       entry (F17). authorizes() is the cheap gate before any signature work.
 
   - name: ArtifactError
@@ -7492,36 +7492,36 @@ functions:
       type: Duration
       description: The delay until the next announce keep-alive emission.
 
-  - name: project_release_pubkey
+  - name: project_announce_pubkey
     module: daemonseed_core::public_space
     description: >-
-      F17 project-release signer key (ISC-15). DEV PLACEHOLDER derived once from
+      F17 project-announce signer key (ISC-15). DEV PLACEHOLDER derived once from
       an in-source seed during the private phase; replaced by a baked-in real
       release pubkey before public launch. Always authorized; operators cannot
       remove it.
-    signature: "pub fn project_release_pubkey() -> &'static [u8; PK_LEN]"
+    signature: "pub fn project_announce_pubkey() -> &'static [u8; PK_LEN]"
     parameters: []
     returns:
       type: "&'static [u8; PK_LEN]"
-      description: The always-authorized project-release public key.
+      description: The always-authorized project-announce public key.
 
-  - name: ProjectReleaseSeed::from_bytes
+  - name: ProjectAnnounceSeed::from_bytes
     module: daemonseed_core::public_space
     description: >-
       Wrap a seed already held as bytes. For the loader and for a test building the
       expectation it checks against; a shipped path holds a seed only through
-      ProjectReleaseSeedSource::load.
-    signature: "pub fn from_bytes(bytes: [u8; PROJECT_RELEASE_SEED_LEN]) -> Self"
+      ProjectAnnounceSeedSource::load.
+    signature: "pub fn from_bytes(bytes: [u8; PROJECT_ANNOUNCE_SEED_LEN]) -> Self"
     parameters:
       - name: bytes
-        type: "[u8; PROJECT_RELEASE_SEED_LEN]"
+        type: "[u8; PROJECT_ANNOUNCE_SEED_LEN]"
         direction: in
         description: The 32-byte seed.
     returns:
-      type: ProjectReleaseSeed
+      type: ProjectAnnounceSeed
       description: The wrapped seed.
 
-  - name: ProjectReleaseSeed::parse_hex
+  - name: ProjectAnnounceSeed::parse_hex
     module: daemonseed_core::public_space
     description: >-
       Parse the seed's 64-hex-character text form; surrounding whitespace is ignored.
@@ -7533,7 +7533,7 @@ functions:
         direction: in
         description: The seed as hex.
     returns:
-      type: "Result<ProjectReleaseSeed, SeedHexError>"
+      type: "Result<ProjectAnnounceSeed, SeedHexError>"
       description: The parsed seed.
       error_variants:
         - name: Length
@@ -7541,11 +7541,11 @@ functions:
         - name: NotHex
           condition: A character is not a hexadecimal digit.
 
-  - name: ProjectReleaseSeed::signing_keypair
+  - name: ProjectAnnounceSeed::signing_keypair
     module: daemonseed_core::public_space
     description: >-
       The ML-DSA-87 keypair the operator signs MOTD and announcements with; its public
-      key is project_release_pubkey for a seed the loader accepted.
+      key is project_announce_pubkey for a seed the loader accepted.
     signature: "pub fn signing_keypair(&self) -> Result<SignKeypair, KeyDerivationError>"
     parameters: []
     returns:
@@ -7557,7 +7557,7 @@ functions:
     preconditions:
       - description: The oxicrypt module must be operational.
 
-  - name: ProjectReleaseSeed::announce_owner_seed
+  - name: ProjectAnnounceSeed::announce_owner_seed
     module: daemonseed_core::public_space
     description: The announce record's owner seed, derive_project_announce_veilid_owner_seed over this seed.
     signature: "pub fn announce_owner_seed(&self) -> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError>"
@@ -7569,40 +7569,40 @@ functions:
         - name: Hkdf
           condition: HKDF derivation failed.
 
-  - name: ProjectReleaseSeedSource::new
+  - name: ProjectAnnounceSeedSource::new
     module: daemonseed_core::public_space
     description: >-
       A source from the seed variable's value, if it was set, and the seed file
-      PROJECT_RELEASE_SEED_FILENAME under profile_root. Both inputs are handed in rather
+      PROJECT_ANNOUNCE_SEED_FILENAME under profile_root. Both inputs are handed in rather
       than read here. An instance with no profile root can be given the seed only
       through the variable.
-    signature: "pub fn new(env: Option<ProjectReleaseSeedText>, profile_root: Option<&Path>) -> Self"
+    signature: "pub fn new(env: Option<ProjectAnnounceSeedText>, profile_root: Option<&Path>) -> Self"
     parameters:
       - name: env
-        type: "Option<ProjectReleaseSeedText>"
+        type: "Option<ProjectAnnounceSeedText>"
         direction: in
-        description: The value of PROJECT_RELEASE_SEED_ENV, if set.
+        description: The value of PROJECT_ANNOUNCE_SEED_ENV, if set.
       - name: profile_root
         type: "Option<&Path>"
         direction: in
         description: The profile root the seed file lives under, if any.
     returns:
-      type: ProjectReleaseSeedSource
+      type: ProjectAnnounceSeedSource
       description: The source.
 
-  - name: ProjectReleaseSeedSource::load
+  - name: ProjectAnnounceSeedSource::load
     module: daemonseed_core::public_space
     description: >-
-      Load the seed and check it against the baked project_release_pubkey. Ok(None) is an
+      Load the seed and check it against the baked project_announce_pubkey. Ok(None) is an
       instance given no seed; Ok(Some) is the seed and where it came from; every other
       outcome is an error. The variable, if set, is the seed and the file is not
       consulted; a set-but-empty variable is malformed. A missing file is absence; a file
       that exists and cannot be read, is not a regular file, or (on Unix) is readable by
       users other than its owner, is an error.
-    signature: "pub fn load(&self) -> Result<Option<(ProjectReleaseSeed, SeedOrigin)>, ProjectReleaseSeedError>"
+    signature: "pub fn load(&self) -> Result<Option<(ProjectAnnounceSeed, SeedOrigin)>, ProjectAnnounceSeedError>"
     parameters: []
     returns:
-      type: "Result<Option<(ProjectReleaseSeed, SeedOrigin)>, ProjectReleaseSeedError>"
+      type: "Result<Option<(ProjectAnnounceSeed, SeedOrigin)>, ProjectAnnounceSeedError>"
       description: The checked seed and its origin, or None for an instance given no seed.
       error_variants:
         - name: Malformed
@@ -7618,7 +7618,7 @@ functions:
     preconditions:
       - description: The oxicrypt module must be operational.
 
-  - name: ProjectReleaseSeedText::from_os_string
+  - name: ProjectAnnounceSeedText::from_os_string
     module: daemonseed_core::public_space
     description: Take the variable's value into a zeroed-on-drop buffer; the OsString is consumed.
     signature: "pub fn from_os_string(value: OsString) -> Self"
@@ -7626,24 +7626,24 @@ functions:
       - name: value
         type: OsString
         direction: in
-        description: The value of PROJECT_RELEASE_SEED_ENV.
+        description: The value of PROJECT_ANNOUNCE_SEED_ENV.
     returns:
-      type: ProjectReleaseSeedText
+      type: ProjectAnnounceSeedText
       description: The seed text.
 
-  - name: ProjectReleaseSeedSource::load_checked
+  - name: ProjectAnnounceSeedSource::load_checked
     module: daemonseed_core::public_space
     description: >-
       Load the seed and check it against expected_pubkey. The same contract as load with
       the expectation as a parameter, so the check has a positive control in tests.
-    signature: "pub fn load_checked(&self, expected_pubkey: &[u8; PK_LEN]) -> Result<Option<(ProjectReleaseSeed, SeedOrigin)>, ProjectReleaseSeedError>"
+    signature: "pub fn load_checked(&self, expected_pubkey: &[u8; PK_LEN]) -> Result<Option<(ProjectAnnounceSeed, SeedOrigin)>, ProjectAnnounceSeedError>"
     parameters:
       - name: expected_pubkey
         type: "&[u8; PK_LEN]"
         direction: in
         description: The ML-DSA-87 public key the seed must derive.
     returns:
-      type: "Result<Option<(ProjectReleaseSeed, SeedOrigin)>, ProjectReleaseSeedError>"
+      type: "Result<Option<(ProjectAnnounceSeed, SeedOrigin)>, ProjectAnnounceSeedError>"
       description: As load.
     preconditions:
       - description: The oxicrypt module must be operational.
@@ -7662,7 +7662,7 @@ functions:
       - name: project_seed
         type: "&[u8; 32]"
         direction: in
-        description: The maintainer-held project-release seed.
+        description: The maintainer-held project-announce seed.
     returns:
       type: "Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError>"
       description: The derived 32-byte VLD0 owner seed (the DHT write-gate secret).
@@ -7786,7 +7786,7 @@ functions:
   - name: Whitelist::authorizes
     module: daemonseed_core::public_space
     description: >-
-      ISC-12 gate: project-release always authorized; FullKey by exact bytes;
+      ISC-12 gate: project-announce always authorized; FullKey by exact bytes;
       Handle by SHA-384 hash-prefix match computed without touching the signature.
     signature: "pub fn authorizes(&self, pubkey: &[u8]) -> Result<bool, oxicrypt_module::Error>"
     parameters:
@@ -8543,21 +8543,21 @@ error_types:
 # ─────────────────────────────────────────────────────────────────────
 
 constants:
-  - name: PROJECT_RELEASE_SEED_ENV
+  - name: PROJECT_ANNOUNCE_SEED_ENV
     module: daemonseed_core::public_space
     type: "&str"
-    value: '"DAEMONSEED_PROJECT_RELEASE_SEED"'
-    description: Environment variable carrying the project-release seed as 64 hex characters; read before the seed file.
-  - name: PROJECT_RELEASE_SEED_FILENAME
+    value: '"DAEMONSEED_PROJECT_ANNOUNCE_SEED"'
+    description: Environment variable carrying the project-announce seed as 64 hex characters; read before the seed file.
+  - name: PROJECT_ANNOUNCE_SEED_FILENAME
     module: daemonseed_core::public_space
     type: "&str"
-    value: '"project-release.seed"'
-    description: Name of the file under the profile root holding the project-release seed as 64 hex characters; must be readable by its owner only.
-  - name: PROJECT_RELEASE_SEED_LEN
+    value: '"project-announce.seed"'
+    description: Name of the file under the profile root holding the project-announce seed as 64 hex characters; must be readable by its owner only.
+  - name: PROJECT_ANNOUNCE_SEED_LEN
     module: daemonseed_core::public_space
     type: usize
     value: "32"
-    description: Length of the project-release seed in bytes.
+    description: Length of the project-announce seed in bytes.
   - name: WORD_COUNT
     module: daemonseed_core::identity::mnemonic
     type: usize

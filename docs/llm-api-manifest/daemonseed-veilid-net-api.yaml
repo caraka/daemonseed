@@ -685,7 +685,7 @@ types:
     module: daemonseed_veilid_net::identity
     kind: struct
     description: >-
-      What the operator instance holds: the project-release signing keypair and the
+      What the operator instance holds: the project-announce signing keypair and the
       announce record's owner seed, both derived from one runtime-loaded project seed and
       both checked against the keys baked into the build before either is handed out.
       Not Clone; Debug redacted. Held for the session by the instance that writes the
@@ -697,7 +697,7 @@ types:
     module: daemonseed_veilid_net::identity
     kind: enum
     description: >-
-      Why an operator credential could not be built — Seed(ProjectReleaseSeedError),
+      Why an operator credential could not be built — Seed(ProjectAnnounceSeedError),
       Signer(KeyDerivationError), Owner(AnnounceOwnerError), NotTheBakedSigner (the seed
       derives a signing key that is not the expected one), or NotTheBakedOwner (the seed
       derives an announce owner key that is not the expected one).
@@ -1768,13 +1768,13 @@ functions:
   - name: identity::OperatorCredential::load
     module: daemonseed_veilid_net::identity
     description: >-
-      Load the seed from the source, checked against the baked project_release_pubkey,
+      Load the seed from the source, checked against the baked project_announce_pubkey,
       then derive the announce owner seed, checked against PROJECT_ANNOUNCE_OWNER_PUBKEY.
       Ok(None) is an instance given no seed; every other failure is an error.
-    signature: "pub fn load(source: &ProjectReleaseSeedSource) -> Result<Option<(Self, SeedOrigin)>, OperatorCredentialError>"
+    signature: "pub fn load(source: &ProjectAnnounceSeedSource) -> Result<Option<(Self, SeedOrigin)>, OperatorCredentialError>"
     parameters:
       - name: source
-        type: "&ProjectReleaseSeedSource"
+        type: "&ProjectAnnounceSeedSource"
         direction: in
         description: The seed variable's value and the profile root's seed file.
     returns:
@@ -1782,7 +1782,7 @@ functions:
       description: The credential and where its seed came from, or None for an instance given no seed.
       error_variants:
         - name: Seed
-          condition: The seed could not be loaded or is not the project-release seed.
+          condition: The seed could not be loaded or is not the project-announce seed.
         - name: Signer
           condition: ML-DSA key derivation failed.
         - name: Owner
@@ -1801,12 +1801,12 @@ functions:
       and the owner key against expected_owner. Both checks run on every path that builds
       a credential; the expectations are parameters so each check has a positive control
       in tests, and load passes the baked constants.
-    signature: "pub fn from_seed(seed: &ProjectReleaseSeed, expected_signer: &[u8; IDENTITY_PK_LEN], expected_owner: &[u8; 32]) -> Result<Self, OperatorCredentialError>"
+    signature: "pub fn from_seed(seed: &ProjectAnnounceSeed, expected_signer: &[u8; IDENTITY_PK_LEN], expected_owner: &[u8; 32]) -> Result<Self, OperatorCredentialError>"
     parameters:
       - name: seed
-        type: "&ProjectReleaseSeed"
+        type: "&ProjectAnnounceSeed"
         direction: in
-        description: A loaded project-release seed.
+        description: A loaded project-announce seed.
       - name: expected_signer
         type: "&[u8; IDENTITY_PK_LEN]"
         direction: in
@@ -1828,7 +1828,7 @@ functions:
     parameters: []
     returns:
       type: "&SignKeypair"
-      description: The project-release signing keypair.
+      description: The project-announce signing keypair.
 
   - name: identity::OperatorCredential::owner_seed
     module: daemonseed_veilid_net::identity

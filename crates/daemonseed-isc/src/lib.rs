@@ -24,7 +24,7 @@
 //!   share ones re-scoped to the Veilid DHT. S31 added the #89 UploadMotd
 //!   in-band signer-set MOTD; #156 added ISC-S32/S33/S34 pos + ISC-A-S24/A-S25/
 //!   A-S26 neg — the receiver-verifiable share_id binding; A-S27 neg — the
-//!   project-release seed is not in the source tree, the operator loads it at
+//!   project-announce seed is not in the source tree, the operator loads it at
 //!   runtime and both derived public keys are checked against the baked ones)
 //! - 129 client-side: 90 positive (`ISC-C*`) + 39 negative (`ISC-A-C*`)
 //!   (A-C45 added with the #293 decision: the DM store scrubs a record before
@@ -148,8 +148,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-S24", IscClass::Negative),
     ("ISC-A-S25", IscClass::Negative),
     ("ISC-A-S26", IscClass::Negative),
-    // ── server negative (the project-release seed leaves the source tree): no byte
-    //    in the tree derives the project-release signing key or the announce owner
+    // ── server negative (the project-announce seed leaves the source tree): no byte
+    //    in the tree derives the project-announce signing key or the announce owner
     //    key; the operator loads the seed at runtime and both derived public keys
     //    are checked against the baked ones before the credential is held. ────────
     ("ISC-A-S27", IscClass::Negative),
@@ -675,7 +675,7 @@ mod tests {
         //                                  guard) — the rest of the DM family
         //                                  registers per build slice.
         //   total   161 pos + 85 neg = 246
-        //   (A-S27 neg: the project-release seed is not in the source tree.)
+        //   (A-S27 neg: the project-announce seed is not in the source tree.)
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs. A-C43 was
         //    added with the TLS-stack removal: daemonseed's own envelopes never

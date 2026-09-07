@@ -290,7 +290,7 @@ pub fn public_room_share_veilid_owner(family: &str, room: &str) -> String {
 // ── Project announce channel (F17 / A0/A1) ──────────────────────────────────
 
 /// HKDF salt for the project-announce Veilid rendezvous-owner seed (Phase 4 A1).
-/// A fixed protocol constant. The IKM is the maintainer-held project-release seed
+/// A fixed protocol constant. The IKM is the maintainer-held project-announce seed
 /// (F17), so the owner keypair — the DHT write-gate for the single project
 /// announcements/MOTD channel (A0) — is NON-derivable by clients (they hold only
 /// the derived owner pubkey). A distinct salt so the announce owner can never
@@ -299,7 +299,7 @@ pub const PROJECT_ANNOUNCE_OWNER_SALT: &[u8] = b"daemonseed/v1/project-announce-
 
 /// HKDF info string for the project-announce Veilid rendezvous-owner seed (Phase 4
 /// A1). A **sibling** of the F17 content-signing key: both derive from the one
-/// maintainer-held project-release seed, but the content key uses the seed as an
+/// maintainer-held project-announce seed, but the content key uses the seed as an
 /// ML-DSA seed directly while this HKDF-expands it under this label — so
 /// transport-owner and content-signing material are domain-separated (possessing
 /// one never yields the other). A single global channel — no per-room/family

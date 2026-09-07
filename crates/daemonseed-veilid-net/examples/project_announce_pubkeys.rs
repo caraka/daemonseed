@@ -1,4 +1,4 @@
-//! Derive the two public keys a project-release seed bakes into clients.
+//! Derive the two public keys a project-announce seed bakes into clients.
 //!
 //! Reads the seed as 64 hex characters from standard input — never from an
 //! argument, so it does not land in a shell history or a process listing — and
@@ -7,18 +7,18 @@
 //! owner public key as a Rust array literal (the value of
 //! `PROJECT_ANNOUNCE_OWNER_PUBKEY`). With `--pubkey-out <path>` it also writes the
 //! raw signing public key to that path, which is the file `include_bytes!` bakes
-//! as `project_release_pubkey.bin`.
+//! as `project_announce_pubkey.bin`.
 //!
 //! The seed itself is never printed. Every derivation runs through the same
 //! functions the runtime uses to check a loaded seed, so this tool cannot disagree
 //! with the code that will later refuse a seed that does not match its output.
 //!
-//!     cargo run -p daemonseed-veilid-net --example project_release_pubkeys -- \
-//!         --pubkey-out crates/daemonseed-core/src/project_release_pubkey.bin < seed-file
+//!     cargo run -p daemonseed-veilid-net --example project_announce_pubkeys -- \
+//!         --pubkey-out crates/daemonseed-core/src/project_announce_pubkey.bin < seed-file
 
 use std::io::Read;
 
-use daemonseed_core::public_space::{content_address, ProjectReleaseSeed};
+use daemonseed_core::public_space::{content_address, ProjectAnnounceSeed};
 use daemonseed_veilid_net::identity::rendezvous_owner_public_bytes;
 
 fn main() {
@@ -45,7 +45,7 @@ fn main() {
         eprintln!("could not read the seed from standard input: {e}");
         std::process::exit(2);
     }
-    let seed = match ProjectReleaseSeed::parse_hex(&text) {
+    let seed = match ProjectAnnounceSeed::parse_hex(&text) {
         Ok(seed) => seed,
         Err(e) => {
             eprintln!("the seed is malformed: {e}");
@@ -86,7 +86,7 @@ fn main() {
         }
     };
     println!(
-        "project-release signing pubkey, SHA-384: {}",
+        "project-announce signing pubkey, SHA-384: {}",
         hex(digest.as_bytes())
     );
     println!("announce owner pubkey, hex: {}", hex(&owner_public));

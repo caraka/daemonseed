@@ -55,7 +55,7 @@ use daemonseed_core::profile::persist::{
     load_for_unlock, session_materials_from_unlock, write_first_start,
 };
 use daemonseed_core::profile::resolve::{ResolveArgs, ResolvedProfileRoot, resolve};
-use daemonseed_core::public_space::{PROJECT_RELEASE_SEED_ENV, ProjectReleaseSeedText};
+use daemonseed_core::public_space::{PROJECT_ANNOUNCE_SEED_ENV, ProjectAnnounceSeedText};
 use daemonseed_core::storage::seeds;
 use net::{NetCommand, NetEvent, NetHandle, RosterEntry};
 use profile::Profile;
@@ -279,7 +279,7 @@ fn announcements_model(view: &AnnouncementsView) -> ModelRc<AnnouncementRow> {
 /// Push the verified announcements/MOTD view into the pane props (#91/#92). The
 /// MOTD is the verbatim inert string (`""` hides the MOTD area, ISC-S9); the posts
 /// replace the list model; the status line is cleared on a successful snapshot,
-/// unless the instance was given a project-release seed it cannot use, in which
+/// unless the instance was given a project-announce seed it cannot use, in which
 /// case the line keeps saying so. `can_compose` (#92) toggles the signer-gated
 /// composer: true reveals the MOTD/announcement composer, false leaves the pane
 /// read-only.
@@ -293,7 +293,7 @@ fn apply_announcements(
     ui.set_announcements(announcements_model(view));
     ui.set_announce_status(SharedString::from(
         operator_fault.map_or_else(String::new, |reason| {
-            format!("project-release seed refused: {reason}")
+            format!("project-announce seed refused: {reason}")
         }),
     ));
     ui.set_can_compose(can_compose);
@@ -480,14 +480,14 @@ type BuiltUi = (
     Rc<RefCell<ShareBrowser>>,
 );
 
-fn build_ui(project_release_seed: Option<ProjectReleaseSeedText>) -> BuiltUi {
+fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
     let ui = AppWindow::new().expect("create AppWindow");
     ui.set_app_version(SharedString::from(APP_VERSION));
     // Round-4 seed: Lobby only (empty-state for circles; Lobby pinned + real).
     let state = Rc::new(RefCell::new(GuiState::lobby_only()));
     state
         .borrow_mut()
-        .set_project_release_seed(project_release_seed);
+        .set_project_announce_seed(project_announce_seed);
     // The net actor is built HERE (round 5) so the circle-plumbing callbacks can
     // reach it (materialize → JoinCircle; circle Send → SendCircle). `NetHandle::new`
     // is crypto-independent — only Connect needs crypto — so it never fails on
@@ -1562,7 +1562,7 @@ fn connect_now(
                 stable_kem_encapsulation_key,
                 dm_session_keys,
                 profile_root,
-                project_release_seed,
+                project_announce_seed,
             ) = {
                 let st = state.borrow();
                 (
@@ -1594,7 +1594,7 @@ fn connect_now(
                     // The seed variable's value, taken out of the environment at
                     // startup; the actor loads the operator credential from it or
                     // from the seed file under the profile root.
-                    st.project_release_seed(),
+                    st.project_announce_seed(),
                 )
             };
             let _ = net.borrow().send(NetCommand::Connect {
@@ -1606,7 +1606,7 @@ fn connect_now(
                 stable_kem_encapsulation_key,
                 dm_session_keys,
                 profile_root,
-                project_release_seed,
+                project_announce_seed,
             });
             // #144: raise the "assembling network" startup mask for the cold-start
             // warmup; it is dismissed on the first real content (a Lobby/circle message
@@ -2597,17 +2597,17 @@ fn main() {
         unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
     }
 
-    // The project-release seed variable's value, if this launch supplied one, taken
+    // The project-announce seed variable's value, if this launch supplied one, taken
     // OUT of the process environment: nothing this process later spawns (a URL
     // opener, a file manager) inherits it, and the only copy is the zeroed-on-drop
     // one `build_ui` hands to the state that carries it to the net actor on each
     // Connect. The seed file under the profile root is the other route, read by the
     // actor itself.
-    let project_release_seed =
-        std::env::var_os(PROJECT_RELEASE_SEED_ENV).map(ProjectReleaseSeedText::from_os_string);
-    if project_release_seed.is_some() {
+    let project_announce_seed =
+        std::env::var_os(PROJECT_ANNOUNCE_SEED_ENV).map(ProjectAnnounceSeedText::from_os_string);
+    if project_announce_seed.is_some() {
         // SAFETY: top of `main`, before any thread spawns or backend init.
-        unsafe { std::env::remove_var(PROJECT_RELEASE_SEED_ENV) };
+        unsafe { std::env::remove_var(PROJECT_ANNOUNCE_SEED_ENV) };
     }
 
     // Headless desktop-integration management (scriptable; the same work the first-run
@@ -2751,7 +2751,7 @@ fn main() {
         // runtime instead of a throwaway per-pick one (#33). Set before any UI wiring
         // so the first pick already has it.
         let _ = PICKER_RT.set(rt.handle().clone());
-        let (ui, state, net, browser) = build_ui(project_release_seed.clone());
+        let (ui, state, net, browser) = build_ui(project_announce_seed.clone());
         wire_auth(
             &ui,
             &state,
@@ -2866,7 +2866,7 @@ fn main() {
         window: window.clone(),
     }))
     .expect("set_platform");
-    let (ui, state, net, browser) = build_ui(project_release_seed);
+    let (ui, state, net, browser) = build_ui(project_announce_seed);
     wire_auth(
         &ui,
         &state,
