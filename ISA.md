@@ -363,8 +363,8 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [x] ISC-A-C41: Anti: a replayed or stale-dated `MemberHeartbeat` MUST NOT refresh presence (or share-liveness) for a member who has departed. The ingest path drops a beacon whose advisory `sent_unix_ms` is outside the freshness window `[now − REPLAY_FRESHNESS_PAST, now + REPLAY_FRESHNESS_FUTURE]` before it reaches the `PresenceTracker` or the share-digest reconcile, so an untrusted relay replaying a captured beacon can pin a departed member present for at most the window, not indefinitely. This BOUNDS replay; it does not eliminate replay of a still-recent beacon (a nonce/sequence anti-replay is deferred) and the window depends on loosely-synchronised wall clocks — both open design points (#78). (#78)
 - [x] ISC-A-C42: Anti: the GUI Lobby roster renders no presence decorator — no dot, colour, badge, "last seen", typing indicator, or join/leave toast — and no offline rows or persistent all-members list; it renders only the live set, and an empty set shows a quiet empty-state, never a roster of absent members. Own presence is never a roster row (the self-beacon is filtered net-side). The roster is RAM-only and not persisted (consistent with ISC-A-C39): a fresh process starts with an empty column. (#75)
 - [ ] ISC-A-C43: Anti: no daemonseed-authored protocol message or sealed envelope ever falls back below CNSA 2.0. Every internal communication — circle frames, share frames, direct messages, provenance signatures, and at-rest envelopes — is sealed and signed under a registry suite in the CNSA 2.0 family or later (ISC-S15); an unsupported, withdrawn, or weaker `suite_id` is rejected outright, with no downgrade path and no negotiated fallback. **This holds independently of the transport.** daemonseed rides Veilid, whose own channel crypto is not CNSA 2.0, and that pre-CNSA-2.0 transport is never grounds for weakening daemonseed's own protocol or envelope: the transport is an untrusted opaque carrier (ISC-A-S2), so its suite has no bearing on the application-layer guarantee. Relying on a pre-CNSA-2.0 transport is permitted; emitting a pre-CNSA-2.0 envelope over it is not.
-- [ ] ISC-A-C44: Anti: a correspondence's on-disk directory name is never a function of any value an observer can compute or harvest. It is minted from the CSPRNG at first contact and recorded in the contact cache — never derived from `chan_id` (which is never serialized anywhere), never from the recipient's key-record address (world-derivable from a harvested public key, so a derived name would make a directory listing a confirmable membership test over any candidate set), and never from a salted derivation over either. The property this buys, stated exactly: against an attacker holding the **disk but not the profile key**, a derived name is a standing oracle answering "is this candidate pubkey a correspondent?" for every directory *including orphaned ones whose cache entry is gone*, while a minted name reveals only what the contact cache still holds — so deleting a contact deletes its linkage, which under a derived scheme outlives the contact for as long as the salt does. **This criterion does NOT claim unlinkability under key compromise:** the mapping is persisted in the contact cache, which lives on the same disk under the same profile key, so an attacker who obtains the key obtains the mapping whichever scheme is used. **Accepted residuals, in scope and deliberately not closed here:** (i) the *number* of correspondence directories reveals the correspondent count, and no naming scheme conceals cardinality — fixed buckets make total profile size report it even if the names were hidden; (ii) the fixed record filenames — one per `RecordKind`, so the set grows as kinds are added — make record *presence* reveal handshake state, and per-file mtimes give a keyless per-directory activity signal that joins to observed online windows exactly as A9's F1 cross-plane join already prices (`docs/design/direct-messaging.md` § *What names a correspondence directory on disk*, #288).
-- [ ] ISC-A-C45: Anti: the DM store never unlinks a record without first overwriting its payload and forcing that overwrite to the medium. Deletion is two fsynced phases then the unlink — an erasure sentinel made durable first, the body overwritten and made durable second — and it applies to **every** `RecordKind`, not only the provisional record that holds `ss0`: the resume record carries A9.2's key material under the same threat. The barrier between the overwrite and the unlink is part of the criterion, not an implementation detail; without it the overwrite may remain dirty page cache that the unlink discards, which is a no-op indistinguishable from a fix by any inspection of the resulting bytes. A crash between the two phases must read as `ErasureInterrupted` and never as an authentication failure, so a power cut is never reported to the user as tampering. **What this criterion does NOT claim:** an SSD's FTL remaps an overwrite to a fresh erase block and a copy-on-write filesystem writes a new extent, so on either the original blocks survive and nothing here reaches them; the property is real on ext4-over-LUKS on rotating or dm-mapped storage and best-effort by construction elsewhere (`docs/design/direct-messaging.md` § *Scrub every record before unlinking it*, #293).
+- [x] ISC-A-C44: Anti: a correspondence's on-disk directory name is never a function of any value an observer can compute or harvest. It is minted from the CSPRNG at first contact and recorded in the contact cache — never derived from `chan_id` (which is never serialized anywhere), never from the recipient's key-record address (world-derivable from a harvested public key, so a derived name would make a directory listing a confirmable membership test over any candidate set), and never from a salted derivation over either. The property this buys, stated exactly: against an attacker holding the **disk but not the profile key**, a derived name is a standing oracle answering "is this candidate pubkey a correspondent?" for every directory *including orphaned ones whose cache entry is gone*, while a minted name reveals only what the contact cache still holds — so deleting a contact deletes its linkage, which under a derived scheme outlives the contact for as long as the salt does. **This criterion does NOT claim unlinkability under key compromise:** the mapping is persisted in the contact cache, which lives on the same disk under the same profile key, so an attacker who obtains the key obtains the mapping whichever scheme is used. **Accepted residuals, in scope and deliberately not closed here:** (i) the *number* of correspondence directories reveals the correspondent count, and no naming scheme conceals cardinality — fixed buckets make total profile size report it even if the names were hidden; (ii) the fixed record filenames — one per `RecordKind`, so the set grows as kinds are added — make record *presence* reveal handshake state, and per-file mtimes give a keyless per-directory activity signal that joins to observed online windows exactly as A9's F1 cross-plane join already prices (`docs/design/direct-messaging.md` § *What names a correspondence directory on disk*, #288).
+- [x] ISC-A-C45: Anti: the DM store never unlinks a record without first overwriting its payload and forcing that overwrite to the medium. Deletion is two fsynced phases then the unlink — an erasure sentinel made durable first, the body overwritten and made durable second — and it applies to **every** `RecordKind`, not only the provisional record that holds `ss0`: the resume record carries A9.2's key material under the same threat. The barrier between the overwrite and the unlink is part of the criterion, not an implementation detail; without it the overwrite may remain dirty page cache that the unlink discards, which is a no-op indistinguishable from a fix by any inspection of the resulting bytes. A crash between the two phases must read as `ErasureInterrupted` and never as an authentication failure, so a power cut is never reported to the user as tampering. **What this criterion does NOT claim:** an SSD's FTL remaps an overwrite to a fresh erase block and a copy-on-write filesystem writes a new extent, so on either the original blocks survive and nothing here reaches them; the property is real on ext4-over-LUKS on rotating or dm-mapped storage and best-effort by construction elsewhere (`docs/design/direct-messaging.md` § *Scrub every record before unlinking it*, #293).
 
 
 - [ ] ISC-A-C1: The client persists no plaintext identifiers, no session-activity logs, no message content, and no recently-contacted lists — only the encrypted at-rest blob (ISC-C3) and a minimal configuration file. Optional ephemeral debug logs must be opt-in, auto-truncated, and exclude identifiers and message content.
@@ -1235,13 +1235,16 @@ and settles nothing else in its text.
 guard lands: replay, clock skew, counter rollback, handle mismatch, forged provenance, a forged share
 identifier on both the announce and withdraw paths, and an outsider key against a room seal.
 
-**The resume record is writable at first establishment, and nothing in production writes one.**
+**The resume record is written at first establishment, and read back at load.**
 `PendingHandshake::establish_with_resume` and `commit_with_resume` implement the create-then-erase
 order, and `restart_channel` consults the resume record first, answering
-`StoredChannelRestart::Established`. Every entry point is reached only from tests: `commit_resume`,
-`establish_with_resume` and `commit_with_resume` have no non-test caller, so the driver still
-establishes by the older path and a correspondence created in one process does not survive into the
-next. What the tests do settle: the pseudonym pair recovered after a store is dropped and reopened
+`StoredChannelRestart::Established`. `commit_with_resume` is the driver's establishment path, so a
+correspondence created in one process is found by the next: `seed_from_store` rebuilds it and
+restores its own signing keypair from the record. What a rebuilt correspondence cannot do is send —
+`DmMachine::send` refuses a resumed channel with `RefusalReason::NotEstablishedThisSession`, because
+each side derives the resumed generation from its own outbox counter and the two can disagree, and
+the answering side's resumed schedule opens a receiving chain only. Agreeing one generation for both
+sides is open (`docs/design/direct-messaging.md`, build note). What the tests settle: the pseudonym pair recovered after a store is dropped and reopened
 signs and verifies real frames, with a crossed-key control; the create-then-erase order holds when
 the resume write is refused; an empty handshake slot round-trips, admits a first attempt, cannot
 replace a persisted one, and leaves the send-floor guard unchanged; and a record's on-disk length
@@ -1257,3 +1260,57 @@ outcome whose contract is that nothing is lost and the caller may retry. That co
 transient store fault and not a decode failure, which is permanent: every restart retries a record
 that will never read, and the user is never told to re-establish. The honest variant cannot carry a
 decode error, so the collapse is forced by the type rather than chosen.
+
+**ISC-A-C44 is met by construction and held by the label tests.** `CorrespondenceLabel::mint` draws
+32 bytes from the CSPRNG and is the only path a new correspondence takes — `DmPersist` and the
+driver's mint site call it, and `from_bytes` has no non-test caller, so no production label descends
+from a harvestable value. `minted_labels_are_distinct`,
+`every_byte_position_of_a_minted_label_varies_across_draws` and
+`successive_minted_labels_do_not_differ_by_a_fixed_step` hold the draw; a directory name is the
+label's own hex and round-trips through it. `chan_id` is not serialized: the contact record has no
+field for it, and `the_address_root_is_at_its_at_rest_offset_and_neither_ss0_nor_chan_id_is` scans
+the sealed bytes for both. That scan is a regression guard over one record, not a corpus-wide
+absence proof, and its own docs say so. The residuals the criterion names — correspondent count from
+directory cardinality, handshake stage from which record kinds are present — are unchanged and
+remain accepted.
+
+**ISC-A-C45 is met, with the barrier driven rather than assumed.** `Locked::delete` refuses a
+profile-scoped kind, scrubs through `scrub_in_place` — sentinel written and made durable, then the
+body overwritten and made durable — and only then unlinks. `a_scrub_drives_two_real_file_barriers`
+drives the two barriers the criterion makes part of itself rather than reading them off the source;
+`delete_reaches_the_scrub_and_not_only_the_unlink` and `delete_reaches_the_scrub_for_every_kind`
+cover the every-kind clause, and `scrub_erases_every_record_kind_without_resizing` holds the length.
+A half-scrubbed record reads as `ErasureInterrupted` rather than as an authentication failure
+(`a_half_scrubbed_record_reads_as_an_interrupted_erase`, and the same for a scrubbed cursor). A
+record whose mode blocks the scrub fails closed as `ErasureBlocked` rather than reporting a delete
+that erased nothing. Orphaned temp siblings take the same overwrite before their unlink, which is
+the path that would otherwise bypass `delete` entirely. The FTL and copy-on-write limits the
+criterion excludes are unchanged.
+
+**What the live two-node driver oracle settles, and what it does not.**
+`two_node_dm_driver` runs first contact, acceptance, one channel message each way and both outboxes
+settling on the correspondent's acknowledgement, over the public network at
+`PowDifficulty::PRODUCTION`, with every address derived independently at both ends. It is the
+evidence for the delivery path as a whole, and it leaves each of these criteria owing something
+specific:
+
+- **ISC-C39** — the engine is proven: both outboxes reach `DeliveryState::ConfirmedCollected` on a
+  verified acknowledgement, and nothing reports delivered before one. The criterion's three truthful
+  UI states are not rendered by either front end, and the seven-day give-up to `Undelivered` is
+  exercised only in paused time.
+- **ISC-C41** — the doorbell, the sender-secret slot and the self-contained entry are proven under a
+  production-difficulty proof of work. Admission is proven at two of its three legs: the oracle runs
+  `AdmissionPolicy::Open`, so the grantee-bound one-time invite token under an invite-only policy is
+  held by unit tests and has no live run.
+- **ISC-C42** — a page round-trips over the real store. The paging tests bound the record count and
+  settle nothing else in the criterion's text.
+- **ISC-C43** — established contact rides the AR-derived channel and the doorbell is consulted only
+  for first contact, both within one session. The criterion's negative — that doorbell
+  erasure cannot suppress an established conversation — has no probe: nothing erases a doorbell and
+  then asserts the channel carries on.
+- **ISC-A-C21** — exactly-once survives the settle window on the live network while the sender is
+  still re-seeding the same slot, and `a_frame_does_not_open_in_another_conversation_or_the_reverse_direction`
+  binds a frame to its pair and direction. The acknowledgement plane cannot assert a position that
+  was never sent (`a_peer_cannot_settle_a_position_we_never_sent`) and a stale acknowledgement is a
+  no-op. Replay into a different carrier record — the same frame at another page position — has no
+  named probe, so the criterion stays open on that clause alone.
