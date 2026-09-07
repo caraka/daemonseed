@@ -71,7 +71,7 @@ A test states what it needs and how to run it, in terms true for anyone: the net
 
 ## Definition of done
 
-The gate is defined once — one table of steps in three groups, `RELEASE_GATE_STEPS` in `xtask/src/main.rs` — and read by every caller. The pre-push hook runs the `preflight` group. CI runs all three groups, one job per group, on every pull request and on `main`. `cargo xtask release-gate` runs all three before a release tag.
+The gate is defined once — one table of steps in three groups, `RELEASE_GATE_STEPS` in `xtask/src/main.rs` — and read by every caller. The pre-push hook runs the `preflight` group. CI runs `preflight` and `dev-suite`, one job per group, on every pull request and on `main`, and `release-suite` on every push to `main` and on manual dispatch — the release profile is exercised once per merge, always before a tag, and not on every pull request. `cargo xtask release-gate` runs all three before a release tag.
 
 | Group | Steps |
 |-------|-------|

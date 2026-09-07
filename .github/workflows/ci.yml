@@ -1,8 +1,13 @@
-# The Definition-of-Done gate, run on every pull request and on `main`. The gate
-# is defined once as a table of steps in three groups in `xtask`
-# (`RELEASE_GATE_STEPS`); each job below runs one group. The pre-push hook runs
-# the `preflight` group, and `cargo xtask release-gate` runs all three before a
-# release tag.
+# The Definition-of-Done gate. The gate is defined once as a table of steps in
+# three groups in `xtask` (`RELEASE_GATE_STEPS`); each job below runs one group.
+# `preflight` and `dev-suite` run on every pull request and on `main`.
+# `release-suite` runs the whole test suite in the release profile, which
+# differs in behaviour (overflow checks, `debug_assertions`) and not only in
+# optimisation; it runs on every push to `main` and on manual dispatch, not on
+# pull requests — a profile-only regression is caught within one merge of
+# landing and always before a tag, at half the billed minutes per pull request.
+# The pre-push hook runs the `preflight` group, and `cargo xtask release-gate`
+# runs all three before a release tag.
 #
 # The live-network tests are excluded by their `#[ignore]` attribute and are NOT
 # covered by this workflow. No job opts back into ignored tests; a unit test in
@@ -68,6 +73,7 @@ jobs:
       - run: cargo xtask gate --group dev-suite
 
   release-suite:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

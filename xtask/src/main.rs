@@ -1052,13 +1052,16 @@ mod tests {
     }
 
     /// The workflow and the gate table are one definition with two callers, so
-    /// every group has exactly one job invoking it. The live-network tests stay behind
-    /// their `#[ignore]` attribute, so nothing in the workflow or in the action it
-    /// calls opts back into ignored tests.
+    /// every group has exactly one job invoking it. `preflight` and `dev-suite` run
+    /// unconditionally; `release-suite` runs on every event except a pull request,
+    /// and that exact condition is pinned so a broader one — which would silently
+    /// stop the release profile being tested on `main` — fails here. The live-network
+    /// tests stay behind their `#[ignore]` attribute, so nothing in the workflow or
+    /// in the action it calls opts back into ignored tests.
     ///
     /// Parsed rather than grepped: a commented-out job, or one held behind an `if:`
-    /// at either the job or the step, is not a job that runs its group, and raw text
-    /// cannot tell the difference.
+    /// at the step, is not a job that runs its group, and raw text cannot tell the
+    /// difference.
     #[test]
     fn the_workflow_runs_every_gate_group_once() {
         let workflow = parse_yaml(".github/workflows/ci.yml");
@@ -1070,31 +1073,60 @@ mod tests {
             "positive control: there must be jobs to examine"
         );
 
-        // One entry per job: the `run` strings of its unconditional steps. A job or a
-        // step carrying an `if:` is conditional, and a job with no `steps` at all — one
-        // that calls a reusable workflow — runs no step of its own.
-        let unconditional: Vec<Vec<&str>> = jobs
+        // Exactly the three gate jobs and nothing beside them: a job that calls a
+        // reusable workflow has no `steps` and would otherwise be invisible below.
+        assert_eq!(
+            jobs.len(),
+            GateGroup::value_variants().len(),
+            "the workflow has one job per gate group and no other"
+        );
+
+        // One entry per job: the job-level `if:` (absent, a string, or something
+        // else — a YAML `false` is not a string and must not read as absent) and the
+        // `run` strings of its unconditional steps. A step carrying an `if:` is
+        // conditional.
+        let per_job: Vec<(Option<&str>, Vec<&str>)> = jobs
             .iter()
-            .filter(|(_, job)| job["if"].is_badvalue())
-            .filter_map(|(_, job)| job["steps"].as_vec())
-            .map(|steps| {
-                steps
-                    .iter()
-                    .filter(|step| step["if"].is_badvalue())
-                    .filter_map(|step| step["run"].as_str())
-                    .collect()
+            .map(|(name, job)| {
+                let condition = &job["if"];
+                assert!(
+                    condition.is_badvalue() || condition.as_str().is_some(),
+                    "job {name:?}: an `if:` must be a string expression, never a bare value"
+                );
+                let runs = job["steps"]
+                    .as_vec()
+                    .map(|steps| {
+                        steps
+                            .iter()
+                            .filter(|step| step["if"].is_badvalue())
+                            .filter_map(|step| step["run"].as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (condition.as_str(), runs)
             })
             .collect();
 
+        const NOT_ON_PULL_REQUESTS: &str = "github.event_name != 'pull_request'";
         for group in GateGroup::value_variants() {
             let invocation = format!("cargo xtask gate --group {}", group.as_str());
-            let jobs_running_it = unconditional
+            let conditions: Vec<Option<&str>> = per_job
                 .iter()
-                .filter(|runs| runs.iter().any(|run| run.trim() == invocation))
-                .count();
+                .filter(|(_, runs)| runs.iter().any(|run| run.trim() == invocation))
+                .map(|(condition, _)| *condition)
+                .collect();
             assert_eq!(
-                jobs_running_it, 1,
+                conditions.len(),
+                1,
                 "exactly one job must run `{invocation}`"
+            );
+            let expected = match group {
+                GateGroup::Preflight | GateGroup::DevSuite => None,
+                GateGroup::ReleaseSuite => Some(NOT_ON_PULL_REQUESTS),
+            };
+            assert_eq!(
+                conditions[0], expected,
+                "the job running `{invocation}` carries the wrong condition"
             );
         }
 

@@ -731,6 +731,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `.github/workflows/ci.yml`: the `release-suite` job runs on pushes to `main` and on manual dispatch,
+  not on pull requests; `preflight` and `dev-suite` run on both.
 - Design documents, `README.md`, `AGENTS.md` and code comments state the design and the tests in
   plain terms: internal review-process narrative, pointers to material not in the repository, and
   private working vocabulary are removed; `README.md` says encrypt where it said seal.
