@@ -4902,14 +4902,27 @@ impl DmMachine {
     ///
     /// **The direction is not guessed.** That call names this side's outbox and
     /// it is destructive: under the state-loss cause every pending entry becomes
-    /// undelivered, terminally. The direction lives on the ratchet, which this
-    /// session holds only for correspondences it established itself
+    /// undelivered, terminally. The direction lives on the ratchet, and a
+    /// correspondence seeded from the store has none
     /// ([`ContactRecord`](daemonseed_core::dm::contact_cache::ContactRecord)
-    /// records `pk_lt`, `pk_pc` and `ss0`, and no role), so after a restart it
-    /// is simply not known here — and trying one direction and then the other
-    /// would run the destructive call on a coin toss. The user is told instead,
-    /// and the queue falls back to the seven-day give-up, which is wasteful and
-    /// never false.
+    /// records `pk_lt`, `pk_pc` and `AR`, and no role) — so from the load until
+    /// something opens a chain again it is simply not known here, and trying one
+    /// direction and then the other would run the destructive call on a coin
+    /// toss. The queue falls back to the seven-day give-up instead, which is
+    /// wasteful and never false.
+    ///
+    /// **Two paths open a chain again, and either makes this decision available.**
+    /// A completed re-establishment does it for a correspondence that was already
+    /// established; [`Self::rearm_handshake`] does it for one whose own
+    /// first-contact entry is still unanswered, from the stored provisional
+    /// record and with no exchange at all. This match is on `pk_lt` alone, so it
+    /// reaches a correspondence armed by either.
+    ///
+    /// **Nothing consumes the event this emits when it cannot answer.** Both
+    /// front ends match [`DmEvent::ChannelDirectionUnknown`] in an explicit
+    /// do-nothing arm, and the variant carries no
+    /// [`TrustEventKey`](daemonseed_core::trust_events::TrustEventKey), so no
+    /// audit entry is written for it either.
     fn on_known_correspondent(
         &mut self,
         now_ms: i64,
@@ -12685,9 +12698,18 @@ mod tests {
     ///
     /// `b` must have been provisioned already; two calls against one acceptor
     /// share it.
-    fn establish_pair(a: &mut DmMachine, b: &mut DmMachine, b_keys: &IdentityKeys) {
+    ///
+    /// The knock is handed back because a re-seed of an introduction is the
+    /// byte-identical entry at the same slot, so it is the only thing a test can
+    /// replay to reach the arm that reads an entry as addressing the channel it
+    /// already holds.
+    fn establish_pair(
+        a: &mut DmMachine,
+        b: &mut DmMachine,
+        b_keys: &IdentityKeys,
+    ) -> (u16, Vec<u8>) {
         let entry = knock_as_initiator(a, b_keys);
-        let out = b.on_doorbell(BASE_MS, sweep_of(vec![entry]));
+        let out = b.on_doorbell(BASE_MS, sweep_of(vec![entry.clone()]));
         let request = out
             .iter()
             .find_map(|e| match e {
@@ -12711,6 +12733,7 @@ mod tests {
             a.correspondences[0].peer_pk_pc.is_some(),
             "the acceptance did not install a pseudonym: {out:?}"
         );
+        entry
     }
 
     /// One outbox entry's delivery state, read from the record.
@@ -14883,9 +14906,25 @@ mod tests {
     /// Queue one entry that has no chain to seal against — A4.2's cause 2, and
     /// the only state that opens a re-establishment.
     fn queue_unsealed(m: &DmMachine, label: &CorrespondenceLabel, direction: Direction, seq: u64) {
+        queue_unsealed_at(m, label, direction, seq, BASE_MS);
+    }
+
+    /// [`queue_unsealed`] at a named instant.
+    ///
+    /// A test running hours past [`BASE_MS`] needs the composition stamp to be
+    /// its own clock: an entry composed at [`BASE_MS`] and read a give-up window
+    /// later is ended by the give-up, which is a fact about the clock and would
+    /// be read as whatever the test was actually asking about.
+    fn queue_unsealed_at(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+        seq: u64,
+        now_ms: i64,
+    ) {
         m.persist
-            .update_outbox(label, direction, BASE_MS, |outbox| {
-                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, BASE_MS)?;
+            .update_outbox(label, direction, now_ms, |outbox| {
+                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, now_ms)?;
                 Ok(Mutation::Changed(()))
             })
             .expect("the entry queues");
@@ -14966,14 +15005,23 @@ mod tests {
         dir: &tempfile::TempDir,
         dir_b: &tempfile::TempDir,
     ) -> (DmMachine, DmMachine, CorrespondenceLabel) {
+        let (a, b, label, _) = established_initiator_with_knock(dir, dir_b);
+        (a, b, label)
+    }
+
+    /// [`established_initiator`], keeping the knock that established the pair.
+    fn established_initiator_with_knock(
+        dir: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+    ) -> (DmMachine, DmMachine, CorrespondenceLabel, (u16, Vec<u8>)) {
         let b_keys = peer_identity();
         let mut b = machine_as(peer_identity(), dir_b);
         b.persist.provision_block_list().expect("provision B");
         let mut a = machine(dir);
         a.persist.provision_block_list().expect("provision");
-        establish_pair(&mut a, &mut b, &b_keys);
+        let knock = establish_pair(&mut a, &mut b, &b_keys);
         let label = a.correspondences[0].label;
-        (a, b, label)
+        (a, b, label, knock)
     }
 
     /// Every correspondence one batch of effects reports as lost.
@@ -15829,7 +15877,17 @@ mod tests {
         dir_b: &tempfile::TempDir,
         pending_seq: u64,
     ) -> (Side, Side) {
-        let (a, b, label_a) = established_initiator(dir_a, dir_b);
+        let (a, b, _) = restart_both_with_knock(dir_a, dir_b, pending_seq);
+        (a, b)
+    }
+
+    /// [`restart_both`], keeping the knock that established the pair.
+    fn restart_both_with_knock(
+        dir_a: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+        pending_seq: u64,
+    ) -> (Side, Side, (u16, Vec<u8>)) {
+        let (a, b, label_a, knock) = established_initiator_with_knock(dir_a, dir_b);
         let label_b = b.correspondences[0].label;
         queue_unsealed(&a, &label_a, Direction::AToB, pending_seq);
         drop(a);
@@ -15904,6 +15962,7 @@ mod tests {
                 label: label_b,
                 surfaced: Vec::new(),
             },
+            knock,
         )
     }
 
@@ -16216,6 +16275,194 @@ mod tests {
                 "{name} side's refusal spent a sequence number"
             );
         }
+    }
+
+    /// Restart both stores and carry the three legs, so both sides hold a
+    /// resumed key schedule again. Hands back the pair, the knock that
+    /// established them, and the clock the last leg landed at.
+    ///
+    /// **The key schedule is asserted here, because without it the callers below
+    /// are about nothing.** `on_known_correspondent` reads this side's outbox
+    /// direction off the ratchet, and a correspondence seeded from the store has
+    /// none — so a fixture that stopped at the restart would take the arm that
+    /// decides nothing, and every assertion about the teardown would pass or fail
+    /// for a reason that has nothing to do with the entry.
+    fn re_established_pair(
+        dir_a: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+    ) -> (Side, Side, (u16, Vec<u8>), i64) {
+        let (mut a, mut b, knock) = restart_both_with_knock(dir_a, dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        let (_, t3) = carry_one_leg(&mut a, &mut b, t2);
+        assert!(
+            a.machine.correspondences[0].ratchet.is_some()
+                && b.machine.correspondences[0].ratchet.is_some(),
+            "the exchange left a side with no key schedule, so the direction \
+             cannot be read and nothing below is about the entry"
+        );
+        (a, b, knock, t3)
+    }
+
+    /// The machine's running admitted total, read off the health event a sweep
+    /// always emits.
+    ///
+    /// **The control every assertion below rests on.** An entry dropped at any
+    /// gate — a stale proof epoch, the seen set, unchanged bytes — produces
+    /// exactly the effects an entry that was admitted and decided nothing
+    /// produces, so an assertion that the channel survived is satisfied by a
+    /// sweep that never opened the entry at all.
+    ///
+    /// **The counter is the machine's, not the sweep's**, so a caller takes the
+    /// difference across its own sweep rather than the value. Read as a total it
+    /// happens to equal one today only because the fixture admits nothing before
+    /// the sweep under test, which a later fixture is free to change without
+    /// anything reporting that the control has stopped controlling.
+    fn admitted_by(effects: &[DmEffect]) -> u64 {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::DoorbellHealth { admission, .. }) => {
+                    Some(admission.admitted)
+                }
+                _ => None,
+            })
+            .expect("a sweep reports its health")
+    }
+
+    /// M73. **A re-seeded introduction arriving after a re-establishment leaves
+    /// the channel and its queue alone.**
+    ///
+    /// The design has a first-contact entry re-seeding on the full schedule
+    /// until its sender sees evidence of establishment, so entries from an
+    /// introduction that worked keep arriving for up to seven days — including
+    /// across a restart, and including after the correspondence has been resumed
+    /// under a fresh key schedule. Every one of them is an entry from an
+    /// identity the acceptor already corresponds with, which is the state
+    /// `on_known_correspondent` decides.
+    ///
+    /// **The re-seed is the identical entry, because that is what a re-seed is.**
+    /// `AR` descends from an `ss0` encapsulated once, when the introduction was
+    /// composed, so replaying the bytes is the only way to produce the root the
+    /// contact record holds. A knock built afresh carries a new one and is the
+    /// case M74 is about.
+    #[test]
+    fn a_re_seeded_introduction_keeps_a_re_established_channel() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (_a, mut b, knock, t3) = re_established_pair(&dir_a, &dir_b);
+
+        // Composed on the acceptor's own clock so the give-up — a fact about the
+        // clock, not about the entry — cannot end it and be read as the teardown.
+        let seq = next_send_seq(&b, t3);
+        queue_unsealed_at(&b.machine, &b.label, Direction::BToA, seq, t3);
+
+        let admitted_before = b.machine.admission.admitted;
+        let out = b.machine.on_doorbell(t3, sweep_of(vec![knock]));
+        assert_eq!(
+            admitted_by(&out) - admitted_before,
+            1,
+            "the re-seed was dropped before any decision was reached: {out:?}"
+        );
+        assert_eq!(
+            lost(&out),
+            Vec::new(),
+            "a re-seed of the introduction tore the channel down: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::ChannelDirectionUnknown { .. }))),
+            "the direction was not read off the resumed key schedule: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::ContactRequest { .. }))),
+            "a re-seed surfaced a second contact request: {out:?}"
+        );
+        assert_eq!(
+            undelivered_seqs(&out),
+            Vec::<u64>::new(),
+            "a re-seed reported a message undelivered: {out:?}"
+        );
+        assert_eq!(
+            outbox_state(&b.machine, &b.label, seq, t3),
+            DeliveryState::Composed,
+            "a re-seed of the introduction ended a pending entry, so that entry \
+             stops being re-seeded: {out:?}"
+        );
+    }
+
+    /// M74. **A fresh knock arriving after a re-establishment ends every pending
+    /// entry the acceptor holds.**
+    ///
+    /// The correspondent has lost their at-rest state: they are knocking as a
+    /// stranger would, under an `ss0` encapsulated afresh, which a
+    /// correspondent's only device would not mint while it still holds the
+    /// channel. Nothing this side holds for
+    /// them can be collected under a chain they no longer have, so the entries
+    /// end now rather than at the seven-day give-up, and the queue stops
+    /// re-seeding against a channel that is gone.
+    ///
+    /// **The reachability is the point of running it here.** The direction the
+    /// teardown names is read off the key schedule, which a restart destroys —
+    /// so before the exchange this decision was not available at all and the
+    /// entries degraded to the give-up. The three legs restore the schedule, and
+    /// this asserts the decision comes back with it.
+    #[test]
+    fn a_fresh_knock_ends_the_queue_of_a_re_established_channel() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (_a, mut b, _knock, t3) = re_established_pair(&dir_a, &dir_b);
+
+        let seq = next_send_seq(&b, t3);
+        queue_unsealed_at(&b.machine, &b.label, Direction::BToA, seq, t3);
+
+        // A knocking from a store that holds nothing, which is what makes this a
+        // fresh introduction rather than a re-send: a new store yields a new
+        // `ss0` and so a root the acceptor's contact record does not hold. Built
+        // on the acceptor's clock so its proof of work is current.
+        let dir_a2 = tempfile::tempdir().expect("temp dir A2");
+        let mut a2 = machine(&dir_a2);
+        a2.persist.provision_block_list().expect("provision A2");
+        let fresh = knock_as_initiator_at(&mut a2, &peer_identity(), t3);
+
+        let admitted_before = b.machine.admission.admitted;
+        let out = b.machine.on_doorbell(t3, sweep_of(vec![fresh]));
+        assert_eq!(
+            admitted_by(&out) - admitted_before,
+            1,
+            "the fresh knock was dropped before any decision was reached: {out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::ChannelDirectionUnknown { .. }))),
+            "the direction was not read off the resumed key schedule: {out:?}"
+        );
+        assert_eq!(
+            lost(&out),
+            vec![(TrustEventKey::DmCorrespondentStateLost, vec![seq])],
+            "the fresh knock did not end the queue under its own cause: {out:?}"
+        );
+        assert_eq!(
+            outbox_state(&b.machine, &b.label, seq, t3),
+            DeliveryState::Undelivered,
+            "the entry is still pending, so it keeps re-seeding against a dead channel"
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::ContactRequest { .. }))),
+            "a known correspondent's fresh knock surfaced a request: {out:?}"
+        );
+    }
+
+    /// The sequence one side's outbox will spend next.
+    fn next_send_seq(side: &Side, now_ms: i64) -> u64 {
+        side.machine
+            .persist
+            .read_outbox(&side.label, now_ms)
+            .expect("the outbox reads")
+            .map_or(0, |outbox| outbox.next_send_seq())
     }
 
     /// Tick one side until it writes a page, and hand back every write with the

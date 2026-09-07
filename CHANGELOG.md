@@ -26,6 +26,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- Coverage for the first-contact teardown across a re-establishment: a re-seeded introduction from
+  an established correspondent leaves a resumed channel and its queue alone, and a fresh
+  first-contact entry from that correspondent ends every pending entry under
+  `TeardownCause::CorrespondentStateLost`. The direction the teardown names is read off the key
+  schedule a completed re-establishment restores (#261).
 - `DmEvent::Roster { correspondents: Vec<Correspondent> }`, emitted once before the DM driver's
   first tick: every correspondence on disk under `CorrespondentState::Established`, `Pending` or
   `Blocked`. `DmEvent::BlockListUnreadable` rides alongside it where the block-list record would not

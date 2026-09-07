@@ -284,11 +284,16 @@ pub enum DmEvent {
     ///
     /// **Nothing was touched**, deliberately. Deciding state loss ends every
     /// pending message on that correspondence irreversibly, and the call that
-    /// does it needs the outbox direction — which lives on the ratchet, which
-    /// this session only holds for correspondences it established itself. A
-    /// guess would end a healthy queue on a coin toss the user cannot see, so
-    /// the queue falls back to the seven-day give-up and the user is told the
-    /// question could not be answered.
+    /// does it needs the outbox direction — which lives on the ratchet, and a
+    /// correspondence seeded from the store at load has none. A guess would end
+    /// a healthy queue on a coin toss, so the queue falls back to the seven-day
+    /// give-up. A completed re-establishment opens a chain again, as does the
+    /// re-arm of a stored handshake on a correspondence whose own first-contact
+    /// entry is unanswered; from either point the question can be answered.
+    ///
+    /// **Nothing surfaces this.** Both front ends match it in an explicit
+    /// do-nothing arm, and it carries no [`TrustEventKey`], so there is no audit
+    /// entry — the unanswered question reaches neither a user nor a log.
     ChannelDirectionUnknown {
         /// The correspondent's long-term identity key.
         with: PkLt,
