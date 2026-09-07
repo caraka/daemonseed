@@ -101,6 +101,41 @@ impl SignKeypair {
         &self.secret_key
     }
 
+    /// Reassemble a keypair from two halves already known to belong together.
+    ///
+    /// **For a keypair read back out of a record rather than derived.** A
+    /// per-correspondent keypair is drawn from the random generator and
+    /// descends from nothing else, so a record is the only place it survives a
+    /// restart — and ML-DSA-87 offers no way to recover a public key from a
+    /// private one, which is why a record that carries one carries both.
+    ///
+    /// **The pairing is the caller's to establish and is not re-checked
+    /// here.** Every record that stores a pair writes both halves of a single
+    /// keypair in one call, and
+    /// [`ProvisionalRecord`](crate::dm::provisional::ProvisionalRecord)
+    /// additionally refuses halves that do not sign and verify when it opens.
+    ///
+    /// The secret half is written straight into its allocation. `Box::new(*key)`
+    /// would materialise 4 896 secret bytes in this frame on the way to the
+    /// heap and leave them there.
+    pub fn from_halves(
+        public_key: &[u8; ml_dsa::PK_LEN],
+        secret_key: &[u8; ml_dsa::SK_LEN],
+    ) -> Self {
+        let mut buf = vec![0u8; ml_dsa::SK_LEN].into_boxed_slice();
+        buf.copy_from_slice(secret_key);
+        let secret_key = match buf.try_into() {
+            Ok(exact) => exact,
+            // Unreachable: the buffer was allocated at exactly the key length.
+            // Not `expect`, whose message would render the bytes.
+            Err(_) => unreachable!("a buffer allocated at SK_LEN is SK_LEN long"),
+        };
+        Self {
+            public_key: Box::new(*public_key),
+            secret_key,
+        }
+    }
+
     /// Build a `SignKeypair` directly from a raw 32-byte ML-DSA-87 seed
     /// (FIPS 204 §5.1) via `oxicrypt_ml_dsa::keygen`.
     ///

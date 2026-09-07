@@ -2835,6 +2835,21 @@ impl PendingHandshake<'_> {
         self.record.address_root()
     }
 
+    /// This party's own per-correspondent signing keypair, as the first-contact
+    /// entry published it.
+    ///
+    /// **What a resuming initiator signs with, and it has to be this one.** The
+    /// entry published the verifying half, so the correspondent verifies every
+    /// later frame against it and a freshly minted pair would sign frames that
+    /// are discarded. The record is the only place it survives the window
+    /// between the entry and the acceptance.
+    ///
+    /// A fresh copy each call rather than a borrow: the caller holds it for the
+    /// life of the correspondence, past the point where the record is erased.
+    pub fn signing_pc(&self) -> crate::identity::keys::SignKeypair {
+        crate::identity::keys::SignKeypair::from_halves(self.record.pk_pc(), self.record.s_pc())
+    }
+
     /// Both channel roots, for a party resuming a handshake it cannot finish
     /// from `AR` alone.
     ///

@@ -693,14 +693,26 @@ struct Introduction {
 /// key schedule and the channel identifier do not survive and are not meant to:
 /// a completed re-establishment mints both again.
 ///
-/// **This side's own pseudonym keypair is on disk and is not read back yet.**
-/// The record carries both halves — `S_pc` and this side's own `PK_pc`, which
-/// has to be stored because ML-DSA offers no way to recover a public key from a
-/// private one — but nothing here installs them on a correspondence rebuilt at
-/// startup. Legs are unaffected either way, because a leg's signature preimage
-/// binds no public key. An ordinary channel frame binds this side's own `PK_pc`
-/// ([`frame::seal`]), so composing one after a restart is still not reachable;
-/// see [`DmMachine::send`], which refuses it.
+/// **This side's own pseudonym keypair survives too, and both halves are needed
+/// for it to.** The record enumerates `S_pc` and this side's own `PK_pc`,
+/// because ML-DSA offers no way to recover a public key from a private one; an
+/// ordinary channel frame binds that public half into what it seals
+/// ([`frame::seal`]), while a leg's signature preimage binds no public key at
+/// all. Both are written when the correspondence is established and read back
+/// when it is rebuilt — [`seed_from_store`] from the resume record, and
+/// [`DmMachine::rearm_handshake`] from the provisional record where the entry is
+/// still awaiting its acceptance.
+///
+/// **What that buys, and what it does not.** The **re-armed handshake** — an
+/// initiator restarting before its acceptance arrives — is wired end to end: it
+/// collects the acceptance, composes ordinary frames under the pseudonym its own
+/// entry published, and the correspondent opens them. The **resumed channel** —
+/// an established correspondence restarted and re-established — is not, and the
+/// keys are not what is missing: see [`Self::resumed`], which is the flag
+/// [`DmMachine::send`] refuses on. So [`DmMachine::send`] refuses a
+/// correspondence with no key schedule, which is every established one until its
+/// re-establishment completes, and refuses it again afterwards for as long as
+/// content frames on a resumed channel are unbuilt.
 struct Correspondence {
     /// The correspondent's long-term identity key.
     pk_lt: PkLt,
@@ -716,8 +728,16 @@ struct Correspondence {
     ratchet: Option<Ratchet>,
     /// Our per-contact pseudonym — what signs every frame we send here.
     ///
-    /// `None` exactly when `ratchet` is: the pseudonym is minted in the process
-    /// that establishes the correspondence and has nowhere at rest to live.
+    /// **Read back at startup**, from whichever record the correspondence has:
+    /// the resume record once it is established, the provisional record while
+    /// its entry is still awaiting an acceptance. So this outlives `ratchet`,
+    /// which nothing writes down — a correspondence rebuilt from disk holds the
+    /// pseudonym and no key schedule until a re-establishment mints one.
+    ///
+    /// `None` where neither record yields it: an established correspondence
+    /// whose resume record will not read, which is the state
+    /// [`DmMachine::resume_channel`] surfaces as unresumable, and an unanswered
+    /// entry whose provisional record is gone.
     signing_pc: Option<SignKeypair>,
     /// The correspondent's pseudonym — what every frame they send is verified
     /// against.
@@ -740,9 +760,8 @@ struct Correspondence {
     /// correspondent's pseudonym from the moment the acceptance is collected.
     /// A correspondence whose entry has not been accepted has none recorded,
     /// and comes back `None` — the same state it was in before the process
-    /// ended. This side's OWN pseudonym keypair is a different matter: its
-    /// at-rest home is the resume record (A4.8 / A9.2), this driver writes
-    /// none, and a restart loses it.
+    /// ended. This side's OWN pseudonym keypair is read back from a different
+    /// record; see [`Self::signing_pc`].
     peer_pk_pc: Option<Box<[u8; IDENTITY_PK_LEN]>>,
     /// The conversation's channel id, derived from `ss0` at establishment or
     /// from the re-rooted secret at a re-establishment.
@@ -777,6 +796,25 @@ struct Correspondence {
     /// advances, and the channel comes back addressable but not speakable until
     /// the next re-establishment.
     candidate: Option<Rerooted>,
+    /// Whether the key schedule this correspondence holds is a **resumed** one —
+    /// opened by a completed re-establishment rather than by a first
+    /// establishment.
+    ///
+    /// **Set by the two re-establishment folds, and it refuses sends.** Content
+    /// frames on a resumed channel are not built yet (the 2026-09-06 note in
+    /// `docs/design/direct-messaging.md`), and the gap is not in the keys: the
+    /// two sides derive the resumed generation from their own outbox counters
+    /// and can disagree, and [`Ratchet::reestablished`] opens a sending chain on
+    /// the initiating side and a receiving chain on the answering one. A frame
+    /// composed here therefore seals, queues, publishes and is discarded by the
+    /// correspondent, surfacing only at the multi-day give-up. So
+    /// [`DmMachine::send`] refuses on this flag instead, at the moment of the
+    /// command and before anything is written.
+    ///
+    /// `false` on every other path, including the re-armed handshake, which is
+    /// wired end to end: an initiator that restarts before its acceptance
+    /// arrives composes ordinary frames its correspondent opens.
+    resumed: bool,
     /// How many `RE-ACK`s this session has composed for this correspondence.
     ///
     /// A8.4's answer-side emission cap, counted here because the design bounds
@@ -1619,7 +1657,8 @@ impl DmMachine {
     }
 
     /// Recompute the ratchet and channel roots of a correspondence whose
-    /// first-contact entry has been sent and not yet accepted.
+    /// first-contact entry has been sent and not yet accepted, and give it back
+    /// the pseudonym keypair that entry published.
     ///
     /// **Without this a restarted initiator can find its correspondence and
     /// still not read it.** The contact record says which correspondence a
@@ -1631,6 +1670,14 @@ impl DmMachine {
     /// them. So a correspondence left unarmed sweeps nothing, opens nothing,
     /// and the correspondent's messages re-emit until their outbox gives up on
     /// them.
+    ///
+    /// **The keypair rides the same record and the same read.** It is drawn
+    /// from the CSPRNG when the entry is composed and descends from nothing, and
+    /// the entry published its verifying half — so a fresh pair minted after a
+    /// restart would sign frames the correspondent discards, and the record is
+    /// the only place the published one survives. Restored here rather than at
+    /// the load: the load has no `fc_epoch` to open the record under, and this
+    /// call is where the two live epochs are tried.
     ///
     /// **The context is rebuilt rather than remembered.** A provisional record
     /// opens only under the context it was sealed with, which binds the
@@ -1734,6 +1781,10 @@ impl DmMachine {
                 chan_id: roots.chan_id(),
             });
             correspondence.ratchet = Some(ratchet);
+            // The pseudonym the entry published, not a fresh one: the
+            // correspondent verifies every frame of this conversation against
+            // the half it read out of that entry.
+            correspondence.signing_pc = Some(pending.signing_pc());
             correspondence.provisional = Some((keyrec_addr, fc_epoch));
             correspondence.rearm_handshake = false;
             return;
@@ -2012,14 +2063,12 @@ impl DmMachine {
     /// The resumed probe frontier of the single correspondence recovered from
     /// disk, for the oracle that pins the cursor seeding.
     ///
-    /// A recovered correspondence is the one with neither a ratchet nor a
-    /// pseudonym; `None` when there is not exactly one, or when it reached no
-    /// page.
+    /// A recovered correspondence is the one with no ratchet: nothing writes a
+    /// key schedule down, so holding one is what says a correspondence was
+    /// established in this process. `None` when there is not exactly one, or
+    /// when it reached no page.
     pub(crate) fn only_resumed_frontier(&self) -> Option<u64> {
-        let mut seeded = self
-            .correspondences
-            .iter()
-            .filter(|c| c.ratchet.is_none() && c.signing_pc.is_none());
+        let mut seeded = self.correspondences.iter().filter(|c| c.ratchet.is_none());
         let first = seeded.next()?;
         if seeded.next().is_some() {
             return None;
@@ -2079,6 +2128,21 @@ impl DmMachine {
                 None,
             ))];
         };
+        // **A resumed channel is live enough to address and not to speak on**,
+        // so the refusal is taken here — before the outbox ask, before the
+        // ratchet steps, and before anything is written. The reason is the same
+        // one a correspondence with no key schedule at all gets, because it
+        // answers the user's question identically: this conversation cannot
+        // carry a message in this session. Sealing instead would queue a frame
+        // the correspondent discards, and the user would learn of it at the
+        // seven-day give-up. See [`Correspondence::resumed`].
+        if self.correspondences[index].resumed {
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::NotEstablishedThisSession,
+                None,
+            ))];
+        }
         let label = self.correspondences[index].label;
         let direction = ratchet.send_direction();
         let next_seq = ratchet.next_send_seq();
@@ -2134,6 +2198,13 @@ impl DmMachine {
 
         // Disjoint borrows: the identity's own public key is read while the
         // correspondence is held mutably for the ratchet step.
+        //
+        // **The re-check below is the same three fields, and it deliberately
+        // does NOT repeat the `resumed` gate above.** Nothing between the two
+        // can set that flag — it is written only by the re-establishment folds
+        // and the two establishment paths, none of which run inside a send —
+        // and the outbox ask in between writes nothing. A second copy would be
+        // a second answer free to disagree with the first.
         let Self {
             identity,
             persist,
@@ -4986,6 +5057,9 @@ impl DmMachine {
                     existing.signing_pc = Some(signing_pc);
                     existing.peer_pk_pc = Some(peer_pk_pc);
                     existing.channel = Some(channel);
+                    // A first establishment, so the schedule is a fresh one and
+                    // whatever this correspondence held before is superseded.
+                    existing.resumed = false;
                     existing.address_root = address_root;
                     existing.provisional = None;
                     if let Some((keyrec_addr, fc_epoch)) = leftover {
@@ -5001,6 +5075,7 @@ impl DmMachine {
                         channel: Some(channel),
                         address_root,
                         candidate: None,
+                        resumed: false,
                         re_acks_answered: 0,
                         response_cap_surfaced: false,
                         retire_ceiling_surfaced: false,
@@ -5661,6 +5736,9 @@ impl DmMachine {
             existing.channel = Some(channel);
             existing.address_root = address_root;
             existing.provisional = Some((recipient_keyrec_addr, fc_epoch));
+            // As above: this schedule is a first establishment's, not a
+            // resumption's.
+            existing.resumed = false;
         } else {
             self.correspondences.push(Correspondence {
                 pk_lt: Box::new(*recipient),
@@ -5673,6 +5751,7 @@ impl DmMachine {
                 channel: Some(channel),
                 address_root,
                 candidate: None,
+                resumed: false,
                 re_acks_answered: 0,
                 response_cap_surfaced: false,
                 retire_ceiling_surfaced: false,
@@ -7169,6 +7248,9 @@ fn fold_re_ack(
     correspondence.ratchet = Some(ratchet);
     correspondence.channel = Some(ChannelRoots { chan_id: *chan_id });
     correspondence.candidate = None;
+    // The channel is addressable and its content frames are not built; see the
+    // field. A send is refused here rather than sealed and discarded.
+    correspondence.resumed = true;
     LegFold::consumed()
 }
 
@@ -7273,6 +7355,10 @@ fn fold_re_confirm(
     correspondence.channel = Some(ChannelRoots {
         chan_id: *candidate.chan_id(),
     });
+    // As on the initiating side, and with more force: this side's resumed
+    // ratchet carries a receiving chain only, so a send would fail inside the
+    // seal and be reported as a seal fault rather than as what it is.
+    correspondence.resumed = true;
     LegFold::consumed()
 }
 
@@ -7442,15 +7528,17 @@ enum Establishment {
 /// nothing speaks on.
 ///
 /// **A lost pseudonym key ends the correspondence, loudly.** `S_pc` is minted
-/// from the CSPRNG when the entry is sent and its only at-rest home is the
-/// record written here, so an initiator whose process ended before the
-/// acceptance arrived comes back without it and can never sign a leg. The
-/// handshake record is still erased — `ss0` roots `RK0`, and keeping it is the
-/// forward-secrecy claim inverted — and the answer is
-/// [`Establishment::Unrecoverable`], which the caller turns into the classed
-/// event a user can act on. The state that leaves behind is one the load path
-/// reads correctly on its own: an established contact record with no resume
-/// record beside it is A3.15 row 6, `RS` absent, which
+/// from the CSPRNG when the entry is sent and cannot be re-derived, so a
+/// correspondence that reaches this call without it can never sign a leg. Both
+/// paths that leave a handshake record to establish from install it — the knock
+/// mints it, and [`DmMachine::rearm_handshake`] reads it back out of that same
+/// record — so this is the residual guard on a state neither of them produces,
+/// not a window that is expected to open. The handshake record is still erased
+/// — `ss0` roots `RK0`, and keeping it is the forward-secrecy claim inverted —
+/// and the answer is [`Establishment::Unrecoverable`], which the caller turns
+/// into the classed event a user can act on. The state that leaves behind is one
+/// the load path reads correctly on its own: an established contact record with
+/// no resume record beside it is A3.15 row 6, `RS` absent, which
 /// [`DmMachine::resume_channel`] surfaces as the recovery offer at every start.
 ///
 /// The floor starts at the outbox's own counters, which is what this side has
@@ -7467,8 +7555,8 @@ fn establish_provisional(
     };
     let Some(signing_pc) = correspondence.signing_pc.as_ref() else {
         crate::vtrace!(
-            "dm driver: this side's pseudonym key did not survive the restart, so this \
-             correspondence can never sign a re-establishment leg"
+            "dm driver: this side's pseudonym key is absent, so this correspondence can \
+             never sign a re-establishment leg"
         );
         // Whatever the erase answers, the correspondence is unrecoverable: with
         // no `S_pc` nothing can sign a leg, and with the record gone nothing can
@@ -7743,17 +7831,30 @@ fn refused(
 
 /// The correspondences already on disk, as this session can hold them.
 ///
-/// **Every one of these is deaf and mute, and that is the honest state rather
-/// than a stub.** A [`Ratchet`] has no at-rest record and the pseudonym pair is
-/// homed in a resume record that cannot be written until the channel has
-/// re-established once (A4.8 / A9.2), so a correspondence established before
-/// this process began has no key schedule here: it cannot open what it sweeps
-/// and cannot sign what it would send. What it does carry is the correspondent's
-/// identity, the store label its records live under, the correspondent's
-/// pseudonym as the contact record recorded it, and a collection seeded from the
-/// persisted cursor — so the correspondence is *listed*, a
-/// [`DmCommand::Send`] to it is refused in as many words rather than silently
-/// dropped, and re-establishment has somewhere to land.
+/// **Every one of these is deaf, and that is the honest state rather than a
+/// stub.** A [`Ratchet`] has no at-rest record, so a correspondence established
+/// before this process began has no key schedule here: it cannot open what it
+/// sweeps, and a [`DmCommand::Send`] to it is refused in as many words rather
+/// than silently dropped until a re-establishment mints one. What it does carry
+/// is the correspondent's identity, the store label its records live under, the
+/// correspondent's pseudonym as the contact record recorded it, and a collection
+/// seeded from the persisted cursor.
+///
+/// **This side's own pseudonym keypair comes back with it, from the resume
+/// record** (A4.8 / A9.2). It is drawn from the CSPRNG at establishment and
+/// descends from nothing, so the record is the only thing that could return it —
+/// and a fresh one would sign frames the correspondent discards, because the
+/// correspondent verifies against the half it was given. Restored here rather
+/// than at the tick that re-establishes: the record is read by three separate
+/// paths and only one of them is guaranteed to run, so the load is where a
+/// single read serves all of them. A correspondence whose entry is still
+/// unanswered has no resume record and comes back without one; its keypair is in
+/// the provisional record, and [`DmMachine::rearm_handshake`] is what reads it.
+///
+/// A resume record that will not read leaves the keypair absent, which is the
+/// state [`DmMachine::resume_channel`] surfaces on the tick that follows: a
+/// correspondence whose record is unreadable cannot re-establish either, so
+/// nothing here is lost by declining to guess.
 ///
 /// **The persisted cursor is read against a `read_through` of zero, which is
 /// what this session has genuinely swept: nothing.** The bound is the caller's
@@ -7820,11 +7921,23 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
                 0
             }
         };
+        // The keypair this side signs its own frames under. Absent where the
+        // correspondence has no resume record, which is either an entry still
+        // awaiting its acceptance — the re-arm reads that one out of the
+        // provisional record — or A3.15 row 6's unresumable case.
+        let signing_pc = match persist.read_resume(&label) {
+            Ok(Some(resume)) => Some(SignKeypair::from_halves(resume.own_pk_pc(), resume.s_pc())),
+            Ok(None) => None,
+            Err(e) => {
+                crate::vtrace!("dm driver: the resume record will not read at load: {e}");
+                None
+            }
+        };
         out.push(Correspondence {
             pk_lt: Box::new(*record.pk_lt()),
             label,
             ratchet: None,
-            signing_pc: None,
+            signing_pc,
             // Absent on a correspondence whose first-contact entry has been
             // sent and not yet accepted, which is the state the record was
             // written in. `on_page` reads the same absence as "only the
@@ -7837,6 +7950,7 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             // the re-establishment plane reachable at all — see the field.
             address_root: record.address_root(),
             candidate: None,
+            resumed: false,
             re_acks_answered: 0,
             response_cap_surfaced: false,
             retire_ceiling_surfaced: false,
@@ -9140,6 +9254,7 @@ mod tests {
             channel: Some(channel),
             address_root,
             candidate: None,
+            resumed: false,
             re_acks_answered: 0,
             response_cap_surfaced: false,
             retire_ceiling_surfaced: false,
@@ -9269,6 +9384,7 @@ mod tests {
             channel: Some(channel),
             address_root,
             candidate: None,
+            resumed: false,
             re_acks_answered: 0,
             response_cap_surfaced: false,
             retire_ceiling_surfaced: false,
@@ -11366,12 +11482,13 @@ mod tests {
     /// acceptance.
     ///
     /// **Kills a page sweep that keeps requiring this side's own pseudonym
-    /// keypair.** An initiator that restarts before its entry is accepted has
-    /// lost that keypair — it is minted from the CSPRNG and nothing writes it
-    /// down before establishment — while the ratchet and channel roots come
-    /// back from the stored handshake. Requiring it would leave the
-    /// correspondence planning nothing, so the acceptance would never be
-    /// fetched and the test that folds a page by hand would never notice.
+    /// keypair.** The load reads that keypair out of a resume record, and an
+    /// entry still awaiting its acceptance has none — its keypair sits in the
+    /// provisional record, which only the re-arm on the first tick opens. So the
+    /// sweep is planned in the same tick that restores it, and a plan that
+    /// waited on the keypair would leave the correspondence planning nothing:
+    /// the acceptance would never be fetched, and the test that folds a page by
+    /// hand would never notice.
     #[test]
     fn a_restarted_correspondence_plans_the_sweep_that_fetches_its_acceptance() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -11385,7 +11502,7 @@ mod tests {
         let mut a = machine(&dir);
         assert!(
             a.correspondences[0].signing_pc.is_none(),
-            "the restart kept a pseudonym keypair, so this proves nothing"
+            "the load found a pseudonym keypair for an unanswered entry, so this proves nothing"
         );
         let out = a.on_tick(BASE_MS);
         let swept: Vec<_> = out
@@ -11395,6 +11512,116 @@ mod tests {
         assert!(
             !swept.is_empty(),
             "a restarted correspondence planned no page sweep: {out:?}"
+        );
+    }
+
+    /// M27.1. **An initiator that restarts between its entry and the acceptance
+    /// speaks under the pseudonym that entry published, and its correspondent
+    /// opens what it sends.**
+    ///
+    /// The keypair is drawn from the CSPRNG when the entry is composed and
+    /// descends from nothing, so the provisional record is the only thing that
+    /// could return it — and the entry published the verifying half, which is
+    /// what the correspondent wrote into its contact record and checks every
+    /// later frame against. A restart that minted a fresh pair instead would
+    /// compose frames that seal, publish, arrive and are discarded.
+    ///
+    /// **The end-to-end shape is what makes the claim, not the keypair's
+    /// bytes.** A frame binds the sealer's own verifying key into what it seals
+    /// and the far side verifies it against its own record, so nothing here
+    /// compares the restored key to anything: the delivery is the comparison,
+    /// performed by the code that would perform it on the wire.
+    ///
+    /// B never restarts, so the only thing this can be about is what A read
+    /// back.
+    #[test]
+    fn a_restarted_initiator_speaks_under_the_pseudonym_its_entry_published() {
+        const BODY: &str = "sent after the restart";
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision B");
+
+        // A's process ends between the entry and the acceptance — the window
+        // the provisional record exists for.
+        let entry = {
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            knock_as_initiator(&mut a, &b_keys)
+        };
+        let mut a = machine(&dir);
+        a.persist.provision_block_list().expect("provision");
+        assert!(
+            a.correspondences[0].ratchet.is_none(),
+            "the load kept a key schedule, so nothing was restarted"
+        );
+
+        // B answers the entry it was left, knowing nothing of the restart.
+        let offered = b.on_doorbell(BASE_MS, sweep_of(vec![entry]));
+        let request = offered
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("B was not offered the knock");
+        b.on_command(BASE_MS, DmCommand::Accept { request });
+        let index_b = b.correspondences.len() - 1;
+        let label_b = b.correspondences[index_b].label;
+        let acceptance = queued_frame_at(&b, &label_b, 0, BASE_MS);
+
+        // The re-arm, which is the only thing that could give the keypair back.
+        a.on_tick(BASE_MS);
+        assert!(
+            a.correspondences[0].signing_pc.is_some(),
+            "the re-arm restored no pseudonym keypair, so the send below proves nothing"
+        );
+
+        let conversation_a = conversation_of(&a, 0);
+        let collected = fold_page_at(
+            &mut a,
+            BASE_MS,
+            conversation_a,
+            0,
+            vec![(position_of(0), acceptance)],
+        );
+        assert!(
+            a.correspondences[0].peer_pk_pc.is_some(),
+            "A did not collect the acceptance, so it is not established: {collected:?}"
+        );
+
+        let label_a = a.correspondences[0].label;
+        let seq = a
+            .only_next_send_seq()
+            .expect("A holds exactly one live correspondence");
+        let out = a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: BODY.into(),
+            },
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::Refused { .. }))),
+            "the send was refused, so nothing was composed to carry: {out:?}"
+        );
+
+        let frame = queued_frame_at(&a, &label_a, seq, BASE_MS);
+        let conversation_b = conversation_of(&b, index_b);
+        let opened = fold_page_at(
+            &mut b,
+            BASE_MS,
+            conversation_b,
+            position_of(seq).page(),
+            vec![(position_of(seq), frame)],
+        );
+        assert_eq!(
+            messages_in(&opened),
+            vec![BODY.to_string()],
+            "B did not open exactly one message from the restarted initiator: {opened:?}"
         );
     }
 
@@ -12048,6 +12275,7 @@ mod tests {
             channel: Some(channel),
             address_root,
             candidate: None,
+            resumed: false,
             re_acks_answered: 0,
             response_cap_surfaced: false,
             retire_ceiling_surfaced: false,
@@ -15027,7 +15255,9 @@ mod tests {
         a.persist.provision_block_list().expect("provision");
 
         // A knocks, B accepts, and B's acceptance is in hand — but A's pseudonym
-        // key is gone, which is the state a restart before the acceptance leaves.
+        // key is taken away by hand, because nothing that walks the load path
+        // produces that state and this test is about what happens if anything
+        // ever does.
         let entry = knock_as_initiator(&mut a, &b_keys);
         let label = a.correspondences[0].label;
         let out = b.on_doorbell(BASE_MS, sweep_of(vec![entry]));
@@ -15344,6 +15574,9 @@ mod tests {
     /// entry composed while no chain exists"*. Without one the load-time pass
     /// finds nothing owed and opens no attempt, and every assertion below would
     /// be about a handshake that never started.
+    ///
+    /// **What the rebuilt pair holds is asserted here, because this is the one
+    /// place the restart happens** and every caller inherits it.
     fn restart_both(
         dir_a: &tempfile::TempDir,
         dir_b: &tempfile::TempDir,
@@ -15379,6 +15612,39 @@ mod tests {
             machine_a.correspondences[0].ratchet.is_none()
                 && machine_b.correspondences[0].ratchet.is_none(),
             "a rebuilt machine came back holding a key schedule, so this is not a restart"
+        );
+        // **Each side came back under the pseudonym the other verifies against,
+        // and the cross-check is what says so.** A load that restored nothing
+        // fails the first pair of assertions; one that minted a fresh keypair,
+        // or read one belonging to another conversation, passes those and fails
+        // these — the correspondent's contact record holds the verifying half it
+        // was given at establishment, and a frame signed under any other key is
+        // discarded on arrival.
+        let own_a = machine_a.correspondences[0]
+            .signing_pc
+            .as_ref()
+            .expect("A came back with no pseudonym keypair");
+        let own_b = machine_b.correspondences[0]
+            .signing_pc
+            .as_ref()
+            .expect("B came back with no pseudonym keypair");
+        assert_eq!(
+            own_a.public_key().as_slice(),
+            machine_b.correspondences[0]
+                .peer_pk_pc
+                .as_ref()
+                .expect("B recorded no pseudonym for A")
+                .as_slice(),
+            "A restored a keypair B does not verify against"
+        );
+        assert_eq!(
+            own_b.public_key().as_slice(),
+            machine_a.correspondences[0]
+                .peer_pk_pc
+                .as_ref()
+                .expect("A recorded no pseudonym for B")
+                .as_slice(),
+            "B restored a keypair A does not verify against"
         );
         (
             Side {
@@ -15478,6 +15744,14 @@ mod tests {
     /// - the entry sealed under the dead chain ends Undelivered exactly once
     ///   (A3.12), and the pending unsealed entry does not — it was never sealed
     ///   under any chain.
+    ///
+    /// - a send on the resumed channel is refused on both sides, with nothing
+    ///   spent. Every part a frame needs is in hand by then, so this is the only
+    ///   thing left that stops one being sealed and silently discarded; see
+    ///   [`Correspondence::resumed`].
+    ///
+    /// The pseudonym keypair each side came back holding is asserted in
+    /// [`restart_both`], where the restart happens.
     #[test]
     fn two_drivers_survive_a_restart_of_both_stores() {
         let dir_a = tempfile::tempdir().expect("temp dir A");
@@ -15646,6 +15920,53 @@ mod tests {
                 pending_legs(&side.machine, &side.label, clock),
                 Vec::<u64>::new(),
                 "a leg outlived its give-up"
+            );
+        }
+
+        // ── a send on the resumed channel is refused, on BOTH sides ─────────
+        //
+        // **The refusal is the honest answer while content frames on a resumed
+        // channel are unbuilt, and it has to be taken at the command.** Both
+        // sides now hold every part a frame needs — a key schedule, the channel
+        // roots, and the pseudonym keypair read back off the resume record — so
+        // the `live()` gate admits them. Sealing
+        // instead would queue bytes the correspondent discards as
+        // `GenerationTooOld`, reported to the user seven days later as a message
+        // that failed to arrive; on the answering side the ratchet carries a
+        // receiving chain only, so it would fail inside the seal and be reported
+        // as a seal fault. Both sides are asserted because they reach the state
+        // through different folds.
+        for (name, side) in [("the initiating", &mut a), ("the answering", &mut b)] {
+            let recipient = side.machine.correspondences[0].pk_lt.clone();
+            let before = side.machine.only_next_send_seq();
+            let out = side.machine.on_command(
+                clock,
+                DmCommand::Send {
+                    to: recipient,
+                    body: "onto a resumed channel".into(),
+                },
+            );
+            let reasons: Vec<RefusalReason> = out
+                .iter()
+                .filter_map(|e| match e {
+                    DmEffect::Emit(DmEvent::Refused { reason, .. }) => Some(*reason),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                reasons,
+                vec![RefusalReason::NotEstablishedThisSession],
+                "{name} side did not refuse a send on its resumed channel: {out:?}"
+            );
+            // **Nothing was spent.** A refusal taken after the ratchet stepped
+            // would burn a sequence the correspondent's contiguous prefix then
+            // waits on for the give-up — invisible in every other observable,
+            // which is why this reads the counter rather than trusting the
+            // ordering.
+            assert_eq!(
+                side.machine.only_next_send_seq(),
+                before,
+                "{name} side's refusal spent a sequence number"
             );
         }
     }

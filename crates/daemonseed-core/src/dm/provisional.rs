@@ -43,15 +43,14 @@
 //! descends from nothing, and the correspondent will verify every frame of the
 //! conversation under the public half the knock published. Between the knock and
 //! the establishment that writes a resume record there is no other record to
-//! hold it, so a party that restarts in that window comes back unable to sign as
-//! the pseudonym its own entry announced. Both halves are here: ML-DSA-87 has no
-//! public-from-private derivation, so the verifying key is not recoverable from
-//! the signing key it belongs to.
+//! hold it, so a party that restarts in that window would otherwise come back
+//! unable to sign as the pseudonym its own entry announced. Both halves are
+//! here: ML-DSA-87 has no public-from-private derivation, so the verifying key
+//! is not recoverable from the signing key it belongs to.
 //!
-//! **Nothing reads the pair back yet.** The record carries it and
-//! [`ProvisionalRecord::s_pc`] hands it over; installing it on a resumed
-//! handshake is separate work, so a restart in that window still ends in a
-//! conversation that cannot send.
+//! The pair is read back through
+//! [`PendingHandshake::signing_pc`](crate::dm::persist::PendingHandshake::signing_pc),
+//! which is the only path a store read offers to it.
 //!
 //! So the derivable four are recomputed on restore rather than stored. That is
 //! not only fewer
@@ -623,10 +622,10 @@ impl ProvisionalRecord {
 
     /// Our per-correspondent signing key.
     ///
-    /// **Nothing in the driver reads this yet.** The record carries it so that
-    /// a handshake resumed after a restart can be given back the keypair its
-    /// knock published; wiring that restoration is separate work, and until it
-    /// lands a resumed handshake still cannot compose a frame.
+    /// Read back by a handshake resumed after a restart, which is given the
+    /// keypair its own entry published rather than a fresh one — see
+    /// [`PendingHandshake::signing_pc`](crate::dm::persist::PendingHandshake::signing_pc),
+    /// the path a store read reaches it by.
     pub fn s_pc(&self) -> &[u8; ml_dsa::SK_LEN] {
         self.s_pc.as_bytes()
     }

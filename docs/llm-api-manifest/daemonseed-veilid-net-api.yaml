@@ -329,9 +329,17 @@ types:
       the contiguous prefix moved, bounded by the pages this session has swept. A
       correspondence found on disk at startup is listed with no ratchet — a
       ratchet has no at-rest record — and a Send to it is refused with
-      NotEstablishedThisSession, which a completed re-establishment does not
-      lift: a channel frame binds this side's own PK_pc, and no record holds it
-      after a restart. Such a correspondence DOES sweep its receiving pages,
+      NotEstablishedThisSession. Its own S_pc/PK_pc pair IS read back: from the
+      resume record at load, and from the provisional record when an unanswered
+      first-contact entry's handshake is re-armed, so a re-armed initiator that
+      collects its acceptance composes ordinary frames under the pseudonym that
+      entry published. A completed re-establishment does not lift the refusal
+      for the established case: it marks the correspondence resumed, and a Send
+      on a resumed correspondence is refused with NotEstablishedThisSession
+      before the outbox is asked and before the ratchet steps, so no sequence is
+      spent. Content frames on a resumed channel are unbuilt — the two sides open
+      the resumed ratchet at generations derived from their own outbox counters,
+      and the answering side opens a receiving chain only. Such a correspondence DOES sweep its receiving pages,
       addressed by DmPageAddress::receiving_on off the stored address root and
       the opposite of the outbox's stored direction, because that plane is where
       a re-establishment leg arrives. On the first tick after a load, an

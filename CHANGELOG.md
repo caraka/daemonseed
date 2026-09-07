@@ -26,6 +26,14 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- A `DmCommand::Send` on a correspondence whose channel was resumed by a completed
+  re-establishment is refused with `RefusalReason::NotEstablishedThisSession`, before the outbox is
+  asked and before the ratchet steps. Content frames on a resumed channel are unbuilt (#401, #402).
+- `daemonseed_core::identity::keys::SignKeypair::from_halves(&pk, &sk)` and
+  `daemonseed_core::dm::persist::PendingHandshake::signing_pc()`, which return the
+  per-correspondent keypair a stored record holds. A correspondence rebuilt at load takes it from
+  the resume record, and one whose first-contact entry is unanswered takes it from the provisional
+  record when its handshake is re-armed (#401, #402).
 - `daemonseed_core::dm::domain` — `DM_REEST_ROOT`, `DM_REEST_NEXT` and `DM_REEST_CHAN_ID`, the
   domain labels for the retained re-establishment root, its successor, and a resumed channel's
   identifier (#404).

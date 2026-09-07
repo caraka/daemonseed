@@ -2372,11 +2372,12 @@ impl ResumeRecord {
     /// Our own per-correspondent verifying key — the public half of
     /// [`Self::s_pc`].
     ///
-    /// **Nothing in the driver reads this yet.** The record carries it so that a
-    /// correspondence restored from disk can be given back the keypair it
-    /// speaks under; wiring that restoration is separate work, and until it
-    /// lands a restored correspondence still refuses to compose an ordinary
-    /// frame.
+    /// Read together with [`Self::s_pc`] when a correspondence is rebuilt from
+    /// disk, so it speaks under the keypair the correspondent already verifies
+    /// against rather than a fresh one. An ordinary channel frame binds this
+    /// key into what it seals, which is why the record holds it and a
+    /// re-establishment leg — whose preimage binds no public key — does not
+    /// need it.
     pub fn own_pk_pc(&self) -> &[u8; ml_dsa::PK_LEN] {
         &self.own_pk_pc
     }
