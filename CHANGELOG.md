@@ -26,6 +26,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `.github/workflows/ci.yml` — the Definition-of-Done gate on every pull request and on `main`,
+  one job per gate group.
+- `cargo xtask gate` — runs the Definition-of-Done gate, `--group <preflight|dev-suite|release-suite>`
+  for one group and `--list` for the step table. A test step reporting zero passing tests is red.
+- A `cargo doc --workspace --no-deps` step under `RUSTDOCFLAGS=-D warnings` in the gate table.
 - Coverage for the first-contact teardown across a re-establishment: a re-seeded introduction from
   an established correspondent leaves a resumed channel and its queue alone, and a fresh
   first-contact entry from that correspondent ends every pending entry under
@@ -567,6 +572,9 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- `cargo xtask install-hooks` writes the hook to the directory git runs hooks from
+  (`git rev-parse --git-path hooks`): `core.hooksPath` when set, otherwise the common `.git/hooks`.
+  Run from a worktree it wrote to `.git/worktrees/<name>/hooks/`, which git does not read.
 - A direct-message leg fold works on its own copy of the page's resume record and writes it back
   only when it consumes its leg, so a fold that defers or refuses leaves nothing for a later fold on
   the same page to commit; a withheld attempt is not recorded in the seen-frame memory; the own
@@ -704,6 +712,9 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- The pre-push hook runs `cargo xtask gate --group preflight`.
+- Gate steps carry a group and a child environment; the table runs `preflight`, then `dev-suite`,
+  then `release-suite`.
 - `daemonseed_core::dm::resume::ResumeRecord::new` returns `Result<Self, ResumeError>` and refuses
   an own slot whose attempt disagrees with the counter, an acceptance below the committed
   generation (`AcceptanceBelowGeneration`), a confirm slot ahead of it

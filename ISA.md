@@ -1173,11 +1173,13 @@ since an entry queued for a blocked correspondent re-seeds to the seven-day give
 settled it being one of the reads the block stops. Both are bounded and deliberate under "the block
 stops reads, not writes".
 
-**The gate that runs on every commit.** `cargo fmt --all --check`, `cargo clippy --workspace
---all-targets -- -D warnings`, `cargo test --workspace`, and `cargo xtask check-proto`, plus the
-judgment gate that the commit's documentation is already true. `cargo xtask release-gate` runs the
-whole set plus the coverage and manifest checks before a tag is created, so a tag is never cut on a
-red tree.
+**The gate.** One table of steps in `xtask`, in three groups: `preflight` (format, lint, a
+release-profile type-check, rustdoc with warnings denied, and the proto, coverage, manifest and
+UI-string checks), `dev-suite` (the windowed-GUI lint and the dev-profile test suite) and
+`release-suite` (the release-profile test suite). The pre-push hook runs `preflight`; CI runs all
+three on every pull request and on `main`; `cargo xtask release-gate` runs all three before a tag is
+created, so a tag is never cut on a red tree. Alongside it sits the judgment gate that the commit's
+documentation is already true.
 
 **Known partial and vacuous coverage, recorded rather than hidden.**
 

@@ -21,22 +21,28 @@
 //!   duplicate-key detection at the event level and fail on any repeat. YAML
 //!   discards a repeated mapping key silently, so nothing else in the repo
 //!   would notice (#326).
-//! - `release-gate` — run the full Definition-of-Done gate and refuse a
-//!   non-zero exit if any check is red, so a release tag is never cut on a
-//!   red tree. Type-checks the workspace in the release profile (#381) and runs
-//!   the test suite in BOTH the dev and release profiles (#274), then deletes
-//!   the binaries those steps linked into `target/` (see `remove_linked_bins`).
-//!   Run before `git tag`.
+//! - `gate` — run the Definition-of-Done gate, defined once as one table of
+//!   steps in three groups: `preflight` (fmt, clippy, a release-profile
+//!   type-check, rustdoc with warnings denied, and the xtask checks),
+//!   `dev-suite` (the gui/desktop clippy pass and the dev-profile test suite)
+//!   and `release-suite` (the release-profile test suite). `--group G` runs one
+//!   group, `--list` prints the table and runs nothing, and no argument runs
+//!   every group. A test step reporting zero passing tests is red whatever its
+//!   exit code. Every run, whole or single-group, ends by deleting the binaries
+//!   its steps linked into `target/` (see `remove_linked_bins`).
+//! - `release-gate` — run every group of the gate and exit non-zero if any step
+//!   is red, so a release tag is never cut on a red tree. Run before `git tag`.
 
 mod manifests;
 mod ui_strings;
 
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use walkdir::WalkDir;
 
 #[derive(Parser)]
@@ -84,11 +90,21 @@ enum Cmd {
         #[arg(long)]
         target: Option<PathBuf>,
     },
-    /// Run the full Definition-of-Done gate (fmt, clippy workspace +
-    /// gui/desktop, check --release, test --workspace, test --workspace
-    /// --release, check-proto, isc-coverage, check-manifests,
-    /// check-ui-strings) and refuse (non-zero exit) if any check is red — so
-    /// a release tag is never cut on a red tree (#62). Run before `git tag`.
+    /// Run the Definition-of-Done gate: the `preflight`, `dev-suite` and
+    /// `release-suite` groups of `RELEASE_GATE_STEPS`, or one group of them.
+    /// Exits non-zero naming any red step.
+    Gate {
+        /// Run only this group. Omit to run every group.
+        #[arg(long)]
+        group: Option<GateGroup>,
+        /// Print one `<group>\t<step>` line per step, narrowed by `--group` where it
+        /// is given, and run nothing.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Run every group of the Definition-of-Done gate and refuse (non-zero
+    /// exit) if any step is red — so a release tag is never cut on a red tree
+    /// (#62). Run before `git tag`.
     ReleaseGate,
 }
 
@@ -101,7 +117,15 @@ fn main() -> Result<()> {
         Cmd::IscCoverage { min } => isc_coverage(min),
         Cmd::FindingsResolved { draft } => findings_resolved(draft),
         Cmd::InstallHooks { target } => install_hooks(target),
-        Cmd::ReleaseGate => release_gate(),
+        Cmd::Gate { group, list } => {
+            if list {
+                list_gate_steps(group);
+                Ok(())
+            } else {
+                run_gate(group)
+            }
+        }
+        Cmd::ReleaseGate => run_gate(None),
     }
 }
 
@@ -208,34 +232,38 @@ fn install_hooks(target: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Resolve `.git/hooks/` for a checkout. Works inside worktrees: `git
-/// rev-parse --git-dir` returns the worktree's hooks dir, not the common
-/// `.git/` of the source repo (where the hook would be shared with all
-/// worktrees — which is usually the wrong sharing default).
+/// Resolve the directory git runs hooks from for this checkout.
+///
+/// `git rev-parse --git-path hooks` answers with the directory git itself
+/// consults: `core.hooksPath` when it is set, otherwise the `hooks/` of the
+/// common `.git` directory. Hooks are shared by every worktree of a repository;
+/// a worktree's own `.git/worktrees/<name>/` holds no hooks directory git reads,
+/// so a hook written there never runs.
 fn resolve_git_hooks_dir(repo_root: &Path) -> Result<PathBuf> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
         .arg("rev-parse")
-        .arg("--git-dir")
+        .arg("--git-path")
+        .arg("hooks")
         .output()
-        .context("invoke git rev-parse --git-dir")?;
+        .context("invoke git rev-parse --git-path hooks")?;
     if !out.status.success() {
         bail!(
-            "git rev-parse --git-dir failed: {}",
+            "git rev-parse --git-path hooks failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let git_dir = String::from_utf8(out.stdout)
+    let hooks_dir = String::from_utf8(out.stdout)
         .context("git output is not utf-8")?
         .trim()
         .to_string();
-    let git_dir_path = if Path::new(&git_dir).is_absolute() {
-        PathBuf::from(git_dir)
+    let hooks_path = if Path::new(&hooks_dir).is_absolute() {
+        PathBuf::from(hooks_dir)
     } else {
-        repo_root.join(git_dir)
+        repo_root.join(hooks_dir)
     };
-    Ok(git_dir_path.join("hooks"))
+    Ok(hooks_path)
 }
 
 /// Resolve `<repo>/crates/daemonseed-proto`.
@@ -445,7 +473,7 @@ fn diff_generated_dirs(snapshot: &Path, fresh: &Path) -> Result<Vec<String>> {
     Ok(diffs)
 }
 
-// ── release-gate helpers ─────────────────────────────────────────────
+// ── gate helpers ─────────────────────────────────────────────────────
 
 /// Locate the workspace root from xtask's own manifest dir. xtask lives
 /// at `<repo>/xtask/`, so the repo root is `parent()` — kept local
@@ -463,8 +491,18 @@ fn workspace_root_from_xtask() -> Result<PathBuf> {
 /// addition here.
 const WORKSPACE_BINS: &[&str] = &["daemonseed-tui", "daemonseed-gui", "xtask"];
 
+/// The directory cargo writes artifacts to: `CARGO_TARGET_DIR` where it is set —
+/// taken as given when absolute, resolved against the workspace root when relative
+/// — and `<repo>/target` otherwise.
+fn target_dir(repo: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => repo.join(PathBuf::from(dir)),
+        None => repo.join("target"),
+    }
+}
+
 /// Delete the binaries the gate's `cargo test`/`clippy --all-targets` steps linked into
-/// `target/{debug,release}/`.
+/// the profile directories under the cargo target directory.
 ///
 /// **This is not tidiness — it prevents a cross-machine miscompile.** Where a
 /// `target/` directory is shared between two machines whose glibc versions differ,
@@ -475,11 +513,12 @@ const WORKSPACE_BINS: &[&str] = &["daemonseed-tui", "daemonseed-gui", "xtask"];
 /// a genuine relink wherever they are next built. Missing files are not an error: most
 /// gate runs never link most of these.
 fn remove_linked_bins(repo: &Path) -> Result<()> {
+    let target = target_dir(repo);
     for profile in ["debug", "release"] {
         for bin in WORKSPACE_BINS {
-            let path = repo.join("target").join(profile).join(bin);
+            let path = target.join(profile).join(bin);
             match fs::remove_file(&path) {
-                Ok(()) => println!("release-gate: removed linked binary {}", path.display()),
+                Ok(()) => println!("gate: removed linked binary {}", path.display()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     return Err(e).with_context(|| format!("remove {}", path.display()));
@@ -497,23 +536,52 @@ fn cargo_bin() -> std::ffi::OsString {
     std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
 }
 
-// ── release-gate ─────────────────────────────────────────────────────
+// ── gate ─────────────────────────────────────────────────────────────
 
-/// One Definition-of-Done step the release gate runs, in order. `args` go to
-/// `cargo`. Mirrors `AGENTS.md` § Definition of done.
-struct GateStep {
-    name: &'static str,
-    args: &'static [&'static str],
+/// The groups the Definition-of-Done gate is split into. Every gate step belongs
+/// to exactly one group, and the groups run in this order: `preflight` is the
+/// compile-and-check half, `dev-suite` and `release-suite` are the test suites in
+/// the two profiles.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum GateGroup {
+    Preflight,
+    DevSuite,
+    ReleaseSuite,
 }
 
-/// The full DoD gate a release tag-cut must pass green (#62).
+impl GateGroup {
+    /// The group's name on the command line and in `--list` output.
+    fn as_str(self) -> &'static str {
+        match self {
+            GateGroup::Preflight => "preflight",
+            GateGroup::DevSuite => "dev-suite",
+            GateGroup::ReleaseSuite => "release-suite",
+        }
+    }
+}
+
+/// One Definition-of-Done step, run as `cargo <args>` with `env` set in the
+/// child's environment. Mirrors `AGENTS.md` § Definition of done.
+struct GateStep {
+    name: &'static str,
+    group: GateGroup,
+    args: &'static [&'static str],
+    env: &'static [(&'static str, &'static str)],
+}
+
+/// The Definition-of-Done gate: one table, read by every caller. The pre-push hook
+/// runs the `preflight` group; CI runs all three; a release tag-cut runs the whole
+/// table through `release-gate` (#62).
 const RELEASE_GATE_STEPS: &[GateStep] = &[
     GateStep {
         name: "fmt --all --check",
+        group: GateGroup::Preflight,
         args: &["fmt", "--all", "--check"],
+        env: &[],
     },
     GateStep {
         name: "clippy --workspace -D warnings",
+        group: GateGroup::Preflight,
         args: &[
             "clippy",
             "--workspace",
@@ -522,9 +590,61 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
             "-D",
             "warnings",
         ],
+        env: &[],
+    },
+    // #381: a type-check of the workspace in the profile that ships. `debug_assert!`
+    // expands its arguments in every profile, so a binding introduced under
+    // `#[cfg(debug_assertions)]` and read only by a `debug_assert_eq!` compiles in dev
+    // and fails to compile in release (E0425). `check` rather than `build`: it does not
+    // link, and reuses the release cache the release-profile test step fills.
+    GateStep {
+        name: "check --workspace --release",
+        group: GateGroup::Preflight,
+        args: &["check", "--workspace", "--release"],
+        env: &[],
+    },
+    // `cargo doc` exits 0 with warnings present, so `-D warnings` is what gives this
+    // step a red state at all. The class it covers is public documentation linking to
+    // deliberately private items.
+    GateStep {
+        name: "doc --workspace --no-deps (warnings denied)",
+        group: GateGroup::Preflight,
+        args: &["doc", "--workspace", "--no-deps"],
+        env: &[("RUSTDOCFLAGS", "-D warnings")],
     },
     GateStep {
+        name: "xtask check-proto",
+        group: GateGroup::Preflight,
+        args: &["xtask", "check-proto"],
+        env: &[],
+    },
+    GateStep {
+        name: "xtask isc-coverage",
+        group: GateGroup::Preflight,
+        args: &["xtask", "isc-coverage"],
+        env: &[],
+    },
+    // #326: a parse of seven small files, cheap enough to sit alongside the compile
+    // steps rather than form a step set of its own.
+    GateStep {
+        name: "xtask check-manifests",
+        group: GateGroup::Preflight,
+        args: &["xtask", "check-manifests"],
+        env: &[],
+    },
+    // No other step reads a user-visible string. Cheap: a scan of the .slint
+    // files and the two front-end src trees.
+    GateStep {
+        name: "xtask check-ui-strings",
+        group: GateGroup::Preflight,
+        args: &["xtask", "check-ui-strings"],
+        env: &[],
+    },
+    // `--all-targets` skips targets whose `required-features` are unsatisfied, so the
+    // windowed GUI is linted only by an invocation that opts into `desktop`.
+    GateStep {
         name: "clippy -p daemonseed-gui --features desktop -D warnings",
+        group: GateGroup::DevSuite,
         args: &[
             "clippy",
             "-p",
@@ -536,51 +656,52 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
             "-D",
             "warnings",
         ],
-    },
-    // #381: a type-check of the workspace in the profile that ships. `debug_assert!`
-    // expands its arguments in every profile, so a binding introduced under
-    // `#[cfg(debug_assertions)]` and read only by a `debug_assert_eq!` compiles in dev
-    // and fails to compile in release (E0425). `check` rather than `build`: it does not
-    // link, and reuses the release cache the release-profile test step below fills.
-    GateStep {
-        name: "check --workspace --release",
-        args: &["check", "--workspace", "--release"],
+        env: &[],
     },
     GateStep {
         name: "test --workspace",
+        group: GateGroup::DevSuite,
         args: &["test", "--workspace"],
+        env: &[],
     },
-    // #274: the suite in the RELEASE profile as well as dev. Three `daemonseed-gui`
-    // tests were red in release for as long as the release profile existed, and this
-    // gate never saw them because it only ever ran dev. Since #258 put
-    // `overflow-checks = true` on the release profile, the two profiles differ in
-    // BEHAVIOUR and not merely in optimization level, so a green dev suite is no longer
-    // evidence about the artifact that actually ships.
+    // #274: the release profile sets `overflow-checks = true` (#258), so the two
+    // profiles differ in behaviour and not only in optimization level — a green dev
+    // suite is not evidence about the artifact that ships.
     GateStep {
         name: "test --workspace --release",
+        group: GateGroup::ReleaseSuite,
         args: &["test", "--workspace", "--release"],
-    },
-    GateStep {
-        name: "xtask check-proto",
-        args: &["xtask", "check-proto"],
-    },
-    GateStep {
-        name: "xtask isc-coverage",
-        args: &["xtask", "isc-coverage"],
-    },
-    // #326: a parse of seven small files, so it joins the gate that already runs
-    // rather than becoming a push-time cost of its own.
-    GateStep {
-        name: "xtask check-manifests",
-        args: &["xtask", "check-manifests"],
-    },
-    // No other step reads a user-visible string. Cheap: a scan of the .slint
-    // files and the two front-end src trees.
-    GateStep {
-        name: "xtask check-ui-strings",
-        args: &["xtask", "check-ui-strings"],
+        env: &[],
     },
 ];
+
+/// Total tests reported passing across every `test result:` line in a cargo test
+/// run's output.
+///
+/// A test binary that contains no tests exits 0 and prints `0 passed`, which is
+/// indistinguishable from a suite of thousands by exit code alone. Summing the
+/// reported counts is what tells the two apart, so the gate reads this in addition to
+/// the status of a `test` step (#62).
+fn passed_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| line.contains("test result:"))
+        .filter_map(|line| {
+            let head = &line[..line.find(" passed")?];
+            let reversed: String = head
+                .chars()
+                .rev()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            reversed
+                .chars()
+                .rev()
+                .collect::<String>()
+                .parse::<usize>()
+                .ok()
+        })
+        .sum()
+}
 
 /// Pure verdict: GREEN iff every step passed, else RED naming the failed steps in
 /// order. Separated from the subprocess runner so the refuse-on-red logic is
@@ -600,32 +721,116 @@ fn release_gate_verdict(
     }
 }
 
-/// Run every DoD step and refuse the tag-cut (non-zero exit) if any is red, so a
-/// release tag is never created on a red tree — the v0.29.0 slip, where a tag was
-/// cut while `test --workspace` was red (#62). Run before `git tag`.
-fn release_gate() -> Result<()> {
-    let repo = workspace_root_from_xtask()?;
-    let cargo = cargo_bin();
-    let mut results: Vec<(&'static str, bool)> = Vec::with_capacity(RELEASE_GATE_STEPS.len());
-    for step in RELEASE_GATE_STEPS {
-        println!("release-gate: {} …", step.name);
-        let status = Command::new(&cargo)
-            .current_dir(&repo)
-            .args(step.args)
+/// Run one gate step and report whether it was green.
+///
+/// A `test` step has its stdout piped so the reported pass count can be read, and
+/// every line is echoed as it arrives so the step's progress is still visible. Such
+/// a step is red when it reports zero passing tests, whatever its exit code.
+fn run_gate_step(cargo: &std::ffi::OsStr, repo: &Path, step: &GateStep) -> Result<bool> {
+    let mut cmd = Command::new(cargo);
+    cmd.current_dir(repo).args(step.args);
+    for (key, value) in step.env {
+        cmd.env(key, value);
+    }
+    if step.args.first() != Some(&"test") {
+        let status = cmd
             .status()
             .with_context(|| format!("spawn cargo {}", step.name))?;
-        results.push((step.name, status.success()));
+        return Ok(status.success());
     }
-    // After every step, red or green: the verdict below can `bail!`, and the linked
-    // binaries must not survive that path either.
-    remove_linked_bins(&repo)?;
+
+    cmd.stdout(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn cargo {}", step.name))?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("a child spawned with a piped stdout has one")?;
+    let mut captured = String::new();
+    for line in BufReader::new(stdout).lines() {
+        let line = line.with_context(|| format!("read the output of cargo {}", step.name))?;
+        println!("{line}");
+        captured.push_str(&line);
+        captured.push('\n');
+    }
+    let status = child
+        .wait()
+        .with_context(|| format!("wait for cargo {}", step.name))?;
+    if !status.success() {
+        return Ok(false);
+    }
+
+    let passed = passed_count(&captured);
+    if passed == 0 {
+        println!(
+            "gate: {} reported {passed} passing tests — a test step that runs no tests is red.",
+            step.name
+        );
+        return Ok(false);
+    }
+    println!("gate: {} — {passed} tests passed.", step.name);
+    Ok(true)
+}
+
+/// Print the gate table — every step, or only `group`'s — one `<group>\t<name>` line
+/// each, and run nothing.
+fn list_gate_steps(group: Option<GateGroup>) {
+    for step in RELEASE_GATE_STEPS
+        .iter()
+        .filter(|step| group.is_none_or(|g| step.group == g))
+    {
+        println!("{}\t{}", step.group.as_str(), step.name);
+    }
+}
+
+/// Run the gate — every group, or only `group` — and exit non-zero naming any red
+/// step. With no group this is the full Definition-of-Done gate a release tag-cut
+/// must pass, so a tag is never created on a red tree (#62).
+fn run_gate(group: Option<GateGroup>) -> Result<()> {
+    let repo = workspace_root_from_xtask()?;
+    let cargo = cargo_bin();
+    let steps = RELEASE_GATE_STEPS
+        .iter()
+        .filter(|step| group.is_none_or(|g| step.group == g));
+    let mut results: Vec<(&'static str, bool)> = Vec::with_capacity(RELEASE_GATE_STEPS.len());
+    let mut step_error = None;
+    for step in steps {
+        println!("gate [{}]: {} …", step.group.as_str(), step.name);
+        match run_gate_step(&cargo, &repo, step) {
+            Ok(ok) => results.push((step.name, ok)),
+            // A step that could not be run at all — the spawn, the read of its output or
+            // the wait failed — ends the run, but only after the sweep below.
+            Err(e) => {
+                step_error = Some(e);
+                break;
+            }
+        }
+    }
+    // After every step, green, red or errored: the paths below all leave the run, and
+    // the linked binaries must not survive any of them. Where both the sweep and a step
+    // failed, the step's error is what started it and is carried as the sweep's context.
+    let swept = remove_linked_bins(&repo);
+    match (step_error, swept) {
+        (Some(step), Err(sweep)) => {
+            return Err(sweep.context(format!("after the gate step failed: {step}")));
+        }
+        (Some(step), Ok(())) => return Err(step),
+        (None, Err(sweep)) => return Err(sweep),
+        (None, Ok(())) => {}
+    }
     match release_gate_verdict(&results) {
         Ok(()) => {
-            println!("release-gate: GREEN — every DoD check passed; safe to cut the signed tag.");
+            match group {
+                Some(g) => println!("gate: GREEN — every step in {} passed.", g.as_str()),
+                None => println!(
+                    "gate: GREEN — every Definition-of-Done step passed; safe to cut the signed tag."
+                ),
+            }
             Ok(())
         }
         Err(failed) => bail!(
-            "release-gate: RED — refusing the tag-cut; failed: {}. Fix and re-run before `git tag`.",
+            "gate: RED — failed: {}. Fix and re-run before pushing or cutting a tag.",
             failed.join(", ")
         ),
     }
@@ -728,6 +933,243 @@ mod tests {
             "the sweep must not touch non-bin artifacts"
         );
         fs::remove_dir_all(&repo).ok();
+    }
+
+    /// Every group in the enum names at least one step, so a caller asking for a
+    /// group never gets a silently empty run that reads as a pass.
+    #[test]
+    fn every_group_has_at_least_one_step() {
+        for group in GateGroup::value_variants() {
+            assert!(
+                RELEASE_GATE_STEPS.iter().any(|s| s.group == *group),
+                "group {} has no steps",
+                group.as_str()
+            );
+        }
+    }
+
+    /// The rustdoc step is part of the gate and denies warnings. `cargo doc` exits 0
+    /// with warnings present, so without `RUSTDOCFLAGS` the step can never be red and
+    /// reads exactly like one that passes.
+    #[test]
+    fn the_gate_documents_the_workspace_with_warnings_denied() {
+        let step = RELEASE_GATE_STEPS
+            .iter()
+            .find(|s| s.args.first() == Some(&"doc"))
+            .expect("the rustdoc step must be in the gate");
+        assert_eq!(step.args, ["doc", "--workspace", "--no-deps"]);
+        assert_eq!(step.group, GateGroup::Preflight);
+        assert!(step.env.contains(&("RUSTDOCFLAGS", "-D warnings")));
+    }
+
+    /// The `release-suite` group is exactly the release-profile test suite: it is the
+    /// longest group, and anything else landing in it lengthens the gate's slowest leg.
+    #[test]
+    fn the_release_suite_group_is_the_release_profile_test_step() {
+        let steps: Vec<&GateStep> = RELEASE_GATE_STEPS
+            .iter()
+            .filter(|s| s.group == GateGroup::ReleaseSuite)
+            .collect();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].args, ["test", "--workspace", "--release"]);
+    }
+
+    /// A suite that compiled to no tests exits 0 and prints `0 passed`, so the sum of
+    /// the reported counts is what separates it from a suite that ran thousands.
+    #[test]
+    fn a_run_reporting_only_zero_passed_counts_zero() {
+        let output = "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                      test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out\n";
+        assert_eq!(passed_count(output), 0);
+    }
+
+    #[test]
+    fn a_run_mixing_empty_binaries_with_one_real_suite_counts_its_tests() {
+        let output = "   Running unittests src/lib.rs\n\
+                      test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                      test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n";
+        assert_eq!(passed_count(output), 3);
+    }
+
+    #[test]
+    fn a_run_that_printed_nothing_counts_zero() {
+        assert_eq!(passed_count(""), 0);
+    }
+
+    /// A failing suite still ran its passing tests, and the count is read off the
+    /// same line whether the verdict is `ok.` or `FAILED.`.
+    #[test]
+    fn a_failed_run_still_counts_the_tests_that_passed() {
+        let output =
+            "test result: FAILED. 5 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        assert_eq!(passed_count(output), 5);
+    }
+
+    #[test]
+    fn a_count_of_more_than_one_digit_is_read_whole() {
+        let output =
+            "test result: ok. 1234 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n";
+        assert_eq!(passed_count(output), 1234);
+    }
+
+    /// Only a `test result:` line carries a count. A test whose NAME contains the word
+    /// is not a summary and contributes nothing.
+    #[test]
+    fn a_test_name_containing_the_word_is_not_a_summary_line() {
+        assert_eq!(passed_count("test tests::passed_count_works ... ok\n"), 0);
+    }
+
+    /// Every string in a parsed YAML document, in document order.
+    fn yaml_strings(node: &yaml_rust2::Yaml, out: &mut Vec<String>) {
+        match node {
+            yaml_rust2::Yaml::String(text) => out.push(text.clone()),
+            yaml_rust2::Yaml::Array(items) => {
+                for item in items {
+                    yaml_strings(item, out);
+                }
+            }
+            yaml_rust2::Yaml::Hash(map) => {
+                for (key, value) in map {
+                    yaml_strings(key, out);
+                    yaml_strings(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse a YAML file under the workspace root, panicking with its path on either
+    /// a read or a parse failure.
+    fn parse_yaml(relative: &str) -> yaml_rust2::Yaml {
+        let path = workspace_root_from_xtask().unwrap().join(relative);
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let docs = yaml_rust2::yaml::YamlLoader::load_from_str(&text)
+            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        docs.into_iter()
+            .next()
+            .unwrap_or(yaml_rust2::Yaml::BadValue)
+    }
+
+    /// The workflow and the gate table are one definition with two callers, so
+    /// every group has exactly one job invoking it. The live-network tests stay behind
+    /// their `#[ignore]` attribute, so nothing in the workflow or in the action it
+    /// calls opts back into ignored tests.
+    ///
+    /// Parsed rather than grepped: a commented-out job, or one held behind an `if:`
+    /// at either the job or the step, is not a job that runs its group, and raw text
+    /// cannot tell the difference.
+    #[test]
+    fn the_workflow_runs_every_gate_group_once() {
+        let workflow = parse_yaml(".github/workflows/ci.yml");
+        let jobs = workflow["jobs"]
+            .as_hash()
+            .expect("the workflow defines jobs");
+        assert!(
+            !jobs.is_empty(),
+            "positive control: there must be jobs to examine"
+        );
+
+        // One entry per job: the `run` strings of its unconditional steps. A job or a
+        // step carrying an `if:` is conditional, and a job with no `steps` at all — one
+        // that calls a reusable workflow — runs no step of its own.
+        let unconditional: Vec<Vec<&str>> = jobs
+            .iter()
+            .filter(|(_, job)| job["if"].is_badvalue())
+            .filter_map(|(_, job)| job["steps"].as_vec())
+            .map(|steps| {
+                steps
+                    .iter()
+                    .filter(|step| step["if"].is_badvalue())
+                    .filter_map(|step| step["run"].as_str())
+                    .collect()
+            })
+            .collect();
+
+        for group in GateGroup::value_variants() {
+            let invocation = format!("cargo xtask gate --group {}", group.as_str());
+            let jobs_running_it = unconditional
+                .iter()
+                .filter(|runs| runs.iter().any(|run| run.trim() == invocation))
+                .count();
+            assert_eq!(
+                jobs_running_it, 1,
+                "exactly one job must run `{invocation}`"
+            );
+        }
+
+        // Every string of both files, not only the gate lines: an opt-in to the ignored
+        // tests would work as well from an `env:` value or a step's `with:` as from a
+        // `run:`.
+        let mut strings = Vec::new();
+        yaml_strings(&workflow, &mut strings);
+        yaml_strings(
+            &parse_yaml(".github/actions/setup/action.yml"),
+            &mut strings,
+        );
+        assert!(
+            strings.iter().any(|s| s.contains("cargo xtask gate")),
+            "positive control: the scan must reach the gate invocations"
+        );
+        assert!(
+            !strings.iter().any(|s| s.contains("--include-ignored")),
+            "the live-network tests are excluded by their attribute"
+        );
+    }
+
+    /// The workflow's jobs share their setup through a local composite action, which
+    /// nothing else checks: a composite step that omits `shell` fails only at run time,
+    /// and a `uses: ./…` naming a directory with no `action.yml` fails the same way.
+    #[test]
+    fn the_local_composite_action_is_well_formed_and_reachable() {
+        let action = parse_yaml(".github/actions/setup/action.yml");
+        assert_eq!(action["runs"]["using"].as_str(), Some("composite"));
+        let steps = action["runs"]["steps"]
+            .as_vec()
+            .expect("the action defines steps");
+        assert!(!steps.is_empty(), "positive control: there must be steps");
+        for step in steps {
+            if step["run"].as_str().is_some() {
+                assert!(
+                    step["shell"].as_str().is_some(),
+                    "a composite `run` step must name its shell"
+                );
+            }
+        }
+
+        let workflow = parse_yaml(".github/workflows/ci.yml");
+        let mut strings = Vec::new();
+        yaml_strings(&workflow, &mut strings);
+        let local: Vec<&String> = strings.iter().filter(|s| s.starts_with("./")).collect();
+        assert!(
+            !local.is_empty(),
+            "positive control: a local `uses:` exists"
+        );
+        let root = workspace_root_from_xtask().unwrap();
+        for path in local {
+            let manifest = root.join(path.trim_start_matches("./")).join("action.yml");
+            assert!(
+                manifest.exists(),
+                "`uses: {path}` names no {}",
+                manifest.display()
+            );
+        }
+    }
+
+    /// The CLI spelling of a group and the spelling `--list` prints come from two
+    /// places — clap's `ValueEnum` derive and `as_str` — so a rename of one without
+    /// the other would leave `--group <what --list printed>` unparseable. Matched
+    /// case-sensitively: a case-only divergence is a divergence.
+    #[test]
+    fn every_group_parses_back_from_the_name_it_prints() {
+        for group in GateGroup::value_variants() {
+            assert_eq!(
+                GateGroup::from_str(group.as_str(), false).unwrap(),
+                *group,
+                "`{}` must parse back to itself",
+                group.as_str()
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,78 @@
+# The Definition-of-Done gate, run on every pull request and on `main`. The gate
+# is defined once as a table of steps in three groups in `xtask`
+# (`RELEASE_GATE_STEPS`); each job below runs one group. The pre-push hook runs
+# the `preflight` group, and `cargo xtask release-gate` runs all three before a
+# release tag.
+#
+# The live-network tests are excluded by their `#[ignore]` attribute and are NOT
+# covered by this workflow. No job opts back into ignored tests; a unit test in
+# `xtask` asserts that the flag which would do so appears in no string of this
+# file or of the action it calls.
+#
+# Do NOT move any job to a larger runner: larger runners are billed.
+#
+# Every job carries a `timeout-minutes` well under the six-hour default: a test
+# that leaves a child holding its output pipe stops producing output without
+# exiting, and the run must end rather than hold a runner for the maximum.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation caches serve a developer's edit loop and are dead
+  # weight on a fresh runner. Full debuginfo in the dev profile is most of a
+  # dev-profile target directory's size and changes nothing a test asserts;
+  # line tables keep panics and backtraces readable.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  # `ubuntu-24.04` is pinned rather than `ubuntu-latest` so the `protoc` the
+  # runner image ships is the same version between runs:
+  # `cargo xtask check-proto` regenerates the protobuf code and fails on any
+  # byte difference from the committed snapshot.
+  #
+  # Each job takes its own cache key: they run concurrently, and one shared key
+  # would have them racing to save over each other.
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: ci-preflight
+      - run: cargo xtask gate --group preflight
+
+  dev-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: ci-dev-suite
+      - run: cargo xtask gate --group dev-suite
+
+  release-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+        with:
+          cache-key: ci-release-suite
+      - run: cargo xtask gate --group release-suite

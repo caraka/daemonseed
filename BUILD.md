@@ -27,6 +27,12 @@ says nothing about the pinned version.
   `zig` on `PATH`.
 - The AppImage build also needs **`appimagetool`** on `PATH`.
 - The Windows build also needs the target: `rustup target add x86_64-pc-windows-gnu`.
+- System packages are build prerequisites: **`protoc`** (the protobuf compiler,
+  invoked by `daemonseed-proto/build.rs`), the **wayland client development
+  headers** (probed by `wayland-sys`'s build script, reached through
+  `daemonseed-gui` → `rfd` → `ashpd`), and **pkg-config**, which that probe
+  uses. dbus is vendored and sqlite is bundled by their crates, so neither needs
+  a package. On Debian/Ubuntu: `protobuf-compiler libwayland-dev pkg-config`.
 
 ## Dev builds (fast, local run)
 
@@ -149,6 +155,6 @@ Wayland setups).
 
 Building is not the gate. Before committing, run the
 [Definition of done](AGENTS.md#definition-of-done) checks; before cutting a release
-tag, run `cargo xtask release-gate` (fmt · clippy workspace + `daemonseed-gui
---features desktop` · test · check-proto · isc-coverage), which refuses to let a tag
-be created on a red tree.
+tag, run `cargo xtask release-gate`, which runs every group of that gate and refuses
+to let a tag be created on a red tree. `cargo xtask gate --list` prints the step
+table; `cargo xtask gate --group preflight` runs the group the pre-push hook runs.

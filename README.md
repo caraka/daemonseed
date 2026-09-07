@@ -50,7 +50,8 @@ daemonseed/
 │       └── daemonseed-gui-api.yaml
 │
 └── xtask/                                  workspace task runner: gen-proto, check-proto,
-                                            isc-coverage, findings-resolved, install-hooks, release-gate
+                                            isc-coverage, findings-resolved, install-hooks,
+                                            gate, release-gate
 ```
 
 The `tui` (ratatui) and `gui` (Slint) crates are the product surfaces; their interactive logic is a terminal-free / RAM-only, unit-testable screen state machine over the shared authoring library (`cli`) and the Veilid DHT transport (`daemonseed-veilid-net`). There is no relay — every client is a Veilid node.

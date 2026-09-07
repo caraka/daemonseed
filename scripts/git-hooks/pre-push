@@ -1,45 +1,17 @@
 #!/usr/bin/env bash
-# daemonseed pre-push hook — local CI gate for the private phase.
+# daemonseed pre-push hook — the pre-flight group of the Definition-of-Done
+# gate, which is defined once in `xtask` (`RELEASE_GATE_STEPS`).
 #
-# Installed by `cargo xtask install-hooks`. Mirrors oxicrypt's pattern:
-# GitHub-hosted CI minutes are reserved for the public phase; today the
-# developer's machine is the gate. Six checks must pass before push
-# succeeds. To skip on a doc-only push: `git push --no-verify`. Skipping
-# must be justified in the commit body — not the merge fast path.
+# Installed by `cargo xtask install-hooks`. The two suite groups are
+# `dev-suite`, which lints the windowed GUI and runs the dev-profile test
+# suite, and `release-suite`, which runs the release-profile suite; CI runs all
+# three groups on every pull request and on `main`. `git push --no-verify`
+# skips this hook, and a skip is justified in the commit body. The full gate is
+# `cargo xtask gate`. Every gate run ends by deleting the binaries its steps
+# linked into `target/`, so the next build of one relinks it.
 
 set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-echo "pre-push (1/6): cargo fmt --all --check"
-cargo fmt --all --check
-
-echo "pre-push (2/6): cargo clippy --workspace --all-targets -- -D warnings"
-cargo clippy --workspace --all-targets -- -D warnings
-
-# Every other check in this hook compiles the dev profile, where
-# `debug_assertions` is on. `debug_assert!` and friends expand their arguments
-# in every profile, so a binding introduced under `#[cfg(debug_assertions)]` and
-# read only by a `debug_assert_eq!` compiles in dev and fails to compile in
-# release (E0425). `check` rather than `build`: it does not link, and reuses the
-# release cache.
-echo "pre-push (3/6): cargo check --workspace --release"
-cargo check --workspace --release
-
-# Debug mode + single-threaded matches oxicrypt's discipline: bug-surfacing
-# beats wall-clock minutes on a developer machine. Budget is 30-60 min for
-# a clean workspace push; release-bound pushes always run the full hook.
-echo "pre-push (4/6): cargo test --workspace -- --test-threads=1 (DEBUG)"
-cargo test --workspace -- --test-threads=1
-
-echo "pre-push (5/6): cargo xtask check-proto"
-cargo xtask check-proto
-
-# `-D warnings` is load-bearing, not tidiness: `cargo doc` exits 0 with warnings
-# present, so without it this gate can never fail and reads exactly like one that
-# passes. The class it guards is real -- 23 warnings had accumulated unnoticed,
-# most of them public docs linking to deliberately-private items.
-echo "pre-push (6/6): cargo doc --workspace --no-deps (warnings denied)"
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-
-echo "pre-push: all 6 gates green; push proceeding."
+exec cargo xtask gate --group preflight

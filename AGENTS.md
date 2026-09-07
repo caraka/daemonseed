@@ -67,18 +67,26 @@ Every change lands on `main` through a **pull request** — never a direct push 
 
 ## Definition of done
 
-Every task is incomplete until all of these pass:
+The gate is defined once — one table of steps in three groups, `RELEASE_GATE_STEPS` in `xtask/src/main.rs` — and read by every caller. The pre-push hook runs the `preflight` group. CI runs all three groups, one job per group, on every pull request and on `main`. `cargo xtask release-gate` runs all three before a release tag.
 
-1. `cargo fmt --all --check` — no unformatted code
-2. `cargo clippy --workspace --all-targets -- -D warnings` — no warnings
-3. `cargo check --workspace --release` — the workspace type-checks in the profile that ships. Every other check compiles the dev profile, where `debug_assertions` is on; `debug_assert!` expands its arguments in every profile, so a binding introduced under `#[cfg(debug_assertions)]` and read only by a `debug_assert_eq!` compiles in dev and fails to compile in release
-4. `cargo test --workspace` — all tests pass
-5. `cargo xtask check-proto` — generated protobuf code matches the committed snapshot (per the hybrid codegen decision: `build.rs` regenerates each build; CI verifies the committed snapshot)
-6. **Doc-sync** — the commit is the gate: every commit that changed tracked state landed with its documentation already true (see **Doc-sync reconciliation**). This is the judgment gate alongside the five mechanical checks.
+| Group | Steps |
+|-------|-------|
+| `preflight` | `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo check --workspace --release` · `cargo doc --workspace --no-deps` under `RUSTDOCFLAGS=-D warnings` · `cargo xtask check-proto` · `cargo xtask isc-coverage` · `cargo xtask check-manifests` · `cargo xtask check-ui-strings` |
+| `dev-suite` | `cargo clippy -p daemonseed-gui --features desktop --all-targets -- -D warnings` · `cargo test --workspace` |
+| `release-suite` | `cargo test --workspace --release` |
 
-Run checks 1–5 as the last step before handing control back to the user, and re-run after any post-review fix-ups; check 6 (doc-sync) is applied per-commit as you go, not deferred to handback. If `cargo fmt --all --check` reports diffs, run `cargo fmt --all` to fix them before the clippy step — clippy output is easier to read on formatted code.
+`cargo xtask gate --list` prints the table; `cargo xtask gate --group <group>` runs one group; `cargo xtask gate` runs every group. A `test` step that reports zero passing tests is red whatever its exit code — a suite that compiled to no tests exits 0. Every gate run, whole or single-group, ends by deleting the workspace binaries its steps linked into `target/{debug,release}/`, so the next build of one relinks it.
 
-**Cutting a release tag:** run `cargo xtask release-gate` before `git tag`. It runs the full DoD gate (fmt · clippy workspace + `daemonseed-gui --features desktop` · `check --workspace --release` · `test --workspace` · `test --workspace --release` · check-proto · isc-coverage · check-manifests · check-ui-strings) and exits non-zero naming any red step, so a tag is never created on a red tree — the v0.29.0 slip, where a tag was cut while `test --workspace` was red. The pre-push hook is the backstop on push; the release-gate stops the tag being created in the first place.
+Three of the steps cover a class no other step reaches. `cargo check --workspace --release` type-checks in the profile that ships: every other compile step runs the dev profile, where `debug_assertions` is on, and `debug_assert!` expands its arguments in every profile, so a binding introduced under `#[cfg(debug_assertions)]` and read only by a `debug_assert_eq!` compiles in dev and fails to compile in release. `cargo test --workspace --release` runs the suite in that same profile, which sets `overflow-checks = true` and so differs in behaviour and not only in optimization level. `RUSTDOCFLAGS=-D warnings` is what gives the rustdoc step a red state at all: `cargo doc` exits 0 with warnings present.
+
+Every task is incomplete until both of these pass:
+
+1. **The gate** — `cargo xtask gate` green, every group. The table above is the authority on what that runs; `cargo xtask gate --list` reads it live.
+2. **Doc-sync** — the commit is the gate: every commit that changed tracked state lands with its documentation already true (see **Doc-sync reconciliation**). This is the judgment gate alongside the mechanical steps.
+
+Run the gate as the last step before handing control back to the user, and re-run after any post-review fix-up; doc-sync is applied per-commit as you go, not deferred to handback. If `cargo fmt --all --check` reports diffs, run `cargo fmt --all` to fix them before re-running — clippy output is easier to read on formatted code.
+
+**Cutting a release tag:** run `cargo xtask release-gate` before `git tag`. It runs every group of the gate above and exits non-zero naming any red step, so a tag is never created on a red tree. The pre-push hook is the backstop on push and CI is the backstop on the pull request; the release-gate stops the tag being created in the first place.
 
 ## Documentation sync at every commit point
 

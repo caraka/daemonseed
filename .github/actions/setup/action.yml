@@ -1,0 +1,41 @@
+name: setup
+description: Install the native build dependencies, the pinned Rust toolchain and the cargo cache.
+
+inputs:
+  cache-key:
+    description: Cache key for this job. Distinct per job, so concurrent saves do not race.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The runner image ships toolchains this build never uses. A dev-profile build
+    # of the workspace with its test targets is larger than the disk left beside
+    # them, so they go first.
+    - name: Free runner disk
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+          /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        df -h / | tail -1
+    # `protoc` for `daemonseed-proto/build.rs`. `libwayland-dev` for the build
+    # script of `wayland-sys`, reached through `daemonseed-gui` → `rfd` → `ashpd`,
+    # which probes `wayland-client` through `pkg-config` when its `dlopen` feature
+    # is off, as it is in the default workspace build. dbus is vendored and sqlite
+    # bundled in this dependency graph, so neither needs a system package.
+    - name: Install native build dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          protobuf-compiler libwayland-dev pkg-config
+    # Reads `rust-toolchain.toml`, so the pinned channel and its rustfmt and
+    # clippy components are what install rather than a floating stable.
+    - name: Install the pinned toolchain
+      shell: bash
+      run: rustup show
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
