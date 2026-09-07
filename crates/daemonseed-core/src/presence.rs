@@ -122,8 +122,8 @@ pub fn next_keepalive_interval() -> Duration {
 ///
 /// One definition for both interval draws. They were byte-identical apart from
 /// their constants, and a second copy of jitter arithmetic is drift waiting to
-/// happen — the same argument [`crate::jitter::apply_jitter`] makes for the
-/// exponential path.
+/// happen — the same argument [`crate::backoff::apply_jitter`] makes for the
+/// outbox reseed ladder, its one caller.
 ///
 /// `fill` is a parameter rather than a direct `getrandom` call for the reason
 /// [`crate::jitter::unit_or_zero`] takes one: the degrade is the single branch here

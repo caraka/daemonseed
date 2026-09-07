@@ -26,7 +26,7 @@ daemonseed/
 │   ├── daemonseed-core/                    protocol library — identity, 3-layer storage (seeds /
 │   │                                       redb share index / chunk CAS), crypto-agility, first-start,
 │   │                                       bootstrap, flat circle-of-trust keys, shared-record (rendezvous) addressing, indexer,
-│   │                                       reconnect backoff, mute/hide lists, @-mention logic (M9),
+│   │                                       mute/hide lists, @-mention logic (M9),
 │   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM (M10),
 │   │                                       at-rest persistence of display-name / mute / hide / circle membership
 │   │                                       via a cached SealingKey re-encrypt (M13); fetched-download CAS + manifest

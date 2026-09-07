@@ -90,9 +90,9 @@ pub enum TrustEventKey {
     CircleCrossFamilyDeprecated,
     /// No common protocol version at APP_HELLO (ISC-C23).
     NoCommonVersion,
-    /// Connection refused by the server's rate limiter, mid auto-backoff (ISC-C26).
+    /// A connection was refused as rate-limited.
     ConnectionRateLimited,
-    /// Rate-limit retry budget exhausted (ISC-C26).
+    /// The retry budget for a rate-limited peer is exhausted.
     ConnectionRateLimitedExhausted,
     /// A release-channel update artifact failed signature verification (ISC-A-C11).
     UpdateVerificationFailed,

@@ -1,14 +1,12 @@
 //! The jitter unit drawn from the OS CSPRNG, with the entropy read behind a seam.
 //!
-//! Two callers draw a `[-1, 1]` jitter unit at runtime — [`crate::backoff::Backoff`]
-//! for retry spacing and [`crate::dm::outbox::ReseedSchedule`] for DM re-seed
-//! spacing — and both had the draw, the mapping and the failure degrade written
-//! inline and identically. That is three problems in one shape:
+//! [`crate::dm::outbox::ReseedSchedule`] draws a `[-1, 1]` jitter unit at runtime
+//! for DM re-seed spacing, and had the draw, the mapping and the failure degrade
+//! written inline. That is two problems in one shape:
 //!
 //! - the **mapping** from eight bytes onto the band was never asserted anywhere;
 //! - the **degrade** (`Err(_) => 0.0`, i.e. no jitter) was unreachable from a test,
-//!   because `getrandom::fill` cannot be made to fail from inside one;
-//! - two copies of an unasserted rule drift independently.
+//!   because `getrandom::fill` cannot be made to fail from inside one.
 //!
 //! [`unit_or_zero`] takes the fill as a parameter, so a test supplies a failing
 //! one and the degrade becomes an ordinary branch. Production passes [`os_fill`].
@@ -149,28 +147,40 @@ mod tests {
 
     /// The production source is wired to something real and varies.
     ///
-    /// **The band assertion alone is vacuous and was, until review caught it:**
-    /// the degrade returns `0.0`, which is inside the band, so an `os_fill` that
-    /// always failed — or a `unit` that returned a constant — satisfied it. The
-    /// spread assertion is what excludes a dead source, and it is the reason the
-    /// 64 iterations exist at all.
+    /// The production source is wired to something real, varies, and is not
+    /// quantised.
     ///
-    /// Not flaky: the mapping has ~2^53 distinct outputs, so 64 draws collapsing
-    /// to one value is not a tail this suite will meet.
+    /// **The band assertion alone is vacuous:** the degrade returns `0.0`, which
+    /// is inside the band, so an `os_fill` that always failed — or a `unit` that
+    /// returned a constant — satisfies it. The cardinality assertion is what
+    /// excludes a dead source, and it is the reason the 64 iterations exist.
+    ///
+    /// **The floor is a majority of the draws, not one.** A `> 1` floor separates
+    /// SOME spread from NO spread and cannot see a draw quantised onto a handful
+    /// of values — `unit().signum()` spans the whole band from two points, which
+    /// is worse for de-correlation than a collapsed band because a population
+    /// splits into two synchronised herds rather than one.
+    ///
+    /// Not flaky: the mapping has ~2^53 distinct outputs and the band holds far
+    /// more of them than 64, so a collision is not a tail this suite meets, while
+    /// any low-cardinality mutation falls off a cliff to a handful.
     ///
     /// Breadth only. Uniformity of the OS CSPRNG is not this crate's to assert.
     #[test]
     fn the_production_draw_is_live_and_lands_in_the_band() {
+        const DRAWS: usize = 64;
         let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..64 {
+        for _ in 0..DRAWS {
             let u = unit();
             assert!((-1.0..=1.0).contains(&u), "drew {u}, outside the band");
             seen.insert(u.to_bits());
         }
         assert!(
-            seen.len() > 1,
-            "64 draws produced one value, so the entropy source is dead or the \
-             draw is a constant — the band assertion above cannot see either"
+            seen.len() > DRAWS / 2,
+            "{DRAWS} draws produced only {} distinct values, so the source is \
+             dead, constant, or quantised — the band assertion above sees none \
+             of the three",
+            seen.len()
         );
     }
 
@@ -191,18 +201,20 @@ mod tests {
         );
     }
 
-    /// Neither call site has re-inlined its own copy of the mapping.
+    /// Neither jitter file has re-inlined its own copy of the mapping.
     ///
     /// This is the regression the extraction exists to prevent and the only one
-    /// the seam's own tests cannot see: reverting either site to a private
-    /// `getrandom` draw leaves the whole crate green, because both entry points
+    /// the seam's own tests cannot see: reverting a site to a private
+    /// `getrandom` draw leaves the whole crate green, because the entry point
     /// would still return a jittered value — just from a copy free to drift.
+    /// `backoff.rs` is scanned as well as the call site, because it owns the
+    /// jitter arithmetic and is where a draw would most plausibly reappear.
     ///
     /// A source check is the right instrument here precisely because the property
-    /// *is* confined to these two files. The predicate is factored out so it can be
-    /// driven by fixtures rather than only by reading real sources.
+    /// *is* confined to these two files. The predicate is factored out so it can
+    /// be driven by fixtures rather than only by reading real sources.
     #[test]
-    fn neither_call_site_carries_its_own_mapping() {
+    fn neither_jitter_file_carries_a_mapping_of_its_own() {
         // Assembled from fragments so this file's own source cannot match.
         fn has_inline_mapping(src: &str) -> bool {
             src.contains(["u64::MAX as ", "f64"].concat().as_str())
@@ -213,18 +225,18 @@ mod tests {
             "the predicate does not detect the mapping it exists to find"
         );
         assert!(
-            !has_inline_mapping("self.next(crate::jitter::unit())"),
+            !has_inline_mapping("self.schedule_next_with_unit(now_ms, crate::jitter::unit())"),
             "the predicate fires on a call site that delegates correctly"
         );
 
         for (name, src) in [
-            ("backoff.rs", include_str!("backoff.rs")),
             ("dm/outbox.rs", include_str!("dm/outbox.rs")),
+            ("backoff.rs", include_str!("backoff.rs")),
         ] {
             assert!(
                 !has_inline_mapping(src),
-                "{name} carries its own copy of the jitter mapping again; it is \
-                 supposed to call jitter::unit"
+                "{name} carries its own copy of the jitter mapping; the draw \
+                 belongs to jitter::unit"
             );
         }
     }

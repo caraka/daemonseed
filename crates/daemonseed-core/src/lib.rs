@@ -13,8 +13,8 @@
 //! addressing), [`storage::cas`] (the content-addressed chunk store),
 //! [`storage::share_index`] (the encrypted redb share index), and [`indexer`]
 //! (the share-folder indexer engine driving that index). M9 adds client-side
-//! abuse-resilience and chat affordances: [`backoff`] (reconnect curve +
-//! close-cause categorization, ISC-C26), [`mention`] (@-mention recognition +
+//! abuse-resilience and chat affordances: [`backoff`] (jitter arithmetic +
+//! close-cause categorization), [`mention`] (@-mention recognition +
 //! resolution, ISC-C17/C18), and the mute / hide-shares lists on
 //! [`storage::seeds::Seeds`] (ISC-C15/C16). M10-completion adds the two
 //! platform-feature *scaffolds*: [`biometric`] (the `BiometricStore` trait for

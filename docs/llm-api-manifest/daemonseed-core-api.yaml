@@ -2524,19 +2524,14 @@ modules:
 
   - name: daemonseed_core::backoff
     description: >-
-      Client reconnect backoff curve + close-cause categorization (M9, ISC-C26).
-      Exponential 1s->60s x2 with +/-25% jitter and an 8-retry per-server-id
-      budget; a uniform close-cause layering that never names which rate-limit
-      was hit (A-S12). apply_jitter(delay, frac, unit) is the free function
-      applying +/-frac jitter at unit in [-1, 1], clamped to >= 0 — the one
-      definition of jitter in the workspace, called by BackoffPolicy::jitter and
-      by dm::outbox's rung ladder.
+      Jitter arithmetic + close-cause categorization. apply_jitter(delay, frac,
+      unit) applies +/-frac jitter at unit in [-1, 1], clamped to >= 0 — the one
+      definition of jitter in the workspace, called by dm::outbox's rung ladder.
+      CloseCause is a uniform close-cause layering that never names which
+      rate-limit was hit (A-S12).
     no_std: false
-    depends_on:
-      - daemonseed_core::trust_events
-    iscs:
-      - C26
-      - A-S12
+    depends_on: []
+    iscs: []
     added_in: "v0.11.0 (M9)"
 
   - name: daemonseed_core::mention
@@ -4247,19 +4242,6 @@ types:
       Malformed.
 
   # ── backoff ─────────────────────────────────────────────────────────
-  - name: BackoffPolicy
-    module: daemonseed_core::backoff
-    kind: struct
-    description: "delay_for_attempt(attempt) (saturating, no overflow); jitter(delay, unit), which delegates to backoff::apply_jitter."
-
-  - name: Backoff
-    module: daemonseed_core::backoff
-    kind: struct
-    description: >-
-      Stateful driver. new/with_policy; next(unit)/next_jittered() consume one
-      retry, None once the budget is exhausted; attempts/exhausted/reset;
-      refusal_event() -> TrustEventKey (ConnectionRateLimited -> …Exhausted).
-
   - name: CloseCause
     module: daemonseed_core::backoff
     kind: enum
@@ -8003,38 +7985,28 @@ functions:
       description: The derived client trust signals (report-only).
 
   # ── backoff ─────────────────────────────────────────────────────────
-  - name: BackoffPolicy::delay_for_attempt
-    module: daemonseed_core::backoff
-    description: Saturating exponential delay for the given attempt (no overflow).
-    signature: "pub fn delay_for_attempt(&self, attempt: u32) -> Duration"
-    parameters:
-      - name: attempt
-        type: u32
-        direction: in
-        description: The zero-based retry attempt number.
-    returns:
-      type: Duration
-      description: The base (un-jittered) delay for that attempt.
-
-  - name: Backoff::next_jittered
+  - name: apply_jitter
     module: daemonseed_core::backoff
     description: >-
-      Consume one retry, returning the jittered delay, or None once the budget is
-      exhausted.
-    signature: "pub fn next_jittered(&mut self) -> Option<Duration>"
-    parameters: []
+      Apply +/-frac jitter to a delay, clamped to >= 0 — the one definition of
+      jitter in the workspace.
+    signature: "pub fn apply_jitter(delay: Duration, frac: f64, unit: f64) -> Duration"
+    parameters:
+      - name: delay
+        type: Duration
+        direction: in
+        description: The un-jittered delay.
+      - name: frac
+        type: f64
+        direction: in
+        description: The half-width of the jitter band, as a fraction of the delay.
+      - name: unit
+        type: f64
+        direction: in
+        description: The point in the band, clamped to [-1, 1].
     returns:
-      type: "Option<Duration>"
-      description: The next jittered delay, or None when retries are exhausted.
-
-  - name: Backoff::refusal_event
-    module: daemonseed_core::backoff
-    description: "Map the current state to a trust-event key (ConnectionRateLimited -> …Exhausted)."
-    signature: "pub fn refusal_event(&self) -> TrustEventKey"
-    parameters: []
-    returns:
-      type: TrustEventKey
-      description: The trust-event key describing the current refusal state.
+      type: Duration
+      description: The jittered delay.
 
   # ── mention ─────────────────────────────────────────────────────────
   - name: find_self_mentions
@@ -8831,29 +8803,11 @@ constants:
     value: "2h"
     description: Minimum lead time a cutoff must sit in the future at signing.
 
-  - name: DEFAULT_BASE
-    module: daemonseed_core::backoff
-    type: Duration
-    value: "1s"
-    description: Backoff base delay (first retry).
-
-  - name: DEFAULT_CAP
-    module: daemonseed_core::backoff
-    type: Duration
-    value: "60s"
-    description: Backoff maximum (capped) delay.
-
-  - name: DEFAULT_MAX_RETRIES
-    module: daemonseed_core::backoff
-    type: u32
-    value: "8"
-    description: Per-server-id retry budget.
-
   - name: DEFAULT_JITTER_FRAC
     module: daemonseed_core::backoff
     type: f64
     value: "0.25"
-    description: Jitter fraction (+/-25%) applied to each backoff delay.
+    description: Jitter fraction (+/-25%) of the delay it is applied to.
 
   - name: RECOVERY_RISK_WARNING
     module: daemonseed_core::biometric

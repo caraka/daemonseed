@@ -589,6 +589,9 @@ work lives in the maintainer's own planning notes, not here.
 - `cargo xtask install-hooks` writes the hook to the directory git runs hooks from
   (`git rev-parse --git-path hooks`): `core.hooksPath` when set, otherwise the common `.git/hooks`.
   Run from a worktree it wrote to `.git/worktrees/<name>/hooks/`, which git does not read.
+- The `daemonseed_core::presence` interval-draw documentation links `apply_jitter` in
+  `daemonseed_core::backoff`, the module that defines it. (#332)
+
 - A direct-message leg fold works on its own copy of the page's resume record and writes it back
   only when it consumes its leg, so a fold that defers or refuses leaves nothing for a later fold on
   the same page to commit; a withheld attempt is not recorded in the seen-frame memory; the own
@@ -661,10 +664,10 @@ work lives in the maintainer's own planning notes, not here.
   bytes an interrupted download had staged. `wrapper_folder` reuses the folder the download
   actually staged under, keeps the name of a download that has already staged bytes, and
   collision-suffixes a fresh one against the destination. (#355)
-- The backoff jitter band is pinned by tests that can fail. Four probes assert its width, its
-  centring on the base delay, its population across the band and its shape at the saturated
-  rung, in place of a range check that a collapsed draw satisfied. Tests only; no production
-  code changes. (#332)
+- `daemonseed_core::backoff::apply_jitter` is pinned by tests that can fail. Three probes assert
+  the band's edges and its centre, that a unit outside `[-1, 1]` is clamped, and that a negative
+  or NaN factor returns zero rather than panicking. Tests only; no production code changes.
+  (#332)
 - Corrected the at-rest circle read high-water map, which held a circle's `cot_key` IKM in the
   clear as a `BTreeMap` key while `PersistedCircle` protected the identical value. The key is
   `CircleSeenKey`, a newtype over `Zeroizing<String>`, so the phrase is wiped on an ordinary
@@ -707,6 +710,14 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-gui`: `DAEMONSEED_OPERATOR` — possession of the project-announce seed is the operator
   capability; there is no second gate. Debug builds are no longer world-writable on the announce
   record.
+- `daemonseed_core::backoff::Backoff` and `daemonseed_core::backoff::BackoffPolicy`, with the
+  `DEFAULT_BASE`, `DEFAULT_CAP` and `DEFAULT_MAX_RETRIES` constants they carried. Nothing
+  constructed a `Backoff`; the retry cadences that run carry their own delay ladders.
+  `Backoff::refusal_event`, noted in issue #338, is removed with them. Jitter remains
+  `daemonseed_core::backoff::apply_jitter` and `DEFAULT_JITTER_FRAC`, and the close-cause
+  layering remains `daemonseed_core::backoff::CloseCause`. ISC-C26 is withdrawn as an `ISA.md`
+  tombstone and deregistered from the ISC registry; `TOTAL` 245 after the registry change. (#332)
+
 - `daemonseed_veilid_net::dm::spawn_dm_ack_publish`. The DM driver owns when a standalone
   acknowledgement is written, and the helper decided nothing about it; no production caller
   existed. Building and addressing a record remains

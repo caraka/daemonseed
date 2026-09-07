@@ -1052,8 +1052,9 @@ impl ReseedSchedule {
     /// `Self::schedule_next_with_unit` with the jitter unit drawn from the OS CSPRNG.
     ///
     /// A CSPRNG read failure degrades to the un-jittered rung rather than failing
-    /// the emission — the same trade [`crate::backoff::Backoff::next_jittered`]
-    /// makes, and the same reason: a message that stops being re-seeded is lost,
+    /// the emission — the same shape of trade the presence keepalive draw
+    /// ([`crate::presence::next_keepalive_interval`]) takes for its own reason.
+    /// Here the reason is that a message that stops being re-seeded is lost,
     /// while a message re-seeded on an unjittered cadence is only correlatable.
     pub fn schedule_next_jittered(&mut self, now_ms: i64) {
         self.schedule_next_with_unit(now_ms, crate::jitter::unit());
@@ -2981,6 +2982,60 @@ mod tests {
             floor > T0 + ReseedSchedule::delay_for_rung(0).as_millis() as i64,
             "the band's floor is inside the re-seed ladder's opening rung, so \
              this test cannot tell the two jitters apart"
+        );
+    }
+
+    /// **The deferred first dispatch is drawn across the width of its band, on
+    /// both sides of the un-jittered centre.**
+    ///
+    /// [`a_deferred_first_dispatch_leaves_the_entry_undue_at_the_enqueue_instant`](Self::a_deferred_first_dispatch_leaves_the_entry_undue_at_the_enqueue_instant)
+    /// computes its floor and ceiling from [`RECONNECT_JITTER_FRAC`], so a
+    /// narrowed band moves that window with it and every draw stays inside:
+    /// scaling the drawn unit to a hundredth collapses the band to ±0.75% and
+    /// that test cannot see it. A collapsed-but-nonzero band is phase-lock in
+    /// practice, which is the whole thing this draw exists to prevent — k legs
+    /// gated on one boot land within minutes of each other again.
+    ///
+    /// The spread floor is derived from the band rather than written as a
+    /// constant, and the centring assertion is what kills a unit confined to one
+    /// sign: that keeps half the width AND pushes every leg systematically later,
+    /// which a spread floor alone would pass.
+    ///
+    /// Not flaky: for 64 uniform draws the chance of spanning less than half the
+    /// band, or of landing entirely on one side of the centre, is far below any
+    /// tail this suite meets.
+    #[test]
+    fn a_deferred_first_dispatch_spans_its_band_and_straddles_the_centre() {
+        const DRAWS: usize = 64;
+        let centre = T0 + RECONNECT_FIRST_DISPATCH.as_millis() as i64;
+        let band_ms =
+            (RECONNECT_FIRST_DISPATCH.as_millis() as f64 * RECONNECT_JITTER_FRAC * 2.0) as i64;
+
+        let mut draws = Vec::with_capacity(DRAWS);
+        for _ in 0..DRAWS {
+            let mut ob = empty();
+            ob.enqueue_sealed(1, OutboxTarget::ChannelPage, T0, frame(0x11), 0)
+                .expect("enqueues");
+            ob.entry_mut(1)
+                .expect("just enqueued")
+                .defer_first_dispatch(T0)
+                .expect("nothing has been emitted");
+            draws.push(ob.entry(1).expect("there").schedule().next_due_ms());
+        }
+
+        let lo = *draws.iter().min().expect("DRAWS is non-zero");
+        let hi = *draws.iter().max().expect("DRAWS is non-zero");
+        assert!(
+            hi - lo > band_ms / 2,
+            "{DRAWS} draws spanned only {} ms of the {band_ms} ms band — the \
+             jitter is scaled down, not absent, which the single-draw window \
+             check cannot see",
+            hi - lo
+        );
+        assert!(
+            lo < centre && hi > centre,
+            "every draw fell on one side of the un-jittered centre {centre}: \
+             [{lo}, {hi}] — the unit is not centred on zero"
         );
     }
 

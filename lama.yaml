@@ -51,7 +51,7 @@ crates:
     purpose: >-
       Protocol library — identity, storage, bootstrap, first-start
       orchestration, crypto-agility primitives, circle-of-trust key derivation,
-      the M9 client surfaces (reconnect backoff, mute / hide-shares lists,
+      the M9 client surfaces (mute / hide-shares lists,
       @-mention recognition/resolution), the M10 release surface
       (daemonseed_core::release: release trust anchor + N-of-M multi-sig verify +
       update-lifecycle FSM), and the M13 at-rest persistence keystone — the
@@ -377,10 +377,10 @@ capabilities:
   - category: "Chat affordances: backoff, mute/hide, mentions (client)"
     summary: >-
       Client-side abuse-resilience + chat surfaces, all pure/local. backoff:
-      an exponential+jitter reconnect curve (1s→60s, ±25%) with an 8-retry
-      per-server-id budget and CloseCause categorization by observable layer,
-      mapping refusals to the M7 ConnectionRateLimited trust events without
-      speculating which limit was hit (C26). storage::seeds gains mute +
+      apply_jitter, the one definition of jitter in the workspace (±frac at a
+      unit in [-1, 1]), and CloseCause, the close-cause vocabulary by observable
+      layer whose user_message() never speculates which limit was hit.
+      storage::seeds gains mute +
       hide-shares handle lists, persisted as additive directive lines in the
       sealed at-rest blob and never sent on the wire (C15/C16/A-C3). mention:
       find_self_mentions (read-only scan keyed on the full wire handle) and
@@ -392,7 +392,7 @@ capabilities:
       - daemonseed_core::backoff
       - daemonseed_core::mention
       - daemonseed_core::storage::seeds
-    iscs: [C15, C16, C17, C18, C26, A-C3, A-C4]
+    iscs: [C15, C16, C17, C18, A-C3, A-C4]
 
   - category: "Release-signing verify + update lifecycle (verifiable-core)"
     summary: >-

@@ -64,7 +64,7 @@ modules:
       ISC-A-C19). Tab cycles focus across all Main-view panes (see MainFocus).
     no_std: false
     depends_on: [daemonseed-core, "daemonseed_tui::screens::first_start"]
-    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C25, C26, C28, C59, C60, C61, C62, C63, C64, C65, C66, C67, C68, C69, C70, C71, A-S3, A-S11, A-C3, A-C7, A-C12, A-C29, A-C30, A-C31, A-C32, A-C33, F23]
+    iscs: ["1", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", C16, C25, C28, C59, C60, C61, C62, C63, C64, C65, C66, C67, C68, C69, C70, C71, A-S3, A-S11, A-C3, A-C7, A-C12, A-C29, A-C30, A-C31, A-C32, A-C33, F23]
     added_in: "M11 scaffold + chat + trust/server + C28 + shares + fetch + public-space + deprecation workstream; v0.16 multi-circle carousel (C59-C62 / A-C29 / A-C30); M13 session write-through + circle-membership persistence/rejoin (C51 / C59); M15 Fetched browse pane — named-file downloads, read-only (C63 / C64 / A-C31 / A-C32); M15 cleanup removed separate Publish pane ([p]-publish now in Shares pane), added sender_handle/sharer_handle to public-room and share-fetch paths; M16 informed-fetch overlay — manifest preview (C66 / A-C33) + selective fetch (C67) + choose-download-dir (C68), multi-share publish/unpublish from the Shares pane (C69), status-line auto-clear on focus change (C70), and a Ctrl-G strong-circle-phrase generator in the join box (C71); M16 crown completion — chunk-granular fetch gauge seeded from per-entry chunk counts, complete-clamp to the chunk total, and a preview key-hint line (C76)"
 
   - name: daemonseed_tui::net
@@ -208,13 +208,13 @@ modules:
       surfaced on the status line; the cached candidate list is left intact).
       On connect failure the actor categorizes the error into a CloseCause
       and emits the warranted trust event: an actionable key directly
-      (ServerKeyMismatch / NoCommonVersion, Blocking), else the uniform rate-limit
-      refusal escalated via a per-session Backoff (Transient → PersistentNonBlocking,
-      ISC-A-S12 — the client never claims a server-side cause it cannot observe).
+      (ServerKeyMismatch / NoCommonVersion, Blocking), else the uniform
+      rate-limit refusal (ISC-A-S12 — the client never claims a server-side
+      cause it cannot observe).
       Foreign/undecryptable inbound frames are skipped.
     no_std: false
     depends_on: [daemonseed-cli, daemonseed-core, daemonseed-proto]
-    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "25", "28", "47", C15, C17, C21, C22, C25, C26, C28, C37, C59, C60, C62, C63, C64, C65, C66, C67, C68, C69, S6, A-S2, A-S3, A-S11, A-C7, A-S12, A-C19, A-C30, A-C31, A-C32, A-C33, F23]
+    iscs: ["10", "14", "16", "17", "19", "20", "22", "23", "24", "25", "28", "47", C15, C17, C21, C22, C25, C28, C37, C59, C60, C62, C63, C64, C65, C66, C67, C68, C69, S6, A-S2, A-S3, A-S11, A-C7, A-C19, A-C30, A-C31, A-C32, A-C33, F23]
     added_in: "M11 connect + chat + C28 + shares + fetch + public-space + deprecation workstream; M12 introducer refresh (gate step 6); v0.16 multi-circle (C59/C60/C62 / A-C30); M13 CircleJoined entropy echo for rejoin pairing (C51 / C59); M15 FetchShare gained sharer_handle+name+fetched_root fields; new ListFetched command and FetchedShares event (C63/C64/A-C31); M15 cleanup: SendPublicRoom gained sender_handle, PublishShare gained sharer_handle (no separate Publish pane); M16 split the fetch into a manifest-preview FetchShare + a download ConfirmFetch { selected }, added the FetchManifest event + ShareManifestEntry (A1 preview / A2 selective fetch / A3 download-dir — C66/C67/C68 / A-C33)"
 
   - name: daemonseed_tui::screens::first_start
