@@ -1231,8 +1231,20 @@ mod tests {
         ensure_module();
         assert_eq!(
             hex::encode(sha384(project_release_pubkey().as_slice()).unwrap()),
-            "9867a1eb67c3875972e475ba3c05764d1122c7500f8807b4199ae106782f3ac3f1acc8eddfe7f0983e0ea63db6469f2f",
+            "3cdf6f2b9c64e032557ef4f0e3bd67eec1b1a6c5f44c73759352e08c650a5fbaba6e495437dfb5c52cceaf2e645285a7",
             "the project-release pubkey (client whitelist anchor) changed unexpectedly"
+        );
+    }
+
+    /// A retired project-release signing key is not the baked one, so an artifact
+    /// signed under a retired seed does not authorize. The retired key's digest is a
+    /// public value, pinned here so a rotation cannot be half-reverted to it.
+    #[test]
+    fn retired_project_release_pubkey_is_not_current() {
+        ensure_module();
+        assert_ne!(
+            hex::encode(sha384(project_release_pubkey().as_slice()).unwrap()),
+            "9867a1eb67c3875972e475ba3c05764d1122c7500f8807b4199ae106782f3ac3f1acc8eddfe7f0983e0ea63db6469f2f"
         );
     }
 

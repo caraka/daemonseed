@@ -152,8 +152,8 @@ pub fn owner_public_key(owner_public: &[u8; 32]) -> PublicKey {
 /// than pointing a fleet at a record nobody writes. `project_announce_owner_pubkey_kat`
 /// pins the value.
 pub const PROJECT_ANNOUNCE_OWNER_PUBKEY: [u8; 32] = [
-    0x99, 0x0a, 0xd4, 0x3d, 0xc3, 0x74, 0x82, 0x2b, 0xe8, 0xc7, 0xa9, 0xb9, 0x84, 0x55, 0xcc, 0xd5,
-    0xc6, 0x85, 0xe3, 0xe7, 0x72, 0x30, 0x39, 0x03, 0x34, 0x98, 0xd0, 0x97, 0xcf, 0x7e, 0xc4, 0xa7,
+    0xca, 0x40, 0x6b, 0xe7, 0x2b, 0x15, 0xea, 0xb6, 0xe5, 0xc9, 0x7a, 0x51, 0xa9, 0xdb, 0x4c, 0x35,
+    0x05, 0x4a, 0x57, 0xb1, 0xda, 0x76, 0x45, 0xc0, 0x5d, 0xb4, 0x3a, 0x32, 0x6e, 0xed, 0xe3, 0x1c,
 ];
 
 // ── What the operator instance holds (F17 / ISC-15) ──────────────────────────
@@ -634,9 +634,23 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(
-            hex, "990ad43dc374822be8c7a9b98455ccd5c685e3e7723039033498d097cf7ec4a7",
+            hex, "ca406be72b15eab6e5c97a51a9db4c35054a57b1da7645c05db43a326eede31c",
             "the announce owner key (record address) changed unexpectedly"
         );
+    }
+
+    /// The announce record a retired project identity owned is not the baked one:
+    /// a build that carries this constant reads a record the retired seed cannot
+    /// write. The retired key is a public value and is pinned here so a rotation
+    /// cannot be half-reverted to it.
+    #[test]
+    fn retired_announce_owner_key_is_not_current() {
+        const RETIRED: [u8; 32] = [
+            0x99, 0x0a, 0xd4, 0x3d, 0xc3, 0x74, 0x82, 0x2b, 0xe8, 0xc7, 0xa9, 0xb9, 0x84, 0x55,
+            0xcc, 0xd5, 0xc6, 0x85, 0xe3, 0xe7, 0x72, 0x30, 0x39, 0x03, 0x34, 0x98, 0xd0, 0x97,
+            0xcf, 0x7e, 0xc4, 0xa7,
+        ];
+        assert_ne!(PROJECT_ANNOUNCE_OWNER_PUBKEY, RETIRED);
     }
 
     /// The record the former world-known dev placeholder seed owned is not the

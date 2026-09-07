@@ -731,6 +731,10 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- The project-release identity is rotated: `project_release_pubkey()` and
+  `PROJECT_ANNOUNCE_OWNER_PUBKEY` are the keys of a new seed. Every client re-anchors to the new
+  announce record on upgrade. Builds carrying the previous keys are untrusted and must be upgraded:
+  they accept content signed under a seed that is no longer private.
 - `daemonseed-gui`: the operator credential is loaded once at Connect and held for the session; a
   seed that is malformed, readable by others, or not the project-release seed is reported on the
   announcements pane on every snapshot and at every write, rather than silently demoting the

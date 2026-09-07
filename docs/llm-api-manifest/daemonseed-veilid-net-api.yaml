@@ -1928,7 +1928,7 @@ constants:
   - name: PROJECT_ANNOUNCE_OWNER_PUBKEY
     module: daemonseed_veilid_net::identity
     type: "[u8; 32]"
-    value: "990ad43dc374822be8c7a9b98455ccd5c685e3e7723039033498d097cf7ec4a7"
+    value: "ca406be72b15eab6e5c97a51a9db4c35054a57b1da7645c05db43a326eede31c"
     description: >-
       The 32-byte Ed25519 public key owning the project-announce/MOTD DHT record
       (ISC-15). owner_public_key turns it into the VLD0 PublicKey get_dht_record_key
