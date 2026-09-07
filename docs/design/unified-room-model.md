@@ -73,7 +73,7 @@ Last-writer-wins per *logical key*, with freshness + TTL. For **shares** (key = 
 - **Stable placement** keyed on the item's STABLE identity (`share_id` / member identity),
   NOT the ephemeral node identity → a republish overwrites in place; a withdraw cancels in
   place. (Removes the node-identity-rotation orphan that is #118.)
-- **Freshness** — each item carries `sent_unix_ms` (the deferred red-team residual (f)).
+- **Freshness** — each item carries `sent_unix_ms` (the deferred review residual (f)).
 - **Re-announce + TTL aging** — owners periodically re-assert; recipients prune any item
   not refreshed within a prune-TTL (`> ~2` re-announce intervals so one missed cycle does
   not drop a live item). An offline owner's item ages out — owner presence *is* the share
@@ -125,11 +125,11 @@ the proto merge at v0.33.0 (MAJOR).
 3. **Harden on one surface; the other inherits via entropy-swap** (the corollary above).
 4. **Phase 5 cutover:** flip Veilid-default, delete the relay, land the Layer-2 wire merge.
 
-## Decisions (resolved 2026-06-29, caraka + Sanjay)
+## Decisions (resolved 2026-06-29)
 
 - **Shape A for chat, Shape B for shares (caraka).** Keep the backlog append-ring for
   messages; build the current-state primitive for shares (and later presence/MOTD).
-- **Shape B storage mechanism = per-key subkey on the room record (Sanjay's call).** The
+- **Shape B storage mechanism = per-key subkey on the room record.** The
   announcement slot is `share-id → subkey` on the rendezvous record (last-writer-wins),
   not a separate per-item record + index. Simplest, fits the existing record. The lobby
   presently holds *only* share announcements (lobby chat is unbuilt), so Shape B can use the
@@ -138,12 +138,12 @@ the proto merge at v0.33.0 (MAJOR).
   larger dedicated schema (DHT supports up to 1024 subkeys) if the ceiling ever bites.
 - **Cadence / TTL: implement with sane defaults, tunable later (caraka).** Re-announce
   interval + prune-TTL (`> ~2` intervals), tuned against ~14.7 s watch latency. Start
-  conservative; tweak from felt-testing.
-- **Build surface: public-shares first (Sanjay's call; caraka leaned circles, deferred to
+  conservative; tweak from manual testing.
+- **Build surface: public-shares first (circles were the alternative, deferred to
   judgement).** The Shape B *primitive* is built fresh in the engine regardless; its **first
   consumer is the existing public-share path** — repoint publish/withdraw to call Shape B (a
   call-site swap, not a refactor of Shape-A code). This directly fixes the live #116/#117/#118
-  bugs, reuses the felt-tested publish/discover/fetch plumbing, and avoids the Shape-A/Shape-B
+  bugs, reuses the manually tested publish/discover/fetch plumbing, and avoids the Shape-A/Shape-B
   slot-contention a circle record (which carries messages) would have. **Circle-shares become
   the second consumer** via the entropy swap — proving the corollary, and adding the feature.
 - **Operator write-gate (MOTD/announcements): out for now (caraka).** A third consumer of the

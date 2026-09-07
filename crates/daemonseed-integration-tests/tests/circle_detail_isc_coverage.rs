@@ -9,7 +9,7 @@
 //! sheet render (`apply_circle_detail`) are unit-tested IN the `daemonseed-gui`
 //! binary crate (`state::tests::circle_detail_label_derives_from_net_contract_not_chosen_name`),
 //! whose `pub` does not escape to this integration crate; the visible 3-vector
-//! sheet render is felt-test-gated (ISA `## Criteria` ISC-C96 left `[ ]`).
+//! sheet render is manual test-gated (ISA `## Criteria` ISC-C96 left `[ ]`).
 //! Registers ISC-C96.
 
 use daemonseed_core::circle::default_circle_label;

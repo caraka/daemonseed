@@ -154,7 +154,7 @@ const SERVE_QUEUE_CAP: usize = 256;
 /// fragment demand (gui `CHUNK_FETCH_CONCURRENCY` 8 × `share::FRAGMENT_FETCH_CONCURRENCY`
 /// 8 = 64), or a single legitimate large download self-throttles: fragments beyond the
 /// cap wait for a permit, age past the 5s answer window, and the download fails on an
-/// otherwise-idle sharer (xhigh review). 128 clears one full download with margin while
+/// otherwise-idle sharer (review). 128 clears one full download with margin while
 /// still bounding a pathological multi-fetcher burst.
 const MAX_CONCURRENT_SERVE_REPLIES: usize = 128;
 
@@ -1687,7 +1687,7 @@ async fn actor_loop(
     // async mutex per record serializes both; DISTINCT records stay fully concurrent,
     // so a slow write to one record never blocks another's traffic or the actor loop.
     // Shared so the spawned publish + advert refresh contend on the same locks as the
-    // main loop. See rendezvous::record_lock + ISA (2026-07-07, #128 xhigh review).
+    // main loop. See rendezvous::record_lock + ISA (2026-07-07, #128 review).
     let record_locks: Arc<rendezvous::RecordLocks> = Arc::new(Mutex::new(HashMap::new()));
     // Active share adverts (Phase 3 discovery), keyed by share_id, so a
     // RouteChanged can re-allocate + re-sign + re-publish each one.
@@ -2386,14 +2386,14 @@ async fn actor_loop(
                 // self-inflicted release never matches here. Without this filter
                 // the actor's own releases re-armed refresh forever: an endless
                 // refresh→release→RouteChange→refresh storm re-publishing a 12KB
-                // envelope every coalesce window (2026-07-02 felt-test log).
+                // envelope every coalesce window (2026-07-02 manual test log).
                 let relevant = {
                     let routes = advert_routes.lock().unwrap();
                     dead_routes.iter().any(|d| routes.values().any(|r| r == d))
                 };
                 // Always trace: correlating route churn against a fetch wave's
                 // serve/reply timing is the latency-kill vs rotation-kill
-                // discriminator a felt-test log needs.
+                // discriminator a manual test log needs.
                 crate::vtrace!(
                     "route_maintenance: {} dead route(s), relevant={relevant}",
                     dead_routes.len()
@@ -2455,7 +2455,7 @@ async fn actor_loop(
                 // one + releases the old) would kill an active download's imported
                 // route mid-transfer, so a share that served a fetch within
                 // SERVE_RECENCY_WINDOW is skipped — a live download keeps its route
-                // stamped fresh and is never disturbed (xhigh review). No busy-gate
+                // stamped fresh and is never disturbed (review). No busy-gate
                 // re-delivery (the next tick is the retry); the shared coalesce gate
                 // makes a tick just after a real refresh a quiet no-op, so the cadence
                 // never approaches the refresh storm the RouteMaintenance filter closed.
@@ -2581,7 +2581,7 @@ async fn serve_loop(
         // Re-check expiry AFTER the permit wait: acquiring can block seconds when all
         // permits are held (the exact latency spike #125 targets), so an entry that
         // passed the dequeue check may have aged past the window while waiting. Sealing
-        // + sending it would be pure wasted work the reply lands too late for (xhigh
+        // + sending it would be pure wasted work the reply lands too late for (review
         // review). The permit drops here on `continue`.
         if received.elapsed() > SERVE_ANSWER_WINDOW {
             crate::vtrace!(
@@ -2612,7 +2612,7 @@ async fn serve_loop(
         // Reply on a spawned task: awaiting `app_call_reply` inline serializes
         // the lane at whatever per-reply latency the network imposes (observed
         // ~4.6s per call, cause not yet pinned). queued / seal / reply are
-        // timed separately so a slow felt-test log names the stage to blame.
+        // timed separately so a slow manual test log names the stage to blame.
         let api = api.clone();
         tokio::spawn(async move {
             let _permit = permit; // released when this reply task ends
@@ -2654,7 +2654,7 @@ async fn publish_rendezvous(
     let owner = identity::rendezvous_owner_keypair(&owner_seed)?;
     // Serialize the whole open + seq-bump + write for THIS record: a spawned publish
     // for a later ring seq must not race an earlier one into the shared 2-slot ring
-    // and lose the newer message (#128 xhigh review). Distinct records take distinct
+    // and lose the newer message (#128 review). Distinct records take distinct
     // locks and stay concurrent, so this never blocks another record or the loop.
     let record_lock = rendezvous::record_lock(record_locks, &owner.key());
     let _write_guard = record_lock.lock().await;
@@ -5178,7 +5178,7 @@ mod tests {
         // #125 hardening invariants (compile-time): the reply cap MUST exceed one
         // fetcher's peak concurrent fragment fan-out (gui CHUNK_FETCH_CONCURRENCY 8 ×
         // share::FRAGMENT_FETCH_CONCURRENCY 8 = 64) or a single legitimate download
-        // self-throttles past the answer window (xhigh review); it stays below the
+        // self-throttles past the answer window (review); it stays below the
         // intake cap so replies remain the tighter bound (the network work).
         const SINGLE_FETCHER_PEAK_FRAGMENTS: usize = 8 * 8;
         const {
@@ -6139,7 +6139,7 @@ mod tests {
         // actually closes that hole, by pinning that the opener's body names a shape
         // constant exactly once.
         //
-        // (Found by an independent review lens, which ran the mutation — retargeting
+        // (Found by an independent reviewer, who ran the mutation — retargeting
         // the report-absent mode at the key-record shape — and got a clean 123-pass
         // run. Recorded because the reasoning that produced the weaker guard was
         // confident and wrong.)

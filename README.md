@@ -25,15 +25,15 @@ daemonseed/
 ├── crates/
 │   ├── daemonseed-core/                    protocol library — identity, 3-layer storage (seeds /
 │   │                                       redb share index / chunk CAS), crypto-agility, first-start,
-│   │                                       bootstrap, flat circle-of-trust keys, rendezvous addressing, indexer,
+│   │                                       bootstrap, flat circle-of-trust keys, shared-record (rendezvous) addressing, indexer,
 │   │                                       reconnect backoff, mute/hide lists, @-mention logic (M9),
 │   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM (M10),
 │   │                                       at-rest persistence of display-name / mute / hide / circle membership
-│   │                                       via a cached SealingKey re-seal (M13); fetched-download CAS + manifest
+│   │                                       via a cached SealingKey re-encrypt (M13); fetched-download CAS + manifest
 │   │                                       store (storage::fetched, M15)
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
-│   ├── daemonseed-veilid-net/              Veilid transport: identity-bound node, sealed 1:1 + circle/lobby/public-room rendezvous, signed share-discovery route adverts, owner-on-demand share content transfer
-│   ├── daemonseed-cli/                     library-only client: Veilid route-advert signer (`route_signer`) + announcements/MOTD authoring & render helpers (`public_space`)
+│   ├── daemonseed-veilid-net/              Veilid transport: identity-bound node, encrypted 1:1 + circle/lobby/public-room shared records, signed share-discovery route advertisements, owner-on-demand share content transfer
+│   ├── daemonseed-cli/                     library-only client: Veilid route-advertisement signer (`route_signer`) + announcements/MOTD authoring & render helpers (`public_space`)
 │   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11); Servers-pane introducer discovery (M12); multi-circle carousel (v0.16); session write-through + silent circle rejoin from the at-rest blob (M13); define-share + indexer (M14); publish/serve/unpublish + fetched-download browse/extract (M15)
 │   ├── daemonseed-gui/                     Slint GUI client (round-1 scaffold) — software-renderer shell; `--features desktop` opens a real window
 │   ├── daemonseed-isc/                      ISC registry leaf crate (zero deps): the single source of
@@ -58,7 +58,7 @@ The `tui` (ratatui) and `gui` (Slint) crates are the product surfaces; their int
 
 ## Status
 
-Current release: **v0.36.3** — alpha (post-MVP). The transport is now the Veilid DHT: the relay server is retired and daemonseed runs fully serverless, peer-to-peer — the public Lobby and circle chat, member presence, in-band share discovery/transfer, and operator announcements/MOTD all ride the DHT, end-to-end sealed. See `CHANGELOG.md` for per-release detail.
+Current release: **v0.36.3** — alpha (post-MVP). The transport is now the Veilid DHT: the relay server is retired and daemonseed runs fully serverless, peer-to-peer — the public Lobby and circle chat, member presence, in-band share discovery/transfer, and operator announcements/MOTD all ride the DHT, end-to-end encrypted. See `CHANGELOG.md` for per-release detail.
 
 The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track; direct messaging is planned. Promotion to a public repository is gated on the `oxicrypt` sibling crate going public.
 

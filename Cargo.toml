@@ -15,7 +15,7 @@ members = [
 
 # Crypto runs at full optimization even in dev builds. oxicrypt's portable
 # constant-time paths (accelerated backends are off by default) are unusable at
-# opt-level 0 for bulk work: a debug felt-test measured ~5 s to AEAD-seal one
+# opt-level 0 for bulk work: a debug manual test measured ~5 s to AEAD-seal one
 # 1 MiB share chunk — past veilid's 5 s app_call answer window on its own — and
 # the fetch side pays the same tax on its SHA-384 chunk verify (#123).
 [profile.dev.package.oxicrypt-aes]

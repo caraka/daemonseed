@@ -2076,7 +2076,7 @@ mod tests {
     }
 
     /// The other direction of the same guarantee: a **v2** file relabelled as
-    /// v1 also fails the tag. The lens that reviewed this noticed the pair was
+    /// v1 also fails the tag. The reviewer of this noticed the pair was
     /// only pinned one way — a version tag inside the AAD is worth nothing if
     /// it authenticates only the downgrade.
     #[test]

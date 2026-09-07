@@ -1093,7 +1093,7 @@ mod tests {
     /// runnable address test in the workspace used a recipient — the only
     /// initiator-paired ones are the `#[ignore]`d two-node tests. So zeroing the
     /// initiator's assignment was caught by nothing that executes here. Found by
-    /// a review lens enumerating both constructors against all address call sites.
+    /// a reviewer enumerating both constructors against all address call sites.
     #[test]
     fn an_initiator_ratchet_binds_its_conversation_too() {
         let _ = crate::kats::initialize_module_unsigned_test_binary();

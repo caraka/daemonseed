@@ -364,8 +364,8 @@ async fn an_acknowledgement_published_by_one_node_merges_at_the_other() {
 /// transmitted between them. Verified on every ordinary `cargo test` run rather
 /// than resting on the `#[ignore]`d body, because a derivation that put the two
 /// ends on different records would make the live test fail as a *convergence
-/// timeout* — indistinguishable, on a host that cannot attach, from the network
-/// being unavailable.
+/// timeout* — indistinguishable, without a live network to test against, from
+/// the network being unavailable.
 #[test]
 fn both_ends_derive_the_same_acknowledgement_record() {
     daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");

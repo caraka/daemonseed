@@ -11,7 +11,7 @@
 //! line plus the net actor's `SetMyHandle`) is unit-tested IN the `daemonseed-gui`
 //! binary crate (`state::tests::rename_identity_*` and
 //! `net::tests::set_my_handle_updates_presented_handle`), whose `pub` does not escape
-//! to this integration crate; the visible palette flow is felt-test-gated (ISA
+//! to this integration crate; the visible palette flow is manual test-gated (ISA
 //! `## Criteria` ISC-C95 left `[ ]`). Registers ISC-C95.
 
 use daemonseed_core::bootstrap::BootstrapAnchor;

@@ -668,7 +668,7 @@ mod tests {
         assert!(!root.join("clip.bin").exists());
     }
 
-    /// Integrity dominates a racing transient (bug-lens finding): a fetch where one
+    /// Integrity dominates a racing transient (review finding): a fetch where one
     /// file route-deaths (transient) and another serves poison (integrity) always
     /// resolves to IntegrityFailed + destroyed staging, regardless of which failure
     /// completes first — the poison-quarantine guarantee is not timing-defeatable.

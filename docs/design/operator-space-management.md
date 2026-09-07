@@ -190,7 +190,7 @@ would relocate the announcements channel and force every client to rediscover it
 makes enforcement free and updates impossible.
 
 **Retention is far cheaper than assumed.** Veilid has no TTL; retention is capacity
-eviction only. Measured in early felt testing: announcement values survived **more than 24
+eviction only. Measured in early manual testing: announcement values survived **more than 24
 hours with nobody re-seeding them at all**. Caveat: eviction is capacity-driven, so that
 figure is a property of DHT load during that test, not a constant.
 

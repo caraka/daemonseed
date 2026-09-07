@@ -1488,7 +1488,7 @@ pub fn derive_resume_state(
             // chunks: [one]}` leaves `[CS, 2*CS)` uncovered) is NEVER resumed-as-complete:
             // every chunk is marked missing so the re-fetch path re-derives it and the
             // engine's coverage guard rejects a hostile manifest. Without this, a
-            // "fully verified" file could carry an unverified sparse tail (xhigh review F1).
+            // "fully verified" file could carry an unverified sparse tail (review F1).
             let expected_chunks = entry.size.div_ceil(CHUNK_SIZE as u64) as usize;
             if entry.chunks.len() != expected_chunks {
                 return FileResume {
@@ -1503,12 +1503,12 @@ pub fn derive_resume_state(
             // Exact-length gate: a candidate file is trusted only if it is EXACTLY
             // `size` bytes. A co-resident append past `size` would otherwise ride along
             // as unverified content beyond the last chunk's region; a short file fails
-            // the last chunk's read anyway (xhigh review F1).
+            // the last chunk's read anyway (review F1).
             //
             // STAGING-authoritative `verified`: the engine promotes the STAGING file,
             // so a chunk is skippable (already_verified) ONLY if it re-verifies in
             // staging. A chunk present only at the promoted dest is `missing` and
-            // re-fetched — skipping it would promote a sparse zero-hole (xhigh review,
+            // re-fetched — skipping it would promote a sparse zero-hole (review,
             // 8b-1 location-mismatch finding).
             // Opened ONCE for the whole chunk loop below (#212).
             let staged = staging
@@ -2942,7 +2942,7 @@ mod tests {
         assert!(plan.files[0].missing.is_empty());
     }
 
-    /// xhigh review F1 (coverage guard): a manifest entry whose chunk list does NOT
+    /// review F1 (coverage guard): a manifest entry whose chunk list does NOT
     /// tile `[0, size)` (a hostile `{size: 2*CHUNK_SIZE, chunks: [one]}`) is NEVER
     /// resumed-as-complete even though the one listed chunk verifies — the uncovered
     /// `[CHUNK_SIZE, 2*CHUNK_SIZE)` tail would otherwise ride along as unverified
@@ -2971,7 +2971,7 @@ mod tests {
         assert_eq!(plan.files[0].missing, vec![0]);
     }
 
-    /// xhigh review F1 (exact-length gate): a promoted file APPENDED past `size` by a
+    /// review F1 (exact-length gate): a promoted file APPENDED past `size` by a
     /// co-resident (every in-bounds chunk still re-hashes correctly) is NOT trusted —
     /// the unverified trailing bytes must not ride along as content; the file is
     /// treated as absent and its chunks re-fetch.
@@ -3027,7 +3027,7 @@ mod tests {
         assert!(plan.files[0].verified.is_empty());
     }
 
-    /// xhigh review (8b-1 location-mismatch): chunks good at the PROMOTED dest but
+    /// review (8b-1 location-mismatch): chunks good at the PROMOTED dest but
     /// absent from staging are NOT `verified`/skippable — the engine promotes staging,
     /// so skipping them would promote a sparse zero-hole. A partially-corrupt promoted
     /// file with no staging yields an EMPTY skippable set (every chunk re-fetched) and
@@ -3058,7 +3058,7 @@ mod tests {
         assert!(!plan.files[0].is_complete());
     }
 
-    /// xhigh review (8b-1): a length-matched but content-GARBAGE promoted dest file is
+    /// review (8b-1): a length-matched but content-GARBAGE promoted dest file is
     /// NOT `promoted_complete`, even when staging holds the complete verified copy — so
     /// the resume promotes the good STAGING bytes, never the garbage dest file.
     #[test]

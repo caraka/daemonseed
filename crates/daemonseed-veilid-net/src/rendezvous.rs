@@ -1054,7 +1054,7 @@ where
 /// Holding this lock across the open+write of one record serializes both, while
 /// DISTINCT records take DISTINCT locks and stay fully concurrent — so a slow write
 /// to one record never blocks another's traffic or the actor command loop. See ISA
-/// Decisions (2026-07-07, #128 xhigh review).
+/// Decisions (2026-07-07, #128 review).
 ///
 /// **Deliberately keyed on the owner alone, unlike [`OpenCache`].** Where the open
 /// cache MUST distinguish shapes (returning a key derived for the wrong `o_cnt`
@@ -1455,7 +1455,7 @@ where
 /// open question, **repro-gated**). `close_dht_record` cancels the desired watch
 /// (`close_record.rs:117-119`), so a close-first yields a guaranteed-fresh session +
 /// re-watch — the closest analog to the consumer *restart* that empirically heals the
-/// felt-tested dead session; open-in-place (veilid updates an already-open record in
+/// manually tested dead session; open-in-place (veilid updates an already-open record in
 /// place, `open_record.rs:155-170`) is cheaper but may not clear a death that lives in
 /// the opened-record session. Defaulted **`true`** (mirror the restart that is known to
 /// work) pending the two-client reproduction (§RS-1.3); caraka flips it against the

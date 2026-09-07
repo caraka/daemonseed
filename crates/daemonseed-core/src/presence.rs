@@ -495,7 +495,7 @@ impl PresenceTracker {
 /// read calm, and it self-heals on the member's next keepalive (WB-1.10
 /// bias-to-forgiveness) — the median-of-5 + calm-padding already make the signal sticky
 /// (3 fast completions to recede). A finer decoupled observe timer (sampling the probe
-/// on a seconds cadence, independent of the reap tick) is a felt-test-gated follow-up.
+/// on a seconds cadence, independent of the reap tick) is a manual test-gated follow-up.
 /// The median never staleness-freezes for longer than one keepalive interval (a
 /// connected client emits a non-chat keepalive ≤ every [`KEEPALIVE_INTERVAL_MAX`],
 /// updating the estimator); a disconnected client is not reaping.

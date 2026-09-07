@@ -1937,7 +1937,7 @@ impl App {
         // Ordered-insert by sent_unix_ms (#130). The #131 forged-timestamp clamp is
         // GUI-only for now: the TUI is a post-cutover surface (does not gate), and the
         // sound clamp needs a stored per-line order key (a moving-`now` re-clamp in the
-        // comparator would break the sorted invariant — xhigh review); TUI-#131 rides
+        // comparator would break the sorted invariant — review); TUI-#131 rides
         // the TUI parity work (#111). Raw ordering here is stable.
         let pos = self
             .messages

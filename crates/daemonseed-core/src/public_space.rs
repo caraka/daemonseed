@@ -645,7 +645,7 @@ pub fn random_announce_slot_cursor() -> String {
 ///
 /// Veilid has no TTL — retention is capacity-eviction only — so an announcement
 /// survives exactly as long as someone re-seeds it (#141). The band is deliberately
-/// slow, against measured evidence: in early felt testing announcement values survived
+/// slow, against measured evidence: in early manual testing announcement values survived
 /// **more than 24 hours with nobody re-seeding them at all**, so eviction pressure on
 /// this record is far lower than the original fixed 120 s cadence assumed.
 ///

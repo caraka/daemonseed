@@ -260,13 +260,13 @@ code keep them separable so the fork stays quarantined to announcements.
 
 Presence and announcements are independent tracks; presence is further along and lower-risk.
 Order within each track is dependency-driven. "Unattended" = oracle-gated core/veilid-net, no GUI;
-"attended" = has a GUI surface / felt-test.
+"attended" = has a GUI surface / manual test.
 
 **Track P — presence (lower risk, mostly re-wiring):**
 1. **P-a (#74, unattended)** — sibling `presence_owner_seed` + `VeilidNetHandle::presence()`
    emit/ingest/reap on a current-state sibling record; cadence via `with_cadence`; two-node
    roster-converge oracle (`#[ignore]`, live network). *Depends on:* nothing new (core is done).
-2. **P-b (#75, attended)** — GUI Lobby roster render; felt test on a real-network host (two clients see each
+2. **P-b (#75, attended)** — GUI Lobby roster render; manual test on a real-network host (two clients see each
    other appear/disappear). *Depends on:* P-a.
 3. **P-c (#77, attended)** — circle presence (persistent handles) on the same mechanism.
    *Depends on:* P-a, P-b proven.
@@ -302,7 +302,7 @@ must be non-stubbed on Veilid, or it goes dark.** Required before Phase 5:
 
 Per the project cutover-gate decisions (2026-07-07): TUI parity does **not** gate (GUI primary);
 this Phase-4 gate composes with the transport-quality bugs (#113/#123/#112/#121/#128) and a
-whole-branch xhigh review already named as the full cutover gate.
+whole-branch review already named as the full cutover gate.
 
 ## Open questions (residual)
 

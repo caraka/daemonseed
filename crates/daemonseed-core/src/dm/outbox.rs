@@ -135,7 +135,7 @@
 //! Two of those need their reasoning stated rather than assumed.
 //!
 //! **`peer-reachable` is an annotation, never a state here, and that is B5.** The
-//! adversarial pass refuted stop-on-presence as a BLOCKER: *"stop-on-presence
+//! adversarial review refuted stop-on-presence as a BLOCKER: *"stop-on-presence
 //! certifies delivery on record B from liveness on record A"*, and M16 showed the
 //! signal is replayable outright. § D-DELIV replaced it — *"Default
 //! not-delivered; confirm only on a genuine ack."* So this module takes **no
@@ -4246,7 +4246,7 @@ mod tests {
             seen.insert(due);
         }
         // `seen.len() > 1` separates SOME spread from NO spread and cannot see band
-        // WIDTH — a review lens proved it by scaling the drawn unit to a tenth,
+        // WIDTH — a reviewer proved it by scaling the drawn unit to a tenth,
         // collapsing the band to ±2.5% while every draw still sat inside the ±25%
         // window and every test still passed. A collapsed-but-nonzero band is
         // phase-lock in practice, so the width needs its own assertion.
@@ -4484,7 +4484,7 @@ mod tests {
     /// the user a message failed that the peer demonstrably received, and
     /// unrecoverably, since `settle_from_ack` only revisits `AwaitingCollection`.
     ///
-    /// Found by a review lens on the #261 work; the gap predates it and outlives
+    /// Found by a reviewer on the #261 work; the gap predates it and outlives
     /// its revert, so it is closed on its own.
     #[test]
     fn a_teardown_does_not_downgrade_a_confirmed_collection() {

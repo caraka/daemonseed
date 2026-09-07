@@ -1637,7 +1637,7 @@ mod tests {
     /// is the first place the distinction can bite.
     ///
     /// **This test previously pinned the survivor keeping its OWN class, and that was
-    /// wrong.** An authority lens showed the consequence: a queued `Chat` first-contact
+    /// wrong.** A review showed the consequence: a queued `Chat` first-contact
     /// knock coalesced by its own `Keepalive` re-seed produced a `Keepalive` survivor,
     /// which `drain_for_shutdown` then SHEDS — so on quit nothing reached the wire while
     /// the coalesced caller already held an `Ok(())` from `drop_same_id_current_state`.

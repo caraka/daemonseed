@@ -731,6 +731,9 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- Design documents, `README.md`, `AGENTS.md` and code comments state the design and the tests in
+  plain terms: internal review-process narrative, pointers to material not in the repository, and
+  private working vocabulary are removed; `README.md` says encrypt where it said seal.
 - `project_release_*` is renamed `project_announce_*` throughout `daemonseed-core` and
   `daemonseed-veilid-net`: `project_announce_pubkey()`, `project_announce_pubkey.bin`,
   `ProjectAnnounceSeed` / `ProjectAnnounceSeedText` / `ProjectAnnounceSeedSource`,
@@ -1786,7 +1789,7 @@ work lives in the maintainer's own planning notes, not here.
 ### Added
 
 - Direct-messaging design-of-record **FROZEN** (`docs/design/direct-messaging.md`,
-  DRAFT v6): hardened over 8 adversarial panel rounds (crypto/metadata/erasure)
+  DRAFT v6): hardened over 8 adversarial review rounds (crypto/metadata/erasure)
   to a post-quantum double-ratchet DM over per-page scattered DHT records, a
   sender-blind first-contact doorbell, and fail-safe delivery (never claims
   "delivered"). Its ISC family (ISC-C38–C46 / ISC-A-C20–A-C25) is re-cut in
@@ -1997,7 +2000,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-tui`: Veilid net actor behind the `veilid` feature (#98) — `NetHandle::new` selects a `VeilidNetHandle`-backed actor (circles + attach; lobby/shares/presence/MOTD return "not yet on Veilid") over the same `NetCommand`/`NetEvent` contract; UI unchanged. Off by default.
 - `daemonseed-veilid-net` + `daemonseed-{gui,tui}`: the steady-state resweep cursor selector is hoisted into a shared `resweep` module (`next_resweep_seed`) and imported by both net actors, replacing two byte-identical private copies; behavior and the per-crate tick/hand-off constants are unchanged (#157 follow-up).
 - `daemonseed-{gui,tui}`: `DAEMONSEED_VEILID_DIR` / `DAEMONSEED_VEILID_PORT` env knobs select a per-instance Veilid store, listen port, and program namespace so several Veilid-mode clients run on one host (#98).
-- `daemonseed-veilid-net` + `daemonseed-gui`: `DAEMONSEED_VEILID_TRACE` env gate (`vtrace!`) emits stderr probes at the attach (with peer counts), `open_or_create`, watch, sweep, and circle join/send/inbound boundaries for live Veilid felt-test diagnosis (#98).
+- `daemonseed-veilid-net` + `daemonseed-gui`: `DAEMONSEED_VEILID_TRACE` env gate (`vtrace!`) emits stderr probes at the attach (with peer counts), `open_or_create`, watch, sweep, and circle join/send/inbound boundaries for live Veilid manual test diagnosis (#98).
 - `daemonseed-veilid-net`: extracted the shared-owner DFLT rendezvous engine to a generic `rendezvous` module (was `circle`); added `VeilidNetHandle::publish_room` / `subscribe_room` for the lobby / public rooms and public-share discovery — a `ShareAnnouncement` sealed under the `PublicRoomKey` is published on the lobby rendezvous record (Phase 3/4).
 - `daemonseed-core`: `derive_room_veilid_owner_seed` + `RoomVeilidOwnerSeed` + `public_room_veilid_owner` HKDF label — a public room's deterministic Veilid rendezvous-owner seed, a sibling of the room key, so every participant computes the same lobby/public-room DHT rendezvous address (Phase 3/4).
 - `daemonseed-veilid-net`: public-share content transfer over `app_call` (Phase 3) — `VeilidNetHandle::serve_share` serves an indexed share owner-on-demand over a private route; `fetch_manifest` / `fetch_chunk` reassemble the `PublicRoomKey`-sealed response from ≤32 KiB transport fragments and SHA-384-verify each 1 MiB chunk against its content address (ISC-S28).
@@ -2011,7 +2014,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-tui`: the same public-share publish / discover / fetch path on the Veilid transport behind the `veilid` feature (Phase 3 Slice 2b TUI mirror) — adapted to the TUI's `NetCommand`/`NetEvent` contract (`SharesSnapshot{local,remote,indexer_status}`, per-surface error events, `FetchedStore`-backed downloads), with the same invariants (ephemeral node id, stable-content identity, least-authority `RouteAdvertSigner`, `stop_serve` on unpublish, `NotServed`→withdrawn notice, anti-swap verify-before-import).
 - `daemonseed-veilid-net`: transit-experiment harness (`tests/transit_experiment.rs`, `--ignored`) — a two-node live-network matrix measuring private-route `app_call` latency across the Stability × Sequencing 2×2 plus hop-count and burst cells, with a same-clock rtt split (`req_1way` / `reply_op` / `reply_path`) (#123).
 - `daemonseed-veilid-net`: `DAEMONSEED_VEILID_TRACE` lines carry a `+seconds` relative timestamp (`trace_elapsed_secs`), and the serve / publish / advert-refresh paths report per-stage durations (queued / seal / reply; write ms), so a live log localizes where a deadline is spent.
-- `daemonseed-veilid-net`: `AimdWindow` — an AIMD (additive-increase / multiplicative-decrease) fetch-concurrency window controller (climbs by one per healthy observation, halves on a breach, bounded `[1, FRAGMENT_FETCH_CONCURRENCY]`), wired as the public-share fetcher's adaptive fragment window (#128): `fetch_chunk` times each fragment `app_call` and returns the max per-fragment latency, and the GUI fetcher drives one controller per download, observing that latency against `FRAGMENT_LATENCY_THRESHOLD` (2 s, felt-test-tunable) to size the next chunk's fragment concurrency. Starts fully open, so a healthy download is unchanged and only a congested link narrows the window, yielding concurrency back to interactive chat.
+- `daemonseed-veilid-net`: `AimdWindow` — an AIMD (additive-increase / multiplicative-decrease) fetch-concurrency window controller (climbs by one per healthy observation, halves on a breach, bounded `[1, FRAGMENT_FETCH_CONCURRENCY]`), wired as the public-share fetcher's adaptive fragment window (#128): `fetch_chunk` times each fragment `app_call` and returns the max per-fragment latency, and the GUI fetcher drives one controller per download, observing that latency against `FRAGMENT_LATENCY_THRESHOLD` (2 s, manual test-tunable) to size the next chunk's fragment concurrency. Starts fully open, so a healthy download is unchanged and only a congested link narrows the window, yielding concurrency back to interactive chat.
 - `daemonseed-veilid-net`: `VeilidNetHandle::resweep_rendezvous` — re-runs the one-shot backlog sweep on an already-subscribed rendezvous record without registering another watch, the recovery primitive for a backlog item published during the post-(re)connect watch-warmup window (#132/#133).
 - `daemonseed-gui`: chat messages carry a muted relative-age caption ("just now" / "2m ago" / "3h ago" / "sitting 3 days"), formatted by `format_relative_age(sent_unix_ms, now_ms)` on every model rebuild and refreshed on a ~30 s tick, so a swept old backlog message reads as stale, not live (#100).
 
@@ -2028,7 +2031,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-core`: `circle::message::{seal_message, open_message}` and `public_room::{seal_room_message, open_room_message}` are thin wrappers over one signed `room_message` seal/open path; `seal_message` takes the poster's `SignKeypair`; the circle AAD + provenance domain are `daemonseed/circle/message/v2`; `open_room_message` gains a `room` argument (the signature is verified against the caller's expected room_id, never the carried field) (#145).
 - `daemonseed-{gui,tui}`: circle send/open route through the signed `RoomMessage`; `mine`, own-loopback suppression, and dedup key on the stable `sender_pubkey`; the displayed author binds to `SHA-384(sender_pubkey)[:12]` via `Handle::display_bound`; the GUI send paths transmit the canonical `name#<12hex>` handle so receivers honor the display name (#146).
 - `daemonseed-gui`: the announcements/MOTD pane never force-opens — the #93 connect-time auto-landing is replaced by an unread dot on the Announcements tab (`state::announcements_unread`, reusing `combined_content_hash`), shown when the verified content is non-empty and changed since last seen, cleared on open. It behaves identically on connect and mid-session, and an empty-view guard means an unconverged/blank pane no longer auto-opens (the old auto-land could land on a not-yet-converged blank view). Removes the `landing_decision`/`Landing` decision; `OPERATOR_CONNECT_LANDING_DELAY` + the connect-landing machinery are now vestigial (their removal is a follow-up, coupled to the #140 resweep references) (#142).
-- `daemonseed-gui`: the post-connect warmup re-sweep is stepped and priority-ordered — the single delayed re-sweep at +25s is replaced by `WARMUP_RESWEEP_SCHEDULE` (force-refresh re-sweeps on `sleep_until` deadlines from connect), re-sweeping the content records in priority order (operator MOTD/announce → lobby chat → circle chats, via the unit-tested `warmup_priority_records`) so DHT-converged content surfaces sooner during cold-start than the passive watch alone. Presence records are excluded (they self-heal via the heartbeat cycle); re-swept already-seen items are deduped downstream. **Dialled down after felt-test** (2026-07-08: the 4-round 12/25/45/75s schedule spun the host fans up for marginal benefit — operator content converged past the window) to a light 2-round schedule (+20/60s, circles only round 1); a light best-effort early-catch, felt-tunable, keep/revert pending felt-test (#140).
+- `daemonseed-gui`: the post-connect warmup re-sweep is stepped and priority-ordered — the single delayed re-sweep at +25s is replaced by `WARMUP_RESWEEP_SCHEDULE` (force-refresh re-sweeps on `sleep_until` deadlines from connect), re-sweeping the content records in priority order (operator MOTD/announce → lobby chat → circle chats, via the unit-tested `warmup_priority_records`) so DHT-converged content surfaces sooner during cold-start than the passive watch alone. Presence records are excluded (they self-heal via the heartbeat cycle); re-swept already-seen items are deduped downstream. **Dialled down after manual test** (2026-07-08: the 4-round 12/25/45/75s schedule spun the host fans up for marginal benefit — operator content converged past the window) to a light 2-round schedule (+20/60s, circles only round 1); a light best-effort early-catch, tunable by hand, keep/revert pending manual test (#140).
 - `docs/design`: the Phase 4 design-of-record (presence + announcements/MOTD) is consolidated onto Veilid as `phase4-veilid-presence-announcements.md`; the two relay-era docs (`presence-superstructure.md`, `announcements-motd-admin.md`) are archived under `docs/design/zarchive/` behind redirect tombstones — one active source of truth (#74/#75/#77, #88/#92/#93/#94). Announcements/MOTD MVP is scoped to a single project-owned channel (design decision A0); per-community channels are deferred (they reintroduce an owner/originator onto the deliberately-ownerless circle model, ISC-C8).
 - `daemonseed-veilid-net`: the inbound serve lane is bounded — a full intake queue (`SERVE_QUEUE_CAP` = 256) sheds the incoming fetch request on the producer (a shed serve is one fetcher retry the fetch side already does) instead of growing without limit under a serve-latency spike, and concurrent `app_call_reply` tasks are capped by a semaphore (`MAX_CONCURRENT_SERVE_REPLIES` = 128) acquired before sealing, so a fetch burst can neither spawn unbounded reply tasks nor hold unbounded sealed responses in memory. The cap exceeds one fetcher's 64-fragment peak so a single legitimate large download never self-throttles, and the answer-window expiry is re-checked after the permit is acquired so a request that aged out while waiting is dropped instead of sealed-and-sent too late (#125).
 - `daemonseed-gui`: the public-share list attributes a foreign share to its announcer — a discovered share's row shows the sharer's handle, with the sharer's **verified** `#12hex` identity fingerprint (`SHA-384(sender_pubkey)[:12]`, derived from the anti-swap-verified announcer pubkey, not the spoofable advisory handle) revealed on hover; own shares show "you", backed by the `ShareListing` `mine` marker distinguishing own published shares from foreign discovered shares. Adds `daemonseed_core::handle::pubkey_fingerprint` and a `ShareListing::sharer_fingerprint` field (#114).
@@ -2061,7 +2064,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-veilid-net`: the WB-3 write scheduler no longer busy-spins at 100% CPU under sustained write congestion — `next_wakeup` armed the timer at `now` for an already-passed starvation-escalation crossing (`.max(now)`), so the driver hot-looped while the aged non-chat write could not dispatch (AIMD window full). An escalation crossing is now armed only while it is still in the future; once passed the head already sorts at its escalated rank and dispatches on the next completion (#162).
 - `daemonseed-veilid-net`: an in-flight tombstone now dominates a same-id current-state exactly like a queued one — the scheduler tracks the logical id of a tombstone currently being written, so a keepalive/refresh enqueued while a leave or share withdraw is mid-DHT-write is dropped instead of resurrecting the departed member / withdrawn share once the tombstone completes (closes the in-flight window WB-ISC-12 left open) (#164).
 - `daemonseed-gui`: a nameless/floor identity no longer renders its own Veilid chat messages twice — the optimistic echo computes `who` through the same `Handle::display_bound(wire_handle, pubkey).format(Default)` path as the DHT re-surface, so a floor handle floors to `#<hex>` on both sides and `push_message` dedups the echo (the echo previously used `split('#').next()`, collapsing a `#<hex>` handle to `""` → dedup mismatch). (#155)
-- `daemonseed-{gui,tui}`: the Veilid lobby presence-beacon cadence is widened [15,20]s → [50,55]s to relieve Veilid DHT `set_dht_value` saturation (#159) — the per-member beacon was the dominant DHT writer, backing writes up to minutes (`write ok in` 90s–314s) and starving chat delivery, share-advert refresh, and presence freshness (roster flicker-then-reap); the ~3× cadence cut restores single-digit-second writes (felt-test 314s → ≤5.8s). Tier-1 mitigation; the structural fix (presence-as-reads + a priority write scheduler) is tracked by #159.
+- `daemonseed-{gui,tui}`: the Veilid lobby presence-beacon cadence is widened [15,20]s → [50,55]s to relieve Veilid DHT `set_dht_value` saturation (#159) — the per-member beacon was the dominant DHT writer, backing writes up to minutes (`write ok in` 90s–314s) and starving chat delivery, share-advert refresh, and presence freshness (roster flicker-then-reap); the ~3× cadence cut restores single-digit-second writes (manual test 314s → ≤5.8s). Tier-1 mitigation; the structural fix (presence-as-reads + a priority write scheduler) is tracked by #159.
 - `daemonseed-{core,gui,tui}`: public-share ownership is bound against forged withdraws and hijack re-announces (#152) — `ShareCatalog::apply` rejects a withdraw or an owner-changing refresh whose `sender_pubkey` differs from the stored owner (first-writer-wins on identity), and `apply_discovery` now gates the discovered-**route** map on the catalog decision, so a rejected forged withdraw no longer evicts the owner's route (share stays fetchable) and a rejected hijack refresh no longer replaces it (no fetch redirect). A foreign peer scraping a victim's public `share_id` off the world-writable lobby record can thus neither censor nor redirect a KNOWN share. The residual first-seed squatting of a not-yet-announced `share_id` (needs a receiver-verifiable `share_id`↔`sender_pubkey` binding) is tracked in #156.
 - `daemonseed-{core,gui,tui}`: public-share discovery rides its OWN Veilid rendezvous record, split off the lobby chat record (#153) — a new `derive_room_share_veilid_owner_seed` / `RoomShareVeilidOwnerSeed` sibling (HKDF label `public_room_share_veilid_owner`, disjoint from the chat and presence owners) so share adverts (a current-state writer) and lobby chat (an append-ring writer) no longer overlap the same 64-slot subkey space and silently overwrite each other (the message-loss / undiscoverable-share collision the co-location caused). The GUI/TUI subscribe + re-sweep the share record and publish/withdraw adverts on it; the share write path fails closed on a derivation error (no all-zeros write record). The three room owner-seed derivations share one `expand_room_owner_seed` body so a future hardening change can't diverge them.
 - `daemonseed-gui`: stale DHT-ring backlog (a message older than 24h, a count-bounded-ring ghost from a prior session) is pruned at ingest — no longer renders as a "ghost" nor collapses onto the `now-24h` ordering edge (which sorted old messages mixed) (#151). TUI prune deferred to #111.
@@ -2076,7 +2079,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-gui` Veilid mode: the manual Refresh button on the public-shares tab re-sweeps the lobby rendezvous (`ResweepShares`) to recover a share announcement missed by the join-time sweep (#133) — a rendezvous subscribe sweeps once at join then relies on a watch whose latency is tens of seconds, so a plain re-render could never surface a missed announcement. The ~3 s shares-tab liveness auto-poll stays a cheap local re-render (`RefreshShares`) and never re-sweeps the DHT.
 - `daemonseed-gui` Veilid mode: a one-shot delayed re-sweep runs ~25 s after connect over the lobby and every joined circle, recovering announcements and circle messages published during the post-connect watch-warmup window that the single join-time sweep missed (#132). Downstream dedup (`apply_discovery` self-filter, `push_message` exact-match) folds a re-swept already-seen item silently.
 - `daemonseed-veilid-net`: concurrent writes to one rendezvous record are serialized by a per-`owner_seed` async lock. Spawning each `PublishRendezvous` off the actor loop (#128) let two append-ring writes for the same record race into the shared 2-slot ring, so an older seq landing after a newer one silently dropped the newer message — a loss the receiver's `sent_unix_ms` sort cannot recover. The lock is held across the whole open+seq-bump+write for a record, and every open path (`publish_rendezvous`, `publish_current_state`, `subscribe_rendezvous`) takes it, so it also single-flights the cold-cache record open (two concurrent first-publishes no longer both run `open_or_create`). Distinct records take distinct locks and stay fully concurrent, so the actor command loop still never blocks (#128).
-- workspace: dev builds compile the oxicrypt crates at `opt-level = 3` — the portable constant-time crypto at opt-level 0 made a debug felt-test client take ~5 s to AEAD-seal one 1 MiB share chunk, exceeding veilid's 5 s `app_call` answer window and failing every fragment fetch on a seal-cache miss (#123).
+- workspace: dev builds compile the oxicrypt crates at `opt-level = 3` — the portable constant-time crypto at opt-level 0 made a debug manual test client take ~5 s to AEAD-seal one 1 MiB share chunk, exceeding veilid's 5 s `app_call` answer window and failing every fragment fetch on a seal-cache miss (#123).
 - `daemonseed-gui` Veilid mode: a graceful close now reliably withdraws owned shares before teardown — the close-time withdraw wait was raised from 2 s to 8 s so a Veilid DHT `set` under load completes (the actor acks only after the set returns) instead of being aborted mid-set, which had left the share on a peer's list for the full ~600 s TTL; the wait still returns the instant the withdraw acks, so a healthy close stays fast (#121).
 - `daemonseed-gui`: leaving a circle no longer panics with "RefCell already borrowed" — the leave handler's `forget_circle` + rail rebuild is deferred to the next event-loop tick (`defer`) instead of mutating the rail model synchronously from inside the Slint clicked handler, where an inbound-circle-message rail rebuild on the drain timer could re-enter the partial renderer (#120).
 - `daemonseed-gui` Veilid mode: a published share no longer appears twice (the second copy pointing at a dead route) on the sharer's reconnect — the `share_id` is now derived deterministically from `(identity pubkey, root)` (`daemonseed_core::share_announce::derive_share_id`) instead of freshly minted, so a republish re-asserts the same id and a fetcher folds it onto the existing catalog entry (#112).
@@ -2211,7 +2214,7 @@ corrected to the unified-share-model registry counts.
 Shares move to fully relay-blind in-band discovery: sealed `ShareAnnouncement` /
 `ShareRollCall` over the subscribe stream replace the relay share registry,
 public-share content is sealed under the public room key, and the relay holds no
-share directory. Plus first-start passphrase confirmation and GUI felt-fixes.
+share directory. Plus first-start passphrase confirmation and GUI hands-on fixes.
 
 ### Added
 
@@ -2289,9 +2292,9 @@ share directory. Plus first-start passphrase confirmation and GUI felt-fixes.
   server-side `SharePublishRegistry`. (#51)
 - The CLI's registry-backed `publish` / `unpublish` / `list-shares` subcommands. (#51)
 
-## [0.28.0] — GUI auth-input felt-fixes + global font pass (round 2)
+## [0.28.0] — GUI auth-input hands-on fixes + global font pass (round 2)
 
-Post-`v0.27.0` round-2 polish of the first-start / unlock auth surface, felt-tested
+Post-`v0.27.0` round-2 polish of the first-start / unlock auth surface, manually tested
 on Ubuntu noble via an AppImage build.
 
 - **Visible password mask + complete glyph coverage:** the software renderer now
@@ -2310,7 +2313,7 @@ on Ubuntu noble via an AppImage build.
 ## [0.27.0] — GUI Shares-tab cleanup (round 1)
 
 Post-`v0.26.0` cleanup of the GUI Shares tab and first-start flow, plus one core
-refactor. Felt-tested on Ubuntu noble via an AppImage build.
+refactor. Manually tested on Ubuntu noble via an AppImage build.
 
 - **Publish-persistence:** published shares survive restart and auto-republish on
   Unlock — the share's root is written through to the at-rest seeds blob (M16);
@@ -2339,7 +2342,7 @@ The GUI gains the full public-share loop, matching the TUI's M16 surface.
 - **Publish:** a Publish overlay — choose a folder (optional name) → publish and serve
   it from disk for the session; a live-shares list with one-click Unpublish; your own
   shares are tagged "you" in the tree.
-- **Fixes from the felt-test:** enter a tokio runtime on the main thread so Slint's
+- **Fixes from the manual test:** enter a tokio runtime on the main thread so Slint's
   winit xdg-settings watcher (zbus, forced onto tokio by rfd→ashpd) no longer panics
   at startup; the Publish overlay stays open and reports its outcome; a guard refuses
   to publish the home / system directories; auth fields re-focus after a failed unlock.
@@ -2347,7 +2350,7 @@ The GUI gains the full public-share loop, matching the TUI's M16 surface.
 ## [0.25.0] — GUI persistent identity: first-start + Unlock + silent circle rejoin
 
 The GUI gains an identity that survives a relaunch — the blocker to a multi-session
-tester felt-test.
+tester manual test.
 
 - **First-start wizard:** passphrase (strength-gated) → 24-word recovery phrase →
   streamlined round-trip confirm → display name. Reuses the core `FirstStart` state
@@ -2388,7 +2391,7 @@ relay, completing the GUI alpha's core loop (public Lobby + circles).
   messages are sealed under the circle key and delivered to the other members.
   Each circle is independent (its own key and inbound reader); the public Lobby
   path is unchanged. Verified by an in-process round-trip and a live relay
-  round-trip, then a two-client felt-test.
+  round-trip, then a two-client manual test.
 - **Phrase-sharing affordances:** the new-circle phrase is editable and
   copyable (Copy to the clipboard, with a confirmation); the join field accepts
   the pasted phrase and auto-focuses. (Out-of-band phrase sharing is the alpha's
@@ -2431,7 +2434,7 @@ static shell to real networked chat.
 - **Real public-Lobby chat:** a net actor (dedicated-thread tokio runtime, live
   application session, ephemeral identity, mirroring the TUI) connects to the
   relay, auto-joins the default public room, and sends/receives real AEAD-sealed
-  messages; the UI thread never blocks. Verified by a two-client live felt-test
+  messages; the UI thread never blocks. Verified by a two-client live manual test
   on the relay.
 - **`--x11` / `DAEMONSEED_X11=1` launch opt-in:** forces XWayland for testers on
   Wayland-in-a-VM (winit's Wayland pointer path drops clicks under VM software

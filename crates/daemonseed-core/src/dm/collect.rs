@@ -101,7 +101,7 @@ use crate::dm::paging::{MAX_PAGE, PagePosition, position_of};
 /// and next page ([`Collection::watched`]) is the path a message normally
 /// arrives by, and this catches what a missed or evicted watch dropped. Thirty
 /// seconds is therefore chosen against sweep load and the shared op-gate rather
-/// than against message latency, and it is the number a felt-test would tune.
+/// than against message latency, and it is the number a manual test would tune.
 pub const PROBE_INTERVAL_MS: u64 = 30_000;
 
 /// How many pages holding a hole one probe plan re-reads.

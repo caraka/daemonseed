@@ -1018,7 +1018,7 @@ mod tests {
     /// #81 cross-restart: the cache MUST survive dropping + reopening the
     /// `ShareIndex` at the same path/key (a process restart), then a reconcile,
     /// then a cached_or_hash — otherwise the GUI re-hashes a large share on every
-    /// launch (the bug felt-tested 2026-06-24). Mirrors the GUI restart flow:
+    /// launch (the bug manually tested 2026-06-24). Mirrors the GUI restart flow:
     /// open → reconcile → cached_or_hash (session 1), DROP, reopen → reconcile →
     /// cached_or_hash (session 2). The same-size + restored-mtime corruption makes
     /// a cache HIT return the ORIGINAL chunks; a re-hash would return the new bytes'.

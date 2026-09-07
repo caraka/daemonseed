@@ -12,7 +12,7 @@
 //! (`net::tests::presence_roster::{circle_beacon_opens_under_its_key_only_then_rosters,
 //! self_filter_drops_own_beacon_only, roster_render_changed_matrix}`), whose `pub`
 //! does not escape to this integration crate; the visible circle-roster render is
-//! felt-test-gated (ISA `## Criteria` ISC-C94 left `[ ]`). Registers ISC-C94.
+//! manual test-gated (ISA `## Criteria` ISC-C94 left `[ ]`). Registers ISC-C94.
 
 use daemonseed_core::circle::key::derive_cot_key;
 use daemonseed_core::crypto::suite::CNSA_2_0;

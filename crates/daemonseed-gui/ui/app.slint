@@ -201,7 +201,7 @@ component RosterRowView inherits Rectangle {
     in property <string> fingerprint;
     // Tall enough to hold the name AND the on-hover fingerprint line WITHIN the
     // row's own bounds, so the hex can never overlap the next member's name
-    // (caraka felt-test 2026-06-24). Accessibility pass: larger, higher-contrast
+    // (caraka manual test 2026-06-24). Accessibility pass: larger, higher-contrast
     // text for low-vision readability.
     height: 46px; border-radius: 6px;
     background: touch.has-hover ? #1b1d20 : transparent;
@@ -349,7 +349,7 @@ component TabLabel inherits TouchArea {
 // clipboard functions (cut/copy/paste/select-all), which use Slint's backend
 // (winit) clipboard. That backend keeps X11 selection ownership correct, unlike a
 // transient `arboard::Clipboard` that drops ownership on drop — so Copy/Cut need
-// NO hand-rolled clipboard write and dodge the X11-ownership felt-test risk. The
+// NO hand-rolled clipboard write and dodge the X11-ownership manual test risk. The
 // pattern mirrors Slint's own LineEditBase. The wrapped input fills the wrapper,
 // so left-click still focuses/edits it; only right-click raises the menu.
 //
@@ -791,7 +791,7 @@ export component AppWindow inherits Window {
 
                 // Persistent entry once circles exist — the empty-state's buttons
                 // vanish with `only-lobby`, so adding a SECOND circle needs an
-                // always-present surface (felt-test gap, caraka 2026-06-15).
+                // always-present surface (manual test gap, caraka 2026-06-15).
                 if !root.only-lobby : HorizontalLayout {
                     padding: 4px; spacing: 8px;
                     PillButton { label: "+ New circle"; primary: true; w: 120px; clicked => { root.open-new(); } }
@@ -881,7 +881,7 @@ export component AppWindow inherits Window {
                 Rectangle { height: 1px; background: #ffffff10; }
 
                 // Restore notice — tab-INDEPENDENT so it is seen from the Chat landing
-                // view (felt-test 2026-06-21: was Shares-tab-only via share-status →
+                // view (manual test 2026-06-21: was Shares-tab-only via share-status →
                 // the user lands on Chat and never saw it). Persists until dismissed; no timeout.
                 if root.connect-notice != "" : Rectangle {
                     height: 30px; background: #11302b; border-width: 1px; border-color: #1f4d45;
@@ -1652,7 +1652,7 @@ export component AppWindow inherits Window {
                 }
                 Rectangle { }
                 // Select-all + copy to the system clipboard (Slint-native, via the
-                // backend) + a visible confirmation. No-op was the felt-test blocker.
+                // backend) + a visible confirmation. No-op was the manual test blocker.
                 PillButton {
                     label: "Copy"; w: 84px;
                     clicked => { new_phrase_input.select-all(); new_phrase_input.copy(); root.new-copied = true; }

@@ -10,7 +10,7 @@
 //! publish-overlay name field are unit-tested IN the `daemonseed-gui` binary
 //! crate (`state::tests::profile_round_trips_published_shares_across_reload`),
 //! whose `pub` does not escape to this integration crate; the visible
-//! peer-sees-the-name round-trip is felt-test-gated (ISA `## Criteria` ISC-C98
+//! peer-sees-the-name round-trip is manual test-gated (ISA `## Criteria` ISC-C98
 //! left `[ ]`). Registers ISC-C98.
 
 use daemonseed_core::identity::mnemonic::Mnemonic;

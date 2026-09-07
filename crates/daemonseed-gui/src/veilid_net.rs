@@ -155,34 +155,34 @@ const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// and give each surface an earlier "discovering → content" reveal. Each re-sweep is
 /// `SUBKEY_COUNT` (64) force-refresh gets/record, so rounds are few + widening, not a
 /// tight loop; re-swept already-seen items are deduped downstream (`apply_discovery`
-/// self-filter, `push_message` exact-match). **#140 dial-down (felt-test 2026-07-08):**
+/// self-filter, `push_message` exact-match). **#140 dial-down (manual test 2026-07-08):**
 /// the original 4-round 12/25/45/75 s schedule cost ~900 DHT gets per client
 /// for marginal benefit — operator content converged (~120 s) past the window, and #142
 /// removed the #93 landing this schedule used to feed — so it is dialled to a LIGHT
 /// 2-round best-effort early-catch that helps only fast-converging content; slower
 /// content rides the passive watch. The proper load fix (stop-on-content backoff) is
-/// deferred; whether to keep / revert this at all is caraka's call after felt-test.
-/// Felt-tunable.
+/// deferred; whether to keep / revert this at all is caraka's call after manual test.
+/// Tunable by hand.
 const WARMUP_RESWEEP_SCHEDULE: [Duration; 2] = [Duration::from_secs(20), Duration::from_secs(60)];
 
 /// Rounds (from the front of [`WARMUP_RESWEEP_SCHEDULE`]) in which the circle records
 /// are ALSO re-swept. Operator + lobby — the top priority and the #93 landing feed —
 /// are re-swept every round; circles (which can be many) only in the early rounds, so a
 /// heavily-joined user's warmup doesn't fan out to `rounds × circles` concurrent
-/// backlog sweeps competing with initial chat/downloads (#140 review). Felt-tunable.
+/// backlog sweeps competing with initial chat/downloads (#140 review). Tunable by hand.
 const WARMUP_CIRCLE_RESWEEP_ROUNDS: usize = 1;
 
-/// #157 (generalized, felt-test 2026-07-10): the steady-state resweep tick. The
+/// #157 (generalized, manual test 2026-07-10): the steady-state resweep tick. The
 /// warmup schedule above stops at +60s, but the passive DHT watch is lossy — a chat
 /// message or share advert *written after* warmup gets no reliable ValueChange, so it
-/// never re-surfaces at a peer that has already settled (the felt-test symptom: matching
+/// never re-surfaces at a peer that has already settled (the manual test symptom: matching
 /// record keys, writes 36–246s, lobby chat that echoes locally but never arrives). WB-4
 /// sanctions a reader-side resweep as the fix. On each tick ONE record from the current
 /// subscribed chat/discovery set is re-swept, round-robin, so the instantaneous read
 /// burst stays one `SUBKEY_COUNT` (64) force-refresh sweep (WB-2 read lane) and the
 /// per-record cadence = tick × record-count (scales with room count instead of fanning
 /// out). Presence records are excluded — they self-heal via keepalive re-writes (WB-4
-/// table). Known limitations (both felt-tunable, each with a follow-up lever): (1)
+/// table). Known limitations (both tunable by hand, each with a follow-up lever): (1)
 /// per-record latency grows linearly with room count — the fix is a tail-sweep (resweep
 /// only beyond each record's high-water) so more records fit per tick; (2) the sweep is a
 /// continuous background read load (one 64-GET sweep per tick, indefinitely) — the fix is
@@ -608,7 +608,7 @@ pub async fn veilid_net_actor(
     let mut shares = ShareState::new();
     // The presented display name. Set from a profile's persisted handle on
     // Connect/SetMyHandle; the fallback only matters on the ephemeral path, and
-    // the S4 felt-test uses named profiles.
+    // the S4 manual test uses named profiles.
     let mut my_handle = "guest".to_owned();
     let mut prune_timer = tokio::time::interval(SHARE_CATALOG_PRUNE_INTERVAL);
     // #141: re-publish operator MOTD/announcements on a slow cadence so their DHT
@@ -2085,7 +2085,7 @@ async fn connect(
         Err(e) => return fail(evt_tx, format!("identity keys: {e}")),
     };
     // Per-instance overrides so several clients can run on ONE host (the
-    // single-machine felt-test): `DAEMONSEED_VEILID_DIR` gives each instance its
+    // single-machine manual test): `DAEMONSEED_VEILID_DIR` gives each instance its
     // own Veilid protected-store, `DAEMONSEED_VEILID_PORT` its own listen port.
     let dir = std::env::var("DAEMONSEED_VEILID_DIR").unwrap_or_else(|_| {
         std::env::temp_dir()
@@ -4231,7 +4231,7 @@ async fn run_confirm_download(
             // under a different manifest (retained bytes are never reinterpreted), so
             // DISCARD it + its anchor — a re-open then previews and downloads the NEW
             // contents fresh (design §Part 3 re-gate). Without this, the stale stored
-            // manifest would re-trigger this same halt forever (xhigh review F1).
+            // manifest would re-trigger this same halt forever (review F1).
             // Best-effort cleanup; the download halts regardless.
             let _ = staging.destroy();
             if let Ok(store) = ManifestDigestStore::open(profile_root.join(DIGEST_STORE_FILE)) {
@@ -4405,7 +4405,7 @@ async fn run_confirm_download(
     // quick locked fs op), not in the fold, which has neither the promoted-file list nor a store
     // handle. An idx-registration FAILURE downgrades the outcome to `LocalFailed`: the files are
     // promoted on disk (retained) but not discoverable in the downloads list, so reporting
-    // `Complete` would be a silent success — surface the error instead (xhigh review finding).
+    // `Complete` would be a silent success — surface the error instead (review finding).
     let outcome = match (outcome, &managed_folder) {
         (DownloadOutcome::Complete { files, bytes }, Some(folder)) => {
             match FetchedStore::open(&fetched_root)
@@ -5825,7 +5825,7 @@ mod tests {
         const I4_BOUND: Duration = Duration::from_secs(2);
         let (outcome_tx, mut outcome_rx) = unbounded_channel::<FetchOutcome>();
 
-        // A ~60s failing-fetch storm (the felt-test's retry window), all spawned off-loop.
+        // A ~60s failing-fetch storm (the manual test's retry window), all spawned off-loop.
         let start = Instant::now();
         for i in 0..16 {
             let tx = outcome_tx.clone();

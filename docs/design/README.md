@@ -17,3 +17,22 @@ ceremony.
 
 A doc here is *design rationale*, not status or history: status is the issues it
 spawned, and history is git tags + `CHANGELOG.md`.
+
+## Vocabulary
+
+These docs use a few ordinary words in a fixed technical sense. Read them as
+defined here wherever they appear.
+
+- **seal / sealed** — encrypt with the authenticated cipher (AES-256-GCM under a
+  derived key); *open* is the inverse. A sealed frame is ciphertext plus its tag.
+- **sweep** — read every slot of a DHT record once, in bounded parallel batches,
+  to pick up anything a watch missed.
+- **fold** — merge an item that arrived from the network into local state, after
+  verifying it.
+- **advert** — an advertisement: a signed announcement of a route or a share,
+  published to a shared record so peers can find it.
+- **knock** — a first-contact request written to a peer's doorbell record.
+- **rung** — one level of a write-budget ladder; the budget steps up and down a
+  rung at a time.
+- **rendezvous record** — the shared DHT record a group meets on; its address is
+  derived from the group's owner key.

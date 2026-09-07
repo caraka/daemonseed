@@ -15,7 +15,7 @@ deliverables filed as #74 (heartbeat primitive), #75 (Lobby increment), #76 (sha
 
 Members need to know whether another member's client is online *before* reaching out. Today there is
 no member-visible signal: the relay tracks subscription liveness (ISC-S20) but, by design, members
-cannot see who is present. Concretely — a tester connected from Slovenia pinged the maintainer
+cannot see who is present. Concretely — a tester several time zones away pinged the maintainer
 overnight; the maintainer had no way to see the tester was online to reply. And because messages are
 **live-only** (held in RAM, gone on relaunch; ISC-S20: "a frame sent while a daemon is absent is
 never delivered"), a reply sent into a room the recipient has left is simply lost. Presence is the

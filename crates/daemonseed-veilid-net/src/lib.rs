@@ -94,7 +94,7 @@
 /// Enabled when `DAEMONSEED_VEILID_TRACE` is set (any value); a zero-output
 /// no-op otherwise. It exists because the attach and circle-rendezvous paths can
 /// only be exercised on a real public-network host (a NAT'd VM blocks attach),
-/// where no debugger attaches — so the next felt-test produces a decisive trace
+/// where no debugger attaches — so the next manual test produces a decisive trace
 /// instead of an inference. Not a logging framework: a deliberate, minimal probe
 /// at the exact points the `veilid-migration` design's fault tree enumerates.
 /// Reachable from dependent crates as `daemonseed_veilid_net::vtrace!`.
@@ -112,7 +112,7 @@ macro_rules! vtrace {
 }
 
 /// Seconds since this process's first trace line, prefixed onto every [`vtrace!`]
-/// so a felt-test log carries relative timing. Event ORDER alone cannot show
+/// so a manual test log carries relative timing. Event ORDER alone cannot show
 /// where a deadline was spent (veilid answers an inbound `app_call` for only
 /// `rpc.timeout_ms` = 5s; the 2026-07-02 chunk-fetch diagnosis needed to know
 /// WHICH 5s elapsed, and the untimestamped trace could not say).

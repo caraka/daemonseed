@@ -65,7 +65,7 @@ const FRAGMENT_RETRY_BACKOFF_MS: u64 = 250;
 /// into fewer waves (the wall-clock win behind #109), just at a lower concurrency.
 ///
 /// Set to 2 (#204): a multi-file folder download sustains this window across many
-/// fragments, and a 2-client felt-test on veilid 0.5.7 showed a wider window kills
+/// fragments, and a 2-client manual test on veilid 0.5.7 showed a wider window kills
 /// the serving private route mid-fetch — the whole folder fails with
 /// `could not get remote private route`, while single files (one brief wave)
 /// succeed. A bisect landed 2 as the widest window a folder downloads cleanly at
@@ -82,12 +82,12 @@ pub const FRAGMENT_FETCH_CONCURRENCY: usize = 2;
 
 /// Per-fragment `app_call` round-trip latency at or above which the fetcher-side
 /// AIMD window treats the link as congested and backs off (#128 D-1). INITIAL,
-/// felt-test-tunable value: a healthy private-route fragment `app_call` runs well
+/// manual test-tunable value: a healthy private-route fragment `app_call` runs well
 /// under this (the transit experiment's worst observed rtt was ~1.7 s), while
 /// veilid's inbound `app_call` answer window (~5 s) is the hard ceiling — so a
 /// fragment reaching this threshold signals real congestion and is the point to
 /// yield concurrency (and thus bandwidth) back to interactive chat. Kept as a
-/// named `const` so the fat-link felt-test can retune it in one place.
+/// named `const` so the fat-link manual test can retune it in one place.
 pub const FRAGMENT_LATENCY_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// A legitimate fragment is sliced to ≤[`FRAGMENT_SIZE`] on the serve side

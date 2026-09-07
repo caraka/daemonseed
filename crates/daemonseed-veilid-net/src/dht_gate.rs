@@ -100,7 +100,7 @@ pub const W_MAX: usize = 2;
 pub const READ_PERMITS: usize = DHT_BUDGET - CHAT_PERMITS - FLOOR_PERMITS - W_MAX;
 /// The read-partition floor (WB-5.1 / I5″.1/.2): the `W_max` step-up may not take read
 /// below this, pinning the worst-case warmup GET-throughput inflation to ≤ ~2.2× the
-/// felt-tested 68–112s baseline. Ceiling on `W_max` is therefore `14 − 3 − 6 = 5`.
+/// manually tested 68–112s baseline. Ceiling on `W_max` is therefore `14 − 3 − 6 = 5`.
 pub const R_MIN: usize = 6;
 
 // The `W_max = 2` partition pins exactly to the budget at compile time (WB-5.1 /

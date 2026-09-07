@@ -12,7 +12,7 @@
 //! right circle by `circle_id`.
 //!
 //! Two run modes. **Windowed** (the `desktop` feature) opens a real winit window,
-//! software-rendered (no GL) — the felt-test surface. **Offscreen** renders the
+//! software-rendered (no GL) — the manual test surface. **Offscreen** renders the
 //! shell to a PNG; the only mode a headless *terminal* can verify.
 //!
 //! Offscreen verification flags: `--switch <n>` drives the real switch callback;
@@ -1523,7 +1523,7 @@ fn read_clipboard_text() -> Option<String> {
 
 /// Best-effort clipboard WRITE (#115 copy-phrase). NOTE the X11 caveat above: arboard
 /// can clear the selection when a transient `Clipboard` is dropped, so a paste into
-/// another app may not land — this is felt-test-gated. The reveal itself (the phrase
+/// another app may not land — this is manual test-gated. The reveal itself (the phrase
 /// shown in the sheet for the user to read / screenshot) works regardless, so copy
 /// degrades gracefully to "read it off the screen".
 fn write_clipboard_text(text: &str) -> bool {
@@ -1801,7 +1801,7 @@ fn apply_net_event(
         }
         NetEvent::CircleError { circle_id, reason } => {
             // Non-fatal (the connection may still be up). Surface on the status
-            // line for felt-test diagnostics; no per-circle status surface yet.
+            // line for manual test diagnostics; no per-circle status surface yet.
             let _ = circle_id;
             ui.set_connection_status(SharedString::from(format!("circle: {reason}")));
         }
@@ -2049,7 +2049,7 @@ fn apply_net_event(
         // The `connect_notice` slot is SHARED (Error / connect-flow notices), so this is
         // lowest-priority: it sets the caveat only when the slot is free and clears only
         // its own message — never clobbering an unrelated notice. The polished
-        // roster-header render is a `.slint` follow-up (felt-test-verified).
+        // roster-header render is a `.slint` follow-up (manual test-verified).
         NetEvent::PresenceStale { stale } => {
             const STALE_NOTICE: &str = "Presence may be stale — network congested";
             let cur = ui.get_connect_notice();

@@ -26,7 +26,7 @@ Every kind of project fact has exactly **one** canonical home. Do not duplicate 
 
 | Fact | Canonical home | Everything else |
 |------|----------------|-----------------|
-| **Design contract** — Problem, Vision, Principles, Constraints, Criteria (ISC IDs + end-states), Out of Scope | **`ISA.md`** (this repo) | nowhere else. It is a PAI-Algorithm artifact and may be regenerated — keep it to what must *always* hold, never history or status |
+| **Design contract** — Problem, Vision, Principles, Constraints, Criteria (ISC IDs + end-states), Out of Scope | **`ISA.md`** (this repo) | nowhere else. It is a generated design artifact and may be regenerated — keep it to what must *always* hold, never history or status |
 | **Milestone / release history** — what shipped, when, under which tag | **SSH-signed git tags + `CHANGELOG.md`** (root) | ISA / `lama.yaml` / `README.md` carry a *pointer*, never a milestone table |
 | **Live ISC coverage / count** | **`cargo xtask isc-coverage`** (registry `isc_coverage::TOTAL`) | never hand-write an ISC count anywhere; cite the command |
 | **Pending work — actionable, scoped** | **GitHub Issues** — type label (`bug` / `enhancement` / `documentation`) + tier label (`tier:punchlist` / `tier:candidate` / `tier:backlog`; unlabeled tier = needs triage) | closed the ordinary way (`Closes #N` in a PR/commit); never duplicated in-tree |
@@ -64,6 +64,10 @@ Every change lands on `main` through a **pull request** — never a direct push 
 2. Review before merge. A trust-surface change — crypto, the signer whitelist / announce write-gate, provenance, identity/key derivation — warrants a thorough review pass called out in the PR.
 3. Merge by a **signature-preserving** path (this repo signs commits): a local fast-forward of the PR branch, or `gh pr merge --merge`. Never `--rebase` / `--squash` — they re-create the commits server-side and drop the SSH signature, landing an unsigned commit on `main`.
 4. The **release-chore** — version stamps (`lama.yaml`, `README.md` `## Status`, `daemonseed-gui`'s `APP_VERSION`) and the `CHANGELOG.md` `[Unreleased]` → `[vX.Y.Z]` rename — plus the signed tag are a **separate post-merge** step, never bundled into a feature PR (see *Cutting a release tag* below).
+
+## What a test file says about its environment
+
+A test states what it needs and how to run it, in terms true for anyone: the network it must reach, the features it needs, the flag that opts it in. It never describes the environment it was developed in — a machine, a hypervisor, a network topology, who does or does not run it. A comment that only makes sense to someone who knows the maintainer's setup does not belong in the tree.
 
 ## Definition of done
 

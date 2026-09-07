@@ -175,7 +175,7 @@ what the attack satisfies. Rejected as insufficient (per the #156 analysis).
   is hiding (nonce is secret-derived, unguessable), so dictionary confirmation of a
   guessed path fails. **Pubkey-linkage is unchanged** (the announcement already carries
   `sender_pubkey`), **but a new cross-tier folder-linkage arises and is accepted with
-  eyes open (crypto panel MED-4):** because `share_id`/`root_commitment` are
+  eyes open (crypto review finding MED-4):** because `share_id`/`root_commitment` are
   deterministic functions of `(identity, root)` and tier-independent, the *same folder*
   shared both publicly and inside a circle yields the *same* `share_id` in both. A peer
   who can open both announcements (a lobby member who is also a circle member) learns

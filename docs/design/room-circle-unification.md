@@ -59,7 +59,7 @@ So any holder of a circle key — an ex-member, an infiltrator, a leaked or comp
 ## Sequencing (REVISED 2026-07-08 — cutover gate dropped)
 
 - **Layer 1 — engine / state / discovery / liveness unification (internal, no wire break)** landed with Veilid **Phase 4** on the one unified rendezvous engine. Design-of-record: `unified-room-model.md`.
-- **Layer 2 — the proto message-type merge + signed circle authorship (this document's headline; wire-breaking, MAJOR)** is **no longer gated behind the v0.33.0 cutover.** The gate protected a non-existent user base — the relay is unused (caraka, 2026-07-08), so a wire break breaks no users. Layer 2 is built now, sequenced after the round-2 quick fixes, with its own review (**xhigh** — trust surface) and an adversarial pass on the drafted implementation. Graduated to GitHub issues 2026-07-08.
+- **Layer 2 — the proto message-type merge + signed circle authorship (this document's headline; wire-breaking, MAJOR)** is **no longer gated behind the v0.33.0 cutover.** The gate protected a non-existent user base — the relay is unused (caraka, 2026-07-08), so a wire break breaks no users. Layer 2 is built now, sequenced after the round-2 quick fixes, with its own thorough review (a trust surface) and an adversarial review of the drafted implementation. Graduated to GitHub issues 2026-07-08.
 
 ## Design (A) — implementation-ready (ratified 2026-07-08)
 

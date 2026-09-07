@@ -1765,7 +1765,7 @@ mod tests {
     /// The conversation binding is pinned to a byte string, and to the ratchet
     /// that carries it.
     ///
-    /// **The one derivation in this family that had no vector.** A review lens
+    /// **The one derivation in this family that had no vector.** A reviewer
     /// found that switching `ar_fingerprint` from SHA-384 to SHA-256, changing the
     /// truncation, or salting it left every test green — the value is never
     /// serialized and only ever compared for equality, so nothing noticed. It is

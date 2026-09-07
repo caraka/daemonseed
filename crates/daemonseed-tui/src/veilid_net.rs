@@ -328,7 +328,7 @@ fn now_unix_ms() -> i64 {
 /// The Veilid net actor. Same channel shape as [`crate::net`]'s `net_actor`
 /// (`cmd_rx` in, `evt_tx` out; `_cmd_tx` is the self-send handle the relay actor
 /// uses for timers — unused here, kept for a uniform spawn signature).
-/// #157 (generalized, felt-test 2026-07-10): the steady-state resweep tick. The passive
+/// #157 (generalized, manual test 2026-07-10): the steady-state resweep tick. The passive
 /// DHT watch is lossy — a chat message or share advert written after the login sweep gets
 /// no reliable ValueChange, so it never re-surfaces at a peer that has already settled.
 /// WB-4 sanctions a reader-side resweep as the fix. On each tick ONE record from the
@@ -337,14 +337,14 @@ fn now_unix_ms() -> i64 {
 /// per-record cadence = tick × record-count (scales with room count). Presence records
 /// are excluded — they self-heal via keepalive re-writes (WB-4 table). Mirrors the GUI
 /// actor; same known limitations (per-record latency vs room count → tail-sweep;
-/// continuous read load → stop-on-quiet backoff). Felt-tunable.
+/// continuous read load → stop-on-quiet backoff). Tunable by hand.
 const STEADY_RESWEEP_TICK: Duration = Duration::from_secs(15);
 
 /// Hand-off delay past Connect before the steady resweep begins. Unlike the GUI, the TUI
 /// has NO stepped warmup re-sweep schedule — only the single connect-time login sweep in
 /// `subscribe_lobby` — so this is kept SHORT: just long enough to clear the connect-time
 /// subscribe/login-sweep read burst (WB-2), never a 70s dead window in which nothing
-/// re-surfaces (review finding). Felt-tunable.
+/// re-surfaces (review finding). Tunable by hand.
 const STEADY_RESWEEP_WARMUP_HANDOFF: Duration = Duration::from_secs(20);
 
 pub async fn veilid_net_actor(
@@ -1141,7 +1141,7 @@ async fn connect(
         Err(e) => return fail(evt_tx, format!("identity keys: {e}")),
     };
     // Per-instance overrides so several clients can run on ONE host (the
-    // single-machine felt-test): `DAEMONSEED_VEILID_DIR` gives each instance its
+    // single-machine manual test): `DAEMONSEED_VEILID_DIR` gives each instance its
     // own Veilid protected-store, `DAEMONSEED_VEILID_PORT` its own listen port.
     // Without them two nodes on one host collide on the default store dir + port.
     let dir = std::env::var("DAEMONSEED_VEILID_DIR").unwrap_or_else(|_| {

@@ -836,7 +836,7 @@ impl GuiState {
     /// empty-state lean — the rail starts with just the pinned, real public Lobby
     /// (rail index 0, the round-3 networked room); circles are then *materialized*
     /// by the user via the join / new-circle flows. No fake demo circles: a mute
-    /// placeholder circle would muddy the felt-test. The Lobby's transcript fills
+    /// placeholder circle would muddy the manual test. The Lobby's transcript fills
     /// from the relay at runtime (empty until connected).
     pub fn lobby_only() -> GuiState {
         let circles = vec![CircleState {
@@ -1280,7 +1280,7 @@ impl GuiState {
             name: fp,
             // Operator-facing trust copy (brief refinement #3, D6). No bit numbers
             // (ISC-45). The old "· not yet connected" was a placeholder that never got
-            // the live-state wiring (felt-test 2026-06-21: it contradicted the live
+            // the live-state wiring (manual test 2026-06-21: it contradicted the live
             // header status on a circle whose chat works) — dropped. Live per-circle
             // connection state is the Round-5 item; the header `connection-status`
             // property already carries the truthful live state.
@@ -1480,7 +1480,7 @@ impl GuiState {
             // Compare against each element's STORED `order_ms` (clamped once at its own
             // insert), NOT a re-clamp against the current `now` — re-clamping would let a
             // future forgery that has since re-entered the window silently re-sort past
-            // inserts and break `partition_point`'s sorted invariant (xhigh review).
+            // inserts and break `partition_point`'s sorted invariant (review).
             let pos = c.messages.partition_point(|m| m.order_ms <= order);
             c.messages.insert(
                 pos,
@@ -1556,7 +1556,7 @@ impl GuiState {
             // in `order_ms` order, so the last is the max). #131: advance from the
             // CLAMPED `order_ms` capped at `now` — NOT the raw `sent_unix_ms` — so a
             // forged far-future stamp cannot push the mark ahead and permanently suppress
-            // unreads (the xhigh-review hole). A later reconnect re-delivering this
+            // unreads (the review hole). A later reconnect re-delivering this
             // backlog then falls at/below the mark and won't re-trip.
             if let Some(latest) = c.messages.last().map(|m| m.order_ms) {
                 c.high_water_ms = c.high_water_ms.max(latest.min(now_unix_ms()));
@@ -2347,7 +2347,7 @@ mod tests {
 
     #[test]
     fn forged_future_via_switch_to_cannot_suppress_future_unreads() {
-        // #131 (xhigh-review hole): the suppression path is switch_to, NOT the active
+        // #131 (review hole): the suppression path is switch_to, NOT the active
         // push. A forged i64::MAX lands in a NON-active room; focusing it must advance
         // the high-water only to ~now (clamped `order_ms`, capped), NOT to i64::MAX — so
         // a later genuine message still trips the unread dot.
@@ -3248,7 +3248,7 @@ mod tests {
     /// reload the blob from disk → the kept root is back in `persisted_published()`
     /// (the auto-republish set) and the unpersisted one is gone. Mirrors the circle
     /// round-trip; this is the persistence half of ISC-DS5 (live restart→republish is
-    /// the felt-test).
+    /// the manual test).
     #[test]
     fn profile_round_trips_published_shares_across_reload() {
         use daemonseed_core::bootstrap::BootstrapAnchor;
