@@ -26,6 +26,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `crates/daemonseed-veilid-net/tests/two_node_dm_restart.rs` — a two-node network oracle,
+  `#[ignore]`: a sender that restarts between its knock and the acceptance composes a frame its
+  correspondent opens, and a correspondence whose stores both restarted and then re-established on
+  one committed root refuses a `DmCommand::Send` with `RefusalReason::NotEstablishedThisSession`,
+  spending no sequence number (#401, #402).
 - A `DmCommand::Send` on a correspondence whose channel was resumed by a completed
   re-establishment is refused with `RefusalReason::NotEstablishedThisSession`, before the outbox is
   asked and before the ratchet steps. Content frames on a resumed channel are unbuilt (#401, #402).
