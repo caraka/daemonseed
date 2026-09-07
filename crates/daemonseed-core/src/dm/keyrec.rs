@@ -110,16 +110,16 @@ pub const RESEED_INTERVAL_MAX: std::time::Duration = std::time::Duration::from_s
 /// signature and, across records, a stable phase relationship that is itself a
 /// linkage channel (WB-3 I6). An entropy failure falls back to the midpoint: a
 /// re-seed is liveness, not a key, and the next draw recovers.
+///
+/// Draws through the crate-internal `presence::interval_in_band`, which is the
+/// single definition of this arithmetic and carries the seam the band-width and
+/// degrade assertions need.
 pub fn next_reseed_interval() -> std::time::Duration {
-    let min_ms = RESEED_INTERVAL_MIN.as_millis() as u64;
-    let max_ms = RESEED_INTERVAL_MAX.as_millis() as u64;
-    let span = max_ms - min_ms;
-    let mut buf = [0u8; 8];
-    let offset = match getrandom::fill(&mut buf) {
-        Ok(()) => u64::from_le_bytes(buf) % (span + 1),
-        Err(_) => span / 2,
-    };
-    std::time::Duration::from_millis(min_ms + offset)
+    crate::presence::interval_in_band(
+        RESEED_INTERVAL_MIN,
+        RESEED_INTERVAL_MAX,
+        crate::jitter::os_fill,
+    )
 }
 
 redacted_secret_newtype! {
@@ -985,6 +985,154 @@ mod tests {
         assert!(
             distinct.len() > 1,
             "64 draws collapsed to one value — the cadence is not jittered"
+        );
+    }
+
+    /// The re-seed band is reachable end to end, pinned exactly (#372).
+    ///
+    /// The test above cannot see band WIDTH: it asserts membership of `[MIN, MAX]` and
+    /// that more than one value occurred, and a draw collapsed to `% (span / 10 + 1)`
+    /// satisfies both — every interval lands in the first two minutes of a twenty-minute
+    /// span, still in range, still varying. A narrowed band is a tighter cadence
+    /// signature on the key record, which is the property the design's M7 finding asked
+    /// jitter to remove.
+    ///
+    /// Deterministic, not statistical: a fill of `span` must map to exactly `MAX`.
+    #[test]
+    fn reseed_band_ends_are_exactly_reachable() {
+        let span = (RESEED_INTERVAL_MAX.as_millis() - RESEED_INTERVAL_MIN.as_millis()) as u64;
+        let at = |v: u64| {
+            crate::presence::interval_in_band(
+                RESEED_INTERVAL_MIN,
+                RESEED_INTERVAL_MAX,
+                move |buf| {
+                    *buf = v.to_le_bytes();
+                    Ok(())
+                },
+            )
+        };
+        assert_eq!(
+            at(0),
+            RESEED_INTERVAL_MIN,
+            "a zero draw must land on the band floor"
+        );
+        assert_eq!(
+            at(span),
+            RESEED_INTERVAL_MAX,
+            "a draw of the full span must reach the band ceiling — if it does not, the \
+             reachable band is narrower than the declared one, which both tightens the \
+             cadence signature and moves the mean off the budgeted write rate"
+        );
+        assert_eq!(
+            at(span / 2),
+            RESEED_INTERVAL_MIN + std::time::Duration::from_millis(span / 2),
+            "the midpoint draw must land on the midpoint"
+        );
+    }
+
+    /// The entropy-failure degrade lands on the band midpoint, not on an end (#372).
+    ///
+    /// Unreachable while this draw called `getrandom` directly; the seam is the `fill`
+    /// parameter [`crate::presence::interval_in_band`] takes. A degrade to a band END
+    /// would put every client that lost entropy onto the same extreme re-seed period —
+    /// a stronger correlation signal than the fixed period the jitter replaced — and at
+    /// the floor it would also raise the record's write rate off its budget.
+    #[test]
+    fn a_reseed_entropy_failure_degrades_to_the_band_midpoint() {
+        let span = (RESEED_INTERVAL_MAX.as_millis() - RESEED_INTERVAL_MIN.as_millis()) as u64;
+        let d =
+            crate::presence::interval_in_band(
+                RESEED_INTERVAL_MIN,
+                RESEED_INTERVAL_MAX,
+                |_| Err(()),
+            );
+        assert_eq!(
+            d,
+            RESEED_INTERVAL_MIN + std::time::Duration::from_millis(span / 2),
+            "an entropy failure must degrade to the midpoint"
+        );
+        assert!(
+            d > RESEED_INTERVAL_MIN && d < RESEED_INTERVAL_MAX,
+            "the degrade must not sit on an end"
+        );
+    }
+
+    /// The PRODUCTION source spans the re-seed band, in both halves, with real
+    /// population and without a density tilt (#372).
+    ///
+    /// The deterministic tests above pin the arithmetic and would still pass if
+    /// `os_fill` were swapped for something confined or skewed. This one covers the
+    /// source.
+    ///
+    /// The floors are derived for THIS band, not carried over from the presence bands —
+    /// its span is minutes, not seconds. Over `DRAWS` samples on a 1 200 001 ms span:
+    /// missing a half has probability `2^-4095`; the expected collision count is
+    /// `C(4096,2)/1200001 ≈ 7.0`, so ~4089 distinct values are expected against a floor
+    /// of 4050; and the upper third's share has `σ ≈ 0.74%` about 33.3%, putting the 27%
+    /// floor 8.6σ down.
+    ///
+    /// **Range and cardinality together are not uniformity**, which is why the
+    /// upper-third share is asserted separately. The mutation that drives that floor is
+    /// a draw biased toward the bottom while still reaching both ends: taking the MIN of
+    /// two independent draws — the shape a botched clamp or a mis-written
+    /// rejection-sampling retry produces — leaves the top third at `(1/3)^2 = 11.1%`
+    /// while range, halves and cardinality all stay green. The narrow-SOURCE mutation
+    /// that drives the same floor on the 40 s presence band (truncating the entropy read
+    /// to `u16`) does not apply at this span: every natural truncation either falls far
+    /// short of the band and is caught by the spread floor, or is wide enough to be
+    /// uniform to within a fraction of a σ.
+    #[test]
+    fn the_production_reseed_draw_spans_its_band() {
+        const DRAWS: usize = 4096;
+        let span_ms = (RESEED_INTERVAL_MAX.as_millis() - RESEED_INTERVAL_MIN.as_millis()) as u64;
+        let mid = RESEED_INTERVAL_MIN + std::time::Duration::from_millis(span_ms / 2);
+        let top_third = RESEED_INTERVAL_MIN + std::time::Duration::from_millis(span_ms * 2 / 3);
+
+        let mut seen = std::collections::HashSet::new();
+        let (mut lower, mut upper, mut in_top_third) = (0usize, 0usize, 0usize);
+        let (mut lo, mut hi) = (RESEED_INTERVAL_MAX, RESEED_INTERVAL_MIN);
+        for _ in 0..DRAWS {
+            let d = next_reseed_interval();
+            seen.insert(d.as_millis());
+            if d < mid {
+                lower += 1;
+            } else {
+                upper += 1;
+            }
+            if d >= top_third {
+                in_top_third += 1;
+            }
+            lo = lo.min(d);
+            hi = hi.max(d);
+        }
+
+        assert!(
+            lower > 0 && upper > 0,
+            "every one of {DRAWS} draws fell in one half of the band \
+             (lower={lower}, upper={upper}) — the draw is confined, not uniform"
+        );
+        // Three quarters of the span: a uniform draw covers essentially all of it at
+        // this sample size, and the tenth-collapse mutation leaves 10%.
+        let observed = (hi - lo).as_millis() as u64;
+        assert!(
+            observed * 4 >= span_ms * 3,
+            "observed spread {observed} ms covers less than three quarters of the \
+             {span_ms} ms band — the reachable band is narrower than the declared one"
+        );
+        assert!(
+            in_top_third * 100 >= DRAWS * 27,
+            "only {in_top_third} of {DRAWS} draws landed in the band's upper third \
+             ({:.1}%, uniform is 33.3%) — the draw spans its band but is denser at the \
+             bottom, which is a cadence signature even though every value is in range",
+            in_top_third as f64 * 100.0 / DRAWS as f64
+        );
+        assert!(
+            seen.len() >= 4050,
+            "only {} distinct values in {DRAWS} draws — a uniform draw over {} values \
+             yields ~4089, so this is quantised onto a grid, which neither the spread \
+             floor nor the density check above can see",
+            seen.len(),
+            span_ms + 1
         );
     }
 

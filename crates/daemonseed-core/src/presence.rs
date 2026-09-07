@@ -120,10 +120,14 @@ pub fn next_keepalive_interval() -> Duration {
 /// Draw uniformly in `[min, max]` from `fill`, degrading to the band **midpoint**
 /// if the source fails.
 ///
-/// One definition for both interval draws. They were byte-identical apart from
-/// their constants, and a second copy of jitter arithmetic is drift waiting to
-/// happen — the same argument [`crate::backoff::apply_jitter`] makes for the
-/// outbox reseed ladder, its one caller.
+/// One definition for every uniform-band interval draw in the tree. Five draws
+/// reach it: the keepalive and heartbeat draws here, both operator keep-alive bands
+/// ([`crate::public_space::next_operator_keepalive_interval`]) and the DM key-record
+/// re-seed ([`crate::dm::keyrec::next_reseed_interval`]). The two further copies this
+/// absorbed were byte-identical to it apart from their constants, and a second copy of
+/// jitter arithmetic is drift waiting to happen — the same argument
+/// [`crate::backoff::apply_jitter`] makes for the outbox reseed ladder, its one
+/// caller (#372).
 ///
 /// `fill` is a parameter rather than a direct `getrandom` call for the reason
 /// [`crate::jitter::unit_or_zero`] takes one: the degrade is the single branch here

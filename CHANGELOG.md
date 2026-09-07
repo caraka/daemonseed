@@ -768,6 +768,10 @@ work lives in the maintainer's own planning notes, not here.
 - The pre-push hook runs `cargo xtask gate --group preflight`.
 - Gate steps carry a group and a child environment; the table runs `preflight`, then `dev-suite`,
   then `release-suite`.
+- `daemonseed_core::public_space::{first_operator_keepalive_interval, next_operator_keepalive_interval}`
+  and `daemonseed_core::dm::keyrec::next_reseed_interval` draw through one crate-internal
+  interval-drawing helper; the private `public_space::jittered` helper is gone. Each band gains the
+  band-ceiling, entropy-degrade, spread, density and cardinality assertions (#372).
 - `daemonseed_core::dm::resume::ResumeRecord::new` returns `Result<Self, ResumeError>` and refuses
   an own slot whose attempt disagrees with the counter, an acceptance below the committed
   generation (`AcceptanceBelowGeneration`), a confirm slot ahead of it
