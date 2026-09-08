@@ -1772,6 +1772,7 @@ dependencies = [
  "daemonseed-proto",
  "daemonseed-veilid-net",
  "dirs",
+ "futures-util",
  "oxicrypt-integrity-sign",
  "oxicrypt-module",
  "ratatui",

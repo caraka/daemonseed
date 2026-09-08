@@ -53,6 +53,11 @@ tonic = { workspace = true }
 
 anyhow = { workspace = true }
 
+# Concurrent awaits on the graceful-close path: one LEAVE tombstone per joined room
+# is awaited across rooms at once, so a member of many circles does not spend the
+# close budget telling them one at a time.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
 # The session copy of a circle phrase is the `cot_key` IKM (ISC-C8), so
 # `JoinedCircle::entropy` is a `Zeroizing<String>` rather than a bare one —
 # the same shape the core and the GUI took in #259 (#268).

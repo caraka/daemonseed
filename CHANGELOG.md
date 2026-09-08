@@ -604,6 +604,9 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- `daemonseed-tui`: a graceful close publishes a LEAVE tombstone for every joined circle as well as
+  the lobby, each sealed under its own circle key and posted to that circle's presence record,
+  awaited concurrently under the close budget. (#368)
 - `cargo xtask install-hooks` writes the hook to the directory git runs hooks from
   (`git rev-parse --git-path hooks`): `core.hooksPath` when set, otherwise the common `.git/hooks`.
   Run from a worktree it wrote to `.git/worktrees/<name>/hooks/`, which git does not read.

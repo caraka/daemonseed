@@ -80,7 +80,10 @@ use std::time::{Duration, Instant};
 use daemonseed_cli::route_signer::IdentityRouteAdvertSigner;
 use daemonseed_core::browse_retry::{ParkedBrowseRetry, ParkedRetryAction, parked_retry_action};
 use daemonseed_core::circle::default_circle_label;
-use daemonseed_core::circle::key::{CircleKey, derive_circle_veilid_owner_seed, derive_cot_key};
+use daemonseed_core::circle::key::{
+    CircleKey, derive_circle_presence_veilid_owner_seed, derive_circle_veilid_owner_seed,
+    derive_cot_key,
+};
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
@@ -89,7 +92,9 @@ use daemonseed_core::dm::keyrec::{self as dm_keyrec, KemEncapsulationKey};
 use daemonseed_core::dm::persist::DmPersist;
 use daemonseed_core::dm::pow::PowDifficulty;
 use daemonseed_core::handle::{DisplayMode, Handle};
-use daemonseed_core::heartbeat::{HeartbeatFields, open_heartbeat, seal_public_heartbeat};
+use daemonseed_core::heartbeat::{
+    HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
+};
 use daemonseed_core::identity::keys::{Identity, ShareRootIkm, SignKeypair, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::presence::{
@@ -153,12 +158,18 @@ const SHARE_CATALOG_TTL: Duration = Duration::from_secs(600);
 const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A joined circle's local state: the per-session routing id, the content key
-/// (for seal/open), the shared rendezvous-owner seed (for publish/subscribe),
-/// and the client-local display label.
+/// (for seal/open), the shared chat rendezvous-owner seed (for publish/subscribe),
+/// the presence sibling record's owner seed, and the client-local display label.
 struct VeilidCircle {
     circle_id: u64,
     cot_key: CircleKey,
     owner_seed: [u8; 32],
+    /// The **presence** sibling record's owner seed — presence rides its OWN
+    /// entropy-derived record, never the chat rendezvous, so a beacon and a chat
+    /// message can never overwrite each other. Every member who agrees on the phrase
+    /// derives the byte-identical seed, so a LEAVE tombstone posted here (WB-1.3)
+    /// lands on the record the rest of the circle reads.
+    presence_owner_seed: [u8; 32],
     label: String,
 }
 
@@ -1044,45 +1055,78 @@ async fn handle_command(
             // hold the quit open AND skip the I7 flush entirely.
             let preflush_deadline = Instant::now() + CLOSE_PREFLUSH_BUDGET;
             daemonseed_veilid_net::vtrace!(
-                "tui close: entry, preflush budget {CLOSE_PREFLUSH_BUDGET:?}, lobby={}",
-                shares.lobby.is_some()
+                "tui close: entry, preflush budget {CLOSE_PREFLUSH_BUDGET:?}, lobby={}, circles={}",
+                shares.lobby.is_some(),
+                circles.len()
             );
-            // WB-1.3: the lobby LEAVE tombstone. AWAITED, not fire-and-forget (#161) —
-            // a spawned task is aborted at process exit and the member ages out at the
-            // ~600s TTL instead of departing immediately; `publish_presence` resolves
-            // after the scheduler's `set_dht_value` returns, so the await is what bounds
-            // delivery. The funnel's I3 dominance keeps a queued keepalive from
-            // superseding it (#164). The lobby is the TUI's only presence surface — it
-            // publishes no circle presence — and it withdraws no shares here, so a
-            // TUI-owned share still ages out at its own TTL.
-            if let (Some(handle), Some(signing), Some(lobby)) =
-                (net.as_ref(), shares.signing.clone(), shares.lobby.as_ref())
-            {
+            // WB-1.3: one LEAVE tombstone per joined room — the lobby AND every circle.
+            // AWAITED, not fire-and-forget (#161) — a spawned task is aborted at process
+            // exit and the member ages out at the ~600s TTL instead of departing
+            // immediately; `publish_presence` resolves after the scheduler's
+            // `set_dht_value` returns, so the await is what bounds delivery. CONCURRENT
+            // across rooms: each room is a distinct record the scheduler dispatches in
+            // parallel, and sequential leaves let a member of many circles spend the
+            // budget before the later rooms are told. Every room is bounded by the SAME
+            // absolute pre-flush deadline — they are abandoned together, not one at a
+            // time — but each reports its own outcome against it, so what one record does
+            // is never read off another's. The funnel's I3 dominance keeps a queued
+            // keepalive from superseding a leave (#164). The tombstone is byte-identical
+            // to a keepalive on the wire (WB-ISC-6); only in-room members decrypt the
+            // leave marker. No shares are withdrawn here, so a share this client owns
+            // still ages out at its own TTL.
+            if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone()) {
+                let sender_handle = my_handle.as_deref().unwrap_or("guest");
                 // A timed-out leave is handed to the flush, not cancelled — the tombstone
-                // is already on the scheduler; only the await is abandoned.
+                // is already on the scheduler; only the await is abandoned. Every room is
+                // cut at the absolute deadline, not a duration read now, so the time
+                // spent sealing the circle writes below is not added to the budget.
                 let leave_budget = preflush_deadline.saturating_duration_since(Instant::now());
-                match tokio::time::timeout(
-                    leave_budget,
-                    publish_public_leave(
+                let leave_deadline = tokio::time::Instant::from_std(preflush_deadline);
+                let lobby_leave = shares.lobby.as_ref().map(|lobby| {
+                    let leave = publish_public_leave(
                         handle,
                         &signing,
                         &lobby.room_key,
                         lobby.presence_owner_seed,
-                        my_handle.as_deref().unwrap_or("guest"),
-                    ),
-                )
-                .await
-                {
-                    Ok(()) => {
-                        daemonseed_veilid_net::vtrace!("tui close: leave {DEFAULT_ROOM} awaited")
+                        sender_handle,
+                    );
+                    async move {
+                        match tokio::time::timeout_at(leave_deadline, leave).await {
+                            Ok(()) => daemonseed_veilid_net::vtrace!(
+                                "tui close: leave {DEFAULT_ROOM} awaited"
+                            ),
+                            Err(_) => daemonseed_veilid_net::vtrace!(
+                                "tui close: leave {DEFAULT_ROOM} timed out after {leave_budget:?}"
+                            ),
+                        }
                     }
-                    Err(_) => daemonseed_veilid_net::vtrace!(
-                        "tui close: leave {DEFAULT_ROOM} timed out after {leave_budget:?}"
-                    ),
-                }
+                });
+                // WHAT is published per circle is decided by `circle_leave_writes`, off
+                // this path: the close arm only paces the writes it hands back.
+                let circle_leaves = circle_leave_writes(circles, &signing, sender_handle)
+                    .into_iter()
+                    .map(|write| {
+                        let label = write.label.clone();
+                        let leave = publish_circle_leave(handle, &signing, write);
+                        async move {
+                            match tokio::time::timeout_at(leave_deadline, leave).await {
+                                Ok(()) => daemonseed_veilid_net::vtrace!(
+                                    "tui close: leave {label} awaited"
+                                ),
+                                Err(_) => daemonseed_veilid_net::vtrace!(
+                                    "tui close: leave {label} timed out after {leave_budget:?}"
+                                ),
+                            }
+                        }
+                    });
+                let _ = futures_util::future::join(
+                    futures_util::future::OptionFuture::from(lobby_leave),
+                    futures_util::future::join_all(circle_leaves),
+                )
+                .await;
             } else {
                 daemonseed_veilid_net::vtrace!(
-                    "tui close: leave stage skipped, no session, signing key or lobby"
+                    "tui close: leave stage skipped, no session or signing key"
                 );
             }
             // The WB-3.I7 flush: its floor plus whatever the leave left unspent. It
@@ -1332,18 +1376,21 @@ async fn join_circle(
     let Some(handle) = net.as_ref() else {
         return err("not connected to Veilid yet".to_owned());
     };
-    let cot_key = match derive_cot_key(phrase, &CNSA_2_0) {
-        Ok(k) => k,
-        Err(e) => return err(format!("circle-key derivation failed: {e}")),
-    };
-    let owner_seed = match derive_circle_veilid_owner_seed(phrase, &CNSA_2_0) {
-        Ok(s) => *s.as_bytes(),
-        Err(e) => return err(format!("rendezvous-owner derivation failed: {e}")),
+    // Everything the phrase determines, derived in one place (`derive_joined_circle`)
+    // so nothing downstream can hold a circle assembled on different terms than a join
+    // produces. The id is the one the join WOULD take; it is consumed only if the
+    // subscribe below succeeds.
+    let candidate = match derive_joined_circle(*next_circle_id, phrase) {
+        Ok(c) => c,
+        Err(message) => return err(message),
     };
     // Idempotent join (ISC-C59): a circle already in the set (same phrase → same
     // owner_seed) re-emits its existing id + label so the app re-selects it,
     // rather than re-subscribing or duplicating membership.
-    if let Some(existing) = circles.iter().find(|c| c.owner_seed == owner_seed) {
+    if let Some(existing) = circles
+        .iter()
+        .find(|c| c.owner_seed == candidate.owner_seed)
+    {
         let _ = evt_tx.send(NetEvent::CircleJoined {
             circle_id: existing.circle_id,
             label: existing.label.clone(),
@@ -1351,26 +1398,46 @@ async fn join_circle(
         });
         return;
     }
-    if let Err(e) = handle.subscribe_circle(OwnerSeed::new(owner_seed)).await {
+    if let Err(e) = handle
+        .subscribe_circle(OwnerSeed::new(candidate.owner_seed))
+        .await
+    {
         return err(format!("subscribe failed: {e}"));
     }
-    let circle_id = *next_circle_id;
     *next_circle_id += 1;
-    // Deterministic client-local label (ISC-C62): derived from the per-circle
-    // content-key fingerprint so the same circle gets the same default label,
-    // never from other members and never transmitted.
-    let label = default_circle_label(&circle_fingerprint(&cot_key));
-    circles.push(VeilidCircle {
-        circle_id,
-        cot_key,
-        owner_seed,
-        label: label.clone(),
-    });
+    let circle_id = candidate.circle_id;
+    let label = candidate.label.clone();
+    circles.push(candidate);
     let _ = evt_tx.send(NetEvent::CircleJoined {
         circle_id,
         label,
         entropy: phrase.to_owned(),
     });
+}
+
+/// Derive every part of a joined circle a phrase determines: the content key (seal /
+/// open), the chat rendezvous-owner seed, the presence sibling record's owner seed,
+/// and the deterministic client-local label (ISC-C62) — taken from the per-circle
+/// content-key fingerprint, so the same circle always gets the same default label, and
+/// never from other members and never transmitted. Pure, so the derivations a join runs
+/// are the derivations everything else runs. `Err` carries the message the join surfaces.
+fn derive_joined_circle(circle_id: u64, phrase: &str) -> Result<VeilidCircle, String> {
+    let cot_key = derive_cot_key(phrase, &CNSA_2_0)
+        .map_err(|e| format!("circle-key derivation failed: {e}"))?;
+    let owner_seed = *derive_circle_veilid_owner_seed(phrase, &CNSA_2_0)
+        .map_err(|e| format!("rendezvous-owner derivation failed: {e}"))?
+        .as_bytes();
+    let presence_owner_seed = *derive_circle_presence_veilid_owner_seed(phrase, &CNSA_2_0)
+        .map_err(|e| format!("presence-owner derivation failed: {e}"))?
+        .as_bytes();
+    let label = default_circle_label(&circle_fingerprint(&cot_key));
+    Ok(VeilidCircle {
+        circle_id,
+        cot_key,
+        owner_seed,
+        presence_owner_seed,
+        label,
+    })
 }
 
 /// A stable per-circle fingerprint, used only to seed the deterministic
@@ -3165,6 +3232,89 @@ async fn publish_public_leave(
     }
 }
 
+/// Seal ONE LEAVE tombstone (WB-1.3) for a CIRCLE, under that circle's `cot_key` and
+/// carrying its client-local label as the room. Padded to the constant sealed length
+/// every presence beacon shares (WB-ISC-6), so the frame is indistinguishable from a
+/// keepalive on the wire and only in-circle members decrypt the leave marker. A pure
+/// function of the circle and the signer, so the frame a close would post is
+/// determined — and readable — without a transport. `None` on a seal failure: the
+/// caller drops that beacon and the member ages out at the ~600s `PRESENCE_TTL`.
+fn seal_circle_leave(
+    signing: &SignKeypair,
+    circle: &VeilidCircle,
+    my_handle: &str,
+) -> Option<Vec<u8>> {
+    let fields = HeartbeatFields {
+        room: &circle.label,
+        sender_handle: my_handle,
+        sent_unix_ms: now_unix_ms(),
+        live_share_ids: &[],
+        is_leave: true,
+    };
+    seal_circle_heartbeat(&circle.cot_key, signing, &fields).ok()
+}
+
+/// One prepared circle presence write: the record it is posted to, the sealed frame,
+/// and the funnel boundary it is classed under.
+struct CircleLeaveWrite {
+    owner_seed: [u8; 32],
+    sealed: Vec<u8>,
+    boundary: PresenceBoundary,
+    /// The circle's client-local label, so the close trace can name the room.
+    label: String,
+}
+
+/// Prepare the LEAVE tombstone (WB-1.3) each joined circle is owed on a graceful
+/// close: one per circle, sealed under that circle's own `cot_key`, addressed to that
+/// circle's PRESENCE sibling record (never its chat rendezvous — a beacon on the chat
+/// record would overwrite the append-ring), and classed as a leave so the funnel
+/// treats it as a non-coalescible tombstone that dominates a queued keepalive (I3).
+/// A circle whose seal fails is dropped from the batch; that member ages out at the
+/// ~600s `PRESENCE_TTL` instead. Pure, so what a close publishes is decided here and
+/// merely paced by the close path.
+fn circle_leave_writes(
+    circles: &[VeilidCircle],
+    signing: &SignKeypair,
+    my_handle: &str,
+) -> Vec<CircleLeaveWrite> {
+    circles
+        .iter()
+        .filter_map(|circle| {
+            Some(CircleLeaveWrite {
+                owner_seed: circle.presence_owner_seed,
+                sealed: seal_circle_leave(signing, circle, my_handle)?,
+                boundary: PresenceBoundary::Leave,
+                label: circle.label.clone(),
+            })
+        })
+        .collect()
+}
+
+/// AWAIT one prepared circle presence write — the circle counterpart of
+/// [`publish_public_leave`], which carries the reasoning for awaiting rather than
+/// spawning the write. Posting to the circle's presence record is what clears the
+/// circle roster on the same terms a lobby departure clears the lobby's. Non-fatal on
+/// transport failure (the TTL backstops it).
+async fn publish_circle_leave(
+    handle: &VeilidNetHandle,
+    signing: &SignKeypair,
+    write: CircleLeaveWrite,
+) {
+    let CircleLeaveWrite {
+        owner_seed,
+        sealed,
+        boundary,
+        label: _,
+    } = write;
+    let pubkey = signing.public_key().to_vec();
+    if let Err(e) = handle
+        .publish_presence(owner_seed, &pubkey, sealed, boundary)
+        .await
+    {
+        daemonseed_veilid_net::vtrace!("tui circle presence: {boundary:?} emit failed: {e}");
+    }
+}
+
 fn emit_and_reap_lobby_presence(
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
@@ -3544,6 +3694,61 @@ mod tests {
     fn announcer(seed: u8) -> SignKeypair {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
+    }
+
+    /// A joined circle, built through the derivation path a join runs, so a change to
+    /// any seed or to the label derivation reaches this fixture.
+    fn joined_circle(circle_id: u64, phrase: &str) -> VeilidCircle {
+        derive_joined_circle(circle_id, phrase).expect("a phrase derives its circle")
+    }
+
+    /// A graceful close owes EVERY joined circle a LEAVE tombstone, not just the lobby:
+    /// one write per circle, addressed to that circle's presence record, classed as a
+    /// leave, and sealed under that circle's own key. Without the per-circle tombstone a
+    /// departing member sits on every circle roster until the ~600s `PRESENCE_TTL`,
+    /// which is what makes a clean quit indistinguishable from a crash.
+    #[test]
+    fn every_joined_circle_gets_its_own_leave_write() {
+        let signing = announcer(9);
+        let circles = [
+            joined_circle(0, "circle phrase alfa"),
+            joined_circle(1, "circle phrase bravo"),
+        ];
+
+        let writes = circle_leave_writes(&circles, &signing, "quitter#0123456789ab");
+
+        assert_eq!(writes.len(), circles.len(), "one write per joined circle");
+        assert_ne!(
+            circles[0].presence_owner_seed, circles[1].presence_owner_seed,
+            "each circle is told on its own presence record"
+        );
+        for (circle, write) in circles.iter().zip(&writes) {
+            assert_ne!(
+                circle.presence_owner_seed, circle.owner_seed,
+                "the fixture must be able to tell the two records apart"
+            );
+            assert_eq!(
+                write.owner_seed, circle.presence_owner_seed,
+                "a leave goes to the presence record, not the chat rendezvous"
+            );
+            assert_eq!(
+                write.boundary,
+                PresenceBoundary::Leave,
+                "a tombstone must be classed as a leave, not a keepalive"
+            );
+            let beacon = open_heartbeat(&circle.cot_key, &write.sealed)
+                .expect("opens under its own circle key");
+            assert!(beacon.is_leave, "the beacon must carry the leave marker");
+            assert_eq!(beacon.room, circle.label, "sealed for its own circle");
+            assert_eq!(
+                write.label, circle.label,
+                "the close trace names the room it left"
+            );
+        }
+        assert!(
+            open_heartbeat(&circles[1].cot_key, &writes[0].sealed).is_err(),
+            "a circle's leave must not open under another circle's key"
+        );
     }
 
     fn lobby() -> LobbyRendezvous {
