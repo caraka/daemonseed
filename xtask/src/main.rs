@@ -7,13 +7,10 @@
 //! - `check-proto` — regenerate to a temporary directory and diff against the
 //!   committed snapshot. Non-zero exit on drift. CI gate.
 //! - `isc-coverage` — report the percentage of ISCs covered by registered
-//!   tests in `daemonseed-integration-tests::isc_coverage`. M0 reports the
-//!   0/93 baseline; later milestones surface the live registry count and
-//!   gate CI at `--min 95`.
-//! - `findings-resolved` — grep-assert that the M0 cross-ISC findings
-//!   (F14 / F18 / F19 / F21) are still resolved in `ds-isc-draft.md`. Closes
-//!   redteam reservation R4: the text fixes have a runtime gate, not just
-//!   a memory.
+//!   tests in `daemonseed-integration-tests::isc_coverage`, against the
+//!   registry's live total; `--min N` fails the run below N percent.
+//! - `check-ui-strings` — refuse placeholder text in any string a user can
+//!   read.
 //! - `install-hooks` — install the workspace's git pre-push hook into the
 //!   active checkout's `.git/hooks/` (or into a `--target` directory).
 //!   Idempotent; overwrites a previously-installed hook in-place.
@@ -73,15 +70,6 @@ enum Cmd {
         #[arg(long)]
         min: Option<u8>,
     },
-    /// Grep-assert that the M0 cross-ISC findings (F14 / F18 / F19 / F21) are
-    /// still resolved in `ds-isc-draft.md`. Exits non-zero on the first
-    /// missing marker. Closes redteam reservation R4.
-    FindingsResolved {
-        /// Path to the working ISC draft. Required: the draft is kept outside
-        /// this repository, so there is no default that would resolve here.
-        #[arg(long)]
-        draft: Option<PathBuf>,
-    },
     /// Install the workspace's git pre-push hook into the active checkout.
     /// Idempotent — overwrites an existing hook in-place.
     InstallHooks {
@@ -115,7 +103,6 @@ fn main() -> Result<()> {
         Cmd::CheckProto => check_proto(),
         Cmd::CheckUiStrings => ui_strings::check_ui_strings(&workspace_root_from_xtask()?),
         Cmd::IscCoverage { min } => isc_coverage(min),
-        Cmd::FindingsResolved { draft } => findings_resolved(draft),
         Cmd::InstallHooks { target } => install_hooks(target),
         Cmd::Gate { group, list } => {
             if list {
@@ -159,46 +146,6 @@ fn isc_coverage(min: Option<u8>) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// M0 cross-ISC findings whose ISC-draft text fixes are runtime-asserted by
-/// `findings-resolved`. Each marker is the literal substring that must appear
-/// in `ds-isc-draft.md`; the in-draft edit phrases the marker so re-wording
-/// the surrounding prose doesn't accidentally trip the gate.
-const FINDING_MARKERS: &[&str] = &["per F14", "per F18", "per F19", "per F21"];
-
-fn findings_resolved(draft: Option<PathBuf>) -> Result<()> {
-    // The ISC draft is a working document kept outside this repository, so there
-    // is no default path that would mean anything to a reader: `--draft` names it.
-    let path = draft.context(
-        "findings-resolved needs `--draft <path>`: the ISC draft is kept outside this repository",
-    )?;
-    let body = fs::read_to_string(&path)
-        .with_context(|| format!("read ISC draft at {}", path.display()))?;
-
-    let mut missing = Vec::new();
-    for marker in FINDING_MARKERS {
-        let n = body.matches(marker).count();
-        if n == 0 {
-            missing.push(*marker);
-        } else {
-            println!("findings-resolved: `{marker}` ✓  ({n} occurrence(s))");
-        }
-    }
-    if missing.is_empty() {
-        println!(
-            "findings-resolved: all 4 markers present in {}",
-            path.display()
-        );
-        Ok(())
-    } else {
-        bail!(
-            "findings-resolved: {} marker(s) missing in {}: {}",
-            missing.len(),
-            path.display(),
-            missing.join(", ")
-        )
-    }
 }
 
 fn install_hooks(target: Option<PathBuf>) -> Result<()> {

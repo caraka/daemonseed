@@ -726,6 +726,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Removed
 
+- `cargo xtask findings-resolved`. It asserted marker strings in a document kept outside this
+  repository, so it could not run from a clean checkout.
 - `daemonseed-core`: `PROJECT_RELEASE_SEED`, `dev_project_release_keypair`,
   `dev_project_announce_veilid_owner_seed` — the seed is no longer in the source tree.
 - `daemonseed-gui`: `DAEMONSEED_OPERATOR` — possession of the project-announce seed is the operator

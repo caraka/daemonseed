@@ -13,9 +13,9 @@
 //! No platform implementation ships. iOS Keychain, Android Keystore, the
 //! Linux Secret Service, and any biometric-prompt UX live with the client that
 //! actually holds a session and can prompt for a fingerprint/face — there is no
-//! meaning to enclave storage without one. See the ISC-C7 Reservation in
-//! `ds-isc-draft.md`. This crate ships the trait + the typed secret + the
-//! mandatory warning so wiring a real backend later is purely additive.
+//! meaning to enclave storage without one. ISC-C7 in `ISA.md` stays open until
+//! one does. This crate ships the trait, the typed secret and the mandatory
+//! warning so wiring a real backend later is purely additive.
 
 use zeroize::ZeroizeOnDrop;
 

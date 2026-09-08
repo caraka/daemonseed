@@ -6,7 +6,7 @@ rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
 license = "AGPL-3.0-or-later"
-description = "Slint GUI client for daemonseed (round-1 scaffold: software-renderer shell)."
+description = "Slint GUI client for daemonseed."
 publish = false
 
 [dependencies]

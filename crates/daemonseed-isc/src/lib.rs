@@ -89,7 +89,7 @@ pub enum IscClass {
     Negative,
 }
 
-/// Every ISC known to this MVP, in declaration order from `ds-isc-draft.md`.
+/// Every ISC known to this MVP, in declaration order from `ISA.md`.
 /// Length is [`TOTAL`].
 pub const ISCS: &[(&str, IscClass)] = &[
     // ── server positive (21 — the relay/TLS/federation ISCs S1/S2a/S3/S5/S6/

@@ -22,10 +22,10 @@
 //!   `PRESENCE_SIDE_CHANNEL_WARNING`, opt-in `ProfileConfig::autostart`
 //!   (default off). No OS install/enable/run.
 //!
-//! Reserved (NOT closed): the platform secure-enclave backends + biometric UX
-//! (C7) and the actual OS install + GUI-autostart + mobile background-exec +
-//! the persistent headless client (C20). See the C7/C20 Reservations in
-//! `ds-isc-draft.md`.
+//! Not implemented, so ISC-C7 and ISC-C20 in `ISA.md` stay open: the platform
+//! secure-enclave backends and biometric UX (C7), and the OS install,
+//! GUI-autostart wiring, mobile background execution and the persistent
+//! headless client (C20).
 
 use daemonseed_core::autostart::{
     AutostartMode, AutostartSpec, AutostartTarget, PRESENCE_SIDE_CHANNEL_WARNING, unit_descriptor,
@@ -90,11 +90,11 @@ fn m10b_closes_c7_and_c20_scaffold() {
     let mut coverage = Coverage::empty();
     coverage.register(
         "ISC-C7",
-        "daemonseed_core::biometric (BiometricStore trait + SessionPassphrase + RECOVERY_RISK_WARNING + ProfileConfig::biometric_unlock) + m10b::c7_biometric_scaffold_is_present_and_off_by_default; platform backend reserved (ds-isc-draft.md C7 Reservation)",
+        "daemonseed_core::biometric (BiometricStore trait + SessionPassphrase + RECOVERY_RISK_WARNING + ProfileConfig::biometric_unlock) + m10b::c7_biometric_scaffold_is_present_and_off_by_default; platform backend not implemented; ISC-C7 stays open",
     );
     coverage.register(
         "ISC-C20",
-        "daemonseed_core::autostart (unit_descriptor generator + AutostartManager trait + PRESENCE_SIDE_CHANNEL_WARNING + ProfileConfig::autostart) + m10b::c20_autostart_scaffold_generates_descriptors_without_installing; OS install reserved (ds-isc-draft.md C20 Reservation)",
+        "daemonseed_core::autostart (unit_descriptor generator + AutostartManager trait + PRESENCE_SIDE_CHANNEL_WARNING + ProfileConfig::autostart) + m10b::c20_autostart_scaffold_generates_descriptors_without_installing; OS install not implemented; ISC-C20 stays open",
     );
     assert_eq!(
         coverage.covered_count(),

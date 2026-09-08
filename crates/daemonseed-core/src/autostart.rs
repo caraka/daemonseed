@@ -18,9 +18,9 @@
 //! ## What is NOT here (reserved)
 //!
 //! Actual OS installation, GUI-autostart wiring, mobile background-execution
-//! policy, and the persistent headless client the unit would launch are all
-//! reserved to the future GUI/mobile client — see the ISC-C20 Reservation in
-//! `ds-isc-draft.md`. The descriptor *text* is generated here so the install
+//! policy, and the persistent headless client the unit would launch all belong
+//! to the GUI and mobile clients and are not implemented, so ISC-C20 in
+//! `ISA.md` stays open. The descriptor *text* is generated here so the install
 //! step is later additive.
 
 /// Which OS autostart mechanism a descriptor targets.
