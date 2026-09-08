@@ -157,7 +157,7 @@ Each slice registers its ISCs in `crates/daemonseed-isc` at its build commit, pe
 
 **These slices do not proceed until the reopened decisions below are resolved** — several would build a refuted construction.
 
-## Adversarial review findings (2026-07-27, three independent axes — authoritative; supersedes contradicted in-body claims)
+## Adversarial review findings (three independent axes — authoritative; supersedes contradicted in-body claims)
 
 The one-line root, stated on all three axes: **the design analyzes each record for write authority and never asks the prior questions — what does the network retain, and which records can an adversary choose to watch and at what cost.** Two of the three records are world-addressable from a stable identity for free.
 
@@ -205,7 +205,7 @@ The one-line root, stated on all three axes: **the design analyzes each record f
 
 Cross-pair `DmMessage` replay resistance (both identities in the KDF info — holds, it was just mistaken for general anti-replay); outbox authorized-*erasure* resistance (sender-only owner derivation genuinely holds — it just doesn't imply availability or insertion resistance); key-record *forgery* under another identity (signature covers `domain‖pubkey‖version‖ek`, fixed-length, unambiguous); schema-squatting (schema binds into the record key); doorbell slot enumeration by a co-host (sender-secret rooting defeats candidate-set naming — correct and load-bearing); domain-string cross-lifting (no collision with any existing label); false-dedup on repeated text (fresh encapsulation per message). The **fork verdicts** — C over A on the *authorization* axis, static-KEM over handshake, the WriteClass classification, offline store-and-forward as the shape — survive; what fails is the *mechanism* built under them.
 
-## Revised direction (2026-07-27, post-adjudication) — pseudonymous ratchet + lobby presence
+## Revised direction (post-adjudication) — pseudonymous ratchet + lobby presence
 
 > This is the iteration *after* the adjudication. It **supersedes the § The three records model on the identity/metadata axis** and **largely dissolves reopened decision #1.** It is a design *direction*, not a re-freeze — it wants its own review re-run. Decisions #2 (first-contact availability) and #3 (crypto construction) remain; #3 now interacts favorably.
 
@@ -252,7 +252,7 @@ That leaves only *first-contact* flooding/erasure/replay. Graded options, cheape
 
 **Irreducible:** cold first contact from a bare public identity is floodable to *some* degree — the lever is cost (PoW) or admission (token), never elimination. Honest posture: first contact is best-effort under active attack, the system *says so* rather than faking delivery, and the ongoing channel — where real conversations live — is exposed to none of it.
 
-### Decision #2 — ~~RESOLVED~~ REOPENED by the round-2 re-review (see § Review round 2). Adopt A + B + C together, on three axes
+### Decision #2 — ~~RESOLVED~~ REOPENED (see § Review round 2). Adopt A + B + C together, on three axes
 
 A, B, and C are not alternatives — they are three orthogonal axes and all three ship:
 
@@ -276,7 +276,7 @@ A, B, and C are not alternatives — they are three orthogonal axes and all thre
 
 **Net decision #2 status: the review re-run REFUTED this "resolved" claim — see § Review round 2.** The `ss`-channel-as-ack is not a reliable ack (its own value evicts, E1; "any peer write" ≠ collection, E2), and A+B+C bound spam/CPU but not availability (the world-writable first-contact record is wipeable regardless of posture, E5/E6). Decision #2 is reopened, not resolved. What the re-run confirmed *does* hold is recorded below.
 
-## Review round 2 (2026-07-27) — the revised direction is ALSO not freezable
+## Review round 2 — the revised direction is ALSO not freezable
 
 The revised direction was re-run through the same three-axis adversarial review (the check that should have run *before* marking anything resolved). All three axes returned BLOCKER-class findings. The direction is a **real improvement** with a confirmed surviving core, but decisions #1 and #2 are *not* resolved and #3 is not "mechanical."
 
@@ -307,7 +307,7 @@ The revised direction was re-run through the same three-axis adversarial review 
 
 **Round-2 verdict:** the revised direction is the right *direction* — `ss`-gated ongoing-channel authority is a genuine, banked win — but it is not a freeze. #1 is capped by the lobby side-channel (F1), #2 is reopened by the ack's non-durability (E1/E2) and the unaddressed world-writable wipe (E5/E6), and #3 is not mechanical (no-FS F1, unwritten nonce/AAD spec F9/F10, binding gaps F4/F5). The next iteration must first make **scope/ambition calls** that are above a build — best-effort delivery vs a pinning node; no-PFS vs a key-layer redesign; unlinkability-vs-lobby vs cover traffic — and only then write the concrete crypto construction before a third review round. Fork verdicts and schema facts still carry forward unchanged.
 
-## Committed decisions (2026-07-27) — the ambition line
+## Committed decisions — the ambition line
 
 The round-2 scope/ambition calls are made. These convert two of the three "hard limits" into committed work.
 
@@ -331,11 +331,11 @@ Corrects the round-2 overclaim that "reliable collection confirmation is impossi
 - **Deferred: a daemonseed replication *overlay*** (clients store + re-serve sealed blobs outside the owner-write DHT) — it could both refresh and echo, but it is a new subsystem ("distributed relay reborn") with its own reduced-but-real surface. Only if the retention window proves too short in practice.
 - **Not obtained: decorrelation cover from the swarm.** The owner-write rule that makes the ack unforgeable also blocks third parties from injecting write-timing cover on a channel they don't own — so F1 decorrelation must come from endpoint cover traffic (expensive) or stay an accepted cap. This stays under the unlinkability posture (decision #1's residual), NOT solved here.
 
-### Residual ambition call — DECIDED (2026-07-27): accept for alpha
+### Residual ambition call — DECIDED: accept for alpha
 
 - **Unlinkability vs the lobby (F1).** **Accepted-and-documented for alpha**: activity-timed DM writes are rhythm-correlatable to lobby-published online windows; the ongoing channel is otherwise pseudonymous, so the residual is the lobby co-residence rhythm only. Endpoint constant-cadence cover traffic (expensive, WB-budget hit) and reduced lobby co-residence are post-alpha levers, not built now. This is a documented limit in the shipped posture, not a hidden gap.
 
-## Concrete crypto construction (DRAFT v1 — 2026-07-27, for the third review round; NOT frozen)
+## Concrete crypto construction (DRAFT v1 — NOT frozen)
 
 > First concrete pass, written so a review has a fixed target instead of a direction. Every seal names its key, nonce, and AAD; every signature names its signed input; every derivation is a domain-labelled HKDF, never a bare hash/concat. **Sub-decisions flagged `‹OPEN›` need the maintainer or a review round.** This supersedes the sketch-level derivations scattered above.
 
@@ -410,7 +410,7 @@ All `‹OPEN›` items below are now DECIDED (2026-07-27) — accepted-for-alpha
 
 **Status: DRAFT — not frozen.** All scope/ambition calls are now made. Remaining path to freeze: the running three-axis adversarial review against this construction → fold any spec bugs → converge to a clean review round → run the WB budget arithmetic (decision #4) → freeze ratification. No further maintainer input is required to converge the construction (only the final freeze sign-off).
 
-## Concrete crypto construction DRAFT v2 (2026-07-27, folds R3 — supersedes v1)
+## Concrete crypto construction DRAFT v2 (supersedes v1)
 
 > The round-3 review (crypto/metadata/erasure) hit the v1 draft with 2 crypto BLOCKERs, several MAJOR spec bugs, and overclaims. v2 fixes every fixable one and honestly downgrades the rest. The `ss`-gated ongoing-channel write authority, the token, key-record forgery resistance, and domain-label prefix-freeness were all re-verified as holding. **v1's construction block above is superseded by this.**
 
@@ -446,7 +446,7 @@ All `‹OPEN›` items below are now DECIDED (2026-07-27) — accepted-for-alpha
 
 **Status: DRAFT v2 — not frozen.** Next: round-4 review against v2 → if clean, decision #4 (WB budget arithmetic) → freeze ratification.
 
-## Concrete crypto construction DRAFT v3 (2026-07-27, folds R4 — supersedes v2)
+## Concrete crypto construction DRAFT v3 (supersedes v2)
 
 > Round-4 confirmed v2 fixed R3's crypto BLOCKERs cleanly (two-directional chains, `eph_ek` auth) and that the `ss`-gated ongoing-channel authority is solid — but v2's **delivery machinery** (the 31-slot ring + epoch migration + contiguous-prefix ack + ACCEPT handshake) composed into a fresh BLOCKER cluster. v3 is an **architectural simplification** the findings drove: **drop epoch address rotation, drop the ring, use per-message per-direction records rooted in the secret `AR`, and add the standard async-messaging components.** The core crypto (ratchet direction, owner-write authority, token, key record) carries over.
 
@@ -483,7 +483,7 @@ Lobby-rhythm unlinkability (activity-timed writes correlate to lobby windows —
 
 **Status: DRAFT v3 — not frozen. Architectural simplification vs v2 (epochs + ring removed).** Next: round-5 review against v3 → if clean, decision #4 (WB budget arithmetic) → freeze ratification.
 
-## Concrete crypto construction DRAFT v4 (2026-07-27, folds R5 — supersedes v3)
+## Concrete crypto construction DRAFT v4 (supersedes v3)
 
 > **Round 5 was the convergence point: the crypto review found NO axis-refuting BLOCKER ("v3 is the first draft with no axis-refuting BLOCKER"), the metadata review confirmed the ongoing-channel scatter holds, and the one erasure BLOCKER (per-message records) has a mechanical fix (paging).** The core — `ss`/`AR`-gated owner-write authority, the two-directional ratchet, cross-carrier replay resistance, the nonce rule, fail-safe delivery — held on all three axes. v4 folds the localized R5 cluster; no core change.
 
@@ -504,7 +504,7 @@ Lobby-rhythm. Key-record rollback. Recovery. First-contact best-effort-under-att
 
 **Status: DRAFT v4 — not frozen. First draft with no core refutation (R5); folds the localized R5 cluster.** Next: round-6 review against v4 → if clean, decision #4 (WB budget arithmetic, now paging-amortized) → freeze ratification + the one `‹MAINTAINER›` prekey sub-call.
 
-## Concrete crypto construction DRAFT v5 (2026-07-27, folds R6 — supersedes v4)
+## Concrete crypto construction DRAFT v5 (supersedes v4)
 
 > **Round 6 returned NO axis-refuting BLOCKER on any of the three axes** (crypto: "every regression check passed"; metadata: pairwise oracle closed + scatter holds; erasure: **paging genuinely fixes the per-message budget BLOCKER**, within-page independence + injective mapping confirmed). The design has converged. v5 folds R6's clean-fix findings; no core change. Remaining before freeze: decision #4 (budget arithmetic, run below) and the maintainer's sign-off + the one prekey sub-call.
 
@@ -529,7 +529,7 @@ Lobby-rhythm. Key-record rollback (+ compose: a cold sender served a rolled-back
 
 **Status: DRAFT v5 — no core refutation across R5+R6; folds all R6 clean-fixes.** Next: decision #4 (below), then a confirming review round, then the freeze + prekey sub-call.
 
-## Decision #4 — WB budget arithmetic (run 2026-07-27, against v5 + the WB-2/WB-5.1 model)
+## Decision #4 — WB budget arithmetic (against v5 + the WB-2/WB-5.1 model)
 
 Against the frozen `docs/design/veilid-write-budget.md`: WB-2 steady-state ceiling **≤ 4 non-chat DHT writes/min**; chat/user-action writes excluded (2-permit chat pool); WB-5.1 four-pool 16-permit gate (chat 2 / floor 1 / write W_max=2 / read 9). DM writers classified and priced:
 
@@ -553,7 +553,7 @@ Against the frozen `docs/design/veilid-write-budget.md`: WB-2 steady-state ceili
 
 **Net:** the budget is **not a BLOCKER** for v5; it closes within the frozen WB-2/WB-5.1 with the ack-min-interval constraint + the documented ~25-channel record ceiling. #4 is discharged as "closes conditionally," the conditions folded into the build contract.
 
-## Concrete crypto construction DRAFT v6 (2026-07-27, folds R7 confirming pass — supersedes v5)
+## Concrete crypto construction DRAFT v6 (supersedes v5)
 
 > The R7 confirming pass returned: **metadata HOLDS** (accepted residuals only, 3 doc tidies); **crypto HOLDS on all four R6 fixes but surfaced one surviving BLOCKER** (first-contact entry sizing — the unresolved half of B1); **erasure found decision #4 does not close as I derived it** (+ 2 spec gaps, 1 relaxed residual). No new architectural refutation — the ss/AR core, paging, and the ratchet all held. v6 folds every R7 finding; then a focused round-8 confirming pass.
 
@@ -574,7 +574,7 @@ Lobby-rhythm (+ bucket-class size, + fc-boundary re-seal window). Key-record rol
 
 **Status: DRAFT v6 — folds R7's BLOCKER (doorbell sizing) + the #4 re-derivation + spec fixes; no architectural refutation across R5–R7.** Next: a focused round-8 confirming pass (verify the `dflt(32)` sizing fits, #4 closes at aggregate-cap, the probe-frontier/gap-bitmap fixes hold) → the maintainer's freeze + prekey sub-call.
 
-## CONVERGED — freeze-ready pending ratification (2026-07-27, after round 8)
+## CONVERGED — freeze-ready pending ratification
 
 **All three adversarial review axes returned HOLDS — accepted residuals only.** Round 7 metadata: HOLDS. Round 8 erasure: HOLDS (#4 closes at 3.13/min). Round 8 crypto: HOLDS (the `dflt(32)` sizing fit re-verified byte-by-byte, ~18 KB base / ~23 KB with token < 32768). Eight rounds run (R1–R2 refuted the approach, R3–R4 the v1/v2 machinery, R5 first no-BLOCKER, R6 confirmed, R7 caught the sizing BLOCKER + #4 error, **R8 confirms v6 clean**). No architectural refutation since R5; the ss/AR-gated authority, PQ double-ratchet, paging, and fail-safe delivery held throughout.
 
@@ -713,7 +713,7 @@ Corrections found while building, recorded here rather than by editing the froze
 
   **Not built: queuing that message unsealed and sealing it when the chain opens.** The outbox already carries entries that reserve a sequence and hold no frame, and the shape is right — the message would take its position now and be sealed once, at that position, on the first pass after the correspondent's frame lands. What is missing is that such an entry deliberately holds **no plaintext**, and no pass composes a frame outside the send command, so the path needs a store for the composed body and a sealing site that does not exist. Recorded here rather than built, because the refusal above is legible and the missing pieces are outbox construction rather than a gap in this amendment.
 
-## Amendment A1 — channel re-establishment after a restart (2026-07-30; ~~PENDING ratification~~ **SUPERSEDED by A2, refuted on all three axes**)
+## Amendment A1 — channel re-establishment after a restart (~~PENDING ratification~~ **SUPERSEDED by A2, refuted on all three axes**)
 
 > **Withdrawn 2026-07-30, before ratification.** A confirming adversarial review refuted this construction on all three axes: it omits `msg_sig` from a new frame kind against the doctrine at `dm/frame.rs:36-42` (a frame sealed under a shared key proves *one of the two parties* wrote it, never which) and then decides a tiebreak and triggers a teardown on that frame; Clause 1's healing claim is false, because an at-rest compromise can reconnect first, self-renew its own authority, and lock the rightful holder out permanently; the responder→initiator leg is never specified at all, which would put request and response under one key (F9's shape); Clause 1 has no commit point, so ordinary frame loss desynchronizes `RS` terminally and silently; and the frame is a clear length-visible restart marker (fresh `eph_ek`, absent `eph_ct` — the opening-burst shape the code documents as distinguishable regardless of padding bucket) whose startup burst links N unlinkable records to one device with no jitter. **Kept as the record A2 builds on, not deleted.**
 
@@ -795,7 +795,7 @@ Each must be shown able to **fail**, not merely to pass.
 
 The ISC-C38–C46 / A-C20–A-C25 family in `ISA.md` gains criteria for the three clauses and the six obligations above, and #262 closes citing this section. Until then #262 stays open and #236's contact-cache scope line stands corrected but unamended.
 
-## Amendment A2 — channel re-establishment: the high-level map (2026-07-30; supersedes A1; ~~PENDING ratification~~ **stress-tested and REFUTED in part — superseded by A3, below**)
+## Amendment A2 — channel re-establishment: the high-level map (supersedes A1; ~~PENDING ratification~~ **stress-tested and REFUTED in part — superseded by A3, below**)
 
 > **Stress-tested 2026-07-30 by an adversarial review on four axes** (the three project axes plus implementability of the store requirements). **Refuted on three axes; SATISFIABLE-with-required-changes on the fourth.** Unlike A1 this is a *partial* refutation: M1, M8, M11's core statement and M2's two-leg structure survived every review that examined them, and M4's split, M6's premise and M5's trial-decryption choice were accepted in principle. **Do not build against this section.** The most serious finding is that M3's retirement condition is unreachable — nothing obliges the initiator to emit anything under the new root, so an idle initiator retains `RS_n` for the life of the install and any actor able to suppress one frame chooses the window length. Four of A2's own decisions also contradict each other pairwise. **The store question it was written to answer did get answered:** the minimum mechanism is one sealed fixed-size blob per correspondence per record kind behind a single atomic-replace helper — no journal, no index, ~30 lines. Numbering note: A2's `M1`–`M11` collide with this document's own metadata-residual numbering and A3 must renumber.
 
@@ -885,7 +885,7 @@ Byte values for every new label; the two legs' exact AAD composition and whether
 
 Not byte layouts — decisions. Whether M3's two-slot window is the right length and whether "a confirming observation" is well-defined enough to be implementable; whether M4's loud state can be *induced* by an attacker as a denial or a social-engineering prompt; whether M5's trial decryption is a usable oracle for an attacker probing which key a client holds, and whether the filler is genuinely indistinguishable; whether M7's identity ordering leaks or biases anything; whether M9's give-up pause can be abused to hold a message alive indefinitely; whether M11's honest property is now complete or still undercounts; and whether the seven store requirements are together satisfiable without inventing a database.
 
-## Amendment A3 — channel re-establishment: the revised map (2026-07-30; supersedes A2; ~~PENDING ratification~~ ~~stress-tested 2026-07-30 and REFUTED in part — A4 pending~~ **superseded by A4, below**)
+## Amendment A3 — channel re-establishment: the revised map (supersedes A2; ~~PENDING ratification~~ ~~stress-tested and REFUTED in part — A4 pending~~ **superseded by A4, below**)
 
 > **Stress-tested 2026-07-30 by an adversarial review on three axes (crypto/replay, correlation/metadata, erasure/availability). REFUTED; the spine holds, so an A4 revision follows — not a redesign.** The surviving core (retained sibling `RS`, reconnect on the `AR` plane, RE-CONFIRM-driven reachable retirement, the shared-secret coin, commit-then-emit, the direction-scoped idempotent sweep, no-silent-content-regression) passed all three axes. Five clusters failed, ranked by fix depth: (1) **retirement availability** — A2's fatal retirement-timing class is closed against immortality but reopened against availability: a responder that commits `RS_{n+1}` then hits `T_RETIRE` before an absent initiator collects `RE-ACK` strands the channel terminally by asynchrony (B-CRYPTO-1); (2) **reconnect-burst metadata** — A3.10's decorrelation rests on jitter absent at first dispatch and an inapplicable oracle, the prioritized trickle adds a correspondent-ranking leak, and A3.4's idempotent re-serve is an active page-to-page confirmation oracle (B-META-1/2/3); (3) **the A3.9 residual is materially larger than the accepted sizing** — single-record discriminators plus a third correlated record make it a cross-plane join, not "weaker than F1"; the maintainer's `029ab72` acceptance is reopened on corrected facts (S1–S5); (4) **key collision** — `K(RS_n, gen, leg)` omits party/direction, sealing two plaintexts under one key in the contest case (B-CRYPTO-2, one KDF input); (5) **store gaps** — `next_send_seq` must stay in the outbox not the resume record (B-ERAS-1), the pseudonym signing key `S_pc` is un-enumerated making A3.1 unimplementable after restart (MAJOR-CRYPTO-4), and per-correspondence files leak at rest without the seal key (M-b). **Do not build against this section.**
 
@@ -989,7 +989,7 @@ Carried from A1, still owed: #282's KATs pinning every sibling root, proven able
 
 The ISC-C38–C46 / A-C20–A-C25 family gains criteria for A3.1–A3.16 and the obligations above; #262 closes citing this section; #236's contact-cache scope line is corrected to A3.14's record family. #279's record-format question and #281's store shape are answered by A3.14 — both issues stay open as the build work they track. Until ratification, #262 stays open and this section binds nothing.
 
-## Amendment A4 — channel re-establishment: the revision after the A3 stress round (2026-07-30; supersedes A3; ~~PENDING ratification~~ ~~stress-tested 2026-07-30 and REFUTED in part — A5 pending~~ **superseded by A5, below**)
+## Amendment A4 — channel re-establishment: the revision after A3 (supersedes A3; ~~PENDING ratification~~ ~~stress-tested and REFUTED in part — A5 pending~~ **superseded by A5, below**)
 
 > **Stress-tested 2026-07-30 by an adversarial review on three axes (crypto/replay, correlation/metadata, store/erasure). REFUTED; the spine held on every axis, so an A5 revision follows — not a redesign.** The surviving core (the tiebreak coin, commit-then-emit, the direction-scoped idempotent sweep, RE-CONFIRM as the retirement mechanism, CSPRNG filler, the deleted pausable clock, counter-continuity crypto, A4.2's causal-edge removal, A4.3's jitter + trickle-deletion, A4.6's `dir`, A4.8's `next_send_seq`/`S_pc`+`PK_pc`/anti-rollback-drop) passed all three. The headline is a cross-axis convergence: all three axes independently refuted **A4.1's recovery mechanism** — a deleted correspondent and a long-absent one are wire-indistinguishable so no single trigger is both "recover at any delay" and "loud on deletion" (crypto B-A4-1); the single peer-acceptance slot can be evicted during the unbounded absence window (store F3); and the past-give-up standing re-seed is a new single-record discriminator A4.7 never priced (metadata M3). The convergent fix: recovery is an **active `(gen, attempt)` rendezvous** with peer-activity liveness, not a passive stale-slot sweep + give-up timer. Two further clusters: A4's crypto sections created two persistent-state requirements (`attempt`, a byte-novelty dedup memory) that A4.8 never carried, reopening B-CRYPTO-2 and MAJOR-CRYPTO-3 (crypto B-A4-2/B-A4-3); and the single "outbox blob" conflates immutable sealed frames with the volatile re-seed schedule, giving O(N²) rewrite volume and making its fixed-bucket sizing self-contradictory (store F1/F2). The A4.7 residual is re-sized: more accurately a **selectivity amplifier on the already-accepted F1 cross-plane join**, not a new class (metadata M4), but carrying M3's new discriminator and a downtime cessation floor that network scale does not reach and only a deferred pinning node would mask — **unreachable in MVP**. **Do not build against this section.**
 
@@ -1128,7 +1128,7 @@ Carried from A3, still owed, plus new obligations each to be shown able to fail:
 
 The ISC-C38–C46 / A-C20–A-C25 family gains criteria for A4.1–A4.10 and the obligations above, superseding the A3.1–A3.16 criteria wherever A4 revised a decision (A4.1/2/3/4/5/6/8/10) and keeping the A3 criteria for every decision A4 carried unchanged. #262 closes citing A4; #236's contact-cache scope line points at A3.14's record family as A4.8 corrects it; #279's persisted-`surfaced`-flag question and #281's store shape are answered by A3.14 + A4.8 and stay open as the build work they track. **The one decision A4 does not make and puts to the maintainer is A4.7: whether the corrected A3.9 residual is accepted as-is or spent against** — now sized as a cross-plane join available *passively* from the downtime cessation shadow (A4.4), sharpened but not created by the emission-side discriminators, worst at alpha scale; the only lever that reaches the cessation floor is network scale, and A4.8's bundled-blob decision is the adjacent at-rest question. Until ratification, #262 stays open and this section binds nothing.
 
-## Amendment A5 — channel re-establishment: the revision after the A4 stress round (2026-07-30; supersedes A4; ~~PENDING ratification~~ ~~stress-tested 2026-07-30 and REFUTED in part — A6 pending~~ **superseded by A6, below**)
+## Amendment A5 — channel re-establishment: the revision after A4 (supersedes A4; ~~PENDING ratification~~ ~~stress-tested and REFUTED in part — A6 pending~~ **superseded by A6, below**)
 
 > **Stress-tested 2026-07-30 by an adversarial review on three axes (crypto/replay, correlation/metadata, store/erasure). REFUTED in part; the spine held on every axis, so an A6 revision follows — not a redesign.** No BLOCKERs and no mechanism breaks — the findings are narrower than the A4 round's, all clause-level seams, named forks, or doc-scope. The surviving core (bounded re-attempt, the symmetric confirmation-locked supersede, the store's hard/soft split, local-timer retry, per-record jitter) passed every axis. Three themes failed: **(1) the availability guarantee overreaches** — A5.8's "recovers whenever both overlap online" reaches only overlaps *during a live, confirmable attempt*: the last-leg confirmation must accept any openable gen-(n+1) frame not just RE-CONFIRM (M-A5-A), inter-attempt backoff leaves dead windows (M-A5-B), and the `attempt` trial-scan cap fights availability against DoS (F-A5-1); **(2) the store split under-specified its cross-record disciplines** — the bundled-record write critical-section must be read-modify-write-under-lock or the cardinal silent-send-loss returns (F-A5-2), a frame-record `next_send_seq` subset-rollback is silent (F-A5-3), and the dedup set both re-induces a loud false alarm on rollback (F-A5-4) and re-commits a milder F1 inside the resume record (F-A5-5); **(3) the A5.6 residual reopens larger and now coupled** — attempt COUNT is a keyless, single-record, downtime-monotone discriminator not dilutable by network scale (F-META-1), and capping re-initiations to bound it directly trades against availability, so A5.6 is now a where-to-set-the-cadence call, not accept-or-spend. **Do not build against this section.**
 
@@ -1231,7 +1231,7 @@ Carried from A4, plus, each to be shown able to fail:
 
 The ISC-C38–C46 / A-C20–A-C25 family gains criteria for A5.1–A5.8, superseding the A4 criteria wherever A5 revised a decision and keeping A4's for every decision carried unchanged. #262 closes citing A5; #236's contact-cache scope points at A5.4's record family; #279 and #281 are answered by A5.4 and stay open as build work. **The one decision A5 puts to the maintainer is A5.6: whether the reopened A4.7 residual — now sized as a selectivity amplifier on the already-accepted F1 cross-plane join, with an MVP-unreachable cessation floor — is accepted or spent against.** Until ratification, #262 stays open and this section binds nothing.
 
-## Amendment A6 — channel re-establishment: the revision after the A5 stress round (2026-07-30; supersedes A5; ~~PENDING ratification~~ **stress-tested 2026-07-30 and REFUTED in part — superseded by A7, below**)
+## Amendment A6 — channel re-establishment: the revision after A5 (supersedes A5; ~~PENDING ratification~~ **stress-tested and REFUTED in part — superseded by A7, below**)
 
 > **A revision, not a redesign.** The A5 stress round (three independent axes: crypto/replay, correlation/metadata, store/erasure) refuted A5 in part with **no BLOCKERs and no mechanism breaks** — the findings were all clause-level seams, named forks, or doc-scope, confirming the design is converging. A6 folds the three themes that round named, carries A5's confirmed spine forward, and renumbers nothing it does not touch. Decision IDs `A6.1`–`A6.4`, a namespace nothing else uses. **Written to be attacked; a stress round is still expected.**
 
@@ -1274,7 +1274,7 @@ Per the one-knob unification above, `C` (the per-`T_RETIRE`-window re-initiation
 
 The ISC family gains criteria for A6.1–A6.4, superseding the A5 criteria where A6 revised a decision and keeping A5's otherwise. #262 closes citing A6; #279/#281/#236 are answered by the A5.4 store shape as A6.2 disciplines it, and stay open as build work. **The one decision A6 puts to the maintainer is A6.3: the value of `C` on the availability↔metadata-leak curve** — A6 defaults it to the availability-favoring anchor (continuous coverage, `C ≈ T_RETIRE / eviction-linger` attempts legible), an F1-family residual, and marks it PENDING. Until ratification, #262 stays open and this section binds nothing.
 
-## Amendment A7 — channel re-establishment: the revision after the A6 stress round (2026-07-30; supersedes A6; ~~PENDING ratification~~ **stress-tested 2026-07-30 and REFUTED in part — superseded by A8, below**)
+## Amendment A7 — channel re-establishment: the revision after A6 (supersedes A6; ~~PENDING ratification~~ **stress-tested and REFUTED in part — superseded by A8, below**)
 
 > **A revision, not a redesign.** The A6 stress round (three independent axes: crypto/replay, correlation/metadata, store/erasure) refuted A6 in part with **no BLOCKERs and no mechanism breaks** — the fourth consecutive round where the spine held and the findings were clause-level refinements of the *previous* fix, not new problem areas. Cross-axis convergence was tight (two axes independently prescribed the identical fix in two places). A7 folds the five clusters; decision IDs `A7.1`–`A7.5`. **Written to be attacked; a stress round is still expected. The store fixes cite in-tree primitives to reuse, not invent.**
 
@@ -1313,7 +1313,7 @@ A6.4 cited the ratchet's skip-batch machinery to make a crash-burned clear gener
 
 The ISC family gains criteria for A7.1–A7.5, superseding the A6 criteria where revised. #262 closes citing A7; the store shape (#279/#281/#236) is answered by A5.4 as A6.2/A7.2/A7.4 discipline it. **The one decision A7 puts to the maintainer is the value of `C` on the availability↔metadata-leak curve (A7.3), now quantified in absolute terms** — A7 moves the documented default toward the leak-favoring anchor (fewer legible re-attempts, coverage degrading to overlap-during-a-live-attempt) rather than A6's availability-favoring maximum, and presents both anchors with their leaked-integer numbers, PENDING ratification. Until ratification, #262 stays open and this section binds nothing.
 
-## Amendment A8 — channel re-establishment: the revision after the A7 stress round (2026-07-30; supersedes A7; ~~PENDING ratification~~ **stress-tested 2026-07-30 and REFUTED in part — superseded by A9, below**)
+## Amendment A8 — channel re-establishment: the revision after A7 (supersedes A7; ~~PENDING ratification~~ **stress-tested and REFUTED in part — superseded by A9, below**)
 
 > **A revision, not a redesign — and largely a collapse, not an addition.** The A7 stress round (three independent axes) refuted A7 in part with no BLOCKERs (the fifth consecutive round in which the spine held), but this round found two *real holes* alongside the pricing: A7 treated in-tree atomic-replace as a solved primitive when it is neither cross-file-atomic nor power-loss-durable, and A7.3's crash-inflation decoupling contradicted A7.5's reuse-not-skip. A8 folds four clusters; three of them *remove* mechanism (unify two crash rules into one, delete a decoupling, reframe a knob). Decision IDs `A8.1`–`A8.4`. **Written to be attacked.**
 
@@ -1357,7 +1357,7 @@ A7.1 bounded the answering side's quiet window below the expected overlap so rec
 
 The ISC family gains criteria for A8.1–A8.4, superseding the A7 criteria where revised. #262 closes citing A8; the store shape (#279/#281/#236) is answered by A5.4 as A8.2 gives it its real atomicity/durability contract. **The decision A8 puts to the maintainer is now two-level (A8.3):** first the feature-level accept-the-irreducible-onset-beacon-or-drop-reconnection call, then — if accepted — the `C` downtime-resolution/availability tuning, defaulted to a middle setting, PENDING. The build-obligation list (the real durable `replace_atomically`, the flock, reuse-not-skip on the re-establishment step, the `(gen,seq)` scoping) is specified in A8.1/A8.2. Until ratification, #262 stays open and this section binds nothing.
 
-## Amendment A9 — channel re-establishment: the convergence revision after the A8 stress round (2026-07-30; supersedes A8; **RATIFIED 2026-07-30 — the design-of-record for channel re-establishment**)
+## Amendment A9 — channel re-establishment: the convergence revision after A8 (supersedes A8; **RATIFIED — the design-of-record for channel re-establishment**)
 
 > **RATIFIED 2026-07-30.** Seven adversarial stress rounds (A3→A9) converged the design; A9's own final round returned it ratifiable on all three axes, its one-line coherence fixes were folded and then verified by a focused fold-check (which caught two stale wordings, now propagated). the maintainer's two human items are decided: **(1) reconnection is ACCEPTED** — it is the metadata-preferable option (its onset is visible only to an incumbent co-host of one opaque `ss`-derived record, strictly narrower than the fresh-contact/doorbell fallback's world-derivable-address observer set); **(2) `C` is ACCEPTED as a tunable dial** at a middle default — a downtime-resolution/availability knob, not an anonymity knob (the reconnect onset is irreducible at any `C≥1`), to be tuned in a release if field data warrants. A9 is the design-of-record; the build-obligation list in *On ratification* below is the implementer's contract.
 
@@ -1407,7 +1407,7 @@ The ISC family gains criteria for A9.1–A9.4, superseding the A8 criteria where
 
 **Channel re-establishment: RATIFIED at Amendment A9 (2026-07-30).** The A1→A9 amendment chain designs channel re-establishment after a restart; A9 is its design-of-record. Reconnection is accepted (metadata-preferable to the doorbell fallback); `C` is accepted as a tunable middle-default dial. The ISC family gains criteria for A9.1–A9.4 (superseding earlier amendments' criteria where revised) at the build-slice cut. #262 is answered and closed citing A9. Amendments A1–A8 above are superseded and retained only as the refutation trail. Lands via PR #284.
 
-## Decision — what names a correspondence directory on disk (2026-08-07; ratified; closes #288)
+## Decision — what names a correspondence directory on disk (ratified; closes #288)
 
 The A1–A9 chain settles what a correspondence *stores* and never settles what its directory is *called*. This decision fixes it. It is not an amendment — A9's mechanisms are untouched — but it is a boundary, so it is recorded here with the rest of the re-establishment design.
 
@@ -1445,7 +1445,7 @@ Note also that `CorrespondenceLabel::from_bytes` remains public and unconstraine
 
 **No naming scheme conceals cardinality.** Anyone with read access counts the directories. Hiding the count would need cover directories indistinguishable from real ones — and indistinguishable now means forged mtimes, not merely a plausible name. It would also not work: each correspondence occupies fixed buckets totalling roughly 328 KB, so **total profile size reports the correspondent count even if every name were hidden**. (Justifying this by write rhythm instead is weaker than it sounds: a dormant correspondence emits no rhythm but still occupies a directory. The size argument is the one that holds.) (A cover directory does not additionally have to forge a plausibly-evolving plaintext cursor — the cursor is sealed at rest. The size argument is untouched by that.) Accepted, and recorded as accepted.
 
-## Decision — scrub every record before unlinking it (2026-08-07; ratified; closes #293)
+## Decision — scrub every record before unlinking it (ratified; closes #293)
 
 `Locked::delete` unlinked a record and fsynced the directory. The name went away; the blocks did not. An adversary who reads unallocated blocks and **later** obtains the profile key recovers the sealed record and opens it — for the provisional record that is `ss0`, which roots `RK0` and reopens the early chain. That is precisely the harvest-now-decrypt-later exposure the erasure was introduced to bound, so the property was weakened rather than absent.
 
@@ -1477,7 +1477,7 @@ On an SSD the FTL remaps an overwrite to a fresh erase block; a copy-on-write fi
 
 The #288 decision (a minted, non-derived correspondence directory name) rests its surviving argument on deletion: *one erased contact-cache row kills that correspondent's linkage forever*. That argument was explicitly recorded as partly self-undercut, because an unlinked cache row may itself be recoverable from unallocated blocks. Scrubbing on delete narrows that gap — not to zero, subject to the ceiling above, but the two decisions now point the same way instead of one quietly weakening the other.
 
-### What it costs: `establish` is no longer a safe retry (2026-08-13; ratified)
+### What it costs: `establish` is no longer a safe retry (ratified)
 
 `PendingHandshake::establish` builds the ratchet and then deletes the provisional record, in that order, so that a failed deletion leaves the record on disk and the whole call can be retried. **The scrub ends that.** A crash after the sentinel's barrier leaves a record that no longer opens, so a handshake a pre-scrub crash would have left resumable is destroyed.
 

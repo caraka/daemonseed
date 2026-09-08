@@ -394,7 +394,7 @@ struct OwnShare {
 
 /// The subscribed operator announce/MOTD record (Phase 4 A-c): the write-gate owner
 /// seed (dev-only — the in-source project seed) plus the accumulated, verified
-/// operator content. A0: ONE project-owned channel; the composer signs with the F17
+/// operator content. A0: ONE project-owned channel; the composer signs with the
 /// project-announce key, so an empty [`Whitelist`] authorizes it and NO signer
 /// whitelist distribution is needed. `motd` holds the current verified MOTD;
 /// `posts` maps a content-address hex slot → its verified announcement (dedup +
@@ -415,7 +415,7 @@ struct OperatorSpace {
     /// instance that writes the record holds its seed in
     /// [`ShareState::operator_role`], which every reader leaves as a reader.
     announce: OwnerPublic,
-    /// The current verified MOTD (F17-signed), or `None` if none verifies yet.
+    /// The current verified MOTD (signed), or `None` if none verifies yet.
     motd: Option<wire::SignedArtifact>,
     /// Verified announcement posts, keyed by their content-address hex slot.
     posts: BTreeMap<String, wire::Post>,
@@ -2848,11 +2848,11 @@ async fn refresh_public_space(
     }
 }
 
-/// (#92 / A-c) Sign a MOTD with the F17 project-announce key ([`sign_motd`] enforces the
+/// (#92 / A-c) Sign a MOTD with the project-announce key ([`sign_motd`] enforces the
 /// ISC-S9 single-line-plaintext rule BEFORE signing), publish it to the operator
 /// record's fixed `"motd"` slot, then fold it in locally + refresh. Guards mirror the
 /// relay path (not connected → a clean [`NetEvent::PublicSpaceError`], nothing
-/// published). The dev composer signs with F17 (A0), NOT the local stable identity —
+/// published). The dev composer signs with (A0), NOT the local stable identity —
 /// so an empty whitelist authorizes it and non-signer distribution is unnecessary.
 async fn set_motd(
     shares: &mut ShareState,
@@ -2915,9 +2915,9 @@ async fn set_motd(
     }
 }
 
-/// (#92 / A-c) Sign an announcement post with the F17 project-announce key, publish it
+/// (#92 / A-c) Sign an announcement post with the project-announce key, publish it
 /// to the operator record at its content-address slot, then fold it in locally +
-/// refresh. Same guards + F17 signing rationale as [`set_motd`].
+/// refresh. Same guards + signing rationale as [`set_motd`].
 async fn upload_announcement(
     shares: &mut ShareState,
     evt_tx: &UnboundedSender<NetEvent>,
@@ -2997,7 +2997,7 @@ async fn upload_announcement(
 /// the caller passes [`ShareState::is_operator`], the same predicate that gates the
 /// composer, so writes are consistently operator-only.
 ///
-/// Integrity was never the issue — [`apply_operator_item`] verifies the F17 signature and
+/// Integrity was never the issue — [`apply_operator_item`] verifies the signature and
 /// the content address before folding, so a non-operator could not have injected forged
 /// content. This is about write volume and authority, not authenticity.
 ///
@@ -3011,7 +3011,7 @@ async fn upload_announcement(
 ///
 /// ONLY the announcements are kept alive, NOT the MOTD. Announcements live in
 /// content-addressed slots (`hex(content_address)`), so re-publishing their exact
-/// F17-signed bytes to the same key is idempotent under last-writer-wins — it can never
+/// signed bytes to the same key is idempotent under last-writer-wins — it can never
 /// revert anything a peer already holds. The MOTD lives in the single MUTABLE `"motd"`
 /// slot and the fold ([`apply_operator_item`]) has no newer-wins, so re-publishing a
 /// stale MOTD would let peers adopt + rebroadcast it and revert a newer/cleared MOTD
@@ -3062,7 +3062,7 @@ fn next_operator_keepalive_item(
 /// Returns `false` when they are not an operator item, or fail to decode/verify
 /// (dropped; the caller logs them as unrecognized).
 ///
-/// A0 verification: an empty [`Whitelist`] authorizes the F17 project-announce key the
+/// A0 verification: an empty [`Whitelist`] authorizes the project-announce key the
 /// item is signed with, so no signer-whitelist distribution is needed. A MOTD uses
 /// [`verify_served_motd`]; an announcement uses [`verify_served_post`] (signature AND
 /// content-address). This runs AFTER the circle / lobby-chat / presence / discovery
@@ -3094,7 +3094,7 @@ fn apply_operator_item(
                 return false;
             };
             if verify_served_motd(&artifact, whitelist).is_err() {
-                return false; // not F17-authorized / bad signature → dropped
+                return false; // not authorized / bad signature → dropped
             }
             if let Some(op) = shares.operator.as_mut() {
                 op.motd = Some(artifact);
@@ -7143,8 +7143,8 @@ mod tests {
         assert_eq!(decode_operator_item(&[]), None);
     }
 
-    /// A verified F17-signed MOTD folds into `OperatorSpace` and pushes a
-    /// `PublicSpaceSnapshot`; an EMPTY whitelist authorizes the F17 signer (A0), so no
+    /// A verified signed MOTD folds into `OperatorSpace` and pushes a
+    /// `PublicSpaceSnapshot`; an EMPTY whitelist authorizes the signer (A0), so no
     /// whitelist distribution is needed, and the fold relays the write-gate it was
     /// handed into the snapshot's `can_compose`. The gate is a PARAMETER (#274), so this
     /// test's subject — the fold — is asserted identically in debug and release; before
@@ -7195,7 +7195,7 @@ mod tests {
         }
     }
 
-    /// A verified F17-signed announcement folds in, keyed by its content-address slot,
+    /// A verified signed announcement folds in, keyed by its content-address slot,
     /// and appears in the projected view's posts.
     #[test]
     fn apply_operator_item_folds_a_verified_f17_announcement() {
@@ -7226,7 +7226,7 @@ mod tests {
         ));
     }
 
-    /// A real F17-signed announcement paired with the content-address hex slot it is
+    /// A real signed announcement paired with the content-address hex slot it is
     /// stored under — the same `(key, value)` pairing `apply_operator_item` inserts,
     /// built directly so an ordering test can choose exactly which posts exist.
     fn signed_post_in_slot(

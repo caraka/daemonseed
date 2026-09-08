@@ -141,7 +141,7 @@ modules:
 
   - name: cot
     description: >-
-      Circle-of-trust live relay service (M8, F23). The protocol's first
+      Circle-of-trust live relay service. The protocol's first
       streaming RPC, served as gRPC-over-h2 over the post-Authenticated
       TLS stream. The relay routes opaque ciphertext frames by rendezvous
       address and forwards them verbatim; it never decrypts. Generated
@@ -233,8 +233,7 @@ types:
         description: >-
           AGPL section 13 source-URL the relay advertises to a connecting
           client (ISC-9). Additive MINOR field (ISC-S14) —
-          old clients ignore it. Unset means no URL declared (M7
-          ServerSourceUnverified trust event).
+          old clients ignore it. Unset means no URL declared (ServerSourceUnverified trust event).
 
   - name: AppHelloReject
     module: app_hello
@@ -250,7 +249,7 @@ types:
         type: int32
         tag: 1
         description: >-
-          Reject code. 1 = NO_COMMON_VERSION (M4a). New codes append
+          Reject code. 1 = NO_COMMON_VERSION. New codes append
           additively per ISC-S14.
       - name: server_supported
         type: "repeated ProtocolVersion"
@@ -839,7 +838,7 @@ types:
     module: cot
     kind: message
     description: >-
-      One frame on a circle-of-trust live relay (F23). The relay routes by
+      One frame on a circle-of-trust live relay. The relay routes by
       asset_address and forwards payload verbatim — payload is opaque
       E2EE ciphertext the relay can neither read nor produce (ISC-A-S2).
     iscs: [S4, S20, A-S2, A-S5]
@@ -1464,7 +1463,7 @@ functions:
   - name: FederationIntroducer.Introduce
     module: federation
     description: >-
-      Federation introducer endpoint (M12, gate step 6). A unary post-
+      Federation introducer endpoint. A unary post-
       Authenticated RPC reusing the M5 IntroducerQuery / IntroducerResponse
       messages: an empty target_server_id returns the full introduce-to-
       clients peer list; a populated one returns just that peer's triple if

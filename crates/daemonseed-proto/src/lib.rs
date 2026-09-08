@@ -57,8 +57,8 @@ mod tests {
     }
 
     /// `AppHello` round-trips the MVP offer shape: one supported version,
-    /// `tcp-tls13` as the sole transport capability (F29 anchor), and an
-    /// unset `server_source` (F32 placeholder; population deferred to M6).
+    /// `tcp-tls13` as the sole transport capability (anchor), and an
+    /// unset `server_source` (placeholder; population deferred to M6).
     #[test]
     fn app_hello_round_trips_mvp_offer() {
         let original = AppHello {

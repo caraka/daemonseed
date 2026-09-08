@@ -8,7 +8,7 @@
 //! `daemonseed/recovery-file/<profile-id>` — so the two artifacts decrypt
 //! under independent keys even though they share an expensive Argon2id pass.
 //!
-//! ## Format v2 (M3+)
+//! ## Format v2
 //!
 //! ```text
 //!   [MAGIC          (20 bytes: b"daemonseed/dseed/v2\0")]
@@ -22,7 +22,7 @@
 //!   [TAG            (16 bytes — AES-GCM authenticator)]
 //! ```
 //!
-//! ## Format v1 (M2 — read-only since M3)
+//! ## Format v1 (read-only since v0.4.0)
 //!
 //! ```text
 //!   [MAGIC          (20 bytes: b"daemonseed/dseed/v1\0")]
@@ -680,7 +680,7 @@ mod tests {
         }
     }
 
-    /// Hand-build a v1 `.dseed` (M2 wire shape) and confirm `open` recovers
+    /// Hand-build a v1 `.dseed` and confirm `open` recovers
     /// it under the implicit `suite_id = 0x0001`. Without this test the
     /// v1→v2 migration claim is just words.
     #[test]

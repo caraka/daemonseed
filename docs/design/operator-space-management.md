@@ -213,7 +213,7 @@ empirical DHT saturation point in testing, ~2/min ran healthy.
 - **Four costs surfaced by the #238 review, accepted-and-recorded rather than fixed.**
   These are the pass's most concrete inputs:
   1. **Rotation latency has an attacker-influenced denominator.** `OperatorSpace.posts` is
-     an unbounded, insert-only map, and the F17 signing seed is in-source, so anyone can
+     an unbounded, insert-only map, and the signing seed is in-source, so anyone can
      mint verifying announcements. Per-slot refresh period is `|posts| × band`: publish
      enough announcements and the operator's genuine posts refresh slower than they
      evict. This is the *limits* question with a sharp edge on it — and note the old

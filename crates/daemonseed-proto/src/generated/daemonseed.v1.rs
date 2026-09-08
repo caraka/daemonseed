@@ -1065,9 +1065,9 @@ pub struct PeerTriple {
     #[prost(string, tag = "2")]
     pub address: ::prost::alloc::string::String,
     /// Best-effort last-known-availability, unix milliseconds. Optional: the
-    /// RAM-only availability-observation producer is deferred past MVP (finding
-    /// F15), so MVP introducers leave this unset. Kept in the schema now so
-    /// populating it later is an additive change, not a wire bump.
+    /// RAM-only availability-observation producer is deferred past MVP, so MVP
+    /// introducers leave this unset. Kept in the schema now so populating it
+    /// later is an additive change, not a wire bump.
     #[prost(uint64, optional, tag = "3")]
     pub last_known_availability_unix_ms: ::core::option::Option<u64>,
 }

@@ -1,4 +1,4 @@
-// daemonseed wire protocol — circle-of-trust live relay service (M8, F23).
+// daemonseed wire protocol — circle-of-trust live relay service.
 //
 // The protocol's FIRST streaming RPC. Like PublicSpace it runs as
 // gRPC-over-h2 over the post-Authenticated TLS stream (daemonseed-core
@@ -18,7 +18,7 @@
 //
 // Anchors: ISC-S4 (CoT side of the public-vs-CoT bifurcation), ISC-8 / ISC-S4
 // (asset addressing), ISC-A-S2 (relay opacity), ISC-A-S5 (refcounted, no
-// persistent CoT state), F23 (subscription lifecycle).
+// persistent CoT state) (subscription lifecycle).
 //
 // MINOR bumps to this schema MUST be additive-only (ISC-S14): never reuse a
 // field number, never repurpose an enum value, never tighten validation after

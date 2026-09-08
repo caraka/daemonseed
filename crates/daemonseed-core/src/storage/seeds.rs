@@ -1,6 +1,6 @@
 //! Encrypted at-rest seeds blob (ISC-C3, ISC-C24).
 //!
-//! ## Format v2 (M3+)
+//! ## Format v2
 //!
 //! ```text
 //!   [MAGIC      (19 bytes: b"daemonseed/blob/v2\0")]
@@ -15,7 +15,7 @@
 //! artifact the client authors carries a `suite_id`; the at-rest blob is the
 //! first such artifact in M3.
 //!
-//! ## Format v1 (M1 / M2 — read-only since M3)
+//! ## Format v1 (read-only since v0.4.0)
 //!
 //! ```text
 //!   [MAGIC      (19 bytes: b"daemonseed/blob/v1\0")]
@@ -49,7 +49,7 @@
 //!
 //! ## AAD binding
 //!
-//! v1 blobs use empty AAD (M1 / M2 contract). v2 blobs bind the `suite_id`
+//! v1 blobs use empty AAD (the v1 contract). v2 blobs bind the `suite_id`
 //! bytes into the AAD so a tamper-swap of the suite tag fails AEAD auth —
 //! the receiver cannot be tricked into running a v2 blob under the wrong
 //! suite's primitives without the AEAD detecting it.
@@ -73,7 +73,7 @@ use crate::profile::config::ArgonParams;
 /// change.
 pub const MAGIC: &[u8; 19] = b"daemonseed/blob/v2\0";
 
-/// Magic prefix for the **legacy** v1 blob format (M1 / M2). [`open`]
+/// Magic prefix for the **legacy** v1 blob format. [`open`]
 /// accepts blobs prefixed with this value and treats them as carrying the
 /// implicit `suite_id = 0x0001` (CNSA 2.0). [`seal`] never writes this
 /// magic.
@@ -207,7 +207,7 @@ pub struct Seeds {
     /// The user's chosen display name (ISC-C4b), persisted so it survives a
     /// daily-login Unlock (ISC-C51) instead of resetting each session. `None`
     /// is the floor-handle presentation (no name chosen). Mutate via
-    /// [`Self::set_display_name`] (M13 persistence keystone).
+    /// [`Self::set_display_name`].
     pub display_name: Option<String>,
     /// The set of circles to rejoin on next launch (ISC-C59 persistence, M13).
     /// Each entry carries the canonicalized circle entropy needed to re-derive
@@ -2725,7 +2725,7 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// Hand-build a v1 blob (M2 wire shape) and confirm `open` recovers
+    /// Hand-build a v1 blob and confirm `open` recovers
     /// it under the implicit `suite_id = 0x0001`. Without this test the
     /// v1→v2 migration claim is just words.
     #[test]

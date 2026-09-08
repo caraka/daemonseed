@@ -1,5 +1,5 @@
 //! Encrypted, incremental share index — the redb-backed indexed-state layer
-//! (M8, ISC-C21 / ISC-A-C6 / ISC-A-C7).
+//! (ISC-C21 / ISC-A-C6 / ISC-A-C7).
 //!
 //! A daemon that shares a folder keeps a persistent index of what's in it
 //! (one [`ShareEntry`] per file: relative path, size, mtime). The index lives
@@ -484,7 +484,7 @@ mod tests {
         }
     }
 
-    /// An entry carrying a cached multi-chunk addr blob (M16 v3 format):
+    /// An entry carrying a cached multi-chunk addr blob (v3 format):
     /// two concatenated 48-byte addresses, ordered.
     fn entry_with_addr(path: &str) -> ShareEntry {
         let mut blob = vec![0xab; 48];

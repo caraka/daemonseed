@@ -149,7 +149,7 @@ impl Profile {
             .collect()
     }
 
-    /// Record a newly-joined circle and re-seal the blob to disk (M13 write-through).
+    /// Record a newly-joined circle and re-seal the blob to disk.
     /// Returns `Ok(true)` if it was newly added (so the caller can skip a redundant
     /// re-seal on an idempotent rejoin), `Ok(false)` if already present. A disk /
     /// seal failure is surfaced as `Err(reason)` — the caller decides how loud to
@@ -203,7 +203,7 @@ impl Profile {
 
     /// Remember a published share root (a directory path) with its optional
     /// wire-facing `name` and re-seal the blob to disk, so the share
-    /// auto-republishes next launch (M16 write-through, #41). `name` is
+    /// auto-republishes next launch (#41). `name` is
     /// `Some(custom)` when the user named the share in the publish overlay and
     /// `None` when it defaults to the root's basename (the republish path derives
     /// the basename for `None`; see `republish_name` in `net`). Returns `Ok(true)`
@@ -297,7 +297,7 @@ impl Profile {
     }
 
     /// #66: rename this identity — set a new display name in the at-rest blob and
-    /// re-seal it (M13 write-through), so the chosen name persists across unlock.
+    /// re-seal it, so the chosen name persists across unlock.
     /// Also the recovery path for a profile created nameless before #65: it sets a
     /// name on an existing identity. The cryptographic identity (the handle hash) is
     /// unchanged — only the presented name. Rejects an invalid name

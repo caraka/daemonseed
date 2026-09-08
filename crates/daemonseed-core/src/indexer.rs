@@ -1,4 +1,4 @@
-//! Share-folder indexer engine (M8 — ISC-C21 / ISC-A-C7).
+//! Share-folder indexer engine (ISC-C21 / ISC-A-C7).
 //!
 //! Drives a [`ShareIndex`] from the filesystem in the two modes ISC-C21
 //! requires — both designed against the
@@ -86,8 +86,8 @@ impl Indexer {
     /// Synchronous by design — see the module docs. Run it on a niced
     /// background thread so it cannot starve a foreground task. Delegates to the
     /// free [`scan_into`] (with a never-set cancel flag — an owned cold scan
-    /// runs to completion) so a caller holding only an `Arc<ShareIndex>` (M14
-    /// net-actor activation) can run the identical walk against a borrowed index.
+    /// runs to completion) so a caller holding only an `Arc<ShareIndex>` can run the identical walk
+    /// against a borrowed index.
     pub fn cold_scan(&self) -> Result<usize, IndexError> {
         scan_into(&self.index, &self.root, &AtomicBool::new(false))
     }
@@ -963,7 +963,7 @@ mod tests {
             .collect()
     }
 
-    /// The full cache cycle (M16 multi-addr): a metadata-only entry (no
+    /// The full cache cycle (multi-addr): a metadata-only entry (no
     /// cached blob) is hashed and **all** its per-chunk addresses written
     /// back, ordered and concatenated; a second pass over the unchanged file
     /// reuses the cached addresses *without reading the file* — proved by

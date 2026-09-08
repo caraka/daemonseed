@@ -147,7 +147,7 @@ pub fn write_first_start(
     Ok(dseed_p)
 }
 
-/// Overwrite the at-rest seeds blob at `profile_root` (M13 write-through).
+/// Overwrite the at-rest seeds blob at `profile_root`.
 ///
 /// Unlike [`write_first_start`], this writes *only* `seeds.blob` and always
 /// clobbers: it is the post-first-start re-seal path, where the running client
@@ -225,7 +225,7 @@ impl std::error::Error for UnlockError {}
 /// `seeds` is the decrypted at-rest payload ([`crate::storage::seeds::Opened::seeds`])
 /// and `seal_key` its cached AEAD key ([`crate::storage::seeds::Opened::key`]),
 /// both threaded into the returned materials so the running client can re-seal on
-/// every persist-worthy mutation (M13 write-through) — and so the persisted
+/// every persist-worthy mutation — and so the persisted
 /// display name (ISC-C4b) is restored rather than reset each login.
 ///
 /// The blob and recovery bytes in the returned materials are the on-disk bytes

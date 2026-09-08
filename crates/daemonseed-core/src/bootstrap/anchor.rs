@@ -8,7 +8,7 @@
 //!
 //! At M2 the bundled anchor is intentionally **empty** — the project's
 //! canonical relay does not yet exist; manual-paste is the only working
-//! path. A later milestone (M11 or whenever the project relay stands up)
+//! path. A later milestone (whenever the project relay stands up)
 //! lands the real anchor by editing `anchor.toml` and bumping a binary
 //! release.
 

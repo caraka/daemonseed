@@ -9,9 +9,11 @@
 //! as the analogue.
 //!
 //! **Pre-public phase.** No real release key exists yet — the bundled key array
-//! is empty, exactly as the bootstrap anchor ships an empty `canonical` at M2.
+//! is empty, exactly as the bootstrap anchor ships an empty
+//! `canonical`.
 //! The shape ships **1-of-1** (`threshold = 1`); a future signing-key ceremony
-//! (deferred M10-infra) lands the real key by adding its hex public key to the
+//! (deferred to the signing-key ceremony) lands the real key by adding its hex
+//! public key to the
 //! TOML and shipping a signed release, and ratchets toward N-of-M by adding
 //! keys and raising `threshold`. Keeping the array+threshold shape now means
 //! the ratchet is additive, never a refactor.
@@ -111,7 +113,7 @@ pub struct BundledReleaseAnchor {
     /// N-of-M threshold; the bundled shape ships 1-of-1.
     pub threshold: u32,
     /// Hex-encoded ML-DSA-87 release-signing public keys. Empty until the
-    /// signing-key ceremony (M10-infra) publishes the real key.
+    /// signing-key ceremony publishes the real key.
     #[serde(default)]
     pub keys: Vec<String>,
 }
@@ -188,9 +190,9 @@ mod tests {
 
     #[test]
     fn bundled_has_no_real_key_yet() {
-        // Pre-public phase: the signing-key ceremony (M10-infra) has not run, so
+        // Pre-public phase: the signing-key ceremony has not run, so
         // no real release key is bundled and `to_anchor` is inert. Mirrors the
-        // bootstrap anchor's empty `canonical` at M2.
+        // bootstrap anchor's empty `canonical` as first shipped.
         assert!(bundled().keys.is_empty());
         assert!(bundled().to_anchor().is_none());
     }

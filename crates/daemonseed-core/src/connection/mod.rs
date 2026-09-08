@@ -175,7 +175,7 @@ impl<T: Transport> Connection<Versioned, T> {
 impl<T: Transport> Connection<Authenticated, T> {
     /// Consume the connection, returning the raw authenticated
     /// transport — e.g. to hand to `tonic::transport::Server` for the
-    /// post-auth application stream (M5+).
+    /// post-auth application stream.
     pub fn into_inner(self) -> T {
         self.transport
     }

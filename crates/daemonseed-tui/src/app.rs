@@ -136,15 +136,15 @@ pub enum MainFocus {
     /// (ISC-19). The indexer status line at the top of My-shares stays
     /// non-blocking during a cold scan (ISC-A-C7).
     Shares,
-    /// The Define-Share input box (M14, ISC-C21): type a directory path
+    /// The Define-Share input box (ISC-C21): type a directory path
     /// (optionally `path|label`), Enter validates the directory exists and
     /// queues a [`ShareDefineRequest`] the binary turns into a
     /// `NetCommand::DefineShare` — opening the redb share index and activating
     /// the M8 indexer against that root. An input box modelled on
     /// [`MainFocus::JoinCircle`]; on success focus returns to the Shares view so
     /// the My-shares pane shows the new root indexing. Publishing the defined
-    /// share to the relay is the Shares pane's `[p]` action (M15 cleanup —
-    /// define once, then `[p]` to publish, `[u]` to unpublish); there is no
+    /// share to the relay is the Shares pane's `[p]` action (define once, then `[p]` to
+    /// publish, `[u]` to unpublish); there is no
     /// separate Publish input pane.
     DefineShare,
     /// The Hide box: type a full `name#hash` handle, Enter toggles it in the
@@ -153,11 +153,11 @@ pub enum MainFocus {
     /// applied as a render-time filter to the Public shares pane. Main area
     /// stays on the Shares view.
     Hide,
-    /// The server-management screen (F22): add servers, set per-server trust
+    /// The server-management screen: add servers, set per-server trust
     /// mode with the trusted/untrusted slider (C22), and connect to a selected
     /// one (ISC-21/26/27). The main area shows the server list instead of chat,
     /// plus a read-only "Discovered (introducer)" sub-section listing candidate
-    /// peers the connected relay's introducer reported (M12 gate step 6, ISC-S6 /
+    /// peers the connected relay's introducer reported (ISC-S6 /
     /// ISC-A-C19). Opening the pane auto-dispatches a `RefreshIntroducer`;
     /// candidates are surfaced but never auto-trusted — promotion stays explicit.
     Servers,
@@ -182,7 +182,7 @@ pub enum MainFocus {
     /// `PublicSpace.GetDeprecationPolicy` RPC (no new wire protocol). The main
     /// area shows the deprecation policy instead of chat.
     Deprecation,
-    /// The Fetched-downloads browse pane (M15 C; ISC-C64 / C65). Lists the
+    /// The Fetched-downloads browse pane (ISC-C64 / C65). Lists the
     /// shares fetched this profile (persisted on disk as explicit downloads,
     /// ISC-C63); ↑/↓ selects a download, typing builds a destination directory
     /// path, Enter extracts the selected download's files there (path-traversal
@@ -276,7 +276,7 @@ pub enum IndexerStatus {
     Ready { entries: u64 },
 }
 
-/// A user request to define (add) a local share root (M14, ISC-C21).
+/// A user request to define (add) a local share root (ISC-C21).
 ///
 /// Produced by `App::on_key_define_share` when the user enters a valid
 /// directory path in the Define-Share box, drained by the binary via
@@ -307,8 +307,8 @@ pub struct PublishRequest {
     pub sharer_handle: String,
 }
 
-/// A share currently published + served this session (M16 smoke fix,
-/// ISC-A-C34). Keyed by the client-local defined `root` so `[p]` can be
+/// A share currently published + served this session (ISC-A-C34). Keyed by the
+/// client-local defined `root` so `[p]` can be
 /// idempotent and the Shares pane's `●` marker binds to the exact defined row
 /// — display-name string joins conflate distinct shares that happen to share
 /// a name. `share_id` is the relay-minted listing id (the unpublish handle);
@@ -316,7 +316,7 @@ pub struct PublishRequest {
 /// never rides the wire.
 #[derive(Debug, Clone)]
 pub struct PublishedShare {
-    /// Server-assigned opaque listing id (F25); the `[u]` unpublish handle.
+    /// Server-assigned opaque listing id; the `[u]` unpublish handle.
     pub share_id: String,
     /// The defined share root this listing serves — the idempotency key.
     pub root: std::path::PathBuf,
@@ -363,7 +363,7 @@ pub enum DirSelection {
     Partial,
 }
 
-/// Active share-fetch state (ISC-19, F23 unified mechanism).
+/// Active share-fetch state (ISC-19).
 ///
 /// Constructed when the user presses `f` on a selected Public-shares row;
 /// folded by [`App::on_net_event`] as `NetEvent::FetchProgress` /
@@ -643,7 +643,7 @@ impl TrustItem {
     }
 }
 
-/// One managed federation server in the server-management screen (F22 / C22).
+/// One managed federation server in the server-management screen (C22).
 /// `trusted` is the slider position: trusted = TOFU-pin on first contact,
 /// untrusted = require a pre-imported operator key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,7 +707,7 @@ pub struct JoinedCircle {
     /// indicator. Never transmitted, never derived from members.
     pub label: String,
     /// The phrase this circle's `cot_key` derives from — the in-memory session
-    /// copy of the persisted seed (M13, ISC-C59). The at-rest form is
+    /// copy of the persisted seed (ISC-C59). The at-rest form is
     /// [`daemonseed_core::storage::seeds::PersistedCircle`]; this lets the
     /// `CircleJoined` handler map a runtime circle back to its persisted entry.
     entropy: Zeroizing<String>,
@@ -853,7 +853,7 @@ pub struct App {
     /// Client-local muted full wire handles (ISC-13 / C15). Never leaves the
     /// client (ISC-A-C3); applied as a render-time suppression filter.
     muted: std::collections::BTreeSet<String>,
-    /// Managed federation servers shown on the server-management screen (F22).
+    /// Managed federation servers shown on the server-management screen.
     servers: Vec<ManagedServer>,
     /// The add-server input buffer (`server-id@host:port`) (ISC-26).
     server_input: String,
@@ -867,12 +867,12 @@ pub struct App {
     /// binary drains it via [`Self::take_pending_share_define`], derives the
     /// index path + key from the session, and sends `NetCommand::DefineShare`.
     pending_share_define: Option<ShareDefineRequest>,
-    /// Queued share re-definitions to replay on Unlock (M14, ISC-C21): one per
+    /// Queued share re-definitions to replay on Unlock (ISC-C21): one per
     /// persisted share root, drained after the single-shot slot so a returning
     /// daemon re-indexes its remembered roots without re-typing. FIFO preserves
     /// definition order. Mirrors [`Self::pending_joins`] for circles.
     pending_share_defines: std::collections::VecDeque<ShareDefineRequest>,
-    /// The defined share roots + their display names (M16 C1, ISC-C69). One
+    /// The defined share roots + their display names (ISC-C69). One
     /// entry per share the user has defined this session (interactively or
     /// restored on Unlock, in full); appended on define (dedup by root) and
     /// restored entirely across Unlock. The Shares pane lists these with a
@@ -884,7 +884,7 @@ pub struct App {
     /// reflected in the "my shares" indexed file-count view).
     defined_shares: Vec<(std::path::PathBuf, String)>,
     /// Selection cursor into [`Self::defined_shares`] for the Shares pane's
-    /// My-defined list (M16 C1). `↑`/`↓` move it (clamped); `[p]`/`[u]` act on
+    /// My-defined list. `↑`/`↓` move it (clamped); `[p]`/`[u]` act on
     /// the selected entry. Clamped on restore/append so it never dangles.
     defined_sel: usize,
     /// Single-shot slot for a publish request; the binary drains it via
@@ -898,13 +898,13 @@ pub struct App {
     /// Single-shot slot for an unpublish (D, M15): the server-assigned share_id
     /// to stop serving; drained into `NetCommand::UnpublishShare`.
     pending_unpublish: Option<String>,
-    /// Single-shot slot for a publish-hash cancel (M16 serve-from-disk): the
+    /// Single-shot slot for a publish-hash cancel: the
     /// defined root whose in-flight hash `[u]` asked to stop; drained into
     /// `NetCommand::CancelPublish`. Root-keyed like [`Self::hashing`]
     /// (ISC-A-C34 — never a display-name join).
     pending_cancel_publish: Option<std::path::PathBuf>,
-    /// Defined roots whose publish hash is currently in flight (M16
-    /// serve-from-disk). Inserted on `PublishProgress`; removed on
+    /// Defined roots whose publish hash is currently in flight (serve-from-disk).
+    /// Inserted on `PublishProgress`; removed on
     /// `PublishStarted` / `PublishCancelled` / a root-carrying `PublishError`.
     /// Drives the `[u]`-cancels affordance and extends the `[p]` idempotency
     /// guard (ISC-A-C34) to the hashing window — without it a second `[p]`
@@ -917,7 +917,7 @@ pub struct App {
     /// relay reaps these when the connection drops.
     published: Vec<PublishedShare>,
     /// Queued circle-rejoins to forward to the net actor, one per launch-time
-    /// remembered circle (M13 persistence, ISC-C59). Filled on Unlock from
+    /// remembered circle (ISC-C59). Filled on Unlock from
     /// `seeds.circles()` and drained one-per-tick by the same binary loop that
     /// drains [`Self::pending_join`]; FIFO preserves join order. Distinct slot so
     /// existing single-join callers/tests are unaffected.
@@ -960,8 +960,8 @@ pub struct App {
     /// [`daemonseed_cli::public_space::filter_shares_excluding_hidden`]. Never
     /// leaves the client (ISC-A-C3): no wire field carries it. This set is the UI
     /// source of truth; it is kept in lock-step with the persisted home
-    /// [`daemonseed_core::storage::seeds::Seeds::hidden_shares`] (M13
-    /// write-through) — every toggle mirrors onto [`Self::seeds`] and re-seals, and
+    /// [`daemonseed_core::storage::seeds::Seeds::hidden_shares`] — every toggle mirrors
+    /// onto [`Self::seeds`] and re-seals, and
     /// it is restored from there on Unlock (ISC-C16).
     hidden_shares: std::collections::BTreeSet<String>,
     /// The hide-box input buffer (ISC-18).
@@ -987,7 +987,7 @@ pub struct App {
     /// manifest-row indices; `dest` (A3, ISC-C68) is the user-chosen download
     /// destination, empty for the default downloads dir.
     pending_fetch_confirm: Option<PendingFetchConfirm>,
-    /// Fetched-downloads list for the browse pane (M15 C; ISC-C64). Replaced
+    /// Fetched-downloads list for the browse pane (ISC-C64). Replaced
     /// wholesale by `NetEvent::FetchedShares`.
     fetched_shares: Vec<daemonseed_core::storage::fetched::FetchedShare>,
     /// Selected row in the Fetched pane (↑/↓ moves it).
@@ -1046,7 +1046,7 @@ pub struct App {
     /// (drained once). Set when the user opens the Deprecation pane or presses
     /// `r`; the binary translates it into a `NetCommand::RefreshDeprecation`.
     pending_deprecation_refresh: bool,
-    /// Latest introducer-discovered candidate peers (M12 gate step 6, ISC-C22 /
+    /// Latest introducer-discovered candidate peers (ISC-C22 /
     /// ISC-S6 / ISC-A-C19), each as a `(server_id, address)` pair. Replaced
     /// wholesale on each `IntroducerSnapshot` (idempotent — never appended), and
     /// left intact on an `IntroducerError` so a transient refresh failure never
@@ -1081,8 +1081,8 @@ pub struct App {
     /// every mutation without re-running Argon2id. `None` until a session lands;
     /// zeroizes on drop.
     seal_key: Option<SealingKey>,
-    /// A re-sealed at-rest blob the binary should write over `seeds.blob` (M13
-    /// write-through). Set by [`Self::persist_seeds`], drained once by
+    /// A re-sealed at-rest blob the binary should write over `seeds.blob`. Set by
+    /// [`Self::persist_seeds`], drained once by
     /// [`Self::take_pending_blob_update`]. Distinct from [`Self::pending_persist`],
     /// which is the first-start config+blob+`.dseed` write.
     pending_blob_update: Option<Vec<u8>>,
@@ -1587,7 +1587,7 @@ impl App {
 
     /// Take a queued circle-join phrase (drained once by the binary). The
     /// interactive single-shot slot wins; with it empty, the next queued rejoin
-    /// (M13 persistence, ISC-C59) is popped FIFO. So the binary's once-per-tick
+    /// (ISC-C59) is popped FIFO. So the binary's once-per-tick
     /// drain dispatches all remembered circles over successive ticks without any
     /// dispatch-loop change.
     pub fn take_pending_join(&mut self) -> Option<String> {
@@ -1614,24 +1614,24 @@ impl App {
             .or_else(|| self.pending_share_defines.pop_front())
     }
 
-    /// All defined share roots + names, in definition order (M16 C1, ISC-C69) —
+    /// All defined share roots + names, in definition order (ISC-C69) —
     /// the My-defined list rendered in the Shares pane.
     pub fn defined_shares(&self) -> &[(std::path::PathBuf, String)] {
         &self.defined_shares
     }
 
-    /// The selection cursor into [`Self::defined_shares`] (M16 C1).
+    /// The selection cursor into [`Self::defined_shares`].
     pub fn defined_sel(&self) -> usize {
         self.defined_sel
     }
 
-    /// The currently-selected defined share (M16 C1) — what the Shares pane's
+    /// The currently-selected defined share — what the Shares pane's
     /// `[p]`/`[u]` act on. `None` when nothing is defined.
     pub fn selected_defined_share(&self) -> Option<&(std::path::PathBuf, String)> {
         self.defined_shares.get(self.defined_sel)
     }
 
-    /// Append a defined share root, deduplicating by root (M16 C1). Defining the
+    /// Append a defined share root, deduplicating by root. Defining the
     /// same root twice does not duplicate it; the display name is refreshed to
     /// the latest. Used by both the interactive define and the Unlock restore.
     fn push_defined_share(&mut self, root: std::path::PathBuf, name: String) {
@@ -1643,8 +1643,8 @@ impl App {
         self.clamp_defined_sel();
     }
 
-    /// Echo the My-defined selection on the status line after a `[`/`]` move
-    /// (M16 smoke fix). The split-cursor scheme (arrows = public row, `[`/`]`
+    /// Echo the My-defined selection on the status line after a `[`/`]` move. The
+    /// split-cursor scheme (arrows = public row, `[`/`]`
     /// = defined row) proved invisible in live smoke — the echo confirms the
     /// keys did something and names what `[p]`/`[u]` will act on. One-shot:
     /// cleared on focus change like any status (ISC-C70).
@@ -1663,7 +1663,7 @@ impl App {
         }
     }
 
-    /// Shares currently published+served this session (M16, [`PublishedShare`]).
+    /// Shares currently published+served this session ([`PublishedShare`]).
     pub fn published(&self) -> &[PublishedShare] {
         &self.published
     }
@@ -1709,7 +1709,7 @@ impl App {
         self.pending_unpublish.take()
     }
 
-    /// Drain a queued publish-hash cancel (M16 serve-from-disk) — the binary
+    /// Drain a queued publish-hash cancel — the binary
     /// turns it into a `NetCommand::CancelPublish` for that defined root.
     pub fn take_pending_cancel_publish(&mut self) -> Option<std::path::PathBuf> {
         self.pending_cancel_publish.take()
@@ -1746,8 +1746,8 @@ impl App {
     }
 
     /// Re-seal the live [`Seeds`] under the cached [`SealingKey`] and queue the
-    /// refreshed blob for the binary to write over `seeds.blob` (M13
-    /// write-through). A no-op (with no error) before a session lands — both the
+    /// refreshed blob for the binary to write over `seeds.blob`. A no-op (with no error)
+    /// before a session lands — both the
     /// seeds and the key are `None` until first-start completes or an Unlock
     /// succeeds. A seal failure surfaces on the status line rather than panicking,
     /// so a persist hiccup never takes the session down; the in-memory mutation is
@@ -1833,7 +1833,7 @@ impl App {
         for sh in session.seeds.shares() {
             let root = std::path::PathBuf::from(&sh.root);
             // Restore EVERY persisted root into the My-defined list so `[p]`/`[u]`
-            // can publish/unpublish each independently (M16 C1, ISC-C69) — not
+            // can publish/unpublish each independently (ISC-C69) — not
             // just the last-defined one.
             let name = Self::share_display_name(&root, &sh.label);
             self.push_defined_share(root.clone(), name.clone());
@@ -2047,7 +2047,7 @@ impl App {
                     .as_ref()
                     .and_then(|s| s.circles().iter().find(|c| c.entropy() == entropy))
                 {
-                    // A rejoin (M13, ISC-C59): this circle is already remembered.
+                    // A rejoin (ISC-C59): this circle is already remembered.
                     // The user's persisted label (ISC-C62) wins over the
                     // actor-supplied one, and we must NOT persist again.
                     self.circles.push(JoinedCircle::new(
@@ -2057,7 +2057,7 @@ impl App {
                     ));
                     self.active_circle = Some(self.circles.len() - 1);
                 } else {
-                    // A fresh join: remember it (M13 write-through, ISC-C59) so
+                    // A fresh join: remember it (ISC-C59) so
                     // it is silently rejoined next launch.
                     self.circles
                         .push(JoinedCircle::new(circle_id, label.clone(), entropy.clone()));
@@ -2277,7 +2277,7 @@ impl App {
                 file_count,
             } => {
                 // The hash phase is over — clear the hashing marker so `[u]`
-                // routes to unpublish, not cancel (M16 serve-from-disk).
+                // routes to unpublish, not cancel.
                 self.hashing.remove(&root);
                 // Publish-intent persistence: remember this root as published so
                 // it auto-republishes next launch. Idempotent — an auto-republish
@@ -2299,7 +2299,7 @@ impl App {
                     "sharing {name:?} as {share_id} ({file_count} file(s)) — [u] in Shares to stop"
                 ));
             }
-            // A publish hash is in flight (M16 serve-from-disk): mark the root
+            // A publish hash is in flight: mark the root
             // hashing — which extends the `[p]` guard (ISC-A-C34) and routes
             // `[u]` to CancelPublish — and surface the per-file progress with
             // the cancel affordance spelled out.
@@ -2415,7 +2415,7 @@ impl App {
         self.muted.iter().map(String::as_str)
     }
 
-    /// The managed servers, for rendering the server-management screen (F22).
+    /// The managed servers, for rendering the server-management screen.
     pub fn servers(&self) -> &[ManagedServer] {
         &self.servers
     }
@@ -2551,7 +2551,7 @@ impl App {
         self.pending_fetch_confirm.take()
     }
 
-    /// Accessors + drains for the Fetched browse pane (M15 C).
+    /// Accessors + drains for the Fetched browse pane.
     pub fn fetched_shares(&self) -> &[daemonseed_core::storage::fetched::FetchedShare] {
         &self.fetched_shares
     }
@@ -2735,7 +2735,7 @@ impl App {
         std::mem::replace(&mut self.pending_deprecation_refresh, false)
     }
 
-    /// Introducer-discovered candidate peers (M12 gate step 6, ISC-C22 /
+    /// Introducer-discovered candidate peers (ISC-C22 /
     /// ISC-S6 / ISC-A-C19), each as a `(server_id, address)` pair, for the
     /// Servers pane's "Discovered (introducer)" sub-section. These are
     /// *candidates* only — known-of but never trusted or connectable until the
@@ -3128,10 +3128,10 @@ impl App {
     ///
     /// `Up` / `Down` move the public-shares selection (clamped to the visible,
     /// hide-filtered subset so a hidden row can never be highlighted);
-    /// `[` / `]` move the My-defined selection (M16 C1, ISC-C69, same
+    /// `[` / `]` move the My-defined selection (ISC-C69, same
     /// saturating idiom as the other single-list panes); `r` requests a fresh
     /// snapshot; `f` initiates a fetch of the currently-selected public-share
-    /// row (ISC-19, F23 unified mechanism); `p` / `u` publish /
+    /// row (ISC-19); `p` / `u` publish /
     /// unpublish-or-cancel the selected defined share; `x` removes it
     /// (unpublishing/cancelling first and forgetting the persisted root, M16
     /// serve-from-disk). (`Up`/`Down` stay on public shares to keep the fetch
@@ -3170,16 +3170,16 @@ impl App {
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 // Unpublish the SELECTED defined share if it is currently served
-                // (M16 C1, ISC-C69) — or cancel its in-flight publish hash (M16
-                // serve-from-disk). Serving is session-scoped, so this is the
+                // (ISC-C69) — or cancel its in-flight publish hash (serve-from-disk).
+                // Serving is session-scoped, so this is the
                 // in-session "stop sharing"; quit / disconnect reaps everything
                 // anyway. The binary forwards it as NetCommand::UnpublishShare /
                 // NetCommand::CancelPublish; PublishStopped prunes `published`.
                 self.unpublish_selected_share();
             }
             KeyCode::Char('x') | KeyCode::Char('X') => {
-                // Remove the SELECTED defined share entirely (M16
-                // serve-from-disk): stop any publish stage in flight, drop it
+                // Remove the SELECTED defined share entirely (serve-from-disk): stop any
+                // publish stage in flight, drop it
                 // from the My-defined list, and forget the persisted root so
                 // it is not re-defined next launch.
                 self.remove_selected_defined_share();
@@ -3530,7 +3530,7 @@ impl App {
         &self.circles
     }
 
-    /// Test-only: the queued circle-rejoins not yet drained (M13, ISC-C59).
+    /// Test-only: the queued circle-rejoins not yet drained (ISC-C59).
     #[cfg(test)]
     pub(crate) fn pending_joins_for_test(&self) -> &std::collections::VecDeque<String> {
         &self.pending_joins
@@ -3789,7 +3789,7 @@ impl App {
         }
     }
 
-    /// Handle a key in the Define-Share box (M14, ISC-C21). Typing builds the
+    /// Handle a key in the Define-Share box (ISC-C21). Typing builds the
     /// buffer; Enter parses `path` (or `path|label`), validates the directory
     /// exists, and queues a [`ShareDefineRequest`] for the binary to turn into a
     /// `NetCommand::DefineShare`. A non-existent path keeps the buffer and shows
@@ -3828,7 +3828,7 @@ impl App {
                 }
                 // Append the defined root to the My-defined list (dedup by root)
                 // so the Shares pane's `[p]`/`[u]` can publish/unpublish it
-                // independently (M16 C1, ISC-C69 — define several, act per-share).
+                // independently (ISC-C69 — define several, act per-share).
                 let name = Self::share_display_name(&root, &label);
                 self.push_defined_share(root.clone(), name);
                 self.pending_share_define = Some(ShareDefineRequest { root, label });
@@ -3845,7 +3845,7 @@ impl App {
     }
 
     /// A share's display name: its label if set, else the directory's own name,
-    /// else the path string (M15 cleanup — used for `[p]` publish + downloads).
+    /// else the path string (used for `[p]` publish + downloads).
     fn share_display_name(root: &std::path::Path, label: &Option<String>) -> String {
         label.clone().unwrap_or_else(|| {
             root.file_name()
@@ -3854,12 +3854,12 @@ impl App {
         })
     }
 
-    /// Publish the **selected** defined share root to the relay (M16 C1,
-    /// ISC-C69 — the Shares pane's `[p]` action). Define several, select with
+    /// Publish the **selected** defined share root to the relay (ISC-C69 — the Shares
+    /// pane's `[p]` action). Define several, select with
     /// `[`/`]`, then `[p]`; each is served by its own session-scoped serve task.
     /// A no-op with a hint if nothing is defined yet. Idempotent per root
     /// (ISC-A-C34): a root that is already published — or already queued and
-    /// not yet drained, or mid-hash on the net actor (M16 serve-from-disk) —
+    /// not yet drained, or mid-hash on the net actor —
     /// is never re-queued; `[u]` first to re-publish. A failed publish never
     /// reaches `published` (and a root-carrying `PublishError` clears the
     /// hashing marker), so the guard stays open and `[p]` is retryable after
@@ -3893,7 +3893,7 @@ impl App {
     }
 
     /// Unpublish — or cancel the in-flight publish of — the selected defined
-    /// share (M16 C1 / serve-from-disk, ISC-C69 — the Shares pane's `[u]`
+    /// share (ISC-C69 — the Shares pane's `[u]`
     /// action). The selected defined share is matched by its root (the
     /// [`PublishedShare`] key, ISC-A-C34) — never by display-name string join,
     /// which would conflate distinct shares sharing a name.
@@ -3942,7 +3942,7 @@ impl App {
         self.status = Some("selected share is not currently published".to_owned());
     }
 
-    /// Remove the selected defined share (M16 serve-from-disk — the Shares
+    /// Remove the selected defined share (the Shares
     /// pane's `[x]` action). Stops whatever publish stage is in flight for it
     /// first — drops an undrained [`PublishRequest`], queues a `CancelPublish`
     /// for an in-flight hash, queues the unpublish if it is served — then
@@ -3992,10 +3992,10 @@ impl App {
         self.status = Some(format!("removed {name:?}"));
     }
 
-    /// Fetched-downloads pane key handling (M15 C; ISC-C64). A read-only browse
+    /// Fetched-downloads pane key handling (ISC-C64). A read-only browse
     /// pane — ↑/↓ scrolls the downloaded shares. The files already live on disk
-    /// under their real names in each share's download folder (M15 cleanup: no
-    /// extract step), so there is no input here. Refreshed when the pane opens
+    /// under their real names in each share's download folder (no extract step), so there
+    /// is no input here. Refreshed when the pane opens
     /// (`ListFetched`).
     fn on_key_fetched(&mut self, key: KeyEvent) {
         match key.code {
@@ -4039,7 +4039,7 @@ impl App {
         }
     }
 
-    /// Server-management screen (F22 / C22): printable chars build the
+    /// Server-management screen (C22): printable chars build the
     /// add-server input; Enter either adds a server (when the input is
     /// non-empty, ISC-26) or connects to the selected one (when the input is
     /// empty); Up/Down moves the selection; Left/Right slides the selected
@@ -4619,7 +4619,7 @@ mod tests {
         assert!(req.root.is_dir());
         assert_eq!(req.name, "My Share");
         // The listing carries the publisher's handle so peers see the sharer's
-        // name, not "(operator)" (M15 — completes the #6 passthrough).
+        // name, not "(operator)" (completes the #6 passthrough).
         assert!(
             !req.sharer_handle.is_empty(),
             "publish carries the sharer handle"
@@ -4647,7 +4647,7 @@ mod tests {
     }
 
     /// `PublishStarted` tracks the share; `[u]` on the matching selected defined
-    /// share queues the unpublish; `PublishStopped` prunes it (M16 C1, ISC-C69).
+    /// share queues the unpublish; `PublishStopped` prunes it (ISC-C69).
     #[test]
     fn publish_lifecycle_tracks_and_unpublish_queues() {
         let mut app = drive_to_main();
@@ -4791,7 +4791,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
-    /// `[p]` publishes the SELECTED defined share, not always the first (M16 C1).
+    /// `[p]` publishes the SELECTED defined share, not always the first.
     #[test]
     fn publish_p_acts_on_the_selected_defined_share() {
         let mut app = drive_to_main();
@@ -4937,8 +4937,8 @@ mod tests {
     }
 
     /// `PublishProgress` folds into a "hashing N/M — [u] cancels" status, and
-    /// `[u]` during the hash queues a `CancelPublish` for that root (M16
-    /// serve-from-disk) — never an unpublish (nothing is published yet).
+    /// `[u]` during the hash queues a `CancelPublish` for that root (serve-from-disk) —
+    /// never an unpublish (nothing is published yet).
     #[test]
     fn publish_progress_sets_status_and_u_queues_cancel() {
         let mut app = drive_to_main();
@@ -4976,7 +4976,7 @@ mod tests {
     }
 
     /// `[u]` on a publish still queued locally (not yet drained by the binary)
-    /// drops the request in place — no actor round-trip (M16, `[u]` priority
+    /// drops the request in place — no actor round-trip (`[u]` priority
     /// stage (a)).
     #[test]
     fn u_drops_an_undrained_publish_request() {
@@ -5006,7 +5006,7 @@ mod tests {
 
     /// The ISC-A-C34 `[p]` guard covers the hashing window: a second `[p]`
     /// while the hash runs queues nothing, and a `PublishCancelled` re-opens
-    /// the guard so `[p]` retries (M16 serve-from-disk).
+    /// the guard so `[p]` retries.
     #[test]
     fn p_guard_covers_the_hashing_window() {
         let mut app = drive_to_main();
@@ -5053,8 +5053,7 @@ mod tests {
 
     /// `[x]` removes the selected defined share: queues the unpublish for a
     /// served share, drops the defined row, and persists the removal via the
-    /// M13 write-through so the root is not re-defined next launch (M16
-    /// serve-from-disk).
+    /// Write-through so the root is not re-defined next launch (serve-from-disk).
     #[test]
     fn x_removes_unpublishes_and_persists_the_removal() {
         let mut app = drive_to_main();
@@ -5098,7 +5097,7 @@ mod tests {
     }
 
     /// `[x]` mid-hash cancels the in-flight publish too: the CancelPublish is
-    /// queued alongside the removal (M16 serve-from-disk).
+    /// queued alongside the removal.
     #[test]
     fn x_mid_hash_cancels_the_publish_too() {
         let mut app = drive_to_main();
@@ -5143,8 +5142,8 @@ mod tests {
         );
     }
 
-    /// `[`/`]` echo the My-defined selection on the status line (M16 smoke
-    /// fix) — live smoke showed the split-cursor scheme gave no feedback at
+    /// `[`/`]` echo the My-defined selection on the status line — live smoke showed the
+    /// split-cursor scheme gave no feedback at
     /// all when the user reached for the wrong keys.
     #[test]
     fn bracket_keys_echo_the_defined_selection() {
@@ -5189,8 +5188,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_b);
     }
 
-    /// On Unlock, ALL persisted roots are restored into `defined_shares` (M16 C1,
-    /// ISC-C69) — not just the last — each re-emitted for re-indexing.
+    /// On Unlock, ALL persisted roots are restored into `defined_shares` (ISC-C69) — not
+    /// just the last — each re-emitted for re-indexing.
     #[test]
     fn unlock_restores_all_persisted_roots_into_defined_shares() {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
@@ -6868,7 +6867,7 @@ mod tests {
     }
 
     /// A fresh circle join (entropy not yet in `seeds.circles()`) remembers the
-    /// circle in the live payload AND queues a write-through (M13, ISC-C59).
+    /// circle in the live payload AND queues a write-through (ISC-C59).
     #[test]
     fn fresh_join_persists_circle_and_queues_blob() {
         use daemonseed_core::storage::seeds;
@@ -6907,7 +6906,7 @@ mod tests {
 
     /// On Unlock, every remembered circle is queued for rejoin; the resulting
     /// `CircleJoined` restores the runtime circle with the PERSISTED label (it
-    /// wins over the actor-supplied one) and does NOT re-persist (M13, ISC-C59).
+    /// wins over the actor-supplied one) and does NOT re-persist (ISC-C59).
     #[test]
     fn unlock_queues_rejoins_and_persisted_label_wins() {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
@@ -6955,7 +6954,7 @@ mod tests {
     }
 
     /// A disconnect clears the RUNTIME circle set but leaves the persisted
-    /// circles in the live payload intact (M13, ISC-C59).
+    /// circles in the live payload intact (ISC-C59).
     #[test]
     fn disconnect_keeps_persisted_circles() {
         let mut app = drive_to_main();

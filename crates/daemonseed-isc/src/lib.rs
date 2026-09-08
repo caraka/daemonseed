@@ -205,7 +205,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C56", IscClass::Positive),
     ("ISC-C57", IscClass::Positive),
     ("ISC-C58", IscClass::Positive),
-    // ── client positive (M13 multi-circle persistence; M15 C fetched browse) ──
+    // ── client positive (multi-circle persistence; fetched browse) ──
     ("ISC-C59", IscClass::Positive),
     ("ISC-C60", IscClass::Positive),
     ("ISC-C61", IscClass::Positive),
@@ -216,16 +216,16 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C66", IscClass::Positive),
     ("ISC-C67", IscClass::Positive),
     ("ISC-C68", IscClass::Positive),
-    // ── client positive (M16 C1 multi-share publish; C2 status-auto-clear; C3 generate-circle-phrase) ──
+    // ── client positive (multi-share publish; status-auto-clear; generate-circle-phrase) ──
     ("ISC-C69", IscClass::Positive),
     ("ISC-C70", IscClass::Positive),
     ("ISC-C71", IscClass::Positive),
-    // ── client positive (M16 A4 collapsible-folder-tree fetch preview) ──
+    // ── client positive (collapsible-folder-tree fetch preview) ──
     ("ISC-C72", IscClass::Positive),
     ("ISC-C73", IscClass::Positive),
     ("ISC-C74", IscClass::Positive),
     ("ISC-C75", IscClass::Positive),
-    // ── client positive (M16 chunking completion: robust chunked fetch) ──
+    // ── client positive (robust chunked fetch) ──
     ("ISC-C76", IscClass::Positive),
     // ── client positive (alpha3 unified-share-model: key-class safety) ──
     ("ISC-C77", IscClass::Positive),
@@ -297,7 +297,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C26", IscClass::Negative),
     ("ISC-A-C27", IscClass::Negative),
     ("ISC-A-C28", IscClass::Negative),
-    // ── client negative (M13 cross-circle isolation; M15 C fetched safety) ──
+    // ── client negative (cross-circle isolation; fetched safety) ──
     ("ISC-A-C29", IscClass::Negative),
     ("ISC-A-C30", IscClass::Negative),
     ("ISC-A-C31", IscClass::Negative),
@@ -306,7 +306,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-A-C34", IscClass::Negative),
     ("ISC-A-C35", IscClass::Negative),
     ("ISC-A-C36", IscClass::Negative),
-    // ── client negative (M16 chunking completion: manifest frame budget) ──
+    // ── client negative (manifest frame budget) ──
     ("ISC-A-C37", IscClass::Negative),
     // ── client negative (presence heartbeat #74: no roster leak, no persist) ──
     ("ISC-A-C38", IscClass::Negative),
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn isc_s20_is_registered_server_positive() {
-        // ISC-S20 (circle-of-trust live relay) was formalized at M8 (F23) and
+        // ISC-S20 (circle-of-trust live relay) was formalized at M8  and
         // AGENTS.md tracks 94 ISCs, but this registry lagged at 93 — the M8
         // milestone never backfilled the entry. It is a server-positive ISC.
         assert_eq!(lookup_class("ISC-S20"), Some(IscClass::Positive));

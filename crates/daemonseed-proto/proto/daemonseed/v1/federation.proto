@@ -69,9 +69,9 @@ message PeerTriple {
   string address = 2;
 
   // Best-effort last-known-availability, unix milliseconds. Optional: the
-  // RAM-only availability-observation producer is deferred past MVP (finding
-  // F15), so MVP introducers leave this unset. Kept in the schema now so
-  // populating it later is an additive change, not a wire bump.
+  // RAM-only availability-observation producer is deferred past MVP, so MVP
+  // introducers leave this unset. Kept in the schema now so populating it
+  // later is an additive change, not a wire bump.
   optional uint64 last_known_availability_unix_ms = 3;
 }
 
@@ -84,7 +84,7 @@ message IntroducerResponse {
   repeated PeerTriple peers = 1;
 }
 
-// ── Service (M12, gate step 6) ────────────────────────────────────────────
+// ── Service ────────────────────────────────────────────
 
 // The federation introducer endpoint (ISC-S6 / ISC-S12 / ISC-S13 / ISC-A-S7).
 //

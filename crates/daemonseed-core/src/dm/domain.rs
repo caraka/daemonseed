@@ -518,7 +518,7 @@ mod tests {
         Ok(())
     }
 
-    /// The frozen design's F11 requirement: no label may be a prefix of another.
+    /// The frozen design's requirement: no label may be a prefix of another.
     /// If one were, a derivation for the shorter purpose could be confused with a
     /// truncated derivation for the longer one.
     ///

@@ -14,9 +14,9 @@
 //!   correspondent — plus the profile's block list. It is **not** where messages
 //!   are kept: a received message is never written, and sent content lives there
 //!   only until its outbox entry settles.
-//! - [`seeds`] (M1, ISC-C3) — the AEAD-protected mnemonic + per-circle state
+//! - [`seeds`] (ISC-C3) — the AEAD-protected mnemonic + per-circle state
 //!   blob.
-//! - [`recovery_file`] (M2, ISC-C32) — the same KDF chain with a distinct
+//! - [`recovery_file`] (ISC-C32) — the same KDF chain with a distinct
 //!   HKDF info string and a cleartext header carrying the profile-id + argon2
 //!   params, so recovery on a clean device works without a pre-existing
 //!   `daemonseed.toml`.

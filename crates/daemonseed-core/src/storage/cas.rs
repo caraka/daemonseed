@@ -1,7 +1,7 @@
 //! Content-addressed chunk store — the third storage layer.
 //!
 //! daemonseed splits at-rest state three ways: the encrypted seeds blob
-//! ([`super::seeds`]), the redb-backed indexed state (M8+), and this
+//! ([`super::seeds`]), the redb-backed indexed state, and this
 //! content-addressed chunk filesystem. A *chunk* is an opaque, already-
 //! encrypted byte run; the store neither knows nor cares what a chunk
 //! decrypts to. Chunks are named by their own hash, so an address both
@@ -9,7 +9,7 @@
 //! not match the address it was requested under is corrupt or substituted,
 //! and the caller drops it.
 //!
-//! ## Addressing — `SHA-384(chunk)` (F23, resolved 2026-05-26)
+//! ## Addressing — `SHA-384(chunk)` (resolved 2026-05-26)
 //!
 //! A [`ChunkAddr`] is the 48-byte SHA-384 of the chunk's bytes — the same
 //! hash primitive used for public-space content addresses
@@ -70,7 +70,7 @@ use oxicrypt_sha::sha384;
 /// Length of a SHA-384 chunk address, in bytes.
 pub const CHUNK_ADDR_LEN: usize = 48;
 
-/// A `SHA-384(chunk)` content address (F23).
+/// A `SHA-384(chunk)` content address.
 ///
 /// The address is *derived* from the chunk's bytes, never read off the wire
 /// and trusted — re-hashing a fetched chunk and comparing to the address it
@@ -109,7 +109,7 @@ impl fmt::Debug for ChunkAddr {
     }
 }
 
-/// Compute a chunk's address: `SHA-384(chunk)` (ISC-2 / F23).
+/// Compute a chunk's address: `SHA-384(chunk)` (ISC-2).
 ///
 /// Returns the underlying oxicrypt error only if SHA-384's power-up self-test
 /// has not yet passed (first hash in a fresh process).

@@ -1576,7 +1576,7 @@ fn emit_shares_snapshot(shares: &ShareState, evt_tx: &UnboundedSender<NetEvent>)
 }
 
 /// Read the fetched-shares browse manifest and emit a [`NetEvent::FetchedShares`]
-/// snapshot (M15 C; ISC-C64). Mirrors the relay's `handle_list_fetched`: a
+/// snapshot (ISC-C64). Mirrors the relay's `handle_list_fetched`: a
 /// transient/corrupt read leaves the pane's last-known list in place (no event).
 fn emit_fetched_snapshot(evt_tx: &UnboundedSender<NetEvent>, fetched_root: &Path) {
     if let Ok(shares) = FetchedStore::open(fetched_root).and_then(|s| s.list_shares()) {

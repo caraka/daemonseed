@@ -3,7 +3,7 @@
 //! A circle is born from shared entropy (a passphrase/sentence agreed among
 //! members out-of-band). The entropy is the **sole** circle secret and the
 //! **sole** distinguisher — there is no circle name, no per-circle salt, no
-//! founder, and no signed metadata record (F16, resolved 2026-05-26). Two
+//! founder, and no signed metadata record (resolved 2026-05-26). Two
 //! circles differ iff their entropy differs; a collision requires
 //! deliberately sharing the same phrase, which in the seed-key model *is*
 //! being the same circle.
@@ -45,7 +45,7 @@ pub const COT_KEY_LEN: usize = 32;
 /// **Not for real use.** It is published here as a *teaching example*, so the
 /// `cot_key` it derives is public knowledge and any circle built from it is
 /// public by construction. The client pre-fills it as the circle-creation
-/// placeholder (M11 surface) so a user can watch entropy → key derive locally,
+/// placeholder so a user can watch entropy → key derive locally,
 /// edit it, and see the key change — then clear it and type their own secret.
 /// It is **never auto-joined to a relay**: nothing is private, and nothing
 /// reaches the network, until the user supplies their own phrase. This is the

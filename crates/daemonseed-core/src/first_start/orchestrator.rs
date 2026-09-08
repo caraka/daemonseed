@@ -35,7 +35,7 @@ pub enum Sealed {}
 pub enum BackupVerified {}
 
 /// Terminal phase — display-name + bootstrap-relay chosen. The caller
-/// extracts [`SessionMaterials`] and hands them to the wire layer (M4a+).
+/// extracts [`SessionMaterials`] and hands them to the wire layer.
 pub enum Ready {}
 
 // ── Errors ───────────────────────────────────────────────────────────────
@@ -217,8 +217,8 @@ impl FirstStart<Welcome> {
         // (C36 / C14) fresh profile config.
         let profile_config = ProfileConfig::new_for_first_start(argon2_params);
 
-        // (C3) at-rest blob. Derive the cached at-rest key once (M13
-        // write-through) and seal with it, so the stashed `SealingKey` is
+        // (C3) at-rest blob. Derive the cached at-rest key once and seal with it, so the stashed
+        // `SealingKey` is
         // byte-identical to the key that produced `blob_bytes` — the running
         // client re-seals on each mutation without re-running Argon2id. The
         // share-index key falls out of the same Argon2id run.
@@ -335,7 +335,7 @@ impl FirstStart<Welcome> {
         .map_err(FirstStartError::RecoveryFile)?;
 
         // (C3) re-seal the at-rest blob under the new profile_id. Derive the
-        // cached at-rest key once (M13 write-through) and seal with it so the
+        // cached at-rest key once and seal with it so the
         // stashed `SealingKey` matches `blob_bytes` byte-for-byte. The
         // share-index key is derived from the same Argon2id run, under
         // the new profile_id.
@@ -522,7 +522,7 @@ impl FirstStart<Ready> {
         &self.inner.recovery_file_bytes
     }
 
-    /// Consume self into the materials the wire layer (M4a+) opens with.
+    /// Consume self into the materials the wire layer opens with.
     pub fn into_session_materials(self) -> SessionMaterials {
         // Attach the chosen display name to the handle derived during
         // `initialize` (the mnemonic is gone by now, so the hash prefix comes
@@ -569,7 +569,7 @@ impl FirstStart<Ready> {
 // ── SessionMaterials ─────────────────────────────────────────────────────
 
 /// Outputs of a completed first-start, ready for the caller to persist to
-/// the profile root and hand off to the wire layer (M4a+).
+/// the profile root and hand off to the wire layer.
 #[derive(Debug)]
 pub struct SessionMaterials {
     pub profile_config: ProfileConfig,

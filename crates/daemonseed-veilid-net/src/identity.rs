@@ -131,7 +131,7 @@ pub fn owner_public_key(owner_public: &[u8; 32]) -> PublicKey {
 }
 
 /// The baked 32-byte Ed25519 public key owning the project-announce/MOTD DHT
-/// record (F17 / ISC-15, Phase 4 A1).
+/// record (ISC-15, Phase 4 A1).
 ///
 /// A client needs this and nothing else to address, read, watch and verify that
 /// record — [`owner_public_key`] turns it into the VLD0 `PublicKey`
@@ -141,7 +141,7 @@ pub fn owner_public_key(owner_public: &[u8; 32]) -> PublicKey {
 /// It lives in this crate rather than in `daemonseed-core` for two reasons. Ed25519
 /// is a transport-layer concern — `daemonseed-core` has no ed25519 dependency and
 /// gains none — so this is the only crate that can derive the value at all. And the
-/// transport-owner key is deliberately domain-separated from the F17 content-signing
+/// transport-owner key is deliberately domain-separated from the content-signing
 /// key: they descend from one project seed through different derivations, so keeping
 /// them in different crates matches a split the design already enforces.
 ///
@@ -156,7 +156,7 @@ pub const PROJECT_ANNOUNCE_OWNER_PUBKEY: [u8; 32] = [
     0x05, 0x4a, 0x57, 0xb1, 0xda, 0x76, 0x45, 0xc0, 0x5d, 0xb4, 0x3a, 0x32, 0x6e, 0xed, 0xe3, 0x1c,
 ];
 
-// ── What the operator instance holds (F17 / ISC-15) ──────────────────────────
+// ── What the operator instance holds (ISC-15) ──────────────────────────
 
 /// The operator instance's credential: the project-announce signing keypair and the
 /// announce record's owner seed, both derived from one runtime-loaded project

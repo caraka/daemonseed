@@ -14,8 +14,7 @@
 //!
 //! Per ISC-A-C19 those two paths are exhaustive. No mDNS / DHT / broadcast
 //! / introducer-without-a-relay handshake. The selected entry is persisted
-//! to `daemonseed.toml` and is what step 7 will hand to the wire layer
-//! (M4a+).
+//! to `daemonseed.toml` and is what step 7 will hand to the wire layer.
 
 mod anchor;
 

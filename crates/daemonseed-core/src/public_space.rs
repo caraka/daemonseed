@@ -172,9 +172,9 @@ impl FromStr for WhitelistEntry {
     }
 }
 
-// ── Project-announce signer (F17 / ISC-15) ───────────────────────────────
+// ── Project-announce signer (ISC-15) ───────────────────────────────
 
-/// The baked ML-DSA-87 public key of the project-announce signer (F17 / ISC-15).
+/// The baked ML-DSA-87 public key of the project-announce signer (ISC-15).
 ///
 /// Held as a separate binary file rather than an array literal because it is
 /// `ml_dsa::PK_LEN` bytes: the file is the artifact a reader diffs and a rotation
@@ -190,11 +190,11 @@ impl FromStr for WhitelistEntry {
 const PROJECT_ANNOUNCE_PUBKEY: [u8; ml_dsa::PK_LEN] =
     *include_bytes!("project_announce_pubkey.bin");
 
-/// The full ML-DSA-87 public key of the project-announce signer (F17 / ISC-15).
+/// The full ML-DSA-87 public key of the project-announce signer (ISC-15).
 ///
 /// This entry is merged into every [`Whitelist`] regardless of the operator's
 /// whitelist file, and there is no file syntax that removes it — that
-/// non-removability is the whole point of F17 (a self-host operator cannot
+/// non-removability is the whole point of (a self-host operator cannot
 /// silence project announce announcements). Returns the baked
 /// `PROJECT_ANNOUNCE_PUBKEY`: no derivation runs, so this needs no operational
 /// oxicrypt module and cannot fail.
@@ -220,7 +220,7 @@ pub const PROJECT_ANNOUNCE_SEED_FILENAME: &str = "project-announce.seed";
 
 redacted_secret_newtype! {
     /// The project-announce seed: the one secret from which the project-announce
-    /// signing key and the announce record's owner seed both descend (F17 / ISC-15).
+    /// signing key and the announce record's owner seed both descend (ISC-15).
     ///
     /// Held only by the operator instance, which loads it at runtime through
     /// [`ProjectAnnounceSeedSource`]; every other instance holds the two derived
@@ -563,7 +563,7 @@ pub const PROJECT_ANNOUNCE_VEILID_OWNER_SEED_LEN: usize = 32;
 redacted_secret_newtype! {
     /// The project-announce channel's Veilid **rendezvous-owner** seed (Phase 4 A1) —
     /// the DHT write-gate for the single project announcements/MOTD channel (A0). A
-    /// **sibling** of the F17 content-signing key: both derive from the one
+    /// **sibling** of the content-signing key: both derive from the one
     /// maintainer-held project-announce seed, but the content key uses it as an ML-DSA
     /// seed directly while this HKDF-expands it under a distinct label
     /// ([`info::PROJECT_ANNOUNCE_VEILID_OWNER`]), so transport-owner and
@@ -602,7 +602,7 @@ impl std::error::Error for AnnounceOwnerError {}
 ///       info = "daemonseed/veilid/project-announce-owner")
 /// ```
 ///
-/// Domain-separated from the F17 content-signing key (which uses `project_seed`
+/// Domain-separated from the content-signing key (which uses `project_seed`
 /// as an ML-DSA seed directly), so a holder of one cannot derive the other. The
 /// project seed is not in the source tree: the operator instance loads it at
 /// runtime ([`ProjectAnnounceSeedSource`]) and reaches this through
@@ -790,7 +790,7 @@ impl AnnounceFreshness {
 }
 
 /// The operator's signer whitelist (ISC-S8), plus the always-present
-/// project-announce entry (F17 / ISC-15).
+/// project-announce entry (ISC-15).
 ///
 /// Authorization is the cheap gate run before any signature verification
 /// (ISC-12): an unknown key never reaches the ML-DSA verify path.
@@ -801,7 +801,7 @@ pub struct Whitelist {
 
 impl Whitelist {
     /// Build a whitelist from the operator's parsed file entries. The
-    /// project-announce entry (F17) is *not* stored here — it is checked
+    /// project-announce entry  is *not* stored here — it is checked
     /// unconditionally by [`Self::authorizes`], so no operator file content can
     /// remove it.
     pub fn from_entries(entries: Vec<WhitelistEntry>) -> Self {
@@ -816,12 +816,12 @@ impl Whitelist {
 
     /// Whether `pubkey` is authorized to sign posts / MOTDs (ISC-12 / ISC-S8).
     ///
-    /// The project-announce key (F17) is always authorized. For operator
+    /// The project-announce key  is always authorized. For operator
     /// entries: a `FullKey` matches by exact bytes; a `Handle` matches by
     /// hash-prefix against the arriving key (ISC-12), which is computed without
     /// touching the signature.
     pub fn authorizes(&self, pubkey: &[u8]) -> Result<bool, OxicryptError> {
-        // F17: the project-announce signer is always authorized, regardless of
+        // The project-announce signer is always authorized, regardless of
         // the operator's file (ISC-15).
         if pubkey == project_announce_pubkey().as_slice() {
             return Ok(true);
@@ -1355,7 +1355,7 @@ mod tests {
         assert!(!wl.authorizes(stranger.public_key()).unwrap());
     }
 
-    /// ISC-15 / F17: the project-announce signer is authorized even when the
+    /// ISC-15: the project-announce signer is authorized even when the
     /// operator's whitelist file is empty — it can't be removed.
     #[test]
     fn project_announce_signer_authorized_with_empty_file() {
@@ -1423,7 +1423,7 @@ mod tests {
         );
     }
 
-    // ── the operator's runtime seed (F17 / ISC-15) ─────────────────────────
+    // ── the operator's runtime seed (ISC-15) ─────────────────────────
 
     /// A fixed test seed, its hex form, and the public key it derives — the
     /// expectation a load is checked against, built the way a rotation would build
@@ -1836,7 +1836,7 @@ mod tests {
         assert_ne!(a.as_bytes(), other.as_bytes());
     }
 
-    /// A1 domain separation — the announce owner seed is a SIBLING of the F17
+    /// A1 domain separation — the announce owner seed is a SIBLING of the
     /// content-signing key: derived from the SAME project seed but disjoint, so a
     /// holder of the owner seed cannot recover the content-signing key material and
     /// vice versa. (The content key uses the seed as an ML-DSA seed directly; the

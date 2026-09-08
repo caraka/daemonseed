@@ -2,7 +2,7 @@
 //!
 //! A public room is the **public tier** of the public-vs-circle bifurcation
 //! (ISC-S4), built over the exact same `CircleOfTrust.Subscribe` live relay and
-//! `CotFrame` mechanism as a circle (M8 / ISC-S20). The only differences from a
+//! `CotFrame` mechanism as a circle (ISC-S20). The only differences from a
 //! circle are *who holds the key* and *how authorship is established*:
 //!
 //! - **A public room is a circle-of-trust the server is a member of (ISC-S22 /

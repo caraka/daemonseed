@@ -1,5 +1,5 @@
 //! Persistent landing zone for *fetched* share content — explicit downloads
-//! (M15 C; ISC-C63 / ISC-C64 / ISC-C65, ISC-A-C31 / ISC-A-C32).
+//! (ISC-C63 / ISC-C64 / ISC-C65, ISC-A-C31 / ISC-A-C32).
 //!
 //! The share-fetch path ([`crate::share_envelope`], the TUI `FetchShare` net
 //! actor) verifies every chunk against its content address (ISC-S28 /
@@ -8,7 +8,7 @@
 //! a per-share folder the user can open — no content-addressed store, no manual
 //! extract step.
 //!
-//! ## At-rest posture — plaintext named downloads (M15 cleanup, 2026-06-06)
+//! ## At-rest posture — plaintext named downloads
 //!
 //! A fetched chunk is a **plaintext byte run of a shared file** as the sharer
 //! indexed it (since M16 a file is split into fixed

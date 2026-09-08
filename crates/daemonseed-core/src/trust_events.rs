@@ -1814,7 +1814,7 @@ mod tests {
         ));
     }
 
-    /// The audit log path is `<root>/trust-events.log` (F24).
+    /// The audit log path is `<root>/trust-events.log`.
     #[test]
     fn audit_log_path_is_profile_root_file() {
         let p = audit_log_path(Path::new("/profiles/alice"));

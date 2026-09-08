@@ -30,7 +30,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 /// Canonical config filename. Uniform across all three discovery paths per
-/// the F19 finding fix.
+/// the finding fix.
 pub const CONFIG_FILENAME: &str = "daemonseed.toml";
 
 /// Inputs to [`resolve`]. Future flags land here without touching the

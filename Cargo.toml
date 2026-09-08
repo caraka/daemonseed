@@ -169,12 +169,12 @@ dirs = "5"
 # CSPRNG entry point for mnemonic entropy and profile-id generation.
 getrandom = "0.3"
 # Embedded pure-Rust KV store — the redb-backed indexed-state layer of the
-# three-layer storage split (M8 share index, ISC-C21). daemonseed encrypts each
+# three-layer storage split (ISC-C21). daemonseed encrypts each
 # value (AES-256-GCM) before storing it (ISC-A-C6); redb itself holds opaque
 # bytes. Pure Rust, no C — preserves the no-C-dependencies constraint.
 redb = "2"
 # Cross-platform filesystem-event watcher (inotify / FSEvents /
-# ReadDirectoryChangesW) for the live share indexer (M8, ISC-C21 / ISC-20).
+# ReadDirectoryChangesW) for the live share indexer (ISC-C21 / ISC-20).
 # Pure Rust (the platform backends are syscall bindings, no bundled C).
 notify = "6"
 # PTY-backed subprocess control for the M11 MVP-gate harness — the only thing

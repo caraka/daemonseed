@@ -1,4 +1,4 @@
-//! Introducer-discovered peers (M12, gate step 6 — client side).
+//! Introducer-discovered peers (client side).
 //!
 //! A relay's introducer answer is **discovery only**: it carries
 //! `(server-id, address)` pairs, never keys (ISC-S6). Recording one here is a

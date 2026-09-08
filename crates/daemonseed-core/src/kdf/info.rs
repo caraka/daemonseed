@@ -4,7 +4,7 @@
 //! (or as a function emitting a deterministic string from runtime
 //! parameters). The byte content of these strings is part of the protocol
 //! contract: changing any of them silently breaks identity continuity and
-//! cross-version interop. Wire-visible regression tests (M4a / D5 §5)
+//! cross-version interop. Wire-visible regression tests (D5 §5)
 //! byte-compare these constants against the published spec.
 //!
 //! Naming convention: `daemonseed/<area>/<subject>[/<discriminator>]`.
@@ -153,7 +153,7 @@ pub const IDENTITY_PROOF_V1: &str = "daemonseed/identity-proof/v1";
 /// HKDF salt for the circle-of-trust key derivation (ISC-C8). A **fixed
 /// protocol constant**, never a per-circle value — per-circle uniqueness
 /// comes entirely from the shared entropy (the IKM), so two circles differ
-/// iff their entropy differs (F16: no per-circle salt, no circle name).
+/// iff their entropy differs (no per-circle salt, no circle name).
 pub const CIRCLE_KEY_SALT: &[u8] = b"daemonseed/v1/circle-key";
 
 /// HKDF info-string template for the circle-of-trust key (ISC-C8). The
@@ -287,18 +287,18 @@ pub fn public_room_share_veilid_owner(family: &str, room: &str) -> String {
         .replace("{room}", room)
 }
 
-// ── Project announce channel (F17 / A0/A1) ──────────────────────────────────
+// ── Project announce channel (A0/A1) ────────────────────────────────────────
 
 /// HKDF salt for the project-announce Veilid rendezvous-owner seed (Phase 4 A1).
-/// A fixed protocol constant. The IKM is the maintainer-held project-announce seed
-/// (F17), so the owner keypair — the DHT write-gate for the single project
+/// A fixed protocol constant. The IKM is the maintainer-held project-announce
+/// seed, so the owner keypair — the DHT write-gate for the single project
 /// announcements/MOTD channel (A0) — is NON-derivable by clients (they hold only
 /// the derived owner pubkey). A distinct salt so the announce owner can never
 /// collide with a circle/room owner or the content-signing key.
 pub const PROJECT_ANNOUNCE_OWNER_SALT: &[u8] = b"daemonseed/v1/project-announce-owner";
 
 /// HKDF info string for the project-announce Veilid rendezvous-owner seed (Phase 4
-/// A1). A **sibling** of the F17 content-signing key: both derive from the one
+/// A1). A **sibling** of the content-signing key: both derive from the one
 /// maintainer-held project-announce seed, but the content key uses the seed as an
 /// ML-DSA seed directly while this HKDF-expands it under this label — so
 /// transport-owner and content-signing material are domain-separated (possessing
@@ -316,7 +316,7 @@ mod tests {
     /// derived key. Edit only after reading ISC-C1 / ISC-C3 / ISC-C30 / etc.
     /// and updating the corresponding spec entry.
     ///
-    /// Wire-visible regression test (M4a, D5 §5) will reference these same
+    /// Wire-visible regression test (D5 §5) will reference these same
     /// expected literals.
     #[test]
     fn identity_info_strings_are_pinned() {

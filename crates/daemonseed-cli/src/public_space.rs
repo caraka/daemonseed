@@ -11,7 +11,7 @@
 //!   terminal.
 //! - [`select_rating`] — choose a rating from the *active server's* taxonomy
 //!   (ISC-30); a choice outside that taxonomy is rejected, which is the
-//!   public-space half of active-server scoping (ISC-31 / F20 — the active
+//!   public-space half of active-server scoping (ISC-31 — the active
 //!   server is the connected host).
 //! - [`filter_shares_by_rating`] — the rating filter predicate (ISC-32 /
 //!   ISC-A-C5), applied both when rendering a listing and when fetching it

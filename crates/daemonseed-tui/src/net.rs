@@ -197,7 +197,7 @@ pub enum NetCommand {
     /// into the message so peers render the display name, not the floor (parity
     /// with `SendChat`). The relay never sees it in cleartext (ISC-A-S16).
     SendPublicRoom { body: String, sender_handle: String },
-    /// Define (activate) a local share root (M14, ISC-C21 / ISC-A-C7). Opens
+    /// Define (activate) a local share root (ISC-C21 / ISC-A-C7). Opens
     /// the redb `ShareIndex` at `index_path` under `index_key` (the
     /// share-index key derived as a sibling of the at-rest key — the actor never
     /// re-derives it), retains it for foreground queries, and runs a cold scan
@@ -281,8 +281,8 @@ pub enum NetCommand {
     /// withdrawn policy emits a [`NetEvent::DeprecationError`] plus the matching
     /// trust event and leaves the cached warnings in place.
     RefreshDeprecation,
-    /// Initiate a share fetch from the connected relay (ISC-19, F23 unified
-    /// mechanism). Derives the public-share asset address from `share_id` +
+    /// Initiate a share fetch from the connected relay (ISC-19). Derives the public-share
+    /// asset address from `share_id` +
     /// the connected server-id, opens a new bidi `CircleOfTrust.Subscribe`
     /// stream over the existing `AppSession`, sends a `ManifestRequest`, and
     /// reads a `ManifestResponse` for the A1 preview (the download itself is
@@ -296,7 +296,7 @@ pub enum NetCommand {
     /// manifest. `fetched_root` is the on-disk landing zone (the binary supplies
     /// `<profile-root>/fetched`); on a fully-verified fetch the actor persists
     /// every file there via `FetchedStore` and emits a fresh
-    /// [`NetEvent::FetchedShares`] (M15 C; ISC-C63 / C64). A fetch that fails
+    /// [`NetEvent::FetchedShares`] (ISC-C63 / C64). A fetch that fails
     /// verification never persists (ISC-A-C31).
     FetchShare {
         share_id: String,
@@ -309,8 +309,8 @@ pub enum NetCommand {
     /// stream and requests every chunk of the selected files (`selected = None`
     /// downloads every file; `Some(indices)` downloads only those manifest
     /// rows — the A2 selective path), verifying each chunk against its content
-    /// address and streaming it to the destination file as it arrives (M16,
-    /// ISC-C73 / ISC-A-C35 — never a whole file in RAM). A 30s inactivity
+    /// address and streaming it to the destination file as it arrives (ISC-C73 /
+    /// ISC-A-C35 — never a whole file in RAM). A 30s inactivity
     /// timeout aborts a silent hang; an abort deletes the fetch's partial
     /// files (ISC-A-C31). Terminal state is `NetEvent::FetchComplete` or
     /// `NetEvent::FetchError`.
@@ -338,11 +338,11 @@ pub enum NetCommand {
         root_kind: RootKind,
     },
     /// List the fetched shares recorded under `fetched_root` for the browse
-    /// pane (M15 C; ISC-C64). Emits a [`NetEvent::FetchedShares`] snapshot
+    /// pane (ISC-C64). Emits a [`NetEvent::FetchedShares`] snapshot
     /// (empty if nothing has been fetched).
     ListFetched { fetched_root: PathBuf },
     /// Refresh the introducer-discovered candidate peers for the Servers pane
-    /// (M12 gate step 6, ISC-C22 / ISC-S6 / ISC-A-C19). Ask the connected
+    /// (ISC-C22 / ISC-S6 / ISC-A-C19). Ask the connected
     /// relay's `FederationIntroducer` for its peer list over the live
     /// `AppSession` and merge the result into the actor's `DiscoveredPeers`
     /// cache as candidates, then emit the candidate `(server_id, address)`
@@ -372,7 +372,7 @@ pub enum NetCommand {
         ack: std::sync::mpsc::SyncSender<()>,
     },
     /// Publish a defined share to the connected relay and serve its content
-    /// from disk (D, M15 → serve-from-disk, M16; ISC-S27 / ISC-S29 / F25).
+    /// from disk (D, M15 → serve-from-disk, M16; ISC-S27 / ISC-S29).
     /// Hashes `root` into a manifest on a dedicated blocking thread —
     /// `cached_or_hash` reuses redb-cached chunk addresses when the actor's
     /// single-active `ShareIndex` is for this root, hashing only the misses —
@@ -394,7 +394,7 @@ pub enum NetCommand {
         /// see the sharer's name, not "(operator)".
         sharer_handle: String,
     },
-    /// Cancel an in-flight publish hash for `root` (M16 serve-from-disk).
+    /// Cancel an in-flight publish hash for `root`.
     /// Sets that publish's cancel flag so the blocking `cached_or_hash`
     /// returns `ServeError::Cancelled` at its next per-file check and the
     /// publish flow emits `NetEvent::PublishCancelled` instead of proceeding
@@ -445,7 +445,7 @@ pub struct ShareManifestEntry {
     pub rel_path: String,
     pub size: u64,
     /// How many [`daemonseed_core::share_serve::CHUNK_SIZE`] chunks the file's
-    /// bytes span (M16, ISC-C73 / ISC-A-C35) — `manifest.chunks.len()`, so an
+    /// bytes span (ISC-C73 / ISC-A-C35) — `manifest.chunks.len()`, so an
     /// empty file is `0`. The app sums this over the selected files to seed
     /// the chunk-granular progress gauge before the net actor's authoritative
     /// first `FetchProgress` arrives.
@@ -493,7 +493,7 @@ pub enum NetEvent {
     /// assigned at join (ISC-C62) — never transmitted.
     ///
     /// `entropy` is the exact phrase string the actor derived this circle's
-    /// `cot_key` from (M13 persistence keystone, ISC-C59): re-sending it as a
+    /// `cot_key` from (ISC-C59): re-sending it as a
     /// future [`NetCommand::JoinCircle`] re-derives the same key deterministically,
     /// so it is the sufficient persisted seed. It travels only on this in-process
     /// actor→UI channel, never on the wire.
@@ -566,7 +566,7 @@ pub enum NetEvent {
     /// rendering surfaces this on the status line; the cached snapshot is
     /// left in place so the user keeps seeing the last known state.
     SharesError { message: String },
-    /// A standalone indexer-status transition (M14, ISC-20 / ISC-A-C7): emitted
+    /// A standalone indexer-status transition (ISC-20 / ISC-A-C7): emitted
     /// when a share is defined (`Indexing`) and when its background cold scan
     /// finishes (`Ready`), without a full `SharesSnapshot`. The app folds it
     /// straight into its indexer-status line; the My-shares rows refresh via the
@@ -625,7 +625,7 @@ pub enum NetEvent {
         entries: Vec<ShareManifestEntry>,
     },
     /// Progress on an active share fetch (ISC-19). Chunk-granular over the
-    /// SELECTED set (M16, ISC-C73 / ISC-A-C35): `total_chunks` counts every
+    /// SELECTED set (ISC-C73 / ISC-A-C35): `total_chunks` counts every
     /// 1 MiB chunk of every selected file, not the file count. `None` only
     /// while the fetcher is still waiting on the `ManifestResponse`; `Some(N)`
     /// from the first confirm-side emit on. Emitted once when the download
@@ -637,7 +637,7 @@ pub enum NetEvent {
     },
     /// The share fetch completed: every chunk of every selected file was
     /// verified and streamed to its named destination file. `files_written`
-    /// counts FILES (M16 — no longer == chunks); `bytes_written` is the total
+    /// counts FILES (no longer == chunks); `bytes_written` is the total
     /// verified bytes on disk.
     FetchComplete {
         share_id: String,
@@ -652,12 +652,12 @@ pub enum NetEvent {
     /// disk (ISC-A-C31 posture, now applied to streamed writes). The overlay
     /// marks the fetch failed and waits for the user to dismiss.
     FetchError { message: String },
-    /// A fresh snapshot of the fetched shares recorded on disk (M15 C;
-    /// ISC-C64). Emitted after a successful fetch persists, and in response to
+    /// A fresh snapshot of the fetched shares recorded on disk (ISC-C64). Emitted after a
+    /// successful fetch persists, and in response to
     /// `NetCommand::ListFetched`. Replaces the browse pane's list wholesale.
     FetchedShares { shares: Vec<FetchedShare> },
-    /// A fresh introducer-discovery snapshot for the Servers pane (M12 gate
-    /// step 6, ISC-C22 / ISC-S6 / ISC-A-C19). `candidates` is the full current
+    /// A fresh introducer-discovery snapshot for the Servers pane (ISC-C22 / ISC-S6 /
+    /// ISC-A-C19). `candidates` is the full current
     /// set of introducer-learned peers that are NOT already in the active trust
     /// set, each as a `(server_id, address)` pair. Server-id + address ONLY —
     /// the introducer response carries no key material (ISC-S6), so neither
@@ -687,7 +687,7 @@ pub enum NetEvent {
         name: String,
         file_count: usize,
     },
-    /// Per-file progress on an in-flight publish hash (M16 serve-from-disk).
+    /// Per-file progress on an in-flight publish hash.
     /// Emitted from the blocking `cached_or_hash` thread once per file
     /// (`done` strictly advances — the throttle), so the app can render a
     /// "hashing N/M" status and offer `[u]` as the cancel affordance while the

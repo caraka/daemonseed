@@ -4,7 +4,7 @@
 //! server per ISC-A-S2 — the federation surface never sees which circles
 //! exist, who is a member, or any per-circle parameters in cleartext.
 //!
-//! **Circles are flat and metadata-free** (F16, resolved 2026-05-26). A
+//! **Circles are flat and metadata-free** (resolved 2026-05-26). A
 //! circle is defined solely by its shared entropy: there is no founder, no
 //! signed circle-metadata record, and no per-circle minimum-suite policy.
 //! The shared phrase is both the sole circle secret and the sole
@@ -25,7 +25,7 @@ use crate::handle::display_name::{DisplayNameRng, generate_display_name};
 /// rendezvous [`AssetAddr`]. Deterministic — the same address always yields the same
 /// label, so a re-join is recognisable — while the label never leaves the client and
 /// is derived only from the public rendezvous address, never from members or the
-/// secret phrase (ISC-A-S2: circles are anonymous to the server and metadata-free, F16).
+/// secret phrase (ISC-A-S2: circles are anonymous to the server and metadata-free).
 ///
 /// This is the canonical home shared by the TUI and the GUI; neither reimplements it.
 /// An `adj-noun` pair indexed by the address bytes is the default; `#circle` is the

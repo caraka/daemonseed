@@ -4,7 +4,7 @@
 //! enrollment flow. The ordering invariant is **identity-recoverable-
 //! before-identity-exposed** (ISC-A-C15): no method on any state can
 //! initiate a network connection, and the [`Ready`] terminal — the only
-//! state that yields [`SessionMaterials`] for the wire layer (M4a+) — is
+//! state that yields [`SessionMaterials`] for the wire layer — is
 //! reachable only via [`Sealed`] → [`BackupVerified`] → [`Ready`].
 //!
 //! Phases (each `Sealed → BackupVerified → Ready` transition consumes the

@@ -22,7 +22,7 @@
 //! the reject would carry ([`DeprecationEntry`]) is in the policy. See
 //! [`DeprecationPolicy::is_past_cutoff`] and [`DeprecationPolicy::entry_for`].
 //!
-//! ## F30 — warn-before-cutoff guarantee
+//! ## — warn-before-cutoff guarantee
 //!
 //! Clients cache the policy for [`CACHE_TTL`] (ISC-C25, one hour). To guarantee
 //! a client refreshes and sees a cutoff *before* it hits, the server refuses to
@@ -76,7 +76,7 @@ pub enum PolicyError {
     Decode,
     /// A `suite_id` in the policy was a reserved sentinel.
     SuiteId(SuiteIdError),
-    /// Server-side construction (F30): a cutoff is sooner than [`MIN_CUTOFF_LEAD`].
+    /// Server-side construction: a cutoff is sooner than [`MIN_CUTOFF_LEAD`].
     CutoffTooSoon {
         /// The offending suite.
         suite_id: SuiteId,
@@ -104,7 +104,7 @@ impl core::fmt::Display for PolicyError {
             PolicyError::CutoffTooSoon { suite_id, lead_ms } => write!(
                 f,
                 "cutoff for suite {suite_id} is only {lead_ms} ms out; \
-                 minimum lead is {} ms (F30)",
+                 minimum lead is {} ms",
                 MIN_CUTOFF_LEAD.as_millis()
             ),
             PolicyError::Signature => write!(f, "deprecation policy signature did not verify"),
@@ -119,7 +119,7 @@ impl core::fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {}
 
 impl DeprecationPolicy {
-    /// Server-side construction. Validates F30 lead time for every entry
+    /// Server-side construction. Validates lead time for every entry
     /// against `now_ms` (signing time). Returns [`PolicyError::CutoffTooSoon`]
     /// for the first entry whose cutoff is sooner than [`MIN_CUTOFF_LEAD`].
     pub fn build(
@@ -131,7 +131,7 @@ impl DeprecationPolicy {
         let min_lead = MIN_CUTOFF_LEAD.as_millis() as i64;
         for e in &entries {
             // Saturating: a pathological operator-config cutoff (e.g. i64::MIN)
-            // must fail the F30 guard cleanly, never panic or wrap to a bogus
+            // must fail the guard cleanly, never panic or wrap to a bogus
             // positive lead.
             let lead = e.cutoff_unix_ms.saturating_sub(now_ms);
             if lead < min_lead {
@@ -184,7 +184,7 @@ impl DeprecationPolicy {
     }
 
     /// Client-side decode from a signed payload. Validates that every suite id
-    /// is in range; does **not** re-check F30 (clients honor what they are
+    /// is in range; does **not** re-check (clients honor what they are
     /// served).
     pub fn from_signed_payload(bytes: &[u8]) -> Result<Self, PolicyError> {
         let payload =
@@ -383,7 +383,7 @@ mod tests {
         SignKeypair::from_ml_dsa_seed(&[7u8; 32]).unwrap()
     }
 
-    /// F30: a cutoff at least 2x the cache TTL out is accepted.
+    /// A cutoff at least 2x the cache TTL out is accepted.
     #[test]
     fn build_accepts_cutoff_with_sufficient_lead() {
         let now = 1_000_000_000_000;
@@ -397,7 +397,7 @@ mod tests {
         assert_eq!(policy.entries().len(), 1);
     }
 
-    /// F30: a cutoff sooner than 2x the cache TTL is refused at construction.
+    /// A cutoff sooner than 2x the cache TTL is refused at construction.
     #[test]
     fn build_refuses_cutoff_too_soon() {
         let now = 1_000_000_000_000;
@@ -410,7 +410,7 @@ mod tests {
         assert!(matches!(err, PolicyError::CutoffTooSoon { .. }));
     }
 
-    /// F30: a cutoff already in the past is refused (negative lead).
+    /// A cutoff already in the past is refused (negative lead).
     #[test]
     fn build_refuses_past_cutoff() {
         let now = 1_000_000_000_000;
@@ -426,7 +426,7 @@ mod tests {
         }
     }
 
-    /// F30 guard must not panic or wrap on a pathological extreme cutoff —
+    /// guard must not panic or wrap on a pathological extreme cutoff —
     /// `i64::MIN` saturates to a hugely-negative lead and is refused cleanly.
     #[test]
     fn build_handles_extreme_cutoff_without_overflow() {

@@ -73,7 +73,7 @@ fn main() -> io::Result<()> {
         }
     };
 
-    // Where fetched shares land as named files (M15 C, downloads cleanup):
+    // Where fetched shares land as named files (downloads cleanup):
     // `--portable` keeps everything self-contained under the CWD profile root;
     // otherwise downloads go to the OS Downloads directory, namespaced under a
     // `daemonseed/` subfolder so the per-share folders + manifest stay tidy.

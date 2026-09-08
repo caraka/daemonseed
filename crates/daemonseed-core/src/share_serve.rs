@@ -14,7 +14,7 @@
 //! [`ShareContent`] is that reusable serve side, factored out of the test:
 //!
 //! 1. [`ShareContent::index_dir`] walks a directory, reads each regular file,
-//!    splits it into fixed [`CHUNK_SIZE`] chunks (M16 — see below), stores
+//!    splits it into fixed [`CHUNK_SIZE`] chunks (see below), stores
 //!    each chunk in a [`crate::storage::cas::MemoryChunkStore`], and records
 //!    a [`ManifestEntry`] per file carrying the **ordered** per-chunk address
 //!    list. Each address is `SHA-384(chunk-bytes)` — the same content address
@@ -54,7 +54,7 @@
 //! forward passes the fetcher's re-derived-hash verification; a relay that
 //! tampers with the bytes in flight fails it (ISC-A-S20, proved fetcher-side).
 //!
-//! ## Sub-file fixed-size chunking (M16 — ISC-C73 / ISC-A-C35)
+//! ## Sub-file fixed-size chunking (ISC-C73 / ISC-A-C35)
 //!
 //! The alpha's chunk == whole file put an entire file's bytes into ONE
 //! `ChunkResponse`, hence one gRPC frame: an 8.9 MB file exceeded tonic's
@@ -109,7 +109,7 @@ use crate::storage::cas::{
     CHUNK_ADDR_LEN, CasError, ChunkAddr, ChunkStore, MemoryChunkStore, chunk_addr,
 };
 
-/// Fixed share-chunk size: 1 MiB (M16 — ISC-C73 / ISC-A-C35). Every file is
+/// Fixed share-chunk size: 1 MiB (ISC-C73 / ISC-A-C35). Every file is
 /// split into chunks of exactly this many bytes (only the last chunk of a
 /// file may be short), and one chunk rides in one `ChunkResponse`, hence one
 /// gRPC frame. This MUST stay well under tonic's default 4 MB per-message
@@ -120,8 +120,8 @@ use crate::storage::cas::{
 /// (the exact 8.9 MB-file failure that motivated M16 chunking).
 pub const CHUNK_SIZE: usize = 1024 * 1024;
 
-/// The largest encoded `ManifestResponse` a publisher may put on the wire
-/// (M16 design review). [`CHUNK_SIZE`] keeps every *content* frame under
+/// The largest encoded `ManifestResponse` a publisher may put on the wire. [`CHUNK_SIZE`] keeps
+/// every *content* frame under
 /// tonic's default 4 MiB (4_194_304 bytes) per-message decode cap at the
 /// relay — but the MANIFEST frame itself grows with file count (~62 bytes +
 /// path per entry), so a file-count-dense share (a music library is exactly
@@ -225,7 +225,7 @@ impl core::error::Error for ServeError {
 
 impl ShareContent {
     /// Walk `root`, chunk every regular file beneath it into the content store
-    /// in fixed [`CHUNK_SIZE`] pieces (M16 — ISC-C73 / ISC-A-C35), and build
+    /// in fixed [`CHUNK_SIZE`] pieces (ISC-C73 / ISC-A-C35), and build
     /// the manifest (one entry per file, ordered per-chunk addresses; an
     /// empty file gets `chunks: []`). The manifest's `rel_path` is the file's
     /// path relative to `root`, using `/` separators on every platform so the
@@ -371,7 +371,7 @@ pub struct ShareManifest {
 /// Walk `root`, hashing every regular file beneath it into a [`ShareManifest`]
 /// **without ever holding a whole file in memory** — each file is read one
 /// [`CHUNK_SIZE`] buffer at a time, and each buffer-load IS one chunk, hashed
-/// to its own SHA-384 address (M16 — ISC-C73 / ISC-A-C35). The resulting
+/// to its own SHA-384 address (ISC-C73 / ISC-A-C35). The resulting
 /// per-chunk addresses are byte-identical to what [`ShareContent::index_dir`]
 /// (via `MemoryChunkStore::put`) derives for the same chunk bytes, so
 /// fetch-side verification is unchanged (ISC-S28).
@@ -417,7 +417,7 @@ pub fn hash_share(
 /// holds every file's bytes in RAM, this reads a requested chunk's
 /// [`CHUNK_SIZE`]-bounded byte range from its one file at answer time, so
 /// serving a share costs O(CHUNK_SIZE) memory per request — never a whole
-/// file, never the whole share (M16, ISC-C73 / ISC-A-C35).
+/// file, never the whole share (ISC-C73 / ISC-A-C35).
 ///
 /// Each read applies cheap fail-closed checks only — a read error, or a
 /// length that no longer matches what the manifest entry implies for that
@@ -480,7 +480,7 @@ impl DiskShareContent {
     ///
     /// Deliberately **no serve-time re-hash**: the fetcher already
     /// re-derives SHA-384 over every `ChunkResponse` and fails closed on a
-    /// mismatch (M11, the file-side analog of `open_message` — ISC-S28), so
+    /// mismatch (the file-side analog of `open_message` — ISC-S28), so
     /// receiver-side verification is the integrity guarantee. Re-hashing
     /// here would cost a hash pass before every frame and catch nothing the
     /// receiver won't. The consequence, stated plainly: a **same-size**
@@ -570,7 +570,7 @@ pub(crate) fn share_rel_path(root: &Path, entry: &walkdir::DirEntry) -> String {
 }
 
 /// Stream one file into its ordered per-chunk addresses plus the total byte
-/// count actually read (M16 — ISC-C73 / ISC-A-C35). The file is read one
+/// count actually read (ISC-C73 / ISC-A-C35). The file is read one
 /// [`CHUNK_SIZE`] buffer at a time, and each **full** buffer-load is hashed
 /// as one chunk via [`crate::storage::cas::chunk_addr`] — exactly the digest
 /// `MemoryChunkStore::put` derives for the same chunk slice — so memory stays
@@ -812,7 +812,7 @@ mod tests {
         }
     }
 
-    // ── manifest frame budget (M16 design review) ──────────────────────────
+    // ── manifest frame budget ─────────────────────────────────────────────
 
     /// `manifest_frame_len`'s arithmetic equals the REAL encoder's output
     /// length, byte for byte, on a manifest exercising every entry shape:

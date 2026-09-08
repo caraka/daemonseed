@@ -98,7 +98,7 @@ pub fn generate_display_name<R: DisplayNameRng>(rng: &mut R) -> String {
 ///
 /// This is a permissive validator: it accepts any Unicode that survives the
 /// above constraints, including emoji and non-Latin scripts. Stricter
-/// per-server rules can apply on top via operator config (M4a+).
+/// per-server rules can apply on top via operator config.
 pub fn is_valid_display_name(s: &str) -> bool {
     !s.is_empty()
         && !s.contains('#')

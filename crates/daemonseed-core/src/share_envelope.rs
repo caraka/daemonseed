@@ -1,4 +1,4 @@
-//! Share-fetch envelope (M11 — ISC-19, F23 unified mechanism).
+//! Share-fetch envelope (ISC-19, unified mechanism).
 //!
 //! Public and CoT shares ride the **same** [`CircleOfTrust.Subscribe`][cot]
 //! bidirectional stream as chat circles. What rides inside `CotFrame.payload`
@@ -11,7 +11,7 @@
 //! - **CoT shares** (post-MVP) will carry [`ShareFrame::encode`] output further
 //!   sealed under a share-CoT key, using the same `seal_message`/`open_message`
 //!   pair already used for chat. **Same wire mechanism, additional encryption
-//!   layer — the unified-design property F23 pins.**
+//!   layer — the unified-design property pins.**
 //!
 //! Keeping the envelope in a [`Vec<u8>`] codec rather than a new proto message
 //! does two things at once:
@@ -74,7 +74,7 @@
 //!   the fetcher treats any decode failure as "this frame is foreign noise"
 //!   (same posture chat already takes per `open_message` returning `Err`).
 //!
-//! ## Chunk verification (ISC-19 / F23)
+//! ## Chunk verification (ISC-19)
 //!
 //! On every `ChunkResponse`, the fetcher MUST re-compute
 //! [`crate::storage::cas::chunk_addr`] over `data` and compare against the
@@ -100,7 +100,7 @@ pub struct ManifestEntry {
     /// integrity check is the per-chunk re-derived SHA-384 match on every
     /// [`ShareFrame::ChunkResponse`]).
     pub size: u64,
-    /// The file's **ordered** chunk addresses (M16 — ISC-C73 / ISC-A-C35).
+    /// The file's **ordered** chunk addresses (ISC-C73 / ISC-A-C35).
     /// The file's bytes are the concatenation of the chunks in this order;
     /// chunk `i` covers `[i*CHUNK_SIZE, min((i+1)*CHUNK_SIZE, size))` with
     /// [`crate::share_serve::CHUNK_SIZE`] fixed at 1 MiB, so only the last
@@ -485,7 +485,7 @@ mod tests {
         assert_eq!(ShareFrame::decode(&bytes), Err(DecodeError::Truncated));
     }
 
-    /// ISC-19 / F23: a fetcher verifies a ChunkResponse by recomputing the
+    /// ISC-19: a fetcher verifies a ChunkResponse by recomputing the
     /// SHA-384 of `data` and comparing against the frame's `chunk_addr`. A
     /// chunk forwarded byte-identically passes; a tampered chunk fails closed.
     #[test]

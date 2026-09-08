@@ -43,7 +43,7 @@ use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
 use daemonseed_veilid_net::dm::{DmCommand, DmEvent};
 use tokio::sync::mpsc;
 
-/// The wire-facing name for an auto-republished share (M16 restore path, #41):
+/// The wire-facing name for an auto-republished share (#41):
 /// the persisted [`daemonseed_core::storage::seeds::PublishedShare`] `name` when
 /// one was stored, else the root directory's basename, else `"share"`. Centralizes
 /// the choice both republish loops make so the persisted name is consumed

@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 license = "AGPL-3.0-or-later"
 publish = false
-description = "daemonseed cross-crate integration tests + ISC coverage registry (M0 scaffold; never published)"
+description = "daemonseed cross-crate integration tests + ISC coverage registry (scaffold; never published)"
 
 [lib]
 # Library target so `cargo xtask isc-coverage` can read the registry without

@@ -97,7 +97,7 @@ fn m3_iscs_exercise_end_to_end() {
 
     // ── ISC-A-C8: client refuses to write under a deprecated suite at
     // compose time (per ISC-A-C8 write-suite-policy). In the flat,
-    // metadata-free circle model (F16) there is no per-circle min-suite
+    // metadata-free circle model  there is no per-circle min-suite
     // record, so the policy is enforced two ways:
     //   (a) the WritePolicy gate refuses any non-Active-write lifecycle
     //       state under the default (sub-minimum / deprecated suites), and

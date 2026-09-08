@@ -376,7 +376,7 @@ mod tests {
         const _: () = assert!(CIRCLE_ENTROPY_MIN_BITS > SESSION_PASSPHRASE_MIN_BITS);
     }
 
-    // ── circle key-space estimator (M15, ISC-C9) ──────────────────────────
+    // ── circle key-space estimator (ISC-C9) ──────────────────────────
 
     /// 12 distinct BIP-39 words = 12 × 11 = 132 bits → clears the ≥128 floor.
     /// This is the recommended "generate-then-type" path.

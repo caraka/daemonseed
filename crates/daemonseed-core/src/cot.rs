@@ -1,4 +1,4 @@
-//! Circle-of-trust rendezvous addressing (M8 — ISC-8 / ISC-S4 / F23).
+//! Circle-of-trust rendezvous addressing (ISC-8 / ISC-S4).
 //!
 //! A circle's members exchange traffic through a *rendezvous address* on each
 //! relay they share. The circle key itself ([`crate::circle::key::CircleKey`])
@@ -94,7 +94,7 @@ pub fn asset_address(cot_key: &CircleKey, server_id: &[u8]) -> Result<AssetAddr,
     Ok(AssetAddr(out))
 }
 
-/// Derive a public share's rendezvous address on a given relay (ISC-19, F23
+/// Derive a public share's rendezvous address on a given relay (ISC-19
 /// unified mechanism):
 ///
 /// ```text
@@ -110,7 +110,7 @@ pub fn asset_address(cot_key: &CircleKey, server_id: &[u8]) -> Result<AssetAddr,
 /// server-visible by design). The CoT-share variant (post-MVP) will derive
 /// `SHA-384(share_cot_key || share_id || 0x00 || server_id)` and wrap each
 /// `ShareFrame` payload in an AEAD seal — same wire mechanism, additional
-/// secret + encryption layer (the unified-design property F23 pins).
+/// secret + encryption layer (the unified-design property pins).
 ///
 /// The `0x00` separator byte makes the `share_id` / `server_id` boundary
 /// unambiguous: without it, `share_id="foo", server_id="bar"` would collide
@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(AssetAddr::from_bytes(*addr.as_bytes()), addr);
     }
 
-    // ── Public-share asset address (ISC-19 / F23 unified mechanism) ──
+    // ── Public-share asset address (ISC-19) ──
 
     /// Determinism: same (share_id, server_id) → byte-identical address, so a
     /// fetcher and the sharer meet at the same point on the relay.

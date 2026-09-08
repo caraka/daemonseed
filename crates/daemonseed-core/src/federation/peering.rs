@@ -14,7 +14,7 @@
 use crate::handle::HASH_PREFIX_BYTES;
 
 /// Whether this server initiates the TOFU handshake against a peer, per the
-/// F31 tiebreaker (ISC-S12-8). The lexicographically-lower server-id hash
+/// tiebreaker (ISC-S12-8). The lexicographically-lower server-id hash
 /// prefix initiates; the other observes-and-confirms. Deterministic and
 /// antisymmetric — for two distinct prefixes exactly one side returns `true`.
 pub fn initiates_peer_tofu(

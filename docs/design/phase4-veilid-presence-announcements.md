@@ -145,10 +145,10 @@ pubkey); community identity has no automatic successor — the owner **pubkey** 
 human name is a local label, as with circles/rooms — ISC-C8).
 
 **Decision (2026-07-07): MVP ships Fork A only — a single PROJECT-owned channel.** Owner =
-the maintainer-held project key (the existing F17 `project_announce` anchor, ISC-15): a maintainer-held
-**offline** seed derives both the ML-DSA content-signing key (F17, already present) and a sibling
+the maintainer-held project key (the existing `project_announce` anchor, ISC-15): a maintainer-held
+**offline** seed derives both the ML-DSA content-signing key (already present) and a sibling
 Veilid owner keypair (the DHT write-gate); **only the two public keys are baked into clients** — the
-exact F17 model already in code ("the placeholder is replaced by a baked-in real release public key
+exact model already in code ("the placeholder is replaced by a baked-in real release public key
 whose secret stays offline"; the operator instance loads that seed at runtime and it is not in the
 tree). Clients derive
 the record address from the baked owner pubkey, read/watch/verify, and cannot write. MVP

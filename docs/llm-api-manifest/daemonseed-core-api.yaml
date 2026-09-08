@@ -31,9 +31,9 @@ library:
     crypto-agility primitives (suite registry + policy gate + deprecation),
     circle-of-trust key derivation, the connection type-state + identity-proof,
     federation trust, the trust-event taxonomy, reconnect backoff, @-mention
-    logic, the release trust anchor + multi-sig verify + update-lifecycle FSM
-    (M10 verifiable-core), the biometric + autostart opt-in scaffolds
-    (M10-completion), and the M13 at-rest persistence keystone — storage::seeds
+    logic, the release trust anchor + multi-sig verify + update-lifecycle FSM,
+    the biometric + autostart opt-in scaffolds, and the M13 at-rest persistence
+    keystone — storage::seeds
     now carries the display name + mute/hide lists + rejoinable circle set,
     re-sealed on each mutation via a cached SealingKey (no second Argon2id). The
     wire-protocol surface landed from M4a.
@@ -316,8 +316,7 @@ modules:
     description: >-
       Encrypted at-rest seeds blob (ISC-C3). Format v2 as of M3 with
       a 2-byte big-endian suite_id slot after the magic prefix. v1
-      reads accepted under implicit suite_id = 0x0001 (M1 / M2
-      compatibility). KDF chain (unchanged from M1):
+      reads accepted under implicit suite_id = 0x0001. KDF chain (unchanged):
       Argon2id(passphrase, salt=profile_id) -> HKDF-SHA384-Expand ->
       AES-256-GCM. v2 binds suite_id into AEAD AAD so tamper-swap
       fails authentication. M4b extends the plaintext payload (not the
@@ -386,8 +385,7 @@ modules:
       locates and authenticates a chunk (a re-hash mismatch = corrupt or
       substituted, caller drops it). Reference-counted dedup: put inserts-
       or-increments, unref decrements and drops the bytes at zero (the
-      server-blind CoT lifecycle of A-S5). Per-chunk hash = SHA-384 (F23,
-      one hash primitive across the protocol). Two impls.
+      server-blind CoT lifecycle of A-S5). Per-chunk hash = SHA-384 (one hash primitive across the protocol). Two impls.
     no_std: false
     depends_on: []
     iscs:
@@ -398,12 +396,12 @@ modules:
 
   - name: daemonseed_core::cot
     description: >-
-      Circle-of-trust + public-share rendezvous addressing (M8/M11). For chat
+      Circle-of-trust + public-share rendezvous addressing. For chat
       circles: asset_address = SHA-384(cot_key || server_id) (ISC-8 / S4) —
       the opaque 48-byte point a relay routes a circle's traffic through;
       only a member can compute it (needs cot_key, so the relay never learns
       the circle, ISC-A-S2). For public shares: public_share_asset_address =
-      SHA-384(share_id || 0x00 || server_id) (ISC-19 / F23 unified mechanism)
+      SHA-384(share_id || 0x00 || server_id) (ISC-19)
       — same digest, same 48-byte address surface, with the circle secret
       replaced by the public share_id (nothing to hide; ISC-C19 makes
       public-share content server-visible by design). server_id namespaces
@@ -417,11 +415,10 @@ modules:
       - "19"
       - A-S2
       - S4
-      - F23
 
   - name: daemonseed_core::share_envelope
     description: >-
-      Share-fetch envelope (M11 — ISC-19, F23 unified mechanism). Public and
+      Share-fetch envelope (ISC-19, unified mechanism). Public and
       CoT shares ride the same CircleOfTrust.Subscribe bidi stream as chat
       circles. What rides inside CotFrame.payload differs per asset kind:
       chat circles carry a prost-encoded RoomMessage sealed with AES-256-GCM
@@ -452,7 +449,6 @@ modules:
       - daemonseed_core::storage::cas
     iscs:
       - "19"
-      - F23
       - A-S2
       - A-S5b
 
@@ -502,7 +498,7 @@ modules:
 
   - name: daemonseed_core::storage::share_index
     description: >-
-      Encrypted, incremental redb-backed share index (M8, ISC-C21 / A-C6 / A-C7)
+      Encrypted, incremental redb-backed share index (ISC-C21 / A-C6 / A-C7)
       — the indexed-state layer of the three-layer storage split. One ShareEntry
       per shared file (rel_path, size, mtime, and as of M16 an optional cached
       chunk_addrs blob — the publish-path hash cache, ISC-C73: the ORDERED
@@ -538,8 +534,7 @@ modules:
 
   - name: daemonseed_core::storage::fetched
     description: >-
-      Persistent landing zone for fully-verified fetched share content (M15;
-      ISC-C63 / C64, ISC-A-C31 / A-C32). Sits above the share-fetch path
+      Persistent landing zone for fully-verified fetched share content (ISC-C63 / C64, ISC-A-C31 / A-C32). Sits above the share-fetch path
       (share_envelope + net actor): a verified fetch writes each file's plaintext
       bytes directly under its real name into a per-share folder beneath the
       downloads root, and records the landing in a line-based manifest
@@ -569,11 +564,11 @@ modules:
       - C64
       - A-C31
       - A-C32
-    added_in: "v0.19.0 (M15, cleanup from v0.18.0-pre)"
+    added_in: "v0.19.0 (cleanup from v0.18.0-pre)"
 
   - name: daemonseed_core::indexer
     description: >-
-      Share-folder indexer engine (M8, ISC-C21 / A-C7) — drives a ShareIndex from
+      Share-folder indexer engine (ISC-C21 / A-C7) — drives a ShareIndex from
       the filesystem, designed against Demonsaw's cold-rescan thrash. Two modes:
       cold_scan (one-time walkdir -> upsert every file; caller runs it on a niced
       background thread so it never starves a foreground task, and the persisted
@@ -713,7 +708,7 @@ modules:
       - S14
       - A-S9
       - C23
-    added_in: "v0.5.0 (M4a)"
+    added_in: "v0.5.0"
 
   - name: daemonseed_core::connection
     description: >-
@@ -723,7 +718,7 @@ modules:
       enforce that without runtime checks. A concrete stream plugs
       in via the Transport trait's blanket impl over
       `AsyncRead + AsyncWrite + Send + Unpin + 'static`.
-      Negotiating -> Versioned (M4a) -> Authenticated (M4b). Only
+      Negotiating -> Versioned -> Authenticated. Only
       Authenticated impls AsyncRead/AsyncWrite, so application traffic
       is a compile error pre-auth. The Versioned -> Authenticated step
       consumes a VerifiedPeer token (mintable only by a passed
@@ -736,7 +731,7 @@ modules:
       - C23
       - S14
       - S19
-    added_in: "v0.5.0 (M4a)"
+    added_in: "v0.5.0"
 
   - name: daemonseed_core::federation::trust
     description: >-
@@ -770,7 +765,7 @@ modules:
   - name: daemonseed_core::federation::peering
     description: >-
       Server-to-server peering helper (ISC-S12). The trust decision itself is
-      shared via federation::trust; this holds the F31 concurrent-TOFU
+      shared via federation::trust; this holds the concurrent-TOFU
       tiebreaker.
     no_std: false
     depends_on:
@@ -780,7 +775,7 @@ modules:
 
   - name: daemonseed_core::federation::discovered
     description: >-
-      Introducer-discovered peer candidates (M12, gate step 6 — client side).
+      Introducer-discovered peer candidates (client side).
       DiscoveredPeers is a RAM-only candidate cache, deliberately distinct from
       the active TrustStore: merge() records peers learned from a relay's
       introducer as candidates only and NEVER writes the trust set (ISC-C22 /
@@ -802,7 +797,7 @@ modules:
     description: >-
       Circle-of-trust types. Client-only scope — per ISC-A-S2 the
       server is never aware of which circles exist or who is in them.
-      Circles are flat and metadata-free (F16): a circle is defined
+      Circles are flat and metadata-free: a circle is defined
       solely by its shared entropy — no founder, no signed metadata
       record, no per-circle minimum-suite policy. The shared phrase is
       both the sole circle secret and the sole distinguisher. Suite
@@ -1771,7 +1766,7 @@ modules:
       to DeliveryState (Composed, OnDht, ConfirmedCollected, Undelivered); an
       AwaitingCollection entry is OnDht only while acceptance() is Confirmed,
       and OnDht means the transport confirmed a write, not that the DHT holds
-      the value (M2 — a losing set_dht_value also returns success).
+      the value (a losing set_dht_value also returns success).
       ReseedSchedule::new(now_ms) starts due immediately;
       ReseedSchedule::deferred(now_ms) starts due at a delay drawn from
       RECONNECT_FIRST_DISPATCH +/- RECONNECT_JITTER_FRAC — A5.5's
@@ -2490,7 +2485,7 @@ modules:
 
   - name: daemonseed_core::crypto::deprecation
     description: >-
-      Operator-configured suite-deprecation policy (M7, ISC-S16 / A-S11 / C25 /
+      Operator-configured suite-deprecation policy (ISC-S16 / A-S11 / C25 /
       A-C9). A signed, monotonically-versioned policy listing per-suite cutoffs
       and recommended migration targets; clients fetch + verify it and surface
       trust events (never silently downgrade). Includes a TTL'd per-server cache
@@ -2509,7 +2504,7 @@ modules:
 
   - name: daemonseed_core::trust_events
     description: >-
-      Trust-event taxonomy + bounded encrypted audit log (M7, ISC-C28 / A-C12).
+      Trust-event taxonomy + bounded encrypted audit log (ISC-C28 / A-C12).
       A closed, append-only TrustEventKey enum mapped to a four-class affordance
       taxonomy (Blocking / PersistentNonBlocking / Transient / LogOnly), with a
       frozen stable string form persisted in the log and consumed by third-party
@@ -2553,8 +2548,7 @@ modules:
 
   - name: daemonseed_core::mention
     description: >-
-      @-mention recognition + resolution over decrypted chat plaintext (M9,
-      ISC-C17 / C18 / A-C4). Pure client-side functions that add no server-
+      @-mention recognition + resolution over decrypted chat plaintext (ISC-C17 / C18 / A-C4). Pure client-side functions that add no server-
       visible distinction over plain chat (no daemonseed-proto dependency).
     no_std: false
     depends_on:
@@ -2568,10 +2562,10 @@ modules:
   - name: daemonseed_core::release
     description: >-
       Release-signing trust anchor, N-of-M multi-sig verify, and the client
-      update-lifecycle FSM (M10 verifiable-core, ISC-S18 / A-S13 / C27 / A-C11).
+      update-lifecycle FSM (ISC-S18 / A-S13 / C27 / A-C11).
       The anchor is binary-bound (include_str!'d TOML, mirrors bootstrap::anchor)
-      and ships its 1-of-1 shape with the key array empty (real key deferred to
-      M10-infra). The FSM enforces verify-before-apply, never-auto-install,
+      and ships its 1-of-1 shape with the key array empty (the real key is deferred
+      to the signing-key ceremony). The FSM enforces verify-before-apply, never-auto-install,
       no-silent-downgrade, and wipe-and-log-on-failure by its shape, emitting the
       existing M7 update trust-event keys (no new wire surface).
     no_std: false
@@ -2584,12 +2578,12 @@ modules:
       - C27
       - A-C11
     added_in: "v0.12.0"
-    deferred: "Real signing keys / Sigstore / reproducible build / live fetch / binary swap (M10-infra)."
+    deferred: "Real signing keys / Sigstore / reproducible build / live fetch / binary swap."
 
   - name: daemonseed_core::biometric
     description: >-
       Biometric / secure-enclave session-passphrase storage — scaffold only
-      (M10-completion, ISC-C7). Defines the BiometricStore trait a future
+      (ISC-C7). Defines the BiometricStore trait a future
       GUI/mobile client implements to offer biometric login, plus the typed
       SessionPassphrase secret it may hold (never the mnemonic) and the mandatory
       RECOVERY_RISK_WARNING. No platform implementation (iOS Keychain, Android
@@ -2599,11 +2593,11 @@ modules:
     depends_on: []
     iscs:
       - C7
-    added_in: "v0.12.1 (M10-completion)"
+    added_in: "v0.12.1"
 
   - name: daemonseed_core::autostart
     description: >-
-      OS-native autostart — scaffold only (M10-completion, ISC-C20). Ships the
+      OS-native autostart — scaffold only (ISC-C20). Ships the
       pure `unit_descriptor` generator (systemd user unit / launchd plist /
       Windows Startup command, text only, no I/O) and the AutostartManager trait a
       future client implements to install/enable/disable a unit. Autostart is
@@ -2614,7 +2608,7 @@ modules:
     depends_on: []
     iscs:
       - C20
-    added_in: "v0.12.1 (M10-completion)"
+    added_in: "v0.12.1"
 
 # ─────────────────────────────────────────────────────────────────────
 # Types — structs / enums / traits / aliases. Each references its module.
@@ -2877,7 +2871,7 @@ types:
     description: >-
       Plaintext payload. Construct via Seeds::new(mnemonic) (default counters,
       empty mute/hide/circles, no display name). Plaintext is line-based: line 0 =
-      phrase, then `send-counter <n>` / `seen <target> <n>` directives (M4b), the
+      phrase, then `send-counter <n>` / `seen <target> <n>` directives, the
       M9 `muted <handle>` / `hidden-share <handle>` lines, and the M13
       `display-name <name>` line plus per-circle `circle <entropy-hex> <label-hex>`
       lines (entropy + label hex-encoded so arbitrary text round-trips through the
@@ -3223,7 +3217,7 @@ types:
     module: daemonseed_core::share_serve
     kind: struct
     description: >-
-      Disk-backed serve content (M16, ISC-C73 / A-C35): new(root, manifest)
+      Disk-backed serve content (ISC-C73 / A-C35): new(root, manifest)
       pairs a share root with a hashed ShareManifest (O(1) addr→(entry, chunk
       index) map built once; duplicate addrs keep the first mapping — CAS
       semantics); file_count() / manifest() / get_chunk(&ChunkAddr) ->
@@ -3292,7 +3286,7 @@ types:
       - name: chunk_addrs
         type: "Option<Vec<u8>>"
         description: >-
-          Cached content addresses from the last hash pass (M16, ISC-C73):
+          Cached content addresses from the last hash pass (ISC-C73):
           the ORDERED concatenation of the file's per-chunk 48-byte SHA-384
           addresses (len % 48 == 0, len/48 == ceil(size/CHUNK_SIZE);
           Some(empty) = hashed empty file, distinct from None = never
@@ -3611,7 +3605,7 @@ types:
     kind: struct
     description: >-
       What Ready::into_session_materials() yields — caller persists these and
-      hands off to the wire layer (M4a+).
+      hands off to the wire layer.
     fields:
       - name: profile_config
         type: ProfileConfig
@@ -4128,7 +4122,7 @@ types:
     kind: struct
     description: >-
       Operator entries plus the always-present, file-non-removable project-announce
-      entry (F17). authorizes() is the cheap gate before any signature work.
+      entry. authorizes() is the cheap gate before any signature work.
 
   - name: ArtifactError
     module: daemonseed_core::public_space
@@ -4411,7 +4405,7 @@ types:
       verify(anchor, message, signatures, now_ms); confirm(acknowledge_downgrade);
       state/failure_log/has_artifact/take_pending_events.
 
-  # ── biometric (M10-completion, ISC-C7) ──────────────────────────────
+  # ── biometric (ISC-C7) ──────────────────────────────
   - name: SessionPassphrase
     module: daemonseed_core::biometric
     kind: struct
@@ -4439,7 +4433,7 @@ types:
       Result<_, BiometricError>. The recovery seed is intentionally not
       representable here.
 
-  # ── autostart (M10-completion, ISC-C20) ─────────────────────────────
+  # ── autostart (ISC-C20) ─────────────────────────────
   - name: AutostartTarget
     module: daemonseed_core::autostart
     kind: enum
@@ -5932,7 +5926,7 @@ functions:
   # ── storage::cas ────────────────────────────────────────────────────
   - name: chunk_addr
     module: daemonseed_core::storage::cas
-    description: "SHA-384(chunk) (ISC-2 / F23)."
+    description: "SHA-384(chunk) (ISC-2)."
     signature: "pub fn chunk_addr(chunk: &[u8]) -> Result<ChunkAddr, oxicrypt_module::Error>"
     parameters:
       - name: chunk
@@ -5977,8 +5971,7 @@ functions:
   - name: public_share_asset_address
     module: daemonseed_core::cot
     description: >-
-      Derive a public share's rendezvous address on a given relay (ISC-19,
-      F23 unified mechanism): SHA-384(share_id || 0x00 || server_id). Shape
+      Derive a public share's rendezvous address on a given relay (ISC-19): SHA-384(share_id || 0x00 || server_id). Shape
       mirrors asset_address with the circle secret replaced by the public
       share_id (nothing to hide in a public share's address; ISC-C19 makes
       public-share content server-visible by design). The 0x00 separator
@@ -5999,7 +5992,7 @@ functions:
     returns:
       type: "Result<AssetAddr, oxicrypt_module::Error>"
       description: The public-share rendezvous asset address.
-    iscs: ["19", F23]
+    iscs: ["19"]
 
   # ── share_envelope ──────────────────────────────────────────────────
   - name: ShareFrame::encode
@@ -6018,7 +6011,7 @@ functions:
       ManifestResponse is publish-guarded under
       share_serve::MANIFEST_FRAME_BUDGET (ISC-A-C37).
     signature: "pub fn encode(&self) -> Vec<u8>"
-    iscs: ["19", F23, A-S2]
+    iscs: ["19", A-S2]
 
   - name: ShareFrame::decode
     module: daemonseed_core::share_envelope
@@ -6038,14 +6031,14 @@ functions:
           condition: Buffer ended before parser expected, or a length prefix overruns.
         - name: BadUtf8
           condition: A manifest entry's rel_path bytes are not valid UTF-8.
-    iscs: ["19", F23]
+    iscs: ["19"]
 
   # ── share_serve ─────────────────────────────────────────────────────
   - name: hash_share
     module: daemonseed_core::share_serve
     description: >-
       Walk root and stream-hash every regular file into a ShareManifest
-      (M16, ISC-C73) — each file read one CHUNK_SIZE (1 MiB) buffer at a
+      (ISC-C73) — each file read one CHUNK_SIZE (1 MiB) buffer at a
       time, never a whole-file read, each full buffer-load hashed as ONE
       chunk to its own SHA-384 address (only EOF may leave a chunk short),
       so the pass's memory footprint is independent of file size. Same
@@ -6667,7 +6660,7 @@ functions:
   - name: scan_into
     module: daemonseed_core::indexer
     description: >-
-      Cold-scan root into a BORROWED ShareIndex (M14 — the TUI net-actor
+      Cold-scan root into a BORROWED ShareIndex (the TUI net-actor
       share-activation path; cold_scan delegates here). Upserts every regular
       file (metadata only — chunk_addrs: None; content addresses come from the
       hash pass, never a stat walk); unreadable entries skipped, not fatal.
@@ -6690,7 +6683,7 @@ functions:
     module: daemonseed_core::indexer
     description: >-
       Build a share's ShareManifest using the index as a chunk-addr CACHE
-      (M16, ISC-C73 — the disk-backed publish path): a file whose indexed
+      (ISC-C73 — the disk-backed publish path): a file whose indexed
       size+mtime still match and whose entry carries a cached chunk_addrs
       blob that PARSES for that size (len % 48 == 0, len/48 ==
       ceil(size/CHUNK_SIZE)) is reused WITHOUT reading the file; misses
@@ -7115,7 +7108,7 @@ functions:
     module: daemonseed_core::connection
     description: >-
       Unwraps the raw authenticated transport — e.g. to hand to tonic for the
-      post-auth application stream (M5+).
+      post-auth application stream.
     signature: "pub fn into_inner(self) -> T"
     parameters: []
     returns:
@@ -7171,7 +7164,7 @@ functions:
   - name: initiates_peer_tofu
     module: daemonseed_core::federation::peering
     description: >-
-      F31 tiebreaker (ISC-S12-8): the lower server-id hash-prefix initiates TOFU,
+      tiebreaker (ISC-S12-8): the lower server-id hash-prefix initiates TOFU,
       the other observes-and-confirms. Antisymmetric -> no split-brain double-pin.
     signature: "pub fn initiates_peer_tofu(own_prefix: &[u8; 6], peer_prefix: &[u8; 6]) -> bool"
     parameters:
@@ -7494,7 +7487,7 @@ functions:
   - name: project_announce_pubkey
     module: daemonseed_core::public_space
     description: >-
-      F17 project-announce signer key (ISC-15). DEV PLACEHOLDER derived once from
+      project-announce signer key (ISC-15). DEV PLACEHOLDER derived once from
       an in-source seed during the private phase; replaced by a baked-in real
       release pubkey before public launch. Always authorized; operators cannot
       remove it.
@@ -7653,7 +7646,7 @@ functions:
       Derive the project-announce channel's Veilid rendezvous-owner seed (Phase 4
       A1 write-gate) — HKDF-SHA-384(salt=PROJECT_ANNOUNCE_OWNER_SALT,
       ikm=project_seed) expand under PROJECT_ANNOUNCE_VEILID_OWNER. A sibling of the
-      F17 content-signing key (same project seed, disjoint derivation), so a holder
+      content-signing key (same project seed, disjoint derivation), so a holder
       of one cannot derive the other. The project seed is not in the source tree: the
       operator loads it at runtime and only the owner pubkey is baked into clients.
     signature: "pub fn derive_project_announce_veilid_owner_seed(project_seed: &[u8; 32]) -> Result<ProjectAnnounceVeilidOwnerSeed, AnnounceOwnerError>"
@@ -7759,7 +7752,7 @@ functions:
   - name: Whitelist::from_entries
     module: daemonseed_core::public_space
     description: >-
-      Build from parsed operator entries; F17 is checked unconditionally by
+      Build from parsed operator entries; is checked unconditionally by
       authorizes(), not stored in entries().
     signature: "pub fn from_entries(entries: Vec<WhitelistEntry>) -> Whitelist"
     parameters:
@@ -7769,7 +7762,7 @@ functions:
         description: The parsed operator entries.
     returns:
       type: Whitelist
-      description: A whitelist over the operator entries plus the implicit F17 entry.
+      description: A whitelist over the operator entries plus the implicit entry.
 
   - name: Whitelist::entries
     module: daemonseed_core::public_space
@@ -7780,7 +7773,7 @@ functions:
     parameters: []
     returns:
       type: "&[WhitelistEntry]"
-      description: The operator entries (excluding the implicit F17 entry).
+      description: The operator entries (excluding the implicit entry).
 
   - name: Whitelist::authorizes
     module: daemonseed_core::public_space
@@ -8905,4 +8898,4 @@ testing:
     - "tests/m3_isc_coverage.rs (5 ISCs, cumulative 34)"
     - "tests/m4a_isc_coverage.rs (lands in M4a commit 6)"
   coverage_command: "cargo xtask isc-coverage"
-  coverage_target: "static M3 floor = 34/93 = 36.6% (M4a will bump to 43/93)"
+  coverage_target: "static M3 floor = 34/93 = 36.6% (rises to 43/93 in v0.5.0)"

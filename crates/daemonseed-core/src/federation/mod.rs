@@ -10,7 +10,7 @@
 //! commit (mirrors M4b's decision D8 for the replay-counter state); M5 ships
 //! the state machine the federation test matrix targets.
 //!
-//! [`discovered`] (M12, gate step 6) holds the introducer-discovered peer
+//! [`discovered`] holds the introducer-discovered peer
 //! cache: candidates learned from a relay's introducer that are NEVER
 //! auto-added to the active trust set — the user promotes them explicitly
 //! (ISC-C22 / ISC-A-C19).
