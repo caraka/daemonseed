@@ -1,5 +1,4 @@
-//! Public-space signed-artifact model shared by the server and every client
-//! (M6).
+//! Public-space signed-artifact model shared by the server and every client.
 //!
 //! The relay is verify-and-serve only (ISC-A-S3): it never originates a post
 //! or MOTD, and a client never trusts the server's assertions about a post's

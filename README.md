@@ -26,16 +26,16 @@ daemonseed/
 │   ├── daemonseed-core/                    protocol library — identity, 3-layer storage (seeds /
 │   │                                       redb share index / chunk CAS), crypto-agility, first-start,
 │   │                                       bootstrap, flat circle-of-trust keys, shared-record (rendezvous) addressing, indexer,
-│   │                                       mute/hide lists, @-mention logic (M9),
-│   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM (M10),
+│   │                                       mute/hide lists, @-mention logic,
+│   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM,
 │   │                                       at-rest persistence of display-name / mute / hide / circle membership
-│   │                                       via a cached SealingKey re-encrypt (M13); fetched-download CAS + manifest
+│   │                                       via a cached SealingKey re-encrypt; fetched-download CAS + manifest
 │   │                                       store (storage::fetched, M15)
 │   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
 │   ├── daemonseed-veilid-net/              Veilid transport: identity-bound node, encrypted 1:1 + circle/lobby/public-room shared records, signed share-discovery route advertisements, owner-on-demand share content transfer
 │   ├── daemonseed-cli/                     library-only client: Veilid route-advertisement signer (`route_signer`) + announcements/MOTD authoring & render helpers (`public_space`)
-│   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface (M11); Servers-pane introducer discovery (M12); multi-circle carousel (v0.16); session write-through + silent circle rejoin from the at-rest blob (M13); define-share + indexer (M14); publish/serve/unpublish + fetched-download browse/extract (M15)
-│   ├── daemonseed-gui/                     Slint GUI client (round-1 scaffold) — software-renderer shell; `--features desktop` opens a real window
+│   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface; Servers-pane introducer discovery; multi-circle carousel (v0.16); session write-through + silent circle rejoin from the at-rest blob; define-share + indexer; publish/serve/unpublish + fetched-download browse/extract
+│   ├── daemonseed-gui/                     Slint GUI client (scaffold) — software-renderer shell; `--features desktop` opens a real window
 │   ├── daemonseed-isc/                      ISC registry leaf crate (zero deps): the single source of
 │   │                                       TOTAL / COVERED, read by both the integration tests and xtask
 │   └── daemonseed-integration-tests/       cross-crate integration tests (re-exports daemonseed-isc)
@@ -77,7 +77,7 @@ cargo xtask check-proto                                          # verify commit
 cargo xtask isc-coverage                                         # report ISC coverage against the spec
 ```
 
-See `AGENTS.md` for the full definition-of-done, the doc-sync ritual at every commit boundary, and the worktree placement convention.
+See `AGENTS.md` for the full definition-of-done and the doc-sync ritual at every commit boundary.
 
 ## Running the GUI
 

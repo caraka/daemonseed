@@ -748,7 +748,7 @@ impl JoinedCircle {
     /// The relay-independent `#<hash-of-entropy>` fingerprint (ISC-C62), a pure
     /// function of this circle's entropy.
     ///
-    /// **Coded but unsurfaced in the TUI** (caraka, 2026-06-05): while terminal
+    /// **Coded but unsurfaced in the TUI**: while terminal
     /// space is limited, the human-readable adj-noun [`Self::label`] carries
     /// cross-daemon same-circle verification. This precise check is reserved for
     /// the GUI era — where the user names the circle and the fingerprint backs
@@ -821,7 +821,7 @@ pub struct App {
     compose: String,
     /// The circle-join phrase buffer (ISC-15).
     circle_phrase: String,
-    /// The Define-Share input buffer (M14). Typing in [`MainFocus::DefineShare`]
+    /// The Define-Share input buffer. Typing in [`MainFocus::DefineShare`]
     /// builds it; Enter parses `path` (optional `path|label`) into a
     /// [`ShareDefineRequest`]. Kept on validation failure so the user can fix a
     /// typo'd path in place (mirrors `circle_phrase`).
@@ -863,7 +863,7 @@ pub struct App {
     /// The single-shot slot for an interactive join; [`Self::take_pending_join`]
     /// drains it first, then [`Self::pending_joins`].
     pending_join: Option<String>,
-    /// Single-shot slot for an interactive Define-Share request (M14); the
+    /// Single-shot slot for an interactive Define-Share request; the
     /// binary drains it via [`Self::take_pending_share_define`], derives the
     /// index path + key from the session, and sends `NetCommand::DefineShare`.
     pending_share_define: Option<ShareDefineRequest>,
@@ -887,7 +887,7 @@ pub struct App {
     /// My-defined list (M16 C1). `↑`/`↓` move it (clamped); `[p]`/`[u]` act on
     /// the selected entry. Clamped on restore/append so it never dangles.
     defined_sel: usize,
-    /// Single-shot slot for a publish request (M15); the binary drains it via
+    /// Single-shot slot for a publish request; the binary drains it via
     /// [`Self::take_pending_publish`] into `NetCommand::PublishShare`.
     pending_publish: Option<PublishRequest>,
     /// Queue of `(root, name)` auto-republishes restored from the at-rest blob
@@ -1715,7 +1715,7 @@ impl App {
         self.pending_cancel_publish.take()
     }
 
-    /// The current Define-Share input buffer, for rendering the box (M14).
+    /// The current Define-Share input buffer, for rendering the box.
     pub fn share_input(&self) -> &str {
         &self.share_input
     }
@@ -2314,8 +2314,8 @@ impl App {
                     "hashing {name}: {done}/{total} files — [u] cancels"
                 ));
             }
-            // The user's own cancel landed — neutral wording, not a failure
-            // (M16). The root leaves the hashing set so `[p]` can retry.
+            // The user's own cancel landed — neutral wording, not a failure.
+            // The root leaves the hashing set so `[p]` can retry.
             NetEvent::PublishCancelled { root, name } => {
                 self.hashing.remove(&root);
                 self.status = Some(format!("publish of {name:?} cancelled"));
@@ -3762,12 +3762,12 @@ impl App {
             KeyCode::Enter if !self.circle_phrase.is_empty() => {
                 // ISC-C9: gate the join on circle-entropy strength. A weak shared
                 // phrase is the circle's whole vulnerability, so a below-≥128-bit
-                // estimate BLOCKS the join (caraka 2026-06-05, precautionary
+                // estimate BLOCKS the join (precautionary
                 // default — Fork 4) rather than merely warning. The phrase is
                 // deliberately kept (not drained) so the user can strengthen it in
                 // place; the meter already shows them the gap.
                 //
-                // M15 (caraka 2026-06-05): the REAL ≥128-bit key-space gate, now
+                // The REAL ≥128-bit key-space gate, now
                 // that `estimate_circle` (words + charset) can certify it —
                 // replacing the M14 interim zxcvbn score-4 proxy that wrongly
                 // accepted the public xkcd phrase.
@@ -4585,7 +4585,7 @@ mod tests {
         assert!(app.status().is_some(), "a status explains the refusal");
     }
 
-    // ── D (M15): TUI publish + serve + unpublish ─────────────────────────
+    // ── D: TUI publish + serve + unpublish ─────────────────────────
 
     /// M15 cleanup: define a share, then `[p]` in the Shares pane publishes that
     /// defined root — no separate Publish pane, no re-typing the path.
@@ -6478,7 +6478,7 @@ mod tests {
 
     /// ISC-C62 — a joined circle exposes a relay-independent `#<hash-of-entropy>`
     /// fingerprint for future GUI verification, while its visible `label` stays the
-    /// human-readable seed name (caraka 2026-06-05: hash coded but unsurfaced).
+    /// human-readable seed name (the hash is coded but unsurfaced).
     #[test]
     fn joined_circle_exposes_hidden_fingerprint() {
         let mut app = drive_to_main(); // initializes the crypto backend
@@ -7619,7 +7619,7 @@ mod tests {
 
     /// A1: Enter on the preview queues ConfirmFetch with a `None` selection
     /// (confirm-all) and moves the overlay to Receiving with the known total —
-    /// the CHUNK sum over the selection (M16), not the file count.
+    /// the CHUNK sum over the selection, not the file count.
     #[test]
     fn preview_enter_queues_confirm_all() {
         let mut app = drive_to_main();
@@ -7640,7 +7640,7 @@ mod tests {
                     size: 10,
                     chunk_count: 1,
                 },
-                // A multi-chunk file (M16): e.g. a 2.1 MB file spans 3 chunks.
+                // A multi-chunk file: e.g. a 2.1 MB file spans 3 chunks.
                 ShareManifestEntry {
                     rel_path: "b.txt".to_owned(),
                     size: 20,
@@ -7714,7 +7714,7 @@ mod tests {
                     size: 2,
                     chunk_count: 2,
                 },
-                // An empty file contributes 0 chunks (M16) but still selects.
+                // An empty file contributes 0 chunks but still selects.
                 ShareManifestEntry {
                     rel_path: "c".to_owned(),
                     size: 0,

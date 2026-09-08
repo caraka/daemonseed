@@ -231,10 +231,10 @@ message FirstContactBody {
   // ML-DSA-87 signature, exactly 4627 bytes, under the PSEUDONYM key. Mandatory
   // and always verified: it proves possession of the pseudonym key and covers
   // the body, the ephemeral key, the recipient, the sequence, and both public
-  // keys. It is the SOLE proof-of-possession path — an earlier draft carried a
-  // separate `bind_pop` signature, folded into this one to save 4627 bytes — so
-  // any future frame type must carry it or proof-of-possession silently
-  // disappears there.
+  // keys. It is the SOLE proof-of-possession path: there is no separate
+  // `bind_pop` signature, and folding it into `msg_sig` saves 4627 bytes. So any
+  // future frame type must carry it or proof-of-possession silently disappears
+  // there.
   bytes msg_sig = 10;
 
   // A grantee-bound one-time invite token the recipient issued (admission option

@@ -90,7 +90,7 @@ install -m 0644 "${HERE}/${BIN}.svg"                "${APPDIR}/usr/share/icons/h
 
 # Ubuntu/GNOME's dash does not reliably render a scalable-only app icon, and AppImage
 # desktop integration reads a top-level .DirIcon — neither was present, the classic
-# "AppImage shows no icon on the Ubuntu dash" gap (manual test 2026-06-21). Provide a
+# "AppImage shows no icon on the Ubuntu dash" gap. Provide a
 # sized raster PNG in the extra places that actually get read: a 256x256 hicolor PNG,
 # a root-level PNG matching Icon=, and the .DirIcon at the AppDir root.
 ICON_PNG_DIR="${APPDIR}/usr/share/icons/hicolor/256x256/apps"

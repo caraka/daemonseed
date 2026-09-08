@@ -253,7 +253,7 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
                     .style(Style::default().fg(color)),
                 rows[0],
             );
-            // One-line key hint inside the preview box (M16): the Shares-pane
+            // One-line key hint inside the preview box: the Shares-pane
             // dim-hint convention, answering the live UX complaint that `a`
             // (select all/none) was undiscoverable.
             frame.render_widget(
@@ -283,8 +283,8 @@ fn render_fetch_overlay(f: &FetchUi, frame: &mut Frame, area: Rect) {
     // (no transfer is running yet, and it merely duplicated the header's
     // selected-count) so the file list gets the room.
     if !is_preview {
-        // A real progress bar so the user sees movement, not just red→green
-        // (M15). Ratio by chunks once the manifest's total is known.
+        // A real progress bar so the user sees movement, not just red→green.
+        // Ratio by chunks once the manifest's total is known.
         let ratio = match f.status {
             FetchStatus::Complete => 1.0,
             _ => match f.total_chunks {
@@ -1507,7 +1507,7 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             // matches), driven by the M15 word+charset key-space estimate. Green
             // at the real ≥128-bit floor; a below-floor phrase is blocked at Enter
             // (App::on_key_join, Fork 4). The bits/128 readout tells the user how
-            // much further to go — "keep adding until green" (caraka 2026-06-05).
+            // much further to go — "keep adding until green".
             let s = app.circle_phrase_strength();
             let tier = if s.is_circle_green() {
                 "strong ✓"
@@ -1558,7 +1558,7 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             )
         }
         MainFocus::DefineShare => (
-            // Fork 1 (caraka 2026-06-05): an input box like JoinCircle, with an
+            // The chosen shape: an input box like JoinCircle, with an
             // example path as the hint so the expected format is obvious.
             "share a directory · e.g. /home/you/Shared  (path or path|label)  [Enter] add  [Tab] hide  ([p] in Shares to publish)  [Esc] back"
                 .to_owned(),

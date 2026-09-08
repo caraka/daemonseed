@@ -8,7 +8,7 @@
 //! and drives it from the [`crate::net::NetEvent`] drain (`SharesSnapshot` →
 //! [`ShareBrowser::set_shares`], `FetchManifest` → [`ShareBrowser::load_manifest`]).
 //!
-//! The pane is one unified tree (caraka 2026-06-16, demonsaw-4.20 reference): each
+//! The pane is one unified tree (demonsaw-4.20 reference): each
 //! live relay share is a **root node**; expanding it lazily previews its files
 //! (`FetchShare` → `FetchManifest`), parsed from the manifest's `/`-separated
 //! `rel_path`s into real folders. Everyone's shares — including your own — appear in

@@ -22,9 +22,9 @@
 //!   the sender's identity is inside the seal, not beside it.
 //! - **Authorship** rests on `msg_sig` under the per-contact pseudonym key, and
 //!   on `bind_lt` under the long-term key tying that pseudonym to an identity.
-//!   `msg_sig` is the SOLE proof-of-possession path — an earlier draft carried a
-//!   separate `bind_pop`, folded in here to save 4627 bytes — so it is mandatory
-//!   and always verified, and any future frame type must carry one or
+//!   `msg_sig` is the SOLE proof-of-possession path: there is no separate
+//!   `bind_pop` signature, and folding it into `msg_sig` saves 4627 bytes. So it
+//!   is mandatory and always verified, and any future frame type must carry one or
 //!   proof-of-possession silently vanishes there.
 //! - **Misdirection** is caught by the hashed intended recipient inside the seal.
 //!   Honest scope: the recipient reads it only AFTER decapsulating, so a holder of

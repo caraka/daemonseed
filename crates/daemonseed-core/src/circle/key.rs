@@ -236,7 +236,7 @@ pub const CIRCLE_FINGERPRINT_HEX_LEN: usize = 12;
 /// `SHA-384(cot_key ‖ server_id)`), which differs per relay by design
 /// (cross-server unlinkability, ISC-C8).
 ///
-/// **Hidden in the terminal client by design** (caraka, 2026-06-05): while TUI
+/// **Hidden in the terminal client by design**: while TUI
 /// space is limited the human-readable adj-noun label carries cross-daemon
 /// verification, and this hash stays coded-but-unsurfaced. It is reserved for
 /// the GUI era, where the user names the circle and this fingerprint backs

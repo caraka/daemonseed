@@ -155,14 +155,14 @@ const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 /// and give each surface an earlier "discovering → content" reveal. Each re-sweep is
 /// `SUBKEY_COUNT` (64) force-refresh gets/record, so rounds are few + widening, not a
 /// tight loop; re-swept already-seen items are deduped downstream (`apply_discovery`
-/// self-filter, `push_message` exact-match). **#140 dial-down (manual test 2026-07-08):**
+/// self-filter, `push_message` exact-match). **#140 dial-down:**
 /// the original 4-round 12/25/45/75 s schedule cost ~900 DHT gets per client
 /// for marginal benefit — operator content converged (~120 s) past the window, and #142
 /// removed the #93 landing this schedule used to feed — so it is dialled to a LIGHT
 /// 2-round best-effort early-catch that helps only fast-converging content; slower
 /// content rides the passive watch. The proper load fix (stop-on-content backoff) is
-/// deferred; whether to keep / revert this at all is caraka's call after manual test.
-/// Tunable by hand.
+/// deferred; the schedule is a tuning choice, not a measured one. Tunable by
+/// hand.
 const WARMUP_RESWEEP_SCHEDULE: [Duration; 2] = [Duration::from_secs(20), Duration::from_secs(60)];
 
 /// Rounds (from the front of [`WARMUP_RESWEEP_SCHEDULE`]) in which the circle records

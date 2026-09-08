@@ -1,6 +1,6 @@
 //! Alpha2 item B — share content download ISC traceability.
 //!
-//! Discovery (M12) published a share's listing; nothing served its **content**
+//! Discovery published a share's listing; nothing served its **content**
 //! except the inline logic in `share_fetch_e2e`. Item B lifts that serve side
 //! into a reusable path — `daemonseed_core::share_serve::ShareContent`
 //! (directory index + content-addressed store + the pure `answer` step) driven

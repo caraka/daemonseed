@@ -1,4 +1,4 @@
-//! Client-side public-space data handling (M6).
+//! Client-side public-space data handling.
 //!
 //! The transport — opening a `PublicSpaceClient` over the post-Authenticated
 //! connection — is the thin layer the server's own round-trip test already

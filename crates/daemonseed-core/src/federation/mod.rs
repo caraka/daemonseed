@@ -1,4 +1,4 @@
-//! Federation trust (M5) — the per-server trusted/untrusted slider and its
+//! Federation trust — the per-server trusted/untrusted slider and its
 //! TOFU pin store.
 //!
 //! [`trust`] holds the pure decision core ([`trust::evaluate_trust`]) shared by

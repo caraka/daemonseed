@@ -2371,7 +2371,7 @@ Post-`v0.26.0` cleanup of the GUI Shares tab and first-start flow, plus one core
 refactor. Manually tested on Ubuntu noble via an AppImage build.
 
 - **Publish-persistence:** published shares survive restart and auto-republish on
-  Unlock — the share's root is written through to the at-rest seeds blob (M16);
+  Unlock — the share's root is written through to the at-rest seeds blob;
   explicit Unpublish forgets it, while a disconnect-reap restores it on reconnect.
 - **First-start backup-verify is the C34 3-word type-back:** the C33 full-phrase
   round-trip is replaced by typing back 3 random words at cryptographically-chosen

@@ -21,11 +21,10 @@
 //! The civility properties that need *external* observation on real hardware —
 //! foreground apps staying interactive, the 1-minute load average not pinned
 //! above the CPU count — are for the operator to watch during the run; the
-//! harness prints `/proc/loadavg` samples on Linux to assist. On Caraka's
-//! available rig (a **Pi 5**, not a Pi 4) a pass is *suggestive, not a
-//! Pi-4-floor proof* — the Pi 5 is more capable than the documented spec floor;
-//! degrade it to SD-card storage for the I/O-bound stress (see the corrected
-//! prerequisite decision).
+//! harness prints `/proc/loadavg` samples on Linux to assist. A pass on a Pi 5
+//! is *suggestive, not a Pi-4-floor proof* — the Pi 5 is more capable than the
+//! documented spec floor, so run the I/O-bound stress from SD-card storage to
+//! approximate it.
 
 use std::time::Instant;
 

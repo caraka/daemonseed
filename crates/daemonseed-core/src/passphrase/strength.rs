@@ -10,8 +10,8 @@
 //! [`Strength::bits`] never exceeds ~64 and a literal ≥128 gate through it would
 //! reject every phrase; discovered M14, 2026-06-05). The circle estimator
 //! combines two independent honest models so EITHER path reaches green
-//! (caraka's M15 decision, 2026-06-05 — "words+charset, keep adding until
-//! green, no formatting forced"):
+//! (the rule is words plus charset, adding until green, with no formatting
+//! forced):
 //!   • word model — each DISTINCT BIP-39 word contributes log2(2048)=11 bits
 //!     (repeats add 0, so `abandon ×12` cannot cheat the floor);
 //!   • charset model — the RESIDUE (characters of non-wordlist tokens) adds
@@ -81,7 +81,7 @@ pub struct CircleStrength {
 
 impl CircleStrength {
     /// True iff the phrase meets ISC-C9's ≥128-bit circle-of-trust floor AND is
-    /// not a trivially-guessable pattern — the real gate (M15). A 12-word
+    /// not a trivially-guessable pattern — the real gate. A 12-word
     /// diceware phrase (132 bits) or a sufficiently long, genuinely-varied mixed
     /// string both clear it; the public xkcd 4-word phrase (≤44 bits) and any
     /// periodic/sequential pattern do not.
@@ -444,7 +444,7 @@ mod tests {
 
     /// A long, genuinely varied (non-sequential) non-wordlist string reaches
     /// green via the charset model alone — no diceware format is forced
-    /// (caraka's M15 decision). It must NOT be a sequence, which zxcvbn vetoes.
+    /// (the same rule). It must NOT be a sequence, which zxcvbn vetoes.
     #[test]
     fn long_varied_string_reaches_green_via_charset() {
         // 34 random-looking distinct characters → ≈173 key-space bits, and

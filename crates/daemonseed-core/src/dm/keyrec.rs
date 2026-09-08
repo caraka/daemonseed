@@ -243,11 +243,11 @@ impl std::error::Error for DmKeyRecordError {}
 /// The first-contact anti-replay epoch for a wall-clock instant.
 ///
 /// Both parties derive this from the clock alone. That is the whole design:
-/// an earlier draft had the recipient publish a nonce it rotated on restart,
-/// which made the key record a **restart oracle** (an observer watching the
-/// nonce change learned when the identity restarted) and coupled first-contact
-/// availability to recipient-side state. Deriving from the clock removes the
-/// oracle, the state, and the coupling at once.
+/// having the recipient publish a nonce it rotated on restart would make the key
+/// record a **restart oracle** (an observer watching the nonce change learns when
+/// the identity restarted) and would couple first-contact availability to
+/// recipient-side state. Deriving from the clock removes the oracle, the state,
+/// and the coupling at once.
 ///
 /// A recipient accepts the current epoch and the previous one, so a sender whose
 /// entry was composed just before a boundary is not spuriously rejected; older

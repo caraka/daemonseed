@@ -1,4 +1,4 @@
-// daemonseed wire protocol — federation introducer (M5).
+// daemonseed wire protocol — federation introducer.
 //
 // Anchors ISC-S6 / ISC-S12 / ISC-S13 / ISC-A-S7. A server may act as an
 // introducer: on request it returns the federation peers it knows about as
@@ -30,8 +30,8 @@
 // is a SemVer MINOR bump).
 //
 // Wire transport: the `FederationIntroducer` service is served as gRPC-over-h2
-// over the SAME post-Authenticated TLS stream as `PublicSpace` (M6) and
-// `CircleOfTrust` (M8) — h2 owns its own framing. The introducer is a post-auth
+// over the SAME post-Authenticated TLS stream as `PublicSpace` and
+// `CircleOfTrust` — h2 owns its own framing. The introducer is a post-auth
 // application service, NOT a pre-auth length-prefixed HELLO frame: a client
 // must already have reached the `Authenticated` type-state (ISC-S19 / ISC-C23)
 // before it can ask for an introduction. The length-prefixed (u32 big-endian)

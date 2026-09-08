@@ -999,8 +999,7 @@ pub fn reroot(
 /// wrong — and no way to write a comparison that disagrees with the encoding,
 /// since the encoder walks the same order.
 ///
-/// **Why the generation is carried at all — settled by caraka 2026-08-14,
-/// closing #313.** Send `seq` does **not** restart at a new generation:
+/// **Why the generation is carried at all (closes #313).** Send `seq` does **not** restart at a new generation:
 /// `Ratchet::step_send` starts a new chain at the current `next_send_seq` and
 /// never resets it, so `seq` is monotone per direction for the life of the
 /// conversation. Three surfaces make that continuity load-bearing — `seq` is
@@ -1021,9 +1020,9 @@ pub fn reroot(
 /// **Lexicographic ordering is not by itself a safe write guard.** `(5, 0)`
 /// outranks `(4, u64::MAX)`, so a bare `>=` admits a sequence rollback riding on
 /// a generation bump — which is why [`Self::admits`] requires both components to
-/// be non-decreasing rather than deferring to [`Ord`]. An earlier draft of this
-/// comment claimed lexicographic ordering "contains plain `seq` ordering"; that
-/// is false and was caught in review.
+/// be non-decreasing rather than deferring to [`Ord`]. Lexicographic ordering does
+/// not "contain" plain `seq` ordering, and treating it as though it did is exactly
+/// the mistake this guard exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SendFloor {
     generation: u32,
@@ -5336,8 +5335,8 @@ mod tests {
         // build whose primitives we do not implement.
         let mut unknown = populated().encode().to_vec();
         // NOT `u16::MAX`: that is the reserved SENTINEL_MAX and would take the
-        // branch above instead, which is how the first draft of this test passed
-        // its sentinel case and failed its unknown one.
+        // branch above instead, passing the sentinel case while leaving the
+        // unknown-suite case untested.
         unknown[at..at + SUITE_ID_LEN].copy_from_slice(&0xFFFEu16.to_be_bytes());
         assert!(
             matches!(

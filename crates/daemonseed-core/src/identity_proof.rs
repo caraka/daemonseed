@@ -176,7 +176,7 @@ pub fn build_envelope(
 }
 
 /// Timestamp skew window for identity-proof freshness: **±5 minutes**
-/// (decision D1, caraka 2026-05-24 — Matrix-federation middle ground, over a
+/// (the Matrix-federation middle ground, chosen over a
 /// fragile 120s and a wide ±15min). The per-key counter is the primary replay
 /// defense; this is a coarse staleness gate. Hosts MUST run NTP — drift beyond
 /// this window fails identity-proof against every peer.

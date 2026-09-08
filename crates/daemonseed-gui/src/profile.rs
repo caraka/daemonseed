@@ -1,4 +1,4 @@
-//! Unlocked-profile persistence (round 6).
+//! Unlocked-profile persistence.
 //!
 //! The Slint-free holder for an *unlocked* identity: the at-rest [`Seeds`] payload,
 //! its cached [`SealingKey`], the profile root on disk, and the stable display
@@ -38,7 +38,7 @@ pub struct Profile {
     /// The decrypted at-rest payload: mnemonic, display name, circle membership.
     seeds: Seeds,
     /// The cached AEAD key the blob was opened under — re-seals every mutation
-    /// without re-deriving from the passphrase (M13).
+    /// without re-deriving from the passphrase.
     seal_key: SealingKey,
     /// The stable presented name (the user's chosen display name, or the formatted
     /// handle for a legacy profile with none). Decoupled from the ephemeral

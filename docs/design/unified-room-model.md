@@ -1,6 +1,6 @@
 # The Unified Room Model — Design of Record
 
-> Status: ACCEPTED (caraka, 2026-06-29). The umbrella that folds the room↔circle
+> Status: ACCEPTED (2026-06-29). The umbrella that folds the room↔circle
 > unification, the Veilid **Phase-4** scope, and the share-liveness model into one
 > design. It **revises the sequencing gate** of `room-circle-unification.md` (whose
 > provenance/Layer-2 detail stays canonical there) and **realizes the liveness model**
@@ -24,18 +24,18 @@ thing, twice. Two roots:
 ## Governing principle
 
 **A public room and a private circle behave identically in every respect except how
-their key is derived** (caraka, 2026-06-28). Entropy source is the only variant:
+their key is derived** (2026-06-28). Entropy source is the only variant:
 world-derivable (public room / lobby / share-discovery) vs entropy-gated (circle).
 Everything downstream — **messaging, sharing, discovery, fan-out, presence, lifecycle,
 provenance** — is ONE code path parameterized by the room key (`room-circle-unification.md`
-§Principle). caraka, 2026-06-29: this governs *sharing* as much as messaging.
+§Principle). This governs *sharing* as much as messaging.
 
-**Corollary (caraka, 2026-06-29):** with a genuinely shared engine, hardening *either*
+**Corollary (2026-06-29):** with a genuinely shared engine, hardening *either*
 surface (circle or lobby) completes the other for free — the other side is an
 entropy-source swap. This is the litmus test of true unification, and the reason
 **engine-unify == Phase 4**.
 
-## Staging (sequencing revision — caraka ratified 2026-06-29)
+## Staging (sequencing revision — ratified 2026-06-29)
 
 The unification has two layers with very different costs, so they get different homes:
 
@@ -127,7 +127,7 @@ the proto merge at v0.33.0 (MAJOR).
 
 ## Decisions (resolved 2026-06-29)
 
-- **Shape A for chat, Shape B for shares (caraka).** Keep the backlog append-ring for
+- **Shape A for chat, Shape B for shares.** Keep the backlog append-ring for
   messages; build the current-state primitive for shares (and later presence/MOTD).
 - **Shape B storage mechanism = per-key subkey on the room record.** The
   announcement slot is `share-id → subkey` on the rendezvous record (last-writer-wins),
@@ -136,7 +136,7 @@ the proto merge at v0.33.0 (MAJOR).
   whole lobby record with no Shape-A contention — another reason public-shares-first is clean.
   Ceiling = `SUBKEY_COUNT` distinct shares before hash-collision; the lobby can take its own
   larger dedicated schema (DHT supports up to 1024 subkeys) if the ceiling ever bites.
-- **Cadence / TTL: implement with sane defaults, tunable later (caraka).** Re-announce
+- **Cadence / TTL: implement with sane defaults, tunable later.** Re-announce
   interval + prune-TTL (`> ~2` intervals), tuned against ~14.7 s watch latency. Start
   conservative; tweak from manual testing.
 - **Build surface: public-shares first (circles were the alternative, deferred to
@@ -146,7 +146,7 @@ the proto merge at v0.33.0 (MAJOR).
   bugs, reuses the manually tested publish/discover/fetch plumbing, and avoids the Shape-A/Shape-B
   slot-contention a circle record (which carries messages) would have. **Circle-shares become
   the second consumer** via the entropy swap — proving the corollary, and adding the feature.
-- **Operator write-gate (MOTD/announcements): out for now (caraka).** A third consumer of the
+- **Operator write-gate (MOTD/announcements): out for now.** A third consumer of the
   finished engine; build the engine first, mount MOTD later.
 
 ## Reconciliation with existing design docs

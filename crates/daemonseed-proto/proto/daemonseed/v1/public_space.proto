@@ -1,4 +1,4 @@
-// daemonseed wire protocol — public-space application service (M6).
+// daemonseed wire protocol — public-space application service.
 //
 // This is the FIRST application-stream service in the protocol. Everything up
 // to and including the identity-proof exchange (APP_HELLO + ISC-S19) runs as
@@ -13,8 +13,8 @@
 // published to clients), ISC-S9 (MOTD), ISC-S10 (rating taxonomy), ISC-A-S3
 // (server is verify-and-serve, never originates posts), ISC-A-S5b (server
 // publishes the taxonomy but does NOT enforce ratings), ISC-C19 (sharer-
-// assigned rating tag travels in the public listing), and finding F25
-// (public-share-listing surface defined as an extension of the S4 API).
+// assigned rating tag travels in the public listing), and the public-share
+// listing surface, defined as an extension of the S4 API.
 //
 // MINOR bumps to this schema MUST be additive-only (ISC-S14): never reuse a
 // field number, never repurpose an enum value, never tighten validation after

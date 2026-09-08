@@ -2,7 +2,7 @@
 //!
 //! The trust decision itself is shared with the client via
 //! [`super::trust::evaluate_trust`]. This module holds the one piece unique to
-//! symmetric peering: the concurrent-TOFU tiebreaker (finding F31, ISC-S12-8).
+//! symmetric peering: the concurrent-TOFU tiebreaker (ISC-S12-8).
 //!
 //! When two servers configured to trust each other connect simultaneously,
 //! both could try to TOFU-pin the other at the same instant, racing toward a

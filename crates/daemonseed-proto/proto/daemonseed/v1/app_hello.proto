@@ -44,16 +44,16 @@ message AppHello {
   repeated ProtocolVersion versions = 1;
 
   // Transports the initiator can speak. MVP populates exactly
-  // `["tcp-tls13"]`. Closes finding F29 — the QUIC-ready transport-
-  // pluggability Reservation depends on this field existing from day one
-  // so adding `quic-v1` later is not a wire-protocol-version bump.
+  // `["tcp-tls13"]`. QUIC-ready transport pluggability depends on this
+  // field existing from day one, so adding `quic-v1` later is not a
+  // wire-protocol-version bump.
   repeated string transport_capabilities = 2;
 
-  // AGPL §13 advertisement surface (finding F32). Optional URL where the
+  // AGPL §13 advertisement surface. Optional URL where the
   // operator publishes the source distribution matching this running
   // binary. M4a defines the field; server-side population lands in M6.
   // Empty/unset means "operator has not yet declared a source URL" — that
-  // surfaces the `ServerSourceUnverified` LogOnly trust event (M7).
+  // surfaces the `ServerSourceUnverified` LogOnly trust event.
   optional string server_source = 3;
 }
 
@@ -65,13 +65,13 @@ message AppHelloAck {
   // The single negotiated version, drawn from the initiator's offer.
   ProtocolVersion version = 1;
 
-  // AGPL §13 advertisement surface (finding F32 / ISC-9). Optional URL where
+  // AGPL §13 advertisement surface (ISC-9). Optional URL where
   // the relay operator publishes the source distribution matching this running
   // binary. The client-facing companion to AppHello.server_source (which only
   // a connection *initiator* sends): a relay only ever responds with this Ack,
   // so this is where it advertises its source to connecting clients. Empty/
   // unset means "operator has not declared a source URL" — surfacing the
-  // `ServerSourceUnverified` LogOnly trust event (M7). Additive MINOR field
+  // `ServerSourceUnverified` LogOnly trust event. Additive MINOR field
   // (ISC-S14): older clients ignore it.
   optional string server_source = 2;
 }

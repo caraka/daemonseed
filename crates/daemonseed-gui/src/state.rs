@@ -1,16 +1,16 @@
-//! Plain-Rust, RAM-only per-circle state layer (round 2 + round 4).
+//! Plain-Rust, RAM-only per-circle state layer.
 //!
 //! No `slint` import: this module is the in-memory model of the GUI's circles and
 //! their per-circle scroll/draft state, kept Slint-free so it is unit-testable in
 //! isolation. Each circle remembers its own half-typed draft and scroll position
 //! across rail switches; everything resets on relaunch (no persistence).
 //!
-//! **Round 4 adds the net contract.** A circle can now be *materialized at
+//! **The net contract.** A circle can be *materialized at
 //! runtime* from a shared phrase (join / new-circle flows), and a materialized
 //! circle carries the [`CircleNet`] contract — the originating phrase, its derived
 //! [`CircleKey`] (`daemonseed_core::circle::key::derive_cot_key`), and a rendezvous
-//! slot — so Round 5's circle networking plugs in without reworking this layer.
-//! This is why the module now depends on `daemonseed-core` (it did not in round 2);
+//! slot — so circle networking plugs in without reworking this layer.
+//! This is why the module depends on `daemonseed-core`;
 //! it stays Slint-free and network-free. Materialized circles are RAM-only and
 //! gone on relaunch — config persistence is a separate milestone.
 
@@ -348,10 +348,10 @@ pub struct MyShare {
     pub republishing: bool,
 }
 
-/// The Round-5 **net contract** carried by a materialized circle (refinement #1).
+/// The **net contract** carried by a materialized circle.
 ///
 /// Holding the phrase + derived [`CircleKey`] + a rendezvous slot here is the single
-/// most important thing Round 4 gets right: Round 5's `NetCommand::JoinCircle`
+/// most important thing this layer gets right: `NetCommand::JoinCircle`
 /// takes the phrase (the net actor derives its own key, mirroring the public-room
 /// name path), and seal/open needs the `cot_key` + `rendezvous` — so the net path
 /// plugs into an already-materialized circle with no rework.
@@ -368,13 +368,13 @@ pub struct CircleNet {
     pub circle_id: u64,
     /// The originating shared phrase. RAM-only secret (like the TUI's
     /// `pending_join`); handed to `NetCommand::JoinCircle{phrase}` so the actor
-    /// re-derives the same key (Round-5 circle net path).
+    /// re-derives the same key (the circle net path).
     pub phrase: String,
     /// The derived circle-of-trust key. The net contract's keystone — proves the
-    /// phrase derives now, so Round 5's seal/open reuses it directly.
+    /// phrase derives now, so the seal/open path reuses it directly.
     pub cot_key: CircleKey,
     /// The circle's rendezvous address on a connected relay. `None` pre-net —
-    /// Round 5 fills it (`daemonseed_core::cot::asset_address(cot_key, server_id)`)
+    /// The net path fills it (`daemonseed_core::cot::asset_address(cot_key, server_id)`)
     /// once a relay/server-id is in hand.
     pub rendezvous: Option<AssetAddr>,
 }
@@ -391,7 +391,7 @@ impl core::fmt::Debug for CircleNet {
 
 /// A single circle and its retained, per-circle UI state.
 ///
-/// **No longer `Clone`** (round 4): it now holds a [`CircleNet`] whose [`CircleKey`]
+/// **Not `Clone`**: it holds a [`CircleNet`] whose [`CircleKey`]
 /// is a zeroizing secret that must not be silently copied. The render path borrows
 /// `&CircleState` and applies it; it never clones.
 #[derive(Debug)]
@@ -408,7 +408,7 @@ pub struct CircleState {
     /// (Slint sign convention); retained across switches.
     pub scroll_y: f32,
     /// The net contract — `Some` for a materialized circle, `None` for the public
-    /// Lobby (which derives its room key from the room name, not a phrase). Round 5
+    /// Lobby (which derives its room key from the room name, not a phrase). The net path
     /// reads it to drive `JoinCircle`/`SendCircle` and to route inbound frames.
     pub net: Option<CircleNet>,
     /// #64: client-side unread (new-message) dot. Set when a non-own message lands
@@ -783,7 +783,7 @@ impl DmState {
 /// First circle id handed out (0 is reserved/unused so a missing id is obvious).
 const FIRST_CIRCLE_ID: u64 = 1;
 
-/// The whole GUI state: the circles, which one is active, and — round 6 — the
+/// The whole GUI state: the circles, which one is active, and the
 /// unlocked [`Profile`] (when present) that persists circle membership + the
 /// display handle across relaunches. The circles/draft/scroll layer stays RAM-only
 /// (no message history is ever persisted); only the at-rest settings payload the
@@ -832,9 +832,9 @@ pub struct GuiState {
 }
 
 impl GuiState {
-    /// The binary's seed (round 4): **Lobby only.** Per the design brief's
+    /// The binary's seed: **Lobby only.** Per the design brief's
     /// empty-state lean — the rail starts with just the pinned, real public Lobby
-    /// (rail index 0, the round-3 networked room); circles are then *materialized*
+    /// (rail index 0, the networked room); circles are then *materialized*
     /// by the user via the join / new-circle flows. No fake demo circles: a mute
     /// placeholder circle would muddy the manual test. The Lobby's transcript fills
     /// from the relay at runtime (empty until connected).
@@ -866,7 +866,7 @@ impl GuiState {
         }
     }
 
-    /// Adopt an unlocked [`Profile`] (round 6) and restore its persisted circles
+    /// Adopt an unlocked [`Profile`] and restore its persisted circles
     /// into the rail. Each stored phrase is re-materialized (a fresh per-session
     /// `circle_id`, the key re-derived — never a persisted key); a stored phrase
     /// that no longer derives is skipped so one bad entry can't block startup.
@@ -1134,7 +1134,7 @@ impl GuiState {
             .unwrap_or_default()
     }
 
-    /// Write-through (M16): remember a published share root with its optional
+    /// Write-through: remember a published share root with its optional
     /// wire-facing `name` in the unlocked profile blob so it auto-republishes next
     /// launch (#41). `Some(name)` is a user-typed custom name; `None` defaults to
     /// the root basename at republish. No-op (returns `Ok`) on the ephemeral
@@ -1146,7 +1146,7 @@ impl GuiState {
         }
     }
 
-    /// Write-through (M16): forget a published share root from the profile blob.
+    /// Write-through: forget a published share root from the profile blob.
     pub fn unpersist_published(&mut self, root: &str) -> Result<(), String> {
         match self.profile.as_mut() {
             Some(p) => p.unpersist_published(root).map(|_| ()),
@@ -1181,7 +1181,7 @@ impl GuiState {
             .collect()
     }
 
-    /// Write-through (round 6): record circle `idx`'s phrase into the unlocked
+    /// Write-through: record circle `idx`'s phrase into the unlocked
     /// profile's blob so it silently re-joins next launch. A no-op (returns `Ok`)
     /// when there is no profile (ephemeral session) or the circle has no net
     /// contract (the Lobby). A disk / seal failure is surfaced as `Err(reason)` —
@@ -1268,7 +1268,7 @@ impl GuiState {
         self.next_circle_id += 1;
         // PLACEHOLDER display name: the relay-independent `#<12hex>` circle
         // fingerprint (ISC-C62, explicitly reserved "for the GUI era") stands in
-        // until Round 5's relay-derived adj-noun label (which needs a server_id).
+        // until a relay-derived adj-noun label exists (it needs a server_id).
         // No new naming scheme invented.
         let fp = circle_fingerprint(phrase);
         let initial = fp
@@ -1280,9 +1280,9 @@ impl GuiState {
             name: fp,
             // Operator-facing trust copy (brief refinement #3, D6). No bit numbers
             // (ISC-45). The old "· not yet connected" was a placeholder that never got
-            // the live-state wiring (manual test 2026-06-21: it contradicted the live
-            // header status on a circle whose chat works) — dropped. Live per-circle
-            // connection state is the Round-5 item; the header `connection-status`
+            // the live-state wiring (it contradicted the live header status on a circle
+            // whose chat works) — dropped. Live per-circle
+            // connection state is a follow-up; the header `connection-status`
             // property already carries the truthful live state.
             sub: "end-to-end encrypted".to_owned(),
             initial,
@@ -1442,7 +1442,7 @@ impl GuiState {
 
     /// Append a message to circle `idx` (no-op if out of range). Used by the
     /// real-net event drain to fold inbound/echoed Lobby messages into the RAM
-    /// transcript, and by the non-Lobby local stub (the Round-5 `SendCircle` seam).
+    /// transcript, and by the non-Lobby local stub (the `SendCircle` seam).
     /// Returns a [`PushOutcome`]: `inserted` is false on a dedup no-op (so the caller
     /// skips re-render + scroll — #143 scroll-yank), true on a genuine insert;
     /// `unread_raised` is true only when this newly raised circle `idx`'s unread dot
@@ -1579,9 +1579,9 @@ impl GuiState {
 
 #[cfg(test)]
 impl GuiState {
-    /// Round-2 demo fixture — >=4 circles, a pinned "Lobby" first, the active one
-    /// (index 1) scroll-rich. Round 4 retired it from the binary seed (the app
-    /// uses [`GuiState::lobby_only`]); it is kept **test-only** so the round-2
+    /// Demo fixture — >=4 circles, a pinned "Lobby" first, the active one
+    /// (index 1) scroll-rich. It is no longer the binary seed (the app
+    /// uses [`GuiState::lobby_only`]); it is kept **test-only** so the
     /// retention/perf unit tests below stay intact with zero churn. Materialized
     /// circles carry no net contract here (`net: None`) — these tests exercise the
     /// pure draft/scroll/switch state, not the crypto.
@@ -2178,7 +2178,7 @@ mod tests {
         assert_eq!(st.my_shares()[0].id, "id-b");
     }
 
-    // ── round-2 retention/perf (unchanged behavior; demo fixture) ────────────
+    // ── retention/perf (unchanged behavior; demo fixture) ────────────────────
 
     #[test]
     fn draft_retained_per_circle() {
@@ -2503,7 +2503,7 @@ mod tests {
         assert_eq!(st.current().draft, "captured");
     }
 
-    // ── round-4: seed + materialization + net contract ───────────────────────
+    // ── seed + materialization + net contract ────────────────────────────────
 
     /// A genuinely-strong (>=128-bit) phrase for materialization tests. 12 BIP-39
     /// words = 132 bits; this hand-picked set clears `is_circle_green`.
@@ -2549,7 +2549,7 @@ mod tests {
             net.rendezvous.is_none(),
             "rendezvous unset pre-net (ISC-23)"
         );
-        // Round-5 routing: a stable id is assigned and round-trips through lookup.
+        // Routing: a stable id is assigned and round-trips through lookup.
         assert_eq!(
             net.circle_id, 1,
             "first materialized circle gets FIRST_CIRCLE_ID"
@@ -2792,13 +2792,13 @@ mod tests {
         );
     }
 
-    // ── round-6: persistent identity + silent circle rejoin ──────────────────
+    // ── persistent identity + silent circle rejoin ───────────────────────────
 
     /// The whole persistence loop, end-to-end against a real temp profile root and
     /// no relay: enroll → adopt the profile → user joins a circle (write-through) →
     /// reload the blob from disk under the passphrase → restore. The restored circle
     /// must be back in the rail and re-derive the SAME key, and the display handle
-    /// must survive. This is the round-6 keystone — a tester relaunching keeps their
+    /// must survive. This is the persistence keystone — a tester relaunching keeps their
     /// handle + circles.
     #[test]
     fn profile_round_trips_a_circle_and_handle_across_reload() {

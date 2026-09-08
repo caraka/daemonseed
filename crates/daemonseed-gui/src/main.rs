@@ -73,7 +73,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 /// The Lobby is rail index 0 — the only circle wired to the real public room. A
-/// materialized circle (index ≥1) routes its Send to the Round-5 `SendCircle` seam.
+/// materialized circle (index ≥1) routes its Send to the `SendCircle` seam.
 const LOBBY: usize = 0;
 
 /// #84: large-negative `scroll_y` sentinel meaning "pin to the bottom". `apply_view`
@@ -135,11 +135,12 @@ const APP_VERSION: &str = "v0.36.3";
 
 /// Run `f` on the next event-loop tick instead of synchronously. Used to move
 /// `.focus()` calls OUT of key-event handlers: focusing an element while Slint is
-/// mid key-processing is re-entrant and corrupts routing for the NEXT key (caraka
-/// hit "the third Ctrl shortcut in a row fails" — each prior shortcut had focused a
-/// field synchronously from inside the key handler). A 0ms single-shot defers it to
-/// after the current event completes. No-op in offscreen mode (no event loop), which
-/// is fine — the offscreen paths don't depend on focus.
+/// mid key-processing is re-entrant and corrupts routing for the NEXT key.
+/// Symptom: the third Ctrl shortcut in a row fails, because each prior shortcut
+/// had focused a field synchronously from inside the key handler. A 0ms
+/// single-shot defers it to after the current event completes. No-op in
+/// offscreen mode (no event loop), which is fine — the offscreen paths don't
+/// depend on focus.
 fn defer<F: FnOnce() + 'static>(f: F) {
     slint::Timer::single_shot(Duration::from_millis(0), f);
 }
@@ -428,7 +429,7 @@ fn materialize_and_select(
                 rebuild_rail(ui, &st);
                 apply_view(ui, st.current(), active as i32);
                 apply_circle_detail(ui, &st, active);
-                // Round 6 write-through: record the circle in the unlocked profile
+                // Write-through: record the circle in the unlocked profile
                 // so it silently re-joins next launch. A no-op without a profile; a
                 // disk failure is surfaced quietly — the circle still works this
                 // session (no-history property means nothing is lost but the rejoin).
@@ -449,7 +450,7 @@ fn materialize_and_select(
     };
     match join {
         Some((circle_id, phrase)) => {
-            // Autofocus the composer so the user can type immediately (caraka note),
+            // Autofocus the composer so the user can type immediately,
             // deferred off any key-triggered call path (re-entrant focus footgun).
             let w = ui.as_weak();
             defer(move || {
@@ -457,7 +458,7 @@ fn materialize_and_select(
                     ui.invoke_focus_composer();
                 }
             });
-            // Round 5: subscribe the actor to this circle. Fire-and-forget; if the
+            // Subscribe the actor to this circle. Fire-and-forget; if the
             // session isn't Connected yet the actor emits a (drained, non-fatal)
             // CircleError — the create-before-connect edge, flagged in the ISA.
             let _ = net
@@ -470,7 +471,7 @@ fn materialize_and_select(
 }
 
 /// Build the shell, own the RAM-only state, and wire ALL interactive callbacks
-/// (rail switch, composer send, and the round-4 circle-plumbing surfaces).
+/// (rail switch, composer send, and the circle-plumbing surfaces).
 /// Returns the window AND the shared state so the caller can wire real networking
 /// and drive the offscreen verification flags.
 type BuiltUi = (
@@ -483,12 +484,12 @@ type BuiltUi = (
 fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
     let ui = AppWindow::new().expect("create AppWindow");
     ui.set_app_version(SharedString::from(APP_VERSION));
-    // Round-4 seed: Lobby only (empty-state for circles; Lobby pinned + real).
+    // Seed: Lobby only (empty-state for circles; Lobby pinned + real).
     let state = Rc::new(RefCell::new(GuiState::lobby_only()));
     state
         .borrow_mut()
         .set_project_announce_seed(project_announce_seed);
-    // The net actor is built HERE (round 5) so the circle-plumbing callbacks can
+    // The net actor is built HERE so the circle-plumbing callbacks can
     // reach it (materialize → JoinCircle; circle Send → SendCircle). `NetHandle::new`
     // is crypto-independent — only Connect needs crypto — so it never fails on
     // crypto; the Connect + drain timer are started later by `start_net`.
@@ -870,7 +871,7 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
 
     // Composer Send / Enter. The Lobby (no circle id) publishes a real sealed
     // public-room message; a materialized circle publishes a real sealed circle
-    // message (Round 5 — replaces the round-4 local-echo stub). Both are
+    // message (replacing the earlier local-echo stub). Both are
     // fire-and-forget; the local echo arrives back as a drained NetEvent
     // (`Message` / `CircleMessage`), so there is ONE render path and no double-add.
     ui.on_send_message({
@@ -1127,7 +1128,7 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
         move |share_id| {
             let id = share_id.to_string();
             // Explicit user Unpublish = "forget this share", so drop its persisted
-            // root (M16) — a later reconnect must NOT auto-republish it. PublishStopped
+            // root — a later reconnect must NOT auto-republish it. PublishStopped
             // drops it from the session list. Forgetting is keyed on the root path.
             let root = state.borrow().share_root(&id);
             if let Some(root) = root {
@@ -1430,7 +1431,7 @@ struct LiveNet {
     _timer: Timer,
 }
 
-/// Start the [`NetEvent`] drain timer (round 6: this no longer connects — the
+/// Start the [`NetEvent`] drain timer (this does not connect — the
 /// `Connect` is deferred to [`connect_now`], fired only once an identity is
 /// unlocked, so the actor never connects under an ephemeral handle while the auth
 /// gate is up). The ~33ms repeated, CAPPED non-blocking loop drains events onto the
@@ -1448,7 +1449,7 @@ fn start_drain(
         let state = state.clone();
         let net = net.clone();
         let browser = browser.clone();
-        // Comparative-real-time poll counter (caraka 2026-06-16): the share catalog
+        // Comparative-real-time poll counter: the share catalog
         // has no relay push (`ListPublicShares` is unary), so liveness = re-list on a
         // cadence. ~90 × 33ms ≈ 3s.
         let mut poll_tick: u32 = 0;
@@ -1533,7 +1534,7 @@ fn write_clipboard_text(text: &str) -> bool {
 }
 
 /// Fire the real `Connect` against the running net actor: auto-joins the default
-/// public room, presents under the unlocked profile's stable handle (round 6), and
+/// public room, presents under the unlocked profile's stable handle, and
 /// silently re-joins its persisted circles once the session is live. Called once an
 /// identity is in hand — from the auth-success callbacks (first-start finish /
 /// unlock) or, on the offscreen `main` path, directly at startup. On a crypto-init
@@ -2202,7 +2203,7 @@ fn defer_set_fs_step(ui: &AppWindow, step: i32) {
     });
 }
 
-/// Wire the round-6 auth callbacks: the first-start wizard (passphrase → mnemonic →
+/// Wire the auth callbacks: the first-start wizard (passphrase → mnemonic →
 /// round-trip confirm → name) and the daily-login Unlock. The `FirstStart` machine
 /// lives in `wizard`; the profile root to write / read lives in `profile_root`. On
 /// success each path adopts the profile and enters the shell via [`enter_main`].
@@ -2672,7 +2673,7 @@ fn main() {
     // (can_compose = true) so the offscreen PNG shows the composer affordance;
     // `--show-announcements` renders it as a NON-signer (composer absent, read-only).
     let show_composer = args.iter().any(|a| a == "--show-composer");
-    // Round-6 routing: `--portable` resolves the profile under CWD (else XDG).
+    // Routing: `--portable` resolves the profile under CWD (else XDG).
     // `--first-start [step]` / `--unlock` are OFFSCREEN-only render flags for the
     // new auth screens (windowed routing always uses `resolve`). `portable` feeds
     // the windowed `route_startup`, so it's only read under the `desktop` feature.
@@ -2720,7 +2721,7 @@ fn main() {
     // stays offline. Always init now (self-check materializes, so it needs it too).
     let crypto = init_crypto();
 
-    // Round-6 auth state, shared into the wizard/unlock callbacks: the FirstStart
+    // Auth state, shared into the wizard/unlock callbacks: the FirstStart
     // machine and the profile root to write/read.
     let wizard = Rc::new(RefCell::new(Wizard::Empty));
     // The current C34 type-back challenge (3 word positions), issued on entry to the

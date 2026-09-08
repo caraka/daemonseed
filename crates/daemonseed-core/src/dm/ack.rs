@@ -19,11 +19,11 @@
 //!
 //! Veilid has no TTL. A value survives exactly as long as somebody re-seeds it,
 //! so "it is on the DHT" and "they read it" are different facts and the network
-//! reports only the first. Every earlier draft tried to infer the second — from
-//! lobby presence, from a peer writing *something*, from the message ageing out —
-//! and each inference had the same failure: it certified delivery from evidence
-//! that was compatible with permanent silent loss, and the sender's UI then said
-//! *delivered* about a message nobody ever saw.
+//! reports only the first. Inferring the second — from lobby presence, from a
+//! peer writing *something*, from the message ageing out — fails the same way
+//! every time: it certifies delivery from evidence that is compatible with
+//! permanent silent loss, and the sender's UI then says *delivered* about a
+//! message nobody ever saw.
 //!
 //! So delivery here is **fail-safe**. A message defaults to *not delivered* and
 //! flips to *confirmed-collected* on exactly one thing: an authenticated statement

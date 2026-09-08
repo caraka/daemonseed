@@ -13,9 +13,9 @@
 //! 1. **Recipient-keyed address.** The owner seed is
 //!    `HKDF(salt = DM_DOORBELL_SALT, ikm = PK_lt_B, info = DM_DOORBELL_OWNER)`,
 //!    so B sweeps one record it can always find, and any sender can reach it.
-//!    An earlier draft keyed the address on the *pair* `(PK_lt_A, PK_lt_B)`;
-//!    that was refuted, because a world-derivable pairwise address is a
-//!    contact-graph oracle — anyone could test whether A had ever written to B.
+//!    Keying the address on the *pair* `(PK_lt_A, PK_lt_B)` is refuted: a
+//!    world-derivable pairwise address is a contact-graph oracle — anyone could
+//!    test whether A had ever written to B.
 //! 2. **Sender-blind slot.** Within the record, A writes at
 //!    `slot_for(sender_secret_A, PK_lt_B)`. The secret is A's, so a storage node
 //!    co-hosting the doorbell cannot map an occupied slot back to a candidate
@@ -37,8 +37,8 @@
 //! must hold a full 32768-byte bucket, which needs `o_cnt ≤ 32`. (The base entry is
 //! ~18 KB and a token-bearing one ~23 KB; sizing on those alone would have allowed
 //! more slots, which is why the padding bucket is the binding constraint and not
-//! the entry itself.) The `dflt(256)` of an earlier draft caps at 4096 B and could
-//! not hold an entry at all. The cost is priced and accepted: with 32 slots,
+//! the entry itself.) A `dflt(256)` subkey caps at 4096 B and could not hold an
+//! entry at all. The cost is priced and accepted: with 32 slots,
 //! birthday collision among *concurrent unknown* senders starts to bite around 7.
 //! Colliders overwrite each other, both re-seed, and B sweeps the whole record, so
 //! a collision usually costs latency rather than delivery — though under sustained

@@ -1458,8 +1458,9 @@ where
 /// manually tested dead session; open-in-place (veilid updates an already-open record in
 /// place, `open_record.rs:155-170`) is cheaper but may not clear a death that lives in
 /// the opened-record session. Defaulted **`true`** (mirror the restart that is known to
-/// work) pending the two-client reproduction (§RS-1.3); caraka flips it against the
-/// repro. Either path satisfies CRSH-ISC-3's lock span — the close (when enabled) runs
+/// work) pending the two-client reproduction (§RS-1.3). TODO: re-evaluate this
+/// default once that reproduction exists — open-in-place may suffice. Either
+/// path satisfies CRSH-ISC-3's lock span — the close (when enabled) runs
 /// inside the same `record_lock`-held span as the re-open/re-watch/re-sweep.
 pub const REPAIR_CLOSE_FIRST: bool = true;
 

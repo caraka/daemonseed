@@ -97,7 +97,7 @@ status — no new privilege machinery is needed.
   MOTD or new announcement since last-seen; reuse the #64 unread machinery), else open the
   Lobby; always rail-reachable; scoped to the currently-connected relay.
 
-## User story & unread mechanism (caraka, 2026-06-25)
+## User story & unread mechanism (2026-06-25)
 
 The signer's-eye flow, end to end:
 

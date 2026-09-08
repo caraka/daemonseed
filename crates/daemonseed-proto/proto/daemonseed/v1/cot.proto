@@ -1,6 +1,6 @@
 // daemonseed wire protocol — circle-of-trust live relay service (M8, F23).
 //
-// The protocol's FIRST streaming RPC. Like PublicSpace (M6) it runs as
+// The protocol's FIRST streaming RPC. Like PublicSpace it runs as
 // gRPC-over-h2 over the post-Authenticated TLS stream (daemonseed-core
 // Connection<Authenticated, T>); h2 owns its own framing, so there is no
 // length-prefix framing here (that belonged to the pre-auth HELLO/proof phase).
@@ -28,7 +28,7 @@ syntax = "proto3";
 
 package daemonseed.v1;
 
-// Circle-of-trust live relay (M8). The protocol's only bidirectional-streaming
+// Circle-of-trust live relay. The protocol's only bidirectional-streaming
 // service. A member opens one Subscribe stream per circle-asset it participates
 // in; the relay fans each inbound frame out to every *other* current subscriber
 // of the same asset.

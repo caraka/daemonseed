@@ -14,7 +14,7 @@
 //!    on macOS / Windows.
 //!
 //! If none of the above turns up a config, [`ResolvedProfileRoot::FirstStart`]
-//! is returned so the caller (M2) can run the enrollment flow.
+//! is returned so the caller can run the enrollment flow.
 //!
 //! ## Portable mode (`--portable`, ISC-C52)
 //!

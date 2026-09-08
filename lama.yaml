@@ -89,14 +89,14 @@ crates:
 
   - name: daemonseed-gui
     purpose: >-
-      Slint GUI client (round-1 scaffold). The design brief's three-zone shell
+      Slint GUI client (scaffold). The design brief's three-zone shell
       ported from the perf spike into structured components + the alpha tab nav
       (Chat / Shares / a "coming soon" circle-shares placeholder), with a
       command-palette overlay seeded from a Rust-side action registry. Stub
       in-memory data, no daemonseed-core wiring yet. Base build is
       software-renderer-only (offscreen `--screenshot` PNG, headless-verifiable);
       the `desktop` feature forwards slint/backend-winit for a real window.
-      Binary, no library API surface in round 1.
+      Binary, no library API surface.
     license: AGPL-3.0-or-later
     status: scaffold
     manifest: "docs/llm-api-manifest/daemonseed-gui-api.yaml"
@@ -169,11 +169,11 @@ capabilities:
       device — both v2 as of M3 with a 2-byte suite_id slot after the
       magic prefix (v1 reads accepted under implicit suite_id=0x0001 for
       M1/M2 compatibility; v2 binds suite_id into the AEAD AAD; touch_reseal
-      migrates v1 → v2 on next save per ISC-C24). The chunk CAS (M8) is a
+      migrates v1 → v2 on next save per ISC-C24). The chunk CAS is a
       third layer: opaque encrypted chunks named by SHA-384, reference-
       counted, with an ephemeral in-memory relay backing (constant-time
       presence per A-S2/A-S12) and a persistent client-cache on disk (ISC-6).
-      The share index (M8) is the redb-backed indexed-state layer: a
+      The share index is the redb-backed indexed-state layer: a
       persistent, incremental, per-value-encrypted index of a shared folder
       (keyed opaque keys + AES-256-GCM padded values; ISC-C21 / A-C6 / A-C7).
     crate: daemonseed-core
@@ -204,7 +204,7 @@ capabilities:
 
   - category: "Share indexer engine"
     summary: >-
-      Drives the share index from the filesystem (M8), designed against
+      Drives the share index from the filesystem, designed against
       Demonsaw's cold-rescan thrash. cold_scan walks the root once (run niced
       in the background so it never starves a foreground task; the persisted
       index stays queryable, so startup never blocks); apply_event folds one
@@ -276,7 +276,7 @@ capabilities:
       circle, A-S2), namespaced per relay for cross-server unlinkability.
       Key derivation is client-only; addressing is shared (client derives
       to subscribe, server keys its registry by it). `circle::message`
-      (M11) seals a plaintext CircleMessage under cot_key via AES-256-GCM
+      seals a plaintext CircleMessage under cot_key via AES-256-GCM
       (nonce||ciphertext||tag, domain-separated AAD) — the only path that
       produces CotFrame.payload bytes, making relay content-blindness a
       crypto guarantee not a policy (A-S2); open_message fails closed.

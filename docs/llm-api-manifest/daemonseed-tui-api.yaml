@@ -48,7 +48,7 @@ modules:
       cross-surface bleed (messages_on, ISC-A-C29); a post seals under exactly the
       active circle's key and an inbound message is attributed to the single circle
       whose key opened it (ISC-A-C30); the membership set persists into the
-      at-rest seeds blob (M13) and is restored on a daily-login Unlock, with each
+      at-rest seeds blob and is restored on a daily-login Unlock, with each
       persisted circle silently rejoined without re-typing the phrase (ISC-C51 /
       ISC-C59). It also has a
       server-management screen

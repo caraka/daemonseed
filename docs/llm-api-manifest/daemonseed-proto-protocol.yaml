@@ -130,7 +130,7 @@ modules:
 
   - name: public_space
     description: >-
-      Public-space application service (M6). The first application-
+      Public-space application service. The first application-
       stream service in the protocol: served over the post-Authenticated
       TLS stream as gRPC-over-h2. Covers signed announcement posts,
       MOTD, rating taxonomy, signer whitelist, and the operator-signed
@@ -198,13 +198,13 @@ types:
         tag: 2
         description: >-
           Transports the initiator can speak. MVP populates exactly
-          ['tcp-tls13']. Closes finding F29 — a QUIC-ready transport-
-          pluggability seam without a future protocol-version bump.
+          ['tcp-tls13']. A QUIC-ready transport-pluggability seam without
+          a future protocol-version bump.
       - name: server_source
         type: "optional string"
         tag: 3
         description: >-
-          AGPL section 13 source-URL advertisement (finding F32). Set by
+          AGPL section 13 source-URL advertisement. Set by
           a connection initiator (a server-to-server peering dialer). The
           client-facing case uses AppHelloAck.server_source instead,
           since a relay only ever sends the Ack (ISC-9, M6).
@@ -232,7 +232,7 @@ types:
         tag: 2
         description: >-
           AGPL section 13 source-URL the relay advertises to a connecting
-          client (ISC-9 / finding F32). Additive MINOR field (ISC-S14) —
+          client (ISC-9). Additive MINOR field (ISC-S14) —
           old clients ignore it. Unset means no URL declared (M7
           ServerSourceUnverified trust event).
 
@@ -416,7 +416,7 @@ types:
         tag: 3
         description: >-
           Best-effort availability. Unset at MVP — the RAM-only producer
-          is deferred (finding F15); kept in schema so populating it later
+          is deferred; kept in schema so populating it later
           is additive.
 
   - name: IntroducerResponse
@@ -1420,7 +1420,7 @@ functions:
     module: public_space
     description: >-
       Fetch the operator's signed suite-deprecation policy, or empty if
-      none is configured (M7). The server returns the same signed artifact
+      none is configured. The server returns the same signed artifact
       to every fetcher (ISC-A-S11); the client verifies the signature
       against the server-wide key and replay-protects on policy_version.
     signature: "rpc GetDeprecationPolicy(GetDeprecationPolicyRequest) returns (GetDeprecationPolicyResponse)"

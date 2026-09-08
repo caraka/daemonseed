@@ -98,7 +98,7 @@ pub const ARGON2_OUTPUT_LEN: usize = 48;
 /// AEAD key length (AES-256 → 32 bytes).
 pub const AEAD_KEY_LEN: usize = 32;
 
-/// Length of the share-index key (M14), derived as a sibling of the at-rest
+/// Length of the share-index key, derived as a sibling of the at-rest
 /// key. Re-exported from the redb index module so the two stay in lockstep.
 use crate::storage::share_index::INDEX_KEY_LEN;
 
@@ -708,7 +708,7 @@ impl Seeds {
         true
     }
 
-    /// Forget a remembered circle, keyed on its canonicalized entropy (M13).
+    /// Forget a remembered circle, keyed on its canonicalized entropy.
     /// Returns `true` if one was removed.
     pub fn remove_circle(&mut self, entropy: &str) -> bool {
         let before = self.circles.len();
@@ -751,7 +751,7 @@ impl Seeds {
         true
     }
 
-    /// Forget a remembered share root, keyed on its path (M14). Returns `true`
+    /// Forget a remembered share root, keyed on its path. Returns `true`
     /// if one was removed.
     pub fn remove_share(&mut self, root: &str) -> bool {
         let before = self.shares.len();
@@ -1270,10 +1270,10 @@ pub struct Opened {
     /// to v2 (ISC-C24 read-old-write-new).
     pub legacy_v1: bool,
     /// The at-rest AEAD key derived while opening, cached for the session so the
-    /// write-through (M13) can re-seal on each mutation without re-running
+    /// write-through can re-seal on each mutation without re-running
     /// Argon2id. The Unlock path hands this straight to the running client.
     pub key: SealingKey,
-    /// The share-index key (M14), derived as a sibling of `key` from the *same*
+    /// The share-index key, derived as a sibling of `key` from the *same*
     /// Argon2id run via a second domain-separated HKDF-Expand. The Unlock path
     /// hands this to the running client to open the redb `ShareIndex`
     /// (`crate::storage::share_index`) for free — no extra Argon2id.
@@ -1348,7 +1348,7 @@ impl core::fmt::Display for BlobError {
 
 impl std::error::Error for BlobError {}
 
-/// A cached at-rest AEAD key for the session write-through (M13).
+/// A cached at-rest AEAD key for the session write-through.
 ///
 /// Holds the 32-byte key derived once at unlock ([`Opened::key`]) or first-start
 /// ([`SealingKey::derive`]) so the running client can re-seal the blob on every
@@ -1395,7 +1395,7 @@ impl SealingKey {
     }
 
     /// Derive BOTH session keys — the at-rest [`SealingKey`] and the share-index
-    /// [`IndexKey`] — from a single Argon2id run (M14). The index key falls out
+    /// [`IndexKey`] — from a single Argon2id run. The index key falls out
     /// of the same high-entropy intermediate as the at-rest key via a second
     /// domain-separated HKDF-Expand, so activating the share indexer costs no
     /// extra Argon2id work on the Pi-4 floor. Used at first-start; the Unlock
@@ -1421,7 +1421,7 @@ impl core::fmt::Debug for SealingKey {
     }
 }
 
-/// A cached share-index key (M14) derived as a sibling of the at-rest
+/// A cached share-index key derived as a sibling of the at-rest
 /// [`SealingKey`] from the *same* single Argon2id run — one expensive KDF, two
 /// domain-separated HKDF-Expand outputs. Opens the redb
 /// `ShareIndex`(crate::storage::share_index::ShareIndex). Zeroizes on drop; it
@@ -1477,7 +1477,7 @@ pub fn seal_under(
 }
 
 /// Encrypt a [`Seeds`] payload under a pre-derived 32-byte AEAD `key`, skipping
-/// the Argon2id KDF. This is the hot path for the session write-through (M13):
+/// the Argon2id KDF. This is the hot path for the session write-through:
 /// the client derives the key once at unlock/first-start, caches it in a
 /// [`SealingKey`], and re-seals on every persist-worthy mutation without paying
 /// Argon2id again. The registry MUST contain `suite_id` and it MUST be
@@ -1590,7 +1590,7 @@ fn open_v2(
 
     // Derive both session keys from the single Argon2id run: the at-rest key
     // decrypts the blob, the index key rides out in `Opened` for the running
-    // client (M14) — no second KDF on the Unlock path.
+    // client — no second KDF on the Unlock path.
     let (mut key_bytes, mut index_bytes) = derive_session_keys(passphrase, profile_id, params)?;
     let aes = Aes256Key::new(&key_bytes).map_err(BlobError::AesKeyInit)?;
     let key = SealingKey(Zeroizing::new(key_bytes));
@@ -2321,7 +2321,7 @@ mod tests {
 
     #[test]
     fn cached_key_reseals_without_passphrase() {
-        // The write-through keystone (M13): open a blob once, then re-seal a
+        // The write-through keystone: open a blob once, then re-seal a
         // mutated Seeds using only the cached SealingKey — no passphrase, no
         // second Argon2id run — and confirm the mutation persists on re-open.
         ensure_oxicrypt_initialized();

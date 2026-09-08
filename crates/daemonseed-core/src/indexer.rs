@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(idx.index().len().unwrap(), 200);
     }
 
-    // ── cached hash pass (M16) ─────────────────────────────────────────────
+    // ── cached hash pass ─────────────────────────────────────────────
 
     /// A no-op cancel flag for passes that should run to completion.
     fn no_cancel() -> AtomicBool {

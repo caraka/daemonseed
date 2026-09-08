@@ -99,13 +99,13 @@ pub enum NetCommand {
     /// TLS + APP_HELLO + identity-proof flow to Authenticated, keep the live
     /// session, and auto-join the default public room.
     ///
-    /// `display_handle` (round 6) is the persisted, stable presented name from an
+    /// `display_handle` is the persisted, stable presented name from an
     /// unlocked profile — when `Some`, it replaces the actor's per-launch random
     /// handle so the user presents the SAME name across sessions. The connection
     /// proof itself stays ephemeral (D8, mirroring the TUI): persistence is a
     /// stable *display* identity, not a persisted connection-signing key.
     ///
-    /// `rejoin_circles` (round 6) is the set of persisted circles to silently
+    /// `rejoin_circles` is the set of persisted circles to silently
     /// re-join once the session is live — `(gui_circle_id, phrase)` pairs read
     /// from the at-rest blob. Re-joined AFTER the lobby auto-join so each has a
     /// live session; failures surface per-circle (`CircleError`) and never abort
@@ -113,7 +113,7 @@ pub enum NetCommand {
     Connect {
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
-        /// (M16) persisted published-share roots (directory paths) to silently
+        /// Persisted published-share roots (directory paths) to silently
         /// re-publish once the session is live — read from the at-rest blob, served
         /// after the lobby auto-join exactly like `rejoin_circles`. Each republish
         /// uses the directory basename as the share name and `display_handle` as the
@@ -374,7 +374,7 @@ pub enum NetEvent {
     CircleError { circle_id: u64, reason: String },
     /// A share is now published and served; `share_id` is client-minted (opaque).
     /// `root` is the published directory path — carried back so the GUI can persist
-    /// it for auto-republish (M16) and key Unpublish on it.
+    /// it for auto-republish and key Unpublish on it.
     PublishStarted {
         share_id: String,
         name: String,
@@ -825,7 +825,7 @@ mod tests {
     const CIRCLE_PHRASE: &str =
         "abandon ability able about above absent absorb abstract absurd abuse access accident";
 
-    /// Interop insurance (round-3 lesson): the GUI circle rendezvous derivation is
+    /// Interop insurance: the GUI circle rendezvous derivation is
     /// the canonical one — pinned against an independent `derive_cot_key` +
     /// `asset_address` (the CIRCLE path) AND asserted DISTINCT from the room path,
     /// so an accidental swap to `room_asset_address`/`derive_room_key` is caught.

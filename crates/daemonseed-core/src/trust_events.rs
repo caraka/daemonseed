@@ -1,4 +1,4 @@
-//! Trust-event taxonomy and audit log — ISC-C28 / ISC-A-C12 (M7).
+//! Trust-event taxonomy and audit log — ISC-C28 / ISC-A-C12.
 //!
 //! Every **trust-state event** (an event whose existence reflects a security
 //! decision, anomaly, or required user awareness) is rendered according to a
@@ -47,7 +47,7 @@ use crate::profile::config::ArgonParams;
 use crate::storage::dm_store::RecordKind;
 use crate::storage::seeds::{AEAD_KEY_LEN, ARGON2_OUTPUT_LEN, NONCE_LEN, TAG_LEN};
 
-/// Default audit-log filename at the profile root (finding F24).
+/// Default audit-log filename at the profile root.
 pub const AUDIT_LOG_FILENAME: &str = "trust-events.log";
 
 /// Default bounded capacity of the audit log (ISC-C28). Oldest entries are
@@ -111,10 +111,9 @@ pub enum TrustEventKey {
     /// The cached deprecation policy is past its TTL and could not be refreshed
     /// (ISC-A-C9).
     ServerDeprecationPolicyExpiredOffline,
-    /// Concurrent federation-peer key rotations diverged during partition-heal
-    /// (finding F31).
+    /// Concurrent federation-peer key rotations diverged during partition-heal.
     FederationPeerKeyDivergence,
-    /// A federated server advertised no AGPL §13 source URL (finding F32).
+    /// A federated server advertised no AGPL §13 source URL.
     ServerSourceUnverified,
     /// An established DM channel did not survive a restart and was torn down
     /// (ISC-C44 / #243).
@@ -637,7 +636,7 @@ pub const fn unreadable_policy_event() -> TrustEventKey {
     TrustEventKey::ServerDeprecationPolicyUnreadable
 }
 
-// ── Encrypted persistence (ISC-C28 / ISC-C36 / finding F24) ───────────────
+// ── Encrypted persistence (ISC-C28 / ISC-C36) ───────────────
 
 /// The audit-log path for a profile root: `<profile-root>/trust-events.log`.
 pub fn audit_log_path(profile_root: &Path) -> PathBuf {
@@ -2076,9 +2075,9 @@ mod tests {
     }
 
     /// The other direction of the same guarantee: a **v2** file relabelled as
-    /// v1 also fails the tag. The reviewer of this noticed the pair was
-    /// only pinned one way — a version tag inside the AAD is worth nothing if
-    /// it authenticates only the downgrade.
+    /// v1 also fails the tag. The pair must be pinned in both directions — a
+    /// version tag inside the AAD is worth nothing if it authenticates only the
+    /// downgrade.
     #[test]
     fn a_v2_file_relabelled_as_v1_fails_the_tag() {
         let _ = crate::kats::initialize_module_unsigned_test_binary();

@@ -33,6 +33,5 @@ the design-of-record.
 Wanted, shaped enough to describe, but deliberately deferred (no decision on
 *when*). Promote to a GitHub issue when picked up.
 
-- **(Conditional) reap reason-code + do-not-resurrect** — only needed *if* the
-  relay ever gains a durable/policy/TTL reap. Today every reap is a disconnect
-  (shares should always come back), so this is deferred until such a reap exists.
+- None at present.
+

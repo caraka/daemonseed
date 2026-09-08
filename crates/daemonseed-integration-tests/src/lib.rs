@@ -1,6 +1,6 @@
 //! daemonseed cross-crate integration tests + ISC coverage registry.
 //!
-//! Scope (M0): registry only — every ISC ID from `ds-isc-draft.md` is listed
+//! Scope: registry only — every ISC ID from `ds-isc-draft.md` is listed
 //! with its class (positive / negative). No tests are registered yet, so
 //! `cargo xtask isc-coverage` reports the 0/93 baseline. Real test
 //! registration starts in M1 onward.

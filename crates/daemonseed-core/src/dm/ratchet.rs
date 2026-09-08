@@ -23,10 +23,9 @@
 //!   ratchet rather than a key schedule.
 //! - A **chain** is one direction's run of messages under one root. Each direction
 //!   has its own, from distinct labels, so the two parties never derive the same
-//!   message key. An earlier draft used a single shared chain and thereby produced
-//!   identical keys on both sides — which under a fixed nonce is catastrophic and
-//!   under a random one is still a deletion wedge, since each party's advance
-//!   destroys the other's key.
+//!   message key. A single shared chain would produce identical keys on both
+//!   sides — which under a fixed nonce is catastrophic and under a random one is
+//!   still a deletion wedge, since each party's advance destroys the other's key.
 //! - A **message key** is used once and forgotten. `MK` and the successor `CK` are
 //!   siblings of one extraction, so recovering a message key yields nothing about
 //!   the chain it came from and nothing about any other message.

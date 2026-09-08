@@ -144,7 +144,7 @@ Veilid the operator-owned record covers authority (owner secret) and discovery (
 pubkey); community identity has no automatic successor — the owner **pubkey** becomes the identity (a
 human name is a local label, as with circles/rooms — ISC-C8).
 
-**Decision (caraka, 2026-07-07): MVP ships Fork A only — a single PROJECT-owned channel.** Owner =
+**Decision (2026-07-07): MVP ships Fork A only — a single PROJECT-owned channel.** Owner =
 the maintainer-held project key (the existing F17 `project_announce` anchor, ISC-15): a maintainer-held
 **offline** seed derives both the ML-DSA content-signing key (F17, already present) and a sibling
 Veilid owner keypair (the DHT write-gate); **only the two public keys are baked into clients** — the
@@ -166,7 +166,7 @@ unsolved governance problem the circle model was built to avoid. B therefore nee
 NOT the cutover. A0's operator-only decisions below (A1–A4) all hold for the one project channel and
 are the reusable substrate a future B would parameterize.
 
-**Seed for a future B (caraka, 2026-07-07) — the crux is first-contact key distribution, not the DHT.**
+**Seed for a future B (2026-07-07) — the crux is first-contact key distribution, not the DHT.**
 Owned channels are the *inverse* of circles: an abandoned circle self-purges (ownerless + live-only
 DHT = natural GC), but an owned channel persists exactly as long as someone keeps writing it — so a
 persistent adversary can keep a *squatted* look-alike channel alive and divert trust/traffic to it.

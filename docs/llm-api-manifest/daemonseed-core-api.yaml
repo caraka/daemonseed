@@ -381,7 +381,7 @@ modules:
 
   - name: daemonseed_core::storage::cas
     description: >-
-      Content-addressed chunk store — the third storage layer (M8). Opaque
+      Content-addressed chunk store — the third storage layer. Opaque
       already-encrypted chunks named by SHA-384(chunk); the address both
       locates and authenticates a chunk (a re-hash mismatch = corrupt or
       substituted, caller drops it). Reference-counted dedup: put inserts-
@@ -2469,7 +2469,7 @@ modules:
 
   - name: daemonseed_core::public_space
     description: >-
-      Signed-artifact model for the public-space service (M6), shared
+      Signed-artifact model for the public-space service, shared
       byte-for-byte by the server (verify-and-serve, ISC-A-S3) and every
       client (independent re-verification of what the server served). One
       implementation of "is this artifact trustworthy" — content-address
@@ -2486,7 +2486,7 @@ modules:
       - S7
       - S8
       - A-S3
-    added_in: "v0.8.0 (M6)"
+    added_in: "v0.8.0"
 
   - name: daemonseed_core::crypto::deprecation
     description: >-
@@ -2505,7 +2505,7 @@ modules:
       - A-S11
       - C25
       - A-C9
-    added_in: "v0.9.0 (M7)"
+    added_in: "v0.9.0"
 
   - name: daemonseed_core::trust_events
     description: >-
@@ -2521,7 +2521,7 @@ modules:
     iscs:
       - C28
       - A-C12
-    added_in: "v0.9.0 (M7)"
+    added_in: "v0.9.0"
 
   - name: daemonseed_core::dm::spent_store
     description: >-
@@ -2549,7 +2549,7 @@ modules:
     no_std: false
     depends_on: []
     iscs: []
-    added_in: "v0.11.0 (M9)"
+    added_in: "v0.11.0"
 
   - name: daemonseed_core::mention
     description: >-
@@ -2563,7 +2563,7 @@ modules:
       - C17
       - C18
       - A-C4
-    added_in: "v0.11.0 (M9)"
+    added_in: "v0.11.0"
 
   - name: daemonseed_core::release
     description: >-
@@ -2583,7 +2583,7 @@ modules:
       - A-S13
       - C27
       - A-C11
-    added_in: "v0.12.0 (M10)"
+    added_in: "v0.12.0"
     deferred: "Real signing keys / Sigstore / reproducible build / live fetch / binary swap (M10-infra)."
 
   - name: daemonseed_core::biometric
@@ -2984,7 +2984,7 @@ types:
       - name: index_key
         type: IndexKey
         description: >-
-          The share-index key (M14), derived as a sibling of `key` from the same
+          The share-index key, derived as a sibling of `key` from the same
           Argon2id run via a second domain-separated HKDF-Expand (info=share-index).
           The Unlock path hands it to the client to open the redb ShareIndex for
           free — no extra Argon2id. Zeroizing; never logged/persisted.
@@ -3055,7 +3055,7 @@ types:
     module: daemonseed_core::storage::seeds
     kind: struct
     description: >-
-      A cached at-rest AEAD key for the session write-through (M13). Holds the
+      A cached at-rest AEAD key for the session write-through. Holds the
       32-byte key derived once at unlock (Opened::key) or first-start
       (SealingKey::derive) so the running client can re-seal the blob on every
       persist-worthy mutation (mute, hide, circle join/leave, rename, display-name
@@ -3079,7 +3079,7 @@ types:
     module: daemonseed_core::storage::seeds
     kind: struct
     description: >-
-      A cached share-index key (M14) derived as a sibling of the at-rest SealingKey
+      A cached share-index key derived as a sibling of the at-rest SealingKey
       from the *same* single Argon2id run — one expensive KDF, two domain-separated
       HKDF-Expand outputs. Opens the redb ShareIndex (storage::share_index). A
       session secret on par with the at-rest key: zeroizes on drop, never logged or
@@ -3211,7 +3211,7 @@ types:
     module: daemonseed_core::share_serve
     kind: struct
     description: >-
-      The manifest a hash pass produces over a share root (M16): entries:
+      The manifest a hash pass produces over a share root: entries:
       Vec<ManifestEntry>, one per file, in the same deterministic order as
       ShareContent::index_dir (sorted walk + full-path sort) with
       byte-identical ORDERED per-chunk SHA-384 addresses (1 MiB CHUNK_SIZE
@@ -3243,7 +3243,7 @@ types:
     module: daemonseed_core::share_serve
     kind: trait
     description: >-
-      The minimal content surface a serve loop needs (M16): manifest() ->
+      The minimal content surface a serve loop needs: manifest() ->
       &[ManifestEntry] + chunk(&ChunkAddr) -> Option<Vec<u8>>, with the pure
       answer(&ShareFrame) -> Option<ShareFrame> step provided on top
       (ManifestRequest → full manifest; ChunkRequest → ChunkResponse, or no
@@ -3379,7 +3379,7 @@ types:
     module: daemonseed_core::indexer
     kind: enum
     description: >-
-      Why a cached_or_hash pass failed (M16) — it spans two domains.
+      Why a cached_or_hash pass failed — it spans two domains.
     variants:
       - name: Index
         description: "Index(IndexError) — reading/writing the chunk-addr cache failed."
@@ -3646,12 +3646,12 @@ types:
       - name: seal_key
         type: SealingKey
         description: >-
-          The cached at-rest AEAD key matching the blob `seeds` seals into (M13), so
+          The cached at-rest AEAD key matching the blob `seeds` seals into, so
           the client re-seals on each mutation without re-running Argon2id. Zeroizing.
       - name: index_key
         type: IndexKey
         description: >-
-          The cached share-index key (M14), derived as a sibling of seal_key from the
+          The cached share-index key, derived as a sibling of seal_key from the
           same Argon2id run, used to open the redb ShareIndex and activate the M8
           indexer against TUI-defined share roots. Zeroizing.
 
@@ -4747,7 +4747,7 @@ types:
       - name: chunks
         type: "Vec<ChunkAddr>"
         description: >-
-          The file's ordered chunk addresses (M16). The bytes are the
+          The file's ordered chunk addresses. The bytes are the
           concatenation of the chunks in this order; each address is the SHA-384
           of that chunk. An empty file is size 0, chunks [].
 
@@ -5665,7 +5665,7 @@ functions:
     description: >-
       Derive the at-rest AEAD key from the passphrase (one Argon2id run) and cache
       it for the session write-through. Used at first-start; the Unlock path gets
-      the key for free from open() via Opened::key instead of calling this (M13).
+      the key for free from open() via Opened::key instead of calling this.
     signature: "pub fn derive(passphrase: &str, profile_id: Uuid, params: ArgonParams) -> Result<SealingKey, BlobError>"
     parameters:
       - name: passphrase
@@ -5690,7 +5690,7 @@ functions:
     module: daemonseed_core::storage::seeds
     description: >-
       Re-seal `seeds` under the active write-suite using the cached key — no
-      Argon2id. The session calls this on every persist-worthy mutation (M13).
+      Argon2id. The session calls this on every persist-worthy mutation.
     signature: "pub fn seal(&self, seeds: &Seeds) -> Result<Vec<u8>, BlobError>"
     parameters:
       - name: seeds
@@ -5763,7 +5763,7 @@ functions:
 
   - name: "Seeds::remove_circle"
     module: daemonseed_core::storage::seeds
-    description: "Forget a remembered circle, keyed on its canonicalized entropy (M13)."
+    description: "Forget a remembered circle, keyed on its canonicalized entropy."
     signature: "pub fn remove_circle(&mut self, entropy: &str) -> bool"
     parameters:
       - name: entropy
@@ -6247,7 +6247,7 @@ functions:
     module: daemonseed_core::storage::share_index
     description: >-
       Delete every entry in ONE write transaction — the table is dropped and
-      re-created atomically (M16). The clear-then-rescan move: latest-wins
+      re-created atomically. The clear-then-rescan move: latest-wins
       semantics for a share whose root changed wholesale, without tracking
       per-entry staleness and without ever cycling the redb file lock
       (ISC-A-C36 — the TUI keeps one open handle for the actor's life).

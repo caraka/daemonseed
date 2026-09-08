@@ -1120,12 +1120,12 @@ and no other.
 ends spawn it beside their net actor on connect.** The acknowledgement record, its piggyback path
 and the standalone cadence (ISC-C39, ISC-A-C21), the doorbell and first-contact path (ISC-C41), the
 paged channel (ISC-C42) and the established-contact channel (ISC-C43) run through it. The two-node
-oracle `two_node_dm_driver.rs` passed against the public Veilid network on an attach-capable host:
-first contact, acceptance, one message in each direction, and both outboxes confirmed-collected,
-each exactly once (`test result: ok. 1 passed`, 1221 s). The criteria named above stay open until
-each is closed against its own text; the oracle is evidence for them, not a closing pass. The front
-ends send no `DmCommand` but shutdown. The GUI renders nothing from `DmEvent` at all; the TUI
-renders nothing from it either, except the teardown affordance below.
+oracle `two_node_dm_driver.rs` passed against the public Veilid network, from a host that can reach
+it: first contact, acceptance, one message in each direction, and both outboxes
+confirmed-collected, each exactly once (`test result: ok. 1 passed`, 1221 s). The criteria named
+above stay open until each is closed against its own text; the oracle is evidence for them, not a
+closing pass. The front ends send no `DmCommand` but shutdown. The GUI renders nothing from
+`DmEvent` at all; the TUI renders nothing from it either, except the teardown affordance below.
 
 **A torn-down DM channel is raised as its classed trust event, and the event cannot be separated
 from the loss.** `DmEvent::ChannelLost` carries the `TrustEventKey` that `Teardown::event` assigns
@@ -1183,11 +1183,12 @@ rollback residual ISC-A-C23 names. Pinned by
 `the_bound_is_this_sessions_and_a_restart_takes_the_older_record_again`, each with the byte-level
 `accept_encoded_refuses_a_replayed_older_record` under it.
 
-**Manually tested for real, 2026-08-28: `two_node_dm_ack.rs`'s live oracle passed against the public
-Veilid network on an attach-capable host** — `an_acknowledgement_published_by_one_node_merges_at_the_other`,
-39.12s, collect-with-gaps → publish → fetch from the far end → verify → merge under a ceiling, all
-OK. The record's transport half is now proven over a real network, not merely gate-green; what
-remains open is GUI/TUI production wiring, not the transport primitive itself.
+**Manually tested for real, 2026-08-28: `two_node_dm_ack.rs`'s live oracle passed against the
+public Veilid network, from a host that can reach it** —
+`an_acknowledgement_published_by_one_node_merges_at_the_other`, 39.12s, collect-with-gaps → publish
+→ fetch from the far end → verify → merge under a ceiling, all OK. The record's transport half is
+now proven over a real network, not merely gate-green; what remains open is GUI/TUI production
+wiring, not the transport primitive itself.
 
 **`two_node_dm_ack.rs` is the live oracle for the record's transport half, matching the sibling it
 was missing next to** (`two_node_dm_key_record.rs`, `two_node_dm_page.rs`, `two_node_doorbell.rs`,

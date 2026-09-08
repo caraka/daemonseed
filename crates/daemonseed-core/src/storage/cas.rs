@@ -1,4 +1,4 @@
-//! Content-addressed chunk store — the third storage layer (M8).
+//! Content-addressed chunk store — the third storage layer.
 //!
 //! daemonseed splits at-rest state three ways: the encrypted seeds blob
 //! ([`super::seeds`]), the redb-backed indexed state (M8+), and this

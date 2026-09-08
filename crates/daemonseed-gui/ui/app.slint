@@ -1,11 +1,10 @@
 // daemonseed-gui — shell (Slint, software renderer).
 //
-// Round 1 ported the three-zone shell from the perf spike. Round 2/3 made it
-// interactive + wired the public Lobby to real networking. Round 4 adds **circle
-// plumbing**: Join-a-circle and New-circle overlays (the action-registry surfaces),
-// a rail empty-state ("No circles yet"), and the materialize flow. Circles are
-// materialized-but-MUTE this round (no networking) — Round 5 plugs the net path
-// into the per-circle net contract the state layer now carries.
+// The three-zone shell was ported from the perf spike, then made interactive and
+// wired to real networking on the public Lobby. **Circle plumbing** adds the
+// Join-a-circle and New-circle overlays (the action-registry surfaces), a rail
+// empty-state ("No circles yet"), and the materialize flow; the per-circle net
+// contract the state layer carries is where the net path plugs in.
 //
 // Visual language per brief: dark 4-step surface ladder, GRAYSCALE chrome, ONE
 // teal accent (primary action + E2EE "sealed" tint). Trust marker is a LABELED
@@ -72,7 +71,7 @@ struct MyShareRow {
 
 // One live Lobby roster row (#75). `name` is the member's display handle; the
 // `#12hex` verification fingerprint (ISC-C4 binding to the verified pubkey) is
-// carried per-row but shown only ON HOVER (caraka 2026-06-24 — names stay short).
+// carried per-row but shown only ON HOVER (names stay short).
 // Rust replaces the whole `roster` model on every presence change, so the `for`
 // re-renders without an `if`-teardown (partial_renderer item-tree safety).
 struct RosterRow {
@@ -200,8 +199,8 @@ component RosterRowView inherits Rectangle {
     in property <string> name;
     in property <string> fingerprint;
     // Tall enough to hold the name AND the on-hover fingerprint line WITHIN the
-    // row's own bounds, so the hex can never overlap the next member's name
-    // (caraka manual test 2026-06-24). Accessibility pass: larger, higher-contrast
+    // row's own bounds, so the hex can never overlap the next member's name.
+    // Accessibility pass: larger, higher-contrast
     // text for low-vision readability.
     height: 46px; border-radius: 6px;
     background: touch.has-hover ? #1b1d20 : transparent;
@@ -542,7 +541,7 @@ export component AppWindow inherits Window {
     in-out property <bool> mask-settling: false;         // #144: a settle-timer is holding the mask past first content
     in property <[ActionData]> actions;
 
-    // Round-4 circle-plumbing surfaces.
+    // Circle-plumbing surfaces.
     in-out property <bool> join-open: false;       // Join-a-circle overlay visible
     in-out property <bool> new-open: false;        // New-circle overlay visible
     in-out property <bool> about-open: false;      // About overlay visible (#59)
@@ -568,7 +567,7 @@ export component AppWindow inherits Window {
     in-out property <bool> new-copied: false;      // set on Copy → shows a "copied" confirmation
     in property <bool> only-lobby: true;           // Rust-set: only the pinned Lobby exists → empty-state
 
-    // Real-networking status (round-3): driven by the net actor's events.
+    // Real-networking status: driven by the net actor's events.
     in-out property <string> connection-status: "connecting…";
     in property <string> app-version;                  // Rust-set release version (#59 readout)
     // #66: the user's own live display handle (`name#hash`, or the floor `#hash` when
@@ -580,7 +579,7 @@ export component AppWindow inherits Window {
 
     callback switch-circle(int);
     // Composer Send (or Enter) — carries the draft. Lobby → real sealed SendRoom;
-    // a materialized circle → the Round-5 SendCircle seam (local-echo stub).
+    // a materialized circle → the SendCircle seam (local-echo stub).
     callback send-message(string);
 
     // Shares-tab callbacks (commit 1: browse). `refresh-shares` re-lists the relay
@@ -606,7 +605,7 @@ export component AppWindow inherits Window {
     callback desktop-integrate();          // first-run: register the .desktop + icon
     callback desktop-dismiss(bool);        // close the prompt; true = "don't ask again"
 
-    // Round-4 callbacks. `open-*` raise the overlays from EITHER surface (rail
+    // Circle-plumbing callbacks. `open-*` raise the overlays from EITHER surface (rail
     // empty-state or palette — action registry → two surfaces). `join-phrase-edited`
     // lets Rust recompute the hidden strength on each keystroke. `submit-*`
     // materialize. `reroll-new` regenerates the diceware phrase.
@@ -637,8 +636,8 @@ export component AppWindow inherits Window {
     // Recompute the (hidden) strength when the user edits the generated phrase, so
     // an edited-weak phrase loses the "Looks strong" pill and is blocked on submit.
     callback new-phrase-edited(string);
-    // Autofocus the composer after a rail switch so the user can type immediately
-    // (caraka note 2026-06-15). Guarded to the Chat tab; Rust invokes it on switch.
+    // Autofocus the composer after a rail switch so the user can type immediately.
+    // Guarded to the Chat tab; Rust invokes it on switch.
     callback focus-composer();
     focus-composer => { if (root.active-tab == 0) { composer.focus-input(); } }
     // Any switch INTO the Chat tab (TabLabel click, post-join, or a programmatic
@@ -653,7 +652,7 @@ export component AppWindow inherits Window {
     // (clipboard read), which sets `join-phrase`, refreshes strength, and refocuses.
     callback paste-into-join();
 
-    // ── Round-6: persistent identity — first-start + unlock auth gate ──
+    // ── Persistent identity — first-start + unlock auth gate ──────────
     //
     // `screen` selects the top-level surface: "first-start" (enrollment wizard),
     // "unlock" (daily-login passphrase), or "main" (the shell). Default "main" so the
@@ -708,7 +707,7 @@ export component AppWindow inherits Window {
 
     // Global shortcut host: wraps the WHOLE UI (main + overlays) so a key event from
     // any focused field bubbles up here — Ctrl-K kept dying once focus moved into an
-    // overlay field that sat outside the scope (caraka, DS2). Grabs focus on init so
+    // overlay field that sat outside the scope. Grabs focus on init so
     // the shortcut works before anything else is focused. Ctrl-K TOGGLES the palette;
     // Escape closes the palette / overlays. The "Ctrl+K commands" rail row also opens it.
     key-host := FocusScope {
@@ -791,7 +790,7 @@ export component AppWindow inherits Window {
 
                 // Persistent entry once circles exist — the empty-state's buttons
                 // vanish with `only-lobby`, so adding a SECOND circle needs an
-                // always-present surface (manual test gap, caraka 2026-06-15).
+                // always-present surface (manual test gap).
                 if !root.only-lobby : HorizontalLayout {
                     padding: 4px; spacing: 8px;
                     PillButton { label: "+ New circle"; primary: true; w: 120px; clicked => { root.open-new(); } }
@@ -1152,7 +1151,7 @@ export component AppWindow inherits Window {
             background: #0d0e10;
             VerticalLayout {
                 padding: 12px; spacing: 8px;
-                // Centered over the pane + brighter/larger (caraka accessibility pass).
+                // Centered over the pane + brighter/larger (accessibility pass).
                 Text { text: "HERE NOW"; color: #c8ced6; font-size: 14px; horizontal-alignment: center; }
                 Rectangle { height: 1px; background: #ffffff14; }
                 Rectangle {
@@ -1642,7 +1641,7 @@ export component AppWindow inherits Window {
                 // text/color are COMPUTED from the booleans. Editing the phrase only
                 // changes properties; it never adds/removes items, so the renderer's
                 // item tree can't mutate mid-edit (the `if`-toggle version crashed
-                // with a partial_renderer "RefCell already borrowed", caraka 2026-06-15).
+                // with a partial_renderer "RefCell already borrowed").
                 Text {
                     text: root.new-copied ? "✓ copied to clipboard"
                         : root.new-phrase-strong ? "Looks strong"
@@ -1772,12 +1771,12 @@ export component AppWindow inherits Window {
     } // end key-host FocusScope (wraps main + overlays so Ctrl-K keeps working
       // even when an overlay field holds focus)
 
-    // ── Round-6 auth gate: TWO full-window overlays, ON TOP of the shortcut host.
+    // ── Auth gate: TWO full-window overlays, ON TOP of the shortcut host.
     // Toggled by `visible:` (NOT `if`) so switching to the shell HIDES rather than
     // DESTROYS them. Destroying a focused field's subtree (an `if` going false) re-
     // enters the partial_renderer's `free_graphics_resources` while `partial_cache`
-    // is borrowed → "RefCell already borrowed" (partial_renderer.rs:818); caraka hit
-    // this pressing Return on Unlock. Hiding never frees items, so no teardown, no
+    // is borrowed → "RefCell already borrowed" (partial_renderer.rs:818); pressing
+    // Return on Unlock hit it. Hiding never frees items, so no teardown, no
     // crash. Always-instantiated ⇒ the field ids are reachable for deferred
     // autofocus. Outside key-host so their fields don't trip the global Ctrl shortcuts.
 

@@ -76,7 +76,7 @@ use crate::profile::config::ArgonParams;
 /// layout change.
 pub const MAGIC: &[u8; 20] = b"daemonseed/dseed/v2\0";
 
-/// Magic prefix for the **legacy** v1 `.dseed` format (M2). [`open`]
+/// Magic prefix for the **legacy** v1 `.dseed` format. [`open`]
 /// accepts files prefixed with this value and treats them as carrying the
 /// implicit `suite_id = 0x0001` (CNSA 2.0). [`seal`] never writes this
 /// magic.

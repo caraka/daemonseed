@@ -1,4 +1,4 @@
-//! M0 type-state ↔ tonic compatibility spike (closes redteam R2).
+//! Type-state ↔ tonic compatibility spike.
 //!
 //! Verifies that the type-state pattern named in ISC-C23 composes with
 //! `tonic` + `tokio` + `tower` in Rust 2024 edition. The goal is to prove,

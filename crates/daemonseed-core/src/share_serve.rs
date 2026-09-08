@@ -69,7 +69,7 @@
 //! keep working unchanged; the manifest encoding changed in place — see the
 //! [`crate::share_envelope`] module docs for the alpha-compat waiver.
 //!
-//! ## Disk-backed serving (M16)
+//! ## Disk-backed serving
 //!
 //! [`ShareContent::index_dir`] reads every file into RAM, which caps a share
 //! at available memory. The disk-backed path replaces that for the publish
@@ -356,7 +356,7 @@ pub trait ChunkSource {
     }
 }
 
-// ── Streaming hash pass + disk-backed content (M16) ───────────────────────
+// ── Streaming hash pass + disk-backed content ───────────────────────
 
 /// The manifest a hash pass produces over a share root — one [`ManifestEntry`]
 /// per file, in the same deterministic order as [`ShareContent::index_dir`]
@@ -468,7 +468,7 @@ impl DiskShareContent {
     /// ([`ServeError::UnknownChunk`] if absent), opens that one file, seeks
     /// to `chunk_index * CHUNK_SIZE`, and reads **exactly** the chunk's
     /// manifest-implied length into a right-sized buffer — O(CHUNK_SIZE)
-    /// memory however large the file is (M16). Failure posture:
+    /// memory however large the file is. Failure posture:
     ///
     /// - A read/open failure — the file moved or was deleted since the hash
     ///   pass, the publish-time TOCTOU — is a clean [`ServeError::Io`],
@@ -888,7 +888,7 @@ mod tests {
         const { assert!(MANIFEST_FRAME_BUDGET < 4 * 1024 * 1024) };
     }
 
-    // ── streaming hash pass (M16) ──────────────────────────────────────────
+    // ── streaming hash pass ──────────────────────────────────────────
 
     /// A no-op cancel flag for passes that should run to completion.
     fn no_cancel() -> AtomicBool {
@@ -899,8 +899,8 @@ mod tests {
     /// `index_dir`'s on the same fixture tree — same order, same `rel_path`s,
     /// same sizes, and the same per-chunk SHA-384 addresses
     /// `MemoryChunkStore::put` derived — so existing fetch-side verification
-    /// is unchanged (ISC-S28). The fixture spans every chunk-boundary seam
-    /// (M16): an empty file (zero chunks), a sub-1MiB file (one short chunk),
+    /// is unchanged (ISC-S28). The fixture spans every chunk-boundary seam:
+    /// an empty file (zero chunks), a sub-1MiB file (one short chunk),
     /// an exactly-1MiB file (one full chunk, no phantom empty second chunk),
     /// and a >2MiB file (two full chunks + a short last, non-uniform content
     /// across the seams).
@@ -974,7 +974,7 @@ mod tests {
         assert_eq!(calls, 0, "cancelled before the first file");
     }
 
-    // ── disk-backed content (M16) ──────────────────────────────────────────
+    // ── disk-backed content ──────────────────────────────────────────
 
     /// Build a `DiskShareContent` over a fresh fixture tree.
     fn disk_fixture() -> (tempfile::TempDir, DiskShareContent) {
@@ -1053,7 +1053,7 @@ mod tests {
         );
     }
 
-    /// The receiver-verification contract per chunk, pinned (M16): a
+    /// The receiver-verification contract per chunk, pinned: a
     /// size-preserving tamper of ONE chunk's bytes (at the chunk-boundary
     /// region) passes the server's cheap checks — the bytes are served, no
     /// error — and the served bytes' re-derived SHA-384 differs from that

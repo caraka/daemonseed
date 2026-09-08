@@ -133,7 +133,7 @@ struct Inner {
     // seal) so the write-through re-seals without a second Argon2id run. None on
     // the placeholder; zeroizes on drop.
     seal_key: Option<SealingKey>,
-    // The share-index key (M14), derived as a sibling of `seal_key` from the
+    // The share-index key, derived as a sibling of `seal_key` from the
     // same single Argon2id run during `initialize` / `recover`. None on the
     // placeholder; zeroizes on drop.
     index_key: Option<IndexKey>,
@@ -221,7 +221,7 @@ impl FirstStart<Welcome> {
         // write-through) and seal with it, so the stashed `SealingKey` is
         // byte-identical to the key that produced `blob_bytes` — the running
         // client re-seals on each mutation without re-running Argon2id. The
-        // share-index key (M14) falls out of the same Argon2id run.
+        // share-index key falls out of the same Argon2id run.
         let seeds = Seeds::new(mnemonic.clone());
         let (seal_key, index_key) = SealingKey::derive_session(
             passphrase,
@@ -337,7 +337,7 @@ impl FirstStart<Welcome> {
         // (C3) re-seal the at-rest blob under the new profile_id. Derive the
         // cached at-rest key once (M13 write-through) and seal with it so the
         // stashed `SealingKey` matches `blob_bytes` byte-for-byte. The
-        // share-index key (M14) is derived from the same Argon2id run, under
+        // share-index key is derived from the same Argon2id run, under
         // the new profile_id.
         let seeds = Seeds::new(mnemonic);
         let (seal_key, index_key) = SealingKey::derive_session(
@@ -589,9 +589,9 @@ pub struct SessionMaterials {
     pub seeds: Seeds,
     /// The cached at-rest AEAD key matching the blob `seeds` seals into. Lets the
     /// running client re-seal on every persist-worthy mutation without re-running
-    /// Argon2id (M13). Zeroizes on drop; never logged, never persisted.
+    /// Argon2id. Zeroizes on drop; never logged, never persisted.
     pub seal_key: SealingKey,
-    /// The cached share-index key (M14), derived as a sibling of `seal_key` from
+    /// The cached share-index key, derived as a sibling of `seal_key` from
     /// the same Argon2id run. Opens the redb share index so the running client
     /// can activate the M8 indexer against TUI-defined share roots. Zeroizes on
     /// drop; never logged, never persisted.

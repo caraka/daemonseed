@@ -21,16 +21,16 @@ pub struct AppHello {
     #[prost(message, repeated, tag = "1")]
     pub versions: ::prost::alloc::vec::Vec<ProtocolVersion>,
     /// Transports the initiator can speak. MVP populates exactly
-    /// `\["tcp-tls13"\]`. Closes finding F29 — the QUIC-ready transport-
-    /// pluggability Reservation depends on this field existing from day one
-    /// so adding `quic-v1` later is not a wire-protocol-version bump.
+    /// `\["tcp-tls13"\]`. QUIC-ready transport pluggability depends on this
+    /// field existing from day one, so adding `quic-v1` later is not a
+    /// wire-protocol-version bump.
     #[prost(string, repeated, tag = "2")]
     pub transport_capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    /// AGPL §13 advertisement surface (finding F32). Optional URL where the
+    /// AGPL §13 advertisement surface. Optional URL where the
     /// operator publishes the source distribution matching this running
     /// binary. M4a defines the field; server-side population lands in M6.
     /// Empty/unset means "operator has not yet declared a source URL" — that
-    /// surfaces the `ServerSourceUnverified` LogOnly trust event (M7).
+    /// surfaces the `ServerSourceUnverified` LogOnly trust event.
     #[prost(string, optional, tag = "3")]
     pub server_source: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -43,13 +43,13 @@ pub struct AppHelloAck {
     /// The single negotiated version, drawn from the initiator's offer.
     #[prost(message, optional, tag = "1")]
     pub version: ::core::option::Option<ProtocolVersion>,
-    /// AGPL §13 advertisement surface (finding F32 / ISC-9). Optional URL where
+    /// AGPL §13 advertisement surface (ISC-9). Optional URL where
     /// the relay operator publishes the source distribution matching this running
     /// binary. The client-facing companion to AppHello.server_source (which only
     /// a connection *initiator* sends): a relay only ever responds with this Ack,
     /// so this is where it advertises its source to connecting clients. Empty/
     /// unset means "operator has not declared a source URL" — surfacing the
-    /// `ServerSourceUnverified` LogOnly trust event (M7). Additive MINOR field
+    /// `ServerSourceUnverified` LogOnly trust event. Additive MINOR field
     /// (ISC-S14): older clients ignore it.
     #[prost(string, optional, tag = "2")]
     pub server_source: ::core::option::Option<::prost::alloc::string::String>,
@@ -373,7 +373,7 @@ pub mod circle_of_trust_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// Circle-of-trust live relay (M8). The protocol's only bidirectional-streaming
+    /// Circle-of-trust live relay. The protocol's only bidirectional-streaming
     /// service. A member opens one Subscribe stream per circle-asset it participates
     /// in; the relay fans each inbound frame out to every *other* current subscriber
     /// of the same asset.
@@ -510,7 +510,7 @@ pub mod circle_of_trust_server {
             request: tonic::Request<tonic::Streaming<super::CotFrame>>,
         ) -> std::result::Result<tonic::Response<Self::SubscribeStream>, tonic::Status>;
     }
-    /// Circle-of-trust live relay (M8). The protocol's only bidirectional-streaming
+    /// Circle-of-trust live relay. The protocol's only bidirectional-streaming
     /// service. A member opens one Subscribe stream per circle-asset it participates
     /// in; the relay fans each inbound frame out to every *other* current subscriber
     /// of the same asset.
@@ -867,10 +867,10 @@ pub struct FirstContactBody {
     /// ML-DSA-87 signature, exactly 4627 bytes, under the PSEUDONYM key. Mandatory
     /// and always verified: it proves possession of the pseudonym key and covers
     /// the body, the ephemeral key, the recipient, the sequence, and both public
-    /// keys. It is the SOLE proof-of-possession path — an earlier draft carried a
-    /// separate `bind_pop` signature, folded into this one to save 4627 bytes — so
-    /// any future frame type must carry it or proof-of-possession silently
-    /// disappears there.
+    /// keys. It is the SOLE proof-of-possession path: there is no separate
+    /// `bind_pop` signature, and folding it into `msg_sig` saves 4627 bytes. So any
+    /// future frame type must carry it or proof-of-possession silently disappears
+    /// there.
     #[prost(bytes = "vec", tag = "10")]
     pub msg_sig: ::prost::alloc::vec::Vec<u8>,
     /// A grantee-bound one-time invite token the recipient issued (admission option

@@ -1,4 +1,4 @@
-//! Suite-deprecation policy — ISC-S16 / ISC-A-S11 / ISC-C25 / finding F30 (M7).
+//! Suite-deprecation policy — ISC-S16 / ISC-A-S11 / ISC-C25.
 //!
 //! A server operator declares per-suite **deprecation cutoffs**: peers may keep
 //! signing identity-proofs under a suite until its cutoff, after which the
@@ -44,7 +44,7 @@ use crate::identity::keys::{SignKeypair, SignatureError, verify_signature};
 /// Client policy cache TTL (ISC-C25). One hour.
 pub const CACHE_TTL: Duration = Duration::from_secs(3600);
 
-/// Minimum lead time between signing and a cutoff (finding F30): twice the
+/// Minimum lead time between signing and a cutoff: twice the
 /// cache TTL, so a client refreshing within one TTL window always sees a cutoff
 /// at least one TTL before it hits — warn-before-cutoff is guaranteed.
 pub const MIN_CUTOFF_LEAD: Duration = Duration::from_secs(2 * 3600);
