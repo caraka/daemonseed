@@ -627,6 +627,22 @@ pub enum RefusalReason {
     /// a documented limit, not a transient condition, and the user is told
     /// rather than left with a message that silently never moves.
     NotEstablishedThisSession,
+    /// The channel was re-established from this side answering, and the
+    /// correspondent has not yet written a frame under the re-rooted chain.
+    ///
+    /// **A real state of a live channel, and a short one.** The party that asked
+    /// for the re-establishment owns the first chain under the new root, so the
+    /// party that answered holds a receiving chain and nothing to send on until
+    /// that first frame arrives with the ephemeral its own chain steps off.
+    /// Everything else is in place — the root is committed, the channel
+    /// identifier is known, the correspondent is addressable — so this is
+    /// distinct from [`Self::NotEstablishedThisSession`], which says the key
+    /// schedule is absent altogether.
+    ///
+    /// **Nothing was spent**: the refusal is taken at the command, before the
+    /// outbox is asked and before the ratchet steps, so the same message may be
+    /// sent again once the correspondent has written.
+    AwaitingCorrespondentsFirstFrame,
     /// The body is over the channel cap.
     BodyTooLarge,
     /// The frame would not seal. A crypto-module or signing condition on this

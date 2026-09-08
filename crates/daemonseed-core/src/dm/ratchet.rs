@@ -1457,6 +1457,35 @@ impl Ratchet {
         self.next_send_seq
     }
 
+    /// Whether [`Self::send_next`] has a chain to mint from, or a peer ephemeral
+    /// to open one against.
+    ///
+    /// **The one state where this is `false` is the answering side of a
+    /// re-establishment** (`ReconnectSide::Answered`), which holds a receiving
+    /// chain and no ephemeral to step on: the party that sent the `RE-EST` writes
+    /// the first frame under the re-rooted root, and the ephemeral it carries is
+    /// what opens this side's sending chain. Every other way a ratchet is opened
+    /// yields `true` immediately — the first-contact initiator has a sending
+    /// chain, and the first-contact recipient has the ephemeral its correspondent
+    /// published.
+    ///
+    /// **Exposed so a caller can refuse in its own terms rather than as a seal
+    /// fault.** [`Self::send_next`] answers [`RatchetError::NotYetEstablished`]
+    /// for this state, which a sender reaching it has already priced a message
+    /// against and can only report as a failure of the crypto module. Reading
+    /// this changes nothing and commits nothing.
+    ///
+    /// **Whether the peer's ephemeral has been stepped against does not enter
+    /// into it**, though [`Self::send_next`] consults that to decide whether to
+    /// step first. `consumed_peer_generation` is written in exactly one place,
+    /// the generation step, two lines after that same step installs a sending
+    /// chain — and no path ever removes one. So a consumed ephemeral beside an
+    /// absent chain has no reachable spelling, and testing for it would be a
+    /// second condition nothing can make disagree with the first.
+    pub fn can_send(&self) -> bool {
+        self.send.is_some() || self.peer_eph.is_some()
+    }
+
     /// Mint the key for our next outbound message, taking a generation step first
     /// if the peer has published a fresh ephemeral since our last one.
     pub fn send_next(&mut self) -> Result<Outbound, RatchetError> {
@@ -2346,6 +2375,62 @@ mod tests {
         )
         .expect("the answering side opens");
         (initiator, answerer)
+    }
+
+    /// **Only the answering side of a re-establishment reports that it cannot
+    /// send, and only until the correspondent's first frame arrives.**
+    ///
+    /// A3.2 gives the party that sent the `RE-EST` the one chain under the
+    /// re-rooted root, so its correspondent receives on that chain and has
+    /// nothing to send on until the frame carrying the ephemeral it steps off
+    /// lands. Every other way a ratchet is opened can send at once: the
+    /// first-contact initiator holds a chain, and the first-contact recipient
+    /// holds the ephemeral its correspondent published.
+    ///
+    /// **The four cases are the whole reachable space**, so a build answering a
+    /// constant is caught whichever constant it answers.
+    #[test]
+    fn only_the_answering_side_of_a_re_establishment_cannot_send() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let (initiator, answerer) = reestablished_pair(7, 40, 900);
+        assert!(
+            initiator.can_send(),
+            "the party that owns the chain under the re-rooted root reported it cannot send"
+        );
+        assert!(
+            !answerer.can_send(),
+            "the answering side reported a chain it does not hold"
+        );
+
+        let (opening, recipient) = pair();
+        assert!(
+            opening.can_send(),
+            "the first-contact initiator holds a chain and reported none"
+        );
+        assert!(
+            recipient.can_send(),
+            "the first-contact recipient holds the ephemeral it steps off and reported none"
+        );
+    }
+
+    /// **The answering side can send once the correspondent's first frame has
+    /// published an ephemeral.**
+    ///
+    /// The mirror of the case above, and what makes it a state rather than a
+    /// property of the side: without it a build answering `false` for
+    /// `ReconnectSide::Answered` for ever would pass.
+    #[test]
+    fn the_answering_side_can_send_once_it_has_a_peer_ephemeral() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let (mut initiator, mut answerer) = reestablished_pair(7, 40, 900);
+        let outbound = initiator.send_next().expect("the initiating side mints");
+        deliver(&mut answerer, &outbound)
+            .expect("the answering side derives a key for the first frame")
+            .expect("the closure returns the key it was handed");
+        assert!(
+            answerer.can_send(),
+            "the answering side still reported no chain after the frame that opens one"
+        );
     }
 
     /// **Each side opens at the generation it is given, and derives nothing from

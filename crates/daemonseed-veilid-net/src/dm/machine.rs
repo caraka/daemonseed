@@ -704,16 +704,19 @@ struct Introduction {
 /// [`DmMachine::rearm_handshake`] from the provisional record where the entry is
 /// still awaiting its acceptance.
 ///
-/// **What that buys, and what it does not.** The **re-armed handshake** — an
-/// initiator restarting before its acceptance arrives — is wired end to end: it
-/// collects the acceptance, composes ordinary frames under the pseudonym its own
-/// entry published, and the correspondent opens them. The **resumed channel** —
-/// an established correspondence restarted and re-established — is not, and the
-/// keys are not what is missing: see [`Self::resumed`], which is the flag
-/// [`DmMachine::send`] refuses on. So [`DmMachine::send`] refuses a
-/// correspondence with no key schedule, which is every established one until its
-/// re-establishment completes, and refuses it again afterwards for as long as
-/// content frames on a resumed channel are unbuilt.
+/// **What that buys.** Both recovery paths carry ordinary content frames under
+/// the pseudonym the correspondent verifies against. The **re-armed handshake**
+/// — an initiator restarting before its acceptance arrives — collects the
+/// acceptance and composes under the pseudonym its own entry published. The
+/// **resumed channel** — an established correspondence restarted and
+/// re-established — composes under the pseudonym read back from the resume
+/// record, at the generation the two sides agreed inside the settling leg.
+///
+/// So [`DmMachine::send`] refuses a correspondence with no key schedule at all,
+/// which is every established one until its re-establishment completes, and
+/// refuses the answering side of a completed re-establishment until the
+/// correspondent's first frame opens this side's sending chain — see
+/// [`RefusalReason::AwaitingCorrespondentsFirstFrame`].
 struct Correspondence {
     /// The correspondent's long-term identity key.
     pk_lt: PkLt,
@@ -797,25 +800,13 @@ struct Correspondence {
     /// advances, and the channel comes back addressable but not speakable until
     /// the next re-establishment.
     candidate: Option<Rerooted>,
-    /// Whether the key schedule this correspondence holds is a **resumed** one —
-    /// opened by a completed re-establishment rather than by a first
-    /// establishment.
+    /// Whether this session has already said an exchange settled on a generation
+    /// no chain can open at.
     ///
-    /// **Set by the two re-establishment folds, and it refuses sends.** Content
-    /// frames on a resumed channel are not built yet (the 2026-09-06 note in
-    /// `docs/design/direct-messaging.md`), and the gap is not in the keys: the
-    /// two sides derive the resumed generation from their own outbox counters
-    /// and can disagree, and [`Ratchet::reestablished`] opens a sending chain on
-    /// the initiating side and a receiving chain on the answering one. A frame
-    /// composed here therefore seals, queues, publishes and is discarded by the
-    /// correspondent, surfacing only at the multi-day give-up. So
-    /// [`DmMachine::send`] refuses on this flag instead, at the moment of the
-    /// command and before anything is written.
-    ///
-    /// `false` on every other path, including the re-armed handshake, which is
-    /// wired end to end: an initiator that restarts before its acceptance
-    /// arrives composes ordinary frames its correspondent opens.
-    resumed: bool,
+    /// The condition is a function of two floors and neither goes backwards, so
+    /// once it holds every later exchange meets it again; one event per session
+    /// names it without repeating on every leg the peer re-serves.
+    agreed_generation_surfaced: bool,
     /// How many `RE-ACK`s this session has composed for this correspondence.
     ///
     /// A8.4's answer-side emission cap, counted here because the design bounds
@@ -2180,18 +2171,18 @@ impl DmMachine {
                 None,
             ))];
         };
-        // **A resumed channel is live enough to address and not to speak on**,
-        // so the refusal is taken here — before the outbox ask, before the
-        // ratchet steps, and before anything is written. The reason is the same
-        // one a correspondence with no key schedule at all gets, because it
-        // answers the user's question identically: this conversation cannot
-        // carry a message in this session. Sealing instead would queue a frame
-        // the correspondent discards, and the user would learn of it at the
-        // seven-day give-up. See [`Correspondence::resumed`].
-        if self.correspondences[index].resumed {
+        // **A ratchet with no chain to mint from is refused here** — before the
+        // outbox ask, before the ratchet steps, and before anything is written.
+        // The one state that reaches it is the answering side of a
+        // re-establishment, whose chain opens on the correspondent's first frame
+        // under the re-rooted root; asking [`Ratchet::send_next`] instead would
+        // report a live channel's ordinary waiting state as a failure of this
+        // machine's crypto module, after a sequence number had been priced
+        // against it.
+        if !ratchet.can_send() {
             return vec![DmEffect::Emit(refused(
                 to,
-                RefusalReason::NotEstablishedThisSession,
+                RefusalReason::AwaitingCorrespondentsFirstFrame,
                 None,
             ))];
         }
@@ -2252,11 +2243,11 @@ impl DmMachine {
         // correspondence is held mutably for the ratchet step.
         //
         // **The re-check below is the same three fields, and it deliberately
-        // does NOT repeat the `resumed` gate above.** Nothing between the two
-        // can set that flag — it is written only by the re-establishment folds
-        // and the two establishment paths, none of which run inside a send —
-        // and the outbox ask in between writes nothing. A second copy would be
-        // a second answer free to disagree with the first.
+        // does NOT repeat the sending-chain gate above.** What that gate reads
+        // is written only when a frame is received or a re-establishment folds,
+        // neither of which runs inside a send, and the outbox ask in between
+        // writes nothing. A second copy would be a second answer free to
+        // disagree with the first.
         let Self {
             identity,
             persist,
@@ -2924,8 +2915,19 @@ impl DmMachine {
         let Some(direction) = self.stored_direction(&label, now_ms) else {
             return Vec::new();
         };
-        let Ok(Some(mut record)) = self.persist.read_resume(&label) else {
-            return Vec::new();
+        let mut record = match self.persist.read_resume(&label) {
+            Ok(Some(record)) => record,
+            // No record is the ordinary state of a correspondence that has never
+            // been established, and there is nothing to keep up for it. A store
+            // that would not answer is a fault, and the sibling reads in this
+            // pass all state theirs.
+            Ok(None) => return Vec::new(),
+            Err(e) => {
+                crate::vtrace!(
+                    "dm driver: the resume record would not read for the upkeep pass: {e}"
+                );
+                return Vec::new();
+            }
         };
         let mut out = Vec::new();
         let mut dirty = false;
@@ -5122,9 +5124,6 @@ impl DmMachine {
                     existing.signing_pc = Some(signing_pc);
                     existing.peer_pk_pc = Some(peer_pk_pc);
                     existing.channel = Some(channel);
-                    // A first establishment, so the schedule is a fresh one and
-                    // whatever this correspondence held before is superseded.
-                    existing.resumed = false;
                     existing.address_root = address_root;
                     existing.provisional = None;
                     if let Some((keyrec_addr, fc_epoch)) = leftover {
@@ -5140,7 +5139,7 @@ impl DmMachine {
                         channel: Some(channel),
                         address_root,
                         candidate: None,
-                        resumed: false,
+                        agreed_generation_surfaced: false,
                         re_acks_answered: 0,
                         response_cap_surfaced: false,
                         retire_ceiling_surfaced: false,
@@ -5801,9 +5800,6 @@ impl DmMachine {
             existing.channel = Some(channel);
             existing.address_root = address_root;
             existing.provisional = Some((recipient_keyrec_addr, fc_epoch));
-            // As above: this schedule is a first establishment's, not a
-            // resumption's.
-            existing.resumed = false;
         } else {
             self.correspondences.push(Correspondence {
                 pk_lt: Box::new(*recipient),
@@ -5816,7 +5812,7 @@ impl DmMachine {
                 channel: Some(channel),
                 address_root,
                 candidate: None,
-                resumed: false,
+                agreed_generation_surfaced: false,
                 re_acks_answered: 0,
                 response_cap_surfaced: false,
                 retire_ceiling_surfaced: false,
@@ -6749,6 +6745,56 @@ fn outbox_counters(
     }
 }
 
+/// Whether a resumed chain may be opened at `agreed` by a party whose floor is
+/// `floor`.
+///
+/// **Two refusals, and they answer different questions.** A value at or below
+/// the floor would reopen a generation this party has already written frames
+/// under, which A3.9 forbids on either side — that is the condition
+/// [`Ratchet::reestablished`] enforces for itself, asked here so the refusal
+/// lands before the exchange spends anything rather than after. A value of
+/// [`u32::MAX`] is refused whatever the floor: the agreement saturates there, so
+/// every later exchange would agree the same number and each one would reopen
+/// the generation the last had used. A channel that reaches the ceiling stops,
+/// which is the honest end of a counter that may not go backwards.
+///
+/// **What a refusal costs, on both sides, is the leg.** It runs ahead of the
+/// stored ephemeral being spent, ahead of the acceptance being confirmed, ahead
+/// of the resume record's own commit and ahead of any chain being opened; the
+/// one thing written is the dedup entry for the refused leg, which is A5.3's
+/// durable memory and is what stops a peer re-serving the same bytes re-firing
+/// the report.
+///
+/// Called on both sides of the exchange: the initiating party checks the number
+/// it computed against its own floor, the answering party the number it was
+/// handed against the floor it advertised.
+fn generation_opens_a_resumed_chain(agreed: u32, floor: u32) -> bool {
+    agreed > floor && agreed != u32::MAX
+}
+
+/// Consume a settling leg whose generation opens no chain, and say so once.
+///
+/// **A3.15 admits no silent row, and this is the one disposition that is not a
+/// transient.** A floor never goes backwards on either side, so a pair that has
+/// met [`generation_opens_a_resumed_chain`] once meets it on every later
+/// exchange: the conversation is addressable and will not carry a frame again,
+/// which is exactly what the user has to be told. Reported once per session, on
+/// the terms every sibling anomaly in this module uses — a peer re-serving
+/// captured legs must not re-fire the alarm.
+fn generation_refused(correspondence: &mut Correspondence) -> LegFold {
+    if correspondence.agreed_generation_surfaced {
+        return LegFold::consumed();
+    }
+    correspondence.agreed_generation_surfaced = true;
+    LegFold {
+        outcome: LegOutcome::Consumed,
+        effects: vec![DmEffect::Emit(DmEvent::ReestablishmentAnomaly {
+            with: Box::new(*correspondence.pk_lt),
+            event: TrustEventKey::DmReestablishmentFailed,
+        })],
+    }
+}
+
 /// End every re-establishment leg still queued on this direction, and run the
 /// dead-chain sweep.
 ///
@@ -7089,10 +7135,18 @@ fn fold_re_est(
             return LegFold::retry();
         }
     };
+    // **The floor is pinned in the slot, not re-read at settlement.** It is the
+    // number the correspondent was given and told to compute the agreed
+    // generation from, and this side's own counter goes on moving while the
+    // exchange is in flight — the old chain is still live, and a frame sent on it
+    // raises the outbox's clear counter. Re-reading it when the settlement
+    // arrives would measure the wrong side of that and refuse the correspondent's
+    // correct answer.
     let slot = match AcceptanceSlot::accept(
         generation,
         attempt,
         our_seq,
+        floor_gen,
         re_ack.clone().into_boxed_slice(),
     ) {
         Ok(slot) => slot,
@@ -7200,6 +7254,38 @@ fn fold_re_ack(
     else {
         return LegFold::retry();
     };
+    // **This side's floor: the highest generation either record remembers.** The
+    // outbox carries the clear counter for frames it has sealed and the resume
+    // record carries the one a previous re-establishment opened at; a channel
+    // that has re-established without sending anything since has the second and
+    // not the first, so the floor is the larger of the two. A repeated
+    // generation would put two different roots on one number and rewrite a
+    // write-once page slot (A3.9, `docs/design/direct-messaging.md:917`).
+    let floor_gen = last_clear_gen.max(record.reroot_ratchet_gen());
+    // **The agreed generation, computed here because this is the only place both
+    // floors are in hand.** The answering party's floor rode the `RE-ACK` inside
+    // the payload its signature covers; this side's own is above. The rule lives
+    // in `reest::agreed_generation` so the number the `RE-CONFIRM` names and the
+    // number the answering party checks are the same arithmetic.
+    let ratchet_gen = reest::agreed_generation(floor_gen, opened.floor_gen());
+    // **Refused before the initiation is spent, not after.** Everything below
+    // this line consumes something the record cannot get back — the stored
+    // ephemeral, and then the committed re-establishment itself. A refusal taken
+    // past that point empties the slot for an exchange that then opens no chain,
+    // so nothing is owed, nothing is pending, and the correspondence sits
+    // addressable and mute until a restart walks into the same refusal. Here it
+    // costs the leg and nothing else: the initiation stands, and a later
+    // exchange against a peer whose floor has room completes on it.
+    if !generation_opens_a_resumed_chain(ratchet_gen, floor_gen) {
+        crate::vtrace!(
+            "dm driver: an answer agreed generation {ratchet_gen}, which opens no chain above \
+             this side's floor {floor_gen}"
+        );
+        if !commit_after_dedup(persist, &label, record) {
+            return LegFold::retry();
+        }
+        return generation_refused(correspondence);
+    }
     let Some(held) = record.own_slot() else {
         crate::vtrace!("dm driver: an answer arrived with no initiation to complete");
         if !commit_after_dedup(persist, &label, record) {
@@ -7233,15 +7319,6 @@ fn fold_re_ack(
     // act — and the attempt counter stands, so the next initiation mints the
     // successor rather than reusing a number the peer has answered (A5.2).
     drop(record.take_own_slot());
-    // **Ahead of the highest generation either record remembers.** The outbox
-    // carries the clear counter for frames it has sealed and the resume record
-    // carries the one a previous re-establishment opened at; a channel that has
-    // re-established without sending anything since has the second and not the
-    // first, so the floor is the larger of the two. A repeated generation would
-    // put two different roots on one number and rewrite a write-once page slot
-    // (A3.9, `docs/design/direct-messaging.md:917`).
-    let floor_gen = last_clear_gen.max(record.reroot_ratchet_gen());
-    let ratchet_gen = floor_gen.saturating_add(1);
     let settled_generation = record.reconnect_gen().saturating_add(1);
     // **Sealed BEFORE the commit, and under values the commit has not applied
     // yet**: the successor root the commit is about to install, and the
@@ -7321,9 +7398,6 @@ fn fold_re_ack(
     correspondence.ratchet = Some(ratchet);
     correspondence.channel = Some(ChannelRoots { chan_id: *chan_id });
     correspondence.candidate = None;
-    // The channel is addressable and its content frames are not built; see the
-    // field. A send is refused here rather than sealed and discarded.
-    correspondence.resumed = true;
     LegFold::consumed()
 }
 
@@ -7355,23 +7429,55 @@ fn fold_re_confirm(
             return LegFold::retry();
         }
     }
-    let settles = record
+    let settled = record
         .acceptance()
-        .is_some_and(|slot| slot.generation() == generation && slot.attempt() == attempt);
-    if !settles {
+        .filter(|slot| slot.generation() == generation && slot.attempt() == attempt)
+        .map(AcceptanceSlot::advertised_floor);
+    let Some(advertised_floor) = settled else {
         crate::vtrace!("dm driver: a settlement named an exchange this side is not holding");
         if !commit_after_dedup(persist, &label, record) {
             return LegFold::retry();
         }
         return LegFold::consumed();
-    }
-    let Some((last_clear_gen, our_seq)) = outbox_counters(persist, &label, our_direction, now_ms)
-    else {
+    };
+    let Some((_, our_seq)) = outbox_counters(persist, &label, our_direction, now_ms) else {
         return LegFold::retry();
     };
-    let floor_gen = last_clear_gen.max(record.reroot_ratchet_gen());
-    let ratchet_gen = floor_gen.saturating_add(1);
+    // **The floor this exchange is about is the one this side advertised**, held
+    // in the acceptance slot since the answer was sealed. The outbox's live
+    // counter is the wrong number here: the old chain stays usable for the hours
+    // an exchange spans, so a frame sent on it raises that counter above the
+    // value the correspondent was given, and the correct settlement computed from
+    // the advertised pair would be refused. The two ends would then hold
+    // different chains, each believing the exchange complete, until the retention
+    // ceiling. Legality of reopening the same number under the new identifier is
+    // A8.2's per-`chan_id` scoping of the rollback high-water.
+    let floor_gen = advertised_floor;
+    // **Read off the leg, and checked before anything is written.** The
+    // initiating party computed this number from both floors and named it inside
+    // the payload the leg's signature covers, so a value altered in flight does
+    // not open. What the check is for is a value that opened and is still
+    // unusable — a settling leg replayed from an earlier exchange, or one whose
+    // sender computed against a floor it was never given. Refusing here rather
+    // than at `Ratchet::reestablished` is what keeps the record on disk free of a
+    // generation this side will not open a chain at.
+    let ratchet_gen = opened.agreed_gen();
+    if !generation_opens_a_resumed_chain(ratchet_gen, floor_gen) {
+        crate::vtrace!(
+            "dm driver: a settlement named generation {ratchet_gen}, which opens no chain \
+             above this side's floor {floor_gen}"
+        );
+        if !commit_after_dedup(persist, &label, record) {
+            return LegFold::retry();
+        }
+        return generation_refused(correspondence);
+    }
     if !record.confirm_acceptance(ratchet_gen) {
+        // Unreachable by construction — the acceptance slot was matched above and
+        // the generation cleared the floor — and traced rather than left silent,
+        // because a record that answers otherwise is the one case where knowing
+        // the exchange stopped here is the whole of the diagnosis.
+        crate::vtrace!("dm driver: the acceptance would not confirm at generation {ratchet_gen}");
         if !commit_after_dedup(persist, &label, record) {
             return LegFold::retry();
         }
@@ -7413,7 +7519,14 @@ fn fold_re_confirm(
     ) {
         Ok(ratchet) => ratchet,
         Err(e) => {
+            // **Owed, on the same terms as the branch above.** The record is
+            // settled on disk and this side holds no chain, which is the state
+            // that branch leaves a fresh attempt owed for; reaching it by a
+            // refused open rather than by a lost candidate does not change what
+            // the correspondence needs next.
             crate::vtrace!("dm driver: the resumed ratchet would not open: {e}");
+            correspondence.resume_owed = true;
+            correspondence.resume_retry_due_ms = None;
             return LegFold::consumed();
         }
     };
@@ -7421,10 +7534,6 @@ fn fold_re_confirm(
     correspondence.channel = Some(ChannelRoots {
         chan_id: *candidate.chan_id(),
     });
-    // As on the initiating side, and with more force: this side's resumed
-    // ratchet carries a receiving chain only, so a send would fail inside the
-    // seal and be reported as a seal fault rather than as what it is.
-    correspondence.resumed = true;
     LegFold::consumed()
 }
 
@@ -8016,7 +8125,7 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             // the re-establishment plane reachable at all — see the field.
             address_root: record.address_root(),
             candidate: None,
-            resumed: false,
+            agreed_generation_surfaced: false,
             re_acks_answered: 0,
             response_cap_surfaced: false,
             retire_ceiling_surfaced: false,
@@ -9321,7 +9430,7 @@ mod tests {
             channel: Some(channel),
             address_root,
             candidate: None,
-            resumed: false,
+            agreed_generation_surfaced: false,
             re_acks_answered: 0,
             response_cap_surfaced: false,
             retire_ceiling_surfaced: false,
@@ -9451,7 +9560,7 @@ mod tests {
             channel: Some(channel),
             address_root,
             candidate: None,
-            resumed: false,
+            agreed_generation_surfaced: false,
             re_acks_answered: 0,
             response_cap_surfaced: false,
             retire_ceiling_surfaced: false,
@@ -12539,7 +12648,7 @@ mod tests {
             channel: Some(channel),
             address_root,
             candidate: None,
-            resumed: false,
+            agreed_generation_surfaced: false,
             re_acks_answered: 0,
             response_cap_surfaced: false,
             retire_ceiling_surfaced: false,
@@ -14894,12 +15003,28 @@ mod tests {
         seq: u64,
         gen: u32,
     ) {
+        queue_at_generation_at(m, label, direction, seq, gen, BASE_MS);
+    }
+
+    /// [`queue_at_generation`] at a named instant.
+    ///
+    /// The composition stamp has to be the caller's own clock: an entry stamped
+    /// at [`BASE_MS`] and enqueued hours later is refused as composed in the
+    /// future, which is a fact about the fixture rather than about the entry.
+    fn queue_at_generation_at(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+        seq: u64,
+        gen: u32,
+        now_ms: i64,
+    ) {
         m.persist
-            .update_outbox(label, direction, BASE_MS, |outbox| {
+            .update_outbox(label, direction, now_ms, |outbox| {
                 outbox.enqueue_sealed(
                     seq,
                     OutboxTarget::ChannelPage,
-                    BASE_MS,
+                    now_ms,
                     SealedFrame::new(vec![0xC7; 64]),
                     gen,
                 )?;
@@ -16056,10 +16181,9 @@ mod tests {
     ///   (A3.12), and the pending unsealed entry does not — it was never sealed
     ///   under any chain.
     ///
-    /// - a send on the resumed channel is refused on both sides, with nothing
-    ///   spent. Every part a frame needs is in hand by then, so this is the only
-    ///   thing left that stops one being sealed and silently discarded; see
-    ///   [`Correspondence::resumed`].
+    /// - the initiating side composes on the resumed channel, and the answering
+    ///   side is refused until the first frame arrives, with nothing spent — the
+    ///   asymmetry A3.2 puts on the two sides, observed at the command.
     ///
     /// The pseudonym keypair each side came back holding is asserted in
     /// [`restart_both`], where the restart happens.
@@ -16234,52 +16358,89 @@ mod tests {
             );
         }
 
-        // ── a send on the resumed channel is refused, on BOTH sides ─────────
+        // ── the two sides of the resumed channel are not symmetric ──────────
         //
-        // **The refusal is the honest answer while content frames on a resumed
-        // channel are unbuilt, and it has to be taken at the command.** Both
-        // sides now hold every part a frame needs — a key schedule, the channel
-        // roots, and the pseudonym keypair read back off the resume record — so
-        // the `live()` gate admits them. Sealing
-        // instead would queue bytes the correspondent discards as
-        // `GenerationTooOld`, reported to the user seven days later as a message
-        // that failed to arrive; on the answering side the ratchet carries a
-        // receiving chain only, so it would fail inside the seal and be reported
-        // as a seal fault. Both sides are asserted because they reach the state
-        // through different folds.
-        for (name, side) in [("the initiating", &mut a), ("the answering", &mut b)] {
-            let recipient = side.machine.correspondences[0].pk_lt.clone();
-            let before = side.machine.only_next_send_seq();
-            let out = side.machine.on_command(
-                clock,
-                DmCommand::Send {
-                    to: recipient,
-                    body: "onto a resumed channel".into(),
-                },
-            );
-            let reasons: Vec<RefusalReason> = out
-                .iter()
-                .filter_map(|e| match e {
-                    DmEffect::Emit(DmEvent::Refused { reason, .. }) => Some(*reason),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                reasons,
-                vec![RefusalReason::NotEstablishedThisSession],
-                "{name} side did not refuse a send on its resumed channel: {out:?}"
-            );
-            // **Nothing was spent.** A refusal taken after the ratchet stepped
-            // would burn a sequence the correspondent's contiguous prefix then
-            // waits on for the give-up — invisible in every other observable,
-            // which is why this reads the counter rather than trusting the
-            // ordering.
-            assert_eq!(
-                side.machine.only_next_send_seq(),
-                before,
-                "{name} side's refusal spent a sequence number"
-            );
-        }
+        // **The initiating party owns the first chain under the re-rooted root**
+        // (A3.2), so it composes here and the answering party cannot until that
+        // first frame arrives. Both hold every other part a frame needs — a key
+        // schedule, the channel roots, and the pseudonym keypair read back off
+        // the resume record — so `live()` admits both and the difference is the
+        // chain alone.
+        let a_recipient = a.machine.correspondences[0].pk_lt.clone();
+        let a_seq = a
+            .machine
+            .only_next_send_seq()
+            .expect("the initiating side holds exactly one live correspondence");
+        let composed = a.machine.on_command(
+            clock,
+            DmCommand::Send {
+                to: a_recipient,
+                body: "onto the resumed channel".into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&composed),
+            Vec::new(),
+            "the initiating side did not compose on its own resumed chain: {composed:?}"
+        );
+        // **A refusal is not the only way to compose nothing.** An empty batch
+        // satisfies the assertion above, so the sequence the frame took and the
+        // entry holding its bytes are what say a frame exists.
+        assert_eq!(
+            a.machine.only_next_send_seq(),
+            Some(a_seq.saturating_add(1)),
+            "the initiating side's send spent no sequence number"
+        );
+        assert!(
+            !queued_frame_at(&a.machine, &a.label, a_seq, clock).is_empty(),
+            "no frame is queued at the sequence the send reported"
+        );
+
+        let b_recipient = b.machine.correspondences[0].pk_lt.clone();
+        let before = b.machine.only_next_send_seq();
+        let refused_send = b.machine.on_command(
+            clock,
+            DmCommand::Send {
+                to: b_recipient,
+                body: "before the correspondent has written".into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&refused_send),
+            vec![RefusalReason::AwaitingCorrespondentsFirstFrame],
+            "the answering side did not name the state it is in: {refused_send:?}"
+        );
+        // **Nothing was spent.** A refusal taken after the ratchet stepped would
+        // burn a sequence the correspondent's contiguous prefix then waits on
+        // for the give-up — invisible in every other observable, which is why
+        // this reads the counter rather than trusting the ordering.
+        assert_eq!(
+            b.machine.only_next_send_seq(),
+            before,
+            "the answering side's refusal spent a sequence number"
+        );
+    }
+
+    /// Every re-establishment anomaly key in a batch of effects.
+    fn anomalies_in(effects: &[DmEffect]) -> Vec<TrustEventKey> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::ReestablishmentAnomaly { event, .. }) => Some(*event),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every refusal reason in a batch of effects.
+    fn refusals_in(effects: &[DmEffect]) -> Vec<RefusalReason> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Refused { reason, .. }) => Some(*reason),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Restart both stores and carry the three legs, so both sides hold a
@@ -16308,6 +16469,542 @@ mod tests {
              cannot be read and nothing below is about the entry"
         );
         (a, b, knock, t3)
+    }
+
+    /// Rewrite one correspondence's resume record with a different re-root
+    /// generation, leaving every other field at a fresh establishment's value.
+    ///
+    /// **The floor, and only the floor.** [`set_reroot_generation`] also advances
+    /// `reconnect_gen`, which is the number the legs of an exchange are keyed at
+    /// — moving it on one side alone leaves the two ends scanning at different
+    /// generations and no leg opens. This moves the counter the two sides have
+    /// to agree above and nothing else, which is what a party that has cleared
+    /// further than its correspondent looks like.
+    fn set_floor_generation(m: &DmMachine, label: &CorrespondenceLabel, ratchet_gen: u32) {
+        let stored = read_resume(m, label);
+        let rewritten = ResumeRecord::new(
+            Box::new(*stored.s_pc()),
+            Box::new(*stored.own_pk_pc()),
+            Box::new(*stored.pk_pc()),
+            stored.committed_root().clone(),
+            ReEstState {
+                reroot_ratchet_gen: ratchet_gen,
+                ..ReEstState::first_establishment()
+            },
+            Retention::none(),
+            stored.send_floor(),
+        )
+        .expect("the fixture's pairings are coherent");
+        m.persist
+            .commit_resume(label, &rewritten)
+            .expect("the rewritten record commits");
+    }
+
+    /// The floor one side brings to the agreement, by the reading both folds use:
+    /// the higher of its outbox's clear counter and the generation its record
+    /// last re-rooted at.
+    fn resumed_floor(side: &Side, now_ms: i64) -> u32 {
+        let last_clear_gen = side
+            .machine
+            .persist
+            .read_outbox(&side.label, now_ms)
+            .expect("the outbox reads")
+            .map_or(0, |outbox| outbox.last_clear_gen());
+        last_clear_gen.max(side.resume().reroot_ratchet_gen())
+    }
+
+    /// **Both sides open the resumed chain at one generation, and it is one past
+    /// the higher of their two floors.**
+    ///
+    /// A3.9 has the clear ratchet counter continue across a re-establishment and
+    /// never regress on either side. Each party's floor is its own highest
+    /// persisted generation, and the two differ whenever the parties have cleared
+    /// to different points — so no per-side derivation can produce one number,
+    /// and the parties exchange theirs inside the settling legs instead.
+    ///
+    /// **Both orientations are run, and the answering party's floor being the
+    /// higher one is the case that matters.** A derivation off the initiating
+    /// party's own floor alone happens to be right when that floor is already the
+    /// higher of the two, so a fixture that only ran that orientation would pass
+    /// against arithmetic that ignores the wire entirely.
+    ///
+    /// The expected number comes from [`reest::agreed_generation`], the one home
+    /// of the rule, rather than from arithmetic written out again here.
+    #[test]
+    fn both_sides_open_the_resumed_chain_at_the_agreed_generation() {
+        for (a_floor, b_floor) in [(2u32, 9u32), (9u32, 2u32)] {
+            let dir_a = tempfile::tempdir().expect("temp dir A");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+            set_floor_generation(&a.machine, &a.label, a_floor);
+            set_floor_generation(&b.machine, &b.label, b_floor);
+            assert_eq!(
+                (resumed_floor(&a, BASE_MS), resumed_floor(&b, BASE_MS)),
+                (a_floor, b_floor),
+                "the fixture did not put the two sides on different floors, so \
+                 one number satisfies both derivations"
+            );
+
+            a.machine.on_tick(BASE_MS);
+            let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+            let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+            let (_, _) = carry_one_leg(&mut a, &mut b, t2);
+
+            let agreed = reest::agreed_generation(a_floor, b_floor);
+            assert_eq!(
+                (
+                    a.resume().reroot_ratchet_gen(),
+                    b.resume().reroot_ratchet_gen()
+                ),
+                (agreed, agreed),
+                "the two sides committed different resumed generations from \
+                 floors {a_floor} and {b_floor}"
+            );
+        }
+    }
+
+    /// **One message crosses each way on the resumed channel, the initiating
+    /// party first, and each is delivered exactly once.**
+    ///
+    /// The order is not a fixture's convenience: A3.2 gives the party that sent
+    /// the `RE-EST` the only chain under the re-rooted root, so its frame is what
+    /// publishes the ephemeral the answering party's own chain steps off. Running
+    /// it the other way round is what [`RefusalReason::AwaitingCorrespondentsFirstFrame`]
+    /// names.
+    ///
+    /// **Each frame is folded twice and yields one event.** A page is swept
+    /// again whenever a later one is, so the same bytes reach the fold more than
+    /// once in ordinary use and one arrival is what the user must see.
+    #[test]
+    fn a_message_crosses_each_way_after_a_re_establishment() {
+        const OUTBOUND: &str = "the first frame under the re-rooted root";
+        const REPLY: &str = "and the answer that steps off it";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b, _knock, t3) = re_established_pair(&dir_a, &dir_b);
+
+        let opened = carry_one_message(&mut a, &mut b, t3, OUTBOUND);
+        assert_eq!(
+            messages_in(&opened),
+            vec![OUTBOUND.to_string()],
+            "the answering side did not open the initiating side's first frame: {opened:?}"
+        );
+
+        let answered = carry_one_message(&mut b, &mut a, t3, REPLY);
+        assert_eq!(
+            messages_in(&answered),
+            vec![REPLY.to_string()],
+            "the initiating side did not open the answering side's reply: {answered:?}"
+        );
+    }
+
+    /// **A frame opens only under the pseudonym the correspondent recorded, and
+    /// the recovered secret half is what produces one that does.**
+    ///
+    /// A channel frame binds the sender's pseudonym public half into what it
+    /// seals and is verified against the half the correspondent's contact record
+    /// holds. Neither half is recoverable from the other, so the resume record
+    /// enumerates both — and a restart that restored a secret half belonging to
+    /// another conversation, or minted a fresh one, produces a frame that parses,
+    /// reaches the ratchet, and does not open.
+    ///
+    /// **Both halves of that are asserted, because the first alone is not a
+    /// probe.** A frame opening says the pseudonym worked; it does not say the
+    /// correspondent would have refused any other. The second case swaps the
+    /// secret half for one belonging to the other end of this conversation — a
+    /// real signing key, so the failure is the pairing and not a malformed one —
+    /// and keeps every other part of the send identical.
+    ///
+    /// [`restart_both_with_knock`] cross-checks the two halves at the moment of
+    /// the restart; this says the recovered secret half still signs something the
+    /// correspondent accepts across a completed re-establishment, and that a
+    /// mismatched one does not.
+    #[test]
+    fn a_frame_opens_only_under_the_pseudonym_the_correspondent_recorded() {
+        const BODY: &str = "signed under the recovered pseudonym";
+
+        for paired in [true, false] {
+            let dir_a = tempfile::tempdir().expect("temp dir A");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let (mut a, mut b, _knock, t3) = re_established_pair(&dir_a, &dir_b);
+            if !paired {
+                let public = *a.machine.correspondences[0]
+                    .signing_pc
+                    .as_ref()
+                    .expect("the initiating side recovered its pseudonym")
+                    .public_key();
+                let unrelated = *b.resume().s_pc();
+                a.machine.correspondences[0].signing_pc =
+                    Some(SignKeypair::from_halves(&public, &unrelated));
+            }
+
+            let opened = carry_one_message(&mut a, &mut b, t3, BODY);
+            if paired {
+                assert_eq!(
+                    messages_in(&opened),
+                    vec![BODY.to_string()],
+                    "the frame did not verify against the pseudonym the \
+                     correspondent recorded: {opened:?}"
+                );
+            } else {
+                assert_eq!(
+                    messages_in(&opened),
+                    Vec::<String>::new(),
+                    "a frame signed under a secret half that pairs with no \
+                     recorded pseudonym was opened: {opened:?}"
+                );
+            }
+        }
+    }
+    /// Send one message from `from`, hand the queued frame to `to` as a swept
+    /// page, and hand back what `to` made of it — plus a second fold of the same
+    /// bytes, so a frame opened twice shows up as two events.
+    fn carry_one_message(from: &mut Side, to: &mut Side, at_ms: i64, body: &str) -> Vec<DmEffect> {
+        let recipient = from.machine.correspondences[0].pk_lt.clone();
+        let seq = from
+            .machine
+            .only_next_send_seq()
+            .expect("the sending side holds exactly one live correspondence");
+        let composed = from.machine.on_command(
+            at_ms,
+            DmCommand::Send {
+                to: recipient,
+                body: body.into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&composed),
+            Vec::new(),
+            "the send was refused, so there is nothing to carry: {composed:?}"
+        );
+        let frame = queued_frame_at(&from.machine, &from.label, seq, at_ms);
+        let conversation = to.conversation();
+        let mut opened = fold_page_at(
+            &mut to.machine,
+            at_ms,
+            conversation,
+            position_of(seq).page(),
+            vec![(position_of(seq), frame.clone())],
+        );
+        opened.extend(fold_page_at(
+            &mut to.machine,
+            at_ms,
+            conversation,
+            position_of(seq).page(),
+            vec![(position_of(seq), frame)],
+        ));
+        opened
+    }
+
+    /// **A settling leg naming a generation the answering side cannot open at
+    /// settles nothing.**
+    ///
+    /// The agreed generation rides inside the payload the leg's signature covers,
+    /// so a value altered in flight does not open at all. What this is about is a
+    /// value that opens and is still unusable: one at or below the floor this
+    /// side advertised, which A3.9 forbids because the counter may not go
+    /// backwards, and [`u32::MAX`], where the agreement has saturated and every
+    /// later exchange would name the same number again.
+    ///
+    /// **Nothing is on disk afterwards, and that is the assertion.** The
+    /// acceptance slot still names the exchange, the retained root is still held,
+    /// the re-root generation has not moved and no chain was opened — so the
+    /// genuine settling leg, or a fresh attempt, still has a record to land on.
+    /// The refusal is reported rather than silent.
+    ///
+    /// **The leg one past the floor is the control, and it runs from the same
+    /// code.** A leg sealed under the wrong root, at the wrong position or by the
+    /// wrong key does not open at all, and a fold that never reached the
+    /// generation check leaves the record untouched in exactly the way a refusal
+    /// does. So the same fixture is run over three composed values: two that must
+    /// change nothing, one that must settle the exchange.
+    #[test]
+    fn a_settlement_the_answerer_cannot_open_at_commits_nothing() {
+        const FLOOR: u32 = 9;
+        for (agreed, settles) in [(FLOOR, false), (u32::MAX, false), (FLOOR + 1, true)] {
+            let dir_a = tempfile::tempdir().expect("temp dir A");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+            set_floor_generation(&b.machine, &b.label, FLOOR);
+
+            a.machine.on_tick(BASE_MS);
+            let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+            let (_, _) = carry_one_leg(&mut b, &mut a, t1);
+
+            let before = b.resume();
+            let seq = a
+                .resume()
+                .confirm_slot()
+                .expect("the initiating side sealed a settling leg")
+                .seq();
+            let seen_before = before.dedup().len();
+            let out = deliver_settlement(&a, &mut b, t1, seq, agreed);
+
+            let after = b.resume();
+            if settles {
+                assert!(
+                    after.acceptance().is_none(),
+                    "the control leg one past the floor settled nothing, so the \
+                     refusals above are not what left the record alone"
+                );
+                assert_eq!(
+                    after.reroot_ratchet_gen(),
+                    agreed,
+                    "the control leg settled at a generation it did not name"
+                );
+                assert_eq!(
+                    anomalies_in(&out),
+                    Vec::new(),
+                    "a settlement that succeeded was reported as an anomaly: {out:?}"
+                );
+                continue;
+            }
+            // **The one thing a refusal does write, and the only thing.** A5.3's
+            // memory is what stops a peer re-serving the same bytes reaching the
+            // fold again, so the refusal persists that entry — and a branch that
+            // returned without committing would leave the record untouched by
+            // every other assertion here as well, so nothing else can see the
+            // difference. The settling arm carries no mirror of this: a completed
+            // exchange re-scopes the memory to the root it just installed, which
+            // is a different subject.
+            assert_eq!(
+                after.dedup().len(),
+                seen_before + 1,
+                "the refused leg at generation {agreed} was not recorded as seen"
+            );
+            assert!(
+                after
+                    .acceptance()
+                    .is_some_and(|slot| slot.advertised_floor() == FLOOR && !slot.confirmed()),
+                "the acceptance was settled at generation {agreed}"
+            );
+            assert_eq!(
+                after.reroot_ratchet_gen(),
+                before.reroot_ratchet_gen(),
+                "the re-root generation moved on a settlement that was refused"
+            );
+            assert!(
+                after.retained().is_some(),
+                "the retained root was retired on a settlement that was refused"
+            );
+            assert!(
+                b.machine.correspondences[0].ratchet.is_none(),
+                "a chain was opened at generation {agreed}"
+            );
+            assert_eq!(
+                anomalies_in(&out),
+                vec![TrustEventKey::DmReestablishmentFailed],
+                "the refusal at generation {agreed} was silent: {out:?}"
+            );
+        }
+    }
+
+    /// **A conversation that can no longer agree a generation says so once.**
+    ///
+    /// The condition is a function of two floors and neither goes backwards, so
+    /// every later settling leg meets it again — and a peer re-serving captured
+    /// bytes can produce as many as it likes. A3.8 wants the state reported and
+    /// A5.3's memory exists so the report is not an oracle; one event per session
+    /// is what both ask for together.
+    ///
+    /// **The second leg is the probe.** It is novel — a different position, so a
+    /// different dedup key — and reaches the same refusal, so a flag that is not
+    /// consulted shows up here and nowhere else.
+    #[test]
+    fn the_refusal_to_agree_a_generation_is_reported_once() {
+        const FLOOR: u32 = 9;
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        set_floor_generation(&b.machine, &b.label, FLOOR);
+
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, _) = carry_one_leg(&mut b, &mut a, t1);
+
+        let seq = a
+            .resume()
+            .confirm_slot()
+            .expect("the initiating side sealed a settling leg")
+            .seq();
+        let first = deliver_settlement(&a, &mut b, t1, seq, FLOOR);
+        let seen_after_first = b.resume().dedup().len();
+        let second = deliver_settlement(&a, &mut b, t1, seq.saturating_add(1), FLOOR);
+        assert_eq!(
+            anomalies_in(&first),
+            vec![TrustEventKey::DmReestablishmentFailed],
+            "the first refusal was silent: {first:?}"
+        );
+        // **The control on the second delivery.** A leg that did not open reaches
+        // no refusal and raises no report, which is indistinguishable from a flag
+        // doing its job; the memory growing is what says the fold ran.
+        assert_eq!(
+            b.resume().dedup().len(),
+            seen_after_first + 1,
+            "the second leg never reached the fold, so the report below is vacuous"
+        );
+        assert_eq!(
+            anomalies_in(&second),
+            Vec::new(),
+            "a second refused settlement re-fired the report: {second:?}"
+        );
+    }
+
+    /// Seal a settling leg naming `agreed` under the initiating side's key and
+    /// the answering side's own committed root, address it at `seq`, and hand it
+    /// to the answering side as a swept page.
+    ///
+    /// **Sealed the way the answering side scans it**, so a leg is refused on its
+    /// generation and never on a signature or a root that never matched.
+    fn deliver_settlement(
+        from: &Side,
+        to: &mut Side,
+        at_ms: i64,
+        seq: u64,
+        agreed: u32,
+    ) -> Vec<DmEffect> {
+        let record = to.resume();
+        let acceptance = record
+            .acceptance()
+            .expect("the answering side is holding the exchange it answered");
+        let leg = reest::seal_re_confirm(
+            record.committed_root(),
+            Direction::AToB,
+            acceptance.generation(),
+            seq,
+            acceptance.attempt(),
+            agreed,
+            from.resume().s_pc(),
+        )
+        .expect("the settling leg seals");
+        let conversation = to.conversation();
+        fold_page_at(
+            &mut to.machine,
+            at_ms,
+            conversation,
+            position_of(seq).page(),
+            vec![(position_of(seq), leg)],
+        )
+    }
+
+    /// **An answer that agrees a generation past the counter's ceiling leaves the
+    /// initiation intact.**
+    ///
+    /// The agreement saturates at [`u32::MAX`], so a correspondent whose floor is
+    /// one below the ceiling produces a number no chain can open at. What matters
+    /// is what the refusal costs: the stored initiation and its ephemeral are the
+    /// only things that can complete this exchange, and an answer refused after
+    /// they are spent leaves the record settled on nothing, nothing owed, and the
+    /// correspondence mute until a restart walks into the same refusal.
+    ///
+    /// So the assertion is that the initiation survives byte-identically — the
+    /// same attempt, the same position, the same sealed bytes — and that the
+    /// re-establishment itself was not committed.
+    #[test]
+    fn an_answer_at_the_generation_ceiling_leaves_the_initiation_intact() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        set_floor_generation(&b.machine, &b.label, u32::MAX - 1);
+
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let before = a.resume();
+        let held = before
+            .own_slot()
+            .map(|slot| (slot.seq(), slot.sealed().bytes().to_vec()))
+            .expect("the initiating side is holding its own initiation");
+
+        let (folded, _) = carry_one_leg(&mut b, &mut a, t1);
+
+        let after = a.resume();
+        assert_eq!(
+            after
+                .own_slot()
+                .map(|slot| (slot.seq(), slot.sealed().bytes().to_vec())),
+            Some(held),
+            "the initiation was spent on an answer that opened no chain"
+        );
+        assert_eq!(
+            (after.reconnect_gen(), after.reroot_ratchet_gen()),
+            (before.reconnect_gen(), before.reroot_ratchet_gen()),
+            "the re-establishment was committed at a generation no chain opens at"
+        );
+        assert!(
+            after.confirm_slot().is_none(),
+            "a settling leg was sealed for an exchange that cannot complete"
+        );
+        assert!(
+            a.machine.correspondences[0].ratchet.is_none(),
+            "a chain was opened at the counter's ceiling"
+        );
+        assert_eq!(
+            anomalies_in(&folded),
+            vec![TrustEventKey::DmReestablishmentFailed],
+            "the refusal at the ceiling was silent: {folded:?}"
+        );
+    }
+
+    /// **The floor an exchange is settled against is the one the answering side
+    /// advertised, not where its counter has since got to.**
+    ///
+    /// The two settling legs are hours apart and the old chain stays usable in
+    /// between, so the answering side's own clear counter rises while the
+    /// exchange is in flight — no forgery and no fault, just an ordinary message
+    /// sent on the channel that is still up. The correspondent computed the
+    /// agreed generation from the advertised value and cannot know about the
+    /// later one.
+    ///
+    /// **Read fresh, that settlement is refused and neither side is told.** The
+    /// initiating side has already opened its chain, so the two ends hold
+    /// different chains, each believing the exchange complete, until the
+    /// retention ceiling. The advertised floor is pinned in the acceptance slot
+    /// exactly so this cannot happen.
+    #[test]
+    fn a_settlement_is_judged_against_the_floor_the_answerer_advertised() {
+        const FLOOR: u32 = 5;
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        set_floor_generation(&b.machine, &b.label, FLOOR);
+
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        assert_eq!(
+            b.resume()
+                .acceptance()
+                .expect("the answering side answered")
+                .advertised_floor(),
+            FLOOR,
+            "the answer did not advertise the floor it sealed"
+        );
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+
+        // The answering side sends one more message on the chain that is still
+        // up, which is what raises its own clear counter past the value it
+        // advertised. Queued rather than composed because a restarted machine
+        // holds no key schedule to seal with; the counter moves either way, and
+        // the counter is the whole of the condition.
+        let seq = next_send_seq(&b, t2);
+        queue_at_generation_at(&b.machine, &b.label, Direction::BToA, seq, FLOOR + 1, t2);
+
+        let (_, _) = carry_one_leg(&mut a, &mut b, t2);
+
+        let agreed = reest::agreed_generation(0, FLOOR);
+        assert_eq!(
+            (
+                a.resume().reroot_ratchet_gen(),
+                b.resume().reroot_ratchet_gen()
+            ),
+            (agreed, agreed),
+            "a message sent on the old chain during the exchange moved the floor \
+             the settlement was judged against"
+        );
+        assert!(
+            b.machine.correspondences[0].ratchet.is_some(),
+            "the answering side settled the record and opened no chain"
+        );
     }
 
     /// The machine's running admitted total, read off the health event a sweep
@@ -16835,6 +17532,7 @@ mod tests {
                         slot.generation(),
                         slot.attempt(),
                         seq,
+                        slot.advertised_floor(),
                         slot.sealed_re_ack().to_vec().into_boxed_slice(),
                     )
                     .expect("within the ceiling"),
@@ -17232,6 +17930,7 @@ mod tests {
                         slot.generation(),
                         slot.attempt(),
                         slot.seq(),
+                        slot.advertised_floor(),
                         slot.sealed_re_ack().to_vec().into_boxed_slice(),
                     )
                     .expect("within the ceiling")

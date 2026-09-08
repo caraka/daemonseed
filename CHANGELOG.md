@@ -82,9 +82,20 @@ work lives in the maintainer's own planning notes, not here.
   ephemeral its `RE-EST` published, sealed and zeroized with the slot. `OwnSlot::new` takes it
   (#404).
 - `daemonseed_core::dm::ratchet` — `Ratchet::reestablished` and `ReconnectSide`, opening a ratchet
-  on a re-rooted root with the clear generation and the send sequence continuing. Both
-  `ReconnectSide` variants carry `last_persisted_generation`; a generation that is not ahead of it is
-  refused with `RatchetError::ReestablishedGenerationNotAhead` on either side (#404).
+  on a re-rooted root with the clear generation and the send sequence continuing. It takes the
+  agreed generation, one number on both sides. Both `ReconnectSide` variants carry
+  `last_persisted_generation`; a generation that is not ahead of it is refused with
+  `RatchetError::ReestablishedGenerationNotAhead { generation, persisted }` on either side (#404).
+- `daemonseed_core::dm::ratchet::Ratchet::can_send() -> bool` — whether a chain is in hand to mint
+  from, or a peer ephemeral to open one against (#404).
+- `daemonseed_core::dm::reest::agreed_generation(own_floor: u32, peer_floor: u32) -> u32` — the clear
+  ratchet generation a resumed channel opens at, one past the higher of the two floors, saturating at
+  `u32::MAX` (#404).
+- `daemonseed_core::dm::resume::AcceptanceSlot` carries the floor generation the answer advertised:
+  `AcceptanceSlot::accept` takes it and `AcceptanceSlot::advertised_floor()` reads it. The at-rest v2
+  body gains the field inside its fixed-width run, so a v2 record written before it existed fails to
+  decode as `ResumeError::Truncated`; no released build wrote one.
+  `ResumeError::AcceptanceFloorWithoutAttempt` refuses a floor beside an empty slot (#404).
 - `daemonseed_core::dm::outbox` — `Outbox::sweep_dead_chain(u32)`, `Outbox::next_send_seq()`,
   `Outbox::last_clear_gen()` and `OutboxEntry::sealed_under_gen()` (#404).
 - `daemonseed_core::dm::resume` — `ResumeRecord::commit_reestablished(Rerooted, u32, i64) ->
@@ -96,8 +107,11 @@ work lives in the maintainer's own planning notes, not here.
   `K(RS_n, gen, seq, attempt, leg, dir)` under `DM_REEST_SALT` / `DM_REEST_LEG`; the plaintext
   carries the leg's payload followed by an ML-DSA-87 signature over `DM_REEST_SIG`, the same five
   values and the payload, signed under `S_pc` and verified under the peer's `PK_pc`. `seal_re_est` takes a
-  `FreshAttempt`; `seal_re_ack` takes a `ReAckAuthority` minted only by `OpenedReEst::answer`;
-  `seal_re_confirm` takes an `Attempt`. `scan_re_est` / `scan_re_ack` / `scan_re_confirm` recover a
+  `FreshAttempt`; `seal_re_ack` takes a `ReAckAuthority` minted only by `OpenedReEst::answer` and the
+  answering party's floor generation, read back by `OpenedReAck::floor_gen()`; `seal_re_confirm` takes
+  an `Attempt` and the agreed generation, read back by `OpenedReConfirm::agreed_gen()`. Both fields
+  are big-endian `u32`s inside the payload the leg's signature covers and the leg's AEAD, and
+  `LEG_LEN` is unchanged. `scan_re_est` / `scan_re_ack` / `scan_re_confirm` recover a
   leg by bounded trial decryption over the attempt window `[last_seen, last_seen + MAX_GAP]`.
   `tiebreak_winner` is the contest coin, the least-significant bit of the first byte expanded under
   `DM_REEST_TIEBREAK`; `contest_outcome` is the local contest check. `ReEstGate::admit` evaluates
@@ -178,9 +192,6 @@ work lives in the maintainer's own planning notes, not here.
   by its confirming observation — which retires the retained root in the same write — or by a later
   exchange. `ResumeError::ConfirmSlotDropped`, `ConfirmResealed` and `ConfirmSlotWouldRollBack`
   (#404).
-- `daemonseed_core::dm::ratchet::ReconnectSide::Answered` — an `offered_generation` field carrying
-  A3.9's *sender picks, receiver adopts if above its own*; `Ratchet::reestablished` adopts it on the
-  answering side only (#404).
 - `daemonseed_core::trust_events::TrustEventKey` — `DmPeerStateRegressed`,
   `DmReestablishmentFailed`, `DmReestablishmentUnconfirmed` and `DmReestablishmentBackoffEngaged`,
   A3.8's loud re-establishment states, all `PersistentNonBlocking` (#404).
@@ -748,6 +759,17 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- A resumed channel's clear ratchet generation is agreed inside the settling legs rather than derived
+  on each side: the `RE-ACK` carries the answering party's floor, the initiating party computes
+  `reest::agreed_generation` from both floors, and the `RE-CONFIRM` carries the result. Each side
+  refuses a value at or below the floor it brought to the agreement, or `u32::MAX`, before the
+  exchange spends anything, and reports the refusal once per session as
+  `TrustEventKey::DmReestablishmentFailed`. The answering side judges the settlement against the
+  floor it advertised rather than against its live counter (#404).
+- `daemonseed-veilid-net`: `DmCommand::Send` composes on a channel a completed re-establishment
+  opened. The answering side is refused with `RefusalReason::AwaitingCorrespondentsFirstFrame` until
+  the correspondent's first frame under the re-rooted root opens its sending chain; the refusal
+  spends no sequence number (#404).
 - `.github/workflows/ci.yml`: the `release-suite` job runs on pushes to `main` and on manual dispatch,
   not on pull requests; `preflight` and `dev-suite` run on both.
 - Design documents, `README.md`, `AGENTS.md` and code comments state the design and the tests in

@@ -333,13 +333,15 @@ types:
       resume record at load, and from the provisional record when an unanswered
       first-contact entry's handshake is re-armed, so a re-armed initiator that
       collects its acceptance composes ordinary frames under the pseudonym that
-      entry published. A completed re-establishment does not lift the refusal
-      for the established case: it marks the correspondence resumed, and a Send
-      on a resumed correspondence is refused with NotEstablishedThisSession
+      entry published. A completed re-establishment lifts the refusal on the
+      side that asked for it: that party owns the one chain under the re-rooted
+      root and composes ordinary frames at the agreed generation, which the two
+      sides settle inside the RE-ACK and RE-CONFIRM payloads rather than derive
+      from their own counters. The party that answered opens a receiving chain
+      only, so a Send to it is refused with AwaitingCorrespondentsFirstFrame —
       before the outbox is asked and before the ratchet steps, so no sequence is
-      spent. Content frames on a resumed channel are unbuilt — the two sides open
-      the resumed ratchet at generations derived from their own outbox counters,
-      and the answering side opens a receiving chain only. Such a correspondence DOES sweep its receiving pages,
+      spent — until the correspondent's first frame under that root arrives with
+      the ephemeral its own chain steps off. Such a correspondence DOES sweep its receiving pages,
       addressed by DmPageAddress::receiving_on off the stored address root and
       the opposite of the outbox's stored direction, because that plane is where
       a re-establishment leg arrives. On the first tick after a load, an
@@ -484,9 +486,12 @@ types:
       queued sequence is reported as Delivery{state: Composed}. Surfaced clears
       the surfacing owed on the named sequence numbers. Send is refused with
       RefusalReason::NotEstablishedThisSession when no ratchet is held for that
-      identity, OutboxFull{needed} when the record cannot take another message,
-      BodyTooLarge over DM_BODY_CAP, and SealFailed when the frame will not seal;
-      an OutboxFull refusal spends no sequence number. FirstContact is refused
+      identity, AwaitingCorrespondentsFirstFrame on the answering side of a
+      completed re-establishment until the correspondent's first frame opens this
+      side's chain, OutboxFull{needed} when the record cannot take another
+      message, BodyTooLarge over DM_BODY_CAP, and SealFailed when the frame will
+      not seal; an OutboxFull or AwaitingCorrespondentsFirstFrame refusal spends
+      no sequence number. FirstContact is refused
       with
       RefusalReason::AlreadyEstablished when a correspondence with that identity
       exists and AlreadyInFlight when an introduction to it is already between the
@@ -586,8 +591,11 @@ types:
       Where a send stopped — NoKeyRecord, KeyRecordInvalid, KeyRecordRollback,
       PublishFailed, StoreFailure, AlreadyEstablished, AlreadyInFlight,
       MintPanicked, TaskPanicked, MintFailed, Module, OutboxFull{needed},
-      NotEstablishedThisSession, BodyTooLarge, SealFailed. The first eleven are
-      first-contact refusals and the last four channel-send ones.
+      NotEstablishedThisSession, AwaitingCorrespondentsFirstFrame, BodyTooLarge,
+      SealFailed. The first eleven are first-contact refusals and the last five
+      channel-send ones. AwaitingCorrespondentsFirstFrame is the answering side
+      of a completed re-establishment, whose chain opens on the correspondent's
+      first frame under the re-rooted root; it spends no sequence number.
       KeyRecordRollback is an authentic record naming a version below the highest
       already verified for that identity this session; KeyRecordInvalid is one
       that does not verify at all. Acceptance says how far the write got; this

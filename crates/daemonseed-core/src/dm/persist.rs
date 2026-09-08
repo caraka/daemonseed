@@ -8511,6 +8511,7 @@ mod tests {
             generation,
             attempt_of(attempt),
             55,
+            12,
             vec![seal; 128].into_boxed_slice(),
         )
         .expect("within MAX_SEALED_LEG_LEN")

@@ -253,6 +253,7 @@ const FIXED_LEN: usize = RESUME_MAGIC.len()
     + 4 /* acceptance slot generation */
     + 4 /* acceptance slot attempt */
     + 8 /* acceptance slot seq */
+    + 4 /* acceptance slot advertised floor */
     + 1 /* acceptance slot confirmed */
     + 4 /* confirm slot generation */
     + 8 /* confirm slot seq */
@@ -542,6 +543,13 @@ pub enum ResumeError {
     /// ignored, because a generation read back out of an empty slot would be a
     /// value nothing wrote and nothing checks.
     SlotGenerationWithoutAttempt { generation: u32 },
+    /// At-rest bytes carrying an advertised floor for an acceptance slot
+    /// standing empty.
+    ///
+    /// The same reading as [`Self::SlotGenerationWithoutAttempt`]: an empty slot
+    /// advertised nothing, so a non-zero floor beside it is a value this encoder
+    /// does not write and no reader would know what to do with.
+    AcceptanceFloorWithoutAttempt { floor: u32 },
     /// At-rest bytes carrying retained-root bytes beside a clear presence flag.
     ///
     /// [`ResumeRecord::encode`] writes the absent case as an all-zero root, so
@@ -782,6 +790,10 @@ impl std::fmt::Display for ResumeError {
             Self::AcceptanceHasNoFrame { attempt } => {
                 write!(f, "accepted attempt {attempt} carries no sealed frame")
             }
+            Self::AcceptanceFloorWithoutAttempt { floor } => write!(
+                f,
+                "an empty acceptance slot advertises floor generation {floor}"
+            ),
             Self::EmptyFrame => write!(f, "a handshake slot may not hold an empty frame"),
             Self::AttemptSlotDisagrees { field, slot } => write!(
                 f,
@@ -1467,6 +1479,7 @@ pub struct AcceptanceSlot {
     generation: u32,
     attempt: Attempt,
     seq: u64,
+    advertised_floor: u32,
     sealed_re_ack: Box<[u8]>,
     confirmed: bool,
 }
@@ -1486,6 +1499,7 @@ impl AcceptanceSlot {
         generation: u32,
         attempt: Attempt,
         seq: u64,
+        advertised_floor: u32,
         sealed_re_ack: Box<[u8]>,
     ) -> Result<Self, ResumeError> {
         if sealed_re_ack.len() > MAX_SEALED_LEG_LEN {
@@ -1503,9 +1517,26 @@ impl AcceptanceSlot {
             generation,
             attempt,
             seq,
+            advertised_floor,
             sealed_re_ack,
             confirmed: false,
         })
+    }
+
+    /// The floor this party put inside the `RE-ACK` it sealed.
+    ///
+    /// **Stored because the agreement is about the advertised value, not about
+    /// where this party's counter has since got to.** The two settling legs are
+    /// hours apart, and in between this party's own channel is still live: a
+    /// frame sent on the old chain raises the outbox's clear counter, so a fresh
+    /// read at settlement time is above the number the correspondent was given
+    /// and was told to compute from. Checking the arriving generation against
+    /// that read refuses the correspondent's correct answer and leaves the two
+    /// ends on different chains until the retention ceiling. Pinned here at the
+    /// moment the answer is sealed, it is the same number on both sides for as
+    /// long as the exchange lasts.
+    pub fn advertised_floor(&self) -> u32 {
+        self.advertised_floor
     }
 
     /// The outbox sequence position the stored `RE-ACK` was addressed to.
@@ -3004,6 +3035,10 @@ impl ResumeRecord {
             .as_ref()
             .is_some_and(AcceptanceSlot::confirmed);
         let acc_seq = self.acceptance.as_ref().map_or(0, AcceptanceSlot::seq);
+        let acc_floor = self
+            .acceptance
+            .as_ref()
+            .map_or(0, AcceptanceSlot::advertised_floor);
         let acc_frame = self
             .acceptance
             .as_ref()
@@ -3043,6 +3078,7 @@ impl ResumeRecord {
         out.extend_from_slice(&acc_generation.to_be_bytes());
         out.extend_from_slice(&acc_attempt.to_be_bytes());
         out.extend_from_slice(&acc_seq.to_be_bytes());
+        out.extend_from_slice(&acc_floor.to_be_bytes());
         out.push(u8::from(acc_confirmed));
         out.extend_from_slice(&confirm_generation.to_be_bytes());
         out.extend_from_slice(&confirm_seq.to_be_bytes());
@@ -3164,6 +3200,7 @@ impl ResumeRecord {
         let acc_generation = u32::from_be_bytes(r.array()?);
         let acc_attempt = u32::from_be_bytes(r.array()?);
         let acc_seq = u64::from_be_bytes(r.array()?);
+        let acc_floor = u32::from_be_bytes(r.array()?);
         let acc_confirmed = r.array::<1>()?[0] != 0;
         let confirm_generation = u32::from_be_bytes(r.array()?);
         let confirm_seq = u64::from_be_bytes(r.array()?);
@@ -3283,6 +3320,9 @@ impl ResumeRecord {
                     generation: acc_generation,
                 });
             }
+            0 if acc_floor != 0 => {
+                return Err(ResumeError::AcceptanceFloorWithoutAttempt { floor: acc_floor });
+            }
             0 => None,
             n if sealed_re_ack.is_empty() => {
                 return Err(ResumeError::AcceptanceHasNoFrame { attempt: n });
@@ -3291,6 +3331,7 @@ impl ResumeRecord {
                 generation: acc_generation,
                 attempt: Attempt(n),
                 seq: acc_seq,
+                advertised_floor: acc_floor,
                 sealed_re_ack,
                 confirmed: acc_confirmed,
             }),
@@ -3491,6 +3532,7 @@ mod tests {
             generation,
             Attempt::from_nonzero(NonZeroU32::new(attempt).expect("a real attempt")),
             55,
+            12,
             pattern(seed, len).into_boxed_slice(),
         )
         .expect("the fixture is within MAX_SEALED_LEG_LEN")
@@ -3860,6 +3902,7 @@ mod tests {
             + 4 /* acceptance generation */
             + 4 /* acceptance attempt */
             + 8 /* acceptance seq */
+            + 4 /* acceptance advertised floor */
             + 1 /* acceptance confirmed */
             + 4 /* confirm slot generation */
             + 8 /* confirm slot seq */
@@ -3944,6 +3987,7 @@ mod tests {
         out.extend_from_slice(&if acc_attempt == 0 { 0u32 } else { 11 }.to_be_bytes());
         out.extend_from_slice(&acc_attempt.to_be_bytes());
         out.extend_from_slice(&if acc_attempt == 0 { 0u64 } else { 55 }.to_be_bytes());
+        out.extend_from_slice(&if acc_attempt == 0 { 0u32 } else { 12 }.to_be_bytes());
         out.push(u8::from(acc_confirmed));
         out.extend_from_slice(&0u32.to_be_bytes()); // confirm slot generation
         out.extend_from_slice(&0u64.to_be_bytes()); // confirm slot seq
@@ -4046,6 +4090,7 @@ mod tests {
         expected.extend_from_slice(&11u32.to_be_bytes()); // acceptance generation
         expected.extend_from_slice(&5u32.to_be_bytes()); // acceptance attempt
         expected.extend_from_slice(&55u64.to_be_bytes()); // acceptance seq
+        expected.extend_from_slice(&12u32.to_be_bytes()); // acceptance advertised floor
         expected.push(1); // acceptance confirmed
         expected.extend_from_slice(&0u32.to_be_bytes()); // confirm slot generation
         expected.extend_from_slice(&0u64.to_be_bytes()); // confirm slot seq
@@ -5026,6 +5071,7 @@ mod tests {
                         1,
                         Attempt::FIRST,
                         u64::MAX,
+                        u32::MAX,
                         pattern(0x66, MAX_SEALED_LEG_LEN).into_boxed_slice(),
                     )
                     .expect("a frame of exactly MAX_SEALED_LEG_LEN is allowed"),
@@ -6324,13 +6370,15 @@ mod tests {
             Some(ResumeError::EmptyFrame)
         );
         assert_eq!(
-            AcceptanceSlot::accept(1, Attempt::FIRST, 0, Vec::new().into_boxed_slice()).err(),
+            AcceptanceSlot::accept(1, Attempt::FIRST, 0, 0, Vec::new().into_boxed_slice()).err(),
             Some(ResumeError::EmptyFrame)
         );
         // Positive control: one byte is enough, so the guard is on emptiness
         // rather than on some larger floor.
         assert!(SealedReEst::seal(FreshAttempt::first(), vec![1u8].into_boxed_slice()).is_ok());
-        assert!(AcceptanceSlot::accept(1, Attempt::FIRST, 0, vec![1u8].into_boxed_slice()).is_ok());
+        assert!(
+            AcceptanceSlot::accept(1, Attempt::FIRST, 0, 0, vec![1u8].into_boxed_slice()).is_ok()
+        );
     }
 
     /// **The acceptance slot's own length ceiling is enforced and is reachable.**
@@ -6349,6 +6397,7 @@ mod tests {
                 1,
                 Attempt::FIRST,
                 0,
+                0,
                 pattern(0x66, too_long).into_boxed_slice()
             )
             .err(),
@@ -6360,6 +6409,7 @@ mod tests {
             AcceptanceSlot::accept(
                 1,
                 Attempt::FIRST,
+                0,
                 0,
                 pattern(0x66, MAX_SEALED_LEG_LEN).into_boxed_slice()
             )
@@ -6428,6 +6478,60 @@ mod tests {
         assert!(ResumeRecord::decode(&base).is_ok());
     }
 
+    /// **An advertised floor beside an empty acceptance slot is refused, and a
+    /// record in the layout that predates the field does not decode.**
+    ///
+    /// The first is the same reading as `SlotGenerationWithoutAttempt`: an empty
+    /// slot advertised nothing, so a floor beside it is a value this encoder does
+    /// not write and no reader could act on. The hand-built fixture is the only
+    /// way to spell it, because `encode` reads both halves from one `Option`.
+    ///
+    /// The second is what the field costs on the way in. It sits inside the
+    /// fixed-width run, so every field after it moves by four bytes and a record
+    /// written before it existed misreads its own length prefixes. No released
+    /// build wrote one; a development store that holds one is replaced rather
+    /// than upgraded, and the record says so rather than decoding to something
+    /// plausible.
+    ///
+    /// Kills a decoder that reads the floor without checking the attempt beside
+    /// it, and pins the migration answer rather than leaving it to be discovered.
+    #[test]
+    fn the_decoder_refuses_an_advertised_floor_with_no_acceptance() {
+        let floor_at = ROOT_AT
+            + ROOT_KEY_LEN
+            + 4 /* reconnect_gen */
+            + 4 /* attempt counter */
+            + 4 /* own slot generation */
+            + 4 /* own slot attempt */
+            + 8 /* own slot seq */
+            + 1 /* ephemeral key present */
+            + ml_kem::DK_LEN
+            + 4 /* acceptance generation */
+            + 4 /* acceptance attempt */
+            + 8 /* acceptance seq */;
+
+        let mut bytes = assembled_full(0, &[], 0, &[], false, None, &[]);
+        bytes[floor_at..floor_at + 4].copy_from_slice(&7u32.to_be_bytes());
+        assert_eq!(
+            ResumeRecord::decode(&bytes).err(),
+            Some(ResumeError::AcceptanceFloorWithoutAttempt { floor: 7 })
+        );
+
+        // Positive control: the same body with the field left at zero decodes,
+        // so the refusal is on the pairing and not on the offset.
+        let intact = assembled_full(0, &[], 0, &[], false, None, &[]);
+        assert!(ResumeRecord::decode(&intact).is_ok());
+
+        // The previous layout: the same record without the four bytes.
+        let mut previous = intact.clone();
+        previous.drain(floor_at..floor_at + 4);
+        assert_eq!(
+            ResumeRecord::decode(&previous).err(),
+            Some(ResumeError::Truncated),
+            "a record in the layout that predates the advertised floor decoded"
+        );
+    }
+
     /// **Retained root bytes under a clear presence flag are refused.**
     ///
     /// [`ResumeRecord::encode`] writes the absent case as an all-zero root, so
@@ -6450,6 +6554,7 @@ mod tests {
             + 4 /* acceptance generation */
             + 4 /* acceptance attempt */
             + 8 /* acceptance seq */
+            + 4 /* acceptance advertised floor */
             + 1 /* acceptance confirmed */
             + 4 /* confirm slot generation */
             + 8 /* confirm slot seq */

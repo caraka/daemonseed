@@ -563,6 +563,33 @@ route taken to reach a decision are not recorded here — the git history and `C
   the seed per write, which costs a file read and an ML-DSA keygen on every command and lets the
   composer flip mid-session.
 
+- **The generation a resumed channel opens at is carried inside the re-establishment legs, not
+  derived on each side.** The `RE-ACK`'s signed payload holds the answering party's floor — its
+  highest persisted clear ratchet generation — the initiating party takes one past the higher of that
+  and its own floor, and the `RE-CONFIRM`'s signed payload names the result, which both sides then
+  open at. Both fields sit inside the payload the leg's signature covers and inside the leg's AEAD,
+  so each value is authenticated by the sender's per-correspondent key and legible only to a party
+  that can already open the leg; the leg length is unchanged and all three legs remain one size, so
+  nothing about the exchange is announced in the clear. Each side still refuses a value at or below
+  its own floor, which is what a forged or replayed settling leg meets. Rejected: a one-way carry, in
+  which the initiating party names a generation off its own floor alone — wrong whenever the
+  answering party's floor is higher, which is the ordinary case once that party has sent more than it
+  has received, and every frame is then refused as too old. Also rejected: a stride derived from the
+  re-establishment counter and computed identically on both sides, which needs no exchange but makes
+  a generation jump of fixed size at every re-establishment — a restart marker readable from the
+  clear counter, which is the residual the wire shape was designed to avoid.
+
+- **A message composed on a resumed channel before the correspondent has written is refused at the
+  command, under a reason that names that state.** The party that asked for the re-establishment owns
+  the only chain under the re-rooted root, so the party that answered can receive and cannot send
+  until the first frame arrives with the ephemeral its own chain steps off. The refusal is taken
+  before the outbox is asked and before the ratchet steps, so no sequence number is spent and the
+  same message may be sent again. Rejected: letting the ratchet answer, which reports an ordinary
+  waiting state as a failure to seal and prices a sequence number against it first. Also rejected for
+  now: reserving the sequence and sealing the message once the chain opens, which is the better
+  outcome for the user and needs a store for the composed body and a sealing site outside the send
+  command — an unsealed outbox entry holds no plaintext, by design.
+
 - **A re-establishment leg that opens under the SUPERSEDED root is scanned at the generation the
   open exchange is at, not at the committed one.** A3.5 says retention buys *"the ability to open the
   peer's frames at the superseded generation"* and names one generation; the build needs two, because
