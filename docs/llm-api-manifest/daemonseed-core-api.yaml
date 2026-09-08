@@ -2092,7 +2092,10 @@ modules:
       u64, attempt: &FreshAttempt, eph_ek: &[u8; ml_kem::EK_LEN], s_pc: &[u8;
       ml_dsa::SK_LEN]) takes the token, so a fresh encapsulation is only
       possible under a new attempt. seal_re_ack(root, dir, seq, authority:
-      ReAckAuthority, eph_ct: &[u8; ml_kem::CT_LEN], s_pc) takes a
+      ReAckAuthority, floor_generation: u32, eph_ct: &[u8; ml_kem::CT_LEN],
+      s_pc) carries the sealer's highest persisted clear ratchet generation as a
+      big-endian u32 leading its payload, inside the signature and the seal. It
+      takes a
       ReAckAuthority, which carries the generation and attempt it answers and is
       minted only by OpenedReEst::answer(self); it is neither Clone nor Copy, so
       mint_ephemeral() -> Result<(Box<[u8; ml_kem::EK_LEN]>,
@@ -2111,16 +2114,23 @@ modules:
       re-rooted chain. ReEstError::Reroot(Box<ratchet::RatchetError>) carries a
       derivation fault verbatim. one opened RE-EST authorises one RE-ACK.
       seal_re_confirm(root, dir,
-      generation, seq, attempt: Attempt, s_pc) takes a plain Attempt: it
+      generation, seq, attempt: Attempt, agreed_generation: u32, s_pc) takes a
+      plain Attempt: it
       encapsulates nothing, so it cannot spell a fresh ciphertext under an
-      unchanged key. Each sealer returns Vec<u8> of LEG_LEN.
+      unchanged key. Its payload is the agreed clear ratchet generation as a
+      big-endian u32, in the same position and under the same signature and
+      seal. agreed_generation(own_floor: u32, peer_floor: u32) -> u32 returns
+      max(own_floor, peer_floor).saturating_add(1) and is the one home of that
+      rule. Each sealer returns Vec<u8> of LEG_LEN.
       scan_re_est / scan_re_ack / scan_re_confirm(root, dir, generation, seq:
       u64, last_seen: u32, encoded: &[u8], peer_pk_pc: &[u8; ml_dsa::PK_LEN])
       recover a leg by bounded trial decryption over the attempt window
       [last_seen, last_seen + MAX_GAP] inclusive, skipping attempt 0; dir,
       generation, seq and the kind come from the reader, never from the bytes.
       They return OpenedReEst / OpenedReAck / OpenedReConfirm with generation(),
-      attempt() and, for the first two, eph_ek() / eph_ct(); OpenedReEst also has
+      attempt() and, for the first two, eph_ek() / eph_ct(); OpenedReAck also has
+      floor_gen() -> u32 and OpenedReConfirm agreed_gen() -> u32, the carried
+      generations. OpenedReEst also has
       answer() -> ReAckAuthority, whose generation() and attempt() read back.
       ReEstError is Truncated for bytes that are not LEG_LEN, PayloadLen {
       expected, got } for an opened payload of the wrong size in either

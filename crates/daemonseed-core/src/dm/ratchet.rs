@@ -289,7 +289,7 @@ pub enum ReconnectSide {
     /// `RE-CONFIRM` that opens it.
     Initiated {
         /// The highest clear ratchet generation this party has persisted, which
-        /// the offered generation must be strictly ahead of.
+        /// the agreed generation must be strictly ahead of.
         ///
         /// The natural source is [`crate::dm::outbox::Outbox::last_clear_gen`].
         /// **A record migrated from an outbox layout that predates that field
@@ -306,11 +306,17 @@ pub enum ReconnectSide {
         ///
         /// `docs/design/direct-messaging.md:917` (A3.9) has the clear generation
         /// counter continue across a re-establishment and never regress, so the
-        /// generation offered by the peer's first frame is adopted only if it is
+        /// agreed generation the settling leg named is taken only if it is
         /// strictly ahead of this. Refused otherwise, with
         /// [`RatchetError::ReestablishedGenerationNotAhead`] — a generation that
         /// repeated would put two different roots on one number and rewrite a
         /// write-once page slot.
+        ///
+        /// **This is the answering side's own guard, not a restatement of the
+        /// initiator's.** The agreed value is computed from both floors, so in
+        /// the ordinary case it clears this by construction; the check is what
+        /// stands between a forged or replayed settling leg and a chain opened
+        /// on a number this party has already written under.
         last_persisted_generation: u32,
         /// The sequence number the peer's first frame under the re-rooted chain
         /// will carry.
@@ -321,25 +327,6 @@ pub enum ReconnectSide {
         /// read off the fetch rather than carried in the leg. Distinct from this
         /// party's own `next_send_seq`, which counts the other direction.
         peer_next_send_seq: u64,
-        /// The clear ratchet generation the peer's first frame under the
-        /// re-rooted chain declares.
-        ///
-        /// **A3.9's *"sender picks, receiver adopts if above its own"*, made a
-        /// parameter so the rule has one home.** The initiating side computes
-        /// one past its own last persisted value and passes it as `generation`;
-        /// the answering side has no such freedom — it must end on whatever the
-        /// peer's chain actually declares, or the two chains disagree on the
-        /// number every frame carries in the clear. So this is the offer, and
-        /// [`Ratchet::reestablished`] adopts it only when it is strictly above
-        /// the `generation` the answerer would otherwise take.
-        ///
-        /// **Nothing carries an offer today**, and the parameter says so rather
-        /// than pretending otherwise: a re-establishment leg has no clear
-        /// ratchet header, so the first value that can be an offer arrives on
-        /// the first content frame of the resumed chain. Until that path exists
-        /// the answering side passes its own `generation` here, which makes the
-        /// adoption a no-op and leaves the rule in one place for when it does.
-        offered_generation: u32,
     },
 }
 
@@ -450,14 +437,14 @@ pub enum RatchetError {
     /// setting a downstream build could turn off. A cursor wrapping to zero would
     /// rewrite the write-once page slot sequence zero already owns.
     SequenceExhausted { seq: u64 },
-    /// A re-established channel was offered a clear ratchet generation at or
+    /// A clear ratchet generation read off the peer's settling leg is at or
     /// below the highest this party has persisted.
     ///
     /// `docs/design/direct-messaging.md:917` (A3.9) has the counter continue
     /// across a re-establishment and never regress. Accepting a repeat would put
     /// two different roots on one generation number, which collides the
     /// skipped-key cache's slots and rewrites a write-once page slot.
-    ReestablishedGenerationNotAhead { offered: u32, persisted: u32 },
+    ReestablishedGenerationNotAhead { generation: u32, persisted: u32 },
     /// A frame sits further ahead on its chain than [`MAX_CATCH_UP`] — further
     /// than a receiver will walk in one step. Not recoverable by retrying the
     /// same frame; the conversation re-anchors at the peer's next ratchet step.
@@ -509,10 +496,13 @@ impl std::fmt::Display for RatchetError {
                 f,
                 "sequence {seq} is the last there is, and the chain cannot step past it"
             ),
-            Self::ReestablishedGenerationNotAhead { offered, persisted } => write!(
+            Self::ReestablishedGenerationNotAhead {
+                generation,
+                persisted,
+            } => write!(
                 f,
-                "a re-established channel was offered generation {offered}, which is not \
-                 ahead of the persisted {persisted}"
+                "a re-established channel would open at generation {generation}, which is \
+                 not ahead of the persisted {persisted}"
             ),
             Self::BacklogTooWide { gap, max } => write!(
                 f,
@@ -1269,13 +1259,18 @@ impl Ratchet {
     /// arrives and publishes an ephemeral to step against.
     ///
     /// **`generation` and `next_send_seq` continue; neither restarts** (A3.9,
-    /// `:917`; A4.8, `:1056`). The initiating party passes one past its last
-    /// persisted generation; the answering party passes the generation the
-    /// peer's frame declares. **Both sides carry their own floor and both are
-    /// checked here rather than by the caller** — a regression is refused
-    /// whichever side offers it, so the counter cannot go backwards on either.
-    /// `next_send_seq` is always **this party's own** next send position, which
-    /// the outbox homes.
+    /// `:917`; A4.8, `:1056`).
+    ///
+    /// **`generation` is the agreed generation and is the same number on both
+    /// sides.** The initiating party computes it from the two floors — its own
+    /// and the one the `RE-ACK` carried — and names it in the `RE-CONFIRM`; the
+    /// answering party reads it off that leg. So neither side derives it from
+    /// its own counter alone, which cannot produce one number when the sides
+    /// have cleared to different generations. **Both sides carry
+    /// their own floor and both are checked here rather than by the caller** — a
+    /// regression is refused whichever side supplies it, so the counter cannot
+    /// go backwards on either. `next_send_seq` is always **this party's own**
+    /// next send position, which the outbox homes.
     ///
     /// **A fresh ephemeral is minted on the initiating side and nowhere else**
     /// (A4.7, `:1043`): `RE-CONFIRM` is the first frame of the re-rooted chain
@@ -1316,7 +1311,7 @@ impl Ratchet {
         };
         if generation <= last_persisted_generation {
             return Err(RatchetError::ReestablishedGenerationNotAhead {
-                offered: generation,
+                generation,
                 persisted: last_persisted_generation,
             });
         }
@@ -1327,15 +1322,6 @@ impl Ratchet {
 
         // The one chain that exists, in the direction the `RE-EST` sender sends,
         // based where that party's own sequence numbers had reached.
-        // A3.9's adoption: the answering side ends on the higher of its own
-        // floor-derived generation and what the peer's chain offers, because the
-        // clear counter is one number both sides must agree on.
-        let generation = match side {
-            ReconnectSide::Initiated { .. } => generation,
-            ReconnectSide::Answered {
-                offered_generation, ..
-            } => generation.max(offered_generation),
-        };
         let (send, recv) = match side {
             ReconnectSide::Initiated { .. } => {
                 let dir = role.send_dir();
@@ -2353,7 +2339,6 @@ mod tests {
             ReconnectSide::Answered {
                 last_persisted_generation: generation - 1,
                 peer_next_send_seq: initiator_seq,
-                offered_generation: 0,
             },
             generation,
             answerer_seq,
@@ -2363,21 +2348,24 @@ mod tests {
         (initiator, answerer)
     }
 
-    /// **A3.9's sender-picks / receiver-adopts, both directions.**
+    /// **Each side opens at the generation it is given, and derives nothing from
+    /// its own floor.**
     ///
-    /// The clear generation is one number both chains must agree on, and only
-    /// the initiating side is free to choose it: A3.9 has *"the re-rooted ratchet
-    /// initialize its clear generation at one past the last persisted value"* on
-    /// that side, and the answering side ending on a different number would make
-    /// every frame carry a header its peer refuses. So the answering side takes
-    /// the higher of what it computed and what the peer's chain declares.
+    /// This is the constructor's half of the rule and only that half. The number
+    /// itself comes from [`crate::dm::reest::agreed_generation`], which the
+    /// fixture below calls rather than restating; what is asserted here is that
+    /// `Ratchet::reestablished` puts that number on the ratchet and on the chain,
+    /// on both sides, and never substitutes one computed from
+    /// `last_persisted_generation` (A3.9's continuity, which binds either party).
     ///
-    /// **Two cases, because one of them is a no-op and would pass on its own.**
-    /// An offer above the answerer's own value must win, and an offer below it
-    /// must not pull the counter back — A3.9's continuity clause, which a bare
-    /// assignment would break in the direction nothing else checks.
+    /// **Run in both floor orientations, and that is what gives it teeth.** With
+    /// one orientation only, the side whose floor happens to be the higher one
+    /// can reach the agreed value from its own counter, so a build that ignored
+    /// the argument on that side would still pass. Swapping the floors under one
+    /// agreed value leaves each side, in one of the two cases, on a number its
+    /// own floor cannot produce.
     #[test]
-    fn the_answering_side_adopts_a_higher_offered_generation_and_no_lower_one() {
+    fn both_sides_open_at_the_agreed_generation() {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let rerooted = crate::dm::resume::reroot(
             &crate::dm::resume::CommittedRoot::from_bytes(&[0x5c; ROOT_KEY_LEN]),
@@ -2385,48 +2373,65 @@ mod tests {
         )
         .expect("the module is operational");
         let ar = [0x71u8; crate::dm::firstcontact::ROOT_LEN];
-        let answered = |offered_generation: u32| {
-            Ratchet::reestablished(
+        let high = 40;
+        let low = 12;
+        let agreed = crate::dm::reest::agreed_generation(low, high);
+
+        let opened = |initiator_floor: u32, answerer_floor: u32| {
+            let initiated = Ratchet::reestablished(
+                &rerooted,
+                Role::Initiator,
+                ReconnectSide::Initiated {
+                    last_persisted_generation: initiator_floor,
+                },
+                agreed,
+                900,
+                &ar,
+            )
+            .expect("the initiating side opens");
+            let answered = Ratchet::reestablished(
                 &rerooted,
                 Role::Recipient,
                 ReconnectSide::Answered {
-                    last_persisted_generation: 40,
+                    last_persisted_generation: answerer_floor,
                     peer_next_send_seq: 900,
-                    offered_generation,
                 },
-                41,
+                agreed,
                 250,
                 &ar,
             )
-            .expect("the answering side opens")
-            .generation()
+            .expect("the answering side opens");
+            (initiated, answered)
         };
-        assert_eq!(
-            answered(44),
-            44,
-            "an offer above this side's own value was not adopted, so the two chains \
-             would disagree about the number every frame carries"
-        );
-        assert_eq!(
-            answered(7),
-            41,
-            "an offer below this side's own value pulled the counter back, which A3.9's \
-             continuity clause forbids"
-        );
-        // The control on the fixture itself: the initiating side has no offer to
-        // take, and keeps the value it chose.
-        let initiated = Ratchet::reestablished(
-            &rerooted,
-            Role::Initiator,
-            ReconnectSide::Initiated {
-                last_persisted_generation: 40,
-            },
-            41,
-            900,
-            &ar,
-        )
-        .expect("the initiating side opens");
-        assert_eq!(initiated.generation(), 41);
+
+        for (initiator_floor, answerer_floor) in [(high, low), (low, high)] {
+            let (mut initiated, mut answered) = opened(initiator_floor, answerer_floor);
+            let initiated_gen = initiated.generation();
+            let answered_gen = answered.generation();
+            assert_eq!(
+                initiated_gen, agreed,
+                "the initiating side opened at {initiated_gen} rather than the agreed \
+                 {agreed}, with floors {initiator_floor}/{answerer_floor}"
+            );
+            assert_eq!(
+                answered_gen, agreed,
+                "the answering side opened at {answered_gen} rather than the agreed \
+                 {agreed}, so every frame the initiator seals would carry a header its \
+                 peer refuses"
+            );
+            // The chains carry the number too, not only the ratchets: the first
+            // frame declares it in the clear and the far end opens under it.
+            let first = initiated.send_next().unwrap();
+            assert_eq!(first.header.generation, agreed);
+            deliver_ok(&mut answered, &first);
+        }
+
+        // Control on the fixture: the lower floor cannot reach the agreed value
+        // by adding one, so in each orientation one of the two sides is on a
+        // number its own counter does not produce. Equal floors would make the
+        // pair above vacuous.
+        assert_ne!(low + 1, agreed);
+        assert_eq!(high + 1, agreed);
     }
 
     /// **A resumed channel carries traffic both ways, with both counters
@@ -2504,7 +2509,6 @@ mod tests {
             ReconnectSide::Answered {
                 last_persisted_generation: 40,
                 peer_next_send_seq: 900,
-                offered_generation: 0,
             },
             41,
             250,
@@ -2551,14 +2555,14 @@ mod tests {
         )
         .expect("operational");
 
-        for offered in [40u32, 41] {
+        for candidate in [40u32, 41] {
             let err = Ratchet::reestablished(
                 &rerooted,
                 Role::Initiator,
                 ReconnectSide::Initiated {
                     last_persisted_generation: 41,
                 },
-                offered,
+                candidate,
                 900,
                 &ar,
             )
@@ -2567,11 +2571,11 @@ mod tests {
                 matches!(
                     err,
                     Some(RatchetError::ReestablishedGenerationNotAhead {
-                        offered: got,
+                        generation: got,
                         persisted: 41,
-                    }) if got == offered
+                    }) if got == candidate
                 ),
-                "generation {offered} was admitted over a persisted 41"
+                "generation {candidate} was admitted over a persisted 41"
             );
         }
 
@@ -2628,16 +2632,15 @@ mod tests {
         )
         .expect("operational");
 
-        for offered in [40u32, 41] {
+        for candidate in [40u32, 41] {
             let err = Ratchet::reestablished(
                 &rerooted,
                 Role::Recipient,
                 ReconnectSide::Answered {
                     last_persisted_generation: 41,
                     peer_next_send_seq: 900,
-                    offered_generation: 0,
                 },
-                offered,
+                candidate,
                 250,
                 &ar,
             )
@@ -2646,11 +2649,11 @@ mod tests {
                 matches!(
                     err,
                     Some(RatchetError::ReestablishedGenerationNotAhead {
-                        offered: got,
+                        generation: got,
                         persisted: 41,
-                    }) if got == offered
+                    }) if got == candidate
                 ),
-                "generation {offered} was admitted over a persisted 41"
+                "generation {candidate} was admitted over a persisted 41"
             );
         }
 
@@ -2664,7 +2667,6 @@ mod tests {
                 ReconnectSide::Answered {
                     last_persisted_generation: 41,
                     peer_next_send_seq: 900,
-                    offered_generation: 0,
                 },
                 42,
                 250,

@@ -7051,9 +7051,15 @@ fn fold_re_est(
         }
         return LegFold::consumed();
     }
-    let Some((_, our_seq)) = outbox_counters(persist, &label, our_direction, now_ms) else {
+    let Some((last_clear_gen, our_seq)) = outbox_counters(persist, &label, our_direction, now_ms)
+    else {
         return LegFold::retry();
     };
+    // The floor this side brings to the agreement, by the same reading the
+    // initiating side uses: the outbox carries the clear counter for frames this
+    // party has sealed and the resume record the one a previous
+    // re-establishment opened at, so the floor is the larger of the two.
+    let floor_gen = last_clear_gen.max(record.reroot_ratchet_gen());
     let eph_ek = *opened.eph_ek();
     let authority = opened.answer();
     let (rerooted, eph_ct) = match reest::answer(root, &eph_ek) {
@@ -7073,6 +7079,7 @@ fn fold_re_est(
         our_direction,
         our_seq,
         authority,
+        floor_gen,
         &eph_ct,
         record.s_pc(),
     ) {
@@ -7248,6 +7255,7 @@ fn fold_re_ack(
         settled_generation,
         our_seq,
         attempt,
+        ratchet_gen,
         record.s_pc(),
     ) {
         Ok(bytes) => bytes,
@@ -7398,13 +7406,6 @@ fn fold_re_confirm(
             // The settling leg rode the peer's outbox at this position, so the
             // first content frame of the resumed chain takes the next one.
             peer_next_send_seq: seq.saturating_add(1),
-            // **What the peer's first frame under the re-rooted chain offers.**
-            // A leg carries no clear ratchet header, so nothing has offered a
-            // generation yet and this side passes its own; the offer arrives
-            // with the first content frame, which is unbuilt. The adoption rule
-            // lives in `Ratchet::reestablished` so the value has one meaning
-            // whichever side supplies it.
-            offered_generation: ratchet_gen,
         },
         ratchet_gen,
         our_seq,

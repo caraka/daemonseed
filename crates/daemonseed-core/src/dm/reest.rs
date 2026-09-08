@@ -119,12 +119,14 @@ use crate::identity::keys::verify_signature;
 pub const FRAME_KIND_RE_EST: &[u8] = b"re-est";
 
 /// The other side's answer, carrying the ciphertext that co-determines the new
-/// root. Not a wire field; see [`FRAME_KIND_RE_EST`]. FROZEN.
+/// root and this party's floor generation. Not a wire field; see
+/// [`FRAME_KIND_RE_EST`]. FROZEN.
 pub const FRAME_KIND_RE_ACK: &[u8] = b"re-ack";
 
 /// The returning side settling the exchange — A9's retirement mechanism. Its
-/// payload is the signature and nothing else: the whole content of the leg is
-/// the authenticated fact that it arrived. Not a wire field. FROZEN.
+/// payload is the generation the two sides resume at, and the whole rest of the
+/// leg's content is the authenticated fact that it arrived. Not a wire field.
+/// FROZEN.
 pub const FRAME_KIND_RE_CONFIRM: &[u8] = b"re-confirm";
 
 /// The one padded plaintext size every leg seals, so all three are the same
@@ -134,6 +136,12 @@ pub const FRAME_KIND_RE_CONFIRM: &[u8] = b"re-confirm";
 /// padding all three to one bucket is that requirement applied uniformly. The
 /// value matches the outbox's lower `PAD_BUCKETS` rung (A4.8), so a leg is the
 /// size of an ordinary padded frame body rather than a size of its own. FROZEN.
+///
+/// The settling leg's body is not empty: it names the generation the resumed
+/// channel opens at ([`GEN_FIELD_LEN`], A3.9), so A3.2's word *"empty-bodied"*
+/// is struck. What A3.2 required is untouched — the body sits inside the same
+/// padding, so all three legs are still one length and no observer can tell a
+/// settling leg from either of its siblings by size.
 const LEG_PLAINTEXT_LEN: usize = 8192;
 
 /// The single-rung padding ladder [`pad_to_bucket`] is driven with.
@@ -147,18 +155,37 @@ const SEAL_OVERHEAD: usize = 28;
 /// one length.
 pub const LEG_LEN: usize = LEG_PLAINTEXT_LEN + SEAL_OVERHEAD;
 
-/// Bytes of `RE-EST` payload inside the seal: the ephemeral and the signature.
-const RE_EST_PAYLOAD_LEN: usize = ml_kem::EK_LEN + ml_dsa::SIG_LEN;
+/// Bytes of the clear ratchet generation a leg carries, big-endian.
+///
+/// The `RE-ACK` carries the answering party's floor and the `RE-CONFIRM` the
+/// generation both sides resume at, so the two parties reach one number without
+/// either guessing at the other's counter. The field **leads** the payload of
+/// every leg that carries one: it then sits at one offset whatever else that
+/// leg holds, and a reader recovers it the same way for both kinds.
+///
+/// It is inside the payload, so it is covered by the leg's signature
+/// ([`leg_sig_input`]) and sealed under the leg key (A3.9) — nothing about it is
+/// legible to anything that cannot already open the leg.
+const GEN_FIELD_LEN: usize = 4;
 
-/// Bytes of `RE-ACK` payload inside the seal: the ciphertext and the signature.
-const RE_ACK_PAYLOAD_LEN: usize = ml_kem::CT_LEN + ml_dsa::SIG_LEN;
+/// Bytes of `RE-EST` payload — the ephemeral.
+///
+/// **The one spelling of that leg's layout.** Every site that builds, splits or
+/// length-checks a payload reads these three constants rather than restating the
+/// sum, so a field added to one kind cannot be added to the sealer and missed by
+/// the scanner. The signature is not counted here: it follows the payload inside
+/// the sealed body, and [`open_signed_leg`] adds [`ml_dsa::SIG_LEN`] itself.
+const RE_EST_PAYLOAD_LEN: usize = ml_kem::EK_LEN;
 
-/// Bytes of `RE-CONFIRM` payload inside the seal: the signature alone.
-const RE_CONFIRM_PAYLOAD_LEN: usize = ml_dsa::SIG_LEN;
+/// Bytes of `RE-ACK` payload — the floor generation, then the ciphertext.
+const RE_ACK_PAYLOAD_LEN: usize = GEN_FIELD_LEN + ml_kem::CT_LEN;
 
-const _: () = assert!(LEN_PREFIX + RE_EST_PAYLOAD_LEN <= LEG_PLAINTEXT_LEN);
-const _: () = assert!(LEN_PREFIX + RE_ACK_PAYLOAD_LEN <= LEG_PLAINTEXT_LEN);
-const _: () = assert!(LEN_PREFIX + RE_CONFIRM_PAYLOAD_LEN <= LEG_PLAINTEXT_LEN);
+/// Bytes of `RE-CONFIRM` payload — the agreed generation.
+const RE_CONFIRM_PAYLOAD_LEN: usize = GEN_FIELD_LEN;
+
+const _: () = assert!(LEN_PREFIX + RE_EST_PAYLOAD_LEN + ml_dsa::SIG_LEN <= LEG_PLAINTEXT_LEN);
+const _: () = assert!(LEN_PREFIX + RE_ACK_PAYLOAD_LEN + ml_dsa::SIG_LEN <= LEG_PLAINTEXT_LEN);
+const _: () = assert!(LEN_PREFIX + RE_CONFIRM_PAYLOAD_LEN + ml_dsa::SIG_LEN <= LEG_PLAINTEXT_LEN);
 
 /// How many re-establishment attempts a window admits before the party gives up
 /// — the design's `C`.
@@ -639,14 +666,25 @@ pub fn seal_re_est(
 /// arguments, so they cannot disagree with the leg being answered. `dir` and
 /// `seq` stay arguments: they are the *answerer's* own direction and its own
 /// next send position, neither of which the incoming leg names.
+///
+/// `floor_generation` is the highest clear ratchet generation this party has
+/// persisted. The initiating party has no other way to learn it — a leg carries
+/// no clear ratchet header and the two counters diverge whenever the sides have
+/// cleared to different generations — so carrying it here is what lets the
+/// settling leg name a generation both sides can resume at
+/// (A3.9).
 pub fn seal_re_ack(
     root: &CommittedRoot,
     dir: Direction,
     seq: u64,
     authority: ReAckAuthority,
+    floor_generation: u32,
     eph_ct: &[u8; ml_kem::CT_LEN],
     s_pc: &[u8; ml_dsa::SK_LEN],
 ) -> Result<Vec<u8>, ReEstError> {
+    let mut payload = Vec::with_capacity(RE_ACK_PAYLOAD_LEN);
+    payload.extend_from_slice(&floor_generation.to_be_bytes());
+    payload.extend_from_slice(eph_ct);
     seal_signed_leg(
         root,
         FRAME_KIND_RE_ACK,
@@ -654,7 +692,7 @@ pub fn seal_re_ack(
         authority.generation,
         seq,
         authority.attempt,
-        eph_ct,
+        &payload,
         s_pc,
     )
 }
@@ -667,12 +705,20 @@ pub fn seal_re_ack(
 /// calls at one attempt produce two ciphertexts under one key, which is a
 /// re-emit discipline question — A9.1(a) answers it, the stored bytes — and not
 /// the root-divergence class the tokens exist to remove.
+///
+/// `generation` and `agreed_generation` are two different counters and the leg
+/// carries both. `generation` is the re-establishment generation this exchange
+/// is keyed at, which the peer already knows because it is what the leg opens
+/// under; `agreed_generation` is the **clear ratchet** generation the resumed
+/// channel's frames will declare, computed from the two floors and named here
+/// because this leg is the only one that can name it after both are known.
 pub fn seal_re_confirm(
     root: &CommittedRoot,
     dir: Direction,
     generation: u32,
     seq: u64,
     attempt: Attempt,
+    agreed_generation: u32,
     s_pc: &[u8; ml_dsa::SK_LEN],
 ) -> Result<Vec<u8>, ReEstError> {
     seal_signed_leg(
@@ -682,9 +728,35 @@ pub fn seal_re_confirm(
         generation,
         seq,
         attempt,
-        &[],
+        &agreed_generation.to_be_bytes(),
         s_pc,
     )
+}
+
+/// The clear ratchet generation a resumed channel opens at: one past the higher
+/// of the two sides' floors.
+///
+/// A floor is a party's highest persisted clear ratchet generation. A3.9 has the
+/// counter continue across a re-establishment and never regress on either side,
+/// and the two floors differ whenever the sides have cleared to different
+/// generations — so the resumed chain must open above **both**, which no party
+/// can work out from its own counter alone. The initiating party is the one that
+/// holds both numbers, because the `RE-ACK` carried the answering party's floor
+/// to it, and it names the result in the `RE-CONFIRM`.
+///
+/// **One function so the two sides cannot each carry their own arithmetic.** The
+/// sealer, the reader's check and any test that predicts the number all read it
+/// here; a second copy of `max(a, b) + 1` somewhere else is exactly how the two
+/// ends of a conversation come to disagree about a value neither can see the
+/// other compute.
+///
+/// Saturating rather than wrapping at [`u32::MAX`], because the alternative is a
+/// generation that regresses to zero — the one thing the floors exist to
+/// prevent. A channel that reached the ceiling stops advancing and is refused by
+/// [`crate::dm::ratchet::Ratchet::reestablished`]'s floor check rather than
+/// silently reopening a number it has already written under.
+pub fn agreed_generation(own_floor: u32, peer_floor: u32) -> u32 {
+    own_floor.max(peer_floor).saturating_add(1)
 }
 
 /// Mint the fresh ML-KEM keypair a `RE-EST` carries.
@@ -900,6 +972,7 @@ impl ReAckAuthority {
 pub struct OpenedReAck {
     generation: u32,
     attempt: Attempt,
+    floor_gen: u32,
     eph_ct: Box<[u8; ml_kem::CT_LEN]>,
 }
 
@@ -914,18 +987,32 @@ impl OpenedReAck {
         self.attempt
     }
 
+    /// The answering party's highest persisted clear ratchet generation.
+    ///
+    /// Authenticated by that party's per-correspondent signing key, because it
+    /// is inside the payload the leg's signature covers — a value altered in
+    /// flight does not verify, and a party that cannot open the leg cannot read
+    /// it at all.
+    ///
+    /// It is a **floor**, not the generation to resume at: the reader takes the
+    /// higher of this and its own floor and goes one past it, so neither side
+    /// can be pulled backwards by the other's number.
+    pub fn floor_gen(&self) -> u32 {
+        self.floor_gen
+    }
+
     /// The ciphertext that created the new generation.
     pub fn eph_ct(&self) -> &[u8; ml_kem::CT_LEN] {
         &self.eph_ct
     }
 }
 
-/// A `RE-CONFIRM` that opened and verified. It carries no payload past its
-/// signature, so it carries no accessor past the exchange it settles.
+/// A `RE-CONFIRM` that opened and verified.
 #[derive(Debug)]
 pub struct OpenedReConfirm {
     generation: u32,
     attempt: Attempt,
+    agreed_gen: u32,
 }
 
 impl OpenedReConfirm {
@@ -937,6 +1024,19 @@ impl OpenedReConfirm {
     /// The attempt this leg settles.
     pub fn attempt(&self) -> Attempt {
         self.attempt
+    }
+
+    /// The clear ratchet generation the resumed channel opens at, on both
+    /// sides.
+    ///
+    /// Computed by the initiating party from both floors — its own and the one
+    /// the `RE-ACK` carried — and authenticated by that party's signature, so
+    /// the answering side adopts a number it can attribute rather than one it
+    /// guesses. The reader still checks it is strictly above its own floor
+    /// before adopting it: a value that repeated a generation would put two
+    /// roots on one number.
+    pub fn agreed_gen(&self) -> u32 {
+        self.agreed_gen
     }
 }
 
@@ -966,7 +1066,7 @@ pub fn scan_re_est(
         last_seen,
         encoded,
         peer_pk_pc,
-        ml_kem::EK_LEN,
+        RE_EST_PAYLOAD_LEN,
     )?;
     let eph_ek: Box<[u8; ml_kem::EK_LEN]> = payload
         .into_boxed_slice()
@@ -998,15 +1098,22 @@ pub fn scan_re_ack(
         last_seen,
         encoded,
         peer_pk_pc,
-        ml_kem::CT_LEN,
+        RE_ACK_PAYLOAD_LEN,
     )?;
-    let eph_ct: Box<[u8; ml_kem::CT_LEN]> = payload
+    // `open_signed_leg` refused anything but exactly this length, so the split
+    // and the conversion below cannot be short: a leg whose payload omits the
+    // generation is already gone as `PayloadLen`.
+    let (floor, ct) = payload.split_at(GEN_FIELD_LEN);
+    let floor_gen = u32::from_be_bytes(floor.try_into().expect("checked length"));
+    let eph_ct: Box<[u8; ml_kem::CT_LEN]> = ct
+        .to_vec()
         .into_boxed_slice()
         .try_into()
         .map_err(|_| ReEstError::DidNotOpen)?;
     Ok(OpenedReAck {
         generation,
         attempt,
+        floor_gen,
         eph_ct,
     })
 }
@@ -1021,7 +1128,7 @@ pub fn scan_re_confirm(
     encoded: &[u8],
     peer_pk_pc: &[u8; ml_dsa::PK_LEN],
 ) -> Result<OpenedReConfirm, ReEstError> {
-    let (attempt, _) = scan_signed_leg(
+    let (attempt, payload) = scan_signed_leg(
         root,
         FRAME_KIND_RE_CONFIRM,
         dir,
@@ -1030,11 +1137,16 @@ pub fn scan_re_confirm(
         last_seen,
         encoded,
         peer_pk_pc,
-        0,
+        RE_CONFIRM_PAYLOAD_LEN,
     )?;
+    // Exact-length by `open_signed_leg`'s check; an empty-bodied settling leg is
+    // refused there as `PayloadLen` rather than opened and read as generation
+    // zero.
+    let agreed_gen = u32::from_be_bytes(payload.as_slice().try_into().expect("checked length"));
     Ok(OpenedReConfirm {
         generation,
         attempt,
+        agreed_gen,
     })
 }
 
@@ -1577,6 +1689,15 @@ mod tests {
     /// derivation would still collide with a zero default.
     const SEQ: u64 = 42;
 
+    /// The answering party's floor generation, as a `RE-ACK` carries it.
+    const FLOOR_GEN: u32 = 33;
+
+    /// The generation both sides resume at, as a `RE-CONFIRM` names it. One
+    /// past [`FLOOR_GEN`], and deliberately not equal to it: a build that
+    /// carried the wrong one of the two would still pass every assertion here
+    /// if the two constants were the same number.
+    const AGREED_GEN: u32 = 34;
+
     fn root() -> CommittedRoot {
         CommittedRoot::from_bytes(&[3u8; 32])
     }
@@ -1634,7 +1755,8 @@ mod tests {
         assert_eq!(opened.eph_ek(), &eph_ek());
     }
 
-    /// A sealed `RE-ACK` comes back with the ciphertext it went in with.
+    /// A sealed `RE-ACK` comes back with the ciphertext and the floor
+    /// generation it went in with.
     ///
     /// Kills an `open_signed_leg` that splits the payload at the wrong offset:
     /// the ciphertext comparison fails rather than the length check.
@@ -1646,6 +1768,7 @@ mod tests {
             Direction::BToA,
             SEQ,
             ReAckAuthority::for_test(7, Attempt::FIRST),
+            FLOOR_GEN,
             &eph_ct(),
             ours.secret_key(),
         )
@@ -1663,10 +1786,11 @@ mod tests {
         .unwrap();
         assert_eq!(opened.attempt(), Attempt::FIRST);
         assert_eq!(opened.eph_ct(), &eph_ct());
+        assert_eq!(opened.floor_gen(), FLOOR_GEN);
     }
 
-    /// A sealed `RE-CONFIRM` carries only its signature and still authenticates
-    /// the exchange it settles.
+    /// A sealed `RE-CONFIRM` carries the agreed generation and authenticates the
+    /// exchange it settles.
     #[test]
     fn a_re_confirm_round_trips() {
         let ours = keypair(3);
@@ -1676,6 +1800,7 @@ mod tests {
             7,
             SEQ,
             Attempt::FIRST,
+            AGREED_GEN,
             ours.secret_key(),
         )
         .unwrap();
@@ -1692,6 +1817,394 @@ mod tests {
         .unwrap();
         assert_eq!(opened.generation(), 7);
         assert_eq!(opened.attempt(), Attempt::FIRST);
+        assert_eq!(opened.agreed_gen(), AGREED_GEN);
+        // Control on the two constants: `generation` and `agreed_gen` are
+        // different counters and the assertions above would agree with each
+        // other if the leg carried the wrong one.
+        assert_ne!(opened.generation(), opened.agreed_gen());
+    }
+
+    /// **The generation field leads the payload of both legs that carry one, in
+    /// big-endian.** Pinned as an encoding, not as a round trip.
+    ///
+    /// A round trip agrees with itself whatever the layout: seal and open are
+    /// the same build. Two implementations are not, and the field sits inside
+    /// the AEAD where nothing else names its offset — so a build that appended
+    /// it, or wrote it little-endian, would interoperate with itself and with
+    /// nothing else. The pin is over the payload handed to
+    /// [`seal_signed_leg`], because that is the byte string the signature
+    /// covers and the seal encrypts.
+    #[test]
+    fn the_generation_leads_the_payload_of_the_legs_that_carry_one() {
+        let ours = keypair(9);
+        let ack = seal_re_ack(
+            &root(),
+            Direction::BToA,
+            SEQ,
+            ReAckAuthority::for_test(7, Attempt::FIRST),
+            FLOOR_GEN,
+            &eph_ct(),
+            ours.secret_key(),
+        )
+        .unwrap();
+        let ack_body = open_leg(
+            &root(),
+            FRAME_KIND_RE_ACK,
+            Direction::BToA,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &ack,
+        )
+        .unwrap();
+        assert_eq!(&ack_body[..GEN_FIELD_LEN], &FLOOR_GEN.to_be_bytes());
+        assert_eq!(
+            &ack_body[GEN_FIELD_LEN..RE_ACK_PAYLOAD_LEN],
+            eph_ct().as_slice(),
+            "the ciphertext must follow the generation, not precede it"
+        );
+
+        let confirm = seal_re_confirm(
+            &root(),
+            Direction::AToB,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            AGREED_GEN,
+            ours.secret_key(),
+        )
+        .unwrap();
+        let confirm_body = open_leg(
+            &root(),
+            FRAME_KIND_RE_CONFIRM,
+            Direction::AToB,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &confirm,
+        )
+        .unwrap();
+        assert_eq!(&confirm_body[..GEN_FIELD_LEN], &AGREED_GEN.to_be_bytes());
+
+        // Control: big-endian is what is pinned, and these two constants are
+        // small enough that their byte strings differ under the two orderings.
+        assert_ne!(FLOOR_GEN.to_be_bytes(), FLOOR_GEN.to_le_bytes());
+        assert_ne!(AGREED_GEN.to_be_bytes(), AGREED_GEN.to_le_bytes());
+    }
+
+    /// A leg whose payload omits the generation is refused on open, by length.
+    ///
+    /// The field is fixed-width and the body length is exact, so a sender that
+    /// never wrote it — an older build, or a stripped leg — cannot be read as
+    /// one that wrote zero. That distinction is what stops a missing value
+    /// being adopted as a generation.
+    #[test]
+    fn a_leg_that_omits_the_generation_is_refused_by_length() {
+        let ours = keypair(10);
+        // Sealed through the same signing path as the real call, with the
+        // generation left out of the payload: exactly the leg an
+        // implementation that had not added the field would produce.
+        let ack = seal_signed_leg(
+            &root(),
+            FRAME_KIND_RE_ACK,
+            Direction::BToA,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            eph_ct().as_slice(),
+            ours.secret_key(),
+        )
+        .unwrap();
+        assert_eq!(ack.len(), LEG_LEN, "the padding hides the missing bytes");
+        assert!(
+            matches!(
+                scan_re_ack(&root(), Direction::BToA, 7, SEQ, 0, &ack, ours.public_key()),
+                Err(ReEstError::PayloadLen { .. })
+            ),
+            "a RE-ACK without its generation opened"
+        );
+
+        let confirm = seal_signed_leg(
+            &root(),
+            FRAME_KIND_RE_CONFIRM,
+            Direction::AToB,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &[],
+            ours.secret_key(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                scan_re_confirm(
+                    &root(),
+                    Direction::AToB,
+                    7,
+                    SEQ,
+                    0,
+                    &confirm,
+                    ours.public_key()
+                ),
+                Err(ReEstError::PayloadLen { .. })
+            ),
+            "an empty-bodied RE-CONFIRM opened and would have read as generation zero"
+        );
+
+        // Control: the same two calls with the field present do open, so the
+        // refusals above are about the missing generation and not about the
+        // fixture's keys, root or position.
+        let ok_ack = seal_re_ack(
+            &root(),
+            Direction::BToA,
+            SEQ,
+            ReAckAuthority::for_test(7, Attempt::FIRST),
+            FLOOR_GEN,
+            &eph_ct(),
+            ours.secret_key(),
+        )
+        .unwrap();
+        assert!(
+            scan_re_ack(
+                &root(),
+                Direction::BToA,
+                7,
+                SEQ,
+                0,
+                &ok_ack,
+                ours.public_key()
+            )
+            .is_ok()
+        );
+        let ok_confirm = seal_re_confirm(
+            &root(),
+            Direction::AToB,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            AGREED_GEN,
+            ours.secret_key(),
+        )
+        .unwrap();
+        assert!(
+            scan_re_confirm(
+                &root(),
+                Direction::AToB,
+                7,
+                SEQ,
+                0,
+                &ok_confirm,
+                ours.public_key()
+            )
+            .is_ok(),
+            "the settling-leg control did not open, so its refusal above says nothing"
+        );
+    }
+
+    /// **The agreement is one past the higher floor, whichever side holds it,
+    /// and it saturates rather than wraps.**
+    ///
+    /// Both orientations are asserted because the function is the one place the
+    /// rule lives: a build that took `own_floor + 1` would agree with this test
+    /// in one orientation and disagree in the other, and a caller has no way to
+    /// see which it got.
+    #[test]
+    fn the_agreed_generation_is_one_past_the_higher_floor() {
+        assert_eq!(
+            agreed_generation(12, 40),
+            41,
+            "the peer's floor was ignored"
+        );
+        assert_eq!(
+            agreed_generation(40, 12),
+            41,
+            "this side's floor was ignored"
+        );
+        assert_eq!(
+            agreed_generation(40, 40),
+            41,
+            "equal floors must still advance, or the resumed chain reopens a \
+             generation both sides have already written under"
+        );
+        // The ceiling saturates. Wrapping would hand back zero — a generation
+        // below every floor there is, and the regression the floors exist to
+        // refuse.
+        assert_eq!(agreed_generation(u32::MAX, 0), u32::MAX);
+        assert_eq!(agreed_generation(0, u32::MAX), u32::MAX);
+        // Control on the three assertions above: the two floors are distinct, so
+        // a build that returned either argument unchanged, or the lower of the
+        // two, fails rather than coincides.
+        assert_ne!(agreed_generation(12, 40), 40);
+        assert_ne!(agreed_generation(12, 40), 13);
+    }
+
+    /// A generation altered inside the sealed body fails the signature.
+    ///
+    /// **The forgery is done under the real leg key**, by opening the AEAD,
+    /// rewriting the field and re-sealing — which is what a party holding the
+    /// root but not the peer's signing key can do, and the only adversary the
+    /// signature is there for. A test that flipped ciphertext bytes would fail
+    /// the AEAD tag and prove nothing about the signature's coverage.
+    #[test]
+    fn a_generation_altered_inside_the_seal_fails_the_signature() {
+        let ours = keypair(11);
+        let ack = seal_re_ack(
+            &root(),
+            Direction::BToA,
+            SEQ,
+            ReAckAuthority::for_test(7, Attempt::FIRST),
+            FLOOR_GEN,
+            &eph_ct(),
+            ours.secret_key(),
+        )
+        .unwrap();
+        let mut body = open_leg(
+            &root(),
+            FRAME_KIND_RE_ACK,
+            Direction::BToA,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &ack,
+        )
+        .unwrap();
+        let forged = FLOOR_GEN + 1000;
+        body[..GEN_FIELD_LEN].copy_from_slice(&forged.to_be_bytes());
+        let resealed = seal_leg(
+            &root(),
+            FRAME_KIND_RE_ACK,
+            Direction::BToA,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &body,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                scan_re_ack(
+                    &root(),
+                    Direction::BToA,
+                    7,
+                    SEQ,
+                    0,
+                    &resealed,
+                    ours.public_key()
+                ),
+                Err(ReEstError::Signature)
+            ),
+            "a forged floor generation verified"
+        );
+
+        // Control on the forgery machinery itself: re-sealing the body
+        // UNCHANGED must still open and verify, or the refusal above would be
+        // about the re-seal rather than about the altered field.
+        let untouched = open_leg(
+            &root(),
+            FRAME_KIND_RE_ACK,
+            Direction::BToA,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &ack,
+        )
+        .unwrap();
+        let resealed_intact = seal_leg(
+            &root(),
+            FRAME_KIND_RE_ACK,
+            Direction::BToA,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &untouched,
+        )
+        .unwrap();
+        let opened = scan_re_ack(
+            &root(),
+            Direction::BToA,
+            7,
+            SEQ,
+            0,
+            &resealed_intact,
+            ours.public_key(),
+        )
+        .unwrap();
+        assert_eq!(opened.floor_gen(), FLOOR_GEN);
+    }
+
+    /// The same forgery on the settling leg, which carries the value both sides
+    /// adopt and so is the one worth forging.
+    #[test]
+    fn an_agreed_generation_altered_inside_the_seal_fails_the_signature() {
+        let ours = keypair(12);
+        let confirm = seal_re_confirm(
+            &root(),
+            Direction::AToB,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            AGREED_GEN,
+            ours.secret_key(),
+        )
+        .unwrap();
+        let mut body = open_leg(
+            &root(),
+            FRAME_KIND_RE_CONFIRM,
+            Direction::AToB,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &confirm,
+        )
+        .unwrap();
+        // Control on the forgery machinery, before the forgery: the body
+        // re-sealed UNCHANGED still opens and verifies, so the refusal below is
+        // about the altered field and not about the re-seal.
+        let resealed_intact = seal_leg(
+            &root(),
+            FRAME_KIND_RE_CONFIRM,
+            Direction::AToB,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &body,
+        )
+        .unwrap();
+        let opened = scan_re_confirm(
+            &root(),
+            Direction::AToB,
+            7,
+            SEQ,
+            0,
+            &resealed_intact,
+            ours.public_key(),
+        )
+        .unwrap();
+        assert_eq!(opened.agreed_gen(), AGREED_GEN);
+
+        body[..GEN_FIELD_LEN].copy_from_slice(&(AGREED_GEN + 1000).to_be_bytes());
+        let resealed = seal_leg(
+            &root(),
+            FRAME_KIND_RE_CONFIRM,
+            Direction::AToB,
+            7,
+            SEQ,
+            Attempt::FIRST,
+            &body,
+        )
+        .unwrap();
+        assert!(matches!(
+            scan_re_confirm(
+                &root(),
+                Direction::AToB,
+                7,
+                SEQ,
+                0,
+                &resealed,
+                ours.public_key()
+            ),
+            Err(ReEstError::Signature)
+        ));
     }
 
     /// **The wire carries no discriminator.** All three legs are one length, so
@@ -1721,6 +2234,7 @@ mod tests {
             Direction::AToB,
             SEQ,
             ReAckAuthority::for_test(7, Attempt::FIRST),
+            FLOOR_GEN,
             &eph_ct(),
             ours.secret_key(),
         )
@@ -1731,6 +2245,7 @@ mod tests {
             7,
             SEQ,
             Attempt::FIRST,
+            AGREED_GEN,
             ours.secret_key(),
         )
         .unwrap();
@@ -2533,6 +3048,7 @@ mod tests {
             Direction::AToB,
             SEQ,
             ReAckAuthority::for_test(7, attempt),
+            FLOOR_GEN,
             &eph_ct(),
             ours.secret_key(),
         )
@@ -2566,6 +3082,7 @@ mod tests {
             Direction::AToB,
             SEQ,
             ReAckAuthority::for_test(7, edge),
+            FLOOR_GEN,
             &eph_ct(),
             ours.secret_key(),
         )
@@ -2589,6 +3106,7 @@ mod tests {
             Direction::AToB,
             SEQ,
             ReAckAuthority::for_test(7, beyond),
+            FLOOR_GEN,
             &eph_ct(),
             ours.secret_key(),
         )
@@ -2621,6 +3139,7 @@ mod tests {
             Direction::AToB,
             SEQ,
             ReAckAuthority::for_test(7, at_base),
+            FLOOR_GEN,
             &eph_ct(),
             ours.secret_key(),
         )
@@ -2644,6 +3163,7 @@ mod tests {
             Direction::AToB,
             SEQ,
             ReAckAuthority::for_test(7, below),
+            FLOOR_GEN,
             &eph_ct(),
             ours.secret_key(),
         )
@@ -2930,6 +3450,7 @@ mod tests {
             Direction::BToA,
             SEQ + 1,
             authority,
+            FLOOR_GEN,
             &eph_ct(),
             ours.secret_key(),
         )
