@@ -239,7 +239,8 @@ pub enum NetCommand {
     /// Internal: the presence-heartbeat tick (#74) — emit one sealed member
     /// beacon into the lobby and each joined circle, then `reap` every tracker so
     /// members past their TTL age out (the timer is the reap clock too).
-    /// Self-scheduled on `next_heartbeat_interval`; never sent by the binary.
+    /// A relay-path command with no sender: no code in this crate constructs it,
+    /// and the Veilid actor no-ops it.
     EmitHeartbeat,
     /// Internal: a verified member heartbeat the inbound reader opened, to fold
     /// into the matching room/circle's `PresenceTracker` (all tracker mutation

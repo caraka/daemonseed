@@ -717,6 +717,12 @@ work lives in the maintainer's own planning notes, not here.
   `daemonseed_core::backoff::apply_jitter` and `DEFAULT_JITTER_FRAC`, and the close-cause
   layering remains `daemonseed_core::backoff::CloseCause`. ISC-C26 is withdrawn as an `ISA.md`
   tombstone and deregistered from the ISC registry; `TOTAL` 245 after the registry change. (#332)
+- `daemonseed_core::presence::next_heartbeat_interval` and
+  `daemonseed_core::presence::HEARTBEAT_INTERVAL_MIN`. No production caller reached the draw,
+  and the constant bounded nothing else. `HEARTBEAT_INTERVAL_MAX` and `HEARTBEAT_MISS_COUNT`
+  are retained for the test and integration fixtures that build a `PresenceTracker` with a
+  cadence; no production caller reads either. The crate-internal `interval_in_band` remains the
+  single uniform-band draw. (#372)
 
 - `daemonseed_veilid_net::dm::spawn_dm_ack_publish`. The DM driver owns when a standalone
   acknowledgement is written, and the helper decided nothing about it; no production caller

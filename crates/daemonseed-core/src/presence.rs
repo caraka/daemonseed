@@ -26,9 +26,9 @@
 //! ## Cadence knobs (decoupled)
 //!
 //! The heartbeat *interval* sets presence resolution; the TTL sets the liveness
-//! window — kept separate. The legacy relay path uses a jittered interval in
-//! `[HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX]` with reap after
-//! [`HEARTBEAT_MISS_COUNT`] misses ([`PresenceTracker::with_cadence`]).
+//! window — kept separate. The legacy relay path reaps after
+//! [`HEARTBEAT_MISS_COUNT`] misses of a [`HEARTBEAT_INTERVAL_MAX`] cadence
+//! ([`PresenceTracker::with_cadence`]).
 //!
 //! ## WB-1 write-budget presence (the veilid path — design: `docs/design/veilid-write-budget.md`)
 //!
@@ -57,17 +57,18 @@ use std::time::{Duration, Instant};
 
 use daemonseed_proto::v1 as wire;
 
-/// Lower bound of the jittered heartbeat emit interval (presence resolution).
-pub const HEARTBEAT_INTERVAL_MIN: Duration = Duration::from_secs(10);
-/// Upper bound of the jittered heartbeat emit interval.
+/// The legacy relay-path heartbeat emit interval (presence resolution). Read by
+/// the fixtures that build a [`PresenceTracker::with_cadence`] tracker; no
+/// production caller reads it.
 pub const HEARTBEAT_INTERVAL_MAX: Duration = Duration::from_secs(15);
 /// Consecutive missed beacons before a member is reaped (the TTL multiplier).
+/// Same readership as [`HEARTBEAT_INTERVAL_MAX`].
 pub const HEARTBEAT_MISS_COUNT: u32 = 3;
 
 // ── WB-1 write-budget presence cadence (design: docs/design/veilid-write-budget.md) ──
 
 /// Lower bound of the jittered **keepalive** interval (WB-1.2). Far slower than
-/// the legacy [`HEARTBEAT_INTERVAL_MIN`]: presence is a *read* question moved to
+/// the legacy [`HEARTBEAT_INTERVAL_MAX`]: presence is a *read* question moved to
 /// the read side, so the write cadence only has to be well above the ~14.7s DHT
 /// watch floor while staying under the WB-2 write ceiling. Jitter is drawn fresh
 /// per emission and takes NO input from user activity (sends, reads, congestion).
@@ -120,9 +121,10 @@ pub fn next_keepalive_interval() -> Duration {
 /// Draw uniformly in `[min, max]` from `fill`, degrading to the band **midpoint**
 /// if the source fails.
 ///
-/// One definition for every uniform-band interval draw in the tree. Five draws
-/// reach it: the keepalive and heartbeat draws here, both operator keep-alive bands
-/// ([`crate::public_space::next_operator_keepalive_interval`]) and the DM key-record
+/// One definition for every uniform-band interval draw in the tree. Four draws
+/// reach it: the keepalive draw here, both operator keep-alive bands
+/// ([`crate::public_space::first_operator_keepalive_interval`] and
+/// [`crate::public_space::next_operator_keepalive_interval`]) and the DM key-record
 /// re-seed ([`crate::dm::keyrec::next_reseed_interval`]). The two further copies this
 /// absorbed were byte-identical to it apart from their constants, and a second copy of
 /// jitter arithmetic is drift waiting to happen — the same argument
@@ -186,21 +188,6 @@ pub fn beacon_is_fresh(sent_unix_ms: i64, now_unix_ms: i64) -> bool {
     let past = REPLAY_FRESHNESS_PAST.as_millis() as i64;
     let future = REPLAY_FRESHNESS_FUTURE.as_millis() as i64;
     sent_unix_ms >= now_unix_ms - past && sent_unix_ms <= now_unix_ms + future
-}
-
-/// Draw the next heartbeat emit interval, uniformly random in
-/// `[HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX]`. Jitter keeps emissions
-/// from forming a fixed-period timing signature (ISC-A-S2 traffic-shape) and
-/// de-synchronises many clients so roll-call/heartbeat storms spread out. Drawn
-/// from the OS CSPRNG; an entropy failure falls back to the midpoint rather than
-/// panicking (a heartbeat is liveness, not a key — a non-random interval leaks
-/// nothing and the next draw recovers).
-pub fn next_heartbeat_interval() -> Duration {
-    interval_in_band(
-        HEARTBEAT_INTERVAL_MIN,
-        HEARTBEAT_INTERVAL_MAX,
-        crate::jitter::os_fill,
-    )
 }
 
 /// One live member — a roster row built from a verified
@@ -728,22 +715,6 @@ mod tests {
         );
     }
 
-    /// ISC-8: the jittered interval stays within the band and varies across draws
-    /// (not a constant). 64 draws all in range, and at least two distinct values.
-    #[test]
-    fn jittered_interval_within_band_and_varies() {
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..64 {
-            let d = next_heartbeat_interval();
-            assert!(
-                d >= HEARTBEAT_INTERVAL_MIN && d <= HEARTBEAT_INTERVAL_MAX,
-                "interval {d:?} outside [{HEARTBEAT_INTERVAL_MIN:?}, {HEARTBEAT_INTERVAL_MAX:?}]"
-            );
-            seen.insert(d.as_millis());
-        }
-        assert!(seen.len() > 1, "jitter produced a constant interval");
-    }
-
     /// ISC-A-C39: a fresh tracker is empty — liveness is never persisted, so a new
     /// process starts with an empty roster.
     #[test]
@@ -775,6 +746,21 @@ mod tests {
         );
     }
 
+    /// The keepalive band is well-formed and correctly ordered (#372).
+    ///
+    /// An inverted band is silent at the call site, and ordering the constants is the
+    /// only thing that catches it. [`interval_in_band`] subtracts plainly behind a
+    /// `debug_assert!`, so an inversion aborts a debug build, and this workspace sets
+    /// `overflow-checks = true` on the release profile, so it panics there too rather
+    /// than wrapping. A consumer building `daemonseed-core` under the default release
+    /// profile gets the wrap instead, handing its caller an interval nowhere near
+    /// either bound. The assertion has to live here, against the constants, because
+    /// that is the only place the ordering is a fact rather than an argument.
+    #[test]
+    fn keepalive_band_is_well_formed() {
+        assert!(KEEPALIVE_INTERVAL_MIN <= KEEPALIVE_INTERVAL_MAX);
+    }
+
     /// The band's FULL span is reachable at both ends, pinned exactly (#364).
     ///
     /// The test above cannot see band width: it asserts membership of
@@ -790,35 +776,27 @@ mod tests {
     /// rather than with some probability.
     #[test]
     fn interval_band_ends_are_exactly_reachable() {
-        for (min, max, name) in [
-            (KEEPALIVE_INTERVAL_MIN, KEEPALIVE_INTERVAL_MAX, "keepalive"),
-            (HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX, "heartbeat"),
-        ] {
-            let span = (max.as_millis() - min.as_millis()) as u64;
-            let at = |v: u64| {
-                interval_in_band(min, max, move |buf| {
-                    *buf = v.to_le_bytes();
-                    Ok(())
-                })
-            };
-            assert_eq!(
-                at(0),
-                min,
-                "{name}: a zero draw must land on the band floor"
-            );
-            assert_eq!(
-                at(span),
-                max,
-                "{name}: a draw of the full span must reach the band ceiling — if it \
-                 does not, the reachable band is narrower than the declared one and \
-                 the emission carries a tighter timing signature than intended"
-            );
-            assert_eq!(
-                at(span / 2),
-                min + Duration::from_millis(span / 2),
-                "{name}: the midpoint draw must land on the midpoint"
-            );
-        }
+        let (min, max) = (KEEPALIVE_INTERVAL_MIN, KEEPALIVE_INTERVAL_MAX);
+        let span = (max.as_millis() - min.as_millis()) as u64;
+        let at = |v: u64| {
+            interval_in_band(min, max, move |buf| {
+                *buf = v.to_le_bytes();
+                Ok(())
+            })
+        };
+        assert_eq!(at(0), min, "a zero draw must land on the band floor");
+        assert_eq!(
+            at(span),
+            max,
+            "a draw of the full span must reach the band ceiling — if it does not, \
+             the reachable band is narrower than the declared one and the emission \
+             carries a tighter timing signature than intended"
+        );
+        assert_eq!(
+            at(span / 2),
+            min + Duration::from_millis(span / 2),
+            "the midpoint draw must land on the midpoint"
+        );
     }
 
     /// The entropy-failure degrade lands on the band midpoint, not on an end (#364).
@@ -829,44 +807,15 @@ mod tests {
     /// correlation signal than the fixed period the jitter replaced.
     #[test]
     fn an_entropy_failure_degrades_to_the_band_midpoint() {
-        for (min, max, name) in [
-            (KEEPALIVE_INTERVAL_MIN, KEEPALIVE_INTERVAL_MAX, "keepalive"),
-            (HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX, "heartbeat"),
-        ] {
-            let span = (max.as_millis() - min.as_millis()) as u64;
-            let d = interval_in_band(min, max, |_| Err(()));
-            assert_eq!(
-                d,
-                min + Duration::from_millis(span / 2),
-                "{name}: an entropy failure must degrade to the midpoint"
-            );
-            assert!(
-                d > min && d < max,
-                "{name}: the degrade must not sit on an end"
-            );
-        }
-    }
-
-    /// Each public draw is wired to its OWN constants (#364).
-    ///
-    /// Both functions now route through one helper, so nothing else in the suite
-    /// would notice if they were handed the same pair. The bands do not overlap —
-    /// keepalive is `[180, 220] s`, heartbeat `[10, 15] s` — so membership alone
-    /// separates them.
-    #[test]
-    fn each_interval_draw_uses_its_own_band() {
-        for _ in 0..32 {
-            let k = next_keepalive_interval();
-            assert!(
-                k >= KEEPALIVE_INTERVAL_MIN && k <= KEEPALIVE_INTERVAL_MAX,
-                "keepalive draw {k:?} outside its own band"
-            );
-            let h = next_heartbeat_interval();
-            assert!(
-                h >= HEARTBEAT_INTERVAL_MIN && h <= HEARTBEAT_INTERVAL_MAX,
-                "heartbeat draw {h:?} outside its own band"
-            );
-        }
+        let (min, max) = (KEEPALIVE_INTERVAL_MIN, KEEPALIVE_INTERVAL_MAX);
+        let span = (max.as_millis() - min.as_millis()) as u64;
+        let d = interval_in_band(min, max, |_| Err(()));
+        assert_eq!(
+            d,
+            min + Duration::from_millis(span / 2),
+            "an entropy failure must degrade to the midpoint"
+        );
+        assert!(d > min && d < max, "the degrade must not sit on an end");
     }
 
     /// The PRODUCTION source spans the band, in both halves and with real

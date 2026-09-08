@@ -95,9 +95,9 @@ archived 10–15 s to **~15–20 s** so it sits at/above the ~14.7 s watch floor
 (TTL ~45–60 s) and the bias-to-forgiveness. Effective presence resolution ≈ interval + ~14.7 s
 regardless, and beaconing faster than the channel propagates only adds redundant DHT writes. These
 are the values to tune against real-network wobble data once the Lobby increment is live (this is
-the archived doc's open question #4, now bounded by the measured floor). `presence.rs` currently
-defaults `HEARTBEAT_INTERVAL_MIN/MAX = 10/15 s`; the wiring passes the tuned cadence via
-`PresenceTracker::with_cadence`.
+the archived doc's open question #4, now bounded by the measured floor). `presence.rs` defaults
+`HEARTBEAT_INTERVAL_MAX = 15 s`; the cadence is a `PresenceTracker::with_cadence` constructor
+argument, and the fixtures are what set it.
 
 ### What the relay-plane reaping question resolves to
 

@@ -2312,8 +2312,8 @@ modules:
       reap() ages members out past a TTL measured from monotonic receive time and
       returns the reaped members (so a caller can drop their shares too, #76).
       with_cadence(interval, miss_count) sets TTL = interval * miss_count
-      (decoupled knobs, bias to forgiveness). next_heartbeat_interval draws a
-      jittered interval in [HEARTBEAT_INTERVAL_MIN, HEARTBEAT_INTERVAL_MAX].
+      (decoupled knobs, bias to forgiveness). next_keepalive_interval draws a
+      jittered interval in [KEEPALIVE_INTERVAL_MIN, KEEPALIVE_INTERVAL_MAX].
       Transport-free, RAM-only. Types: PresenceTracker, LiveMember,
       PresenceChange.
     no_std: false
