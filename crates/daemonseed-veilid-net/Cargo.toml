@@ -7,8 +7,9 @@
 name = "daemonseed-veilid-net"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-or-later"
 publish = false
-description = "Veilid transport layer for daemonseed (Phase 1 skeleton): identity-bound node, private routes, sealed app_message. Circles/shares/presence stubbed for Phase 2+."
+description = "Veilid DHT transport layer for daemonseed."
 
 [dependencies]
 # D4: join the PUBLIC Veilid network (no network_key_password). Private routes
