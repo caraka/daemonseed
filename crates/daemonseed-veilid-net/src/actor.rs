@@ -2491,14 +2491,32 @@ async fn actor_loop(
                 flush_budget,
                 reply,
             } => {
+                // Traced at the dequeue, not at the send: `flush_budget` starts counting
+                // here, so the gap between this line and the caller's own entry line is
+                // the head-of-line wait the caller's cap exists to bound.
+                let dequeued = std::time::Instant::now();
+                crate::vtrace!("close: Shutdown dequeued, flush_budget={flush_budget:?}");
                 // I7: flush pending chat writes + leave tombstones + share withdraws
                 // within the caller's remaining close budget, shed class-3/4/5
                 // current-state writes, THEN tear the node down — a locally-echoed chat
                 // silently dropped at close is data loss the sender already saw as sent.
                 sched.shutdown(flush_budget).await;
+                crate::vtrace!(
+                    "close: sched.shutdown returned after {:?}",
+                    dequeued.elapsed()
+                );
                 // Capped: the caller is blocking a UI thread on the reply below, and
                 // veilid's teardown is otherwise an unbounded await past every budget.
-                let _ = tokio::time::timeout(TEARDOWN_CAP, api.shutdown()).await;
+                let teardown_started = std::time::Instant::now();
+                match tokio::time::timeout(TEARDOWN_CAP, api.shutdown()).await {
+                    Ok(()) => crate::vtrace!(
+                        "close: teardown returned after {:?}",
+                        teardown_started.elapsed()
+                    ),
+                    Err(_) => {
+                        crate::vtrace!("close: teardown hit TEARDOWN_CAP {TEARDOWN_CAP:?}")
+                    }
+                }
                 let _ = reply.send(());
                 return;
             }

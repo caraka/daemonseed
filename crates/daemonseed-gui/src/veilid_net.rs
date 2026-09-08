@@ -1885,6 +1885,12 @@ async fn handle_command(
             // write unbounded: `main.rs` blocks the UI thread on this ack, so a stalled
             // step would freeze the window AND skip the I7 flush entirely.
             let preflush_deadline = Instant::now() + CLOSE_PREFLUSH_BUDGET;
+            daemonseed_veilid_net::vtrace!(
+                "gui close: entry, preflush budget {CLOSE_PREFLUSH_BUDGET:?}, \
+                 {} share(s), {} circle(s)",
+                shares.own.len(),
+                circles.len()
+            );
             // Step 1 — withdraws FIRST. A stale share advert outlives the sharer as a
             // fetch that a peer can click and that then fails against a dead route;
             // a stale roster entry is inert until its TTL. Under budget pressure the
@@ -1899,6 +1905,10 @@ async fn handle_command(
             for s in shares.own.clone() {
                 let left = withdraw_deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
+                    daemonseed_veilid_net::vtrace!(
+                        "gui close: withdraw budget spent, {} share(s) not withdrawn",
+                        shares.own.len()
+                    );
                     break;
                 }
                 // A timed-out withdraw is handed to the flush, not cancelled — once
@@ -1907,9 +1917,21 @@ async fn handle_command(
                 // serve-registry de-registration inside it: cancellation before the post
                 // would drop the write entirely, which is the one outcome step 1 exists
                 // to prevent.
-                let _ =
+                let withdrawn =
                     tokio::time::timeout(left, unpublish_share(shares, evt_tx, net, &s.share_id))
                         .await;
+                let share_id = &s.share_id;
+                let remaining = withdraw_deadline.saturating_duration_since(Instant::now());
+                match withdrawn {
+                    Ok(()) => daemonseed_veilid_net::vtrace!(
+                        "gui close: withdraw {share_id} posted, {remaining:?} left of the \
+                         withdraw budget"
+                    ),
+                    Err(_) => daemonseed_veilid_net::vtrace!(
+                        "gui close: withdraw {share_id} timed out after {left:?}, \
+                         {remaining:?} left of the withdraw budget, handed to the flush"
+                    ),
+                }
             }
             // Step 2 — WB-1.3: one LEAVE tombstone per joined room. AWAITED, not
             // fire-and-forget (#161): a spawned task is aborted at process exit and the
@@ -1923,18 +1945,44 @@ async fn handle_command(
             // tombstone is byte-identical to a keepalive on the wire (WB-ISC-6); only
             // in-room members decrypt the leave marker.
             if let (Some(handle), Some(signing)) = (net.as_ref(), shares.signing.clone()) {
+                // One budget, read once and applied per room as well as to the group, so
+                // each room reports its own outcome at the instant the group bound would
+                // have abandoned it anyway.
+                let leave_budget = preflush_deadline.saturating_duration_since(Instant::now());
                 let lobby_leave = shares.lobby.as_ref().map(|lobby| {
-                    publish_public_leave(
+                    let leave = publish_public_leave(
                         handle,
                         &signing,
                         &lobby.room_key,
                         lobby.presence_owner_seed,
                         my_handle,
-                    )
+                    );
+                    async move {
+                        match tokio::time::timeout(leave_budget, leave).await {
+                            Ok(()) => daemonseed_veilid_net::vtrace!(
+                                "gui close: leave {DEFAULT_ROOM} awaited"
+                            ),
+                            Err(_) => daemonseed_veilid_net::vtrace!(
+                                "gui close: leave {DEFAULT_ROOM} timed out after {leave_budget:?}"
+                            ),
+                        }
+                    }
                 });
-                let circle_leaves = circles
-                    .iter()
-                    .map(|circle| publish_circle_leave(handle, &signing, circle, my_handle));
+                let circle_leaves = circles.iter().map(|circle| {
+                    let leave = publish_circle_leave(handle, &signing, circle, my_handle);
+                    async move {
+                        match tokio::time::timeout(leave_budget, leave).await {
+                            Ok(()) => daemonseed_veilid_net::vtrace!(
+                                "gui close: leave {} awaited",
+                                default_circle_label(&circle_fingerprint(&circle.cot_key))
+                            ),
+                            Err(_) => daemonseed_veilid_net::vtrace!(
+                                "gui close: leave {} timed out after {leave_budget:?}",
+                                default_circle_label(&circle_fingerprint(&circle.cot_key))
+                            ),
+                        }
+                    }
+                });
                 // Bounded as one group: same reasoning as the withdraws — a leave the
                 // timeout abandons is still queued on the scheduler for the flush.
                 let _ = tokio::time::timeout(
@@ -1945,6 +1993,10 @@ async fn handle_command(
                     ),
                 )
                 .await;
+            } else {
+                daemonseed_veilid_net::vtrace!(
+                    "gui close: leave stage skipped, no session or signing key"
+                );
             }
             // Step 3 — the WB-3.I7 flush: its floor plus whatever the steps above left
             // unspent. It dispatches pending chat (a locally-echoed message the sender
@@ -1963,11 +2015,25 @@ async fn handle_command(
                 // prevent, reached by the path meant to fix it.
                 // `flush_budget + TEARDOWN_CAP` is the actor's own ceiling once dequeued,
                 // so this cap never truncates a flush that is actually running.
-                let _ = tokio::time::timeout(
+                daemonseed_veilid_net::vtrace!("gui close: flush handed {flush_budget:?}");
+                let flush_started = Instant::now();
+                match tokio::time::timeout(
                     flush_budget + TEARDOWN_CAP,
                     handle.shutdown(flush_budget),
                 )
-                .await;
+                .await
+                {
+                    Ok(()) => daemonseed_veilid_net::vtrace!(
+                        "gui close: shutdown returned after {:?}",
+                        flush_started.elapsed()
+                    ),
+                    Err(_) => daemonseed_veilid_net::vtrace!(
+                        "gui close: shutdown hit the cap {:?}",
+                        flush_budget + TEARDOWN_CAP
+                    ),
+                }
+            } else {
+                daemonseed_veilid_net::vtrace!("gui close: flush stage skipped, no session");
             }
             // The transport actor has returned and its event stream is closed, so both
             // handles are dead state — drop them rather than leave the actor loop holding

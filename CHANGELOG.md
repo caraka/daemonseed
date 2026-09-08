@@ -594,6 +594,13 @@ work lives in the maintainer's own planning notes, not here.
   `daemonseed_core::dm::persist::PendingHandshake::channel_roots()` — both channel roots
   recomputed from the stored handshake, `AR` and `chan_id` together, in a `ChannelRoots` that
   erases itself. (#402)
+- The graceful-close path traces every stage under `DAEMONSEED_VEILID_TRACE`: entry with the
+  pre-flush budget, each share withdraw as posted or timed out with the withdraw budget left,
+  each room's LEAVE tombstone as awaited or timed out, the flush budget handed over and whether
+  `shutdown` returned or hit `flush_budget + TEARDOWN_CAP`, and on the actor side the
+  `Command::Shutdown` dequeue with its budget, the scheduler flush return, and the teardown
+  return or `TEARDOWN_CAP`. A leave or flush stage that is skipped for want of a session says
+  so, so a silent trace means the close never ran rather than ran and did nothing. (#370)
 
 ### Fixed
 
