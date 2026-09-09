@@ -19,10 +19,12 @@ use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
+use daemonseed_veilid_net::dm::CorrespondentState;
 
 use crate::app::{
-    App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, DirSelection, FetchStatus, FetchUi,
-    IndexerStatus, MainFocus, PreviewKind, Screen, Surface, TrustItem,
+    App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, DM_ACCEPT_KEY, DM_BLOCK_KEY,
+    DM_DECLINE_KEY, DM_PANE_KEY, DirSelection, FetchStatus, FetchUi, IndexerStatus, MainFocus,
+    PreviewKind, Screen, Surface, TrustItem, dm_fingerprint,
 };
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
@@ -110,16 +112,25 @@ fn render_main(app: &App, frame: &mut Frame) {
         .split(frame.area());
 
     render_status_bar(app, frame, chunks[0]);
-    // The main area shows the server-management list, Trust History, or Shares
-    // pane while those screens have focus, otherwise the chat transcript.
-    match app.main_focus() {
-        MainFocus::Servers => render_server_list(app, frame, chunks[1]),
-        MainFocus::TrustHistory => render_trust_history(app, frame, chunks[1]),
-        MainFocus::Shares | MainFocus::Hide => render_shares(app, frame, chunks[1]),
-        MainFocus::PublicSpace => render_public_space(app, frame, chunks[1]),
-        MainFocus::Deprecation => render_deprecation(app, frame, chunks[1]),
-        MainFocus::Fetched => render_fetched(app, frame, chunks[1]),
-        _ => render_chat_transcript(app, frame, chunks[1]),
+    // (#236) The direct-message pane is a view over one body of state rather
+    // than a focus, so it draws over whichever pane has focus and leaves that
+    // focus alone — closing it returns to the pane the user left. It sits below
+    // every C28 overlay, which are drawn after this either way.
+    if app.dm_pane_open() {
+        render_dm(app, frame, chunks[1]);
+    } else {
+        // The main area shows the server-management list, Trust History, or
+        // Shares pane while those screens have focus, otherwise the chat
+        // transcript.
+        match app.main_focus() {
+            MainFocus::Servers => render_server_list(app, frame, chunks[1]),
+            MainFocus::TrustHistory => render_trust_history(app, frame, chunks[1]),
+            MainFocus::Shares | MainFocus::Hide => render_shares(app, frame, chunks[1]),
+            MainFocus::PublicSpace => render_public_space(app, frame, chunks[1]),
+            MainFocus::Deprecation => render_deprecation(app, frame, chunks[1]),
+            MainFocus::Fetched => render_fetched(app, frame, chunks[1]),
+            _ => render_chat_transcript(app, frame, chunks[1]),
+        }
     }
     render_main_input(app, frame, chunks[2]);
 
@@ -1208,6 +1219,93 @@ fn render_deprecation(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(body, area);
 }
 
+/// (#236) The direct-message pane: pending contact requests, then the
+/// correspondences newest first.
+///
+/// Two blocks in one list, requests above correspondences, because a request is
+/// the only row carrying an action and the actions are what the user opened the
+/// pane to take. The title states both counts, so a pane scrolled past its
+/// requests still says how many are waiting.
+///
+/// Neither block shows message text. A request's first message and a
+/// correspondence's thread are the next change's subject; this one answers
+/// "who is waiting, and who do I correspond with", which the identity and the
+/// state answer on their own.
+fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
+    let requests = app.dm_requests();
+    let correspondences = app.dm_correspondences();
+    let title = format!(
+        " direct messages · {} correspondences · {} pending ",
+        correspondences.len(),
+        requests.len()
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+    if requests.is_empty() && correspondences.is_empty() {
+        lines.push(
+            Line::from("(no correspondences and no pending requests)")
+                .style(Style::default().fg(Color::DarkGray)),
+        );
+    }
+
+    // Row index runs across both blocks, in the order they are drawn, which is
+    // the order `App::on_key_dm` moves the selection through.
+    let mut row = 0usize;
+    for request in requests {
+        let marker = if row == app.dm_sel() { "▶ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::raw(marker.to_owned()),
+            Span::styled(
+                format!("pending request from {}", dm_fingerprint(&request.from)),
+                if row == app.dm_sel() {
+                    Style::default().fg(Color::Yellow).bold()
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ),
+        ]));
+        row += 1;
+    }
+    for (pk, correspondence) in &correspondences {
+        let marker = if row == app.dm_sel() { "▶ " } else { "  " };
+        // An unstated state is drawn as unstated rather than guessed: the
+        // roster is the only event that says which state a correspondence is
+        // in, so one created by a delivery or a teardown has never been told.
+        let state = match correspondence.state {
+            Some(CorrespondentState::Established) => "established",
+            Some(CorrespondentState::Pending) => "pending acceptance",
+            Some(CorrespondentState::Blocked) => "blocked",
+            None => "state not stated",
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker.to_owned()),
+            Span::styled(
+                format!("correspondence {} · {state}", dm_fingerprint(pk)),
+                dm_row_style(row == app.dm_sel()),
+            ),
+        ]));
+        row += 1;
+    }
+
+    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+}
+
+/// (#236) The style a direct-message row draws in, selected or not. Matches the
+/// cursor styling every other list pane uses.
+fn dm_row_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(Color::Cyan).bold()
+    } else {
+        Style::default()
+    }
+}
+
 /// Top bar: connection state, circle state, persistent trust badges (ISC-23),
 /// and — when a close was observed — a distinct close-cause segment (ISC-28).
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
@@ -1451,6 +1549,36 @@ fn chat_line(m: &ChatLine, own: Option<&Handle>) -> Line<'static> {
 /// TrustHistory). When composing a partial `@token`, a mention-autocomplete
 /// popup floats above (ISC-12).
 fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
+    // (#236) The direct-message pane brings its own legend, matched before
+    // focus: the pane owns the keystream while it is open, so the focused
+    // pane's keys are not the ones that would work.
+    if app.dm_pane_open() {
+        // Named `dm`, matching the `[c] dm` hint that opens it. The whole line
+        // is 69 columns and fits the 78 a bordered block leaves at an 80-column
+        // terminal, so nothing here is truncated. The close hint leads anyway,
+        // because a title truncates from the right at narrower widths and the
+        // way out is what a user in a pane they did not mean to open needs
+        // most.
+        let title = format!(
+            "dm  [{DM_PANE_KEY}]/[Esc] close  [↑/↓] select  [{DM_ACCEPT_KEY}] accept  \
+             [{DM_DECLINE_KEY}] decline  [{DM_BLOCK_KEY}] block"
+        );
+        // A status set before the pane opened is carried rather than hidden:
+        // it is cleared on a focus change, and opening the pane is not one, so
+        // dropping it here would lose the line instead of retiring it.
+        let shown = match app.status() {
+            Some(s) => format!("! {s}"),
+            None => String::new(),
+        };
+        let body = Paragraph::new(shown).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title),
+        );
+        frame.render_widget(body, area);
+        return;
+    }
     let (title, text): (String, String) = match app.main_focus() {
         MainFocus::Chat if !app.can_chat() => (
             // Item F / ISC-C48: greyed/disabled compose until a circle is joined
@@ -1542,9 +1670,18 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             // M16 C1 (ISC-C69): several shares can be defined; `[`/`]` select
             // the My-defined cursor, `[p]`/`[u]` publish/unpublish the selected
             // one. Show the selected defined share + how many are serving.
+            // The selected defined share and the serving count are the pane's
+            // STATE, and they moved out of the title into the body: a title
+            // truncates from the right, a defined share's label has no length
+            // bound, and both of those sat after `[Esc] back` — so one long
+            // label used to push the way out off the screen. The body is a
+            // second full line and carries the status text already, which is
+            // where variable-length state belongs.
             let defined = match app.selected_defined_share() {
-                Some((_, name)) => format!("   defined: {name} · [[/]] select · [p] publish"),
-                None => "   (Tab → define-share first)".to_owned(),
+                Some((_, name)) => {
+                    format!("defined: {name} · [[/]] select · [p] publish · [x] remove")
+                }
+                None => "no share defined yet — [Tab] to define one".to_owned(),
             };
             let serving = app.published().len();
             let serving_hint = if serving > 0 {
@@ -1554,9 +1691,10 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             };
             (
                 format!(
-                    "shares  [↑/↓] fetch-select  [f] fetch  [r] refresh  [Tab] define-share  [Esc] back{defined}{serving_hint}"
+                    "shares  [{DM_PANE_KEY}] dm  [↑/↓] select  [f] fetch  [r] refresh  \
+                     [Tab] define  [Esc] back"
                 ),
-                String::new(),
+                format!("{defined}{serving_hint}"),
             )
         }
         MainFocus::DefineShare => (
@@ -1583,23 +1721,41 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
                 .to_owned(),
             app.server_input().to_owned(),
         ),
+        // (#236) The five panes that do not turn a printable key into text
+        // advertise `[c] dm`, placed directly after the pane name rather than
+        // at the end: a title truncates from the right, so the last hint is the
+        // first one lost, and the pane opener is not the hint to spend there.
+        //
+        // Every one of these fits the 78 columns a bordered block leaves at an
+        // 80-column terminal, so `[Esc] back` is whole. Making room for `[c] dm`
+        // cost `selected` from the trust-history dismiss hint, `-space` from
+        // its Tab target, and the word `suite` from the deprecation pane's
+        // name — all three recoverable from the pane the user is looking at.
         MainFocus::TrustHistory => (
-            "trust history  [↑/↓] select  [Enter] dismiss selected  [Tab] public-space  [Esc] back"
-                .to_owned(),
+            format!(
+                "trust history  [{DM_PANE_KEY}] dm  [↑/↓] select  [Enter] dismiss  \
+                 [Tab] public  [Esc] back"
+            ),
             String::new(),
         ),
         MainFocus::PublicSpace => (
-            "public space  [↑/↓] select  [r] refresh  [Tab] deprecation  [Esc] back".to_owned(),
+            format!(
+                "public space  [{DM_PANE_KEY}] dm  [↑/↓] select  [r] refresh  [Tab] deprecation  \
+                 [Esc] back"
+            ),
             String::new(),
         ),
         MainFocus::Deprecation => (
-            "suite deprecation  [↑/↓] select  [r] refresh  [Tab] fetched  [Esc] back".to_owned(),
+            format!(
+                "deprecation  [{DM_PANE_KEY}] dm  [↑/↓] select  [r] refresh  [Tab] fetched  \
+                 [Esc] back"
+            ),
             String::new(),
         ),
         MainFocus::Fetched => (
             // M15 C: read-only browse of downloads (files already on disk under
             // their real names in each share's folder — no extract step).
-            "downloads  [↑/↓] select  [Tab] chat  [Esc] back".to_owned(),
+            format!("downloads  [{DM_PANE_KEY}] dm  [↑/↓] select  [Tab] chat  [Esc] back"),
             String::new(),
         ),
     };

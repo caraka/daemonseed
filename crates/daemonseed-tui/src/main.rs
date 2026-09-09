@@ -294,6 +294,11 @@ fn run(
         if let Some((topic, body)) = app.take_pending_upload_announcement() {
             let _ = net.send(NetCommand::UploadAnnouncement { topic, body });
         }
+        // (#236) Answers to contact requests, forwarded verbatim to the DM
+        // driver. Each is queued by one keypress in the direct-message pane.
+        for cmd in app.take_pending_dm() {
+            let _ = net.send(NetCommand::Dm(cmd));
+        }
         if app.take_pending_deprecation_refresh() {
             let _ = net.send(NetCommand::RefreshDeprecation);
         }

@@ -23,7 +23,7 @@ use daemonseed_core::trust_events::{
 };
 use daemonseed_veilid_net::SweepOutcome;
 use daemonseed_veilid_net::dm::{
-    CorrespondentState, DmEvent, PENDING_REQUEST_CAP, PkLt, RefusalReason, RequestId,
+    CorrespondentState, DmCommand, DmEvent, PENDING_REQUEST_CAP, PkLt, RefusalReason, RequestId,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
@@ -188,6 +188,71 @@ pub enum MainFocus {
     /// path, Enter extracts the selected download's files there (path-traversal
     /// safe, ISC-A-C32). Opening the pane requests a fresh list (`ListFetched`).
     Fetched,
+}
+
+impl MainFocus {
+    /// Whether this focus turns a printable key into text.
+    ///
+    /// Six of the eleven do, and in those a bare letter is a character the user
+    /// typed, never a command — which is why [`DM_PANE_KEY`] is offered only
+    /// where this is false, and why the panes that offer it are the ones whose
+    /// legend advertises it. The same reasoning picked `Home` over a letter for
+    /// the chat pane's lobby deselect.
+    pub fn consumes_text(self) -> bool {
+        matches!(
+            self,
+            MainFocus::Chat
+                | MainFocus::JoinCircle
+                | MainFocus::Mute
+                | MainFocus::DefineShare
+                | MainFocus::Hide
+                | MainFocus::Servers
+        )
+    }
+}
+
+/// Opens and closes the direct-message pane, from any focus that does not
+/// consume printable keys ([`MainFocus::consumes_text`]).
+///
+/// `b` is the first unused letter, and it is spent on
+/// [`DM_BLOCK_KEY`] instead: block is the pane's one irreversible action and is
+/// the harder of the two to give a memorable key. `c` is the next, and names
+/// the correspondences the pane lists.
+pub const DM_PANE_KEY: char = 'c';
+
+/// Accepts the selected contact request, sending one `DmCommand::Accept`.
+pub const DM_ACCEPT_KEY: char = 'a';
+
+/// Declines the selected contact request, sending one `DmCommand::Decline`.
+pub const DM_DECLINE_KEY: char = 'd';
+
+/// Blocks the selected contact request's sender, sending one
+/// `DmCommand::Block`.
+pub const DM_BLOCK_KEY: char = 'b';
+
+/// [`DM_PANE_KEY`] with Shift held. Derived rather than written out, so the two
+/// cases of one key cannot drift apart.
+const DM_PANE_KEY_UPPER: char = DM_PANE_KEY.to_ascii_uppercase();
+
+/// [`DM_ACCEPT_KEY`] with Shift held.
+const DM_ACCEPT_KEY_UPPER: char = DM_ACCEPT_KEY.to_ascii_uppercase();
+
+/// [`DM_DECLINE_KEY`] with Shift held.
+const DM_DECLINE_KEY_UPPER: char = DM_DECLINE_KEY.to_ascii_uppercase();
+
+/// [`DM_BLOCK_KEY`] with Shift held.
+const DM_BLOCK_KEY_UPPER: char = DM_BLOCK_KEY.to_ascii_uppercase();
+
+/// Whether a key press carries no modifier that changes what it means.
+///
+/// Shift is allowed because it is how the upper-case letter was produced and
+/// says nothing beyond that; every other modifier makes a different key.
+/// `KeyCode` alone cannot tell them apart — Ctrl-C and `c` share a code — so a
+/// handler matching on the code and nothing else answers a chord it was never
+/// offered.
+fn plain_or_shift(key: &KeyEvent) -> bool {
+    use ratatui::crossterm::event::KeyModifiers;
+    key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT
 }
 
 /// (#92) Public-space composer sub-mode, active only for a whitelisted signer
@@ -1087,8 +1152,27 @@ pub struct App {
     /// which is the first-start config+blob+`.dseed` write.
     pending_blob_update: Option<Vec<u8>>,
     /// (#339) What the DM driver has told this session. Folded by
-    /// [`Self::on_net_event`] and rendered nowhere yet: no interface draws it.
+    /// [`Self::on_net_event`], drawn by the direct-message pane.
     dm: DmState,
+    /// (#236) Whether the direct-message pane is open. While it is, it owns the
+    /// keystream: it is a view over one body of state rather than another
+    /// station on the `Tab` cycle, so the focus underneath is left untouched and
+    /// closing returns to exactly the pane the user left.
+    dm_pane: bool,
+    /// (#236) The selected row in the direct-message pane, indexing the pending
+    /// requests first and the correspondences after them — the order the pane
+    /// draws. Clamped by [`Self::dm_row_count`] on every move.
+    dm_sel: usize,
+    /// (#236) Commands the binary should hand to the DM driver, oldest first.
+    /// A queue rather than a single slot because answering several requests in
+    /// one render tick must not drop any of them, and `DmCommand` is not
+    /// `Clone`, so a dropped one cannot be reconstructed.
+    pending_dm: Vec<DmCommand>,
+    /// (#236) Requests already answered this session, so a second press on a
+    /// row that still looks unanswered sends nothing. A `Vec` because
+    /// `RequestId` is neither `Hash` nor `Ord`, and it is bounded by
+    /// [`PENDING_REQUEST_CAP`] arrivals rather than by keystrokes.
+    dm_answered: Vec<RequestId>,
 }
 
 /// (#339) One correspondence, as the driver has reported it.
@@ -1109,6 +1193,17 @@ pub struct DmCorrespondence {
     pub deliveries: BTreeMap<u64, DeliveryState>,
     /// Sequence numbers a loud teardown left undelivered, in arrival order.
     pub undelivered: Vec<u64>,
+    /// The value [`DmState::activity_seq`] had when an event last named this
+    /// correspondence — the ordering key the roster is drawn by, newest first.
+    ///
+    /// A counter rather than a clock because nothing the driver reports about a
+    /// correspondence carries a time: a roster entry, a delivery and a teardown
+    /// all say what is true, never when. Ordering by the order the statements
+    /// arrived is therefore the only recency this state can support, and it
+    /// says so in its name rather than implying a wall clock it does not have.
+    /// `0` on a correspondence no event has named, which cannot occur through
+    /// the fold — every route that creates one stamps it.
+    pub last_activity: u64,
 }
 
 /// (#339) The DM state one session has accumulated from [`DmEvent`]s.
@@ -1124,9 +1219,10 @@ pub struct DmState {
     ///
     /// **Capped at [`PENDING_REQUEST_CAP`], the driver's own held-request
     /// bound, and the oldest row is dropped to make room.** Nothing removes a
-    /// row otherwise: there is no accept or decline event, so a request answered
-    /// by the user stays here until an interface exists to retire it, and without
-    /// the cap the list would grow for the life of the session. The driver
+    /// row otherwise: there is no accept or decline event, so a request the user
+    /// has answered from the direct-message pane stays here — the pane draws
+    /// what the driver said, and nothing has yet said the answer took effect —
+    /// and without the cap the list would grow for the life of the session. The driver
     /// cannot hold more than this many at once, so a longer list here would
     /// hold requests the driver has already forgotten.
     ///
@@ -1155,6 +1251,13 @@ pub struct DmState {
     /// that wants to warn has the number here rather than having to re-derive
     /// it from an absence.
     pub block_list_unreadable_ticks: u64,
+    /// A monotonic count of the events that named a correspondence, stamped
+    /// onto [`DmCorrespondence::last_activity`] as each one folds.
+    ///
+    /// Session-scoped and meaningless across sessions: it orders statements
+    /// this session heard, and a restart starts it again at zero along with the
+    /// rest of this state.
+    pub activity_seq: u64,
 }
 
 /// A correspondent's identity key, as a trace line may show it: the marker only.
@@ -1162,6 +1265,22 @@ pub struct DmState {
 /// `daemonseed_veilid_net::dm::DmEvent` applies to the same values.
 fn redacted_pk(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.write_str("PkLt(..)")
+}
+
+/// (#236) A correspondent's identity key as the direct-message pane names it:
+/// the first four bytes, hex.
+///
+/// The key is the only thing this state holds that separates one correspondent
+/// from another, so a pane listing them has to show some of it. Four bytes are
+/// enough to tell apart the handful a roster holds and short enough to leave
+/// room on an 80-column row; it is a label for a list, not a verification
+/// string, and nothing here asks the user to compare one against anything.
+///
+/// This is deliberately unlike the `Debug` redaction above, which serves a
+/// different reader: a trace line is copied, forwarded and kept, and the user
+/// looking at their own screen already knows who they correspond with.
+pub fn dm_fingerprint(pk: &PkLt) -> String {
+    pk.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
 impl std::fmt::Debug for DmState {
@@ -1299,7 +1418,25 @@ impl std::fmt::Debug for DmChannelHealth {
 }
 
 impl DmState {
-    /// Fold one driver event.
+    /// Advance [`Self::activity_seq`] and return its new value, the stamp for
+    /// the correspondence the caller is about to touch.
+    ///
+    /// Saturating rather than wrapping: a wrap would put the newest
+    /// correspondence at the bottom of the roster, and a session reaching
+    /// `u64::MAX` statements has stopped ordering anything long before that
+    /// matters.
+    fn next_activity(&mut self) -> u64 {
+        self.activity_seq = self.activity_seq.saturating_add(1);
+        self.activity_seq
+    }
+
+    /// Fold one driver event, returning whether the oldest pending request was
+    /// evicted to make room.
+    ///
+    /// The return value exists for the selection: eviction always removes row
+    /// zero, so every row below a cursor shifts up by one and a cursor left
+    /// alone silently points at its neighbour. `DmState` does not hold the
+    /// cursor, so it reports the shift rather than applying it.
     ///
     /// Observability-only variants ([`DmEvent::ContactLookupFailed`],
     /// [`DmEvent::BlockListFull`] and the rest) are accepted and dropped: no
@@ -1308,7 +1445,8 @@ impl DmState {
     /// exception and is counted: it is an alarm whose only other symptom is a
     /// channel plane that has gone quiet, so dropping it leaves nothing to
     /// check at all.
-    fn fold(&mut self, event: &DmEvent) {
+    fn fold(&mut self, event: &DmEvent) -> bool {
+        let mut evicted_oldest = false;
         match event {
             DmEvent::ContactRequest {
                 request,
@@ -1331,6 +1469,7 @@ impl DmState {
                         // user has not seen.
                         if self.requests.len() >= PENDING_REQUEST_CAP {
                             self.requests.remove(0);
+                            evicted_oldest = true;
                         }
                         self.requests.push(row);
                     }
@@ -1342,18 +1481,26 @@ impl DmState {
                     // a statement about what is on disk, and an entry this
                     // session made for a correspondence the store has not
                     // recorded yet is not something the roster contradicts.
-                    self.correspondences
+                    //
+                    // Stamped per correspondent rather than once for the whole
+                    // roster, so the listed order survives into the pane: the
+                    // roster arrives as one event, and a single stamp would
+                    // leave every entry tied and the order down to the map's
+                    // key ordering, which is a public key.
+                    let seq = self.next_activity();
+                    let entry = self
+                        .correspondences
                         .entry(correspondent.pk_lt.clone())
-                        .or_default()
-                        .state = Some(correspondent.state);
+                        .or_default();
+                    entry.state = Some(correspondent.state);
+                    entry.last_activity = seq;
                 }
             }
             DmEvent::Delivery { to, seq, state } => {
-                self.correspondences
-                    .entry(to.clone())
-                    .or_default()
-                    .deliveries
-                    .insert(*seq, *state);
+                let activity = self.next_activity();
+                let entry = self.correspondences.entry(to.clone()).or_default();
+                entry.deliveries.insert(*seq, *state);
+                entry.last_activity = activity;
             }
             DmEvent::Refused {
                 to,
@@ -1371,9 +1518,25 @@ impl DmState {
                     reason: *reason,
                 });
             }
+            // A received message is activity, and for an inbound-only
+            // correspondent it may be the ONLY thing this session ever hears:
+            // the roster names what was on disk at startup and `Delivery`
+            // reports this side's own sends, so a correspondent who writes
+            // without being written to would otherwise have no row at all. The
+            // body is not kept — no surface shows message text yet — but the
+            // fact that they wrote is what orders the roster.
+            DmEvent::Message { from, .. } => {
+                let activity = self.next_activity();
+                self.correspondences
+                    .entry(from.clone())
+                    .or_default()
+                    .last_activity = activity;
+            }
             DmEvent::ChannelLost { with, surfaced, .. } => {
+                let activity = self.next_activity();
                 let c = self.correspondences.entry(with.clone()).or_default();
                 c.undelivered.extend(surfaced.iter().copied());
+                c.last_activity = activity;
             }
             DmEvent::DoorbellHealth {
                 outcome,
@@ -1418,12 +1581,11 @@ impl DmState {
                     self.block_list_unreadable_ticks.saturating_add(1);
             }
             // Nothing a fold could add and no interface that renders them: an
-            // accepted request stays held by the driver, a message has no view,
-            // and the rest are counters the driver already keeps. The one event
-            // that is an alarm rather than a counter — `BlockListUnreadable`,
-            // whose only other symptom is silence — is folded above instead.
-            DmEvent::Message { .. }
-            | DmEvent::AcceptFailed { .. }
+            // accepted request stays held by the driver, and the rest are
+            // counters the driver already keeps. The one event that is an alarm
+            // rather than a counter — `BlockListUnreadable`, whose only other
+            // symptom is silence — is folded above instead.
+            DmEvent::AcceptFailed { .. }
             | DmEvent::ChannelDirectionUnknown { .. }
             // Its audit entry is written above, where every classed key is. The
             // fold adds nothing to `dm`: recovery is under way and bounded, and
@@ -1434,6 +1596,7 @@ impl DmState {
             | DmEvent::BlockListProvisioned
             | DmEvent::SpentTokensNotPersisted => {}
         }
+        evicted_oldest
     }
 }
 
@@ -1535,6 +1698,10 @@ impl App {
             seal_key: None,
             pending_blob_update: None,
             dm: DmState::default(),
+            dm_pane: false,
+            dm_sel: 0,
+            pending_dm: Vec::new(),
+            dm_answered: Vec::new(),
         }
     }
 
@@ -1994,7 +2161,13 @@ impl App {
                     } => self.fold_trust_event(TrustEventScope::bare(*key), None),
                     _ => {}
                 }
-                self.dm.fold(event);
+                // (#236) An eviction removes row zero, so every row below the
+                // cursor moves up one. Re-anchoring keeps the cursor on the
+                // request the user is looking at instead of sliding it onto
+                // that request's neighbour.
+                if self.dm.fold(event) {
+                    self.dm_sel = self.dm_sel.saturating_sub(1);
+                }
             }
             NetEvent::Connected {
                 server,
@@ -2705,6 +2878,50 @@ impl App {
         &self.dm
     }
 
+    /// (#236) Whether the direct-message pane is open, for rendering.
+    pub fn dm_pane_open(&self) -> bool {
+        self.dm_pane
+    }
+
+    /// (#236) The selected direct-message row, for highlighting. Indexes the
+    /// pending requests first, then the correspondences.
+    pub fn dm_sel(&self) -> usize {
+        self.dm_sel
+    }
+
+    /// (#236) Contact requests awaiting an answer, in the order the driver
+    /// surfaced them — the pane's first block.
+    pub fn dm_requests(&self) -> &[DmContactRequest] {
+        &self.dm.requests
+    }
+
+    /// (#236) Correspondences newest first, by
+    /// [`DmCorrespondence::last_activity`].
+    ///
+    /// Ties break on the identity key, which is total and stable, so the pane's
+    /// row order is a function of the state alone. Nothing here can tie through
+    /// the fold — every stamp is a distinct counter value — so the tie-break
+    /// exists for a state built by hand rather than by an event.
+    pub fn dm_correspondences(&self) -> Vec<(&PkLt, &DmCorrespondence)> {
+        let mut rows: Vec<(&PkLt, &DmCorrespondence)> = self.dm.correspondences.iter().collect();
+        rows.sort_by(|(a_pk, a), (b_pk, b)| {
+            b.last_activity.cmp(&a.last_activity).then(a_pk.cmp(b_pk))
+        });
+        rows
+    }
+
+    /// (#236) How many rows the direct-message pane draws: every pending
+    /// request, then every correspondence.
+    fn dm_row_count(&self) -> usize {
+        self.dm.requests.len() + self.dm.correspondences.len()
+    }
+
+    /// (#236) Drain the commands queued for the DM driver, oldest first. The
+    /// binary forwards each verbatim as a `NetCommand::Dm`.
+    pub fn take_pending_dm(&mut self) -> Vec<DmCommand> {
+        std::mem::take(&mut self.pending_dm)
+    }
+
     /// Latest deprecation-warning rows (ISC-C25), for the Deprecation view. One
     /// row per in-use suite the verified policy schedules for retirement.
     pub fn deprecation_warnings(&self) -> &[DeprecationWarningRow] {
@@ -2883,6 +3100,14 @@ impl App {
     /// between the chat compose box and the circle-join box, `Esc` leaves to
     /// Welcome, and printable keys / Enter drive whichever input has focus.
     fn on_key_main(&mut self, key: KeyEvent) {
+        // (#236) While the direct-message pane is open it owns every key,
+        // routed before anything else so `Esc` closes the pane rather than
+        // opening the logged-in menu and `Tab` cannot walk the focus out from
+        // under a pane the user is reading.
+        if self.dm_pane {
+            self.on_key_dm(key);
+            return;
+        }
         // (#92) While the public-space composer is open, every key (incl. Esc/Tab)
         // belongs to it: Esc cancels the compose rather than opening the menu, and
         // chars/Enter drive the active field. Route before the global Esc/Tab so the
@@ -2891,6 +3116,28 @@ impl App {
             && self.compose_mode != PublicComposeMode::None
         {
             self.on_key_public_space(key);
+            return;
+        }
+        // (#236) Open the pane. Offered only where a printable key is not text,
+        // so the input panes keep every character the user can type.
+        //
+        // Two conditions, and they ask different questions. `consumes_text`
+        // asks it of the FOCUS, which is a fixed property of the variant. The
+        // composer above asks it of the STATE: `MainFocus::PublicSpace` does
+        // not consume text, but it does while a composer is open, and that is
+        // invisible from the variant. So this must sit BELOW every state-level
+        // capture rather than beside the variant-level test — above it, a `c`
+        // typed into an announcement body opens this pane and eats the rest of
+        // the word.
+        //
+        // Modifiers are checked because a `KeyCode` alone does not distinguish
+        // `c` from Ctrl-C, and Ctrl-C is not a request to open a pane.
+        if key.code == KeyCode::Char(DM_PANE_KEY)
+            && plain_or_shift(&key)
+            && !self.main_focus.consumes_text()
+        {
+            self.dm_pane = true;
+            self.dm_sel = 0;
             return;
         }
         match key.code {
@@ -2966,6 +3213,94 @@ impl App {
                 MainFocus::Fetched => self.on_key_fetched(key),
             },
         }
+    }
+
+    /// (#236) Direct-message pane key handling.
+    ///
+    /// `↑` / `↓` move the selection over the pending requests and then the
+    /// correspondences, clamped to the drawn rows.
+    /// [`DM_PANE_KEY`] and `Esc` both close the pane.
+    /// [`DM_ACCEPT_KEY`], [`DM_DECLINE_KEY`] and [`DM_BLOCK_KEY`] each queue one
+    /// command for the selected pending request and change nothing else — in
+    /// particular the answered request stays listed, because the driver reports
+    /// no event for an answer and retiring the row here would claim an outcome
+    /// nothing has confirmed. A key on a correspondence row, or on no row at
+    /// all, queues nothing: the three actions answer a request, and a
+    /// correspondence is not one.
+    fn on_key_dm(&mut self, key: KeyEvent) {
+        // Esc carries no case and no chord worth honouring here; every other
+        // arm is a letter, so a modifier other than Shift means a different key
+        // was pressed and none of them belongs to this pane.
+        if key.code != KeyCode::Esc && !plain_or_shift(&key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char(DM_PANE_KEY) | KeyCode::Char(DM_PANE_KEY_UPPER) => {
+                self.dm_pane = false;
+            }
+            KeyCode::Up => self.dm_sel = self.dm_sel.saturating_sub(1),
+            KeyCode::Down => {
+                let max = self.dm_row_count().saturating_sub(1);
+                if self.dm_sel < max {
+                    self.dm_sel += 1;
+                }
+            }
+            KeyCode::Char(DM_ACCEPT_KEY) | KeyCode::Char(DM_ACCEPT_KEY_UPPER) => {
+                if let Some(request) = self.answer_selected_request() {
+                    self.pending_dm.push(DmCommand::Accept { request });
+                    self.status = Some("request accepted — telling the correspondent".to_owned());
+                }
+            }
+            KeyCode::Char(DM_DECLINE_KEY) | KeyCode::Char(DM_DECLINE_KEY_UPPER) => {
+                if let Some(request) = self.answer_selected_request() {
+                    self.pending_dm.push(DmCommand::Decline { request });
+                    self.status = Some("request declined".to_owned());
+                }
+            }
+            KeyCode::Char(DM_BLOCK_KEY) | KeyCode::Char(DM_BLOCK_KEY_UPPER) => {
+                let pk_lt = self.dm_selected_requester();
+                if let (Some(pk_lt), Some(_)) = (pk_lt, self.answer_selected_request()) {
+                    self.pending_dm.push(DmCommand::Block { pk_lt });
+                    self.status = Some("correspondent blocked".to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// (#236) Claim the selected pending request as answered, returning it the
+    /// first time and `None` on every later press.
+    ///
+    /// The guard exists because nothing retires an answered row: the driver
+    /// reports no event for an answer, so the request stays on screen looking
+    /// exactly as it did before, and a user who presses again — reasonably,
+    /// having seen nothing change — would send a second command for a request
+    /// the driver has already disposed of. The status line is the other half of
+    /// that answer; this is the half that stops the repeat.
+    ///
+    /// One claim per request covers all three actions, because they are three
+    /// answers to the same question and the second is not a correction.
+    fn answer_selected_request(&mut self) -> Option<RequestId> {
+        let request = self.dm_selected_request()?;
+        if self.dm_answered.contains(&request) {
+            return None;
+        }
+        self.dm_answered.push(request.clone());
+        Some(request)
+    }
+
+    /// (#236) The selected row's request, or `None` when the selection is on a
+    /// correspondence row or the pane is empty.
+    fn dm_selected_request(&self) -> Option<RequestId> {
+        self.dm.requests.get(self.dm_sel).map(|r| r.request.clone())
+    }
+
+    /// (#236) The selected row's requester, under the same condition as
+    /// [`Self::dm_selected_request`]. A block names the identity rather than the
+    /// request, because it suppresses everything that identity sends and not
+    /// just the knock on screen.
+    fn dm_selected_requester(&self) -> Option<PkLt> {
+        self.dm.requests.get(self.dm_sel).map(|r| r.from.clone())
     }
 
     /// Daily-login Unlock key handling (ISC-C3 / Item E). Printable chars build
@@ -9693,5 +10028,698 @@ mod tests {
             rendered.contains("PkLt(..)"),
             "expected the marker: {rendered}"
         );
+    }
+
+    // ── #236: the direct-message pane, its roster and its request actions ──
+
+    /// An app on the main view with the direct-message pane open.
+    ///
+    /// Focus is parked on Trust History because [`DM_PANE_KEY`] is only offered
+    /// where a printable key is not text, and that pane is the nearest such
+    /// focus that dispatches nothing on entry — opening Shares, Public Space,
+    /// Deprecation or Fetched queues a refresh, which is state these tests
+    /// would then be asserting around.
+    fn dm_pane_app() -> App {
+        let mut app = drive_to_main();
+        for _ in 0..12 {
+            if app.main_focus() == MainFocus::TrustHistory {
+                break;
+            }
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(
+            app.main_focus(),
+            MainFocus::TrustHistory,
+            "the Tab cycle never reached a focus that offers the pane"
+        );
+        app.on_key(press(KeyCode::Char(DM_PANE_KEY)));
+        assert!(app.dm_pane_open(), "the pane did not open");
+        app
+    }
+
+    /// The pane's title, which a block draws into its TOP BORDER — so it is not
+    /// among the rows [`dm_pane_rows`] returns, and asserting it there would
+    /// fail whatever the title said.
+    fn dm_pane_title(app: &App) -> String {
+        buffer_rows(app, 80, 24).join("\n")
+    }
+
+    /// Every bordered row's interior, trailing blanks removed — so a row can be
+    /// asserted whole rather than by a word that another widget may also draw.
+    fn dm_pane_rows(app: &App) -> Vec<String> {
+        buffer_rows(app, 80, 24)
+            .into_iter()
+            .filter_map(|row| {
+                let inner = row.strip_prefix('│')?.strip_suffix('│')?;
+                Some(inner.trim_end().to_owned())
+            })
+            .collect()
+    }
+
+    /// Where `needle` occurs among the drawn rows. Panics when it does not, so
+    /// a missing row fails as a missing row rather than as a wrong order.
+    fn dm_row_index(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row carries {needle:?}; drew:\n{}", rows.join("\n")))
+    }
+
+    /// One established correspondent, as the driver's startup roster states it.
+    fn dm_roster(app: &mut App, tags: &[u8]) {
+        use daemonseed_veilid_net::dm::Correspondent;
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Roster {
+            correspondents: tags
+                .iter()
+                .map(|tag| Correspondent {
+                    pk_lt: dm_pk(*tag),
+                    state: CorrespondentState::Established,
+                })
+                .collect(),
+        })));
+    }
+
+    /// One pending contact request, as the driver surfaces it from a doorbell.
+    fn dm_contact_request(app: &mut App, tag: u8) {
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::ContactRequest {
+            request: dm_request(1, tag),
+            from: dm_pk(tag),
+            body: "hello".to_owned(),
+            sent_unix_ms: 1,
+        })));
+    }
+
+    /// An empty pane says both lists are empty, in one row.
+    ///
+    /// The control is the same needle against a pane that holds a
+    /// correspondence: an empty-state line that survives the arrival of state
+    /// is a line that says nothing.
+    #[test]
+    fn dm_pane_empty_roster_says_there_is_nothing() {
+        let mut app = dm_pane_app();
+        assert!(
+            dm_pane_rows(&app).contains(&"(no correspondences and no pending requests)".to_owned()),
+            "an empty pane drew no empty-state row; drew:\n{}",
+            dm_pane_rows(&app).join("\n")
+        );
+
+        dm_roster(&mut app, &[1]);
+        assert!(
+            !dm_pane_rows(&app)
+                .contains(&"(no correspondences and no pending requests)".to_owned()),
+            "the empty-state row survived a correspondence arriving; drew:\n{}",
+            dm_pane_rows(&app).join("\n")
+        );
+    }
+
+    /// A pending request draws as its own row, naming the knocker, and the
+    /// title counts it. The control is the whole row before the event.
+    #[test]
+    fn dm_pane_draws_one_pending_request() {
+        let mut app = dm_pane_app();
+        let row = "▶ pending request from abababab";
+        assert!(
+            !dm_pane_rows(&app).iter().any(|r| r.contains(row)),
+            "the request row was drawn before the request arrived"
+        );
+
+        dm_contact_request(&mut app, 0xAB);
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&row.to_owned()),
+            "expected the row {row:?}; drew:\n{}",
+            rows.join("\n")
+        );
+        let screen = dm_pane_title(&app);
+        assert!(
+            screen.contains("direct messages · 0 correspondences · 1 pending"),
+            "the title must carry both counts; drew:\n{screen}"
+        );
+    }
+
+    /// An established correspondence draws with its state named, and the title
+    /// counts it. The control is the whole row before the roster.
+    #[test]
+    fn dm_pane_draws_one_established_correspondence() {
+        let mut app = dm_pane_app();
+        let row = "▶ correspondence 01010101 · established";
+        assert!(
+            !dm_pane_rows(&app).iter().any(|r| r.contains(row)),
+            "the correspondence row was drawn before the roster arrived"
+        );
+
+        dm_roster(&mut app, &[1]);
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&row.to_owned()),
+            "expected the row {row:?}; drew:\n{}",
+            rows.join("\n")
+        );
+        let screen = dm_pane_title(&app);
+        assert!(
+            screen.contains("direct messages · 1 correspondences · 0 pending"),
+            "the title must carry both counts; drew:\n{screen}"
+        );
+    }
+
+    /// Two correspondences draw newest first, and "newest" is the last event
+    /// that named one — not the identity key, which is what a plain map
+    /// iteration would order them by.
+    ///
+    /// Asserted in both directions from one state: the roster alone puts the
+    /// second-listed correspondent on top, and a delivery to the first one
+    /// moves it there. A test asserting only the second half would pass on a
+    /// pane that always drew `01010101` first.
+    #[test]
+    fn dm_pane_orders_correspondences_by_recency() {
+        let mut app = dm_pane_app();
+        dm_roster(&mut app, &[1, 2]);
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            dm_row_index(&rows, "correspondence 02020202")
+                < dm_row_index(&rows, "correspondence 01010101"),
+            "the later roster entry is the more recent; drew:\n{}",
+            rows.join("\n")
+        );
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Delivery {
+            to: dm_pk(1),
+            seq: 0,
+            state: DeliveryState::Composed,
+        })));
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            dm_row_index(&rows, "correspondence 01010101")
+                < dm_row_index(&rows, "correspondence 02020202"),
+            "a delivery is activity and must move its correspondence to the top; drew:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// The accept key sends exactly one `Accept`, for the selected request.
+    #[test]
+    fn dm_accept_key_sends_one_accept_for_the_selected_request() {
+        let mut app = dm_pane_app();
+        dm_contact_request(&mut app, 0xAB);
+
+        app.on_key(press(KeyCode::Char(DM_ACCEPT_KEY)));
+
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected one command, got {cmds:?}");
+        match &cmds[0] {
+            DmCommand::Accept { request } => assert_eq!(*request, dm_request(1, 0xAB)),
+            other => panic!("expected an Accept, got {other:?}"),
+        }
+    }
+
+    /// The decline key sends exactly one `Decline`, for the selected request.
+    #[test]
+    fn dm_decline_key_sends_one_decline_for_the_selected_request() {
+        let mut app = dm_pane_app();
+        dm_contact_request(&mut app, 0xAB);
+
+        app.on_key(press(KeyCode::Char(DM_DECLINE_KEY)));
+
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected one command, got {cmds:?}");
+        match &cmds[0] {
+            DmCommand::Decline { request } => assert_eq!(*request, dm_request(1, 0xAB)),
+            other => panic!("expected a Decline, got {other:?}"),
+        }
+    }
+
+    /// The block key sends exactly one `Block`, naming the knocker's identity
+    /// rather than the request — a block suppresses the identity, and a request
+    /// id would only suppress the one knock.
+    #[test]
+    fn dm_block_key_sends_one_block_for_the_selected_requester() {
+        let mut app = dm_pane_app();
+        dm_contact_request(&mut app, 0xAB);
+
+        app.on_key(press(KeyCode::Char(DM_BLOCK_KEY)));
+
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected one command, got {cmds:?}");
+        match &cmds[0] {
+            DmCommand::Block { pk_lt } => assert_eq!(*pk_lt, dm_pk(0xAB)),
+            other => panic!("expected a Block, got {other:?}"),
+        }
+    }
+
+    /// The negative control for the three above: with the same request
+    /// selected, every other key the pane handles — and one it does not — sends
+    /// nothing. Without this, a handler that queued a command on any key would
+    /// pass all three.
+    #[test]
+    fn dm_other_keys_send_no_command() {
+        let mut app = dm_pane_app();
+        dm_contact_request(&mut app, 0xAB);
+
+        let focus = app.main_focus();
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::Char('z'),
+            KeyCode::Char('r'),
+        ] {
+            app.on_key(press(code));
+            // Checked per key, not once at the end: a key that closed the pane
+            // would let every later key reach the pane underneath, and a single
+            // check afterwards cannot say which key did it.
+            assert!(app.dm_pane_open(), "{code:?} closed the pane");
+            assert_eq!(app.main_focus(), focus, "{code:?} moved the focus beneath");
+        }
+
+        let cmds = app.take_pending_dm();
+        assert!(cmds.is_empty(), "expected no commands, got {cmds:?}");
+    }
+
+    /// A key pressed with no request selected sends nothing: the actions answer
+    /// a request, and a correspondence row is not one.
+    #[test]
+    fn dm_actions_on_a_correspondence_row_send_no_command() {
+        let mut app = dm_pane_app();
+        dm_roster(&mut app, &[1]);
+
+        // All three, because each reads the selection through its own helper
+        // and only accept and decline share one.
+        for key in [DM_ACCEPT_KEY, DM_DECLINE_KEY, DM_BLOCK_KEY] {
+            app.on_key(press(KeyCode::Char(key)));
+            let cmds = app.take_pending_dm();
+            assert!(cmds.is_empty(), "{key:?} queued {cmds:?}");
+        }
+    }
+
+    /// The pane key opens the pane, the same key closes it, and `Esc` closes it
+    /// too. The legend row changes with it, and the control is that the pane's
+    /// own legend is absent while it is closed — a legend that always said
+    /// "accept" would tell the user nothing about what the keystream does now.
+    #[test]
+    fn dm_pane_key_toggles_the_pane_and_its_legend() {
+        let mut app = drive_to_main();
+        for _ in 0..12 {
+            if app.main_focus() == MainFocus::TrustHistory {
+                break;
+            }
+            app.on_key(press(KeyCode::Tab));
+        }
+
+        let closed = buffer_rows(&app, 80, 24).join("\n");
+        assert!(
+            closed.contains("[c] dm"),
+            "the focused pane's legend must advertise the pane key; drew:\n{closed}"
+        );
+        assert!(
+            !closed.contains("[a] accept"),
+            "the pane's own legend was drawn while the pane was closed; drew:\n{closed}"
+        );
+
+        app.on_key(press(KeyCode::Char(DM_PANE_KEY)));
+        assert!(app.dm_pane_open());
+        let open = buffer_rows(&app, 80, 24).join("\n");
+        assert!(
+            open.contains("[a] accept") && open.contains("[c]/[Esc] close"),
+            "the open pane must draw its own legend; drew:\n{open}"
+        );
+
+        app.on_key(press(KeyCode::Char(DM_PANE_KEY)));
+        assert!(!app.dm_pane_open(), "the same key did not close the pane");
+        assert_eq!(
+            app.main_focus(),
+            MainFocus::TrustHistory,
+            "closing must return to the focus the pane was opened over"
+        );
+
+        app.on_key(press(KeyCode::Char(DM_PANE_KEY)));
+        app.on_key(press(KeyCode::Esc));
+        assert!(!app.dm_pane_open(), "Esc did not close the pane");
+        assert_eq!(
+            app.screen(),
+            &Screen::Main,
+            "Esc closing the pane must not also open the logged-in menu"
+        );
+    }
+
+    /// The composer captures the keystream at the STATE level, and the pane key
+    /// must lose to it. `MainFocus::PublicSpace` does not consume text, so a
+    /// variant-level test alone says the pane may open here — which is true
+    /// only until a composer is open, and then typing a word containing the
+    /// pane key would open the pane and eat the rest of it.
+    #[test]
+    fn the_public_space_composer_keeps_the_pane_key_as_text() {
+        let mut app = drive_to_main();
+        to_public_space(&mut app);
+        app.on_net_event(NetEvent::PublicSpaceSnapshot {
+            motd: None,
+            posts: Vec::new(),
+            can_compose: true,
+        });
+        app.on_key(press(KeyCode::Char('m')));
+        assert_eq!(app.compose_mode(), PublicComposeMode::Motd);
+
+        for ch in "circle".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+
+        assert!(
+            !app.dm_pane_open(),
+            "a character typed into the composer opened the pane"
+        );
+        assert_eq!(
+            app.compose_motd(),
+            "circle",
+            "the composer lost the characters that followed the pane key"
+        );
+    }
+
+    /// A received message is activity: it reorders the roster, and for a
+    /// correspondent nothing else has named it creates the row. Both halves,
+    /// because the fold could stamp without creating and lose the second.
+    #[test]
+    fn a_message_is_activity_and_creates_a_missing_row() {
+        let mut app = dm_pane_app();
+        dm_roster(&mut app, &[1, 2]);
+        let rows = dm_pane_rows(&app);
+        assert!(
+            dm_row_index(&rows, "correspondence 02020202")
+                < dm_row_index(&rows, "correspondence 01010101"),
+            "control: the roster order stands before the message"
+        );
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Message {
+            from: dm_pk(1),
+            seq: 0,
+            body: "hello".to_owned(),
+            sent_unix_ms: 1,
+        })));
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            dm_row_index(&rows, "correspondence 01010101")
+                < dm_row_index(&rows, "correspondence 02020202"),
+            "a message must move its correspondence to the top; drew:\n{}",
+            rows.join("\n")
+        );
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Message {
+            from: dm_pk(9),
+            seq: 0,
+            body: "hello".to_owned(),
+            sent_unix_ms: 1,
+        })));
+
+        let rows = dm_pane_rows(&app);
+        assert_eq!(
+            dm_row_index(&rows, "correspondence 09090909"),
+            dm_row_index(&rows, "correspondence 01010101") - 1,
+            "an inbound-only correspondent must get a row, above the older one; drew:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// The title text of the bottom input block, which is where every pane's
+    /// key legend is drawn. The block puts it in its TOP BORDER, so this reads
+    /// that row and strips the corners and the border fill.
+    fn legend_text(row: &str) -> String {
+        row.trim_start_matches('┌')
+            .trim_end_matches('┐')
+            .trim_end_matches('─')
+            .to_owned()
+    }
+
+    /// Every pane that offers the DM pane still shows its way out.
+    ///
+    /// `[c] dm` lengthened five legends that a bordered block truncates at 78
+    /// columns, and the hint truncation reaches first is the last one — which
+    /// on all five is `[Esc] back`. A row ending in a partial word is the whole
+    /// symptom; nothing errors.
+    #[test]
+    fn every_command_pane_legend_still_ends_with_the_back_hint() {
+        // The control is the trust-history legend as it was before it was
+        // shortened — 93 columns — cut to 78 the way the block cuts it. The
+        // assertion below must fail on this, or it cannot fail on anything.
+        let was = "trust history  [c] dm  [↑/↓] select  [Enter] dismiss selected  \
+                   [Tab] public-space  [Esc] back";
+        let cut: String = was.chars().take(78).collect();
+        assert!(
+            !legend_text(&format!("┌{cut}┐")).ends_with("[Esc] back"),
+            "the control legend must fail the assertion the panes pass"
+        );
+
+        for target in [
+            MainFocus::Shares,
+            MainFocus::TrustHistory,
+            MainFocus::PublicSpace,
+            MainFocus::Deprecation,
+            MainFocus::Fetched,
+        ] {
+            let mut app = drive_to_main();
+            for _ in 0..12 {
+                if app.main_focus() == target {
+                    break;
+                }
+                app.on_key(press(KeyCode::Tab));
+            }
+            assert_eq!(app.main_focus(), target, "the Tab cycle missed {target:?}");
+
+            let rows = buffer_rows(&app, 80, 24);
+            // The input block is the last three rows; its title is the first of
+            // them.
+            let legend = legend_text(&rows[rows.len() - 3]);
+            assert!(
+                legend.contains(&format!("[{DM_PANE_KEY}] dm")),
+                "{target:?} must advertise the pane key; legend: {legend:?}"
+            );
+            assert!(
+                legend.ends_with("[Esc] back"),
+                "{target:?} truncated its way out; legend: {legend:?}"
+            );
+        }
+    }
+
+    /// A modifier makes a different key. Without the check, the pane answers
+    /// chords nobody bound to it — and Ctrl-D queueing a `Decline` is the
+    /// expensive one, because the request is disposed of and nothing undoes it.
+    #[test]
+    fn modified_keys_neither_open_the_pane_nor_answer_a_request() {
+        use ratatui::crossterm::event::KeyModifiers;
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+
+        let mut app = drive_to_main();
+        for _ in 0..12 {
+            if app.main_focus() == MainFocus::TrustHistory {
+                break;
+            }
+            app.on_key(press(KeyCode::Tab));
+        }
+        app.on_key(ctrl(DM_PANE_KEY));
+        assert!(!app.dm_pane_open(), "a chord opened the pane");
+
+        let mut app = dm_pane_app();
+        dm_contact_request(&mut app, 0xAB);
+        for c in [DM_ACCEPT_KEY, DM_DECLINE_KEY, DM_BLOCK_KEY, DM_PANE_KEY] {
+            app.on_key(ctrl(c));
+        }
+        assert!(app.dm_pane_open(), "a chord closed the pane");
+        let cmds = app.take_pending_dm();
+        assert!(cmds.is_empty(), "a chord queued {cmds:?}");
+    }
+
+    /// Shift-held letters answer too, as they do in every other pane.
+    #[test]
+    fn upper_case_keys_answer_the_selected_request() {
+        use ratatui::crossterm::event::KeyModifiers;
+        let mut app = dm_pane_app();
+        dm_contact_request(&mut app, 0xAB);
+
+        app.on_key(KeyEvent::new(
+            KeyCode::Char(DM_ACCEPT_KEY.to_ascii_uppercase()),
+            KeyModifiers::SHIFT,
+        ));
+
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected one command, got {cmds:?}");
+        match &cmds[0] {
+            DmCommand::Accept { request } => assert_eq!(*request, dm_request(1, 0xAB)),
+            other => panic!("expected an Accept, got {other:?}"),
+        }
+    }
+
+    /// Answering is once per request, and the status line is why a second press
+    /// is tempting: nothing on the row changes, because the driver reports no
+    /// event for an answer. Without the guard the second press disposes of a
+    /// request the driver has already answered.
+    #[test]
+    fn answering_the_same_request_twice_sends_one_command() {
+        let mut app = dm_pane_app();
+        dm_contact_request(&mut app, 0xAB);
+
+        app.on_key(press(KeyCode::Char(DM_ACCEPT_KEY)));
+        assert!(
+            app.status().is_some_and(|s| s.contains("accepted")),
+            "the answer must be visible; status: {:?}",
+            app.status()
+        );
+        app.on_key(press(KeyCode::Char(DM_ACCEPT_KEY)));
+        app.on_key(press(KeyCode::Char(DM_DECLINE_KEY)));
+        app.on_key(press(KeyCode::Char(DM_BLOCK_KEY)));
+
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected exactly one command, got {cmds:?}");
+    }
+
+    /// Eviction at the cap removes row zero, so a cursor below it must move
+    /// with the rows. Otherwise the cursor keeps its index and lands on the
+    /// neighbour of the request the user was reading — and the actions answer
+    /// whatever the cursor is on.
+    #[test]
+    fn an_evicted_request_carries_the_cursor_with_it() {
+        let mut app = dm_pane_app();
+        for tag in 0..PENDING_REQUEST_CAP {
+            dm_contact_request(&mut app, tag as u8);
+        }
+        assert_eq!(app.dm_requests().len(), PENDING_REQUEST_CAP);
+        for _ in 0..5 {
+            app.on_key(press(KeyCode::Down));
+        }
+        let watched = app.dm_requests()[5].request.clone();
+        assert_eq!(app.dm_sel(), 5);
+
+        // One more arrival than the driver holds: the oldest row goes.
+        dm_contact_request(&mut app, 0xFE);
+
+        assert_eq!(app.dm_sel(), 4, "the cursor did not follow the shift");
+        assert_eq!(
+            app.dm_requests()[app.dm_sel()].request,
+            watched,
+            "the cursor is on a different request than before the eviction"
+        );
+    }
+
+    /// The cursor moves over several requests, and both the command it answers
+    /// and the drawn marker follow it. Asserting only the command would pass on
+    /// a pane that drew the marker on a fixed row.
+    #[test]
+    fn the_cursor_moves_over_two_requests() {
+        let mut app = dm_pane_app();
+        dm_contact_request(&mut app, 0x11);
+        dm_contact_request(&mut app, 0x22);
+        assert!(
+            dm_pane_rows(&app).contains(&"▶ pending request from 11111111".to_owned()),
+            "the marker starts on the first request"
+        );
+
+        app.on_key(press(KeyCode::Down));
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&"▶ pending request from 22222222".to_owned())
+                && rows.contains(&"  pending request from 11111111".to_owned()),
+            "the marker did not move to the second row; drew:\n{}",
+            rows.join("\n")
+        );
+        app.on_key(press(KeyCode::Char(DM_ACCEPT_KEY)));
+        let cmds = app.take_pending_dm();
+        match &cmds[0] {
+            DmCommand::Accept { request } => assert_eq!(*request, dm_request(1, 0x22)),
+            other => panic!("expected the second request's Accept, got {other:?}"),
+        }
+
+        app.on_key(press(KeyCode::Up));
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&"▶ pending request from 11111111".to_owned()),
+            "the marker did not move back; drew:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// Each correspondence state draws its own word. A pane that printed one
+    /// word for every state would tell the user a blocked correspondence is
+    /// writable, which is the thing the state exists to say.
+    #[test]
+    fn each_correspondence_state_draws_its_own_word() {
+        use daemonseed_veilid_net::dm::Correspondent;
+        let mut app = dm_pane_app();
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Roster {
+            correspondents: vec![
+                Correspondent {
+                    pk_lt: dm_pk(1),
+                    state: CorrespondentState::Pending,
+                },
+                Correspondent {
+                    pk_lt: dm_pk(2),
+                    state: CorrespondentState::Blocked,
+                },
+            ],
+        })));
+        // A delivery names a correspondence no roster did, so its state has
+        // never been stated — which the pane says rather than guesses.
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Delivery {
+            to: dm_pk(3),
+            seq: 0,
+            state: DeliveryState::Composed,
+        })));
+
+        let rows = dm_pane_rows(&app);
+        for expected in [
+            "correspondence 01010101 · pending acceptance",
+            "correspondence 02020202 · blocked",
+            "correspondence 03030303 · state not stated",
+        ] {
+            assert!(
+                rows.iter().any(|r| r.contains(expected)),
+                "expected {expected:?}; drew:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// `consumes_text` decides where the pane key is a command, so each pane's
+    /// answer is pinned rather than inferred. A variant added to the enum
+    /// without a decision here shows up as a wrong answer for a real pane.
+    #[test]
+    fn consumes_text_is_pinned_for_every_pane() {
+        for focus in [
+            MainFocus::Chat,
+            MainFocus::JoinCircle,
+            MainFocus::Mute,
+            MainFocus::DefineShare,
+            MainFocus::Hide,
+            MainFocus::Servers,
+        ] {
+            assert!(focus.consumes_text(), "{focus:?} turns a key into text");
+        }
+        for focus in [
+            MainFocus::Shares,
+            MainFocus::TrustHistory,
+            MainFocus::PublicSpace,
+            MainFocus::Deprecation,
+            MainFocus::Fetched,
+        ] {
+            assert!(!focus.consumes_text(), "{focus:?} takes keys as commands");
+        }
+    }
+
+    /// The pane key is a character wherever characters are text, so the six
+    /// input panes keep it. Asserted on the chat compose box, the one every
+    /// session starts in.
+    #[test]
+    fn the_pane_key_is_still_typable_in_the_chat_box() {
+        let mut app = drive_to_main();
+        assert_eq!(app.main_focus(), MainFocus::Chat);
+
+        app.on_key(press(KeyCode::Char(DM_PANE_KEY)));
+
+        assert!(
+            !app.dm_pane_open(),
+            "the pane opened from a focus that turns the key into text"
+        );
+        assert_eq!(app.compose(), "c", "the character was swallowed");
     }
 }

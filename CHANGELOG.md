@@ -26,6 +26,16 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-tui`: a direct-message pane, opened and closed with `[c]` from any pane that does not
+  turn a printable key into text, and closed with `Esc`. It lists the pending contact requests and
+  then the correspondences, newest first by the last driver event that named one, with both counts
+  in its title. `[a]`, `[d]` and `[b]` on a selected request send one `DmCommand::Accept`,
+  `Decline` or `Block`, which the binary forwards to the DM driver; `App::dm_pane_open`,
+  `App::dm_sel`, `App::dm_requests`, `App::dm_correspondences`, `App::take_pending_dm`,
+  `MainFocus::consumes_text`, `app::dm_fingerprint`, `DmCorrespondence::last_activity` and
+  `DmState::activity_seq` (#236). Each action sets a one-shot status line and answers a request
+  once — a later press on the same request queues nothing. `DmEvent::Message` now folds, creating
+  the correspondence row and stamping its recency (#236).
 - `daemonseed-core`: `ProjectAnnounceSeed`, `ProjectAnnounceSeedText`, `ProjectAnnounceSeedSource` and
   `SeedOrigin` — the operator instance's project-announce seed, loaded at runtime from
   `DAEMONSEED_PROJECT_ANNOUNCE_SEED` (read first) or `<profile-root>/project-announce.seed`
@@ -786,6 +796,10 @@ work lives in the maintainer's own planning notes, not here.
 - ISC-C80 is withdrawn and deregistered. It described a reconnect on a capped exponential backoff
   timer, and the `Backoff` type that was the timer is deleted. `ISA.md` keeps the ID as a reserved
   tombstone and `daemonseed_isc::TOTAL` falls from 245 to 244.
+- `daemonseed-tui`: the Shares pane's key legend carries the hints and its input line carries the
+  selected defined share and the serving count, which were previously appended to the legend after
+  `[Esc] back`. The trust-history, deprecation and shares legends are shortened so each fits an
+  80-column terminal with `[Esc] back` whole (#236).
 - A resumed channel's clear ratchet generation is agreed inside the settling legs rather than derived
   on each side: the `RE-ACK` carries the answering party's floor, the initiating party computes
   `reest::agreed_generation` from both floors, and the `RE-CONFIRM` carries the result. Each side
