@@ -604,6 +604,7 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- DM key-record and ack fetches release their read-pool permit on timeout instead of holding it across an unanswered read (#411)
 - `daemonseed-tui`: a graceful close publishes a LEAVE tombstone for every joined circle as well as
   the lobby, each sealed under its own circle key and posted to that circle's presence record,
   awaited concurrently under the close budget. (#368)

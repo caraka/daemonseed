@@ -1215,8 +1215,10 @@ pub async fn publish_at_subkey(
 /// The bound also caps how long a sweep's GET occupies the read-pool permit it holds for
 /// that GET's duration. That is a ceiling on the occupancy and not on the wait for it:
 /// `acquire_read` is awaited outside the bound, so a sweep can still queue indefinitely
-/// for a permit. Nor does it reach read-lane sites outside a sweep, which acquire from
-/// the same pool and are not governed by this constant.
+/// for a permit. One read-lane site outside a sweep is also governed by it: the two
+/// direct-message fetch reads bound their GET by this constant through
+/// `actor::gated_bounded_get`, under the same occupancy-not-wait split. Any other
+/// read-lane site draws the same pool without being governed by this constant.
 ///
 /// A GET cut off here counts in both `SweepOutcome::failed` and
 /// `SweepOutcome::timed_out` — see [`SweepOutcome`].

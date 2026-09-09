@@ -986,6 +986,11 @@ impl VeilidNetHandle {
     /// transport failure. The bytes are UNVERIFIED; pass them to
     /// `daemonseed_core::dm::keyrec::verify` with the identity pubkey the address
     /// was derived from before trusting anything in them.
+    ///
+    /// The read is bounded by the same per-GET timeout a record sweep applies: a
+    /// GET that has not answered by then is abandoned and returns
+    /// [`VeilidNetError::Routing`], the same transport failure an erroring GET
+    /// produces, rather than waiting indefinitely.
     pub async fn fetch_dm_key_record(&self, owner_seed: [u8; 32]) -> Result<Option<Vec<u8>>> {
         self.send(|reply| Command::FetchDmKeyRecord { owner_seed, reply })
             .await?
@@ -1214,6 +1219,11 @@ impl VeilidNetHandle {
     /// conversation's `chan_id`, address root and the correspondent's pseudonym
     /// public key, then merge the resulting `PeerAck` under the highest sequence
     /// number this end has actually sent, before trusting anything in them.
+    ///
+    /// The read is bounded by the same per-GET timeout a record sweep applies: a
+    /// GET that has not answered by then is abandoned and returns
+    /// [`VeilidNetError::Routing`], the same transport failure an erroring GET
+    /// produces, rather than waiting indefinitely.
     pub async fn fetch_dm_ack(&self, address: DmAckAddress) -> Result<Option<Vec<u8>>> {
         self.send(|reply| Command::FetchDmAck { address, reply })
             .await?
@@ -3028,6 +3038,39 @@ async fn publish_dm_key_record(
     rendezvous::publish_at_subkey(rc, &handle, &owner, DM_KEY_RECORD_SUBKEY, record).await
 }
 
+/// Run one read-lane GET under a read permit, bounded by
+/// [`rendezvous::SWEEP_GET_TIMEOUT`] (#411).
+///
+/// The permit is acquired first and `get` is polled only inside the bound, so the
+/// bound covers the read itself and never the wait for a permit — the same split a
+/// sweep's per-GET reads use. A read that has not answered when the bound expires is
+/// abandoned: the future is dropped and the permit released with it, so an unanswered
+/// read cannot hold a read-pool slot past the bound and later readers are not queued
+/// behind it for ever.
+///
+/// A read cut off at the bound is reported as [`VeilidNetError::Routing`], the same
+/// transport failure an erroring GET produces. Both say the same thing to a caller —
+/// the read did not deliver an answer and the record's state is unknown — and both
+/// stay distinct from `Ok(None)`, which is the authoritative *empty slot*.
+async fn gated_bounded_get<T, E: std::fmt::Display>(
+    gate: &Arc<DhtGate>,
+    what: &str,
+    get: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> Result<T> {
+    let got = {
+        let _read_permit = gate.acquire_read().await;
+        tokio::time::timeout(rendezvous::SWEEP_GET_TIMEOUT, get).await
+    };
+    match got {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(VeilidNetError::Routing(e.to_string())),
+        Err(_elapsed) => Err(VeilidNetError::Routing(format!(
+            "{what}: GET exceeded {}s, abandoned",
+            rendezvous::SWEEP_GET_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 /// Fetch a correspondent's DM key record from subkey 0 of its `dflt(1)` record.
 ///
 /// Returns `Ok(None)` for an empty slot — evicted, wiped, or never published —
@@ -3062,19 +3105,20 @@ async fn fetch_dm_key_record(
         )
         .await?
     };
-    // Read lane (WB-5.1 / I5″.2): one read permit around the one GET.
-    let got = {
-        let _read_permit = gate.acquire_read().await;
-        rc.get_dht_value(handle.key().clone(), DM_KEY_RECORD_SUBKEY, true)
-            .await
-    };
+    // Read lane (WB-5.1 / I5″.2): one read permit around the one GET, and the GET
+    // bounded so an unanswered read releases the permit rather than holding it (#411).
+    let got = gated_bounded_get(
+        gate,
+        "fetch_dm_key_record",
+        rc.get_dht_value(handle.key().clone(), DM_KEY_RECORD_SUBKEY, true),
+    )
+    .await?;
     match got {
-        Ok(Some(v)) => Ok(Some(v.data().to_vec())),
-        Ok(None) => {
+        Some(v) => Ok(Some(v.data().to_vec())),
+        None => {
             crate::vtrace!("fetch_dm_key_record: slot empty (evicted, wiped, or never published)");
             Ok(None)
         }
-        Err(e) => Err(VeilidNetError::Routing(e.to_string())),
     }
 }
 
@@ -3162,19 +3206,20 @@ async fn fetch_dm_ack(
         )
         .await?
     };
-    // Read lane (WB-5.1 / I5″.2): one read permit around the one GET.
-    let got = {
-        let _read_permit = gate.acquire_read().await;
-        rc.get_dht_value(handle.key().clone(), DM_ACK_SUBKEY, true)
-            .await
-    };
+    // Read lane (WB-5.1 / I5″.2): one read permit around the one GET, and the GET
+    // bounded so an unanswered read releases the permit rather than holding it (#411).
+    let got = gated_bounded_get(
+        gate,
+        "fetch_dm_ack",
+        rc.get_dht_value(handle.key().clone(), DM_ACK_SUBKEY, true),
+    )
+    .await?;
     match got {
-        Ok(Some(v)) => Ok(Some(v.data().to_vec())),
-        Ok(None) => {
+        Some(v) => Ok(Some(v.data().to_vec())),
+        None => {
             crate::vtrace!("fetch_dm_ack: slot empty (evicted or never written)");
             Ok(None)
         }
-        Err(e) => Err(VeilidNetError::Routing(e.to_string())),
     }
 }
 
@@ -6955,5 +7000,216 @@ mod tests {
             "the doorbell transport's own symbols are not in the production source — \
              this probe is matching nothing"
         );
+    }
+
+    // ── #411: an unanswered DM fetch must not hold its read permit for ever ───
+    /// A read-lane GET that never answers is abandoned at
+    /// [`rendezvous::SWEEP_GET_TIMEOUT`], which releases the read permit it holds, so a
+    /// later reader acquires one and completes instead of queueing behind the wedged
+    /// read for the process's lifetime. The read pool is sized to ONE permit, so the
+    /// later acquire can only succeed by the wedged read having given its permit back.
+    ///
+    /// The abandoned read surfaces as [`VeilidNetError::Routing`] — the transport
+    /// failure the fetch callers already handle — and never as `Ok(None)`, which would
+    /// report an unread slot as an authoritative empty one.
+    ///
+    /// This exercises [`gated_bounded_get`], the bounded read both DM fetch paths go
+    /// through; the fetch functions themselves need a live `RoutingContext` to reach
+    /// `get_dht_value` and so cannot be driven from a unit test. Runs on tokio's paused
+    /// clock, so the asserted wait is virtual time advanced by the bound's own timer.
+    /// The outer timeout is what turns a permit that is never released into a failed
+    /// assertion instead of a test that hangs.
+    #[tokio::test(start_paused = true)]
+    async fn a_dm_fetch_releases_its_read_permit_when_the_get_never_answers() {
+        // Only the READ pool is sized to one, so a later read that acquires can only
+        // have drawn the read pool — an acquire that reached another pool would find
+        // spare permits there and pass for the wrong reason.
+        let gate = DhtGate::with_pools(2, 1, 2, 1);
+
+        let wedged_gate = gate.clone();
+        let wedged = tokio::spawn(async move {
+            let never =
+                std::future::pending::<std::result::Result<Option<Vec<u8>>, VeilidNetError>>();
+            gated_bounded_get(&wedged_gate, "fetch_dm_key_record", never).await
+        });
+        // Let the wedged read take the only read permit before anything else asks for
+        // one — the assertion below is what proves it did, rather than assuming it.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            gate.available_read(),
+            0,
+            "the unanswered read holds the pool's only read permit"
+        );
+
+        let started = tokio::time::Instant::now();
+        let later_read = tokio::time::timeout(
+            rendezvous::SWEEP_GET_TIMEOUT + Duration::from_secs(30),
+            gate.acquire_read(),
+        )
+        .await
+        .expect(
+            "a later read acquires a permit — the unanswered read released its own at \
+             the bound instead of holding it",
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= rendezvous::SWEEP_GET_TIMEOUT,
+            "the unanswered read was given its full bound before being abandoned: {waited:?}"
+        );
+        assert!(
+            waited < rendezvous::SWEEP_GET_TIMEOUT + Duration::from_secs(1),
+            "the permit came back at the bound, not later: {waited:?}"
+        );
+
+        // Bounded: an abandoned read must RETURN, not merely release its permit. Without
+        // the outer bound, a read that gave the permit back and then hung would park
+        // here for ever rather than failing.
+        let err = tokio::time::timeout(Duration::from_secs(1), wedged)
+            .await
+            .expect("the abandoned read returns")
+            .expect("the wedged read's task finished")
+            .expect_err("an abandoned read is a failure, never an empty slot");
+        assert!(
+            matches!(err, VeilidNetError::Routing(_)),
+            "an abandoned read is reported as the existing transport failure, not a \
+             new error class: {err:?}"
+        );
+        drop(later_read);
+    }
+
+    /// The bound must not disturb the two outcomes it is wrapped around: an answering
+    /// read is passed through unchanged, and an erroring one becomes
+    /// [`VeilidNetError::Routing`] carrying the read's own message. Both give the read
+    /// permit back, so a read that answers or errors costs the pool nothing beyond its
+    /// own duration.
+    #[tokio::test]
+    async fn a_bounded_read_passes_an_answer_through_and_reports_an_error() {
+        let gate = DhtGate::with_pools(2, 1, 2, 1);
+
+        let answered = gated_bounded_get(&gate, "fetch_dm_key_record", async {
+            Ok::<_, String>(Some(vec![1u8]))
+        })
+        .await
+        .expect("an answering read reaches the caller as an answer");
+        assert_eq!(
+            answered,
+            Some(vec![1u8]),
+            "the read's own bytes reach the caller unchanged"
+        );
+        assert_eq!(
+            gate.available_read(),
+            1,
+            "an answering read gives its permit back"
+        );
+
+        let err = gated_bounded_get(&gate, "fetch_dm_ack", async {
+            Err::<Option<Vec<u8>>, _>("boom".to_string())
+        })
+        .await
+        .expect_err("an erroring read is a failure, never an empty slot");
+        match err {
+            VeilidNetError::Routing(ref reported) => assert!(
+                reported.contains("boom"),
+                "the read's own error text reaches the caller: {reported}"
+            ),
+            other => panic!("an erroring read is the existing transport failure: {other:?}"),
+        }
+        assert_eq!(
+            gate.available_read(),
+            1,
+            "an erroring read gives its permit back"
+        );
+    }
+
+    /// **The bound covers the read, never the wait for a permit.** The only read permit
+    /// is held elsewhere for `HOLD` before it is released, and the read that then
+    /// acquires it never answers, so the call must last the whole wait PLUS its full
+    /// bound. A bound taken around the acquire as well would spend itself waiting and
+    /// abandon the read the moment it began, finishing at `HOLD` — which is what makes
+    /// the lower assertion the one with teeth.
+    #[tokio::test(start_paused = true)]
+    async fn a_bounded_read_is_bounded_from_its_permit_not_from_the_call() {
+        const HOLD: Duration = Duration::from_secs(20);
+        let gate = DhtGate::with_pools(2, 1, 2, 1);
+
+        let held = gate.acquire_read().await;
+        let holder = tokio::spawn(async move {
+            tokio::time::sleep(HOLD).await;
+            drop(held);
+        });
+
+        let started = tokio::time::Instant::now();
+        let never = std::future::pending::<std::result::Result<Option<Vec<u8>>, VeilidNetError>>();
+        let got = tokio::time::timeout(
+            HOLD + rendezvous::SWEEP_GET_TIMEOUT + Duration::from_secs(30),
+            gated_bounded_get(&gate, "fetch_dm_key_record", never),
+        )
+        .await
+        .expect("the read is abandoned at its bound and returns");
+        let elapsed = started.elapsed();
+
+        assert!(
+            got.is_err(),
+            "a read that never answers is abandoned, whatever it waited for its permit"
+        );
+        assert!(
+            elapsed >= HOLD + rendezvous::SWEEP_GET_TIMEOUT,
+            "the read got its full bound AFTER the permit wait, not inside it: {elapsed:?}"
+        );
+        assert!(
+            elapsed < HOLD + rendezvous::SWEEP_GET_TIMEOUT + Duration::from_secs(1),
+            "the read ended one bound past the permit, not later: {elapsed:?}"
+        );
+        holder.await.expect("the permit holder's task finished");
+    }
+
+    /// **Both DM fetch reads reach the read pool only through the bounded read.** The
+    /// bound lives in one function, so a handler that acquired a permit itself and
+    /// awaited `get_dht_value` directly would be unbounded again with every gate still
+    /// green — the shape needs a live DHT to observe, so it is pinned from the source.
+    ///
+    /// Needles are assembled from fragments so this test's own source text does not
+    /// self-match, as the sibling source probes do.
+    #[test]
+    fn both_dm_fetch_reads_go_through_the_bounded_read() {
+        let src = include_str!("actor.rs");
+        let (prod, _) = src
+            .split_once("#[cfg(test)]")
+            .expect("the tests-module marker moved");
+
+        let bounded: String = ["gated_bounded", "_get"].concat();
+        assert_eq!(
+            prod.matches(bounded.as_str()).count(),
+            3,
+            "the bounded read must be named exactly three times outside the tests: its \
+             own definition, and one call from each of the two DM fetch handlers. A \
+             fourth naming is a third read site nothing here accounts for"
+        );
+
+        let permit: String = ["acquire", "_read"].concat();
+        for handler in [
+            "\nasync fn fetch_dm_key_record(",
+            "\nasync fn fetch_dm_ack(",
+        ] {
+            let start = prod
+                .find(handler)
+                .expect("a DM fetch handler's definition moved");
+            let body = &prod[start..];
+            let body = &body[..body
+                .find("\n}\n")
+                .expect("a DM fetch handler's closing brace moved")];
+            // Positive control: this is the handler's real body. A slice that cut to
+            // nothing would satisfy the assertion below while reading no code at all.
+            assert!(
+                body.contains(bounded.as_str()),
+                "{handler} does not name the bounded read — this probe is matching \
+                 the wrong text"
+            );
+            assert!(
+                !body.contains(permit.as_str()),
+                "{handler} must reach the read pool through the bounded read alone; a \
+                 handler that takes its own permit is an unbounded read again"
+            );
+        }
     }
 }
