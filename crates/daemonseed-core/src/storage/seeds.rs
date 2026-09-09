@@ -436,6 +436,70 @@ fn push_hex(out: &mut String, bytes: &[u8]) {
     }
 }
 
+/// Which of `decode_hex_secret`'s two buffers a report describes.
+///
+/// The helper holds the decoded secret in two allocations in turn, and they have
+/// different lifetimes: the scratch buffer is released before the helper returns,
+/// while the returned copy is still live when a later field of the same payload
+/// fails to parse. A watcher that cannot tell them apart cannot say which one it
+/// observed.
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodedSecretBuffer {
+    /// The buffer the hex is decoded into, released before the decode returns.
+    Scratch,
+    /// The buffer the decode returns, released by whoever takes ownership of it.
+    Returned,
+}
+
+/// Called with the kind of one decode buffer, its start address, and its length.
+#[cfg(feature = "testing")]
+pub type DecodedSecretObserver = fn(DecodedSecretBuffer, usize, usize);
+
+/// The installed observer, or `None`.
+#[cfg(feature = "testing")]
+static DECODED_SECRET_OBSERVER: std::sync::Mutex<Option<DecodedSecretObserver>> =
+    std::sync::Mutex::new(None);
+
+/// Install an observer called with the kind, start address and length of every
+/// buffer a secret hex decode holds its plaintext in, while that buffer is still
+/// live; `None` removes it.
+///
+/// It reports an address rather than the bytes, so a watcher can name the exact
+/// allocation the decode used. Both reports are made from inside the decode, at
+/// the only moment either buffer can be pointed at from outside: the scratch
+/// buffer never escapes, and the returned buffer is dropped by a `?` on a later
+/// field of the same payload, so neither address can be recovered afterwards.
+///
+/// This exists for the behavioural zeroize witness in
+/// `tests/secret_zeroize_on_drop.rs`, which needs a `GlobalAlloc` hook and so
+/// must live outside a crate that forbids `unsafe`. It is gated so no consumer of
+/// the crate can reach it, on the same terms as the other witness hooks here.
+///
+/// The observer is a plain function pointer and is called with the decode's own
+/// stack frame live, so it must not allocate, must not re-enter the decode, and
+/// must not block on anything the calling thread holds.
+#[cfg(feature = "testing")]
+pub fn observe_decoded_secret_buffers(observer: Option<DecodedSecretObserver>) {
+    *DECODED_SECRET_OBSERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = observer;
+}
+
+/// Report one live decode buffer to the installed observer, if there is one.
+///
+/// The observer is copied out and the lock released before the call, so an
+/// observer that installs or removes one cannot deadlock against this.
+#[cfg(feature = "testing")]
+fn report_decoded_secret_buffer(kind: DecodedSecretBuffer, bytes: &[u8]) {
+    let observer = *DECODED_SECRET_OBSERVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(observer) = observer {
+        observer(kind, bytes.as_ptr() as usize, bytes.len());
+    }
+}
+
 /// Decode one hex-encoded **secret** field of the payload, wrapped from the
 /// moment its bytes exist (#343).
 ///
@@ -484,8 +548,13 @@ fn decode_hex_secret(src: &str) -> Result<Zeroizing<String>, BlobError> {
     }
     let mut bytes = Zeroizing::new(vec![0u8; src.len() / 2]);
     hex::decode_to_slice(src, bytes.as_mut_slice()).map_err(|_| BlobError::InvalidPlaintext)?;
+    #[cfg(feature = "testing")]
+    report_decoded_secret_buffer(DecodedSecretBuffer::Scratch, bytes.as_slice());
     let text = core::str::from_utf8(&bytes).map_err(|_| BlobError::InvalidPlaintext)?;
-    Ok(Zeroizing::new(text.to_owned()))
+    let decoded = Zeroizing::new(text.to_owned());
+    #[cfg(feature = "testing")]
+    report_decoded_secret_buffer(DecodedSecretBuffer::Returned, decoded.as_bytes());
+    Ok(decoded)
 }
 
 /// One remembered circle in the at-rest blob (ISC-C59 persistence, M13).

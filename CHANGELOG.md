@@ -701,6 +701,10 @@ work lives in the maintainer's own planning notes, not here.
   decrypted payload in `open_v2` and `open_v1`. Every one is now held in `Zeroizing` from the
   byte it exists. (#343)
 
+- `secret_zeroize_on_drop`: the parse-error case is armed on the buffer the secret hex decode
+  reports rather than on the first allocation of the secret's length, so another allocation of
+  that length can neither take the watch nor disarm it. (#422)
+
 - Corrected the TUI's whole-share download to a user-chosen destination, which placed
   files at their share-root-relative paths and so dropped the share's own folder name —
   a single-depth share landed as loose files in the chosen folder. It now wraps them

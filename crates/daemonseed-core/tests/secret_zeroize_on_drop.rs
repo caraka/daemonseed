@@ -75,8 +75,8 @@
 //! in `dm::reest` and `dm::ratchet`; no case in this file can go red on it.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use daemonseed_core::circle::key::{
     derive_circle_presence_veilid_owner_seed, derive_circle_veilid_owner_seed,
@@ -93,7 +93,9 @@ use daemonseed_core::dm::resume::{
 use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_room::derive_room_veilid_owner_seed;
-use daemonseed_core::storage::seeds::{PersistedCircle, Seeds};
+use daemonseed_core::storage::seeds::{
+    DecodedSecretBuffer, PersistedCircle, Seeds, observe_decoded_secret_buffers,
+};
 use oxicrypt_ml_dsa::{PK_LEN, SK_LEN as ML_DSA_SK_LEN};
 use oxicrypt_ml_kem::{DK_LEN, EK_LEN};
 use zeroize::Zeroizing;
@@ -140,9 +142,8 @@ const CIRCLE_LABEL_CAP: usize = 72;
 /// The capacity carries deliberate slack so the block-size control has something
 /// to assert: a production copy or reallocation collapses it to an exact fit and
 /// the case notices. It is **not** here for distinctness from the other watched
-/// capacities (96, 72, 128) — that reasoning belongs to the `ARM_SIZE`-armed cases
-/// and this one is armed by address, so a same-sized allocation elsewhere cannot
-/// be mistaken for it.
+/// capacities (96, 72, 128): every watch here is armed by address, so a
+/// same-sized allocation elsewhere cannot be mistaken for it.
 ///
 /// The phrase text differs from `PersistedCircle`'s because both hold the same
 /// *kind* of secret, and a snapshot matching the wrong one would otherwise read as
@@ -172,6 +173,18 @@ static WATCH_LEN: AtomicUsize = AtomicUsize::new(0);
 /// finding some other block that happens to contain the address.
 static CAPTURED_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static CAPTURED_BLOCK: AtomicUsize = AtomicUsize::new(0);
+/// How many bytes were snapshotted, recorded at the moment of the snapshot.
+///
+/// Read instead of [`WATCH_LEN`], which by then may describe a later arming while
+/// [`SNAPSHOT`] still holds the first capture — a pair that would report one
+/// buffer's bytes under another's length.
+static CAPTURED_LEN: AtomicUsize = AtomicUsize::new(0);
+/// Every block this allocator has released, counted. A monotonic clock over
+/// frees, so two frees can be ordered against each other without recording when
+/// either happened.
+static FREES: AtomicUsize = AtomicUsize::new(0);
+/// The value of [`FREES`] at the moment the watched block was snapshotted.
+static CAPTURED_AT_FREE: AtomicUsize = AtomicUsize::new(0);
 /// Set once the watched block has actually been freed and snapshotted.
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// Set when a watched range was carried through `realloc`. The watch is disarmed
@@ -198,69 +211,126 @@ struct FreeWitness;
 /// containment is both the "is this the secret's block" test and the bounds proof
 /// for every `ptr.add(offset + i)` read: `watched >= block` makes `offset` the true
 /// difference, and the two length comparisons cannot underflow given it.
-fn watch_offset_in(block: usize, size: usize) -> Option<usize> {
+///
+/// `want` is the watched length, passed in rather than loaded here so a caller
+/// that then reads the block uses the same value it was bounds-checked against.
+/// Loading it twice would let a re-arming between the two loads produce a length
+/// the containment test never approved.
+fn watch_offset_in(block: usize, size: usize, want: usize) -> Option<usize> {
     let watched = WATCH_ADDR.load(Ordering::SeqCst);
-    let want = WATCH_LEN.load(Ordering::SeqCst);
     let offset = watched.wrapping_sub(block);
     (watched != 0 && watched >= block && offset <= size && want <= size - offset).then_some(offset)
 }
 
-/// Size of the *next* allocation to arm the watch on, or 0 when disarmed.
+/// How many decode buffers have been reported since the watch was reset.
+///
+/// A structural assertion for the cases that read it: a secret hex decode holds
+/// its plaintext in two buffers in turn, so a count that is not two means the
+/// decode no longer has the shape the case names.
+static REPORTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Which of the decode's two buffers the current run watches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Watched {
+    /// The buffer the decode returns, still live when a later field fails.
+    Returned,
+    /// The buffer the decode writes into, released before it returns.
+    Scratch,
+}
+
+/// Set when the run watches [`Watched::Scratch`] rather than the returned buffer.
+static WATCH_SCRATCH: AtomicBool = AtomicBool::new(false);
+
+/// The address the watch was armed on, kept after `dealloc` clears
+/// [`WATCH_ADDR`] so a case can still say which buffer it watched.
+static ARMED_ADDR: AtomicUsize = AtomicUsize::new(0);
+/// The address reported for the scratch buffer, and the value of [`FREES`] when
+/// that report was made.
+static SCRATCH_ADDR: AtomicUsize = AtomicUsize::new(0);
+static SCRATCH_REPORTED_AT_FREE: AtomicUsize = AtomicUsize::new(0);
+/// The value of [`FREES`] when the block at [`SCRATCH_ADDR`] was released, or 0
+/// if it has not been.
+static SCRATCH_FREED_AT: AtomicUsize = AtomicUsize::new(0);
+
+/// Set while a case wants the arming of the watch to wait for the churn thread,
+/// and set to the outcome of that wait.
+static STRESS_WINDOW: AtomicBool = AtomicBool::new(false);
+static CHURN_ADVANCED_WHILE_ARMED: AtomicBool = AtomicBool::new(false);
+/// Rounds of same-sized allocation the churn thread has completed.
+static CHURN_ROUNDS: AtomicUsize = AtomicUsize::new(0);
+/// How long the arming will wait for the churn thread before giving up. Large
+/// enough that only a churn thread which is not running can exhaust it.
+const CHURN_SPIN_BOUND: u64 = 10_000_000;
+
+/// Wait for the churn thread to complete at least one more round, so the watch is
+/// provably armed while another thread is allocating blocks of the secret's
+/// length. `false` means the bound expired.
+///
+/// Reads one atomic in a loop and allocates nothing, which is what the observer
+/// contract requires of anything called from inside the decode.
+fn wait_for_churn_round() -> bool {
+    let start = CHURN_ROUNDS.load(Ordering::SeqCst);
+    for _ in 0..CHURN_SPIN_BOUND {
+        if CHURN_ROUNDS.load(Ordering::SeqCst) > start {
+            return true;
+        }
+        std::hint::spin_loop();
+    }
+    false
+}
+
+/// Point the watch at the buffer a report names, and count every report.
 ///
 /// The cases above all hold the secret in a value the test constructs, so they
-/// arm by taking its address. `#343`'s secret is different in kind: it is a
-/// buffer created and dropped entirely *inside* `Seeds::from_plaintext`, on an
-/// error path, and it never escapes for a test to point at. Arming by allocation
-/// size is how a watch reaches it — the first block of exactly this size handed
-/// out after arming is the one the parser decoded into.
+/// arm by taking its address. #343's secret is different in kind: it is decoded
+/// and dropped entirely *inside* `Seeds::from_plaintext`, on an error path, and it
+/// never escapes for a test to point at. The decode reports each buffer it holds
+/// that secret in while the buffer is still live, and this arms the watch on the
+/// one the report identifies — so the watched block is the decode's own, named by
+/// address. Nothing else in the process can be mistaken for it, whatever it
+/// allocates and at whatever size, and nothing else reallocates it.
 ///
-/// Deliberately not a scan of every freed block for the secret's bytes, which is
-/// the obvious alternative: a block's tail can be uninitialized (`Vec` slack), and
-/// reading it would be UB — the very thing whole-range containment above exists to
-/// avoid. An exact-size block that the decoder filled is initialized to its last
-/// byte, so reading all of it stays sound.
-static ARM_SIZE: AtomicUsize = AtomicUsize::new(0);
+/// Most runs watch the returned buffer, which is the one still live when the
+/// later field fails. The scratch buffer is released before the decode returns,
+/// so a watch on it says nothing about the parser's error path — it has its own
+/// case instead, which asserts what that buffer holds when it goes back.
+///
+/// Both reports are recorded whichever is watched. The scratch address and the
+/// free-clock reading at each report are what let a case state that the two
+/// buffers are different blocks and that they were released in the order the
+/// decode's shape implies — an ordering a run that has merely captured zeros at
+/// offset 0 of a right-sized block cannot distinguish.
+///
+/// Allocates nothing and takes no lock, so it is safe to run from inside the
+/// decode with a watch already live.
+fn arm_on_reported_buffer(kind: DecodedSecretBuffer, addr: usize, len: usize) {
+    REPORTS.fetch_add(1, Ordering::SeqCst);
+    let frees = FREES.load(Ordering::SeqCst);
+    if kind == DecodedSecretBuffer::Scratch {
+        SCRATCH_ADDR.store(addr, Ordering::SeqCst);
+        SCRATCH_REPORTED_AT_FREE.store(frees, Ordering::SeqCst);
+    }
 
-/// How many matching allocations to let past before arming.
-///
-/// **Load-bearing, and the case is wrong without it.** On the path under test two
-/// buffers of the secret's exact length are allocated in order: the decode buffer
-/// inside `decode_hex_secret`, and the `to_owned()` copy it returns. The decode
-/// buffer is freed at the end of that helper — *before* the label decode whose
-/// failure this case is about — so arming on the first match observes a buffer
-/// whose wipe says nothing about the entry point's error path. Skipping one match
-/// puts the watch on the returned copy, which is the value still live when the
-/// parser returns `Err`.
-static ARM_SKIP: AtomicUsize = AtomicUsize::new(0);
-
-/// How many allocations of the armed size were seen while armed.
-///
-/// Read by the case as a structural assertion: the path is documented to allocate
-/// exactly two, and a count that is not two means the shape changed underneath the
-/// skip above, which would silently move the watch to a different buffer.
-static ARM_SEEN: AtomicUsize = AtomicUsize::new(0);
-
-/// Point the existing address watch at a block of the armed size.
-///
-/// Called from `alloc`/`alloc_zeroed` so the rest of the machinery — the
-/// containment test, the snapshot, `CAPTURED`, the realloc disarm — is reached
-/// unchanged; only the way the watch gets armed is new. Disarms `ARM_SIZE` once it
-/// arms, so a later same-sized allocation cannot move the watch off the block
-/// being observed.
-///
-/// Allocates nothing, so there is no re-entry into the allocator.
-fn arm_on_size(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || ARM_SIZE.load(Ordering::SeqCst) != size {
+    let wanted = if WATCH_SCRATCH.load(Ordering::SeqCst) {
+        DecodedSecretBuffer::Scratch
+    } else {
+        DecodedSecretBuffer::Returned
+    };
+    if kind != wanted {
         return;
     }
-    ARM_SEEN.fetch_add(1, Ordering::SeqCst);
-    if ARM_SKIP.load(Ordering::SeqCst) > 0 {
-        ARM_SKIP.fetch_sub(1, Ordering::SeqCst);
-        return;
+
+    // Disarm before re-arming: between the two stores the length and the address
+    // describe different blocks, and a free landing there would be bounds-checked
+    // against a length that is not this block's.
+    WATCH_ADDR.store(0, Ordering::SeqCst);
+    WATCH_LEN.store(len, Ordering::SeqCst);
+    ARMED_ADDR.store(addr, Ordering::SeqCst);
+    WATCH_ADDR.store(addr, Ordering::SeqCst);
+
+    if STRESS_WINDOW.load(Ordering::SeqCst) {
+        CHURN_ADVANCED_WHILE_ARMED.store(wait_for_churn_round(), Ordering::SeqCst);
     }
-    ARM_SIZE.store(0, Ordering::SeqCst);
-    WATCH_LEN.store(size, Ordering::SeqCst);
-    WATCH_ADDR.store(ptr as usize, Ordering::SeqCst);
 }
 
 // SAFETY: every method forwards to `System` with the pointer and layout it was
@@ -276,15 +346,11 @@ fn arm_on_size(ptr: *mut u8, size: usize) {
 // allocator.
 unsafe impl GlobalAlloc for FreeWitness {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        arm_on_size(ptr, layout.size());
-        ptr
+        unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc_zeroed(layout) };
-        arm_on_size(ptr, layout.size());
-        ptr
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -298,7 +364,8 @@ unsafe impl GlobalAlloc for FreeWitness {
         // containment matching any larger block later handed out at that address
         // would satisfy it on ITS free, which is a false pass. So disarm, and
         // record that a realloc is why nothing was captured.
-        if watch_offset_in(ptr as usize, layout.size()).is_some() {
+        let want = WATCH_LEN.load(Ordering::SeqCst);
+        if watch_offset_in(ptr as usize, layout.size(), want).is_some() {
             WATCH_ADDR.store(0, Ordering::SeqCst);
             REALLOCATED.store(true, Ordering::SeqCst);
         }
@@ -306,13 +373,26 @@ unsafe impl GlobalAlloc for FreeWitness {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if let Some(offset) = watch_offset_in(ptr as usize, layout.size()) {
+        let frees = FREES.fetch_add(1, Ordering::SeqCst) + 1;
+
+        // The scratch buffer going back. Recorded once, so a block later handed
+        // out at the same address cannot overwrite the reading.
+        let scratch = SCRATCH_ADDR.load(Ordering::SeqCst);
+        if scratch != 0 && ptr as usize == scratch && SCRATCH_FREED_AT.load(Ordering::SeqCst) == 0 {
+            SCRATCH_FREED_AT.store(frees, Ordering::SeqCst);
+        }
+
+        // Loaded once, and the same value bounds the read below. Loading it again
+        // for the loop would read past the block if an arming in between raised it
+        // while `WATCH_ADDR` still named this one.
+        let want = WATCH_LEN.load(Ordering::SeqCst);
+        if let Some(offset) = watch_offset_in(ptr as usize, layout.size(), want) {
             // Disarm before snapshotting: once this block is back with the
             // allocator its address can be handed out again, and a later free of
             // the reused block must not overwrite what we saw.
             WATCH_ADDR.store(0, Ordering::SeqCst);
 
-            let len = WATCH_LEN.load(Ordering::SeqCst).min(SNAPSHOT_CAP);
+            let len = want.min(SNAPSHOT_CAP);
             for (i, slot) in SNAPSHOT.iter().enumerate().take(len) {
                 // SAFETY: `offset + i < offset + len <= layout.size()`, so this
                 // stays inside the block the allocator is being asked to free.
@@ -320,6 +400,8 @@ unsafe impl GlobalAlloc for FreeWitness {
             }
             CAPTURED_OFFSET.store(offset, Ordering::SeqCst);
             CAPTURED_BLOCK.store(layout.size(), Ordering::SeqCst);
+            CAPTURED_LEN.store(want, Ordering::SeqCst);
+            CAPTURED_AT_FREE.store(frees, Ordering::SeqCst);
             CAPTURED.store(true, Ordering::SeqCst);
         }
         unsafe { System.dealloc(ptr, layout) }
@@ -455,20 +537,14 @@ fn init() {
 
 /// Length of the circle entropy the #343 cases decode.
 ///
-/// **A power of two, and that is load-bearing for the probe rather than
-/// arbitrary.** `hex::decode` collects through a `Result` adapter whose
-/// `size_hint` lower bound is 0, so the decoded buffer is grown geometrically
-/// instead of reserved once: measured, 137 bytes decode into a 256-byte
-/// allocation and 3 001 into a 4 096-byte one. At any such length the freed
-/// block's size is not the secret's length, and a watch armed on the length
-/// never fires — which reads as "observed nothing" rather than as a verdict.
-/// At 4 096 the grown capacity lands exactly on the length, so the same watch
-/// observes the buffer whether or not the fix is present, and the case can fail
-/// for the right reason.
+/// The length is free to be anything the snapshot buffer can hold. The watch is
+/// armed on the address the decode reports, not on an allocation size, so a
+/// length that collides with unrelated allocations costs nothing and a length
+/// whose buffer is grown past it cannot hide the buffer from the watch.
 ///
 /// A 4 096-byte circle entropy is not a realistic phrase, and does not need to
 /// be: the parser applies no length rule, and what is under test is the buffer's
-/// lifetime, not its contents. It is also within `SNAPSHOT_CAP`.
+/// lifetime, not its contents. It is within `SNAPSHOT_CAP`.
 const DECODE_SECRET_LEN: usize = 4096;
 
 /// The circle entropy those cases decode, as its own bytes. Distinctive text
@@ -494,77 +570,134 @@ fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
-/// Run `body`, watching the first heap block of exactly `DECODE_SECRET_LEN`
-/// bytes allocated after arming, and hand back what that block held when it was
+/// What the watched decode buffer looked like on its way back to the allocator.
+struct FreedBuffer {
+    /// The bytes the watched range held at the moment its block was freed.
+    bytes: Zeroizing<Vec<u8>>,
+    /// Where the watched range sat inside the freed block.
+    offset: usize,
+    /// How big the freed block was.
+    block: usize,
+    /// How many decode buffers were reported over the run.
+    reports: usize,
+    /// The address the watch was armed on.
+    armed_addr: usize,
+    /// The address reported for the scratch buffer, and the free-clock readings
+    /// at its report, at its release, and at the watched block's snapshot.
+    scratch_addr: usize,
+    scratch_reported_at: usize,
+    scratch_freed_at: usize,
+    captured_at: usize,
+}
+
+/// Run `body` with the watch armed on whatever decode buffer is reported to
+/// [`arm_on_reported_buffer`], and hand back what that block held when it was
 /// freed.
 ///
 /// `Err` means the run observed nothing — which every caller must treat as
 /// inconclusive rather than as a pass, since an unobserved block proves nothing
 /// about its contents. The two reasons are reported separately because they call
 /// for different fixes: a reallocation means the watch was disarmed mid-flight,
-/// while nothing captured means the armed size never matched a freed block, and
-/// the usual cause of the latter is a size that collides with an unrelated
-/// allocation earlier on the path.
-fn freed_bytes_of_decode_sized_block(
-    skip: usize,
+/// while nothing captured means no freed block ever contained the reported
+/// buffer. Each message carries the number of buffers reported, which separates
+/// "the decode never ran, or reported nothing" from "it reported and the watch
+/// still saw no free".
+fn freed_bytes_of_reported_decode_buffer(
+    watched: Watched,
     body: impl FnOnce(),
-) -> Result<(Zeroizing<Vec<u8>>, usize), &'static str> {
+) -> Result<FreedBuffer, String> {
     let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     WATCH_ADDR.store(0, Ordering::SeqCst);
+    WATCH_LEN.store(0, Ordering::SeqCst);
     CAPTURED.store(false, Ordering::SeqCst);
     REALLOCATED.store(false, Ordering::SeqCst);
     CAPTURED_OFFSET.store(0, Ordering::SeqCst);
     CAPTURED_BLOCK.store(0, Ordering::SeqCst);
-    ARM_SKIP.store(skip, Ordering::SeqCst);
-    ARM_SEEN.store(0, Ordering::SeqCst);
-    ARM_SIZE.store(DECODE_SECRET_LEN, Ordering::SeqCst);
+    CAPTURED_LEN.store(0, Ordering::SeqCst);
+    CAPTURED_AT_FREE.store(0, Ordering::SeqCst);
+    ARMED_ADDR.store(0, Ordering::SeqCst);
+    SCRATCH_ADDR.store(0, Ordering::SeqCst);
+    SCRATCH_REPORTED_AT_FREE.store(0, Ordering::SeqCst);
+    SCRATCH_FREED_AT.store(0, Ordering::SeqCst);
+    REPORTS.store(0, Ordering::SeqCst);
+    WATCH_SCRATCH.store(watched == Watched::Scratch, Ordering::SeqCst);
+    observe_decoded_secret_buffers(Some(arm_on_reported_buffer));
 
     body();
 
-    ARM_SIZE.store(0, Ordering::SeqCst);
-    ARM_SKIP.store(0, Ordering::SeqCst);
+    observe_decoded_secret_buffers(None);
     WATCH_ADDR.store(0, Ordering::SeqCst);
-    let seen = ARM_SEEN.swap(0, Ordering::SeqCst);
+    WATCH_SCRATCH.store(false, Ordering::SeqCst);
+    let reports = REPORTS.swap(0, Ordering::SeqCst);
+    let len = CAPTURED_LEN.load(Ordering::SeqCst);
 
     if REALLOCATED.load(Ordering::SeqCst) {
-        return Err("the watched block was reallocated, which disarms the watch");
+        return Err(format!(
+            "the watched buffer was reallocated, which disarms the watch; \
+             {reports} decode buffers were reported"
+        ));
     }
     if !CAPTURED.load(Ordering::SeqCst) {
-        return Err(
-            "no block of the watched size was freed while armed — most likely the \
-             armed size matched an unrelated earlier allocation",
-        );
+        return Err(format!(
+            "no freed block ever contained the reported buffer; {reports} decode \
+             buffers were reported"
+        ));
     }
-    Ok((
-        Zeroizing::new(
+    // A guard for a secret longer than any case here reports, and so a branch no
+    // case exercises: every report is `DECODE_SECRET_LEN` and the snapshot buffer
+    // is larger than that.
+    if len > SNAPSHOT_CAP {
+        return Err(format!(
+            "the reported buffer is {len} bytes, past the {SNAPSHOT_CAP}-byte \
+             snapshot buffer, so only part of it was recorded; {reports} decode \
+             buffers were reported"
+        ));
+    }
+    Ok(FreedBuffer {
+        bytes: Zeroizing::new(
             SNAPSHOT
                 .iter()
-                .take(DECODE_SECRET_LEN)
+                .take(len)
                 .map(|b| b.load(Ordering::SeqCst))
                 .collect::<Vec<u8>>(),
         ),
-        seen,
-    ))
+        offset: CAPTURED_OFFSET.load(Ordering::SeqCst),
+        block: CAPTURED_BLOCK.load(Ordering::SeqCst),
+        reports,
+        armed_addr: ARMED_ADDR.load(Ordering::SeqCst),
+        scratch_addr: SCRATCH_ADDR.load(Ordering::SeqCst),
+        scratch_reported_at: SCRATCH_REPORTED_AT_FREE.load(Ordering::SeqCst),
+        scratch_freed_at: SCRATCH_FREED_AT.load(Ordering::SeqCst),
+        captured_at: CAPTURED_AT_FREE.load(Ordering::SeqCst),
+    })
 }
 
 /// The mirror control for the case below, and it must fail if the watch is broken.
 ///
-/// Deliberately leaks the secret the way the parser used to: a plain `String` of
-/// exactly the watched size, dropped with its bytes intact. If the size-armed
-/// watch works at all, this run captures those bytes — so a green result here is
-/// what licenses reading the real case's "no secret in the freed block" as
-/// evidence rather than as silence. Without it, a watch that never fired would
-/// make the real case pass for the wrong reason.
+/// Deliberately leaks the secret the way the parser used to: a plain `String`
+/// dropped with its bytes intact. It is armed through the same function the
+/// decode's observer calls, with the same argument shape, so it exercises every
+/// step the real case depends on except the decode's own call. If arming on a
+/// reported buffer works at all, this run captures those bytes — so a green
+/// result here is what licenses reading the real case's "no secret in the freed
+/// block" as evidence rather than as silence. Without it, a watch that never
+/// fired would make the real case pass for the wrong reason.
 #[test]
-fn the_size_armed_watch_captures_a_secret_that_is_not_wiped() {
+fn the_reported_buffer_watch_captures_a_secret_that_is_not_wiped() {
     init();
     let needle = decode_secret();
 
-    let (seen, allocations) = freed_bytes_of_decode_sized_block(0, || {
-        // A bare `String`, allocated at exactly the watched size and dropped
-        // without wiping — the pre-#343 shape, reproduced on purpose.
+    let freed = freed_bytes_of_reported_decode_buffer(Watched::Returned, || {
+        // A bare `String`, dropped without wiping — the pre-#343 shape,
+        // reproduced on purpose. `clone` allocates an exact fit, so the block
+        // freed is the string's own bytes and nothing else.
         let leaked: String = needle.clone();
+        arm_on_reported_buffer(
+            DecodedSecretBuffer::Returned,
+            leaked.as_ptr() as usize,
+            leaked.len(),
+        );
         drop(leaked);
     })
     .unwrap_or_else(|why| {
@@ -572,16 +705,68 @@ fn the_size_armed_watch_captures_a_secret_that_is_not_wiped() {
     });
 
     assert_eq!(
-        allocations, 1,
-        "the control is supposed to make exactly one allocation of the watched \
-         size; {allocations} means it is not the clean single-buffer case the \
-         real case's skip count is calibrated against"
+        freed.reports, 1,
+        "the control reports exactly one buffer; a different count means it is \
+         not the single-buffer case it is written as"
     );
     assert_eq!(
-        seen.as_slice(),
+        (freed.offset, freed.block),
+        (0, DECODE_SECRET_LEN),
+        "the control's buffer owns its whole block, so it must be freed at \
+         offset 0 of a block its own length"
+    );
+    assert_eq!(
+        freed.bytes.len(),
+        DECODE_SECRET_LEN,
+        "the control snapshotted a different number of bytes than it armed on"
+    );
+    assert_eq!(
+        freed.bytes.as_slice(),
         needle.as_bytes(),
         "the control did not recover the bytes it deliberately leaked, so the \
          watch is not observing what it claims to"
+    );
+}
+
+/// The decode dispatches to the observer on the path that succeeds, not only on
+/// the one that fails.
+///
+/// The cases either side of this one reach the observer through a payload whose
+/// label is malformed, so all of them would stay green on a decode that reported
+/// only while unwinding, or on a harness that reported from somewhere other than
+/// the decode. This runs a payload that parses cleanly and asserts the same two
+/// reports arrive — which is what says the reports come from the decode itself.
+#[test]
+fn a_successful_parse_reports_both_decode_buffers() {
+    init();
+    let needle = decode_secret();
+    let payload = format!(
+        "{RECOVERY_PHRASE}\ncircle {} {}\n",
+        hex_of(needle.as_bytes()),
+        hex_of(b"a circle label"),
+    );
+
+    let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    WATCH_ADDR.store(0, Ordering::SeqCst);
+    WATCH_LEN.store(0, Ordering::SeqCst);
+    REPORTS.store(0, Ordering::SeqCst);
+    observe_decoded_secret_buffers(Some(arm_on_reported_buffer));
+
+    let parsed = Seeds::parse_plaintext_for_witness(&payload);
+
+    observe_decoded_secret_buffers(None);
+    WATCH_ADDR.store(0, Ordering::SeqCst);
+    let reports = REPORTS.swap(0, Ordering::SeqCst);
+
+    assert!(
+        parsed.is_ok(),
+        "the payload this case is built on must parse cleanly, and it did not: \
+         {parsed:?}"
+    );
+    assert_eq!(
+        reports, 2,
+        "a clean parse of one circle line reports the decode's two buffers; \
+         {reports} means the decode is not reporting on the path that succeeds"
     );
 }
 
@@ -598,66 +783,294 @@ fn the_size_armed_watch_captures_a_secret_that_is_not_wiped() {
 fn a_later_parse_error_does_not_strand_the_decoded_circle_entropy() {
     init();
     let needle = decode_secret();
-    // Valid entropy hex, malformed label hex. `zz` is not hex, so the label
-    // decode fails *after* the entropy has been decoded and while it is live.
-    let payload = format!(
-        "{}\ncircle {} zz\n",
-        "abandon abandon abandon abandon abandon abandon abandon abandon \
-         abandon abandon abandon abandon abandon abandon abandon abandon \
-         abandon abandon abandon abandon abandon abandon abandon art",
-        hex_of(needle.as_bytes()),
-    );
+    let payload = parse_error_payload(&needle);
 
-    // Skip one: the first block of this size is `decode_hex_secret`'s decode
-    // buffer, which is freed inside that helper, before the label decode this
-    // case is about. The watch belongs on the copy it returns — the value still
-    // live when the parser gives up.
-    let (seen, allocations) = freed_bytes_of_decode_sized_block(1, || {
-        let parsed = daemonseed_core::storage::seeds::Seeds::parse_plaintext_for_witness(&payload);
-        // Pinned to the exact variant, not merely `is_err()`. A mnemonic that
-        // failed to parse would also be an error, and would return *before* the
-        // circle line — leaving this case watching a path the secret never
-        // reaches, which reads as a pass once the watch is arranged correctly.
-        assert!(
-            matches!(
-                parsed,
-                Err(daemonseed_core::storage::seeds::BlobError::InvalidPlaintext)
-            ),
-            "expected InvalidPlaintext from the malformed label hex, got {parsed:?} \
-             — this case is not exercising the error path it names"
-        );
+    let freed = freed_bytes_of_reported_decode_buffer(Watched::Returned, || {
+        assert_bad_label(parse_with_bad_label(&payload));
     })
     .unwrap_or_else(|why| {
         panic!(
             "this case observed nothing ({why}).\n\nThat is a FAILURE, not a skip. \
-             The watch is armed on a block of exactly the secret's length, and the \
-             fix is what makes one exist: `decode_hex_secret` decodes into a \
-             right-sized `Zeroizing` buffer. Without it the parser decodes through \
-             `hex::decode`, which grows geometrically — so the secret lives in an \
-             over-sized buffer this watch cannot address, and reaches a ladder of \
-             freed intermediate copies besides. Seeing nothing here means the \
-             exact-size zeroizing buffer is gone."
+                 The watch is armed on the buffer the secret hex decode reports, and \
+                 the fix is what makes one exist: the decode writes into a right-sized \
+                 `Zeroizing` buffer and reports it. Without it the parser decodes \
+                 through `hex::decode`, which grows geometrically — so the secret \
+                 reaches a ladder of freed intermediate copies, none of which is \
+                 reported and none of which is wiped. Seeing nothing here means the \
+                 exact-size zeroizing buffer is gone."
+        )
+    });
+
+    assert_decoded_entropy_was_wiped(&freed, &needle);
+}
+
+/// The same case, run with another thread allocating, growing and freeing blocks
+/// of exactly the secret's length for the whole time the watch is armed.
+///
+/// A watch armed on the first allocation of a chosen size can be taken by any
+/// other allocation of that size, and a growth of the block it settled on
+/// disarms it — so a case armed that way is only as reliable as the rest of the
+/// process is quiet, and fails intermittently when it is not. Arming on the
+/// buffer the decode reports removes both hazards: the address names one live
+/// block, no other allocation shares it, and nothing else grows it. This is what
+/// holds that claim to a run where the collision is guaranteed rather than
+/// occasional.
+///
+/// The churn thread deliberately does **not** take `GATE`. Serialising it would
+/// remove the very interference the case exists to survive.
+///
+/// The overlap is made deterministic rather than left to the scheduler: the
+/// arming of the watch itself waits for the churn thread to complete a further
+/// round before the decode is allowed to continue, so the interference is known
+/// to have happened inside the armed window rather than merely somewhere in the
+/// case. Nothing in the body panics, so the churn thread is always stopped and
+/// joined.
+#[test]
+fn the_parse_error_case_holds_under_concurrent_same_sized_allocation() {
+    init();
+    let needle = decode_secret();
+    let payload = parse_error_payload(&needle);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    CHURN_ROUNDS.store(0, Ordering::SeqCst);
+    CHURN_ADVANCED_WHILE_ARMED.store(false, Ordering::SeqCst);
+    let churn = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                // Allocate at the secret's exact length, grow it — which is the
+                // shape that disarms a watch pointing into it — then free both.
+                let mut block = vec![0xEFu8; DECODE_SECRET_LEN];
+                block.push(0xEF);
+                CHURN_ROUNDS.fetch_add(1, Ordering::SeqCst);
+                drop(block);
+            }
+        })
+    };
+
+    // Wait for the churn thread to be allocating before the body starts. Its loop
+    // ends only when `stop` is set, which happens after the body returns, so a
+    // non-zero count here means it was running for the whole of the body.
+    while CHURN_ROUNDS.load(Ordering::SeqCst) == 0 {
+        std::thread::yield_now();
+    }
+    let before = CHURN_ROUNDS.load(Ordering::SeqCst);
+
+    // The body asserts nothing: a panic inside it would skip the stop below and
+    // leave the churn thread spinning for the rest of the binary. It carries the
+    // parse result out instead, and the variant is checked once the thread is
+    // joined.
+    let mut outcome = None;
+    STRESS_WINDOW.store(true, Ordering::SeqCst);
+    let freed = freed_bytes_of_reported_decode_buffer(Watched::Returned, || {
+        outcome = Some(parse_with_bad_label(&payload));
+    });
+    STRESS_WINDOW.store(false, Ordering::SeqCst);
+
+    stop.store(true, Ordering::SeqCst);
+    churn.join().expect("the churn thread finished");
+    let total = CHURN_ROUNDS.load(Ordering::SeqCst);
+
+    assert_bad_label(outcome.expect("the body ran"));
+
+    // Positive control on the interference itself. A churn thread that never
+    // started, or that exited before the body ran, would leave this case
+    // asserting exactly what the quiet case already does while reading as the
+    // stronger claim.
+    assert!(
+        before > 0,
+        "the churn thread had allocated nothing when the body began ({total} \
+         rounds in total), so this case did not test what it names"
+    );
+    assert!(
+        total > before,
+        "the churn thread completed no round after the body began ({before} \
+         rounds before, {total} in total), so nothing interfered with the watch"
+    );
+    assert!(
+        CHURN_ADVANCED_WHILE_ARMED.load(Ordering::SeqCst),
+        "the watch was armed and the churn thread completed no round within \
+         {CHURN_SPIN_BOUND} spins, so the case cannot say the interference \
+         overlapped the armed window"
+    );
+
+    let freed = freed.unwrap_or_else(|why| {
+        panic!(
+            "this case observed nothing ({why}) while another thread allocated \
+             blocks of the secret's length. The watch is armed on the address the \
+             decode reports, so no other allocation can take it and no other \
+             thread's growth can disarm it — seeing nothing here means the watch \
+             is armed on something other than the decode's own buffer."
+        )
+    });
+
+    assert_decoded_entropy_was_wiped(&freed, &needle);
+}
+
+/// The recovery phrase every payload here opens with.
+const RECOVERY_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon abandon abandon abandon \
+     abandon abandon abandon abandon abandon abandon abandon art";
+
+/// The payload the #343 cases parse: valid entropy hex, malformed label hex.
+///
+/// `zz` is not hex, so the label decode fails *after* the entropy has been
+/// decoded and while it is still live.
+fn parse_error_payload(needle: &str) -> String {
+    format!(
+        "{RECOVERY_PHRASE}\ncircle {} zz\n",
+        hex_of(needle.as_bytes()),
+    )
+}
+
+/// Parse that payload, handing the result back rather than judging it.
+///
+/// The verdict is [`assert_bad_label`]'s, and it is separate because a caller
+/// that has a thread to stop must do so before anything can panic.
+fn parse_with_bad_label(
+    payload: &str,
+) -> Result<Seeds, daemonseed_core::storage::seeds::BlobError> {
+    Seeds::parse_plaintext_for_witness(payload)
+}
+
+/// Require the exact error the malformed label produces.
+///
+/// Pinned to the exact variant, not merely `is_err()`. A mnemonic that failed to
+/// parse would also be an error, and would return *before* the circle line —
+/// leaving the case watching a path the secret never reaches, which reads as a
+/// pass once the watch is arranged correctly.
+fn assert_bad_label(parsed: Result<Seeds, daemonseed_core::storage::seeds::BlobError>) {
+    assert!(
+        matches!(
+            parsed,
+            Err(daemonseed_core::storage::seeds::BlobError::InvalidPlaintext)
+        ),
+        "expected InvalidPlaintext from the malformed label hex, got {parsed:?} \
+         — this case is not exercising the error path it names"
+    );
+}
+
+/// The scratch buffer a secret hex decode writes into is zeroed before its
+/// memory is released.
+///
+/// The other #343 cases watch the buffer the decode returns, and every one of
+/// them stays green on a decode whose scratch buffer is a bare `Vec<u8>` — that
+/// buffer is released before the decode returns, so nothing they observe touches
+/// it, and it would carry the whole plaintext back to the allocator intact. This
+/// case is what holds it.
+#[test]
+fn the_decodes_scratch_buffer_is_zeroed_before_its_memory_is_released() {
+    init();
+    let needle = decode_secret();
+    let payload = parse_error_payload(&needle);
+
+    let freed = freed_bytes_of_reported_decode_buffer(Watched::Scratch, || {
+        assert_bad_label(parse_with_bad_label(&payload));
+    })
+    .unwrap_or_else(|why| {
+        panic!(
+            "this case observed nothing ({why}). The watch is armed on the \
+             scratch buffer the decode reports, so seeing nothing means the \
+             decode no longer writes into a buffer of its own."
         )
     });
 
     assert_eq!(
-        allocations, 2,
-        "the path is documented to allocate exactly two blocks of the secret's \
-         length — the decode buffer and the copy returned from it — and saw \
-         {allocations}. The skip count above is calibrated on that shape, so a \
-         different count means the watch is no longer on the buffer this case \
-         names, whatever the assertions below say"
+        freed.reports, 2,
+        "the decode reports its scratch buffer and its returned copy; {} means \
+         this case is not watching the buffer it names",
+        freed.reports
+    );
+    assert_eq!(
+        freed.armed_addr, freed.scratch_addr,
+        "the watch was armed on a block other than the reported scratch buffer"
+    );
+    assert_eq!(
+        (freed.offset, freed.block),
+        (0, DECODE_SECRET_LEN),
+        "the scratch buffer owns its whole block, so it must be freed at offset \
+         0 of a block its own length"
+    );
+    assert_eq!(
+        freed.bytes.len(),
+        DECODE_SECRET_LEN,
+        "fewer bytes were snapshotted than the scratch buffer holds, so the \
+         zero assertion below covers only part of it"
     );
     assert_ne!(
-        seen.as_slice(),
+        freed.bytes.as_slice(),
+        needle.as_bytes(),
+        "the decode's scratch buffer went back to the allocator holding the \
+         plaintext it decoded"
+    );
+    assert!(
+        freed.bytes.iter().all(|&b| b == 0),
+        "the freed scratch block held something other than zeros: {:02x?}",
+        freed.bytes.as_slice()
+    );
+}
+
+/// The assertions both #343 cases make about the buffer the decode reported.
+fn assert_decoded_entropy_was_wiped(freed: &FreedBuffer, needle: &str) {
+    assert_eq!(
+        freed.reports, 2,
+        "a secret hex decode holds its plaintext in two buffers in turn — the \
+         scratch buffer it writes into and the exact-fit copy it returns — and \
+         this run saw {}. A different count means the decode no longer sizes its \
+         own buffer, so the secret reaches freed intermediate copies that nothing \
+         reports and nothing wipes",
+        freed.reports
+    );
+    assert_eq!(
+        (freed.offset, freed.block),
+        (0, DECODE_SECRET_LEN),
+        "the returned buffer owns its whole block, so it must be freed at offset \
+         0 of a block its own length; a different pair means the watch settled on \
+         some other allocation that merely contains the address"
+    );
+    // Both buffers are exact-fit blocks freed at offset 0 holding zeros, so
+    // everything above is satisfied by either of them. These three separate
+    // them: they are different blocks, and the scratch is the one released
+    // first, since the decode drops it only after handing the copy back.
+    assert_ne!(
+        freed.armed_addr, freed.scratch_addr,
+        "the watched buffer and the scratch buffer are the same block, so the \
+         decode is reporting one allocation under both names"
+    );
+    assert!(
+        freed.scratch_freed_at > freed.scratch_reported_at,
+        "the scratch block was released before it was reported (reported at \
+         free {}, released at free {}), so the address it reported was not its \
+         own live buffer",
+        freed.scratch_reported_at,
+        freed.scratch_freed_at
+    );
+    assert!(
+        freed.scratch_freed_at < freed.captured_at,
+        "the watched block was released before the scratch block (watched at \
+         free {}, scratch at free {}), which is the order the decode produces \
+         only if the two are reported the other way round — so the watch is on \
+         the scratch buffer rather than the copy that outlives the decode",
+        freed.captured_at,
+        freed.scratch_freed_at
+    );
+    assert_eq!(
+        freed.bytes.len(),
+        DECODE_SECRET_LEN,
+        "fewer bytes were snapshotted than the secret holds, so the zero \
+         assertion below covers only part of the freed block — and at zero \
+         bytes it covers none of it"
+    );
+    assert_ne!(
+        freed.bytes.as_slice(),
         needle.as_bytes(),
         "the decoded circle entropy was still in freed memory: the parser's \
          error path released it without wiping"
     );
     assert!(
-        seen.iter().all(|&b| b == 0),
+        freed.bytes.iter().all(|&b| b == 0),
         "the freed block held something other than zeros after the parse error: {:02x?}",
-        seen.as_slice()
+        freed.bytes.as_slice()
     );
 }
 
@@ -755,21 +1168,13 @@ fn the_provisional_records_signing_key_is_zeroed_before_its_memory_is_released()
 fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
     init();
 
-    // **Under `GATE`, released before the cases below take it.** These two lines
-    // are heavy allocation churn, and the reasoning that once excused running
-    // them concurrently covers ADDRESS-armed watches only: such a watch is armed
-    // only while its secret is live, so no free on this thread can match it.
-    // `freed_bytes_of_decode_sized_block` arms on a block SIZE instead, and any
-    // thread's free of that size satisfies the match — which made this churn a
-    // real source of stolen captures once the file grew enough cases to overlap
-    // it. Holding the gate across all three cases below would deadlock, since
-    // each takes it itself; holding it for the derivation alone does not, and
-    // one derivation still feeds all three.
-    let keys = {
-        let _churn_gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mnemonic = Mnemonic::generate().unwrap();
-        derive_identity_keys(&mnemonic, Identity::Primary).unwrap()
-    };
+    // Heavy allocation churn, and it needs no gate. Every watch in this file
+    // names one address, and a watch is armed only while its own secret is live
+    // — so a block allocated or freed here is never the watched one, whatever
+    // its size. One derivation feeds all three cases below, each of which takes
+    // the gate itself.
+    let mnemonic = Mnemonic::generate().unwrap();
+    let keys = derive_identity_keys(&mnemonic, Identity::Primary).unwrap();
 
     // An `inline` secret is the whole of its `Box`, so the block is the newtype's
     // own size and the array sits at its start.
@@ -1123,14 +1528,9 @@ fn a_rerooted_pairs_secret_halves_are_zeroed_before_their_memory_is_released() {
     // Offsets measured on a probe, then asserted to be distinct and inside the
     // struct — see the note above on why they are not taken from `offset_of!`.
     //
-    // **Under `GATE`, and that is not optional.** Building a probe allocates,
-    // and `a_later_parse_error_does_not_strand_the_decoded_circle_entropy` arms
-    // its watch on a block SIZE rather than an address — so an allocation of
-    // that size from any other thread can satisfy its match and steal the
-    // capture. The `inline_arm` case's note about churn being safe outside the
-    // gate holds only for address-armed watches. The guard is dropped before
-    // `assert_zeroed_when_freed`, which takes the same lock itself.
-    let probe_gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The probe needs no gate: it allocates and frees blocks of its own, and
+    // every watch in this file names one live address that no other thread's
+    // allocation can be.
     let probe = make();
     let base = std::ptr::from_ref::<daemonseed_core::dm::resume::Rerooted>(&*probe) as usize;
     let next_at = probe.next().as_bytes().as_ptr() as usize - base;
@@ -1148,7 +1548,6 @@ fn a_rerooted_pairs_secret_halves_are_zeroed_before_their_memory_is_released() {
         "the successor root and the channel identifier are one value"
     );
     drop(probe);
-    drop(probe_gate);
 
     assert_zeroed_when_freed("Rerooted::next", (next_at, width), make, |r| {
         at(r.next().as_bytes())
@@ -1167,11 +1566,6 @@ fn a_rerooted_pairs_secret_halves_are_zeroed_before_their_memory_is_released() {
 #[test]
 fn the_re_establishment_types_render_redacted() {
     init();
-    // Held for the whole body: rendering and deriving both allocate, and a
-    // size-armed watch in another case can be satisfied by any thread's
-    // allocation of the right size. See the note in the case above.
-    let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let rerooted = reroot(
         &CommittedRoot::from_bytes(&[0x5cu8; ROOT_KEY_LEN]),
         &[0x09u8; 32],
@@ -1256,7 +1650,7 @@ fn a_watched_buffer_that_is_reallocated_disarms_the_watch() {
     // buffer would make the assertions below pass for the wrong reason — the same
     // vacuous-pass shape the rest of this file guards against.
     assert_eq!(
-        watch_offset_in(addr, phrase.capacity()),
+        watch_offset_in(addr, phrase.capacity(), WATCH_LEN.load(Ordering::SeqCst)),
         Some(0),
         "the watch is not armed over the buffer this case is about to grow, so \
          nothing it observes afterwards means anything"
