@@ -60,6 +60,8 @@ work lives in the maintainer's own planning notes, not here.
   first-contact entry from that correspondent ends every pending entry under
   `TeardownCause::CorrespondentStateLost`. The direction the teardown names is read off the key
   schedule a completed re-establishment restores (#261).
+- Coverage that the entries such a teardown ends stop re-seeding: no further page is published for
+  them across the first rungs of `RESEED_LADDER`, and their failure reaches the user once (#261).
 - `DmEvent::Roster { correspondents: Vec<Correspondent> }`, emitted once before the DM driver's
   first tick: every correspondence on disk under `CorrespondentState::Established`, `Pending` or
   `Blocked`. `DmEvent::BlockListUnreadable` rides alongside it where the block-list record would not

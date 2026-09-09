@@ -17158,6 +17158,148 @@ mod tests {
         );
     }
 
+    /// M75. **An entry the state-loss teardown ends is never published again,
+    /// and its delivery report reaches the user once.**
+    ///
+    /// **Two layers keep the entry off the wire, and an empty publish list is
+    /// evidence of only the outer one.** A teardown records the conversation as
+    /// torn down, and the due-entry scan skips every [`OutboxTarget::ChannelPage`]
+    /// of a conversation in that set — so no page is published whether or not the
+    /// entry itself was ended, and an outbox that surfaced the message and left
+    /// it pending on
+    /// [`RESEED_LADDER`](daemonseed_core::dm::outbox::RESEED_LADDER) for seven
+    /// days produces an identical batch of effects. The walk therefore reads the
+    /// record at every tick and asserts the entry is terminal and not due there:
+    /// the publish list says the wire is quiet, and the outbox read says the
+    /// entry is what quietened it.
+    ///
+    /// **The publish before the knock is the control.** Without it a silent
+    /// queue afterwards proves nothing: an entry that was never due, or a
+    /// correspondence with no key schedule to address a page from, reports zero
+    /// writes whatever the teardown did.
+    ///
+    /// The clock walks the ladder's first rungs rather than one flat step, so a
+    /// re-seed is passed over at every cadence it would have used, and stops
+    /// short of the seven-day give-up — which would end the entry on its own and
+    /// be read as the teardown having done it.
+    #[test]
+    fn the_entries_a_state_loss_ends_are_never_published_again() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (_a, mut b, _knock, t3) = re_established_pair(&dir_a, &dir_b);
+
+        let seq = next_send_seq(&b, t3);
+        queue_at_generation_at(
+            &b.machine,
+            &b.label,
+            Direction::BToA,
+            seq,
+            b.resume().reroot_ratchet_gen(),
+            t3,
+        );
+
+        let control = b.machine.on_tick(t3);
+        assert_eq!(
+            published_seqs(&control),
+            vec![seq],
+            "the entry never reached the wire, so a silent queue below is not \
+             evidence of anything: {control:?}"
+        );
+
+        // A knocking from a store that holds nothing: a new `ss0`, and so an
+        // address root this side's contact record does not hold.
+        let dir_a2 = tempfile::tempdir().expect("temp dir A2");
+        let mut a2 = machine(&dir_a2);
+        a2.persist.provision_block_list().expect("provision A2");
+        let fresh = knock_as_initiator_at(&mut a2, &peer_identity(), t3);
+
+        let out = b.machine.on_doorbell(t3, sweep_of(vec![fresh]));
+        assert_eq!(
+            lost(&out),
+            vec![(TrustEventKey::DmCorrespondentStateLost, vec![seq])],
+            "the fresh knock did not end the queue under its own cause: {out:?}"
+        );
+        assert_eq!(
+            outbox_state(&b.machine, &b.label, seq, t3),
+            DeliveryState::Undelivered,
+            "the entry is still pending: {out:?}"
+        );
+        assert!(
+            undelivered_seqs(&out).is_empty(),
+            "the doorbell reports an ended entry through `ChannelLost`, and the \
+             `Delivery` report is the tick's; one here means the count below \
+             starts from a route it is not measuring: {out:?}"
+        );
+
+        let mut clock = t3;
+        let mut published = Vec::new();
+        let mut told = 0usize;
+        let mut re_surfaced = 0usize;
+        for rung in daemonseed_core::dm::outbox::RESEED_LADDER.iter().take(6) {
+            clock += duration_as_ms(*rung) * 2;
+            let effects = b.machine.on_tick(clock);
+            published.extend(published_seqs(&effects));
+            told += undelivered_seqs(&effects)
+                .into_iter()
+                .filter(|s| *s == seq)
+                .count();
+            // The other route the same message can reach the user by. Counted
+            // apart, because a repeat here is invisible to the `Delivery` count.
+            re_surfaced += lost(&effects)
+                .into_iter()
+                .flat_map(|(_, surfaced)| surfaced)
+                .filter(|s| *s == seq)
+                .count();
+            // What the effects cannot say: the entry's own state, read from the
+            // record rather than inferred from the machine's silence.
+            let stored = b
+                .machine
+                .persist
+                .read_outbox(&b.label, clock)
+                .expect("the outbox reads")
+                .expect("the outbox exists");
+            assert!(
+                !stored
+                    .entry(seq)
+                    .expect("the ended entry is still in the record")
+                    .lifecycle()
+                    .is_pending(),
+                "the entry is pending again at {clock}, so only the torn-down \
+                 gate is keeping it off the wire"
+            );
+            assert!(
+                !stored.due(clock).contains(&seq),
+                "the ended entry is due for emission again at {clock}"
+            );
+        }
+        assert!(
+            clock - t3 < GIVE_UP_MS,
+            "the walk reached the give-up, which ends the entry by itself"
+        );
+        assert_eq!(
+            published,
+            Vec::<u64>::new(),
+            "the ended entry kept re-seeding against a channel that is gone"
+        );
+        assert_eq!(
+            told, 1,
+            "the message that stopped was reported {told} times, not once"
+        );
+        assert_eq!(
+            re_surfaced, 0,
+            "the teardown re-surfaced the sequence {re_surfaced} times after the \
+             knock that ended it"
+        );
+    }
+
+    /// The sequence numbers one batch of effects publishes a page for.
+    fn published_seqs(effects: &[DmEffect]) -> Vec<u64> {
+        page_writes(effects)
+            .into_iter()
+            .map(|(seq, _, _)| seq)
+            .collect()
+    }
+
     /// The sequence one side's outbox will spend next.
     fn next_send_seq(side: &Side, now_ms: i64) -> u64 {
         side.machine
