@@ -7866,6 +7866,13 @@ mod tests {
         ) -> DmDhtFuture<bool> {
             Self::refuse()
         }
+        fn pin_dm_pages(
+            &self,
+            _: u64,
+            _: Vec<daemonseed_veilid_net::actor::DmPageRecord>,
+        ) -> DmDhtFuture<()> {
+            Self::refuse()
+        }
         fn publish_dm_ack(
             &self,
             _: daemonseed_core::dm::ack_record::DmAckAddress,

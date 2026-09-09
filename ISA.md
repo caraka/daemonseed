@@ -549,6 +549,34 @@ moment it is hand-maintained in two places, so it lives only where it cannot dri
 Decisions in force, with the reasoning that makes each hard to vary. Superseded amendments and the
 route taken to reach a decision are not recorded here — the git history and `CHANGELOG.md` hold those.
 
+- **A DM page record closes on settlement, and the open set is capped at 128 with the pages a read
+  will name again pinned (2026-09-08, #252).** A *receiving* page closes once the contiguous cursor has passed it and
+  every slot on it was collected; a *sending* page closes once every slot on it is confirmed
+  collected or undelivered. The open set is capped at 128 page records per node, least-recently-swept
+  evicted first, and the current and next page of every conversation on cadence are
+  never evicted. Closing drops the local handle only: the record stays on the DHT and reopens on
+  demand through the ordinary opener, at the cost of one open. Three things make this hard to vary.
+  The two close rules are driven by the states that settle rather than by a clock, so a page is
+  released by the same fold that finished it and no page is released while anything can still ask for
+  it. The cap is a hit-rate floor and not the safety property — what stops a record being closed under
+  its user is the per-record lease an operation holds, which no capacity could supply — and it is kept
+  above the in-flight DHT budget so eviction cannot thrash pages that are all still busy. And the pin
+  covers the window no lease can: between one sweep and the next, the current and next pages hold
+  nothing and are the oldest unheld records in the ring, so an unpinned LRU would reclaim precisely
+  the records the next cadence re-opens. The pinned set is stated whole and restated only when it
+  changes, so there is no release to miss; it narrows what the capacity may choose and never what a
+  close by name may reclaim. Two properties keep the whole-set form safe. It is scoped to the
+  conversations a plan would name — a key schedule *or* a stored pseudonym, not torn down, not
+  suppressed by the block list — so its size is twice a per-peer quantity rather than a per-message
+  one; a pinned page is not counted against the capacity, so a pinned set at or past the capacity
+  stalls reclamation, and the ring answers that by holding the pinned records plus the records in
+  flight, one per concurrent open, rather than by growing with traffic. The pin and the sweep derive
+  their addresses through one helper, so a conversation resumed from disk — swept without a key
+  schedule, on the direction its outbox recorded — is pinned on the pages that sweep will open. And
+  each statement carries a strictly increasing number, because
+  operations are dispatched as independent tasks and a stale wholesale replace arriving last would
+  unpin the current window with nothing left to restate it.
+
 - **The project-announce seed is not in the source tree, and possession of it is the operator
   capability.** The operator instance loads the seed at runtime (`ProjectAnnounceSeedSource`: the
   environment variable first, else the owner-only-readable file under the profile root), and

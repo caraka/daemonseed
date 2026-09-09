@@ -320,6 +320,29 @@ pub(crate) enum DhtOp {
     /// are given back the same way, and the type that separates them exists to stop
     /// a *read* or a *write* going to the wrong stream.
     ClosePage { tag: OpTag, address: DmPageRecord },
+    /// State which page records the machine is still working through, so the
+    /// transport's capacity bound does not close one out from under a live sweep
+    /// (#252).
+    ///
+    /// **The whole set every time, across every conversation.** A pin taken per
+    /// page would need a matching release, and a missed release pins a record open
+    /// for the session — the leak the capacity bound exists to fix. Restating the
+    /// set makes the newest statement the only one, so a page that has dropped out
+    /// of every collection's watched window is unpinned by the same call that pins
+    /// the pages still in one.
+    ///
+    /// Bounded by correspondents rather than by traffic: two pages per live
+    /// conversation, which is the cardinality every other record family here
+    /// already has.
+    PinPages {
+        tag: OpTag,
+        /// Which statement this is, strictly increasing per session. The transport
+        /// drops one no newer than the last it applied, because each operation is
+        /// dispatched as its own task and a stale wholesale replace would unpin the
+        /// current window with nothing left to restate it.
+        statement: u64,
+        pages: Vec<DmPageRecord>,
+    },
     /// Publish one direction's acknowledgement record.
     PublishAck {
         tag: OpTag,
@@ -330,7 +353,7 @@ pub(crate) enum DhtOp {
     FetchAck { tag: OpTag, address: DmAckAddress },
 }
 
-/// Which of the nine operations an outcome came from.
+/// Which of the ten operations an outcome came from.
 ///
 /// **A tag cannot answer this and is not meant to.** A tag names what the
 /// operation belongs to — a conversation, an introduction — and a doorbell sweep
@@ -349,6 +372,7 @@ pub(crate) enum DhtOpKind {
     PublishAck,
     FetchAck,
     ClosePage,
+    PinPages,
 }
 
 impl DhtOpKind {
@@ -364,6 +388,7 @@ impl DhtOpKind {
             DhtOpKind::PublishAck => "PublishAck",
             DhtOpKind::FetchAck => "FetchAck",
             DhtOpKind::ClosePage => "ClosePage",
+            DhtOpKind::PinPages => "PinPages",
         }
     }
 }
@@ -381,6 +406,7 @@ impl DhtOp {
             DhtOp::PublishAck { .. } => DhtOpKind::PublishAck,
             DhtOp::FetchAck { .. } => DhtOpKind::FetchAck,
             DhtOp::ClosePage { .. } => DhtOpKind::ClosePage,
+            DhtOp::PinPages { .. } => DhtOpKind::PinPages,
         }
     }
 
@@ -395,7 +421,8 @@ impl DhtOp {
             | DhtOp::WatchPage { tag, .. }
             | DhtOp::PublishAck { tag, .. }
             | DhtOp::FetchAck { tag, .. }
-            | DhtOp::ClosePage { tag, .. } => tag,
+            | DhtOp::ClosePage { tag, .. }
+            | DhtOp::PinPages { tag, .. } => tag,
         }
     }
 
@@ -480,6 +507,13 @@ pub(crate) enum DhtResult {
     /// capacity bound already reclaimed, and one an operation is still holding all
     /// answer it. See `VeilidNetHandle::close_dm_page`.
     Closed(bool),
+    /// The pinned set was replaced with the one the operation named.
+    ///
+    /// Carries nothing: a pin states which records the capacity bound may not
+    /// choose, and every id in that statement is one the transport has just been
+    /// told about, so there is no per-page answer for the machine to fold. What a
+    /// failed pin costs is one reclaimed record too many, not a lost message.
+    Pinned,
 }
 
 /// One completed DHT operation, tagged with what asked for it.
@@ -488,7 +522,7 @@ pub(crate) struct DhtOutcome {
     ///
     /// **Carried rather than recovered from the result**, because the failure
     /// paths have no result to recover it from: an `Err` is one error type for
-    /// all nine operations, and the doorbell sweep's tag names nothing. A sweep
+    /// all ten operations, and the doorbell sweep's tag names nothing. A sweep
     /// the machine cannot recognise on its way back is a sweep it goes on
     /// believing is in flight, and a record whose sweep is permanently in flight
     /// is a record this driver never reads again.
@@ -1447,6 +1481,31 @@ pub(crate) struct DmMachine {
     /// The sending pages this session has asked the transport to open, less the ones
     /// it has asked it to close. The write-side twin of [`Self::open_recv_pages`].
     open_send_pages: std::collections::BTreeSet<([u8; AR_FINGERPRINT_LEN], u64)>,
+    /// The receiving pages this session has told the transport not to reclaim: the
+    /// watched pair of every live conversation, as of the last statement it made.
+    ///
+    /// **Held so the statement can be compared, not so it can be consulted.** The
+    /// pinned set is derivable from the collections at any moment, and the transport
+    /// takes it whole rather than incrementally, so nothing here reads it to decide
+    /// anything. What it buys is silence: a pin op is emitted only where the derived
+    /// set differs from this one, which turns a per-tick restatement into one op per
+    /// frontier move.
+    ///
+    /// Receiving only, because the pages a bound may not close out from under
+    /// something are the ones a sweep is about to read. A sending page is written
+    /// under the record lock and its write holds a lease for the whole operation.
+    pinned_pages: std::collections::BTreeSet<([u8; AR_FINGERPRINT_LEN], u64)>,
+    /// How many pin statements this session has made. The next one is this plus
+    /// one, so every statement carries a strictly greater number than the one
+    /// before it.
+    ///
+    /// **The transport needs the ordering because the delivery does not preserve
+    /// it.** Each operation is dispatched as its own task, so two statements from
+    /// different folds can arrive in either order, and a statement replaces the
+    /// whole set — an older one applied last would unpin the current window and
+    /// leave it unpinned, since this machine will not restate a set that has not
+    /// changed. The number is what lets the transport drop the stale one.
+    pin_statements: u64,
     /// The conversations this session has torn down.
     ///
     /// **A teardown ends the conversation but leaves the ratchet and the channel
@@ -1528,6 +1587,8 @@ impl DmMachine {
             publishing_pages: std::collections::BTreeMap::new(),
             open_recv_pages: std::collections::BTreeSet::new(),
             open_send_pages: std::collections::BTreeSet::new(),
+            pinned_pages: std::collections::BTreeSet::new(),
+            pin_statements: 0,
             torn_down: std::collections::BTreeSet::new(),
             leg_scan_candidates: 0,
         }
@@ -1548,8 +1609,8 @@ impl DmMachine {
                 self.pending.retain(|held| held.id != request);
                 Vec::new()
             }
-            DmCommand::Block { pk_lt } => self.set_blocked(&pk_lt, true),
-            DmCommand::Unblock { pk_lt } => self.set_blocked(&pk_lt, false),
+            DmCommand::Block { pk_lt } => self.set_blocked(now_ms, &pk_lt, true),
+            DmCommand::Unblock { pk_lt } => self.set_blocked(now_ms, &pk_lt, false),
             DmCommand::Send { to, body } => self.send(now_ms, &to, body),
             DmCommand::Surfaced { to, seqs } => self.record_surfaced(now_ms, &to, &seqs),
             // The shell breaks its loop on this and never asks the machine.
@@ -2084,6 +2145,13 @@ impl DmMachine {
                         );
                         Vec::new()
                     }
+                    // The statement was applied. Nothing folds it: what this machine
+                    // records is what it SAID, written when the operation was asked
+                    // for, so that a set unchanged since then costs no traffic. A
+                    // pin that failed on the transport leaves that record ahead of
+                    // reality until the next frontier move restates it, and what
+                    // that costs is one page reclaimed early and re-opened.
+                    Ok(DhtResult::Pinned) => Vec::new(),
                 };
                 freed.extend(folded);
                 // A value change that arrived while this page's sweep was in flight
@@ -2154,8 +2222,11 @@ impl DmMachine {
             | DhtOpKind::FetchAck
             // A close holds nothing: it is what releases, and it takes no slot of
             // its own. A close whose task panicked has left the transport's own
-            // state exactly as it found it.
-            | DhtOpKind::ClosePage => {}
+            // state exactly as it found it. A pin holds nothing either — it names
+            // records a capacity bound may not choose and starts no operation on
+            // any of them.
+            | DhtOpKind::ClosePage
+            | DhtOpKind::PinPages => {}
         }
     }
 
@@ -2622,7 +2693,7 @@ impl DmMachine {
         }
         // The give-up is a settlement like any other, so the pages it finished are
         // offered here for the same reason `on_page` and `on_peer_ack` offer theirs.
-        out.extend(self.retire_pages(index));
+        out.extend(self.retire_pages(now_ms, index));
         out
     }
 
@@ -3793,6 +3864,14 @@ impl DmMachine {
                 Err(e) => crate::vtrace!("dm driver: watch address derivation failed: {e}"),
             }
         }
+        // The plan just named the pages this conversation is working through, so
+        // this is where the statement of them can have moved. It is emitted only if
+        // it changed, so a cadence that re-plans the same window says nothing.
+        //
+        // **The list the plan was decided against, not a fresh read.** A second read
+        // here could fail where the first succeeded, and would then state an empty
+        // set over the very sweeps this call has just asked for.
+        out.extend(self.refresh_pins(now_ms, Some(block_list)));
         out
     }
 
@@ -4126,10 +4205,161 @@ impl DmMachine {
     ///
     /// The two bounds come from the two states that settle, so a page is released by
     /// the same fold that settled its last position — see [`Self::close_pages`].
-    fn retire_pages(&mut self, index: usize) -> Vec<DmEffect> {
+    fn retire_pages(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
         let recv_below = self.correspondences[index].collection.retired_below();
         let send_below = self.correspondences[index].own_ack.settled_pages_below();
-        self.close_pages(index, recv_below, send_below)
+        let mut out = self.close_pages(index, recv_below, send_below);
+        let block_list = self.pin_block_list();
+        out.extend(self.refresh_pins(now_ms, block_list.as_ref()));
+        out
+    }
+
+    /// The block list a pin statement is derived against, read at the one call that
+    /// is about to make it.
+    ///
+    /// **One read per statement, never two.** A caller that already holds the list
+    /// hands it to [`Self::refresh_pins`] instead of calling this, so a plan and the
+    /// statement that covers it are decided against the same answer: a list that
+    /// read once and then failed would otherwise state an empty set over sweeps the
+    /// same tick had just asked for.
+    ///
+    /// `None` where the list would not read, which suppresses every conversation for
+    /// the reason every other consult of it here fails closed.
+    fn pin_block_list(&self) -> Option<BlockList> {
+        match self.persist.read_block_list() {
+            Ok(list) => Some(list),
+            Err(e) => {
+                crate::vtrace!("dm driver: block list unreadable, pinning nothing: {e}");
+                None
+            }
+        }
+    }
+
+    /// Restate which receiving page records the transport's capacity bound may not
+    /// reclaim: the watched pair of every live conversation (#252).
+    ///
+    /// **The pages a bound may not close are not the pages an operation is
+    /// holding.** The transport already refuses to evict a record some sweep or
+    /// write is parked inside, because that holder owns a lease for the length of
+    /// its operation. What no lease covers is the page BETWEEN operations: the
+    /// current page and the next one are what [`Collection::watched`] says every
+    /// probe plan will name again, and between one plan and the next nothing holds
+    /// them. Under capacity pressure they are the oldest unheld records in the ring
+    /// and therefore exactly what an LRU chooses — so the reclamation lands on the
+    /// two pages guaranteed to be re-opened moments later, which is the one victim
+    /// choice that buys nothing.
+    ///
+    /// **Stated as a whole set rather than page by page**, so there is no release to
+    /// miss: a page that has dropped out of every watched window is unpinned by the
+    /// same statement that pins the pages still in one. See
+    /// `rendezvous::BoundedRing::set_pinned`.
+    ///
+    /// **Emitted only where the set has changed**, which makes this one operation
+    /// per frontier move rather than one per settlement. The comparison is against
+    /// what this machine last said, not against what the transport holds: a pin the
+    /// transport failed to apply is not re-derived here, and what that costs is one
+    /// record reclaimed early and re-opened, never a lost message.
+    ///
+    /// **Every conversation a plan would name is pinned, whether or not a sweep of
+    /// it is in flight.** The window a pin covers is the one BETWEEN operations, so
+    /// a set scoped to conversations currently sweeping withdraws the protection at
+    /// the exact moment it starts to matter: the last sweep of a plan returns, its
+    /// lease drops, and the two pages the next cadence will name again become the
+    /// oldest unheld records in the ring.
+    ///
+    /// **The scope is the planner's own gate, which is wider than a live channel.**
+    /// [`Self::probe`] sweeps a correspondence holding a key schedule OR a stored
+    /// pseudonym, because a party resumed from disk has the second and not the
+    /// first and the plane it sweeps is where its re-establishment leg arrives.
+    /// Gating the pin on a key schedule alone would leave every resumed
+    /// conversation swept and unpinned — and once the ratcheted ones are pinned, a
+    /// resumed one's pages are the only records left for the capacity to take. The
+    /// address is derived through [`receiving_page_address`], the one helper the
+    /// sweep and the watch already share, so a pin cannot name a record no sweep
+    /// will open. The rest of the gate is the planner's too: not torn down, and not
+    /// suppressed by the block list. `block_list` is `None` where the list would not
+    /// read, and nothing is pinned in that case.
+    ///
+    /// **The pinned set is at most twice the number of conversations on cadence**,
+    /// a per-correspondent quantity that does not grow with message volume. It can
+    /// exceed the transport's record capacity, and the ring answers that by refusing
+    /// to reclaim rather than by growing: a ring whose every unleased entry is
+    /// pinned holds at the pinned set plus the entries in flight, one per concurrent
+    /// open. See `rendezvous::BoundedRing::evictable`.
+    ///
+    /// A torn-down conversation pins nothing. Its pages were handed back at
+    /// teardown, and a pin would stop the bound reclaiming the ones the teardown
+    /// could not reach.
+    fn refresh_pins(&mut self, now_ms: i64, block_list: Option<&BlockList>) -> Vec<DmEffect> {
+        let mut wanted = std::collections::BTreeSet::new();
+        let mut pages = Vec::new();
+        for correspondence in &self.correspondences {
+            // [`Self::probe`]'s own first test, and it admits the two states that
+            // sweep: a live channel, and an established correspondence read back
+            // from disk, which is recognised by the correspondent's pseudonym.
+            if correspondence.ratchet.is_none() && correspondence.peer_pk_pc.is_none() {
+                continue;
+            }
+            // Derived from the address root, so one correspondence answers the same
+            // way with or without a key schedule — the tag every page operation
+            // carries, and the key `torn_down` is written under.
+            let Some(conversation) = correspondence.conversation() else {
+                crate::vtrace!("dm driver: the conversation fingerprint would not derive");
+                continue;
+            };
+            if self.torn_down.contains(&conversation) {
+                continue;
+            }
+            // A correspondence nothing is allowed to read is one nothing will plan
+            // a sweep for, so its pages are not the pages a reclamation would take
+            // out from under a read. An unreadable list suppresses every one of
+            // them: answering absence with "nobody is blocked" would pin exactly
+            // the records a block says to stop reading.
+            let suppressed =
+                block_list.is_none_or(|list| list.suppresses_channel(&correspondence.pk_lt));
+            if suppressed {
+                continue;
+            }
+            // The outbox is the one place the correspondence's direction is durable,
+            // so it is what a party with no key schedule addresses its plane by.
+            let peer_direction = self
+                .stored_direction(&correspondence.label, now_ms)
+                .map(Direction::opposite);
+            for page in correspondence.collection.watched() {
+                // Neither a key schedule nor a stored direction: no plane to name,
+                // and nothing the planner will open either.
+                let Some(derived) = receiving_page_address(
+                    &correspondence.address_root,
+                    correspondence.ratchet.as_ref(),
+                    peer_direction,
+                    page,
+                ) else {
+                    continue;
+                };
+                match derived {
+                    Ok(address) => {
+                        wanted.insert((conversation, page));
+                        pages.push(DmPageRecord::Receiving(address));
+                    }
+                    // Left out of both the statement and the comparison, so the next
+                    // pass derives it again rather than recording a set the machine
+                    // never managed to name.
+                    Err(e) => {
+                        crate::vtrace!("dm driver: pinned address derivation failed: {e}");
+                    }
+                }
+            }
+        }
+        if wanted == self.pinned_pages {
+            return Vec::new();
+        }
+        self.pinned_pages = wanted;
+        self.pin_statements += 1;
+        vec![DmEffect::Dht(DhtOp::PinPages {
+            tag: OpTag::none(),
+            statement: self.pin_statements,
+            pages,
+        })]
     }
 
     /// Hand back **every** page record of one correspondence, because its channel is
@@ -4144,8 +4374,15 @@ impl DmMachine {
     /// says every page rather than every settled one — and a torn-down conversation
     /// is the one case where a page below the frontier and a page above it are
     /// equally finished.
-    fn close_all_pages(&mut self, index: usize) -> Vec<DmEffect> {
-        self.close_pages(index, u64::MAX, u64::MAX)
+    fn close_all_pages(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        let mut out = self.close_pages(index, u64::MAX, u64::MAX);
+        // A torn-down conversation pins nothing, and the pin has to be withdrawn
+        // rather than left standing: a page this close could not reach — one an
+        // operation was inside — would otherwise stay pinned against the capacity
+        // bound, which after a teardown is the only thing that will ever reclaim it.
+        let block_list = self.pin_block_list();
+        out.extend(self.refresh_pins(now_ms, block_list.as_ref()));
+        out
     }
 
     /// Hand back the pages of a TORN-DOWN conversation that an outcome has just
@@ -4724,7 +4961,7 @@ impl DmMachine {
         // The fold that settled a position is the signal that may have finished a
         // page, so the release is asked for here rather than on the tick: a timer
         // would either lag the settlement or ask when nothing had changed.
-        out.extend(self.retire_pages(index));
+        out.extend(self.retire_pages(now_ms, index));
         out
     }
 
@@ -4930,7 +5167,7 @@ impl DmMachine {
         // A peer acknowledgement settles SENDING positions, so it can finish a
         // sending page. It is not the only signal that does — `give_ups` settles a
         // position this side abandoned — but it is the one that arrives here.
-        out.extend(self.retire_pages(index));
+        out.extend(self.retire_pages(now_ms, index));
         out
     }
 
@@ -5422,7 +5659,7 @@ impl DmMachine {
                         // entry's give-up — a week of a dead correspondence holding
                         // the oldest key in every scheduling round.
                         self.correspondences[index].pending_sent_ms.clear();
-                        self.close_all_pages(index)
+                        self.close_all_pages(now_ms, index)
                     }
                     None => Vec::new(),
                 };
@@ -5826,7 +6063,7 @@ impl DmMachine {
     /// take effect on the request in front of the user and not only on the next
     /// one to arrive. That drop is conditional on the write having landed — a
     /// refused one leaves both the list and the held request as they were.
-    fn set_blocked(&mut self, pk_lt: &PkLt, blocked: bool) -> Vec<DmEffect> {
+    fn set_blocked(&mut self, now_ms: i64, pk_lt: &PkLt, blocked: bool) -> Vec<DmEffect> {
         let result = self.persist.update_block_list(|list: &mut BlockList| {
             if blocked {
                 list.block(pk_lt);
@@ -5848,7 +6085,15 @@ impl DmMachine {
                     self.pending
                         .retain(|held| held.knock.pk_lt().as_slice() != pk_lt.as_slice());
                 }
-                Vec::new()
+                // **The pin is withdrawn here or nowhere.** A block stops the
+                // planner before it reaches the statement, so the one path that
+                // would recompute the set is the one the block just closed: with a
+                // single correspondence, or when the last unsuppressed one is
+                // blocked, its two records would stay pinned against the capacity
+                // bound for the session. An unblock restates them for the same
+                // reason, and against the list this call just wrote.
+                let block_list = self.pin_block_list();
+                self.refresh_pins(now_ms, block_list.as_ref())
             }
             // The 513th identity. The stored 512 are left exactly as they were
             // — `BlockList::encode` refuses before the replace — so this is a
@@ -10890,6 +11135,52 @@ mod tests {
             .collect()
     }
 
+    /// The pages one effect list states as pinned, or `None` where it states
+    /// nothing — the two are different answers and a caller has to tell them apart.
+    fn pinned_in(effects: &[DmEffect]) -> Option<Vec<u64>> {
+        effects.iter().find_map(|e| match e {
+            DmEffect::Dht(DhtOp::PinPages { pages, .. }) => {
+                Some(pages.iter().map(DmPageRecord::page).collect())
+            }
+            _ => None,
+        })
+    }
+
+    /// The pages of EVERY pin statement in a batch of effects, in emission order.
+    ///
+    /// Kept apart from [`pinned_in`], which answers with the first statement only:
+    /// a claim about how many statements a batch made — one covering every
+    /// conversation, or one per conversation — cannot be read off the first.
+    fn statements_in(effects: &[DmEffect]) -> Vec<Vec<u64>> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::PinPages { pages, .. }) => {
+                    Some(pages.iter().map(DmPageRecord::page).collect())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether every record one effect list pins is of the RECEIVING stream, and
+    /// `None` where nothing is pinned.
+    ///
+    /// Kept apart from [`pinned_in`], which reads the page number and would pass
+    /// unchanged if the driver pinned the sending record of the same page — two
+    /// different owner seeds, two different records, and the wrong one protected.
+    fn pinned_all_receiving(effects: &[DmEffect]) -> Option<bool> {
+        effects.iter().find_map(|e| match e {
+            DmEffect::Dht(DhtOp::PinPages { pages, .. }) => Some(
+                !pages.is_empty()
+                    && pages
+                        .iter()
+                        .all(|p| matches!(p, DmPageRecord::Receiving(_))),
+            ),
+            _ => None,
+        })
+    }
+
     /// One page sweep's outcome, as the shell would hand it back.
     fn page_outcome(
         conversation: [u8; AR_FINGERPRINT_LEN],
@@ -11950,6 +12241,17 @@ mod tests {
                 .count(),
             1,
             "a tick that could not read its block list must say so once: {effects:?}"
+        );
+        // The pin statement fails closed the same way, and it is reached on this
+        // tick because the give-up pass runs whatever the list says. Its own read
+        // fails, every conversation is suppressed, and the set becomes empty — the
+        // one assertion that separates a suppressing consult from a permitting one,
+        // which is otherwise invisible because both leave the sweeps above absent.
+        assert_eq!(
+            pinned_in(&effects),
+            Some(Vec::new()),
+            "an unreadable block list must withdraw the pins rather than leave the \
+             set standing over conversations nothing may read: {effects:?}"
         );
     }
 
@@ -13621,6 +13923,21 @@ mod tests {
         b: &mut DmMachine,
         b_keys: &IdentityKeys,
     ) -> (u16, Vec<u8>) {
+        establish_pair_folding(a, b, b_keys).0
+    }
+
+    /// [`establish_pair`], also answering the effects of the fold that installs the
+    /// pseudonym — the moment the correspondence becomes live.
+    ///
+    /// A claim about what a live conversation states is a claim about that fold:
+    /// everything the machine derives from "this conversation is on cadence" is
+    /// first derivable there, which is before the first cadence and therefore
+    /// invisible to a test that only reads what a probe returns.
+    fn establish_pair_folding(
+        a: &mut DmMachine,
+        b: &mut DmMachine,
+        b_keys: &IdentityKeys,
+    ) -> ((u16, Vec<u8>), Vec<DmEffect>) {
         let entry = knock_as_initiator(a, b_keys);
         let out = b.on_doorbell(BASE_MS, sweep_of(vec![entry.clone()]));
         let request = out
@@ -13646,7 +13963,7 @@ mod tests {
             a.correspondences[0].peer_pk_pc.is_some(),
             "the acceptance did not install a pseudonym: {out:?}"
         );
-        entry
+        (entry, out)
     }
 
     /// One outbox entry's delivery state, read from the record.
@@ -14937,7 +15254,10 @@ mod tests {
             };
             if matches!(
                 op.kind(),
-                DhtOpKind::SweepPage | DhtOpKind::PublishPage | DhtOpKind::ClosePage
+                DhtOpKind::SweepPage
+                    | DhtOpKind::PublishPage
+                    | DhtOpKind::ClosePage
+                    | DhtOpKind::PinPages
             ) {
                 crate::dm::driver::dispatch(dht.clone(), op).await;
             }
@@ -15158,6 +15478,571 @@ mod tests {
             closed,
             usize::try_from(FULL_PAGES).expect("small"),
             "one record per settled page must have been handed back"
+        );
+    }
+
+    /// M22g. The driver tells the transport which receiving pages its capacity
+    /// bound may not reclaim — the collection's own watched pair — and restates it
+    /// only when it moves.
+    ///
+    /// **The pages a bound must not choose are not the pages an operation holds.**
+    /// An in-flight sweep already holds a lease the transport refuses to evict
+    /// against; the current and next pages BETWEEN sweeps hold nothing, are the
+    /// oldest unheld records in the ring, and are therefore exactly what an LRU
+    /// picks — the one victim choice that reclaims a record guaranteed to be
+    /// re-opened on the next cadence.
+    ///
+    /// The window is read from the collection rather than written as a literal, so
+    /// the claim is that the driver pins what it watches rather than that it pins
+    /// two particular numbers.
+    ///
+    /// **The statement is made when the conversation goes live, not at its first
+    /// cadence**, because that is when it first has a window to name — so the fold
+    /// that installs the pseudonym is where the emitted statement is read.
+    ///
+    /// The second half needs its own control: a cadence that planned nothing would
+    /// also state no pins, so each plan is asserted to have asked for sweeps
+    /// before its silence about pins is read as the unchanged-set rule working.
+    #[test]
+    fn the_watched_pair_is_pinned_and_restated_only_when_it_moves() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        let (_, settled) = establish_pair_folding(&mut a, &mut b, &b_keys);
+        let list = stored_block_list(&a);
+        let want: Vec<u64> = a.correspondences[0].collection.watched().to_vec();
+
+        // Asserted unconditionally, not behind an `if let`: a machine that recorded
+        // the set and never emitted the operation is exactly the mutation this test
+        // is for, and a conditional assertion steps straight over it.
+        let named =
+            pinned_in(&settled).expect("a conversation going live must state its pinned window");
+        assert_eq!(
+            named, want,
+            "an emitted pin must name the watched pair and nothing else"
+        );
+        assert_eq!(
+            pinned_all_receiving(&settled),
+            Some(true),
+            "the pinned records must be of the receiving stream — the sending record \
+             of the same page is a different record and protects the wrong one"
+        );
+        let recorded: Vec<u64> = a.pinned_pages.iter().map(|(_, page)| *page).collect();
+        assert_eq!(
+            recorded, want,
+            "the recorded pin must be the collection's watched pair"
+        );
+
+        let mut now = BASE_MS + PROBE_MS;
+        let first = a.probe(now, 0, Some(&list));
+        let planned = swept_pages(&first);
+        assert!(
+            !planned.is_empty(),
+            "the first cadence planned no sweep, so its silence about pins says \
+             nothing: {first:?}"
+        );
+        assert!(
+            pinned_in(&first).is_none(),
+            "the window has not moved since the conversation went live, so the \
+             cadence must restate nothing: {first:?}"
+        );
+
+        // The plan's sweeps come back empty. Empty pages move no frontier, so the
+        // window is unchanged and nothing here should be restated. That the set also
+        // survives the plan's LAST sweep being answered is a separate claim, with
+        // its own test.
+        assert!(
+            planned.len() >= 2,
+            "the plan must hold more than one page for a fold to be a fold of one of \
+             several: {planned:?}"
+        );
+        let conversation = conversation_of(&a, 0);
+        for page in planned.iter().skip(1).copied() {
+            let folded = a.on_outcome(
+                now,
+                page_outcome(conversation, page, Ok(empty_page(conversation))),
+            );
+            assert!(
+                pinned_in(&folded).is_none(),
+                "the window has not moved, so this fold must restate nothing: \
+                 {folded:?}"
+            );
+        }
+
+        now += PROBE_MS;
+        let second = a.probe(now, 0, Some(&list));
+        assert!(
+            !swept_pages(&second).is_empty(),
+            "the second cadence planned nothing, so its silence about pins says \
+             nothing: {second:?}"
+        );
+        assert!(
+            pinned_in(&second).is_none(),
+            "a window that has not moved must not be restated: {second:?}"
+        );
+    }
+
+    /// M22i. The pin statements the driver makes reach the transport, in order,
+    /// carrying the sets it named — and an unchanged window across two cadences
+    /// makes no second statement.
+    ///
+    /// **Read from the seam rather than from the effect list**, which is the half no
+    /// machine-level test can reach: an operation the machine emits and the driver
+    /// mishandles — routed to the wrong method, or its set dropped on the way — is
+    /// invisible to an assertion over `Vec<DmEffect>`.
+    ///
+    /// The statement numbers are asserted as a sequence, not merely as a count: a
+    /// machine that reused one number would let the transport drop every statement
+    /// after the first, and a count alone cannot see that.
+    #[tokio::test(start_paused = true)]
+    async fn the_pin_statements_reach_the_transport_with_their_sets() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        let (_, settled) = establish_pair_folding(&mut a, &mut b, &b_keys);
+        let list = stored_block_list(&a);
+        let dht = std::sync::Arc::new(MockDht::new(Duration::from_millis(1)));
+
+        // The conversation going live is what states the window; the cadences below
+        // are what must NOT restate it.
+        let want = a.correspondences[0].collection.watched().to_vec();
+        run_page_ops(&dht, settled).await;
+
+        let mut now = BASE_MS + PROBE_MS;
+        let first = a.probe(now, 0, Some(&list));
+        let planned = swept_pages(&first);
+        assert!(
+            planned.len() >= 2,
+            "the plan must hold more than one page for a fold to be a fold of one of \
+             several: {planned:?}"
+        );
+        run_page_ops(&dht, first).await;
+
+        // Empty pages move no frontier, so the window does not move. The second
+        // cadence re-plans the drained page.
+        let conversation = conversation_of(&a, 0);
+        for page in planned.iter().skip(1).copied() {
+            let folded = a.on_outcome(
+                now,
+                page_outcome(conversation, page, Ok(empty_page(conversation))),
+            );
+            run_page_ops(&dht, folded).await;
+        }
+        now += PROBE_MS;
+        let second = a.probe(now, 0, Some(&list));
+        assert!(
+            !swept_pages(&second).is_empty(),
+            "the second cadence planned nothing, so its silence says nothing"
+        );
+        run_page_ops(&dht, second).await;
+
+        let statements: Vec<(u64, Vec<u64>)> = dht
+            .log()
+            .into_iter()
+            .filter_map(|call| match call {
+                MockCall::PinPages { statement, pages } => Some((
+                    statement,
+                    pages.into_iter().map(|(_, _, page)| page).collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statements,
+            vec![(1, want.clone())],
+            "exactly one statement, numbered one, naming the watched pair: a window \
+             that has not moved must not be restated"
+        );
+
+        let held: Vec<u64> = dht.pinned_pages().into_iter().map(|(_, _, p)| p).collect();
+        assert_eq!(
+            held, want,
+            "the transport must be holding the watched pair pinned"
+        );
+    }
+
+    /// M22h. A teardown withdraws whatever the conversation it ends had pinned.
+    ///
+    /// **A pinned page is not counted against the transport's capacity**, so a pin
+    /// that outlived the conversation it protects would hold a record against the
+    /// bound with nothing left to release it — and after a teardown the bound is the
+    /// ONLY thing that will ever reclaim that record, because `close_all_pages`
+    /// cannot reach a page an operation is inside and no settlement is coming.
+    ///
+    /// The control is the first half: the pin is shown to exist before the teardown
+    /// is asked for, so "nothing is pinned afterwards" cannot be satisfied by a
+    /// machine that never pinned anything.
+    #[test]
+    fn a_teardown_withdraws_the_pins_of_the_conversation_it_ends() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let list = stored_block_list(&a);
+
+        let now = BASE_MS + PROBE_MS;
+        let first = a.probe(now, 0, Some(&list));
+        assert!(
+            !swept_pages(&first).is_empty(),
+            "the conversation is not on cadence, so the withdrawal below proves \
+             nothing: {first:?}"
+        );
+        assert!(
+            !a.pinned_pages.is_empty(),
+            "the conversation must be pinned before the teardown, or \"nothing is \
+             pinned afterwards\" is satisfied by a machine that never pinned"
+        );
+
+        let conversation = conversation_of(&a, 0);
+        a.torn_down.insert(conversation);
+        let out = a.close_all_pages(now, 0);
+
+        assert_eq!(
+            pinned_in(&out),
+            Some(Vec::new()),
+            "the teardown must state an EMPTY pinned set rather than simply stopping \
+             — a statement that is never made leaves the old one standing: {out:?}"
+        );
+        assert!(
+            a.pinned_pages.is_empty(),
+            "the machine must record that it now pins nothing"
+        );
+    }
+
+    /// M22j. The pinned set is the watched pair of every conversation a plan would
+    /// name, and it survives the moment every sweep of that plan has been answered.
+    ///
+    /// **The window a pin covers is the one BETWEEN cadences**, which is precisely
+    /// the window in which nothing else protects those records: an in-flight sweep
+    /// already holds a lease, so a set scoped to conversations currently sweeping
+    /// would withdraw the pin at the instant the last lease dropped and the pages
+    /// became the oldest unheld records in the ring.
+    ///
+    /// Three conversations rather than one, because the claim is about the whole
+    /// set: a machine that pinned only the conversation whose plan was in flight
+    /// would name two pages here where six are due, and a single-conversation
+    /// fixture cannot tell those apart.
+    ///
+    /// Two negative controls follow, each of which is also the control for the
+    /// other's claim being non-vacuous: a blocked correspondent contributes
+    /// nothing to the next statement, and a torn-down conversation contributes
+    /// nothing to the one after it. The set shrinks by exactly one pair each time
+    /// and the remaining conversation goes on being pinned, so neither is
+    /// satisfied by a machine that simply stopped pinning.
+    #[test]
+    fn every_conversation_on_cadence_is_pinned_between_its_sweeps() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+        const CONVERSATIONS: usize = 3;
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let dir_c = tempfile::tempdir().expect("temp dir C");
+        let dir_d = tempfile::tempdir().expect("temp dir D");
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        let mut a = machine(&dir_a);
+        let mut c = machine_as(third_identity(), &dir_c);
+        let mut d = machine_as(fourth_identity(), &dir_d);
+        establish_pair(&mut a, &mut b, &b_keys);
+        establish_pair(&mut c, &mut b, &b_keys);
+        establish_pair(&mut d, &mut b, &b_keys);
+        assert_eq!(
+            b.correspondences.len(),
+            CONVERSATIONS,
+            "the claim is about the whole pinned set, so the fixture needs more than \
+             one conversation to carry"
+        );
+
+        // What the collections say their watched windows are, read rather than
+        // written as literals: the claim is that the driver pins what it watches.
+        let expected: std::collections::BTreeSet<([u8; AR_FINGERPRINT_LEN], u64)> = (0
+            ..CONVERSATIONS)
+            .flat_map(|i| {
+                let conversation = conversation_of(&b, i);
+                b.correspondences[i]
+                    .collection
+                    .watched()
+                    .iter()
+                    .map(|page| (conversation, *page))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            expected.len(),
+            CONVERSATIONS * 2,
+            "each conversation watches a pair, so the set under test is six pages"
+        );
+
+        let mut now = BASE_MS;
+        let first = b.on_tick(now);
+        let swept = swept_channels(&first);
+        // Without this the statement below is satisfied by a tick that planned
+        // nothing at all.
+        for i in 0..CONVERSATIONS {
+            let conversation = conversation_of(&b, i);
+            assert!(
+                swept.iter().any(|(planned, _)| *planned == conversation),
+                "conversation {i} was not planned, so nothing here could be pinned: \
+                 {swept:?}"
+            );
+        }
+
+        let stated = statements_in(&first);
+        assert_eq!(
+            stated.len(),
+            1,
+            "one statement covers every conversation the tick planned for; a \
+             statement per conversation is a set that was being narrowed to the one \
+             in flight: {stated:?}"
+        );
+        assert_eq!(
+            stated[0].len(),
+            CONVERSATIONS * 2,
+            "the statement must name the watched pair of every conversation: \
+             {stated:?}"
+        );
+        assert_eq!(
+            pinned_all_receiving(&first),
+            Some(true),
+            "the pinned records must be of the receiving stream — the sending record \
+             of the same page is a different record and protects the wrong one"
+        );
+        assert_eq!(
+            b.pinned_pages, expected,
+            "the recorded pin must be every conversation's watched pair"
+        );
+
+        // Every sweep of the plan is answered, so nothing of any conversation is in
+        // flight and no lease covers any of these records. This is the window the
+        // pin exists for.
+        let mut drained = Vec::new();
+        for (conversation, page) in &swept {
+            drained.extend(b.on_outcome(
+                now,
+                page_outcome(*conversation, *page, Ok(empty_page(*conversation))),
+            ));
+        }
+        assert!(
+            b.sweeping_pages.is_empty(),
+            "a sweep is still in flight, so this is not the between-cadence window: \
+             {:?}",
+            b.sweeping_pages
+        );
+        // The claim, asserted directly rather than as a loop over what may be an
+        // empty list: answering every sweep of a plan restates nothing at all, and
+        // above all does not restate an EMPTY set over the pages the next cadence
+        // will name again.
+        assert!(
+            statements_in(&drained).is_empty(),
+            "answering a plan's sweeps moved the pinned set: {:?}",
+            statements_in(&drained)
+        );
+        assert_eq!(
+            b.pinned_pages, expected,
+            "the pinned set must be unchanged by a plan being answered"
+        );
+
+        // ── the block contributes nothing ────────────────────────────────────
+        let blocked = conversation_of(&b, 1);
+        let pk_lt: PkLt = b.correspondences[1].pk_lt.clone();
+        // Stated by the block itself rather than by the tick after it: the
+        // planner refuses a blocked correspondence before it reaches the
+        // statement, so the block is the only path that recomputes the set.
+        let after_block = b.on_command(now, DmCommand::Block { pk_lt });
+        let stated = statements_in(&after_block);
+        assert_eq!(
+            stated.len(),
+            1,
+            "the narrowed set must be stated exactly once: {stated:?}"
+        );
+        assert_eq!(
+            stated[0].len(),
+            (CONVERSATIONS - 1) * 2,
+            "a blocked correspondent's pages must drop out of the statement, and the \
+             other two conversations must stay in it: {stated:?}"
+        );
+        assert!(
+            b.pinned_pages.iter().all(|(c, _)| *c != blocked),
+            "a correspondence nothing may read must not be pinned"
+        );
+        now += PROBE_MS;
+        let after_block_tick = b.on_tick(now);
+        assert!(
+            !swept_channels(&after_block_tick).is_empty(),
+            "the tick after the block planned nothing, so its silence about pins \
+             says nothing: {after_block_tick:?}"
+        );
+        assert!(
+            statements_in(&after_block_tick).is_empty(),
+            "the set has not moved since the block, so the cadence must restate \
+             nothing: {after_block_tick:?}"
+        );
+
+        // ── the teardown contributes nothing ─────────────────────────────────
+        let torn = conversation_of(&b, 2);
+        b.torn_down.insert(torn);
+        let after_teardown = b.close_all_pages(now, 2);
+        let stated = statements_in(&after_teardown);
+        assert_eq!(
+            stated.len(),
+            1,
+            "the teardown must state the narrowed set exactly once: {stated:?}"
+        );
+        assert_eq!(
+            stated[0].len(),
+            (CONVERSATIONS - 2) * 2,
+            "a torn-down conversation's pages must drop out, leaving the one \
+             conversation still on cadence: {stated:?}"
+        );
+        assert!(
+            b.pinned_pages.iter().all(|(c, _)| *c != torn),
+            "a torn-down conversation must not be pinned"
+        );
+        assert!(
+            !b.pinned_pages.is_empty(),
+            "the conversation still on cadence must still be pinned, or the two \
+             controls above are satisfied by a machine that stopped pinning"
+        );
+    }
+
+    /// M22k. A conversation resumed from disk — no key schedule, a stored
+    /// pseudonym — is pinned on its first cadence.
+    ///
+    /// **This is the whole population the pin can least afford to miss.** A resumed
+    /// correspondence is swept exactly like a ratcheted one, because the plane it
+    /// sweeps is where its re-establishment leg arrives; but it holds no ratchet, so
+    /// a pin gated on a live channel skips it. Once every ratcheted conversation is
+    /// pinned, the resumed one's pages are the only records the capacity can still
+    /// choose — the reclamation concentrates on the conversation least able to
+    /// afford it.
+    ///
+    /// The control is the plan: the tick is asserted to have swept this
+    /// correspondence, so "it is pinned" is a claim about a page some sweep will
+    /// really open rather than about an address nothing names. That pairing is the
+    /// point of deriving both through one helper.
+    #[test]
+    fn a_conversation_resumed_from_disk_is_pinned() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        drop(b);
+
+        // Cold start over the same store: the key schedule is gone and the
+        // correspondent's pseudonym is what is left.
+        let mut restarted = machine_as(peer_identity(), &dir_b);
+        assert_eq!(
+            restarted.correspondences.len(),
+            1,
+            "the seed found no correspondence, so nothing below is about a resume"
+        );
+        assert!(
+            restarted.correspondences[0].ratchet.is_none(),
+            "the fixture kept a key schedule across the restart, so it is not the \
+             case under test"
+        );
+        assert!(
+            restarted.correspondences[0].peer_pk_pc.is_some(),
+            "the fixture holds no pseudonym, so this correspondence would not be \
+             planned for either"
+        );
+
+        let effects = restarted.on_tick(BASE_MS);
+        assert!(
+            !swept_channels(&effects).is_empty(),
+            "the resumed correspondence was not swept, so a pin on it would protect \
+             a record nothing opens: {effects:?}"
+        );
+        let want: Vec<u64> = restarted.correspondences[0].collection.watched().to_vec();
+        let named =
+            pinned_in(&effects).expect("a resumed conversation must state its pinned window");
+        assert_eq!(
+            named, want,
+            "a conversation with no key schedule must pin the pair it watches, the \
+             same pair its sweeps name"
+        );
+        assert_eq!(
+            pinned_all_receiving(&effects),
+            Some(true),
+            "the pinned records must be of the receiving stream"
+        );
+    }
+
+    /// M22l. Blocking a correspondent withdraws its pin, on a machine where the
+    /// block leaves nothing else to pin.
+    ///
+    /// **The withdrawal has to happen at the block itself.** A blocked
+    /// correspondence is refused by the planner before the planner reaches the
+    /// statement, so the one path that would recompute the set is the one the block
+    /// closes. With a single correspondence there is no other conversation whose
+    /// own cadence would restate the set on its behalf, and the two records would
+    /// stay pinned against the capacity bound for the session.
+    ///
+    /// The control is the first half: the pin is shown to stand before the block, so
+    /// an empty statement afterwards cannot be satisfied by a machine that never
+    /// pinned. The tick after is the second: it must still refuse to restate, which
+    /// is what shows the withdrawal came from the block rather than from a cadence.
+    #[test]
+    fn blocking_a_correspondent_withdraws_its_pin() {
+        const PROBE_MS: i64 = daemonseed_core::dm::collect::PROBE_INTERVAL_MS as i64;
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        assert_eq!(
+            b.correspondences.len(),
+            1,
+            "the case is a block that leaves no other conversation to restate the \
+             set, so the fixture must hold exactly one"
+        );
+
+        let first = b.on_tick(BASE_MS);
+        assert!(
+            pinned_in(&first).is_some_and(|pages| !pages.is_empty()),
+            "the conversation was never pinned, so the withdrawal below proves \
+             nothing: {first:?}"
+        );
+
+        let pk_lt: PkLt = b.correspondences[0].pk_lt.clone();
+        let blocked = b.on_command(BASE_MS, DmCommand::Block { pk_lt });
+        assert_eq!(
+            pinned_in(&blocked),
+            Some(Vec::new()),
+            "the block must state an EMPTY pinned set — a statement never made \
+             leaves the old one standing, and nothing else will recompute it: \
+             {blocked:?}"
+        );
+        assert!(
+            b.pinned_pages.is_empty(),
+            "the machine must record that it now pins nothing"
+        );
+        assert!(
+            pinned_in(&b.on_tick(BASE_MS + PROBE_MS)).is_none(),
+            "the set has not changed since the block, so the next tick must restate \
+             nothing"
         );
     }
 
@@ -18683,10 +19568,16 @@ mod tests {
         // **A4.2: reading emits nothing in the same turn.** A replay that put an
         // operation on the wire would be the page-to-page confirmation oracle
         // A4.2 exists to remove, whatever it did to the record.
+        //
+        // A pin statement is the one exclusion, and it is not a weakening: it
+        // names which records the transport's capacity bound may not reclaim,
+        // reaches no DHT, writes nothing and takes no record lock, so it is
+        // unobservable to the peer and cannot be a confirmation oracle. Every
+        // other operation still counts.
         let writes: Vec<&DmEffect> = replay_one
             .iter()
             .chain(replay_two.iter())
-            .filter(|e| matches!(e, DmEffect::Dht(_)))
+            .filter(|e| matches!(e, DmEffect::Dht(op) if op.kind() != DhtOpKind::PinPages))
             .collect();
         assert!(
             writes.is_empty(),

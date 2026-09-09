@@ -718,7 +718,7 @@ async fn apply<D: DmDht>(
 /// Run one operation against the seam and tag its result.
 ///
 /// The kind is stamped here, from the op itself, rather than inferred later from
-/// the result: four of the nine hold a slot the machine must release — the two
+/// the result: four of the ten hold a slot the machine must release — the two
 /// sweeps, the page write and the page watch — and on the failure path a result
 /// says only that something went wrong.
 pub(crate) async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
@@ -785,6 +785,18 @@ pub(crate) async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
             kind,
             tag,
             result: dht.close_dm_page(address).await.map(DhtResult::Closed),
+        },
+        DhtOp::PinPages {
+            tag,
+            statement,
+            pages,
+        } => DhtOutcome {
+            kind,
+            tag,
+            result: dht
+                .pin_dm_pages(statement, pages)
+                .await
+                .map(|()| DhtResult::Pinned),
         },
         DhtOp::PublishAck {
             tag,
@@ -1379,8 +1391,16 @@ mod tests {
                 .expect("close page"),
             "the page published above must be the one handed back"
         );
+        dht.pin_dm_pages(1, vec![DmPageRecord::Receiving(receiving_address(&r))])
+            .await
+            .expect("pin pages");
+        assert_eq!(
+            dht.pinned_pages().len(),
+            1,
+            "the pin must be recorded as the set it named, not merely counted"
+        );
 
-        assert_eq!(Method::ALL.len(), 9, "the seam has nine methods");
+        assert_eq!(Method::ALL.len(), 10, "the seam has ten methods");
         for method in Method::ALL {
             assert_eq!(dht.count(method), 1, "{method:?} counted once");
         }
@@ -1456,6 +1476,57 @@ mod tests {
                 closed: true,
             }
         );
+        assert_eq!(
+            log[9],
+            MockCall::PinPages {
+                statement: 1,
+                pages: vec![(conversation, recv_dir, 0)],
+            }
+        );
+    }
+
+    /// T2c. A pin statement REPLACES the previous one across the seam.
+    ///
+    /// The mock is the surface a driver oracle reads the statement back from, so
+    /// what it does with a second statement has to be the same thing the transport
+    /// does: replace. A mock that accumulated would report every page ever pinned
+    /// as still pinned, and a driver that had stopped restating a page would look
+    /// correct while its record was held open for the session.
+    ///
+    /// The first statement is the control: without it, an empty set after the
+    /// second is satisfied by a mock that records nothing at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_second_pin_statement_replaces_the_first() {
+        let dht = MockDht::new(Duration::from_millis(1));
+        let r = ratchet();
+
+        dht.pin_dm_pages(1, vec![DmPageRecord::Receiving(receiving_address(&r))])
+            .await
+            .expect("pin");
+        assert_eq!(
+            dht.pinned_pages().len(),
+            1,
+            "the first statement must have been recorded"
+        );
+
+        dht.pin_dm_pages(2, Vec::new()).await.expect("unpin");
+        assert!(
+            dht.pinned_pages().is_empty(),
+            "an empty statement unpins everything — which is what makes a page \
+             dropped from the watched window need no separate release"
+        );
+
+        // Reordered delivery: statement one arriving after statement two must not
+        // reinstate its set. The operations are dispatched as independent tasks, so
+        // this ordering is reachable in production and nothing would repair it —
+        // the driver does not restate a set it believes it has already sent.
+        dht.pin_dm_pages(1, vec![DmPageRecord::Receiving(receiving_address(&r))])
+            .await
+            .expect("stale pin");
+        assert!(
+            dht.pinned_pages().is_empty(),
+            "a statement older than the last applied must change nothing"
+        );
     }
 
     /// T2d. A page record handed back and named again is simply opened again, and
@@ -1526,7 +1597,7 @@ mod tests {
 
     /// How many variants [`DhtOp`] has. Its own count, never borrowed from
     /// something that merely has the same one today.
-    const DHT_OP_VARIANTS: usize = 9;
+    const DHT_OP_VARIANTS: usize = 10;
 
     /// Every [`DhtOp`] variant, as an index. Exhaustive by construction: a new
     /// variant fails to compile here rather than silently escaping the dispatch
@@ -1542,13 +1613,14 @@ mod tests {
             DhtOp::PublishAck { .. } => 6,
             DhtOp::FetchAck { .. } => 7,
             DhtOp::ClosePage { .. } => 8,
+            DhtOp::PinPages { .. } => 9,
         }
     }
 
     /// T2b. `dispatch` routes every op to its own seam method and shapes the
     /// result to match.
     ///
-    /// The routing is nine near-identical arms, which is exactly the shape a
+    /// The routing is ten near-identical arms, which is exactly the shape a
     /// copy-paste slip survives in: a `SweepPage` arm calling `sweep_doorbell`
     /// compiles, returns `Ok`, and is invisible everywhere else.
     #[tokio::test(start_paused = true)]
@@ -1650,6 +1722,15 @@ mod tests {
                 // `false`: nothing opened this page in this mock, which is the
                 // transport's own answer for an id the cache does not hold.
                 shape: |res| matches!(res, DhtResult::Closed(false)),
+            },
+            Case {
+                op: DhtOp::PinPages {
+                    tag: tag(),
+                    statement: 1,
+                    pages: vec![DmPageRecord::Receiving(receiving_address(&r))],
+                },
+                method: Method::PinPages,
+                shape: |res| matches!(res, DhtResult::Pinned),
             },
         ];
 
@@ -1792,6 +1873,16 @@ mod tests {
                         ..tag()
                     },
                     address: DmPageRecord::Sending(sending_address(&r)),
+                },
+                |job| job.is_none(),
+            ),
+            (
+                // A pin holds no slot either: it states which records a capacity
+                // bound may not choose and starts no operation on any of them.
+                DhtOp::PinPages {
+                    tag: tag(),
+                    statement: 1,
+                    pages: vec![DmPageRecord::Receiving(receiving_address(&r))],
                 },
                 |job| job.is_none(),
             ),

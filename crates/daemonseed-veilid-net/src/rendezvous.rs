@@ -27,7 +27,7 @@
 //! share discovery) → open; operator-only owner (announcements/MOTD) → the
 //! non-derivable owner keypair is the write-gate.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
@@ -677,14 +677,22 @@ pub async fn open_cached_optional<I: Eq + std::hash::Hash + Clone, K: Clone>(
 /// record someone is using is instead guaranteed by the [`PageLease`] refcount, and
 /// this constant only decides how much *idle* cache is kept.
 ///
-/// So it is sized for hit rate: 64 covers roughly twenty conversations' live
+/// So it is sized for hit rate: 128 covers roughly forty conversations' live
 /// send/receive/probe pages, so the steady state of ordinary use is still
 /// open-once, and it is deliberately kept above [`DHT_BUDGET`](crate::dht_gate::DHT_BUDGET)
 /// — a capacity at or below the number of operations that can be in flight would
 /// spend the cache thrashing pages that are all still busy, evicting nothing (every
 /// candidate leased) while paying the scan on every open. That relation is asserted
 /// below rather than left in prose.
-pub const DM_PAGE_CACHE_CAPACITY: usize = 64;
+///
+/// **Where the pinned set crosses it.** The DM driver pins two receiving records per
+/// conversation on cadence ([`BoundedRing::set_pinned`]), so 64 such conversations
+/// pin 128 records: the pinned set equals this capacity and nothing is evictable.
+/// The bound stops reclaiming before that — the unpinned headroom is
+/// `128 - 2n`, which falls below [`DHT_BUDGET`](crate::dht_gate::DHT_BUDGET) at 58
+/// conversations, the point past which the cache no longer holds a page for every
+/// operation that can be in flight beside the pinned ones.
+pub const DM_PAGE_CACHE_CAPACITY: usize = 128;
 
 // The capacity/throughput relation the doc above states, made unbreakable: raising
 // the in-flight budget past the cache capacity would leave every eviction candidate
@@ -702,20 +710,33 @@ const _: () = assert!(
 /// Recency + live-borrow bookkeeping over **one record family's** entries in an
 /// [`OpenCache`], oldest at the front.
 ///
-/// Two facts are tracked per id and they answer different questions. `order` is the
-/// LRU membership: which ids this family has opened, most-recently-used last, and
-/// therefore which ids are eligible to be evicted at all. `live` is a borrow count:
-/// how many callers currently hold a handle for that id, which decides whether an
-/// eligible id may be closed *now*.
+/// Three facts are tracked per id and they answer different questions. `order` is
+/// the LRU membership: which ids this family has opened, most-recently-used last,
+/// and therefore which ids are eligible to be evicted at all. `live` is a borrow
+/// count: how many callers currently hold a handle for that id, which decides
+/// whether an eligible id may be closed *now*. `pinned` is the driver's statement
+/// of which pages it is still working through, which decides whether an eligible,
+/// unheld id may be closed *at all*.
 ///
-/// **The fields are private and this module exposes no way to write them except
-/// through [`open_page_bounded`].** That is the structural half of the safety
-/// property: a caller cannot record an id of some other family into the ring, so it
-/// cannot widen the set of records this bound is allowed to close. The set is not
-/// merely "what a reviewer saw a call site do" — it is unreachable from outside.
+/// **`live` and `pinned` cover different windows and neither implies the other.** A
+/// borrow lasts exactly as long as one operation; a pin lasts as long as the driver
+/// keeps naming the page. The page a collector is about to sweep next holds no
+/// borrow — nothing is in flight on it yet — so only a pin distinguishes it from a
+/// page nothing will ask for again, and evicting it would close a record the very
+/// next sweep re-opens.
+///
+/// **The order and live fields are private and this module exposes no way to write
+/// them except through [`open_page_bounded`].** That is the structural half of the
+/// safety property: a caller cannot record an id of some other family into the ring,
+/// so it cannot widen the set of records this bound is allowed to close. The set is
+/// not a convention a call site happens to follow — it is unreachable from outside.
+/// [`Self::set_pinned`] is the one writable field, and it only ever *narrows* what
+/// may be closed.
 pub struct BoundedRing<I> {
     order: VecDeque<I>,
     live: HashMap<I, usize>,
+    pinned: HashSet<I>,
+    pinned_at: u64,
 }
 
 impl<I: Eq + std::hash::Hash + Clone> BoundedRing<I> {
@@ -723,7 +744,56 @@ impl<I: Eq + std::hash::Hash + Clone> BoundedRing<I> {
         Self {
             order: VecDeque::new(),
             live: HashMap::new(),
+            pinned: HashSet::new(),
+            pinned_at: 0,
         }
+    }
+
+    /// Replace the pinned set with `ids` — the pages the driver says it is still
+    /// working through, and which capacity pressure may therefore not close.
+    ///
+    /// **A total statement, not an addition, and that is what keeps it from
+    /// leaking.** A pin taken one page at a time would need a matching release for
+    /// every page a driver stopped caring about, and a missed release would pin a
+    /// record open for the session — the exact leak the capacity bound exists to
+    /// fix. Handing over the whole set instead makes the current statement the only
+    /// one: a page absent from `ids` is unpinned by the same call that pins the
+    /// pages present in it, so there is no release to miss.
+    ///
+    /// The set is a small multiple of the number of live conversations rather than
+    /// of message volume, so pinning cannot itself grow without bound. Sizing it
+    /// near or above the capacity would leave nothing evictable, which is not
+    /// unsafe — the bound simply stops reclaiming — but it is the shape to watch.
+    ///
+    /// **A pin does not stop a close asked for BY NAME.** [`close_page_now`] is the
+    /// holder saying it is finished with a page, and the holder is the same driver
+    /// that maintains this set; refusing it here would leave a torn-down
+    /// conversation's records open until something re-stated the pins. Only the
+    /// capacity's own choice of victim consults it.
+    ///
+    /// **`statement` orders the replacements, and without it a wholesale replace is
+    /// unsafe.** Statements are produced by one driver in order and delivered by
+    /// independent tasks, so they can arrive reordered; an older one applied last
+    /// would unpin the current window and leave it unpinned, because a driver that
+    /// records what it has said will not restate a set that has not changed. A
+    /// statement at or below the last applied one is therefore dropped, and the
+    /// answer says which happened. Numbering must be strictly increasing per
+    /// driver; zero is never a valid statement, so the first one always applies.
+    pub fn set_pinned(&mut self, statement: u64, ids: impl IntoIterator<Item = I>) -> bool {
+        if statement <= self.pinned_at {
+            return false;
+        }
+        self.pinned_at = statement;
+        self.pinned = ids.into_iter().collect();
+        true
+    }
+
+    /// The pinned ids, for a test that has to compare them against an independently
+    /// built expectation. Production reads this set only through
+    /// [`Self::evictable`].
+    #[cfg(test)]
+    pub(crate) fn pinned_ids(&self) -> Vec<I> {
+        self.pinned.iter().cloned().collect()
     }
 
     /// Take a borrow on `id`. Held until the matching [`PageLease`] drops.
@@ -753,12 +823,38 @@ impl<I: Eq + std::hash::Hash + Clone> BoundedRing<I> {
     }
 
     /// The id to close, if the ring is over `capacity`: the oldest one **nobody is
-    /// holding**. A leased id is skipped rather than closed, which is what keeps an
-    /// in-flight sweep's remaining GETs from failing into `outcome.failed` — the
-    /// signal a collector is told to read as record ill-health.
+    /// holding and nothing has pinned**. A leased id is skipped rather than closed,
+    /// which is what keeps an in-flight sweep's remaining GETs from failing into
+    /// `outcome.failed` — the signal a collector is told to read as record
+    /// ill-health. A pinned id is skipped for the neighbouring reason: it names a
+    /// page the driver is still working through, so closing it buys one reclaimed
+    /// record and pays for it with an immediate re-open on the next sweep.
+    ///
+    /// Recency is by last open, and every sweep of a page opens it, so the oldest
+    /// unheld unpinned id is the least recently swept one.
+    ///
+    /// **A pinned page is never counted against `capacity`, and that is deliberate
+    /// rather than an oversight.** When every entry is pinned or leased there is no
+    /// candidate, this answers `None`, and the ring sits above the bound for as long
+    /// as that holds — a capacity that closed a pinned record would be closing one
+    /// the next sweep re-opens, which reclaims nothing and costs an open. What keeps
+    /// that bounded is the SIZE of the pinned set rather than anything here: the
+    /// driver pins the watched pair of a conversation on cadence, so the pinned
+    /// count is at most twice the number of conversations it is carrying — a
+    /// per-peer quantity, which is the cardinality every record family other than
+    /// the page already has. A driver that pinned per message would defeat the
+    /// bound entirely, so the narrowing belongs there and the refusal belongs here.
+    ///
+    /// **A pinned set at or past `capacity` therefore stalls reclamation rather
+    /// than being overridden.** The ring holds the pinned entries plus the entries
+    /// in flight — one per concurrent open, since a leased id is skipped for its own
+    /// reason — and each new open evicts and replaces one of those rather than
+    /// adding to them. It never grows with traffic, and no pinned id is ever the
+    /// answer.
     ///
     /// Skipping means the cache can sit above `capacity` by the number of live
-    /// borrows. That excess is bounded by the count of page operations in flight, and
+    /// borrows and pins. That excess is bounded by the count of page operations in
+    /// flight plus the pinned set's own size, and
     /// since publishes and sweeps are `tokio::spawn`ed per command with no hard cap,
     /// that is a SOFT bound rather than an invariant. Nor does it drain merely because
     /// leases release: a stream of NEW page ids holds the length at its high-water
@@ -774,7 +870,7 @@ impl<I: Eq + std::hash::Hash + Clone> BoundedRing<I> {
         let pos = self
             .order
             .iter()
-            .position(|id| !self.live.contains_key(id))?;
+            .position(|id| !self.live.contains_key(id) && !self.pinned.contains(id))?;
         self.order.remove(pos)
     }
 
@@ -786,6 +882,10 @@ impl<I: Eq + std::hash::Hash + Clone> BoundedRing<I> {
     /// rule — a leased id is refused, never closed — so an explicit close cannot
     /// reach a record an in-flight operation is reading, which is the one thing the
     /// bound is not allowed to do.
+    ///
+    /// **A pinned id is taken, unlike under [`Self::evictable`].** The pin says the
+    /// driver is still working through that page; a close by name is that same
+    /// driver saying it is not. See [`Self::set_pinned`].
     ///
     /// `false` for an id nobody opened, which is the ordinary answer for a page whose
     /// every open was of the *other* direction's record, and for one the capacity
@@ -851,9 +951,9 @@ pub type DmPageRecency = Mutex<BoundedRing<CachedRecordId>>;
 
 /// Open one page record through `cache`, bounded: take a borrow on `id`, memoize the
 /// open exactly as [`open_cached_optional`] does, then — if the ring is over
-/// `capacity` — drop the oldest unleased page from the cache and `close` its record.
-/// Returns the handle together with the [`PageLease`] the caller must hold while
-/// using it.
+/// `capacity` — drop the oldest page that is neither leased nor pinned from the
+/// cache and `close` its record. Returns the handle together with the [`PageLease`]
+/// the caller must hold while using it.
 ///
 /// **[`open_cached`] is deliberately untouched, and its no-eviction property is a
 /// decision rather than an oversight** (ISA Decisions 2026-07-06, #128 D-0a): its
@@ -2117,6 +2217,453 @@ mod tests {
             opens.load(Ordering::SeqCst),
             before + 1,
             "a re-open of an evicted page opens; a hit here would serve a closed record"
+        );
+    }
+
+    /// A conversation long enough to turn the cap over holds at it, and a page the
+    /// cap closed opens again when it is named.
+    ///
+    /// **Twenty pages against a cap of four**, so the ring turns over four times
+    /// rather than once: a bound that only held for the first eviction would pass a
+    /// two-page version of this and fail here. The open set is read after EVERY
+    /// open, not at the end, because a count that overshot and came back would be
+    /// invisible to a final reading.
+    ///
+    /// The reopen half is what makes closing safe to do at all: a closed page is a
+    /// local handle dropped, not a record removed from the network, so naming it
+    /// again is an ordinary open. Pinned as a real open rather than as a returned
+    /// handle, since a cache hit would also return one — and a hit here would be
+    /// serving a record that has been closed.
+    #[tokio::test]
+    async fn a_long_conversations_pages_hold_at_the_cap_and_reopen_on_demand() {
+        const CAP: usize = 4;
+        const PAGES: u32 = 20;
+        let (cache, ring, opens, closed, locks) = page_fixture();
+
+        for id in 1..=PAGES {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+            let held = cache.lock().unwrap().len();
+            assert!(
+                held <= CAP,
+                "the open set reached {held} at page {id}, above the cap of {CAP}"
+            );
+        }
+        assert_eq!(
+            closed.lock().unwrap().len(),
+            PAGES as usize - CAP,
+            "every page opened past the cap must have closed exactly one record"
+        );
+
+        let before = opens.load(Ordering::SeqCst);
+        let reopened = open_page(&cache, &ring, &locks, 1, CAP, &opens, &closed).await;
+        assert!(
+            reopened.is_some(),
+            "a page the cap closed must open again when a later sweep names it"
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            before + 1,
+            "the reopen must go through the opener; a hit here would serve a closed \
+             record"
+        );
+    }
+
+    /// The control for the cap, and the direction the bug runs in: with the bound
+    /// set above the traffic it never binds, and the open set grows by one for every
+    /// page the conversation reaches.
+    ///
+    /// Without this the capped test above is satisfiable by a fixture that never
+    /// reached enough distinct pages to evict anything — an open set that holds at
+    /// four because only four pages exist looks identical to one a cap is holding
+    /// there. Asserted per page rather than at the end, so the claim is monotonic
+    /// growth rather than a final total.
+    #[tokio::test]
+    async fn an_unbinding_cap_lets_the_open_set_grow_with_every_page() {
+        const PAGES: u32 = 20;
+        const CAP: usize = PAGES as usize + 1;
+        let (cache, ring, opens, closed, locks) = page_fixture();
+
+        for id in 1..=PAGES {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+            assert_eq!(
+                cache.lock().unwrap().len(),
+                id as usize,
+                "page {id} must have added an open record rather than replacing one"
+            );
+        }
+        assert!(
+            closed.lock().unwrap().is_empty(),
+            "a cap that never binds closes nothing — this is the unbounded growth \
+             the bound exists to stop"
+        );
+    }
+
+    /// The pages a collector is still sweeping are never the victim under capacity
+    /// pressure, however old they are.
+    ///
+    /// **The pinned pair is opened FIRST on purpose.** That makes them the oldest
+    /// entries in the ring and therefore exactly what an LRU picks, so the test
+    /// exercises the pin rather than a recency that would have spared them anyway.
+    ///
+    /// Two controls, and the assertion is empty without either: an unpinned page of
+    /// the same vintage IS closed, so "nothing was evicted" cannot satisfy this; and
+    /// the open set is asserted to have held at the cap, so the pin is shown to
+    /// narrow the victim choice rather than to switch the bound off.
+    #[tokio::test]
+    async fn the_pinned_sweeping_pages_are_never_evicted_under_pressure() {
+        const CAP: usize = 4;
+        let (cache, ring, opens, closed, locks) = page_fixture();
+
+        // The current page, the next one, and the control — all three opened BEFORE
+        // the pin, so the control is genuinely the same vintage as the pair and the
+        // only thing separating them is the pin. Opening the control after the pin
+        // would make it younger, and an LRU would have spared the pinned pair on
+        // recency alone.
+        for id in [1u32, 2, 3] {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+        ring.lock().unwrap().set_pinned(1, [1u32, 2]);
+
+        for id in 4..=20u32 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+
+        // Handles are `id * 100`, which is what the fixture's opener returns.
+        let reclaimed = closed.lock().unwrap().clone();
+        assert!(
+            !reclaimed.contains(&100) && !reclaimed.contains(&200),
+            "a pinned page was closed under capacity pressure: {reclaimed:?}"
+        );
+        assert!(
+            cache.lock().unwrap().contains_key(&1) && cache.lock().unwrap().contains_key(&2),
+            "a pinned page must still be held after the pressure"
+        );
+        assert!(
+            reclaimed.contains(&300),
+            "page three — the same vintage, unpinned — must have been reclaimed, or \
+             this test shows only that nothing evicts: {reclaimed:?}"
+        );
+        assert_eq!(
+            cache.lock().unwrap().len(),
+            CAP,
+            "the bound must still hold: a pin narrows the victim choice, it does not \
+             switch the cap off"
+        );
+    }
+
+    /// The cap is the number the `ISA.md` Decisions entry of 2026-09-08 names.
+    ///
+    /// The only other check on this constant is the compile-time
+    /// `DM_PAGE_CACHE_CAPACITY > DHT_BUDGET`, which is a hit-rate floor and which
+    /// the previous value of 64 satisfies just as well — so nothing at all would
+    /// have failed if the decided number had never been applied.
+    #[test]
+    fn the_page_cache_capacity_is_the_decided_number() {
+        assert_eq!(
+            DM_PAGE_CACHE_CAPACITY, 128,
+            "the open set is capped at 128 page records per node"
+        );
+    }
+
+    /// A pinned set larger than the cap stalls the ring at the pinned size rather
+    /// than letting it grow with traffic.
+    ///
+    /// **This is the failure mode the driver-side narrowing exists to prevent, seen
+    /// from the transport's end.** A pinned page is not counted against the
+    /// capacity, so once every entry is pinned there is no candidate and the bound
+    /// stops reclaiming. What must NOT happen is unbounded growth: the ring holds at
+    /// the pinned set's own size, because each new open evicts one of the unpinned
+    /// entries the pinned set left room for.
+    ///
+    /// The control is the run's own traffic — twelve distinct pages against a cap of
+    /// three — so a ring that merely never reached the bound could not produce this
+    /// number.
+    #[tokio::test]
+    async fn a_pinned_set_larger_than_the_cap_stalls_the_ring_rather_than_growing() {
+        const CAP: usize = 3;
+        const PINNED: usize = 5;
+        let (cache, ring, opens, closed, locks) = page_fixture();
+
+        // Opened under a capacity that holds all of them, because the pin is applied
+        // AFTER: opening them under `CAP` would evict the first two before anything
+        // pinned them, leaving a pinned set of five that names only three entries the
+        // ring actually holds — a set no larger than the cap, which is not the case
+        // under test.
+        for id in 1..=PINNED as u32 {
+            open_page_and_release(&cache, &ring, &locks, id, PINNED, &opens, &closed).await;
+        }
+        assert_eq!(
+            ring.lock().unwrap().len(),
+            PINNED,
+            "every page to be pinned must be in the ring before the pin is stated"
+        );
+        ring.lock()
+            .unwrap()
+            .set_pinned(1, (1..=PINNED as u32).collect::<Vec<_>>());
+
+        for id in (PINNED as u32 + 1)..=12 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+            let held = ring.lock().unwrap().len();
+            assert!(
+                held <= PINNED + 1,
+                "the ring reached {held} at page {id}: a fully pinned ring must stall \
+                 at the pinned size, not grow with traffic"
+            );
+        }
+        assert_eq!(
+            ring.lock().unwrap().len(),
+            PINNED + 1,
+            "the pinned entries plus the one unpinned slot the evictions rotate \
+             through"
+        );
+        assert!(
+            !closed.lock().unwrap().is_empty(),
+            "the bound must still have reclaimed the unpinned pages, or this shows \
+             only that nothing evicts"
+        );
+    }
+
+    /// With more pages pinned than the capacity allows, the ring refuses to reclaim
+    /// rather than choosing a pinned victim: it holds exactly the pinned set plus at
+    /// most one unpinned entry, and [`BoundedRing::evictable`] never names a pinned
+    /// id however far over the bound the ring sits.
+    ///
+    /// **The membership is asserted, not merely the size.** A ring that had closed
+    /// two pinned records and kept two unpinned ones in their place holds the same
+    /// number of entries as a correct one, so a length assertion alone cannot see
+    /// the failure this case is written for. The final drain is the second half: it
+    /// asks the eviction path directly, past the capacity, until it refuses — the
+    /// ids it gives up must all be unpinned, and what is left when it stops must be
+    /// the pinned set entire.
+    ///
+    /// Two controls, and the claims are empty without either: the run's own traffic
+    /// is asserted to have reclaimed records, so "nothing evicts" cannot satisfy
+    /// this; and the drain is asserted to have given up at least one id, so a ring
+    /// that refused everything unconditionally would fail here too.
+    ///
+    /// The excess over the pinned set is one entry because this fixture opens and
+    /// releases sequentially, so at most one lease is ever held. Concurrent opens
+    /// hold one entry each and the ring sits that much higher, which is the
+    /// live-borrow allowance [`BoundedRing::evictable`] documents.
+    #[tokio::test]
+    async fn a_pinned_set_past_the_cap_holds_the_pinned_entries_and_one_more() {
+        const CAP: usize = 4;
+        const PINNED: usize = CAP + 3;
+        let (cache, ring, opens, closed, locks) = page_fixture();
+
+        // Opened under a capacity that holds all of them, so the pin names entries
+        // the ring is really carrying — under `CAP` the first three would be evicted
+        // before anything pinned them.
+        for id in 1..=PINNED as u32 {
+            open_page_and_release(&cache, &ring, &locks, id, PINNED, &opens, &closed).await;
+        }
+        ring.lock()
+            .unwrap()
+            .set_pinned(1, (1..=PINNED as u32).collect::<Vec<_>>());
+
+        for id in (PINNED as u32 + 1)..=24 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+
+        let held = cache.lock().unwrap();
+        for id in 1..=PINNED as u32 {
+            assert!(
+                held.contains_key(&id),
+                "pinned page {id} was reclaimed under a capacity smaller than the \
+                 pinned set: {:?}",
+                held.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            held.len() <= PINNED + 1,
+            "the ring reached {} entries: a fully pinned ring holds the pinned set \
+             plus the one unpinned slot its evictions rotate through, and does not \
+             grow with traffic",
+            held.len()
+        );
+        drop(held);
+        assert!(
+            !closed.lock().unwrap().is_empty(),
+            "the traffic reclaimed nothing, so nothing above shows a bound that \
+             refuses only the pinned records"
+        );
+
+        // Asked of the eviction path itself, past the capacity, until it refuses.
+        let mut ring = ring.lock().unwrap();
+        let mut given_up = Vec::new();
+        while let Some(id) = ring.evictable(CAP) {
+            given_up.push(id);
+        }
+        assert!(
+            !given_up.is_empty(),
+            "the drain gave up nothing, so a ring that refuses every id would pass \
+             the assertion below"
+        );
+        for id in &given_up {
+            assert!(
+                *id > PINNED as u32,
+                "the eviction path named pinned page {id}: {given_up:?}"
+            );
+        }
+        let mut left = ring.pinned_ids();
+        left.sort_unstable();
+        assert_eq!(
+            left,
+            (1..=PINNED as u32).collect::<Vec<_>>(),
+            "the pinned statement must be untouched by the drain"
+        );
+        assert_eq!(
+            ring.len(),
+            PINNED,
+            "what the eviction path leaves when it refuses must be the pinned set \
+             entire, however far that sits above the capacity"
+        );
+    }
+
+    /// A pinned set exactly equal to the capacity is its own branch of
+    /// [`BoundedRing::evictable`] and gets its own case.
+    ///
+    /// **The `order.len() <= capacity` early return is what separates it.** At
+    /// `pinned > capacity` the scan runs and finds no candidate; at
+    /// `pinned == capacity` the ring is at the bound with every entry pinned, so
+    /// the length test answers first and the scan is never reached. Both must leave
+    /// the pinned records in place, and only one of them exercises the scan — an
+    /// eviction path correct for one and wrong for the other passes a test that
+    /// covers either alone.
+    #[tokio::test]
+    async fn a_pinned_set_equal_to_the_cap_reclaims_nothing_pinned() {
+        const CAP: usize = 5;
+        let (cache, ring, opens, closed, locks) = page_fixture();
+
+        for id in 1..=CAP as u32 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+        ring.lock()
+            .unwrap()
+            .set_pinned(1, (1..=CAP as u32).collect::<Vec<_>>());
+
+        for id in (CAP as u32 + 1)..=20 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+
+        let held = cache.lock().unwrap();
+        for id in 1..=CAP as u32 {
+            assert!(
+                held.contains_key(&id),
+                "pinned page {id} was reclaimed by a ring sitting exactly at its \
+                 capacity: {:?}",
+                held.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            held.len() <= CAP + 1,
+            "the ring reached {} entries against a capacity of {CAP}",
+            held.len()
+        );
+        drop(held);
+        assert!(
+            !closed.lock().unwrap().is_empty(),
+            "the traffic reclaimed nothing, so this shows only that nothing evicts"
+        );
+
+        let mut ring = ring.lock().unwrap();
+        let mut given_up = Vec::new();
+        while let Some(id) = ring.evictable(CAP) {
+            given_up.push(id);
+        }
+        for id in &given_up {
+            assert!(
+                *id > CAP as u32,
+                "the eviction path named pinned page {id}: {given_up:?}"
+            );
+        }
+        assert_eq!(
+            ring.len(),
+            CAP,
+            "a ring pinned to exactly its capacity must hold the pinned set and \
+             stop there"
+        );
+    }
+
+    /// A pin statement older than the one already applied is dropped.
+    ///
+    /// **Statements replace the whole set and are delivered by independent tasks**,
+    /// so a reordered pair would otherwise reinstate a stale window over the current
+    /// one — and the driver will not restate a set it believes it has already sent,
+    /// so nothing would repair it until the window next moved.
+    ///
+    /// The control is the first half: the newer statement is shown to have applied
+    /// before the older one is offered, so "the set is still statement two's" cannot
+    /// be satisfied by a ring that ignores every statement.
+    #[test]
+    fn a_pin_statement_older_than_the_last_applied_is_dropped() {
+        let mut ring: BoundedRing<u32> = BoundedRing::new();
+
+        assert!(
+            ring.set_pinned(2, [10u32, 11]),
+            "the first statement must apply"
+        );
+        let mut got = ring.pinned_ids();
+        got.sort_unstable();
+        assert_eq!(got, vec![10, 11], "statement two's set must be held");
+
+        assert!(
+            !ring.set_pinned(1, [99u32]),
+            "a statement older than the last applied must be refused"
+        );
+        let mut got = ring.pinned_ids();
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![10, 11],
+            "the stale statement must not have replaced the newer set"
+        );
+
+        // A repeat of the applied number is stale too — numbering is strictly
+        // increasing, so an equal number is a duplicate delivery rather than news.
+        assert!(!ring.set_pinned(2, [99u32]), "a repeat must be refused");
+        assert!(
+            ring.set_pinned(3, [12u32]),
+            "a newer statement must still apply"
+        );
+        assert_eq!(ring.pinned_ids(), vec![12]);
+    }
+
+    /// A pin is a whole statement rather than a per-page hold, and it never refuses
+    /// a close the holder asked for by name.
+    ///
+    /// Both halves are the same property from opposite sides: the pinned set says
+    /// what the CAPACITY may not choose, and says nothing about what the driver may
+    /// hand back. Without the first half a page would stay pinned after the frontier
+    /// moved past it — a record held open for the session, which is the leak the
+    /// bound exists to close; without the second, a torn-down conversation's records
+    /// would outlive it.
+    #[tokio::test]
+    async fn a_restated_pin_releases_the_pages_it_no_longer_names() {
+        const CAP: usize = 2;
+        let (cache, ring, opens, closed, locks) = page_fixture();
+        for id in [1u32, 2] {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+        ring.lock().unwrap().set_pinned(1, [1u32, 2]);
+
+        assert!(
+            close_page(&cache, &ring, &locks, 1, &closed).await,
+            "a close by name must not be refused by a pin"
+        );
+
+        // Restated without page two, which is what a moved frontier produces. The
+        // id named here is in no ring, so a pin on an absent record is also shown to
+        // be inert rather than an error.
+        ring.lock().unwrap().set_pinned(2, [9u32]);
+        for id in 3..=6u32 {
+            open_page_and_release(&cache, &ring, &locks, id, CAP, &opens, &closed).await;
+        }
+        assert!(
+            closed.lock().unwrap().contains(&200),
+            "a page dropped from the pinned set must be an eviction candidate again: \
+             {:?}",
+            closed.lock().unwrap()
         );
     }
 

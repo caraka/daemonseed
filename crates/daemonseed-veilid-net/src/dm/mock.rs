@@ -29,7 +29,7 @@ use crate::actor::{DmPageRecord, DmPageSweep, DmPageWatch, DoorbellDispatch, Doo
 use crate::dm::seam::{DmDht, DmDhtFuture};
 use crate::SweepOutcome;
 
-/// The nine seam methods, in trait order, as counter indices.
+/// The ten seam methods, in trait order, as counter indices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Method {
     FetchKeyRecord,
@@ -41,12 +41,13 @@ pub(crate) enum Method {
     PublishAck,
     FetchAck,
     ClosePage,
+    PinPages,
 }
 
 impl Method {
     /// Every method, so an oracle can assert over the whole set rather than over
     /// the ones it remembered to name.
-    pub(crate) const ALL: [Method; 9] = [
+    pub(crate) const ALL: [Method; 10] = [
         Method::FetchKeyRecord,
         Method::PublishDoorbell,
         Method::SweepDoorbell,
@@ -56,6 +57,7 @@ impl Method {
         Method::PublishAck,
         Method::FetchAck,
         Method::ClosePage,
+        Method::PinPages,
     ];
 
     fn index(self) -> usize {
@@ -69,6 +71,7 @@ impl Method {
             Method::PublishAck => 6,
             Method::FetchAck => 7,
             Method::ClosePage => 8,
+            Method::PinPages => 9,
         }
     }
 }
@@ -126,6 +129,16 @@ pub(crate) enum MockCall {
         /// never opened, matching what the transport answers for one the cache
         /// does not hold.
         closed: bool,
+    },
+    /// The pages the driver stated its capacity bound may not reclaim, as the
+    /// whole set it named.
+    PinPages {
+        statement: u64,
+        pages: Vec<(
+            [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+            Direction,
+            u64,
+        )>,
     },
 }
 
@@ -289,7 +302,11 @@ impl MockNetwork {
 
 /// A counting [`DmDht`] with an injected latency.
 pub(crate) struct MockDht {
-    counts: [AtomicU64; 9],
+    /// Sized from [`Method::ALL`] rather than written as a literal. A further seam
+    /// method against a fixed-size array is an index out of bounds at the first call
+    /// — a panic in whatever test happens to reach it first, pointing at the
+    /// counter rather than at the method that was added.
+    counts: [AtomicU64; Method::ALL.len()],
     log: Mutex<Vec<MockCall>>,
     /// Doorbell sweeps to hand back, oldest first. An exhausted queue yields the
     /// empty sweep, which is the ordinary state of a doorbell nobody knocked on
@@ -375,6 +392,18 @@ pub(crate) struct MockDht {
     /// answer of a watch that is simply not there, and a driver must treat the
     /// two the same way while the mock can still tell them apart.
     watches_lost: std::sync::atomic::AtomicBool,
+    /// The pages the driver last said its capacity bound may not reclaim.
+    ///
+    /// **Recorded, not acted on.** This mock holds every page it is asked to hold
+    /// and reclaims none on its own, so there is no eviction here for a pin to
+    /// prevent; what the pin does to a victim choice is the ring's own behaviour
+    /// and is pinned where the ring is. What an oracle wants from this side is the
+    /// statement itself — which pages the driver named, and that a set it has not
+    /// changed is not restated.
+    pinned_pages: Mutex<std::collections::BTreeSet<OpenPageKey>>,
+    /// The highest pin statement applied, so a reordered pair is resolved here the
+    /// way the transport's ring resolves it.
+    pinned_at: Mutex<u64>,
 }
 
 /// What [`MockDht::open_pages`] is keyed on: conversation, direction, page.
@@ -427,6 +456,8 @@ impl MockDht {
             net,
             open_pages: Mutex::new(std::collections::BTreeSet::new()),
             watches_lost: std::sync::atomic::AtomicBool::new(false),
+            pinned_pages: Mutex::new(std::collections::BTreeSet::new()),
+            pinned_at: Mutex::new(0),
         }
     }
 
@@ -488,6 +519,12 @@ impl MockDht {
     /// opens minus closes, not calls minus calls. See [`MockDht::open_pages`].
     pub(crate) fn open_page_count(&self) -> usize {
         self.open_pages.lock().expect("mock open pages").len()
+    }
+
+    /// The pages the driver last stated its capacity bound may not reclaim, as
+    /// `(conversation, direction byte, page)` keys.
+    pub(crate) fn pinned_pages(&self) -> std::collections::BTreeSet<OpenPageKey> {
+        self.pinned_pages.lock().expect("mock pinned pages").clone()
     }
 
     /// Record that a page record is open, if it was not already.
@@ -953,6 +990,54 @@ impl DmDht for MockDht {
                 return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
             }
             Ok(closed)
+        })
+    }
+
+    fn pin_dm_pages(&self, statement: u64, pages: Vec<DmPageRecord>) -> DmDhtFuture<()> {
+        let named: Vec<(
+            [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+            Direction,
+            u64,
+        )> = pages
+            .iter()
+            .map(|address| (*address.conversation(), address.direction(), address.page()))
+            .collect();
+        // Replaced rather than extended, on the seam's own terms: the operation
+        // states the whole set, so a page absent from it is unpinned by this call.
+        // Applied here rather than in the future for the reason every counter is
+        // bumped here — an oracle reads the statement without driving anything.
+        // Ordered exactly as the transport's ring orders them: a statement no newer
+        // than the last applied changes nothing. A mock that applied every
+        // statement in arrival order would report a reordered pair as correct and
+        // hide the failure the number exists to prevent.
+        let mut last = self.pinned_at.lock().expect("mock pin statement");
+        if statement > *last {
+            *last = statement;
+            *self.pinned_pages.lock().expect("mock pinned pages") = named
+                .iter()
+                .map(|(conversation, direction, page)| {
+                    open_page_key(*conversation, *direction, *page)
+                })
+                .collect();
+        }
+        drop(last);
+        self.record(
+            Method::PinPages,
+            MockCall::PinPages {
+                statement,
+                pages: named,
+            },
+        );
+        let latency = self.latency_for(Method::PinPages);
+        let boom = self.panics(Method::PinPages);
+        let dud = self.fails(Method::PinPages);
+        Box::pin(async move {
+            tokio::time::sleep(latency).await;
+            assert!(!boom, "scripted seam panic");
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
+            Ok(())
         })
     }
 

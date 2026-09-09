@@ -74,6 +74,13 @@ pub trait DmDht: Send + Sync + 'static {
     /// one already reclaimed, or one an operation is still holding.
     fn close_dm_page(&self, address: DmPageRecord) -> DmDhtFuture<bool>;
 
+    /// State which page records the capacity bound may not reclaim, replacing any
+    /// previous statement. An empty list pins nothing. `statement` is strictly
+    /// increasing per caller and a statement no newer than the last applied is
+    /// dropped, because these are delivered by independent tasks and can arrive
+    /// reordered.
+    fn pin_dm_pages(&self, statement: u64, pages: Vec<DmPageRecord>) -> DmDhtFuture<()>;
+
     /// Publish one direction's acknowledgement record.
     fn publish_dm_ack(&self, address: DmAckAddress, record: Vec<u8>) -> DmDhtFuture<()>;
 
@@ -126,6 +133,11 @@ impl DmDht for VeilidNetHandle {
     fn close_dm_page(&self, address: DmPageRecord) -> DmDhtFuture<bool> {
         let h = self.clone();
         Box::pin(async move { h.close_dm_page(address).await })
+    }
+
+    fn pin_dm_pages(&self, statement: u64, pages: Vec<DmPageRecord>) -> DmDhtFuture<()> {
+        let h = self.clone();
+        Box::pin(async move { h.pin_dm_pages(statement, pages).await })
     }
 
     fn publish_dm_ack(&self, address: DmAckAddress, record: Vec<u8>) -> DmDhtFuture<()> {

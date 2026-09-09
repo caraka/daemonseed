@@ -629,6 +629,19 @@ work lives in the maintainer's own planning notes, not here.
   `Command::Shutdown` dequeue with its budget, the scheduler flush return, and the teardown
   return or `TEARDOWN_CAP`. A leave or flush stage that is skipped for want of a session says
   so, so a silent trace means the close never ran rather than ran and did nothing. (#370)
+- `VeilidNetHandle::pin_dm_pages(u64, Vec<DmPageRecord>)` and `rendezvous::BoundedRing::set_pinned` —
+  the page records the open cache's capacity bound may not reclaim, stated as a whole set that
+  replaces any previous one. The `u64` is the statement number, strictly increasing per caller; a
+  statement no newer than the last applied is dropped. The DM driver states the watched pair of
+  every conversation it carries on cadence — one holding a key schedule, not torn down, not
+  suppressed by the block list — and restates it only when that set changes; a resumed
+  correspondence holding no key schedule is included, as it is swept on the same cadence. A pinned
+  set at or past the capacity stalls reclamation: the cache holds the pinned records plus the
+  entries in flight, one per concurrent open, and does not grow with traffic. An eviction
+  skips a pinned record as it already skips a leased one, so the bound no longer chooses the current
+  or next page of a sweep — the pages nothing holds between operations, and therefore the oldest
+  unheld records an LRU would pick. A close asked for by name is not refused by a pin.
+  `DM_PAGE_CACHE_CAPACITY` is 128. (#252)
 
 ### Fixed
 

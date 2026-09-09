@@ -711,6 +711,17 @@ enum Command {
         address: DmPageRecord,
         reply: oneshot::Sender<Result<bool>>,
     },
+    /// State which page records the open cache's capacity bound may not reclaim,
+    /// replacing any previous statement (#252).
+    ///
+    /// The whole set every time, so a page absent from `pages` is unpinned by the
+    /// same command that pins the ones present. A pin narrows what an eviction may
+    /// choose and never what a [`Command::CloseDmPage`] may close.
+    PinDmPages {
+        statement: u64,
+        pages: Vec<DmPageRecord>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     // ── Direct messaging (#233) ──
     /// Write one first-contact entry into `slot` of the `dflt(32)` doorbell record
     /// at `owner_seed` (`daemonseed_core::dm::doorbell::derive_owner_seed` over the
@@ -1269,6 +1280,44 @@ impl VeilidNetHandle {
     pub async fn close_dm_page(&self, address: DmPageRecord) -> Result<bool> {
         self.send(|reply| Command::CloseDmPage { address, reply })
             .await?
+    }
+
+    /// State which page records the open cache's capacity bound may not reclaim,
+    /// replacing any previous statement (#252).
+    ///
+    /// **The pages a caller is still working through, not the pages it is using
+    /// right now.** An operation in flight already holds a lease that refuses
+    /// eviction for its whole length; what a lease cannot cover is the page a
+    /// caller will address again shortly but holds nothing on at this instant. Under
+    /// capacity pressure that page is among the oldest unheld records and is
+    /// therefore what an LRU picks, so without a pin the bound reclaims precisely
+    /// the records about to be re-opened.
+    ///
+    /// **The whole set every time.** A page absent from `pages` is unpinned by this
+    /// call, so there is no release for a caller to forget — a forgotten release
+    /// would hold a record open for the session, which is the leak the bound exists
+    /// to close. An empty list pins nothing.
+    ///
+    /// **`statement` must be strictly increasing per caller**, because a wholesale
+    /// replace has to be ordered and the delivery is not: a statement no newer than
+    /// the last applied is dropped rather than allowed to reinstate a stale set over
+    /// the current one. Zero is never a valid statement, so the first call applies.
+    ///
+    /// Keep the set proportional to conversations rather than to traffic: pinning
+    /// as many records as the cache holds leaves the bound nothing to reclaim.
+    /// Pinning does not stop [`Self::close_dm_page`], which is the holder saying it
+    /// is finished with a page.
+    ///
+    /// Takes the records by value for the reason [`Self::close_dm_page`] does: the
+    /// owner seed inside is the conversation's write capability and must be moved,
+    /// never copied out (#244).
+    pub async fn pin_dm_pages(&self, statement: u64, pages: Vec<DmPageRecord>) -> Result<()> {
+        self.send(|reply| Command::PinDmPages {
+            statement,
+            pages,
+            reply,
+        })
+        .await?
     }
 
     // ── Direct messaging (#233) ──
@@ -2216,6 +2265,18 @@ async fn actor_loop(
                     .await;
                     let _ = reply.send(r);
                 });
+            }
+            Command::PinDmPages {
+                statement,
+                pages,
+                reply,
+            } => {
+                // Not spawned, unlike every other page command: this reaches no DHT
+                // and takes no record lock. It is one `std::sync` lock held for the
+                // length of a set replacement, which is the shape the loop already
+                // runs inline everywhere else.
+                let r = pin_dm_pages(&page_recency, statement, pages);
+                let _ = reply.send(r);
             }
             Command::PublishDoorbellEntry {
                 owner_seed,
@@ -4223,6 +4284,71 @@ async fn close_dm_page(
     Ok(closed)
 }
 
+/// Replace the set of page records the capacity bound may not reclaim (#252).
+///
+/// **Addresses the records through [`dm_page_record_id`], the same derivation the
+/// closer uses**, so a pin and a close name the identical id. A pin derived any
+/// other way would silently protect nothing: the ring compares ids, and an id that
+/// matches no cache entry is a pin on a record that does not exist, which reads
+/// exactly like a pin that is working.
+///
+/// **A record whose id will not derive is dropped from the statement rather than
+/// failing it.** The alternative would let one bad address unpin every page of every
+/// other conversation, which costs far more than the one record left evictable —
+/// and that record is not lost, only reclaimable early and re-opened on demand.
+fn pin_dm_pages(
+    page_recency: &rendezvous::DmPageRecency,
+    statement: u64,
+    pages: Vec<DmPageRecord>,
+) -> Result<()> {
+    let ids = pin_ids(&pages, dm_page_record_id);
+    crate::vtrace!(
+        "pin_dm_pages: statement {statement} pins {} records",
+        ids.len()
+    );
+    let applied = page_recency
+        .lock()
+        // Poison-recovered, mirroring every other holder of this lock: a panicked
+        // holder elsewhere must not wedge the page path for the session.
+        .unwrap_or_else(|e| e.into_inner())
+        .set_pinned(statement, ids);
+    if !applied {
+        crate::vtrace!("pin_dm_pages: statement {statement} arrived stale and was dropped");
+    }
+    Ok(())
+}
+
+/// Resolve page records to the ids the open cache holds them under, dropping any
+/// that will not derive.
+///
+/// **`derive` is a parameter so the dropping arm can be driven by a fixture.** The
+/// real derivation is total for every address this crate can build, so a test that
+/// called it could never reach the failure branch and the branch would sit
+/// unexercised — the shape of a guard that reads as working because nothing ever
+/// makes it fire. `pin_ids_uses_the_closers_own_derivation` pins the production
+/// wiring against [`dm_page_record_id`] separately, so factoring it out costs no
+/// coverage of which derivation is used.
+///
+/// **A record that will not derive is dropped from the statement rather than
+/// failing it.** Failing would let one bad address unpin every page of every other
+/// conversation, which costs far more than the one record left evictable — and that
+/// record is not lost, only reclaimable early and re-opened on demand.
+fn pin_ids(
+    pages: &[DmPageRecord],
+    derive: impl Fn(&DmPageRecord) -> Result<rendezvous::CachedRecordId>,
+) -> Vec<rendezvous::CachedRecordId> {
+    pages
+        .iter()
+        .filter_map(|address| match derive(address) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                crate::vtrace!("pin_dm_pages: page id would not derive ({e})");
+                None
+            }
+        })
+        .collect()
+}
+
 /// The DM doorbell's schema: `dflt(32)`, one subkey per knock slot.
 ///
 /// Part of the record ADDRESS, and simultaneously the modulus of
@@ -6014,6 +6140,94 @@ mod tests {
     fn receiving_address(page: u64) -> DmPageAddress<Receiving> {
         DmPageAddress::receiving(&page_address_root(), &page_ratchet(), page)
             .expect("derive a receiving page address")
+    }
+
+    /// The pin path resolves records to the ids the open cache holds them under,
+    /// and a stale statement changes nothing.
+    ///
+    /// **The expectation is built independently, from [`dm_page_record_id`] over
+    /// the same addresses**, so a `pin_dm_pages` that reached for another
+    /// derivation — one that ignored the page, say, or the shape — fails here. A
+    /// test comparing the pinned ids to whatever the pin path produced would agree
+    /// with itself whatever it did.
+    ///
+    /// Two pages of the receiving stream, so a derivation that dropped the page
+    /// number collapses the set to one and fails on the count.
+    #[test]
+    fn the_pin_path_resolves_the_ids_the_closer_would_name() {
+        let ring: rendezvous::DmPageRecency = Mutex::new(rendezvous::BoundedRing::new());
+        let pages = vec![
+            DmPageRecord::Receiving(receiving_address(PAGE_FIXTURE_PAGE)),
+            DmPageRecord::Receiving(receiving_address(PAGE_FIXTURE_PAGE + 1)),
+        ];
+        let want: std::collections::HashSet<rendezvous::CachedRecordId> = [
+            dm_page_record_id(&DmPageRecord::Receiving(receiving_address(
+                PAGE_FIXTURE_PAGE,
+            )))
+            .expect("the closer's derivation"),
+            dm_page_record_id(&DmPageRecord::Receiving(receiving_address(
+                PAGE_FIXTURE_PAGE + 1,
+            )))
+            .expect("the closer's derivation"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(want.len(), 2, "two pages must derive two distinct ids");
+
+        pin_dm_pages(&ring, 1, pages).expect("pin");
+        let got: std::collections::HashSet<rendezvous::CachedRecordId> =
+            ring.lock().unwrap().pinned_ids().into_iter().collect();
+        assert_eq!(
+            got, want,
+            "the pinned ids must be the ones the close path would name"
+        );
+
+        // A statement no newer than the last applied leaves the set alone, so a
+        // reordered delivery cannot unpin the current window.
+        pin_dm_pages(&ring, 1, Vec::new()).expect("stale pin");
+        let got: std::collections::HashSet<rendezvous::CachedRecordId> =
+            ring.lock().unwrap().pinned_ids().into_iter().collect();
+        assert_eq!(got, want, "a stale statement must not clear the set");
+
+        pin_dm_pages(&ring, 2, Vec::new()).expect("newer pin");
+        assert!(
+            ring.lock().unwrap().pinned_ids().is_empty(),
+            "a newer empty statement unpins everything"
+        );
+    }
+
+    /// A record whose id will not derive is dropped from the statement, and the
+    /// rest of the statement still applies.
+    ///
+    /// **Driven through a stand-in derivation because the real one is total for
+    /// every address this crate can build**, so the dropping arm has no fixture
+    /// that could reach it and would sit unexercised — a guard that reads as
+    /// working because nothing ever makes it fire. Which derivation production
+    /// actually uses is pinned by the test above, so nothing is lost by driving
+    /// this half with a stub.
+    ///
+    /// The control is the surviving id: without it, "the bad one was dropped" is
+    /// satisfied by a resolver that drops everything.
+    #[test]
+    fn a_record_whose_id_will_not_derive_is_dropped_from_the_statement() {
+        let good = DmPageRecord::Receiving(receiving_address(PAGE_FIXTURE_PAGE));
+        let bad = DmPageRecord::Receiving(receiving_address(PAGE_FIXTURE_PAGE + 1));
+        let bad_page = bad.page();
+        let want = dm_page_record_id(&good).expect("the closer's derivation");
+
+        let ids = pin_ids(&[good, bad], |address: &DmPageRecord| {
+            if address.page() == bad_page {
+                Err(VeilidNetError::Actor("a derivation that will not".into()))
+            } else {
+                dm_page_record_id(address)
+            }
+        });
+
+        assert_eq!(
+            ids,
+            vec![want],
+            "the underivable record is dropped and the rest of the statement stands"
+        );
     }
 
     /// A handle whose command channel is serviced by `service`, with no actor, no
