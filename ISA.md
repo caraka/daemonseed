@@ -1289,6 +1289,29 @@ spanning four distinct pages ends holding the watched window and nothing more),
 `a_page_is_closed_under_the_id_it_was_opened_with`. ISC-C42 stays open: this bounds the record count
 and settles nothing else in its text.
 
+**2026-09-08 — the receiver gives up on a position it never collected, on its own clock, and the
+entry above is superseded on that point.** That entry records that a permanently lost inbound
+position pins its conversation's receiving pages until the transport's capacity bound reclaims them,
+because no record tells the receiver that the sender abandoned a position. The premise stands — the
+wire carries nothing of the kind, and no field is added — and the conclusion does not: the receiver
+measures the horizon itself. `Collection::sweep_give_ups` abandons a gap that has stood for
+`RECEIVE_GIVE_UP_MS`, the sender's `GIVE_UP` plus the longest `RESEED_LADDER` rung, and the cursor
+advances over it, so `Collection::abandoned` has a production caller and the pages are released after
+one horizon rather than by the capacity bound. **The age is accumulated, not read off the clock:**
+each sweep adds the time since the last one capped at `AGE_STEP_CAP_MS`, so a host clock that steps
+forward cannot abandon positions the sender is still re-seeding — the dangerous direction, since an
+abandoned position is settled and a settled position is filtered out of everything a page fold
+offers. **A give-up is its own reason to write an acknowledgement**, distinct from the standalone
+cadence: that cadence is keyed on the live pending set, which ages out at the sender's give-up, so
+the ordinary case of one lost message and no later traffic would move the cursor at a moment when
+nothing would ever publish it. What was rejected: accepting the stall, which lets `MAX_ACK_RUNS`
+permanent losses refuse every later collection and report read messages as undelivered; and a give-up
+marker on the wire, a frame-shape change carrying a number the receiver can already derive. Pinned by
+`a_gap_past_the_horizon_is_given_up_on`, `a_clock_that_steps_forward_does_not_age_a_gap_by_the_step`,
+`a_gap_filled_from_below_does_not_restart_its_horizon`, `a_split_gap_keeps_its_age_in_both_halves`,
+`a_give_up_with_no_later_traffic_still_publishes_the_moved_cursor` and its mirror
+`a_probe_that_moves_no_cursor_writes_no_acknowledgement`.
+
 **Anti-criteria are verified by negative fixtures**, each of which must be shown to fail before its
 guard lands: replay, clock skew, counter rollback, handle mismatch, forged provenance, a forged share
 identifier on both the announce and withdraw paths, and an outsider key against a room seal.

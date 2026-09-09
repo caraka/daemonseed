@@ -957,6 +957,22 @@ struct Correspondence {
     /// allowance; the alternative is a record whose absence would have to be
     /// distinguished from a conversation that genuinely never wrote one.
     ack_cadence: StandaloneAckCadence,
+    /// Whether a receive-side give-up has moved this side's acknowledgement
+    /// since one was last written.
+    ///
+    /// **A second reason to write, because the cadence's own reason does not
+    /// cover this one.** [`StandaloneAckCadence`] is keyed on
+    /// [`Self::pending_sent_ms`], and an entry there ages out at the sender's
+    /// give-up while a give-up here happens a margin *after* it. So the ordinary
+    /// case — one position lost, no later traffic — has an empty live pending
+    /// set at exactly the moment the cursor moves, and the correspondent would
+    /// never be told: it would go on re-seeding a position this side has stopped
+    /// asking for, to no schedule at all, since nothing else will move this
+    /// cursor again.
+    ///
+    /// Cleared when a write lands, not when one is decided, for the reason
+    /// [`Self::on_ack_written`] states about the cadence it sits beside.
+    owes_give_up_ack: bool,
     /// The send times of the messages this session has opened on the receiving
     /// direction — what the taper measures the sender's give-up from.
     ///
@@ -3602,6 +3618,21 @@ impl DmMachine {
     /// **Asked before the cadence is spent**, so a block leaves the collection's
     /// probe schedule exactly where it was and an unblock resumes on the next
     /// tick rather than after a skipped cadence.
+    ///
+    /// **This is also where the collection's gaps age**, so a position missing
+    /// past [`Collection`]'s receive-side horizon is given up on here. Nothing
+    /// is collected in that case, so the acknowledgement floor is raised
+    /// explicitly and the correspondence is marked as owing a write — the cursor
+    /// is what the acknowledgement reports, and a correspondent that is never
+    /// told has a sender re-seeding positions this side has stopped asking for.
+    ///
+    /// **A gap ages only while this side is reaching the correspondence at all.**
+    /// Every return above the sweep holds the ages where they are: a blocked
+    /// correspondent, a block list that would not read, and a correspondence with
+    /// neither a key schedule nor a stored correspondent. The horizon is
+    /// therefore a count of observed cadences and not a wall-clock deadline, and
+    /// each of those states delays a give-up for as long as it lasts rather than
+    /// preventing one.
     fn probe(
         &mut self,
         now_ms: i64,
@@ -3665,6 +3696,23 @@ impl DmMachine {
         // The cadence is consumed whether or not the sweep can proceed, so a
         // correspondence that cannot verify anything reports once per cadence
         // rather than once per tick.
+        // The give-up sweep runs on this tick and the plan on its own cadence, so
+        // a gap ages every time this correspondence is reached rather than once
+        // per plan; `Collection::sweep_give_ups` caps what one call may add.
+        //
+        // **Any abandonment raises the acknowledgement floor, not only one that
+        // moved the cursor.** A gap given up on above a younger one below it
+        // folds two runs into one and leaves `contiguous_through` exactly where
+        // it was, and that is still a statement this side owes its correspondent
+        // — it has stopped asking for those positions.
+        if !correspondence
+            .collection
+            .sweep_give_ups(probe_ms(now_ms))
+            .is_empty()
+        {
+            correspondence.ack_cadence.on_collected();
+            correspondence.owes_give_up_ack = true;
+        }
         let Some(plan) = correspondence.collection.probe_plan(probe_ms(now_ms)) else {
             return out;
         };
@@ -4901,6 +4949,10 @@ impl DmMachine {
             return Vec::new();
         };
         self.correspondences[index].ack_cadence.on_acked(now_ms);
+        // The give-up's own reason to write is discharged by the same record
+        // that discharges the cadence's, and on the same terms: the write, never
+        // the decision to write.
+        self.correspondences[index].owes_give_up_ack = false;
         Vec::new()
     }
 
@@ -4954,19 +5006,30 @@ impl DmMachine {
             // one value, because the oldest live entry is the only member either
             // answer depends on. Passing the whole set twice would walk it twice
             // for an identical result.
-            let Some(oldest_ms) = ack_cadence::oldest_live_pending_ms(
+            let live_oldest_ms = ack_cadence::oldest_live_pending_ms(
                 now_ms,
                 correspondence.pending_sent_ms.iter().copied(),
                 GIVE_UP_MS,
-            ) else {
-                continue;
+            );
+            // **A give-up is its own reason to write, and it has to be.** Both
+            // gates below are keyed on the live pending set, and a receive-side
+            // give-up happens a margin AFTER the sender's, so in the ordinary
+            // case — one position lost, nothing collected since — that set is
+            // empty at exactly the moment the acknowledgement changed. The
+            // ordering key is then this instant, which is the youngest a claim
+            // can be: an owed write competes for the allowance and never wins it
+            // from a conversation with a real pending message.
+            let oldest_ms = match (live_oldest_ms, correspondence.owes_give_up_ack) {
+                (Some(oldest_ms), _)
+                    if correspondence
+                        .ack_cadence
+                        .is_due(now_ms, [oldest_ms], GIVE_UP_MS) =>
+                {
+                    oldest_ms
+                }
+                (_, true) => now_ms,
+                _ => continue,
             };
-            if !correspondence
-                .ack_cadence
-                .is_due(now_ms, [oldest_ms], GIVE_UP_MS)
-            {
-                continue;
-            }
             due.push((correspondence.label, oldest_ms));
         }
 
@@ -5528,6 +5591,7 @@ impl DmMachine {
                         offered_this_session: Vec::new(),
                         health: ChannelCounters::default(),
                         ack_cadence: StandaloneAckCadence::new(),
+                        owes_give_up_ack: false,
                         pending_sent_ms: Vec::new(),
                         own_ack: AckState::new(),
                         last_accept_refusal: None,
@@ -6201,6 +6265,7 @@ impl DmMachine {
                 offered_this_session: Vec::new(),
                 health: ChannelCounters::default(),
                 ack_cadence: StandaloneAckCadence::new(),
+                owes_give_up_ack: false,
                 pending_sent_ms: Vec::new(),
                 own_ack: AckState::new(),
                 last_accept_refusal: None,
@@ -8541,6 +8606,7 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
             ack_cadence: StandaloneAckCadence::new(),
+            owes_give_up_ack: false,
             pending_sent_ms: Vec::new(),
             own_ack: AckState::new(),
             last_accept_refusal: None,
@@ -9848,6 +9914,7 @@ mod tests {
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
             ack_cadence: StandaloneAckCadence::new(),
+            owes_give_up_ack: false,
             pending_sent_ms: Vec::new(),
             own_ack: AckState::new(),
             last_accept_refusal: None,
@@ -9978,6 +10045,7 @@ mod tests {
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
             ack_cadence: StandaloneAckCadence::new(),
+            owes_give_up_ack: false,
             pending_sent_ms: Vec::new(),
             own_ack: AckState::new(),
             last_accept_refusal: None,
@@ -13391,6 +13459,7 @@ mod tests {
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
             ack_cadence: StandaloneAckCadence::new(),
+            owes_give_up_ack: false,
             pending_sent_ms: Vec::new(),
             own_ack: AckState::new(),
             last_accept_refusal: None,
@@ -13933,6 +14002,326 @@ mod tests {
             b.correspondences[0].pending_sent_ms.is_empty(),
             "the pending set must age out with the sender's window, leaving: {:?}",
             b.correspondences[0].pending_sent_ms
+        );
+    }
+
+    /// The horizon a receive-side give-up waits out, as this module's clock
+    /// reads it.
+    const HORIZON_MS: i64 = daemonseed_core::dm::collect::RECEIVE_GIVE_UP_MS as i64;
+
+    /// The most one sweep may add to a gap's age.
+    const AGE_STEP_MS: i64 = daemonseed_core::dm::collect::AGE_STEP_CAP_MS as i64;
+
+    /// Age one correspondence's gaps from `from_ms` to `to_ms` at the age cap,
+    /// which is the fastest they can age, asserting that none aged out on the
+    /// way.
+    ///
+    /// **The collection is swept directly, and the probe is left to fire the
+    /// give-up itself.** The sweep accumulates a capped interval per call, so
+    /// reaching a horizon measured in days takes thousands of them, and each one
+    /// through `probe` re-reads the stored outbox — minutes of decryption saying
+    /// nothing these tests are about. Each of them then asserts that the *probe*
+    /// is what carries the gap over the line, so the wiring is still what is
+    /// under test; that the ages advance on the probe's own cadence is
+    /// `Collection`'s to state and its own tests to pin.
+    ///
+    /// The empty assertion is the control: a march that gave up on something
+    /// early would leave the probe below with nothing to do, and every assertion
+    /// after it would be satisfied by the fixture.
+    fn age_gaps(m: &mut DmMachine, index: usize, from_ms: i64, to_ms: i64) {
+        let mut now = from_ms;
+        while now <= to_ms {
+            assert!(
+                m.correspondences[index]
+                    .collection
+                    .sweep_give_ups(probe_ms(now))
+                    .is_empty(),
+                "the fixture must not reach the horizon before the probe does"
+            );
+            now += AGE_STEP_MS;
+        }
+    }
+
+    /// The record bytes of every `PublishAck` in a batch of effects.
+    fn ack_records(effects: &[DmEffect]) -> Vec<Vec<u8>> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::PublishAck { record, .. }) => Some(record.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The contiguous prefix an acknowledgement record claims, read the way its
+    /// correspondent reads it: verified against the writer's pseudonym on the
+    /// direction the reader sends, then merged under the reader's own ceiling.
+    ///
+    /// Asserting on this rather than on a publish having happened is what makes
+    /// the test about the statement rather than about the write.
+    fn ack_high_water(
+        reader: &DmMachine,
+        index: usize,
+        record: &[u8],
+        highest_sent: Option<u64>,
+    ) -> Option<u64> {
+        let correspondence = &reader.correspondences[index];
+        let (ratchet, _, channel) = correspondence.live().expect("a live correspondence");
+        let peer_pk_pc = correspondence
+            .peer_pk_pc
+            .as_deref()
+            .expect("the correspondent's pseudonym");
+        let peer = ack_record::decode_and_verify(
+            record,
+            &channel.chan_id,
+            ratchet.send_direction(),
+            &correspondence.address_root,
+            peer_pk_pc,
+        )
+        .expect("the acknowledgement verifies");
+        let mut merged = AckState::new();
+        assert_eq!(
+            merged
+                .merge_peer_ack(peer, highest_sent)
+                .expect("the claim merges"),
+            PeerAckOutcome::WithinCeiling,
+            "a give-up must not claim a position this side never sent"
+        );
+        merged.high_water()
+    }
+
+    /// Send `body` from `a` to `b`'s identity and return the frame it queued at
+    /// `seq`.
+    fn sent_frame(
+        a: &mut DmMachine,
+        to: &IdentityKeys,
+        now_ms: i64,
+        seq: u64,
+        body: &str,
+    ) -> Vec<u8> {
+        a.on_command(
+            now_ms,
+            DmCommand::Send {
+                to: Box::new(*to.signing.public_key()),
+                body: body.into(),
+            },
+        );
+        let label = sole_label(a);
+        queued_frame_at(a, &label, seq, now_ms)
+    }
+
+    /// A position missing past the receive-side horizon is given up on by the
+    /// probe, and the acknowledgement that reports the moved cursor is written
+    /// by the standalone path while the conversation still has live traffic.
+    ///
+    /// The gap is real: B collects A's second message and never its first, so
+    /// the cursor is held below a position B has settled.
+    ///
+    /// **The control is the acknowledgement written just before the give-up.**
+    /// It clears the standalone floor, so the empty batch asserted after it is
+    /// what this correspondence produces with nothing new to say — and the batch
+    /// after the last probe can only come from the give-up.
+    #[test]
+    fn a_gap_past_the_receive_horizon_is_given_up_on_and_acknowledged() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let list = stored_block_list(&b);
+        let conversation = conversation_of(&b, 0);
+
+        // Two messages from A. B is handed the second one only, so the first is
+        // a position below a settled one and can never be collected.
+        let _lost = sent_frame(&mut a, &b_keys, BASE_MS, 1, "the message that is lost");
+        let arriving = sent_frame(&mut a, &b_keys, BASE_MS, 2, "the message that arrives");
+        let folded = fold_page_at(
+            &mut b,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(2), arriving)],
+        );
+        assert_eq!(
+            messages_in(&folded).len(),
+            1,
+            "the fixture must have collected the second message: {folded:?}"
+        );
+        assert_eq!(
+            b.correspondences[0].collection.outstanding(),
+            vec![1..=1],
+            "the first message's position must be the one hole"
+        );
+
+        // A cap short of the horizon: the gap has aged but not aged out.
+        let later = BASE_MS + HORIZON_MS - AGE_STEP_MS;
+        age_gaps(&mut b, 0, BASE_MS, later);
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            Some(0),
+            "the hole must still hold the cursor at the position below it"
+        );
+
+        // A third message, collected: the conversation has live traffic again.
+        let fresh = sent_frame(
+            &mut a,
+            &b_keys,
+            later,
+            3,
+            "the message that arrives a week later",
+        );
+        let folded = fold_page_at(
+            &mut b,
+            later,
+            conversation,
+            0,
+            vec![(position_of(3), fresh)],
+        );
+        assert_eq!(
+            messages_in(&folded).len(),
+            1,
+            "the fixture must have collected the third message: {folded:?}"
+        );
+        ack_written(&mut b, later, conversation);
+        assert!(
+            ack_publishes(&b.standalone_acks(later)).is_empty(),
+            "nothing has been collected since the last write, so no acknowledgement is due"
+        );
+
+        let now = BASE_MS + HORIZON_MS;
+        let _ = b.probe(now, 0, Some(&list));
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            Some(3),
+            "the probe must give up on the hole and carry the cursor over the settled positions"
+        );
+        let records = ack_records(&b.standalone_acks(now));
+        assert_eq!(records.len(), 1, "one acknowledgement must be written");
+        assert_eq!(
+            ack_high_water(&a, 0, &records[0], Some(3)),
+            Some(3),
+            "the published record must carry the moved cursor"
+        );
+    }
+
+    /// The same give-up with no later traffic at all, which is the ordinary
+    /// case: one message lost, nothing collected since.
+    ///
+    /// **The standalone cadence cannot carry this on its own**, and the
+    /// assertion that its pending set is dead is what says so: the set ages out
+    /// at the sender's give-up, and this horizon is a margin past it. Without a
+    /// reason of its own the moved cursor would never be published, and the
+    /// correspondent would go on re-seeding a position this side has stopped
+    /// asking for.
+    #[test]
+    fn a_give_up_with_no_later_traffic_still_publishes_the_moved_cursor() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let list = stored_block_list(&b);
+        let conversation = conversation_of(&b, 0);
+
+        let _lost = sent_frame(&mut a, &b_keys, BASE_MS, 1, "the message that is lost");
+        let arriving = sent_frame(&mut a, &b_keys, BASE_MS, 2, "the message that arrives");
+        let _ = fold_page_at(
+            &mut b,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(2), arriving)],
+        );
+        assert_eq!(
+            b.correspondences[0].collection.outstanding(),
+            vec![1..=1],
+            "the fixture must have opened exactly one hole"
+        );
+        // The collection's own floor, discharged: what follows is the give-up's.
+        ack_written(&mut b, BASE_MS, conversation);
+
+        let now = BASE_MS + HORIZON_MS;
+        age_gaps(&mut b, 0, BASE_MS, now - AGE_STEP_MS);
+        let _ = b.probe(now, 0, Some(&list));
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            Some(2),
+            "the hole must be given up on and the cursor carried over it"
+        );
+        assert!(
+            ack_cadence::oldest_live_pending_ms(
+                now,
+                b.correspondences[0].pending_sent_ms.iter().copied(),
+                GIVE_UP_MS,
+            )
+            .is_none(),
+            "the pending set must be dead by the horizon, or the cadence could \
+             have written this acknowledgement without the give-up"
+        );
+
+        let records = ack_records(&b.standalone_acks(now));
+        assert_eq!(
+            records.len(),
+            1,
+            "the give-up must produce an acknowledgement of its own"
+        );
+        assert_eq!(
+            ack_high_water(&a, 0, &records[0], Some(2)),
+            Some(2),
+            "the published record must carry the moved cursor"
+        );
+    }
+
+    /// The mirror control: a probe that gives up on nothing writes nothing.
+    ///
+    /// Without it, "the give-up published an acknowledgement" is satisfied by a
+    /// probe that publishes one every time it runs.
+    #[test]
+    fn a_probe_that_moves_no_cursor_writes_no_acknowledgement() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let list = stored_block_list(&b);
+        let conversation = conversation_of(&b, 0);
+
+        // One message, collected in order: the conversation has no hole.
+        let arriving = sent_frame(&mut a, &b_keys, BASE_MS, 1, "the message that arrives");
+        let _ = fold_page_at(
+            &mut b,
+            BASE_MS,
+            conversation,
+            0,
+            vec![(position_of(1), arriving)],
+        );
+        assert!(
+            b.correspondences[0].collection.outstanding().is_empty(),
+            "the fixture must have left no hole"
+        );
+        ack_written(&mut b, BASE_MS, conversation);
+
+        let now = BASE_MS + HORIZON_MS;
+        age_gaps(&mut b, 0, BASE_MS, now - AGE_STEP_MS);
+        let _ = b.probe(now, 0, Some(&list));
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            Some(1),
+            "the cursor must be exactly where the collection left it"
+        );
+        assert!(
+            !b.correspondences[0].owes_give_up_ack,
+            "no give-up happened, so none can be owed"
+        );
+        assert!(
+            ack_publishes(&b.standalone_acks(now)).is_empty(),
+            "a probe that gave up on nothing must write no acknowledgement"
         );
     }
 

@@ -52,6 +52,13 @@
 //! on at the seven-day give-up, and nothing in this module can tell that apart
 //! from a collected one afterwards. See [`crate::dm::ack`]'s module docs.
 //!
+//! Which position that is, this side decides for itself:
+//! [`Collection::sweep_give_ups`] abandons a gap that has stood for
+//! [`RECEIVE_GIVE_UP_MS`], accumulated across the sweeps the caller runs rather
+//! than read off the wall clock. Nothing on the wire says a sender gave up, and
+//! without this a single unrecoverable position holds a run of the
+//! acknowledgement for the life of the conversation.
+//!
 //! ## Where the frame check sits, and why it is not here
 //!
 //! A frame declares its own sequence number and the slot it was found in implies
@@ -94,6 +101,7 @@
 use std::ops::RangeInclusive;
 
 use crate::dm::ack::{AckError, AckState};
+use crate::dm::outbox::{GIVE_UP, RESEED_LADDER};
 use crate::dm::paging::{MAX_PAGE, PagePosition, position_of};
 
 /// How long between probe cadences, in milliseconds.
@@ -133,6 +141,61 @@ pub const MAX_BACKFILL_PAGES: usize = 2;
 /// reasoning about how many page records a settled conversation keeps open reads
 /// the same number the window is built from rather than a copy of it.
 pub const WATCHED_PAGES: usize = 2;
+
+/// The longest interval [`RESEED_LADDER`] ever waits between two re-seeds of
+/// one message, in milliseconds.
+///
+/// Read from the ladder rather than written down, and read as a **maximum**
+/// rather than as a position in it, so a rung added or reordered later moves
+/// this rather than silently leaving it short.
+const fn longest_reseed_interval_ms() -> u64 {
+    let mut longest = 0u128;
+    let mut rung = 0;
+    while rung < RESEED_LADDER.len() {
+        let interval = RESEED_LADDER[rung].as_millis();
+        if interval > longest {
+            longest = interval;
+        }
+        rung += 1;
+    }
+    longest as u64
+}
+
+/// How long a position may stay missing below the highest settled one before the
+/// receiving side gives up on it, in milliseconds.
+///
+/// The sender's [`GIVE_UP`] plus one re-seed interval. The first term is the
+/// point past which no copy of the message will be published again, so waiting
+/// longer than it cannot recover anything; the margin covers the interval
+/// between the sender's last re-seed and its give-up, during which a copy is
+/// still on its way and the receiver would otherwise abandon a position it is
+/// about to collect.
+///
+/// **It is the receiver's own clock throughout.** Nothing on the wire says a
+/// sender gave up — an acknowledgement carries the receiver's own prefix and
+/// runs, and nothing travels the other way — so this is measured from when the
+/// gap was first observed here, and the margin is what makes that measurement
+/// safe against the two clocks not agreeing to the millisecond.
+pub const RECEIVE_GIVE_UP_MS: u64 = GIVE_UP.as_millis() as u64 + longest_reseed_interval_ms();
+
+/// The most one call to [`Collection::sweep_give_ups`] may add to a gap's age,
+/// in milliseconds.
+///
+/// A gap's age is **accumulated** across calls rather than measured from an
+/// absolute origin, and this is what makes that worth doing. A host clock that
+/// steps forward — a bad real-time clock corrected on the first successful time
+/// sync — would otherwise age every standing gap by the size of the step in a
+/// single call and abandon positions the sender is still re-seeding. That
+/// failure is silent and permanent: an abandoned position is settled, and
+/// [`Collection::observe_page`] filters settled positions out of what it offers,
+/// so a copy still sitting on the page record is never opened. Capping one
+/// call's contribution to a few cadences absorbs the step instead of believing
+/// it, and costs a delay of at most the step in the case where the clock was
+/// right.
+///
+/// Four cadences, so a caller that misses two or three in a row still ages a gap
+/// at close to real time.
+pub const AGE_STEP_CAP_MS: u64 = 4 * PROBE_INTERVAL_MS;
 
 /// Anything that can go wrong folding a swept page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,6 +294,45 @@ pub struct Collection {
     frontier: Option<u64>,
     /// When [`Collection::probe_plan`] last handed out a plan.
     last_probe_ms: Option<u64>,
+    /// How long each outstanding gap has been observed to stand.
+    ///
+    /// Rebuilt against [`Self::outstanding`] on every sweep, one entry per gap,
+    /// so it is bounded by [`crate::dm::ack::MAX_ACK_RUNS`] exactly as the run
+    /// set is and cannot accumulate entries for gaps that have closed.
+    ///
+    /// **Not persisted, because there is nothing to persist it beside.** The
+    /// record a collection resumes from names a page and no settled set at all
+    /// ([`Self::resuming_from_page`]), so a resumed collection has no gaps until
+    /// it settles something after the restart, and an age carried across would
+    /// belong to a gap this collection no longer knows it has. What a restart
+    /// costs is therefore the age of any gap standing at the time, which is
+    /// bounded by [`RECEIVE_GIVE_UP_MS`] and never by the life of the
+    /// conversation.
+    gap_ages: Vec<GapAge>,
+}
+
+/// How long one outstanding gap has stood, carried across sweeps.
+#[derive(Clone, Debug)]
+struct GapAge {
+    /// The positions the gap covered when this entry was last rebuilt.
+    ///
+    /// **The gap is identified by the whole range, not by an endpoint.** Both
+    /// endpoints move: collecting the gap's first position raises its start, and
+    /// collecting inside it splits it in two. An entry keyed on an endpoint is
+    /// therefore dropped as soon as that endpoint moves, and the gap's age
+    /// restarts — so a gap being filled one position per sweep from either side
+    /// would never age out at all, which is the case the horizon most needs to
+    /// cover.
+    range: RangeInclusive<u64>,
+    /// The accumulated age, in milliseconds.
+    age_ms: u64,
+    /// The clock value the sweep that last touched this entry was given.
+    last_seen_ms: u64,
+}
+
+/// Do two inclusive ranges share at least one position?
+fn ranges_overlap(a: &RangeInclusive<u64>, b: &RangeInclusive<u64>) -> bool {
+    a.start() <= b.end() && b.start() <= a.end()
 }
 
 impl Collection {
@@ -280,6 +382,7 @@ impl Collection {
             ack: AckState::new(),
             frontier: (page <= MAX_PAGE).then_some(page),
             last_probe_ms: None,
+            gap_ages: Vec::new(),
         }
     }
 
@@ -365,11 +468,15 @@ impl Collection {
     }
 
     /// Record that this sequence number will never be collected, because the
-    /// sender abandoned it at the seven-day give-up.
+    /// sender has stopped re-seeding it at the seven-day give-up.
     ///
     /// Takes a bare sequence number rather than a [`PagePosition`], because a
     /// give-up names a message that never arrived — there is no slot it was
     /// found in.
+    ///
+    /// [`Self::sweep_give_ups`] is what calls this on the receiving side, on
+    /// this side's own clock; a caller with some other reason to settle a
+    /// position it will never receive may call it directly.
     ///
     /// **This settles the position**: it leaves
     /// [`Self::outstanding`] and the cursor advances over it, exactly as if it
@@ -409,19 +516,20 @@ impl Collection {
     /// witnessed or unwitnessed lives at or above the first unsettled position,
     /// and the watched pair lives at or above the frontier.
     ///
-    /// **A permanent hole pins this number, and nothing in the protocol lifts it.**
-    /// The prefix-advance-on-give-up rule the design states for the receiver —
-    /// *"the receiver advances its contiguous cursor past a message the sender has
-    /// abandoned at the 7-day give-up"* — needs a signal that the sender gave up,
-    /// and the wire carries none: an acknowledgement record and a frame's piggyback
-    /// both carry only `high_water` and the beyond-prefix runs, which is the
-    /// RECEIVER's statement about the sender's direction. Nothing travels the other
-    /// way saying *I abandoned this position*. [`Self::abandoned`] therefore has no
-    /// production caller, and a position that is never recoverable holds this number
-    /// at that page for the life of the conversation — so its pages stay open and
-    /// the transport's own capacity bound is what reclaims them. Wiring it needs a
-    /// wire field that does not exist; the design records it as a live obligation,
-    /// not a resolved one.
+    /// **A permanent hole pins this number for one horizon, and the receiver's
+    /// own clock is what lifts it.** The prefix-advance-on-give-up rule the
+    /// design states for the receiver — *"the receiver advances its contiguous
+    /// cursor past a message the sender has abandoned at the 7-day give-up"* —
+    /// reads as needing a signal that the sender gave up, and the wire carries
+    /// none: an acknowledgement record and a frame's piggyback both carry only
+    /// `high_water` and the beyond-prefix runs, which is the RECEIVER's
+    /// statement about the sender's direction, and nothing travels the other way
+    /// saying *I abandoned this position*. What replaces the signal is a
+    /// measurement — [`Self::sweep_give_ups`] abandons a gap that has stayed
+    /// missing for [`RECEIVE_GIVE_UP_MS`] — so a position that is never
+    /// recoverable holds this number at its page for that horizon rather than
+    /// for the life of the conversation, and its pages are released after it
+    /// instead of by the transport's own capacity bound.
     ///
     /// **What a caller may do with it, and what it costs.** A transport holding
     /// one open record per page may release every page below this number. That
@@ -461,6 +569,79 @@ impl Collection {
         }
         self.last_probe_ms = Some(now_ms);
         Some(self.pages_to_probe())
+    }
+
+    /// Give up on every gap that has stood longer than [`RECEIVE_GIVE_UP_MS`],
+    /// and return the positions abandoned, ascending.
+    ///
+    /// **The age is accumulated, not measured from an origin.** Each call adds
+    /// the time since the last one, capped at [`AGE_STEP_CAP_MS`], to every gap
+    /// standing at both ends of that interval; a gap seen for the first time
+    /// starts at zero, so the first call after a gap opens can abandon nothing.
+    /// The cap is what a clock that steps forward runs into — see
+    /// [`AGE_STEP_CAP_MS`], which carries that argument in full — and it makes
+    /// this a count of observed cadences rather than a reading of the wall
+    /// clock. A `now_ms` below the last one adds nothing at all.
+    ///
+    /// **The caller chooses the cadence.** Nothing here schedules anything, and
+    /// the cap means calling this more often than the probe interval costs
+    /// nothing but is not required either: what a caller must not do is let its
+    /// own gaps between calls run far past the cap, which slows the horizon down
+    /// in proportion.
+    ///
+    /// **A gap is identified by its whole range, and inherits the largest age
+    /// among the entries it overlaps.** A gap that shrinks from below and a gap
+    /// that a collected position splits in two are both the same gap continuing,
+    /// so both halves keep the age the whole had; two gaps can never merge,
+    /// because a settled position never becomes unsettled, so an inherited age
+    /// never belongs to a longer-standing gap than the one it is inherited from.
+    ///
+    /// **What this settles was never received**, on exactly the terms
+    /// [`Self::abandoned`] states: the cursor advances over it, the runs above
+    /// it fold into the prefix, and nothing afterwards can tell an abandoned
+    /// position from a collected one. That is the point — the acknowledgement
+    /// carries a bounded number of runs ([`crate::dm::ack::MAX_ACK_RUNS`]), and
+    /// a permanently lost position that is never settled holds one of them for
+    /// the life of the conversation, so an unbounded number of losses eventually
+    /// refuses every new collection and reports a live conversation as
+    /// undelivered.
+    ///
+    /// A gap that has aged out is abandoned **whole**: it is one hole of one
+    /// conversation and its positions are equally unrecoverable, so leaving part
+    /// of it would keep the run the give-up exists to release. The positions go
+    /// ascending from the gap's first, so each one extends the prefix or the run
+    /// below it and none opens a new run; a refusal from the run set therefore
+    /// cannot come from this ordering, and if one arrives anyway the sweep stops
+    /// there, leaving what it has already settled settled and the rest for the
+    /// next call.
+    pub fn sweep_give_ups(&mut self, now_ms: u64) -> Vec<u64> {
+        self.accumulate_gap_ages(now_ms);
+
+        let due: Vec<RangeInclusive<u64>> = self
+            .gap_ages
+            .iter()
+            .filter(|entry| entry.age_ms >= RECEIVE_GIVE_UP_MS)
+            .map(|entry| entry.range.clone())
+            .collect();
+
+        let mut abandoned = Vec::new();
+        'gaps: for range in due {
+            for seq in range {
+                if self.abandoned(seq).is_err() {
+                    break 'gaps;
+                }
+                abandoned.push(seq);
+            }
+        }
+
+        // Rebuilt against what stands now, so an entry never outlives the gap it
+        // describes however the loop above ended. The second pass adds nothing:
+        // it is called with the clock value the first pass already advanced the
+        // ages to.
+        if !abandoned.is_empty() {
+            self.accumulate_gap_ages(now_ms);
+        }
+        abandoned
     }
 
     /// The contiguous cursor. **Settled, not collected** — see
@@ -556,6 +737,50 @@ impl Collection {
         if self.frontier.is_none_or(|f| page > f) {
             self.frontier = Some(page);
         }
+    }
+
+    /// Rebuild the gap ages against the gaps standing now, advancing each by the
+    /// capped time since it was last seen.
+    ///
+    /// Rebuilding rather than editing in place is what bounds the list: the
+    /// entries are exactly the current gaps, so nothing a closed gap left behind
+    /// can be inherited by a gap that opens over the same positions later. The
+    /// cost is one pass over the current gaps against the previous entries, both
+    /// bounded by [`crate::dm::ack::MAX_ACK_RUNS`].
+    fn accumulate_gap_ages(&mut self, now_ms: u64) {
+        let gaps = self.outstanding();
+        let mut rebuilt: Vec<GapAge> = Vec::with_capacity(gaps.len());
+        for range in gaps {
+            let inherited = self
+                .gap_ages
+                .iter()
+                .filter(|entry| ranges_overlap(&entry.range, &range))
+                .max_by_key(|entry| entry.age_ms);
+            let age_ms = match inherited {
+                Some(entry) => entry.age_ms.saturating_add(
+                    now_ms
+                        .saturating_sub(entry.last_seen_ms)
+                        .min(AGE_STEP_CAP_MS),
+                ),
+                None => 0,
+            };
+            rebuilt.push(GapAge {
+                range,
+                age_ms,
+                last_seen_ms: now_ms,
+            });
+        }
+        self.gap_ages = rebuilt;
+    }
+
+    /// How many gap ages this collection is carrying, for this module's own
+    /// tests.
+    ///
+    /// The list is bounded by being rebuilt from [`Self::outstanding`], and a
+    /// bound nothing can read is a bound nothing can pin.
+    #[cfg(test)]
+    fn tracked_gaps(&self) -> usize {
+        self.gap_ages.len()
     }
 
     /// The pages the contiguous cursor could still be held by: from the page of
@@ -1183,5 +1408,299 @@ mod tests {
         collect(&mut c, 1);
         assert_eq!(c.ack().high_water(), c.contiguous_through());
         assert_eq!(c.ack().high_water(), Some(1));
+    }
+
+    // ---- the receive-side give-up --------------------------------------------
+
+    /// A clock value far enough above zero that a horizon fits below it.
+    const T0: u64 = 1_000_000;
+
+    /// One second, the margin the boundary control below sits inside.
+    const A_SECOND_MS: u64 = 1_000;
+
+    /// Sweep on the probe cadence from `from_ms` to `to_ms` inclusive, returning
+    /// everything abandoned along the way.
+    ///
+    /// The horizon is days and the cadence is seconds, so a test that wants a
+    /// gap to age has to march the clock rather than jump it — which is the
+    /// behaviour under test, not an inconvenience of it. The horizon is a whole
+    /// number of cadences, so a march that starts when a gap is first observed
+    /// and ends a horizon later leaves its age exactly on the horizon.
+    fn march(c: &mut Collection, from_ms: u64, to_ms: u64) -> Vec<u64> {
+        let mut abandoned = Vec::new();
+        let mut now = from_ms;
+        while now <= to_ms {
+            abandoned.extend(c.sweep_give_ups(now));
+            now = now.saturating_add(PROBE_INTERVAL_MS);
+        }
+        abandoned
+    }
+
+    /// A position that never arrives is given up on once its gap has stood for
+    /// the whole horizon: the cursor advances over it, and the run that was
+    /// holding a position beyond the prefix folds into the prefix.
+    ///
+    /// The state before the horizon is asserted first, so "the cursor advanced"
+    /// cannot be satisfied by a collection that was never holding a gap.
+    #[test]
+    fn a_gap_past_the_horizon_is_given_up_on() {
+        let mut c = Collection::new();
+        collect(&mut c, 1);
+        collect(&mut c, 2);
+        assert_eq!(
+            c.contiguous_through(),
+            None,
+            "position zero is missing, so it holds the cursor"
+        );
+        assert_eq!(c.outstanding(), vec![0..=0], "and it is the one hole");
+        assert_eq!(
+            c.ack().runs(),
+            1,
+            "the two positions above it are one run beyond the prefix"
+        );
+
+        // The first sweep is what observes the gap, so it starts the gap's clock
+        // and can give up on nothing.
+        assert!(
+            c.sweep_give_ups(T0).is_empty(),
+            "a gap observed for the first time has aged nothing"
+        );
+        assert_eq!(c.contiguous_through(), None);
+
+        assert_eq!(
+            march(&mut c, T0, T0 + RECEIVE_GIVE_UP_MS),
+            vec![0],
+            "the position must be given up on once its gap has stood a horizon"
+        );
+        assert_eq!(
+            c.contiguous_through(),
+            Some(2),
+            "the cursor must advance past the abandoned position and over the run above it"
+        );
+        assert_eq!(
+            c.ack().runs(),
+            0,
+            "the run beyond the prefix must fold into the prefix"
+        );
+        assert!(
+            c.outstanding().is_empty(),
+            "nothing is outstanding once the hole is settled"
+        );
+    }
+
+    /// One second short of the horizon the gap stands. The message may still be
+    /// on its way: the sender re-seeds to its own give-up, and the margin past
+    /// that is what the horizon adds.
+    ///
+    /// The last two assertions are the positive control — a horizon that never
+    /// fired at all would satisfy everything above them.
+    #[test]
+    fn a_gap_one_second_short_of_the_horizon_stands() {
+        let mut c = Collection::new();
+        collect(&mut c, 1);
+
+        // One cadence short of the horizon, then one sweep landing the age
+        // exactly one second below it.
+        assert!(
+            march(&mut c, T0, T0 + RECEIVE_GIVE_UP_MS - PROBE_INTERVAL_MS).is_empty(),
+            "a gap short of the horizon must not be given up on"
+        );
+        assert!(
+            c.sweep_give_ups(T0 + RECEIVE_GIVE_UP_MS - A_SECOND_MS)
+                .is_empty(),
+            "a gap one second short of the horizon must not be given up on"
+        );
+        assert_eq!(
+            c.contiguous_through(),
+            None,
+            "so it must still hold the cursor"
+        );
+        assert_eq!(c.outstanding(), vec![0..=0], "and must still be a hole");
+
+        assert_eq!(
+            c.sweep_give_ups(T0 + RECEIVE_GIVE_UP_MS),
+            vec![0],
+            "one second later the same gap must be given up on"
+        );
+        assert_eq!(c.contiguous_through(), Some(1));
+    }
+
+    /// A clock that steps forward does not age a gap by the size of the step.
+    ///
+    /// The dangerous direction: abandoning a position the sender has not given
+    /// up on settles it, and a settled position is filtered out of everything
+    /// [`Collection::observe_page`] offers, so the copy still on the record is
+    /// never opened. The control below is the same collection aged the ordinary
+    /// way, which must abandon — without it "nothing was abandoned" is satisfied
+    /// by a horizon that cannot fire.
+    #[test]
+    fn a_clock_that_steps_forward_does_not_age_a_gap_by_the_step() {
+        const A_MONTH_MS: u64 = 30 * 24 * 60 * 60 * 1_000;
+
+        let mut stepped = Collection::new();
+        collect(&mut stepped, 1);
+        assert!(stepped.sweep_give_ups(T0).is_empty(), "the gap is observed");
+        assert!(
+            stepped.sweep_give_ups(T0 + A_MONTH_MS).is_empty(),
+            "one sweep after a clock step must add one capped interval, not a month"
+        );
+        assert_eq!(
+            stepped.contiguous_through(),
+            None,
+            "the gap must still hold the cursor"
+        );
+
+        let mut marched = Collection::new();
+        collect(&mut marched, 1);
+        assert_eq!(
+            march(&mut marched, T0, T0 + RECEIVE_GIVE_UP_MS),
+            vec![0],
+            "a collection aged on the cadence must reach the horizon"
+        );
+    }
+
+    /// A gap filled from below keeps the age the whole gap had. Its first
+    /// position moves every time one is collected, so an age keyed on that
+    /// endpoint would restart on every sweep and the gap would never age out.
+    #[test]
+    fn a_gap_filled_from_below_does_not_restart_its_horizon() {
+        let mut c = Collection::new();
+        collect(&mut c, 3);
+        assert_eq!(c.outstanding(), vec![0..=2], "three positions are missing");
+
+        assert!(c.sweep_give_ups(T0).is_empty(), "the gap is observed");
+        collect(&mut c, 0);
+        assert_eq!(c.outstanding(), vec![1..=2], "the gap shrinks from below");
+
+        assert_eq!(
+            march(&mut c, T0, T0 + RECEIVE_GIVE_UP_MS),
+            vec![1, 2],
+            "the shrunken gap must age from when the whole gap was first observed"
+        );
+        assert_eq!(c.contiguous_through(), Some(3));
+    }
+
+    /// A gap split by a collected position keeps its age in both halves, for the
+    /// same reason: one gap became two and neither is new.
+    #[test]
+    fn a_split_gap_keeps_its_age_in_both_halves() {
+        let mut c = Collection::new();
+        collect(&mut c, 5);
+        assert_eq!(c.outstanding(), vec![0..=4]);
+
+        assert!(c.sweep_give_ups(T0).is_empty(), "the gap is observed");
+        collect(&mut c, 2);
+        assert_eq!(
+            c.outstanding(),
+            vec![0..=1, 3..=4],
+            "the collected position splits the gap in two"
+        );
+
+        assert_eq!(
+            march(&mut c, T0, T0 + RECEIVE_GIVE_UP_MS),
+            vec![0, 1, 3, 4],
+            "both halves must age from the moment the whole gap was first observed"
+        );
+        assert_eq!(c.contiguous_through(), Some(5));
+    }
+
+    /// A gap is abandoned whole. Leaving part of it would keep the run the
+    /// give-up exists to release.
+    #[test]
+    fn a_multi_position_gap_is_abandoned_whole() {
+        let mut c = Collection::new();
+        collect(&mut c, 3);
+        assert_eq!(c.outstanding(), vec![0..=2]);
+
+        assert_eq!(
+            march(&mut c, T0, T0 + RECEIVE_GIVE_UP_MS),
+            vec![0, 1, 2],
+            "every position of the gap must be abandoned, in order"
+        );
+        assert!(c.outstanding().is_empty());
+        assert_eq!(c.ack().runs(), 0);
+        assert_eq!(c.contiguous_through(), Some(3));
+    }
+
+    /// Gaps age separately. Giving up on one leaves another's age exactly where
+    /// it was, so a conversation that loses a position at a time does not
+    /// restart every remaining gap's horizon each time one of them is settled.
+    #[test]
+    fn giving_up_on_one_gap_does_not_restart_another() {
+        let mut c = Collection::new();
+        // Two holes: position zero, and position two.
+        collect(&mut c, 1);
+        collect(&mut c, 3);
+        assert_eq!(c.outstanding(), vec![0..=0, 2..=2], "two holes stand");
+
+        assert!(c.sweep_give_ups(T0).is_empty(), "both gaps are observed");
+        // Close the lower hole by collecting it, which leaves the upper one
+        // holding the cursor with its own age untouched.
+        collect(&mut c, 0);
+        assert_eq!(c.outstanding(), vec![2..=2]);
+
+        assert_eq!(
+            march(&mut c, T0, T0 + RECEIVE_GIVE_UP_MS),
+            vec![2],
+            "the remaining gap must be given up on at its own first observation, \
+             not at the moment the other hole closed"
+        );
+        assert_eq!(c.contiguous_through(), Some(3));
+    }
+
+    /// The age list is exactly the gaps that stand, so a conversation that opens
+    /// and closes holes over and over carries no more entries than it has holes.
+    ///
+    /// The list is what bounds this state, and it is bounded only because it is
+    /// rebuilt: an entry kept for a closed gap would also be an age a later gap
+    /// over the same positions could inherit.
+    #[test]
+    fn gap_ages_do_not_accumulate_across_closed_gaps() {
+        let mut c = Collection::new();
+        let mut now = T0;
+        for round in 0..8u64 {
+            let base = round * 4;
+            // Open two holes, sweep, then close them both.
+            collect(&mut c, base + 1);
+            collect(&mut c, base + 3);
+            let _ = c.sweep_give_ups(now);
+            now += PROBE_INTERVAL_MS;
+            assert!(
+                c.tracked_gaps() <= c.outstanding().len(),
+                "round {round}: {} entries for {} gaps",
+                c.tracked_gaps(),
+                c.outstanding().len()
+            );
+            collect(&mut c, base);
+            collect(&mut c, base + 2);
+            let _ = c.sweep_give_ups(now);
+            now += PROBE_INTERVAL_MS;
+        }
+        assert_eq!(
+            c.contiguous_through(),
+            Some(31),
+            "the fixture must have closed every hole it opened"
+        );
+        assert_eq!(
+            c.tracked_gaps(),
+            0,
+            "a collection with no holes must carry no ages"
+        );
+    }
+
+    /// The horizon is the sender's give-up plus one re-seed interval, and the
+    /// interval is the ladder's longest rung.
+    #[test]
+    fn the_horizon_is_the_give_up_plus_one_reseed_interval() {
+        let longest = RESEED_LADDER
+            .iter()
+            .max()
+            .expect("the ladder has rungs")
+            .as_millis();
+        assert_eq!(
+            u128::from(RECEIVE_GIVE_UP_MS),
+            GIVE_UP.as_millis() + longest,
+            "the horizon must be the give-up plus the ladder's longest rung"
+        );
     }
 }

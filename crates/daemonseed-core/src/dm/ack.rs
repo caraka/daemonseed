@@ -634,11 +634,12 @@ impl AckState {
     /// nothing will ever ask about again, so a page made entirely of them is as
     /// finished as a page that was fully read.
     ///
-    /// **The give-up that reaches this is the holder's OWN**, applied to the state
-    /// it keeps about its own sends. A receiver has no route to the sender's
-    /// give-up: the wire carries only the receiver's own `high_water` and runs, so
-    /// nothing arrives saying a position was abandoned. See
-    /// [`crate::dm::collect::Collection::retired_below`].
+    /// **The give-up that reaches this is the holder's OWN**, applied on the
+    /// holder's own clock. A receiver is never told of the sender's give-up: the
+    /// wire carries only the receiver's own `high_water` and runs, so nothing
+    /// arrives saying a position was abandoned, and
+    /// [`crate::dm::collect::Collection::sweep_give_ups`] measures the horizon
+    /// here instead. See [`crate::dm::collect::Collection::retired_below`].
     ///
     /// Zero while the prefix is empty, which keeps a caller from retiring a page
     /// the conversation has not reached. A prefix covering the whole sequence

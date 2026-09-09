@@ -36,6 +36,13 @@ work lives in the maintainer's own planning notes, not here.
   `DmState::activity_seq` (#236). Each action sets a one-shot status line and answers a request
   once — a later press on the same request queues nothing. `DmEvent::Message` now folds, creating
   the correspondence row and stamping its recency (#236).
+- `daemonseed-core`: `Collection::sweep_give_ups`, `RECEIVE_GIVE_UP_MS` and `AGE_STEP_CAP_MS`
+  (`dm::collect`) — the receiving side abandons a gap that has stood below the highest settled
+  position for the sender's `GIVE_UP` plus the longest `RESEED_LADDER` rung, advancing the contiguous
+  cursor over it and folding the beyond-prefix runs into the prefix. The age accumulates across
+  sweeps, each adding at most `AGE_STEP_CAP_MS`. The driver sweeps on the probe cadence and publishes
+  an acknowledgement for the moved cursor whether or not the standalone cadence has a live pending
+  message (#235).
 - `daemonseed-core`: `ProjectAnnounceSeed`, `ProjectAnnounceSeedText`, `ProjectAnnounceSeedSource` and
   `SeedOrigin` — the operator instance's project-announce seed, loaded at runtime from
   `DAEMONSEED_PROJECT_ANNOUNCE_SEED` (read first) or `<profile-root>/project-announce.seed`

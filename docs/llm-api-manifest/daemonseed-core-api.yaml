@@ -1445,11 +1445,17 @@ modules:
       future plan can name — the lesser of watched()[0] and
       AckState::settled_pages_below() — so every page below it is settled through and
       out of the watched window, and a transport holding one record per page may
-      release those. **The receiving side has no abandon signal**: no record carries
-      the sender's give-up, so Collection::abandoned has no production caller and a
-      permanently lost position holds this number at its page for the life of the
-      conversation — those pages stay open until the transport's own cache bound
-      reclaims them. probe_plan(now_ms: u64)
+      release those. **The receiving side is told of no give-up**: no record carries
+      the sender's, so sweep_give_ups(now_ms: u64) -> Vec<u64> measures it here.
+      It abandons whole every gap whose accumulated age has reached
+      RECEIVE_GIVE_UP_MS (outbox::GIVE_UP plus the longest RESEED_LADDER rung),
+      ascending from each gap's first position, and returns what it abandoned. The
+      age accumulates across calls: each call adds the time since the last one
+      capped at AGE_STEP_CAP_MS (4 x PROBE_INTERVAL_MS), so a gap first seen in
+      this call is at zero and a clock that steps forward adds one cap. A gap is
+      identified by its whole range and inherits the largest age among the ranges
+      it overlaps, so shrinking and splitting both keep it. The caller chooses the
+      cadence; probe_plan does not call it. probe_plan(now_ms: u64)
       -> Option<Vec<u64>> is that pair followed by up to MAX_BACKFILL_PAGES (2)
       pages holding a hole, oldest first, deduplicated — the pages outstanding()
       witnesses, then the pages from the cursor to the frontier; the bound counts
