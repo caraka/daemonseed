@@ -58,6 +58,19 @@ pub struct DmDriverConfig {
     /// [`PowDifficulty::PRODUCTION`] takes seconds, which no test can afford
     /// per entry.
     pub pow_difficulty: PowDifficulty,
+    /// Whether the machine arms receiving-page watches at all (#234).
+    ///
+    /// **A baseline, not a feature.** A watch changes only *when* a page is read, so
+    /// a driver that arms none must reach exactly the same state as one whose
+    /// watches are lost or refused — same messages, same cadence, same records
+    /// opened and closed. Asserting that needs a run with no watch in it, and that
+    /// run cannot be produced from the seam: a transport that answers `Lost` has
+    /// still been asked, and being asked is the one difference the comparison must
+    /// allow for.
+    ///
+    /// Test-only, so the shipped configuration has no way to turn watching off.
+    #[cfg(test)]
+    pub(crate) arm_page_watches: bool,
 }
 
 /// Where the profile's consumed invite-token nonces are kept across restarts.
@@ -705,9 +718,9 @@ async fn apply<D: DmDht>(
 /// Run one operation against the seam and tag its result.
 ///
 /// The kind is stamped here, from the op itself, rather than inferred later from
-/// the result: three of the eight hold a slot the machine must release — the two
-/// sweeps and the page write — and on the failure path a result says only that
-/// something went wrong.
+/// the result: four of the nine hold a slot the machine must release — the two
+/// sweeps, the page write and the page watch — and on the failure path a result
+/// says only that something went wrong.
 pub(crate) async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
     let kind = op.kind();
     match op {
@@ -758,6 +771,16 @@ pub(crate) async fn dispatch<D: DmDht>(dht: Arc<D>, op: DhtOp) -> DhtOutcome {
             tag,
             result: dht.sweep_dm_page(address).await.map(DhtResult::Page),
         },
+        // Awaited like every other operation, and pending far longer than any of
+        // them: a watch resolves when the record changes, so this task sits in the
+        // shell's `JoinSet` for the life of the watch. That is what makes the
+        // arrival of a message an outcome the loop wakes on rather than something a
+        // tick has to come around to.
+        DhtOp::WatchPage { tag, address } => DhtOutcome {
+            kind,
+            tag,
+            result: dht.watch_dm_page(address).await.map(DhtResult::Watch),
+        },
         DhtOp::ClosePage { tag, address } => DhtOutcome {
             kind,
             tag,
@@ -805,7 +828,7 @@ mod tests {
     use daemonseed_core::dm::keyrec;
     use daemonseed_core::identity::keys::{IdentityKeys, SignKeypair, ML_DSA_SEED_LEN};
 
-    use crate::actor::{DmPageRecord, DoorbellDispatch, VeilidNetHandle};
+    use crate::actor::{DmPageRecord, DmPageWatch, DoorbellDispatch, VeilidNetHandle};
     use crate::dm::machine::{duration_as_ms, OpTag};
     use crate::dm::mock::{Method, MockCall, MockDht};
     use crate::dm::types::{CorrespondentState, RefusalReason};
@@ -913,6 +936,7 @@ mod tests {
                 // Four bits, not production's: a production mint takes seconds
                 // and these oracles mint one entry per knock.
                 pow_difficulty: PowDifficulty::reduced_for_test(TEST_POW_BITS),
+                arm_page_watches: true,
             },
             // `None` is the memory-only set, which is what an open policy
             // needs: the token field is never decoded, so no nonce exists to
@@ -1309,7 +1333,11 @@ mod tests {
     /// satisfy T1 while the driver hammered the DHT.
     #[tokio::test(start_paused = true)]
     async fn mock_counts_what_it_is_asked() {
-        let dht = MockDht::new(Duration::from_millis(50));
+        // On a shared network rather than a private one, so the watch below has
+        // something that can answer it: a watch stands until the record changes,
+        // and the record is the network's rather than the mock's.
+        let net = crate::dm::mock::MockNetwork::new();
+        let dht = MockDht::on(net.clone(), Duration::from_millis(50));
         let r = ratchet();
         let conversation: [u8; AR_FINGERPRINT_LEN] = *sending_address(&r).conversation();
         let send_dir = sending_address(&r).direction();
@@ -1326,6 +1354,16 @@ mod tests {
         dht.sweep_dm_page(receiving_address(&r))
             .await
             .expect("sweep page");
+        // Armed before the change is delivered, because a watch answers a change
+        // that arrives after it — the call registers, the delivery answers it, and
+        // the future resolves.
+        let watching = dht.watch_dm_page(receiving_address(&r));
+        net.deliver_page_change(conversation, recv_dir, 0);
+        assert_eq!(
+            watching.await.expect("watch page"),
+            DmPageWatch::Changed,
+            "the delivered change must be what the watch answers"
+        );
         dht.publish_dm_ack(ack_address(Direction::AToB), vec![0u8; 13])
             .await
             .expect("ack");
@@ -1342,7 +1380,7 @@ mod tests {
             "the page published above must be the one handed back"
         );
 
-        assert_eq!(Method::ALL.len(), 8, "the seam has eight methods");
+        assert_eq!(Method::ALL.len(), 9, "the seam has nine methods");
         for method in Method::ALL {
             assert_eq!(dht.count(method), 1, "{method:?} counted once");
         }
@@ -1390,19 +1428,27 @@ mod tests {
         );
         assert_eq!(
             log[5],
+            MockCall::WatchPage {
+                conversation,
+                page: 0,
+                direction: recv_dir,
+            }
+        );
+        assert_eq!(
+            log[6],
             MockCall::PublishAck {
                 direction: Direction::AToB,
                 record_len: 13,
             }
         );
         assert_eq!(
-            log[6],
+            log[7],
             MockCall::FetchAck {
                 direction: Direction::BToA
             }
         );
         assert_eq!(
-            log[7],
+            log[8],
             MockCall::ClosePage {
                 conversation,
                 page: 0,
@@ -1480,7 +1526,7 @@ mod tests {
 
     /// How many variants [`DhtOp`] has. Its own count, never borrowed from
     /// something that merely has the same one today.
-    const DHT_OP_VARIANTS: usize = 8;
+    const DHT_OP_VARIANTS: usize = 9;
 
     /// Every [`DhtOp`] variant, as an index. Exhaustive by construction: a new
     /// variant fails to compile here rather than silently escaping the dispatch
@@ -1492,16 +1538,17 @@ mod tests {
             DhtOp::SweepDoorbell { .. } => 2,
             DhtOp::PublishPage { .. } => 3,
             DhtOp::SweepPage { .. } => 4,
-            DhtOp::PublishAck { .. } => 5,
-            DhtOp::FetchAck { .. } => 6,
-            DhtOp::ClosePage { .. } => 7,
+            DhtOp::WatchPage { .. } => 5,
+            DhtOp::PublishAck { .. } => 6,
+            DhtOp::FetchAck { .. } => 7,
+            DhtOp::ClosePage { .. } => 8,
         }
     }
 
     /// T2b. `dispatch` routes every op to its own seam method and shapes the
     /// result to match.
     ///
-    /// The routing is eight near-identical arms, which is exactly the shape a
+    /// The routing is nine near-identical arms, which is exactly the shape a
     /// copy-paste slip survives in: a `SweepPage` arm calling `sweep_doorbell`
     /// compiles, returns `Ok`, and is invisible everywhere else.
     #[tokio::test(start_paused = true)]
@@ -1561,6 +1608,20 @@ mod tests {
                 shape: |res| matches!(res, DhtResult::Page(_)),
             },
             Case {
+                op: DhtOp::WatchPage {
+                    tag: tag(),
+                    address: receiving_address(&r),
+                },
+                method: Method::WatchPage,
+                // `Lost`, and the mock is scripted to answer it below. A standing
+                // watch resolves when the record changes and this oracle changes
+                // nothing, so an unscripted one would never answer at all — which is
+                // the production behaviour and useless here. What is under test is
+                // that the op reaches its own seam method and comes back shaped as a
+                // watch.
+                shape: |res| matches!(res, DhtResult::Watch(DmPageWatch::Lost)),
+            },
+            Case {
                 op: DhtOp::PublishAck {
                     tag: tag(),
                     address: ack_address(Direction::AToB),
@@ -1603,6 +1664,8 @@ mod tests {
 
         for Case { op, method, shape } in cases {
             let dht = Arc::new(MockDht::new(Duration::from_millis(50)));
+            // Every case gets it; only the watch reads it. See that case's note.
+            dht.set_watches_lost(true);
             let outcome = dispatch(dht.clone(), op).await;
             let result = outcome.result.expect("the mock succeeds");
             assert!(shape(&result), "{method:?} returned the wrong result shape");
@@ -1619,7 +1682,7 @@ mod tests {
     /// The shell reads this **before** spawning, because a panicked task returns
     /// no outcome and the map is the only route from a dead task back to the
     /// state the machine is holding for it. Exhaustive over [`DhtOp`] by
-    /// construction, on [`op_index`]: an eighth operation fails to compile here
+    /// construction, on [`op_index`]: a further operation fails to compile here
     /// rather than silently escaping with no recorded job.
     #[test]
     fn every_op_records_what_a_panic_would_have_to_release() {
@@ -1692,6 +1755,19 @@ mod tests {
                 |job| matches!(job, Some(PanickedJob::PageSweep { page: 3, .. })),
             ),
             (
+                // A watch holds `watched_pages` until its outcome lands, so a
+                // panicked one has a slot to release exactly as a sweep does.
+                DhtOp::WatchPage {
+                    tag: OpTag {
+                        conversation: Some(conversation),
+                        page: Some(4),
+                        ..tag()
+                    },
+                    address: receiving_address(&r),
+                },
+                |job| matches!(job, Some(PanickedJob::PageWatch { page: 4, .. })),
+            ),
+            (
                 DhtOp::PublishAck {
                     tag: tag(),
                     address: ack_address(Direction::AToB),
@@ -1721,9 +1797,9 @@ mod tests {
             ),
         ];
 
-        // The subject is `DhtOp`'s own arity. `Method` happens to have eight
-        // variants too, and borrowing its count would let a case go missing the
-        // day the two stop matching.
+        // The subject is `DhtOp`'s own arity. `Method` happens to have the same
+        // number of variants, and borrowing its count would let a case go missing
+        // the day the two stop matching.
         let mut covered: Vec<usize> = cases.iter().map(|(op, _)| op_index(op)).collect();
         covered.sort_unstable();
         covered.dedup();
@@ -2766,6 +2842,7 @@ mod tests {
                 idle_tick: IDLE_TICK,
                 policy: AdmissionPolicy::Open,
                 pow_difficulty: PowDifficulty::reduced_for_test(TEST_POW_BITS),
+                arm_page_watches: true,
             },
             spent_tokens: None,
         }
@@ -5339,5 +5416,632 @@ mod tests {
         handle_b.send(DmCommand::Shutdown).await.expect("stop B");
         task_a.await.expect("A ends");
         task_b.await.expect("B ends");
+    }
+
+    /// The idle tick A runs on in the watch oracles below — deliberately far
+    /// shorter than B's [`IDLE_TICK`], and that difference is the whole
+    /// instrument.
+    ///
+    /// Both drivers read one clock, so equal cadences wake them at the same instant
+    /// and every write A makes lands in the step B would have swept in anyway. With
+    /// A six times faster, an advance exists that fires A's tick and cannot fire B's
+    /// — and then anything B does in that window is something the watch caused,
+    /// because B's cadence has not come round.
+    ///
+    /// A's own probe cadence is unaffected: `Collection::probe_plan` is gated on
+    /// `PROBE_INTERVAL_MS` of wall clock, not on the idle tick, so a faster tick
+    /// buys more doorbell sweeps and more outbox emissions and no extra sweeps.
+    ///
+    /// **Chosen so that it does not divide [`IDLE_TICK`], and that is not cosmetic.**
+    /// A tick of five seconds divides thirty exactly, so one A tick in six lands on
+    /// the same instant as a B tick — and on that instant A's re-seed write and B's
+    /// probe are simultaneous, so B's standing watch can be spent by the re-seed
+    /// while B's own sweep of the page is in flight. Seven seconds shares no factor
+    /// with thirty, so no advance in these oracles puts the two on one instant.
+    const A_TICK: Duration = Duration::from_secs(7);
+
+    /// One driver's parts at a chosen idle tick.
+    fn parts_ticking(
+        keys: IdentityKeys,
+        dir: &std::path::Path,
+        wall: &Arc<AtomicI64>,
+        dht: Arc<MockDht>,
+        idle_tick: Duration,
+    ) -> DmDriverParts<MockDht> {
+        let mut parts = parts_as(keys, dir, wall, dht);
+        parts.cfg.idle_tick = idle_tick;
+        parts
+    }
+
+    /// Advance far enough for B to tick once — and A several times — plus the
+    /// latency their operations need to come back.
+    ///
+    /// It leaves B having just ticked, which is what [`only_a_ticks`] depends on:
+    /// B's next deadline is a whole [`IDLE_TICK`] from a point inside this advance,
+    /// so the short window that follows cannot reach it.
+    async fn both_tick(wall: &Arc<AtomicI64>) {
+        advance(wall, IDLE_TICK + Duration::from_millis(500)).await;
+        advance(wall, Duration::from_millis(500)).await;
+        settle().await;
+    }
+
+    /// Advance far enough for A to tick and nowhere near far enough for B, then let
+    /// the operations that started come back.
+    ///
+    /// The margin is what makes it an instrument rather than a coincidence: A's tick
+    /// is [`A_TICK`] away and B's is a fresh [`IDLE_TICK`] away by construction, so
+    /// this window wakes exactly one of them. The caller reads B's tick counter
+    /// across it rather than trusting the arithmetic.
+    async fn only_a_ticks(wall: &Arc<AtomicI64>) {
+        advance(wall, A_TICK + Duration::from_millis(500)).await;
+        advance(wall, Duration::from_millis(500)).await;
+        settle().await;
+    }
+
+    /// What B's watch seam does in one of the oracles below.
+    ///
+    /// **`Lost`, `Failing` and `NeverArmed` are separate because the mock and the
+    /// configuration can tell them apart and the driver must not.** One is a watch
+    /// that is simply not there, one a transport that refused, one a driver that
+    /// never asked; a driver that treated any of them as anything but "no watch"
+    /// would show up as a difference between runs that must be identical.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum WatchMode {
+        /// Watches stand and fire on a write to the page.
+        Standing,
+        /// Every watch answers `Lost` — an expiry, or a page that cannot be
+        /// watched.
+        Lost,
+        /// Every watch answers a transport error.
+        Failing,
+        /// The driver arms no watch at all — the baseline the other two are
+        /// compared against.
+        NeverArmed,
+    }
+
+    /// Everything the watch oracles need: two drivers out of phase, an
+    /// established correspondence, and both event streams drained.
+    ///
+    /// Built rather than inlined per test because the oracles differ only in what
+    /// they do to B's watch seam, and a fixture written out per test is a fixture
+    /// that drifts between them — which is exactly what a control run must not do.
+    struct WatchPair {
+        handle_a: DmDriverHandle,
+        evt_a: mpsc::Receiver<DmEvent>,
+        task_a: tokio::task::JoinHandle<()>,
+        probe_a: Arc<DmDriverProbe>,
+        handle_b: DmDriverHandle,
+        evt_b: mpsc::Receiver<DmEvent>,
+        task_b: tokio::task::JoinHandle<()>,
+        probe_b: Arc<DmDriverProbe>,
+        dht_b: Arc<MockDht>,
+        /// `dht_b.count(Method::WatchPage)` after the mode took effect and the
+        /// fixture settled.
+        ///
+        /// **Every later assertion about arming is growth against this, never a
+        /// cumulative count.** B arms a watch as soon as its collection has a page
+        /// to watch, which is before the mode under test is in force, so
+        /// `count >= 1` is satisfied by the fixture alone and says nothing about
+        /// what happened afterwards.
+        watches_at_switch: u64,
+    }
+
+    /// The address of the last watch a mock was asked to arm, read out of its own
+    /// call log.
+    ///
+    /// A change delivered to this address reaches the record the driver actually
+    /// armed on. Deriving one here instead would be a second answer to the question
+    /// the driver already answered, and a decoy sent to the wrong record fires
+    /// nothing while looking exactly like a driver that ignored it.
+    fn last_watched(dht: &MockDht) -> ([u8; AR_FINGERPRINT_LEN], Direction, u64) {
+        dht.log()
+            .into_iter()
+            .rev()
+            .find_map(|call| match call {
+                MockCall::WatchPage {
+                    conversation,
+                    page,
+                    direction,
+                } => Some((conversation, direction, page)),
+                _ => None,
+            })
+            .expect("the driver must have armed a watch to read one back")
+    }
+
+    async fn watch_pair(
+        dir_a: &std::path::Path,
+        dir_b: &std::path::Path,
+        wall: &Arc<AtomicI64>,
+        mode: WatchMode,
+    ) -> WatchPair {
+        let net = crate::dm::mock::MockNetwork::new();
+        let a_keys = own_keys();
+        let b_keys = peer_keys();
+        let dht_a = Arc::new(MockDht::on(net.clone(), Duration::from_millis(50)));
+        let dht_b = Arc::new(match mode {
+            WatchMode::Failing => {
+                MockDht::failing_on(net.clone(), Duration::from_millis(50), Method::WatchPage)
+            }
+            _ => MockDht::on(net.clone(), Duration::from_millis(50)),
+        });
+        // Scripted BEFORE the drivers start, so no watch armed during the
+        // establishment rounds is left standing under a seam that is supposed to
+        // have none. A watch that outlives the switch fires on the first write of
+        // the run and buys a sweep the case under test was measuring the absence of
+        // — a difference of exactly one sweep between two runs that must match.
+        // Nothing in establishing a correspondence goes over this seam.
+        dht_b.set_watches_lost(mode == WatchMode::Lost);
+        dht_a.set_key_record(Some(key_record_for(&b_keys)));
+        dht_b.set_key_record(Some(key_record_for(&a_keys)));
+
+        let probe_a = Arc::new(DmDriverProbe::new());
+        let probe_b = Arc::new(DmDriverProbe::new());
+        let (handle_a, mut evt_a, task_a) = DmDriver::spawn_with_probe(
+            parts_ticking(own_keys(), dir_a, wall, dht_a.clone(), A_TICK),
+            probe_a.clone(),
+        );
+        // The baseline run's driver never arms a watch. Set at construction rather
+        // than switched later, because the point of the run is that no watch has
+        // existed at any moment of it.
+        let mut parts_b = parts_ticking(peer_keys(), dir_b, wall, dht_b.clone(), IDLE_TICK);
+        parts_b.cfg.arm_page_watches = mode != WatchMode::NeverArmed;
+        let (handle_b, mut evt_b, task_b) = DmDriver::spawn_with_probe(parts_b, probe_b.clone());
+
+        handle_a
+            .send(DmCommand::FirstContact {
+                recipient: Box::new(*b_keys.signing.public_key()),
+                body: "knock knock".into(),
+            })
+            .await
+            .expect("first contact");
+        advance(wall, Duration::from_millis(100)).await;
+        settle_steps(&probe_a, 3).await;
+        both_tick(wall).await;
+        let events = drain(&mut evt_b);
+        let (request, _, _) = only_request(&events);
+        handle_b
+            .send(DmCommand::Accept { request })
+            .await
+            .expect("accept");
+        settle_steps(&probe_b, 3).await;
+        // Two rounds: B's publishes the acceptance, A's sweeps and opens it.
+        both_tick(wall).await;
+        both_tick(wall).await;
+        // A round with the seam under test in force, so B has re-armed (or failed
+        // to) since the conversation was established rather than only during it.
+        both_tick(wall).await;
+        if mode == WatchMode::Standing {
+            // A decoy change, spending whatever watch is standing, so the oracles
+            // start from a KNOWN watch state rather than from whichever one the
+            // establishment rounds happened to leave. Without it a message write can
+            // land while a watch is already spent and its sweep still in flight, and
+            // the run then measures the fixture's phase rather than the watch.
+            let (conversation, direction, page) = last_watched(&dht_b);
+            let before = dht_b.count(Method::WatchPage);
+            net.deliver_page_change(conversation, direction, page);
+            advance(wall, Duration::from_millis(200)).await;
+            advance(wall, Duration::from_millis(200)).await;
+            let _ = drain(&mut evt_b);
+            assert!(
+                dht_b.count(Method::WatchPage) > before,
+                "the decoy change must have been answered by a re-arm ({before} -> {}),                  or the watch under test is one this fixture already spent",
+                dht_b.count(Method::WatchPage)
+            );
+        }
+        let _ = drain(&mut evt_a);
+        let _ = drain(&mut evt_b);
+        let watches_at_switch = dht_b.count(Method::WatchPage);
+        WatchPair {
+            handle_a,
+            evt_a,
+            task_a,
+            probe_a,
+            handle_b,
+            evt_b,
+            task_b,
+            probe_b,
+            dht_b,
+            watches_at_switch,
+        }
+    }
+
+    /// T34. A value change on a watched page collects the message without B's
+    /// probe cadence coming round.
+    ///
+    /// **The tick count is the instrument.** B is out of phase with A by
+    /// construction ([`SLOW_TICK`]), so the advance that makes A publish does not
+    /// wake B at all — and B's tick count is read on both sides of it to prove
+    /// that. A driver whose only route to a page is the probe plan collects
+    /// nothing here; the control below is exactly that driver.
+    ///
+    /// What the watch decides is *when*, never *what*: the collection still runs
+    /// through the ordinary page sweep and the ordinary fold, which is why the
+    /// assertion is on the message and not on any watch-specific state.
+    #[tokio::test(start_paused = true)]
+    async fn a_value_change_collects_the_message_before_the_probe_cadence() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let b_keys = peer_keys();
+        let WatchPair {
+            handle_a,
+            mut evt_a,
+            task_a,
+            handle_b,
+            mut evt_b,
+            task_b,
+            probe_b,
+            ..
+        } = watch_pair(dir_a.path(), dir_b.path(), &wall, WatchMode::Standing).await;
+
+        let ticks_before = probe_b.ticks.load(Ordering::SeqCst);
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "by watch".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        only_a_ticks(&wall).await;
+
+        assert_eq!(
+            probe_b.ticks.load(Ordering::SeqCst),
+            ticks_before,
+            "B's cadence must not have come round, or the collection below proves \
+             nothing about the watch"
+        );
+        let b_events = drain(&mut evt_b);
+        assert_eq!(
+            messages(&b_events),
+            vec![(1, "by watch".to_string())],
+            "the value change must have collected the message on its own: {b_events:?}"
+        );
+
+        let _ = drain(&mut evt_a);
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+    }
+
+    /// T34a. The control: with B's watches lost, the same write is collected on
+    /// B's next probe cadence and not before.
+    ///
+    /// **Two assertions, and the second is what makes the first mean anything.**
+    /// Nothing arriving in the un-ticked window would also be satisfied by a
+    /// driver that never collects the message at all, so the same fixture is then
+    /// run on to B's own cadence and the message must be there.
+    #[tokio::test(start_paused = true)]
+    async fn without_a_watch_the_message_waits_for_the_probe_cadence() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let b_keys = peer_keys();
+        let WatchPair {
+            handle_a,
+            mut evt_a,
+            task_a,
+            handle_b,
+            mut evt_b,
+            task_b,
+            probe_b,
+            dht_b,
+            watches_at_switch,
+            ..
+        } = watch_pair(dir_a.path(), dir_b.path(), &wall, WatchMode::Lost).await;
+
+        let ticks_before = probe_b.ticks.load(Ordering::SeqCst);
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "by sweep".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        only_a_ticks(&wall).await;
+
+        assert_eq!(
+            probe_b.ticks.load(Ordering::SeqCst),
+            ticks_before,
+            "B's cadence must not have come round yet"
+        );
+        let early = drain(&mut evt_b);
+        assert_eq!(
+            messages(&early),
+            Vec::new(),
+            "with no watch standing there is nothing to collect the message early: \
+             {early:?}"
+        );
+        // B's own cadence, and the message must be there — otherwise the emptiness
+        // above is a driver that collects nothing rather than one that waits.
+        both_tick(&wall).await;
+        let late = drain(&mut evt_b);
+        assert_eq!(
+            messages(&late),
+            vec![(1, "by sweep".to_string())],
+            "the sweep cadence must collect what the watch did not: {late:?}"
+        );
+        assert!(
+            dht_b.count(Method::WatchPage) > watches_at_switch,
+            "B must still have ASKED for a watch AFTER the seam was switched — the \
+             case is a watch that is lost, not a driver that stopped arming one. A \
+             cumulative count is satisfied by the arming that established the \
+             conversation"
+        );
+
+        let _ = drain(&mut evt_a);
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+    }
+
+    /// What one watch-mode run leaves behind, for a comparison between two of
+    /// them.
+    ///
+    /// Every field is something a caller or the transport can actually see: what B
+    /// emitted before its cadence came round, what it emitted when it did, what A's
+    /// outbox reached, whether B ticked in the window, and what B asked the DHT for.
+    /// A difference in any of them is a watch outcome that changed something other
+    /// than the timing of a read.
+    ///
+    /// **The transport counts are here because the caller-visible fields alone are
+    /// too coarse.** Two runs can deliver the same messages while one of them swept
+    /// twice as many pages or left records open, and a watch outcome that changed
+    /// the DHT load is exactly the kind of difference this comparison exists to
+    /// catch. `watch_ops` is the one field a run is allowed to differ on — being
+    /// asked at all is what separates a lost watch from one that was never armed.
+    #[derive(Debug, PartialEq, Eq)]
+    struct WatchRun {
+        early: Vec<(u64, String)>,
+        late: Vec<(u64, String)>,
+        confirmed: Vec<u64>,
+        next_send_seq: u64,
+        ticked_early: bool,
+        sweep_ops: u64,
+        close_ops: u64,
+        held_pages: usize,
+    }
+
+    /// Run the whole scenario once under `mode` and report what it left behind, plus
+    /// the watch-seam call count the comparison must exclude.
+    async fn watch_run(wall: &Arc<AtomicI64>, mode: WatchMode) -> (WatchRun, u64) {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_keys();
+        let WatchPair {
+            handle_a,
+            mut evt_a,
+            task_a,
+            probe_a,
+            handle_b,
+            mut evt_b,
+            task_b,
+            probe_b,
+            dht_b,
+            ..
+        } = watch_pair(dir_a.path(), dir_b.path(), wall, mode).await;
+        // The arming control, and it reads differently per mode by design: the
+        // baseline never asks, and every other mode must ask after the switch or it
+        // is the baseline wearing another name.
+        if mode == WatchMode::NeverArmed {
+            assert_eq!(
+                dht_b.count(Method::WatchPage),
+                0,
+                "the baseline run must never have reached the watch seam"
+            );
+        } else {
+            assert!(
+                dht_b.count(Method::WatchPage) >= 1,
+                "B must have asked its watch seam whatever that seam answers"
+            );
+        }
+
+        let ticks_before = probe_b.ticks.load(Ordering::SeqCst);
+        handle_a
+            .send(DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "either way".into(),
+            })
+            .await
+            .expect("send");
+        settle().await;
+        only_a_ticks(wall).await;
+        let early = messages(&drain(&mut evt_b));
+        let ticked_early = probe_b.ticks.load(Ordering::SeqCst) != ticks_before;
+        // B's own cadence, then a round for the acknowledgement to reach A.
+        both_tick(wall).await;
+        let late = messages(&drain(&mut evt_b));
+        both_tick(wall).await;
+        both_tick(wall).await;
+        let confirmed = confirmations(&drain(&mut evt_a));
+        let next_send_seq = probe_a.next_send_seq.load(Ordering::SeqCst);
+        // Read before the shutdown, because a shutdown hands pages back and would
+        // level `held_pages` across every run whatever it had been.
+        let sweep_ops = dht_b.count(Method::SweepPage);
+        let close_ops = dht_b.count(Method::ClosePage);
+        let held_pages = dht_b.open_page_count();
+        let watch_ops = dht_b.count(Method::WatchPage);
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+        (
+            WatchRun {
+                early,
+                late,
+                confirmed,
+                next_send_seq,
+                ticked_early,
+                sweep_ops,
+                close_ops,
+                held_pages,
+            },
+            watch_ops,
+        )
+    }
+
+    /// T34b. A watch that fails, a watch that is lost, and a driver that never
+    /// armed one all leave the same state, and the next probe collects in every
+    /// case.
+    ///
+    /// **Three runs compared field by field rather than asserted against
+    /// written-out values.** What matters is not which messages arrive — the run
+    /// beside it pins that — but that a transport error on the watch seam, a watch
+    /// that is simply not standing, and a driver that never asked are
+    /// indistinguishable downstream. A driver that folded any of them into some
+    /// other state would differ here and nowhere else.
+    ///
+    /// **The never-armed run is the baseline the other two are measured against**,
+    /// and it is the one that cannot be produced from the seam: a transport
+    /// answering `Lost` has still been asked, so `watch_ops` is the single field the
+    /// comparison excludes. Every other field — the messages, the confirmations, the
+    /// send cursor, the sweeps, the closes, the records left open — must match a
+    /// driver that has no watch code path in it at all.
+    ///
+    /// The positive control is inside the comparison: every run must collect the
+    /// message on the cadence. Three runs that collected nothing would also be
+    /// equal.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_watch_leaves_what_an_absent_one_leaves() {
+        let wall_lost = Arc::new(AtomicI64::new(BASE_MS));
+        let (lost, lost_watch_ops) = watch_run(&wall_lost, WatchMode::Lost).await;
+        let wall_failing = Arc::new(AtomicI64::new(BASE_MS));
+        let (failing, failing_watch_ops) = watch_run(&wall_failing, WatchMode::Failing).await;
+        let wall_never = Arc::new(AtomicI64::new(BASE_MS));
+        let (never, never_watch_ops) = watch_run(&wall_never, WatchMode::NeverArmed).await;
+
+        assert_eq!(
+            failing, lost,
+            "a failing watch seam must leave the driver exactly where an absent \
+             watch leaves it"
+        );
+        assert_eq!(
+            lost, never,
+            "a watch that is never standing must leave the driver exactly where a \
+             driver that never armed one leaves it"
+        );
+        // The excluded field, asserted rather than merely excluded: the three runs
+        // must differ on it, or they are the same run and their equality above is
+        // about nothing.
+        assert_eq!(
+            never_watch_ops, 0,
+            "the baseline must never reach the watch seam"
+        );
+        assert!(
+            lost_watch_ops > 0 && failing_watch_ops > 0,
+            "the other two runs must have asked for a watch ({lost_watch_ops}, \
+             {failing_watch_ops}), or nothing distinguishes them from the baseline"
+        );
+        assert_eq!(
+            lost.early,
+            Vec::new(),
+            "no run has a watch to collect early: {lost:?}"
+        );
+        assert_eq!(
+            lost.late,
+            vec![(1, "either way".to_string())],
+            "the probe cadence must collect the message in every run: {lost:?}"
+        );
+        assert!(
+            !lost.ticked_early,
+            "the early window must be one B never ticked in, or `early` is empty \
+             for the wrong reason: {lost:?}"
+        );
+    }
+
+    /// T34c. A watch seam that answers `Lost` immediately, every time, does not
+    /// become a loop.
+    ///
+    /// **A `Lost` resolves the moment it is asked for, and resolving is what frees
+    /// the page to be armed again.** Nothing in that cycle waits, so a machine that
+    /// re-armed on the resolution rather than on the cadence would arm without
+    /// bound — and it would look exactly like this fixture, with messages still
+    /// arriving on the sweep cadence and nothing failing.
+    ///
+    /// The bound is the collection: one watch per page it names, per cadence. The
+    /// assertion is that ceiling, and the second one is the positive control — a
+    /// driver that stopped arming altogether would satisfy any ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_watch_seam_arms_within_the_per_cadence_bound() {
+        const ROUNDS: u64 = 5;
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let wall = Arc::new(AtomicI64::new(BASE_MS));
+        let WatchPair {
+            handle_a,
+            mut evt_a,
+            task_a,
+            handle_b,
+            mut evt_b,
+            task_b,
+            dht_b,
+            watches_at_switch,
+            ..
+        } = watch_pair(dir_a.path(), dir_b.path(), &wall, WatchMode::Lost).await;
+
+        for _ in 0..ROUNDS {
+            both_tick(&wall).await;
+            let _ = drain(&mut evt_a);
+            let _ = drain(&mut evt_b);
+        }
+
+        let total = dht_b.count(Method::WatchPage);
+        let armed = total - watches_at_switch;
+        let ceiling = ROUNDS * daemonseed_core::dm::collect::WATCHED_PAGES as u64;
+        assert!(
+            armed <= ceiling,
+            "{armed} watches armed over {ROUNDS} cadences ({watches_at_switch} -> \
+             {total}), above the ceiling of {ceiling} — a lost watch is being \
+             re-armed on its own resolution"
+        );
+        assert!(
+            armed > 0,
+            "no watch was armed over {ROUNDS} cadences ({watches_at_switch} -> \
+             {total}), so the ceiling above is satisfied by a driver that stopped \
+             arming"
+        );
+
+        handle_a.send(DmCommand::Shutdown).await.expect("stop A");
+        handle_b.send(DmCommand::Shutdown).await.expect("stop B");
+        task_a.await.expect("A ends");
+        task_b.await.expect("B ends");
+    }
+
+    /// T34d. Closing a page record drops the watch standing on it, so a later
+    /// change on that record fires nothing.
+    ///
+    /// The transport releases a watch with the record's session, and the mock has
+    /// to do the same or every oracle above is written against a seam that keeps
+    /// answering after the driver has handed the record back.
+    ///
+    /// The first assertion is the positive control: the record was genuinely held,
+    /// so the close closed something.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_page_record_fires_no_watch() {
+        let net = crate::dm::mock::MockNetwork::new();
+        let dht = MockDht::on(net.clone(), Duration::from_millis(50));
+        let r = ratchet();
+        let conversation: [u8; AR_FINGERPRINT_LEN] = *receiving_address(&r).conversation();
+        let recv_dir = receiving_address(&r).direction();
+
+        let watching = dht.watch_dm_page(receiving_address(&r));
+        assert!(
+            dht.close_dm_page(DmPageRecord::Receiving(receiving_address(&r)))
+                .await
+                .expect("close"),
+            "the watch must have held the record open, or the close below closed \
+             nothing and the change has no watch to miss"
+        );
+        net.deliver_page_change(conversation, recv_dir, 0);
+
+        assert_eq!(
+            watching.await.expect("watch page"),
+            DmPageWatch::Lost,
+            "a change after the record was closed must not be reported as one"
+        );
     }
 }

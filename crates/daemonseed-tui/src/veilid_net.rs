@@ -5068,6 +5068,12 @@ mod tests {
         ) -> DmDhtFuture<daemonseed_veilid_net::actor::DmPageSweep> {
             Self::refuse()
         }
+        fn watch_dm_page(
+            &self,
+            _: daemonseed_core::dm::paging::DmPageAddress<daemonseed_core::dm::paging::Receiving>,
+        ) -> DmDhtFuture<daemonseed_veilid_net::actor::DmPageWatch> {
+            Self::refuse()
+        }
         fn close_dm_page(
             &self,
             _: daemonseed_veilid_net::actor::DmPageRecord,

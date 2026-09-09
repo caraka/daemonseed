@@ -2680,6 +2680,66 @@ mod tests {
         );
     }
 
+    /// A sealed frame republished into a DIFFERENT CARRIER RECORD is refused, and
+    /// refused where the slot index alone cannot tell the two records apart
+    /// (ISC-A-C21).
+    ///
+    /// **The neighbouring misfiling test moves both the page and the slot; this one
+    /// moves only the page.** A channel page is one DHT record, so a frame taken
+    /// from the record at page 3 and written into the record at page 5 is the same
+    /// bytes carried by a different record — which is what replay across carrier
+    /// records means here. Choosing the SAME slot in that record is what makes the
+    /// probe sharp: a check comparing slot indices sees two nines and admits the
+    /// frame, while `open` compares the sequence number the position resolves to and
+    /// refuses it.
+    ///
+    /// Nothing else in the system holds both facts. The record and the slot say
+    /// where the bytes were found; the header says where their author put them; and
+    /// `msg_sig` binds the sequence number but not the record it arrived in, so a
+    /// signature check alone passes a frame that has been moved wholesale.
+    #[test]
+    fn a_frame_replayed_into_another_carrier_record_is_refused() {
+        let mut p = pair();
+        advance_send_to(&mut p.init, DISTINCT_SEQ);
+        let (bytes, key) = p.send_keyed("replayed");
+        let parsed = parse(&bytes).unwrap();
+        let rcpt = recipient_hash(p.b.signing.public_key()).unwrap();
+        let author = AuthorKeys {
+            pc: p.a_pc.signing.public_key(),
+            lt: p.a.signing.public_key(),
+        };
+        let dir = p.recip.recv_direction();
+
+        let honest = position_of(parsed.header().seq);
+        // The same slot of a different page, which is a different record. Asserted
+        // rather than assumed: the whole probe rests on these two positions sharing
+        // a slot and differing in page, and an arithmetic slip either way would
+        // leave it testing what the neighbouring misfiling test already tests.
+        let elsewhere = position_of(5 * PAGE_SLOTS as u64 + 9);
+        assert_eq!(
+            (honest.page(), honest.slot()),
+            (3, 9),
+            "the honest position must be page 3, slot 9"
+        );
+        assert_eq!(
+            (elsewhere.page(), elsewhere.slot()),
+            (5, 9),
+            "the replay target must be another page at the SAME slot, or this probe              is the misfiling test again"
+        );
+
+        assert!(matches!(
+            parsed.open(&key, &[1u8; ROOT_LEN], dir, elsewhere, &rcpt, author),
+            Err(DmFrameError::Misplaced { .. })
+        ));
+        // The control: the frame is a good frame in its own record, so the refusal
+        // above is about where it was found and not about the frame.
+        assert!(
+            parsed
+                .open(&key, &[1u8; ROOT_LEN], dir, honest, &rcpt, author)
+                .is_ok()
+        );
+    }
+
     /// The two things a peer holding the message key still controls, inside the
     /// seal: the padding length prefix and the inner protobuf. Both reach `open`
     /// only after the AEAD has authenticated, so only the peer can produce them —

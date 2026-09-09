@@ -281,9 +281,10 @@ types:
     module: daemonseed_veilid_net::dm
     kind: trait
     description: >-
-      The seam over the eight DM DHT operations the driver performs —
+      The seam over the nine DM DHT operations the driver performs —
       fetch_dm_key_record, publish_doorbell_entry, sweep_doorbell, publish_dm_page,
-      sweep_dm_page, close_dm_page, publish_dm_ack, fetch_dm_ack. Signatures are
+      sweep_dm_page, watch_dm_page, close_dm_page, publish_dm_ack, fetch_dm_ack.
+      Signatures are
       VeilidNetHandle's; the address types are taken by value. Bounds are
       Send + Sync + 'static. VeilidNetHandle implements it. publish_dm_key_record is
       not a member.
@@ -632,6 +633,16 @@ types:
     module: daemonseed_veilid_net::dm
     kind: struct
     description: "Unix milliseconds, injected as Arc<dyn Fn() -> i64 + Send + Sync>. `system()` reads SystemTime; `from_fn(f)` reads whatever f returns; `now_ms()` samples it. Debug prints a fixed marker and does not call the closure."
+  - name: DmPageWatch
+    module: daemonseed_veilid_net::actor
+    kind: enum
+    description: >-
+      What one watch on a receiving page came back with: `Changed`, a subkey of the
+      watched record changed, and `Lost`, the watch is no longer in place. Both arms end
+      the watch that produced them, so a caller that wants to go on hearing about a page
+      arms another one. `Changed` names no subkey and carries no bytes — the page is read
+      by VeilidNetHandle::sweep_dm_page — and `Lost` carries no failure, because a page
+      with no watch on it is collected by the sweep cadence.
   - name: DmPageSweep
     module: daemonseed_veilid_net::actor
     kind: struct
@@ -1092,6 +1103,37 @@ functions:
     returns:
       type: "Result<DmPageSweep>"
       description: DmPageSweep { conversation, slots, outcome } — the AR fingerprint naming the correspondence, the populated slots as (PagePosition, unverified bytes) pairs, and the sweep outcome (attempted / found / failed).
+  - name: VeilidNetHandle::watch_dm_page
+    module: daemonseed_veilid_net::actor
+    description: >-
+      Watch one DM channel page's DHT record and answer once the watch has something to
+      say (#234). Resolves DmPageWatch::Changed on a value change and DmPageWatch::Lost
+      on expiry, on a refused or unanswered arming, on a page the correspondent has not
+      written, and when the record is closed or evicted under the watch. The future is
+      pending for as long as the watch stands, up to a 600-second lease. The DHT watch is
+      cancelled on the Changed path and on lease expiry, bounded by
+      rendezvous::SWEEP_GET_TIMEOUT under one un-gated-op permit. A value change names no
+      subkey and carries no bytes: the page is read by sweep_dm_page, so a watch decides
+      only when that read happens. Nothing may depend on this for correctness — a page
+      swept on a cadence is collected whether or not a watch was armed, and Lost and Err
+      are equivalent to the caller. The record is opened through the same opener
+      sweep_dm_page uses and is never created, so a page with no writes answers Lost. The
+      record is not pinned open: the open cache's capacity bound may reclaim it while the
+      watch stands, which ends the watch and resolves it Lost. A value change on any
+      record this node has armed a page watch on is routed to that watch and never to
+      VeilidNetEvent; every other record's value changes reach VeilidNetEvent unchanged.
+      Spawned off the command loop; the arming runs under one un-gated-op permit bounded
+      by rendezvous::SWEEP_GET_TIMEOUT, and no permit or page lease is held across the
+      wait.
+    signature: "pub async fn watch_dm_page(&self, address: DmPageAddress<Receiving>) -> Result<DmPageWatch>"
+    parameters:
+      - name: address
+        type: "DmPageAddress<Receiving>"
+        direction: in
+        description: The page's address, from daemonseed_core::dm::paging::DmPageAddress::receiving(address_root, ratchet, page). Typed to Receiving, so watching the stream this end sends on is a compile error — that watch would fire on this end's own writes. Taken by value for the reason publish_dm_page gives; derive one per call.
+    returns:
+      type: "Result<DmPageWatch>"
+      description: Changed when a subkey of the watched record changed, Lost when the watch is no longer in place. Neither says anything about the page's contents.
   - name: VeilidNetHandle::close_dm_page
     module: daemonseed_veilid_net::actor
     description: >-

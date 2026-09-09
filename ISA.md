@@ -415,7 +415,7 @@ The direct-messaging family is deferred from the MVP gate to alpha2. The MVP cli
 - [ ] ISC-C45: First-contact UX is explicit-accept — an unknown sender surfaces as a contact request; the thread renders only on accept. A known sender whose cached identity key matches is delivered directly; a mismatch surfaces a trust event ("known handle, new key") via the ISC-C28 taxonomy. The gate is local UI, not a protocol round trip. **User-education requirement:** the pre-establishment first message is labeled **hello-grade** — "not yet secured; say hello, not secrets" — because it has no forward secrecy until B's first reply forks the ratchet.
 - [x] ISC-C46: The block list is the DM revocation primitive (a `blocked` set keyed on identity pubkey): **a blocked sender's records are not read.** Their doorbell entries are dropped at sweep, matched on the sealed `sender_pubkey_hash`, and their outbox is no longer swept — neither the page plane nor the acknowledgement plane fetches or folds anything for a suppressed correspondent, and a block taken while an operation is in flight drops what that operation returns without settling it. The block is **silent and unilateral**: it is taken and reversed locally, nothing on the wire announces it, and the contact cache is preserved so an unblock resumes the conversation. A tick that cannot read the list suppresses everything and says so once, rather than falling open. Mute stays scoped to chat-render suppression. (Amended 2026-09-03: the original wording added "the blocked sender's experience is byte-identical to 'never came online'", which this side's continuing outbox re-seeds and acknowledgement writes do not deliver for a correspondent who had already collected; the criterion is re-cut to what the design specifies — records are not read — and the gap is recorded as a bounded residual under ISC-A-C23. See Verification.)
 - [ ] ISC-A-C20: The DHT and any storage node never see DM content or forgeable authorship — every message and first-contact entry is AES-256-GCM-sealed, the signature lives inside the seal, and ongoing-channel writes are AR-owner-gated; ISC-A-S2 holds as for chat circles.
-- [ ] ISC-A-C21: A DM message is never delivered twice as new and never replayed across pairs, epochs, or carrier records: `msg_sig` binds `chan_id ‖ dir ‖ seq`; the seal-key KDF binds both identities; the monotonic high-water + RLE gap-bitmap ack confirms collected-past-a-gap messages without ever asserting a false "delivered" (fail-safe).
+- [x] ISC-A-C21: A DM message is never delivered twice as new and never replayed across pairs, epochs, or carrier records: `msg_sig` binds `chan_id ‖ dir ‖ seq`; the seal-key KDF binds both identities; the monotonic high-water + RLE gap-bitmap ack confirms collected-past-a-gap messages without ever asserting a false "delivered" (fail-safe).
 - [ ] ISC-A-C22: DM authorship forgery requires the sender's ML-DSA private key. The in-seal pseudonym binding + mandatory-and-verified `msg_sig` under the pseudonym key is the **sole** proof-of-possession path (applied symmetrically to B's ACCEPT); the sender-blind doorbell entry's binding proves possession, so an unknown-key-share or handle-spoof cannot impersonate another sender.
 - [ ] ISC-A-C23: The accepted-for-alpha metadata residuals are named, not hidden: F1 lobby-rhythm (activity-timed writes correlate to lobby online windows) + bucket-class size; first-contact anonymized in-degree (sender-blind); universal address-plane harvest-now (a future `DK_lt` compromise recovers the AR-derived address graph — content stays FS via deleted ratchet chains); **opening-burst no-FS, mitigated by user education** (ISC-C45); **a block stops reads, not writes** — this side's outbox re-seeds and acknowledgement writes to a blocked identity continue, so a blocked correspondent who had already collected an unacknowledged message keeps observing that this side is running, and the same split costs this side an accurate delivery report (the entry re-seeds to the seven-day give-up and surfaces `Undelivered` even where that correspondent collected it, the acknowledgement that would have settled it being one of the reads the block stops). The bound: a block is unobservable to a correspondent who never collected, and observable as continued activity to one who did (ISC-C46). Cover-traffic / prekey / mixnet mitigations are post-alpha.
 - [ ] ISC-A-C24: The ongoing-channel addresses `HKDF(AR ‖ dir ‖ p)` are derivable only by the two parties (`AR = HKDF(ss0)`, `ss0` secret), scatter across DHT nodes per page, and are third-party-opaque; an observer holding only a candidate recipient pubkey cannot derive or confirm any ongoing channel. The first-contact `fc_addr` was deliberately made recipient-keyed + sender-blind (not pairwise-derivable) to avoid a global contact-graph oracle.
@@ -1360,15 +1360,61 @@ specific:
   production-difficulty proof of work. Admission is proven at two of its three legs: the oracle runs
   `AdmissionPolicy::Open`, so the grantee-bound one-time invite token under an invite-only policy is
   held by unit tests and has no live run.
+- **ISC-C38** — the criterion's shape is proven end to end by
+  `two_drivers_carry_a_round_trip_end_to_end_exactly_once`: one knock over an ML-KEM-1024
+  encapsulation with no handshake round trip, an acceptance that installs the per-contact pseudonym,
+  and a message in each direction whose keys each side's own ratchet derived. The ratchet's named
+  mechanisms are held one layer down, by `dm::ratchet`'s own tests and by no driver-level probe —
+  the bounded skipped-message-key cache by `max_skip_is_pinned`,
+  `the_cache_holds_two_full_catch_ups` and
+  `catching_up_yields_the_keys_it_stepped_over_at_the_right_slots`, the per-generation step by
+  `both_sides_open_at_the_agreed_generation` and
+  `a_generation_change_does_not_evict_the_previous_chains_tail`, and key uniqueness along a chain by
+  `a_chain_never_repeats_a_key`. The in-seal binding of the pseudonym to the long-term identity is
+  held by `a_frame_does_not_open_in_another_conversation_or_the_reverse_direction`. What the
+  criterion still owes is forward secrecy after B's first reply: nothing asserts that the material a
+  completed step leaves behind cannot open the generation before it.
 - **ISC-C42** — a page round-trips over the real store. The paging tests bound the record count and
-  settle nothing else in the criterion's text.
+  settle nothing else in the criterion's text. The `watchable` clause is now probed at the driver:
+  `a_value_change_collects_the_message_before_the_probe_cadence` collects a message on a value
+  change with the receiving driver's cadence held away from it,
+  `without_a_watch_the_message_waits_for_the_probe_cadence` is its control — the same write, no
+  watch standing, nothing collected until the cadence comes round and the message there when it does
+  — and `a_failed_watch_leaves_what_an_absent_one_leaves` pins the three watch seams (lost, failing,
+  never armed) to the same end state, so a broken watch degrades to the cadence rather than losing
+  the message. All three read the receiving driver's tick counter across the window, so none can
+  pass on a driver that ticked. What the criterion still owes is the write budget: the `K:1` open
+  amortization and the ≈3.13/min close under a client-global aggregate ack cap are design arithmetic
+  with no measurement behind them, and `dflt(16)` is checked against the record's own shape rather
+  than against a record the live network created.
 - **ISC-C43** — established contact rides the AR-derived channel and the doorbell is consulted only
   for first contact, both within one session. The criterion's negative — that doorbell
   erasure cannot suppress an established conversation — has no probe: nothing erases a doorbell and
   then asserts the channel carries on.
+- **ISC-A-C20** — the forgeable-authorship half is held by
+  `a_tampered_frame_is_counted_and_settles_nothing`, which flips one byte inside the envelope and
+  watches the frame reach the ratchet, fail to authenticate, and settle nothing. That the signature
+  lives inside the seal is what `a_frame_does_not_open_in_another_conversation_or_the_reverse_direction`
+  and `a_frame_replayed_into_another_carrier_record_is_refused` exercise, both refusing on material
+  no unsealing party could have read. What no probe covers is the storage node's own view: nothing
+  asserts that the bytes a record holds carry no cleartext and no signature outside the seal, and
+  the AR-owner write gate is a property of the address derivation rather than of anything a test
+  observes a third party being refused.
 - **ISC-A-C21** — exactly-once survives the settle window on the live network while the sender is
   still re-seeding the same slot, and `a_frame_does_not_open_in_another_conversation_or_the_reverse_direction`
   binds a frame to its pair and direction. The acknowledgement plane cannot assert a position that
   was never sent (`a_peer_cannot_settle_a_position_we_never_sent`) and a stale acknowledgement is a
-  no-op. Replay into a different carrier record — the same frame at another page position — has no
-  named probe, so the criterion stays open on that clause alone.
+  no-op. Replay into a different carrier record is refused by
+  `a_frame_replayed_into_another_carrier_record_is_refused`: a frame sealed at page 3 slot 9 and
+  offered at page 5 slot 9 — another record at the same slot index, so a check comparing slots alone
+  would admit it — is refused as `DmFrameError::Misplaced`, with the frame opening at its honest
+  position as the control. That was the clause the criterion was open on.
+- **ISC-A-C24** — the positive half is proven by the addresses themselves: both parties derive the
+  same page record from `AR` alone, which is what makes every two-driver oracle here run at all, and
+  `paging.rs` pins the derivation's separations — `distinct_conversations_address_distinct_pages`,
+  `the_two_directions_address_different_records`, `consecutive_pages_are_unrelated`, with
+  `an_address_refuses_a_root_from_another_conversation` and
+  `an_initiator_ratchet_binds_its_conversation_too` binding an address to the root its correspondence
+  actually holds. The criterion's negative has no probe: nothing constructs a third-party observer
+  holding only a candidate recipient pubkey and shows it cannot derive or confirm a channel. What is
+  established is that the two parties CAN derive the address, not that an observer cannot.

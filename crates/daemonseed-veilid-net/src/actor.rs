@@ -242,6 +242,133 @@ impl DmPageSweep {
     }
 }
 
+/// What one watch on a receiving page came back with (#234).
+///
+/// **A watch that has resolved is over.** Each arm of this enum ends the watch it
+/// answers: a caller that wants to keep hearing about a page arms another one. That
+/// is what keeps the type two-valued — there is no "still watching" state to
+/// represent, because a caller holding the future has not been answered yet.
+///
+/// Nothing about collection depends on either arm. A page's contents are read by
+/// [`DmPageSweep`] and by nothing else, so a watch decides only *when* a sweep
+/// happens; a watch that never fires costs the latency of the next scheduled sweep
+/// and nothing more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmPageWatch {
+    /// A subkey of the watched record changed. Says nothing about which subkey or
+    /// what it now holds — a value change is a prompt to read the page, and the
+    /// read is the sweep.
+    Changed,
+    /// The watch is no longer in place: it expired, the record could not be
+    /// watched, or the transport dropped it. Carries no failure of its own,
+    /// because none of those is one — a page with no watch on it is collected by
+    /// the sweep cadence, which is where every page starts.
+    Lost,
+}
+
+/// The receiving-page watches this node holds, by the record key each was armed on
+/// (#234).
+///
+/// **Shared between the update callback and the watch tasks, and that is why it is a
+/// map rather than a channel.** A value change arrives on the callback carrying the
+/// record key and nothing else, so the key is the only thing that can route it — and
+/// it must route to *one* waiter, since a page watch answers the task that armed it
+/// rather than the front end. Every other `ValueChange` this node receives belongs to
+/// a rendezvous record and goes on reaching [`VeilidNetEvent`] unchanged.
+///
+/// One entry per watched record: an arm on a key already present replaces the
+/// previous entry, which resolves the previous waiter with [`DmPageWatch::Lost`] —
+/// the correct answer, since only the newer watch is now standing.
+///
+/// **The set of page keys is separate from the waiters and outlives them.** A watch
+/// answers once and is then withdrawn, so between one change and the next arming
+/// there is a live veilid watch on a record with no waiter behind it — and a change
+/// arriving in that window would otherwise fall through to [`map_update`], which
+/// reads a value change as a sealed circle item and hands the front end a DM page
+/// subkey. The key set is what makes the classification independent of whether
+/// anybody is waiting: a record this node has armed a page watch on is a page
+/// record for good, and a change on one with no waiter is dropped.
+///
+/// The type parameter is the record key. It is `RecordKey` in the actor and
+/// anything hashable elsewhere, which is what lets the routing decision be
+/// exercised without a transport.
+struct DmWatches<K> {
+    /// The task waiting on each watched record, with the generation that armed it.
+    waiting: HashMap<K, (u64, oneshot::Sender<DmPageWatch>)>,
+    /// Every record key this node has armed a page watch on.
+    pages: HashSet<K>,
+    /// Stamped on each entry above and never reused, so a withdrawal names the
+    /// arming it belongs to rather than the key alone.
+    armings: u64,
+}
+
+impl<K: Eq + std::hash::Hash + Clone> DmWatches<K> {
+    fn new() -> Self {
+        Self {
+            waiting: HashMap::new(),
+            pages: HashSet::new(),
+            armings: 0,
+        }
+    }
+
+    /// Register a waiter on `key`, answering the generation stamped on it and the
+    /// receiver the arming task waits on.
+    ///
+    /// The key joins [`Self::pages`] here and stays, because that set answers "is
+    /// this a page record" and not "is anybody waiting".
+    fn arm(&mut self, key: K) -> (u64, oneshot::Receiver<DmPageWatch>) {
+        let (tx, rx) = oneshot::channel();
+        self.armings += 1;
+        let generation = self.armings;
+        self.pages.insert(key.clone());
+        self.waiting.insert(key, (generation, tx));
+        (generation, rx)
+    }
+
+    /// Withdraw the waiter on `key`, but only where it is still the one `generation`
+    /// registered.
+    ///
+    /// **Keyed on the generation and not on the key alone.** An arming task
+    /// withdraws its own entry when it stops waiting, and a second arming on the
+    /// same record may already have replaced it — a removal by key would take that
+    /// arming's sender with it and resolve a watch that is standing.
+    fn withdraw(&mut self, key: &K, generation: u64) {
+        if self.waiting.get(key).is_some_and(|(g, _)| *g == generation) {
+            self.waiting.remove(key);
+        }
+    }
+
+    /// Drop whatever waiter is registered on `key`, whichever arming registered it.
+    ///
+    /// For the paths that end the record rather than the watch — a close, an
+    /// eviction — where every waiter on it is over whatever generation armed it.
+    /// Dropping the sender resolves the waiter [`DmPageWatch::Lost`] at once.
+    fn end_record(&mut self, key: &K) {
+        self.waiting.remove(key);
+    }
+}
+
+type DmWatchRegistry = Mutex<DmWatches<RecordKey>>;
+
+/// Take the lock, recovering from a poisoned one.
+///
+/// A panic while a registry guard was held leaves the map exactly as consistent as
+/// the operations under it — an insert or a remove — so the alternative is a node
+/// that stops routing page changes for the rest of the session.
+fn dm_watches<K>(watches: &Mutex<DmWatches<K>>) -> std::sync::MutexGuard<'_, DmWatches<K>> {
+    watches.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// How long one receiving-page watch stands before it is given up and re-armed.
+///
+/// **A ceiling on the wait, not a promise about the watch.** Veilid may drop a watch
+/// at any time, and a dropped one is silent — so without a deadline of our own a
+/// waiter could sit on a watch that stopped existing for the life of the process,
+/// reporting nothing and re-arming never. Expiry is not a failure: it resolves
+/// [`DmPageWatch::Lost`], the caller re-arms on its own schedule, and the sweep
+/// cadence collected the page throughout.
+const DM_WATCH_LEASE: Duration = Duration::from_secs(600);
+
 /// One page record, either direction, for the one operation that does not care
 /// which direction it is (#252).
 ///
@@ -549,6 +676,25 @@ enum Command {
     SweepDmPage {
         address: DmPageAddress<Receiving>,
         reply: oneshot::Sender<Result<DmPageSweep>>,
+    },
+    /// Watch one channel page's record and answer once the watch has something to
+    /// say (#234).
+    ///
+    /// **The one command whose reply is not about the work it asked for.** Every
+    /// other command answers when its operation completes; this one answers when the
+    /// *record* changes, so the spawned task that serves it is pending for the length
+    /// of the watch. It is spawned for that reason above all — awaiting it on the
+    /// command loop would park every other command for [`DM_WATCH_LEASE`].
+    ///
+    /// Carries no bytes back. A value change says the page changed and never what it
+    /// now holds, so the reader is [`Command::SweepDmPage`] here as everywhere, and a
+    /// watch that never fires costs only the latency of the next scheduled sweep.
+    ///
+    /// Typed to `Receiving` for the reason the sweep is: a watch on the stream this
+    /// end writes would fire on our own writes.
+    WatchDmPage {
+        address: DmPageAddress<Receiving>,
+        reply: oneshot::Sender<Result<DmPageWatch>>,
     },
     /// Give one channel page's record back: drop it from the open cache and close
     /// the DHT record (#252).
@@ -1066,6 +1212,35 @@ impl VeilidNetHandle {
             .await?
     }
 
+    /// Watch one channel page's record, answering once the watch has something to say
+    /// (#234).
+    ///
+    /// **This resolves when the record changes, not when the watch is armed**, so it
+    /// is pending for as long as the watch stands — up to a ten-minute lease, after
+    /// which it answers [`DmPageWatch::Lost`] and the watch is cancelled. A caller
+    /// that wants to go on hearing about the page arms another one.
+    ///
+    /// **Nothing may depend on this for correctness.** A watch decides only *when* a
+    /// page is read: the read itself is [`Self::sweep_dm_page`], and a page that is
+    /// swept on a cadence is collected whether or not a watch was ever armed on it.
+    /// [`DmPageWatch::Lost`] and an `Err` are therefore equivalent to the caller —
+    /// both mean the watch is gone, neither means anything was missed. A page the
+    /// correspondent has not written yet cannot be watched at all and answers `Lost`
+    /// immediately, because arming would otherwise have to create the record.
+    ///
+    /// **The record is not pinned open for the watch's lifetime.** The open cache's
+    /// capacity bound may reclaim the page while the watch stands, which ends the
+    /// watch — the caller sees `Lost` no later than the lease, and the sweep cadence
+    /// covers the interval either way.
+    ///
+    /// Takes the address by value for the reason [`Self::sweep_dm_page`] does: the
+    /// owner seed inside is the conversation's write capability and must be moved
+    /// rather than copied out (#244).
+    pub async fn watch_dm_page(&self, address: DmPageAddress<Receiving>) -> Result<DmPageWatch> {
+        self.send(|reply| Command::WatchDmPage { address, reply })
+            .await?
+    }
+
     /// Close one channel page's record, answering whether one was actually closed.
     ///
     /// **The reclamation path for the one record family whose count grows with
@@ -1500,6 +1675,10 @@ impl VeilidNet {
         // than growing without limit under a serve-latency spike.
         let (serve_tx, serve_rx) =
             mpsc::channel::<(OperationId, Vec<u8>, std::time::Instant)>(SERVE_QUEUE_CAP);
+        // Built here rather than inside the actor task because BOTH ends need it and
+        // one of them is this callback, which is constructed before the task exists.
+        let dm_watches: Arc<DmWatchRegistry> = Arc::new(Mutex::new(DmWatches::new()));
+        let dm_watches_cb = dm_watches.clone();
         let ev_tx_cb = ev_tx.clone();
         let cmd_tx_cb = cmd_tx.clone();
         let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> = Arc::new(
@@ -1535,6 +1714,26 @@ impl VeilidNet {
                     }
                     let _ = ev_tx_cb.send(VeilidNetEvent::RouteChanged);
                 }
+                // A watched CHANNEL PAGE changed. Routed to the task that armed the
+                // watch and NOT surfaced as an event, because the two kinds of
+                // watched record answer different consumers: a rendezvous change
+                // carries a sealed item the app opens, while a page change carries
+                // nothing to open — it is a prompt to sweep that page, and the sweep
+                // is the only thing that reads it. Falling through would hand the
+                // front end a page subkey as though it were an inbound circle item.
+                //
+                // A change on a record this node has never armed a page watch on falls
+                // through unchanged, which is what keeps every rendezvous watch
+                // behaving exactly as before. A change on a page record with no waiter
+                // is dropped rather than fallen through — the record is a page whether
+                // or not a watch is standing on it at this instant.
+                VeilidUpdate::ValueChange(vc)
+                    if dm_page_watch_taken(
+                        &dm_watches_cb,
+                        &vc.key,
+                        vc.count,
+                        vc.subkeys.is_empty(),
+                    ) => {}
                 other => {
                     if let Some(ev) = map_update(other) {
                         let _ = ev_tx_cb.send(ev);
@@ -1648,6 +1847,7 @@ impl VeilidNet {
             shares,
             cmd_weak,
             write_latency.clone(),
+            dm_watches,
         ));
         Ok((
             VeilidNetHandle {
@@ -1673,6 +1873,7 @@ async fn actor_loop(
     shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
     cmd_weak: mpsc::WeakSender<Command>,
     write_latency: Arc<AtomicU64>,
+    dm_watches: Arc<DmWatchRegistry>,
 ) {
     // Cache of opened rendezvous records (owner seed → post-reopen key):
     // open_or_create costs a fresh ~6–10 s open per publish/subscribe, so once a
@@ -1743,6 +1944,7 @@ async fn actor_loop(
             page_recency: page_recency.clone(),
             record_locks: record_locks.clone(),
             gate: dht_gate.clone(),
+            dm_watches: dm_watches.clone(),
         }),
         SchedulerConfig::default(),
         write_latency,
@@ -1892,6 +2094,7 @@ async fn actor_loop(
                 let opened = opened.clone();
                 let page_recency = page_recency.clone();
                 let record_locks = record_locks.clone();
+                let watches = dm_watches.clone();
                 tokio::spawn(async move {
                     // Borrowed for the pre-open; ownership passes to the request
                     // below, so exactly one zeroizing copy of the conversation
@@ -1910,6 +2113,7 @@ async fn actor_loop(
                                 &opened,
                                 &page_recency,
                                 &record_locks,
+                                &watches,
                                 &owner,
                                 IfAbsent::Create,
                             )
@@ -1944,6 +2148,7 @@ async fn actor_loop(
                 let opened = opened.clone();
                 let page_recency = page_recency.clone();
                 let record_locks = record_locks.clone();
+                let watches = dm_watches.clone();
                 tokio::spawn(async move {
                     let r = sweep_dm_page(
                         &gate,
@@ -1952,6 +2157,34 @@ async fn actor_loop(
                         &opened,
                         &page_recency,
                         &record_locks,
+                        &watches,
+                        &address,
+                    )
+                    .await;
+                    // A dropped receiver (caller gave up / shutting down) is benign.
+                    let _ = reply.send(r);
+                });
+            }
+            Command::WatchDmPage { address, reply } => {
+                // Spawned for the reason the sweep beside it is, and then some: this
+                // task is pending for the whole life of the watch, so awaiting it on
+                // the command loop would park every other command for DM_WATCH_LEASE.
+                let gate = dht_gate.clone();
+                let api = api.clone();
+                let rc = rc.clone();
+                let opened = opened.clone();
+                let page_recency = page_recency.clone();
+                let record_locks = record_locks.clone();
+                let watches = dm_watches.clone();
+                tokio::spawn(async move {
+                    let r = watch_dm_page(
+                        &gate,
+                        &api,
+                        &rc,
+                        &opened,
+                        &page_recency,
+                        &record_locks,
+                        &watches,
                         &address,
                     )
                     .await;
@@ -1970,9 +2203,17 @@ async fn actor_loop(
                 let opened = opened.clone();
                 let page_recency = page_recency.clone();
                 let record_locks = record_locks.clone();
+                let watches = dm_watches.clone();
                 tokio::spawn(async move {
-                    let r =
-                        close_dm_page(&rc, &opened, &page_recency, &record_locks, &address).await;
+                    let r = close_dm_page(
+                        &rc,
+                        &opened,
+                        &page_recency,
+                        &record_locks,
+                        &watches,
+                        &address,
+                    )
+                    .await;
                     let _ = reply.send(r);
                 });
             }
@@ -2869,6 +3110,11 @@ struct ProductionSink {
     // budget. The measured acquire-wait is trace-only telemetry (WB-ISC-27) — the
     // §I5′.2 window controller that consumed it is retired.
     gate: Arc<DhtGate>,
+    // The receiving-page watch registry (#234). Held here because a page WRITE opens
+    // a page record, and opening one can evict another — whose waiter has to be
+    // released with it, or the machine holds that page recorded as watched until the
+    // lease runs out.
+    dm_watches: Arc<DmWatchRegistry>,
 }
 
 impl WriteSink for ProductionSink {
@@ -2883,6 +3129,7 @@ impl WriteSink for ProductionSink {
         let page_recency = self.page_recency.clone();
         let record_locks = self.record_locks.clone();
         let gate = self.gate.clone();
+        let dm_watches = self.dm_watches.clone();
         Box::pin(async move {
             // WB-5.1 / I5″.1: acquire the matching DHT-gate pool before touching the
             // network — chat draws the chat pool (never waits on non-chat), floor the
@@ -2951,6 +3198,7 @@ impl WriteSink for ProductionSink {
                         &opened,
                         &page_recency,
                         &record_locks,
+                        &dm_watches,
                         &address,
                         frame,
                     )
@@ -3457,6 +3705,7 @@ async fn dm_page_open<'r>(
     opened: &rendezvous::OpenCache,
     page_recency: &'r rendezvous::DmPageRecency,
     record_locks: &rendezvous::RecordLocks,
+    watches: &DmWatchRegistry,
     owner: &KeyPair,
     if_absent: IfAbsent,
 ) -> Result<Option<OpenPage<'r>>> {
@@ -3496,6 +3745,15 @@ async fn dm_page_open<'r>(
         // local entry either way. The key comes off the evicted handle itself, which
         // is what binds the close to the record that was actually removed.
         |evicted: rendezvous::RendezvousHandle| async move {
+            // The watch goes with the record here for the reason it does in
+            // `close_dm_page`: an evicted record delivers nothing, so a waiter left
+            // registered would sit out its whole lease on a record this node no
+            // longer holds — and the machine holds that page recorded as watched
+            // for the same length, so nothing re-arms it. Dropping the sender
+            // resolves the waiter `Lost` at once, which is the answer it would
+            // eventually reach. `close_dht_record` releases the watch along with
+            // the session, so no cancel is issued.
+            dm_watches(watches).end_record(evicted.key());
             if let Err(e) = rc.close_dht_record(evicted.into_key()).await {
                 crate::vtrace!("dm page eviction: close_dht_record failed ({e})");
             }
@@ -3524,6 +3782,7 @@ async fn publish_dm_page(
     opened: &rendezvous::OpenCache,
     page_recency: &rendezvous::DmPageRecency,
     record_locks: &rendezvous::RecordLocks,
+    watches: &DmWatchRegistry,
     address: &DmPageAddress<Sending>,
     frame: Vec<u8>,
 ) -> Result<()> {
@@ -3558,6 +3817,7 @@ async fn publish_dm_page(
         opened,
         page_recency,
         record_locks,
+        watches,
         &owner,
         IfAbsent::Create,
     )
@@ -3610,6 +3870,7 @@ async fn sweep_dm_page(
     opened: &rendezvous::OpenCache,
     page_recency: &rendezvous::DmPageRecency,
     record_locks: &rendezvous::RecordLocks,
+    watches: &DmWatchRegistry,
     address: &DmPageAddress<Receiving>,
 ) -> Result<DmPageSweep> {
     // Borrowed, for the reason `publish_dm_page` gives (#244).
@@ -3628,6 +3889,7 @@ async fn sweep_dm_page(
             opened,
             page_recency,
             record_locks,
+            watches,
             &owner,
             IfAbsent::ReportAbsent,
         )
@@ -3718,6 +3980,195 @@ async fn sweep_dm_page(
     Ok(DmPageSweep::for_address(address, found, outcome))
 }
 
+/// Take one value change destined for a DM channel page, answering whether it was
+/// one (#234).
+///
+/// **`true` is "this key is a channel page", not "somebody was waiting".** The two
+/// come apart routinely: a watch answers once and is withdrawn as it is delivered,
+/// so a further change on the same record arrives with no waiter registered. Such a
+/// change is dropped here rather than falling through, because the fall-through maps
+/// a value change to [`VeilidNetEvent::Inbound`] — a DM page subkey handed to the
+/// front end as a sealed circle item — or to a `ValueChanged` naming a record no
+/// circle holds.
+///
+/// `false` is a key this node has never armed a page watch on, which is every
+/// rendezvous record it watches; those go on reaching [`VeilidNetEvent`] unchanged.
+///
+/// **The waiter is de-registered as it is delivered**, because delivering it ends
+/// the watch: a `oneshot` answers once. Leaving the entry would make the next change
+/// for that record resolve nothing.
+///
+/// Veilid states a dead watch two ways — an empty subkey range, or a remaining count
+/// of zero — and both are reported as [`DmPageWatch::Lost`] rather than as a change,
+/// so a caller does not sweep a page on the news that it has stopped being watched.
+fn dm_page_watch_taken<K: Eq + std::hash::Hash + Clone>(
+    watches: &Mutex<DmWatches<K>>,
+    key: &K,
+    count: u32,
+    subkeys_empty: bool,
+) -> bool {
+    let mut watches = dm_watches(watches);
+    if !watches.pages.contains(key) {
+        return false;
+    }
+    let Some((_, waiter)) = watches.waiting.remove(key) else {
+        return true;
+    };
+    let verdict = if count == 0 || subkeys_empty {
+        DmPageWatch::Lost
+    } else {
+        DmPageWatch::Changed
+    };
+    // A dropped receiver is the arming task having already given up, which is
+    // ordinary: the lease may have expired between the change arriving and this.
+    let _ = waiter.send(verdict);
+    true
+}
+
+/// Watch one channel page's record, resolving once the watch has something to say
+/// (#234).
+///
+/// **The record is addressed through [`dm_page_open`], the same opener the sweep
+/// uses, and never created.** A watch on a page the correspondent has not written is
+/// a watch on nothing, and arming one would mean creating the record — a write, on a
+/// path that exists to avoid reads. An absent page answers [`DmPageWatch::Lost`], and
+/// the sweep cadence reaches it when it exists.
+///
+/// **The bounded call is the arming; the unbounded wait holds nothing.** The raw
+/// watch RPC runs under the un-gated-op limiter, on the terms every other
+/// `watch_dht_values` site here states, and both the permit and the page lease are
+/// released before the wait begins. A watch that held either would spend a share of a
+/// fixed budget doing nothing for the length of its lease, and there is no read to
+/// account for — the reading is the sweep the caller performs afterwards.
+///
+/// Releasing the lease means the open cache's capacity bound may reclaim the page
+/// while the watch stands. That ends the watch, the caller sees `Lost` no later than
+/// [`DM_WATCH_LEASE`], and the page is collected by the sweep cadence throughout.
+#[allow(clippy::too_many_arguments)]
+async fn watch_dm_page(
+    gate: &Arc<DhtGate>,
+    api: &VeilidAPI,
+    rc: &RoutingContext,
+    opened: &rendezvous::OpenCache,
+    page_recency: &rendezvous::DmPageRecency,
+    record_locks: &rendezvous::RecordLocks,
+    watches: &DmWatchRegistry,
+    address: &DmPageAddress<Receiving>,
+) -> Result<DmPageWatch> {
+    // Borrowed, for the reason `publish_dm_page` gives (#244).
+    let owner = address.with_owner_seed(identity::rendezvous_owner_keypair)?;
+    // The open is serialized under the record lock exactly as the sweep's is, and
+    // the guard is dropped before any permit is acquired (CRSH-ISC-17).
+    let opened_handle = {
+        let record_lock = rendezvous::record_lock(record_locks, &owner.key());
+        let _open_guard = record_lock.lock().await;
+        dm_page_open(
+            gate,
+            api,
+            rc,
+            opened,
+            page_recency,
+            record_locks,
+            watches,
+            &owner,
+            IfAbsent::ReportAbsent,
+        )
+        .await?
+    };
+    let key = {
+        let Some((handle, _lease)) = opened_handle else {
+            crate::vtrace!(
+                "watch_dm_page: page={} absent, not created -> no watch",
+                address.page()
+            );
+            return Ok(DmPageWatch::Lost);
+        };
+        handle.key().clone()
+    };
+    // Registered BEFORE the watch is armed. A change can arrive the instant the RPC
+    // lands, and a registration that followed it would be a change delivered to
+    // nobody — indistinguishable, from here, from a page that never changed.
+    let (generation, rx) = dm_watches(watches).arm(key.clone());
+    let armed = {
+        // §RS-2 margin limiter: `watch_dht_values` is an un-gated DHT op, so the raw
+        // watch runs under an un-gated-op permit, as every other watch site here
+        // does. No read permit is held across it (CRSH-ISC-17), and the permit is
+        // released with this block — before the wait below.
+        let _ungated = gate.acquire_ungated().await;
+        tokio::time::timeout(
+            rendezvous::SWEEP_GET_TIMEOUT,
+            rc.watch_dht_values(key.clone(), None, None, None),
+        )
+        .await
+    };
+    match armed {
+        Ok(Ok(_)) => {}
+        // An arming that failed or never answered leaves no watch, so the
+        // registration is withdrawn rather than left to time out: an entry with no
+        // watch behind it would swallow a change belonging to a later arming.
+        outcome => {
+            dm_watches(watches).withdraw(&key, generation);
+            match outcome {
+                Ok(Err(e)) => crate::vtrace!("watch_dm_page: watch refused ({e})"),
+                _ => crate::vtrace!("watch_dm_page: watch did not answer in time"),
+            }
+            return Ok(DmPageWatch::Lost);
+        }
+    }
+    let fired = tokio::time::timeout(DM_WATCH_LEASE, rx).await;
+    // Withdrawn on every exit, including the delivered one — where the delivery has
+    // already taken the sender and this is a no-op — and withdrawn by generation, so
+    // an arming that replaced this one keeps its own waiter.
+    dm_watches(watches).withdraw(&key, generation);
+    // Whether veilid's own watch is still standing at this point, and so whether it
+    // has to be cancelled. A watch left standing goes on reporting changes for a
+    // record nothing is waiting on, and the registry drops every one of them — so an
+    // uncancelled watch is network traffic and node state bought for nothing.
+    let (verdict, cancel) = match fired {
+        // A delivered change ends this caller's watch and leaves veilid's standing:
+        // the count decrements, it does not reach zero, and the next change would be
+        // reported to a node with no waiter for it.
+        Ok(Ok(DmPageWatch::Changed)) => (DmPageWatch::Changed, true),
+        // Veilid reported the watch already dead — an empty subkey range or a
+        // remaining count of zero — so there is nothing left to cancel.
+        Ok(Ok(DmPageWatch::Lost)) => (DmPageWatch::Lost, false),
+        // The sender was dropped: the record was closed or evicted under the watch,
+        // which released it with the record, or a second arming replaced this one and
+        // owns what is standing. Cancelling either would be wrong or wasted.
+        Ok(Err(_)) => (DmPageWatch::Lost, false),
+        // The lease ran out with the watch still standing.
+        Err(_) => (DmPageWatch::Lost, true),
+    };
+    if cancel {
+        cancel_dm_watch(gate, rc, &key).await;
+    }
+    crate::vtrace!("watch_dm_page: page={} verdict={verdict:?}", address.page());
+    Ok(verdict)
+}
+
+/// Release one page watch this node armed (#234).
+///
+/// Bounded exactly as the arming is — one un-gated-op permit, `SWEEP_GET_TIMEOUT` —
+/// because a cancel is a DHT round trip on the same terms as the watch it undoes.
+///
+/// Best effort, and every outcome is traced rather than only the timeout: a cancel
+/// veilid refuses leaves a watch it will expire on its own, and each change reported
+/// meanwhile is dropped by the page registry rather than routed anywhere. Silence on
+/// a refusal would make an accumulating set of live watches invisible.
+async fn cancel_dm_watch(gate: &Arc<DhtGate>, rc: &RoutingContext, key: &RecordKey) {
+    let _ungated = gate.acquire_ungated().await;
+    match tokio::time::timeout(
+        rendezvous::SWEEP_GET_TIMEOUT,
+        rc.cancel_dht_watch(key.clone(), None),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => crate::vtrace!("watch_dm_page: cancel refused ({e})"),
+        Err(e) => crate::vtrace!("watch_dm_page: cancel did not answer in time ({e})"),
+    }
+}
+
 /// Give one channel page's record back: drop the open-cache entry and close the DHT
 /// record (#252). Answers whether a record was actually closed.
 ///
@@ -3738,6 +4189,7 @@ async fn close_dm_page(
     opened: &rendezvous::OpenCache,
     page_recency: &rendezvous::DmPageRecency,
     record_locks: &rendezvous::RecordLocks,
+    watches: &DmWatchRegistry,
     address: &DmPageRecord,
 ) -> Result<bool> {
     let id = dm_page_record_id(address)?;
@@ -3750,6 +4202,13 @@ async fn close_dm_page(
         // session veilid has already collected is a benign race, and the local entry
         // is gone either way.
         |handle: rendezvous::RendezvousHandle| async move {
+            // The watch goes with the record, and it is withdrawn HERE rather than
+            // left to expire: a closed record delivers nothing, so a watcher left
+            // registered would wait out its whole lease on a record that no longer
+            // exists. Dropping the sender resolves it `Lost` at once, which is the
+            // same answer it would eventually reach. `close_dht_record` releases the
+            // watch along with the session, so no cancel is issued.
+            dm_watches(watches).end_record(handle.key());
             if let Err(e) = rc.close_dht_record(handle.into_key()).await {
                 crate::vtrace!("close_dm_page: close_dht_record failed ({e})");
             }
@@ -6226,7 +6685,7 @@ mod tests {
         // The shape count above is the load-bearing guard: an inline open must name a
         // shape, so an extra naming IS a second open site. This is the positive half —
         // the opener is defined once and reached from the three places that open a
-        // page: `publish_dm_page`, `sweep_dm_page`, and the pre-warm in the
+        // page: `publish_dm_page`, `sweep_dm_page`, `watch_dm_page`, and the pre-warm in the
         // `PublishDmPage` arm that keeps the cold open off the chat lane.
         //
         // An exact count is deliberate, and so is its brittleness: a fourth caller has
@@ -6234,7 +6693,7 @@ mod tests {
         // be going through the opener at all. Bump it only after answering that.
         // The opener is DEFINED once (the definition is generic over the lease
         // lifetime, so the needle stops before the parameter list) and CALLED exactly
-        // three times: `publish_dm_page`, `sweep_dm_page`, and the publish pre-warm.
+        // four times: `publish_dm_page`, `sweep_dm_page`, `watch_dm_page`, and the publish pre-warm.
         //
         // An exact count is deliberate, and so is its brittleness: a fourth caller has
         // to come and edit this number, which is the moment to ask whether it should
@@ -6249,10 +6708,10 @@ mod tests {
         assert_eq!(
             prod.matches([opener.as_str(), "("].concat().as_str())
                 .count(),
-            3,
-            "the opener must be called exactly three times — from `publish_dm_page`, \
-             `sweep_dm_page`, and the publish pre-warm. A page path that opened its \
-             own record would be free to open a different one"
+            4,
+            "the opener must be called exactly four times — from `publish_dm_page`, \
+             `sweep_dm_page`, `watch_dm_page`, and the publish pre-warm. A page path \
+             that opened its own record would be free to open a different one"
         );
     }
 
@@ -7211,5 +7670,124 @@ mod tests {
                  handler that takes its own permit is an unbounded read again"
             );
         }
+    }
+
+    /// A change on a record armed as a channel page is taken by the registry whether
+    /// or not a watch is standing on it, and a change on any other record is not
+    /// (#234).
+    ///
+    /// **The no-waiter case is what this exists for.** A watch answers once and is
+    /// withdrawn as it is delivered, so between one change and the next arming the
+    /// record has a live watch and no waiter. A change classified there as "not a
+    /// page" reaches `map_update`, which reads a value change as a sealed circle
+    /// item — so the front end would be handed a channel-page subkey as an inbound
+    /// item, and a value-less one as a `ValueChanged` naming a record no circle
+    /// holds.
+    ///
+    /// The first delivery is the control: it must be answered, or the second
+    /// assertion is about a registry that never armed anything.
+    #[test]
+    fn a_page_change_is_taken_with_or_without_a_waiter() {
+        let watches: Mutex<DmWatches<String>> = Mutex::new(DmWatches::new());
+        let page = "page-record".to_string();
+        let (_generation, mut rx) = dm_watches(&watches).arm(page.clone());
+
+        assert!(
+            dm_page_watch_taken(&watches, &page, 1, false),
+            "a change on an armed page must be taken"
+        );
+        assert_eq!(
+            rx.try_recv().expect("the waiter is answered"),
+            DmPageWatch::Changed,
+            "a change with subkeys and a remaining count is a change"
+        );
+        assert!(
+            dm_page_watch_taken(&watches, &page, 1, false),
+            "the record is a channel page after its waiter is spent, and a second \
+             change on it must not reach the event mapping"
+        );
+        assert!(
+            !dm_page_watch_taken(&watches, &"rendezvous-record".to_string(), 1, false),
+            "a record no page watch was ever armed on must fall through"
+        );
+    }
+
+    /// The two shapes veilid states a dead watch in resolve `Lost`, not `Changed`
+    /// (#234) — so a caller does not sweep a page on the news that it has stopped
+    /// being watched.
+    #[test]
+    fn a_dead_watch_resolves_lost_rather_than_changed() {
+        for (count, subkeys_empty) in [(0u32, false), (1, true)] {
+            let watches: Mutex<DmWatches<String>> = Mutex::new(DmWatches::new());
+            let page = "page-record".to_string();
+            let (_generation, mut rx) = dm_watches(&watches).arm(page.clone());
+            assert!(dm_page_watch_taken(&watches, &page, count, subkeys_empty));
+            assert_eq!(
+                rx.try_recv().expect("the waiter is answered"),
+                DmPageWatch::Lost,
+                "count={count} subkeys_empty={subkeys_empty} states a dead watch"
+            );
+        }
+    }
+
+    /// A task withdrawing its own registration leaves a later arming's waiter in
+    /// place (#234).
+    ///
+    /// The withdrawal at the end of a watch names the arming it belongs to. Keyed on
+    /// the record alone it would take whatever is registered — and what is
+    /// registered, after a re-arm, is the watch that is actually standing, whose
+    /// waiter would then be resolved by nothing.
+    #[test]
+    fn a_withdrawal_only_takes_its_own_arming() {
+        let watches: Mutex<DmWatches<String>> = Mutex::new(DmWatches::new());
+        let page = "page-record".to_string();
+        let (first, mut rx_first) = dm_watches(&watches).arm(page.clone());
+        let (second, mut rx_second) = dm_watches(&watches).arm(page.clone());
+        assert_ne!(
+            first, second,
+            "each arming is stamped with its own generation"
+        );
+        // The control: replacing the entry resolved the first waiter, so the
+        // withdrawal below is the only thing that could reach the second.
+        assert_eq!(
+            rx_first.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+            "the replaced arming's waiter is resolved by the replacement"
+        );
+
+        dm_watches(&watches).withdraw(&page, first);
+        assert!(
+            dm_page_watch_taken(&watches, &page, 1, false),
+            "the standing arming must still be registered"
+        );
+        assert_eq!(
+            rx_second
+                .try_recv()
+                .expect("the standing waiter is answered"),
+            DmPageWatch::Changed,
+            "the change must reach the arming that is standing"
+        );
+    }
+
+    /// Ending the record drops whatever waiter is registered, whichever arming
+    /// registered it (#234) — the close and eviction paths, where the record itself
+    /// is gone.
+    #[test]
+    fn ending_a_record_resolves_its_waiter_at_once() {
+        let watches: Mutex<DmWatches<String>> = Mutex::new(DmWatches::new());
+        let page = "page-record".to_string();
+        let (_generation, mut rx) = dm_watches(&watches).arm(page.clone());
+        dm_watches(&watches).end_record(&page);
+        assert_eq!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+            "a record that is gone resolves its waiter rather than leaving it to the \
+             lease"
+        );
+        assert!(
+            dm_page_watch_taken(&watches, &page, 1, false),
+            "the record stays classified as a channel page, so a change racing the \
+             close is still not routed to the event mapping"
+        );
     }
 }

@@ -72,7 +72,7 @@ use daemonseed_core::identity::keys::{SignKeypair, IDENTITY_PK_LEN, ML_DSA_SEED_
 use daemonseed_core::storage::dm_store::CorrespondenceLabel;
 use daemonseed_core::trust_events::TrustEventKey;
 
-use crate::actor::{DmPageRecord, DmPageSweep, DoorbellDispatch, DoorbellSweep};
+use crate::actor::{DmPageRecord, DmPageSweep, DmPageWatch, DoorbellDispatch, DoorbellSweep};
 use crate::dm::driver::{DmDriverConfig, SpentTokenStore};
 use crate::dm::types::{
     AcceptFailure, Correspondent, CorrespondentState, DmCommand, DmEvent, DmIdentity, PkLt,
@@ -259,6 +259,25 @@ impl core::fmt::Debug for OpTag {
     }
 }
 
+/// How many watch-issued sweeps of one page fit inside one probe cadence.
+const WATCH_SWEEPS_PER_CADENCE: u64 = 6;
+
+/// The floor between two watch-issued sweeps of one receiving page (#234).
+///
+/// **This is the amplification bound.** A watch fires on every write the
+/// correspondent makes and each firing issues a sweep, which is up to `PAGE_SLOTS`
+/// GETs drawn from a fixed read pool — so with no floor the correspondent's write
+/// rate is this side's read rate, and one party sets the other's DHT load by typing.
+/// The floor caps watch-issued sweeps of one page at
+/// [`WATCH_SWEEPS_PER_CADENCE`] per cadence, whatever arrives; a change inside it is
+/// recorded in [`DmMachine::change_pending`] and swept by the next tick that clears
+/// the floor, so nothing is dropped and the worst added latency is one floor.
+///
+/// Derived from the probe cadence rather than written out, so the two cannot drift:
+/// the floor is a fraction of the interval it exists to be smaller than.
+const WATCH_SWEEP_FLOOR_MS: i64 =
+    (daemonseed_core::dm::collect::PROBE_INTERVAL_MS / WATCH_SWEEPS_PER_CADENCE) as i64;
+
 /// One DHT operation, as the machine asks for it.
 pub(crate) enum DhtOp {
     /// Fetch a correspondent's key record.
@@ -284,6 +303,16 @@ pub(crate) enum DhtOp {
         tag: OpTag,
         address: DmPageAddress<Receiving>,
     },
+    /// Watch one receiving page (#234).
+    ///
+    /// **An optimisation, and the machine is written so that nothing depends on
+    /// it.** The operation carries no bytes back: its outcome decides only whether
+    /// a sweep of that page happens now instead of at the next cadence, and the
+    /// cadence is unchanged by arming one, by losing one, or by never arming any.
+    WatchPage {
+        tag: OpTag,
+        address: DmPageAddress<Receiving>,
+    },
     /// Give one channel page's record back (#252).
     ///
     /// Direction-erased, unlike the two operations above, because a close acts on
@@ -301,7 +330,7 @@ pub(crate) enum DhtOp {
     FetchAck { tag: OpTag, address: DmAckAddress },
 }
 
-/// Which of the eight operations an outcome came from.
+/// Which of the nine operations an outcome came from.
 ///
 /// **A tag cannot answer this and is not meant to.** A tag names what the
 /// operation belongs to — a conversation, an introduction — and a doorbell sweep
@@ -316,6 +345,7 @@ pub(crate) enum DhtOpKind {
     SweepDoorbell,
     PublishPage,
     SweepPage,
+    WatchPage,
     PublishAck,
     FetchAck,
     ClosePage,
@@ -330,6 +360,7 @@ impl DhtOpKind {
             DhtOpKind::SweepDoorbell => "SweepDoorbell",
             DhtOpKind::PublishPage => "PublishPage",
             DhtOpKind::SweepPage => "SweepPage",
+            DhtOpKind::WatchPage => "WatchPage",
             DhtOpKind::PublishAck => "PublishAck",
             DhtOpKind::FetchAck => "FetchAck",
             DhtOpKind::ClosePage => "ClosePage",
@@ -346,6 +377,7 @@ impl DhtOp {
             DhtOp::SweepDoorbell { .. } => DhtOpKind::SweepDoorbell,
             DhtOp::PublishPage { .. } => DhtOpKind::PublishPage,
             DhtOp::SweepPage { .. } => DhtOpKind::SweepPage,
+            DhtOp::WatchPage { .. } => DhtOpKind::WatchPage,
             DhtOp::PublishAck { .. } => DhtOpKind::PublishAck,
             DhtOp::FetchAck { .. } => DhtOpKind::FetchAck,
             DhtOp::ClosePage { .. } => DhtOpKind::ClosePage,
@@ -360,6 +392,7 @@ impl DhtOp {
             | DhtOp::SweepDoorbell { tag, .. }
             | DhtOp::PublishPage { tag, .. }
             | DhtOp::SweepPage { tag, .. }
+            | DhtOp::WatchPage { tag, .. }
             | DhtOp::PublishAck { tag, .. }
             | DhtOp::FetchAck { tag, .. }
             | DhtOp::ClosePage { tag, .. } => tag,
@@ -387,6 +420,12 @@ impl DhtOp {
             DhtOp::SweepPage { tag, .. } => match (tag.conversation, tag.page) {
                 (Some(conversation), Some(page)) => {
                     Some(PanickedJob::PageSweep { conversation, page })
+                }
+                _ => None,
+            },
+            DhtOp::WatchPage { tag, .. } => match (tag.conversation, tag.page) {
+                (Some(conversation), Some(page)) => {
+                    Some(PanickedJob::PageWatch { conversation, page })
                 }
                 _ => None,
             },
@@ -420,6 +459,8 @@ pub(crate) enum DhtResult {
     Doorbell(DoorbellSweep),
     /// A page sweep.
     Page(DmPageSweep),
+    /// A page watch that has resolved — a value change, or the watch being gone.
+    Watch(DmPageWatch),
     /// An acknowledgement fetch; `None` is no confirmation yet.
     Ack(Option<Vec<u8>>),
     /// An acknowledgement write completed.
@@ -447,7 +488,7 @@ pub(crate) struct DhtOutcome {
     ///
     /// **Carried rather than recovered from the result**, because the failure
     /// paths have no result to recover it from: an `Err` is one error type for
-    /// all eight operations, and the doorbell sweep's tag names nothing. A sweep
+    /// all nine operations, and the doorbell sweep's tag names nothing. A sweep
     /// the machine cannot recognise on its way back is a sweep it goes on
     /// believing is in flight, and a record whose sweep is permanently in flight
     /// is a record this driver never reads again.
@@ -626,6 +667,18 @@ pub(crate) enum PanickedJob {
         conversation: [u8; AR_FINGERPRINT_LEN],
         page: u64,
     },
+    /// A watch on one receiving page, by the conversation and page it addressed.
+    ///
+    /// Recorded for the reason the two above are, with the mildest consequence of
+    /// the three: the machine holds one watch per page, so a dead watch nothing
+    /// reports leaves that page recorded as watched for the life of the driver and
+    /// no later probe re-arms it. What that costs is the watch and nothing else —
+    /// the page goes on being swept on its cadence — but a page permanently
+    /// believed watched is indistinguishable from one that is.
+    PageWatch {
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        page: u64,
+    },
 }
 
 impl core::fmt::Debug for PanickedJob {
@@ -642,6 +695,9 @@ impl core::fmt::Debug for PanickedJob {
             }
             PanickedJob::PageSweep { page, .. } => {
                 write!(f, "PageSweep {{ conversation: \"<AR>\", page: {page} }}")
+            }
+            PanickedJob::PageWatch { page, .. } => {
+                write!(f, "PageWatch {{ conversation: \"<AR>\", page: {page} }}")
             }
         }
     }
@@ -1300,6 +1356,44 @@ pub(crate) struct DmMachine {
     /// per page: two different pages of one conversation are two different
     /// records, and holding one open says nothing about the other.
     sweeping_pages: std::collections::BTreeSet<([u8; AR_FINGERPRINT_LEN], u64)>,
+    /// The receiving pages whose watch is in flight, by conversation and page
+    /// (#234).
+    ///
+    /// **A separate set from [`Self::sweeping_pages`], and it must be.** They answer
+    /// different questions about the same page — may it be swept again, and is a
+    /// watch already standing on it — and a watch outlives many sweeps by design, so
+    /// one set would either stop the page being swept for the length of the watch or
+    /// re-arm a watch on every probe.
+    ///
+    /// Presence is enough, as it is for sweeps: `probe` arms nothing for a page
+    /// already here, so one page never has two watches outstanding.
+    ///
+    /// **Nothing reads this to decide whether a page is collected.** It gates
+    /// arming and nothing else — a page in this set and a page not in it are swept
+    /// on exactly the same cadence.
+    watched_pages: std::collections::BTreeSet<([u8; AR_FINGERPRINT_LEN], u64)>,
+    /// The receiving pages a value change arrived for and was not swept for, by
+    /// conversation and page (#234).
+    ///
+    /// **A change is answered by exactly one sweep, and this is what stops it being
+    /// answered by none.** Two things defer a watch-issued sweep: a sweep of that
+    /// page already in flight, which cannot see the write that caused the change
+    /// because it started before it; and the amplification floor
+    /// ([`WATCH_SWEEP_FLOOR_MS`]). Both would otherwise leave the page unswept and
+    /// unwatched until the probe cadence came round — the exact wait the watch
+    /// exists to remove.
+    ///
+    /// Drained on every tick, not on the cadence, so the delay a deferral costs is
+    /// bounded by the floor rather than by the cadence. An entry is dropped rather
+    /// than kept where there is nothing left to collect: a torn-down conversation,
+    /// or a correspondent whose channel the block list now suppresses.
+    change_pending: std::collections::BTreeSet<([u8; AR_FINGERPRINT_LEN], u64)>,
+    /// When a watch-issued sweep was last dispatched for each page, by conversation
+    /// and page (#234).
+    ///
+    /// Read only by the floor. Entries go when the page is handed back, which is the
+    /// point after which no watch of it can fire.
+    watch_swept_ms: std::collections::BTreeMap<([u8; AR_FINGERPRINT_LEN], u64), i64>,
     /// The sending pages whose publish is in flight, by conversation and page.
     ///
     /// **Not a second [`Self::sweeping_pages`] and not foldable into it.** That set
@@ -1412,6 +1506,9 @@ impl DmMachine {
             sweeping_doorbell: false,
             key_records: Vec::new(),
             sweeping_pages: std::collections::BTreeSet::new(),
+            watched_pages: std::collections::BTreeSet::new(),
+            change_pending: std::collections::BTreeSet::new(),
+            watch_swept_ms: std::collections::BTreeMap::new(),
             publishing_pages: std::collections::BTreeMap::new(),
             open_recv_pages: std::collections::BTreeSet::new(),
             open_send_pages: std::collections::BTreeSet::new(),
@@ -1887,6 +1984,13 @@ impl DmMachine {
                         &OpTag::channel(conversation, None, Some(page)),
                     )
                 }
+                // A dead watch yields nothing and holds nothing but its own slot,
+                // so releasing that slot is the whole of it: the next probe arms a
+                // watch again, and the sweep cadence never depended on one.
+                Some(PanickedJob::PageWatch { conversation, page }) => {
+                    self.watched_pages.remove(&(conversation, page));
+                    Vec::new()
+                }
                 // Same reasoning, the write side: a slot left held is a sending page
                 // the close path refuses for ever.
                 Some(PanickedJob::PagePublish { conversation, page }) => {
@@ -1941,6 +2045,7 @@ impl DmMachine {
                         self.confirm_written(now_ms, &tag)
                     }
                     Ok(DhtResult::Page(sweep)) => self.on_page(now_ms, &tag, sweep),
+                    Ok(DhtResult::Watch(watch)) => self.on_watch(now_ms, &tag, watch),
                     Ok(DhtResult::Ack(record)) => self.on_peer_ack(now_ms, &tag, record),
                     Ok(DhtResult::AckWritten) => self.on_ack_written(now_ms, &tag),
                     // Nothing to fold. The page left `open_recv_pages` /
@@ -1965,6 +2070,21 @@ impl DmMachine {
                     }
                 };
                 freed.extend(folded);
+                // A value change that arrived while this page's sweep was in flight
+                // was recorded rather than swept, because that sweep began before
+                // the write which caused the change and cannot return it. Issued
+                // here, after the outcome has been folded, so the collection's view
+                // of the page is the one the sweep just established — and issued at
+                // all, because otherwise the change waits for the probe cadence the
+                // watch exists to pre-empt.
+                if kind == DhtOpKind::SweepPage {
+                    if let (Some(conversation), Some(page)) = (tag.conversation, tag.page) {
+                        if self.change_pending.contains(&(conversation, page)) {
+                            let owed = self.sweep_watched_page(now_ms, conversation, page);
+                            freed.extend(owed);
+                        }
+                    }
+                }
                 freed
             }
         }
@@ -2001,6 +2121,15 @@ impl DmMachine {
             DhtOpKind::PublishPage => {
                 if let (Some(conversation), Some(page)) = (tag.conversation, tag.page) {
                     release_publish(&mut self.publishing_pages, conversation, page);
+                }
+            }
+            // A watch that has resolved is over, whatever it resolved to, so the
+            // page is no longer recorded as watched and a later probe may arm
+            // another. Released on the failure path too, for `release_sweep`'s own
+            // reason: a page believed watched for ever is one nothing re-arms.
+            DhtOpKind::WatchPage => {
+                if let (Some(conversation), Some(page)) = (tag.conversation, tag.page) {
+                    self.watched_pages.remove(&(conversation, page));
                 }
             }
             DhtOpKind::FetchKeyRecord
@@ -3479,6 +3608,23 @@ impl DmMachine {
         index: usize,
         block_list: Option<&BlockList>,
     ) -> Vec<DmEffect> {
+        // A value change recorded but not yet answered — its page's sweep was in
+        // flight, or it fell inside the watch-sweep floor — is issued here, at the
+        // head of EVERY tick rather than on the cadence. That is what makes a
+        // deferral cost at most one floor instead of the rest of a cadence, and it
+        // is why every early return below carries `out` rather than an empty vector.
+        // `sweep_watched_page` applies this planner's own teardown and block-list
+        // rules, so a change for a conversation this planner would refuse is dropped
+        // there.
+        let mut out = self.drain_change_pending(now_ms, index);
+        // The baseline run's switch, read before the destructure below borrows the
+        // machine: a driver that arms nothing must reach the same state as one whose
+        // watches are lost, and only a run with no watch in it can show that. See
+        // `DmDriverConfig::arm_page_watches`.
+        #[cfg(test)]
+        let arming = self.cfg.arm_page_watches;
+        #[cfg(not(test))]
+        let arming = true;
         // Read before the destructure below borrows the whole machine, and read
         // for every correspondence rather than only the ratchet-less ones: the
         // outbox is the one place the correspondence's direction is durable, so
@@ -3489,6 +3635,7 @@ impl DmMachine {
         let Self {
             correspondences,
             sweeping_pages,
+            watched_pages,
             open_recv_pages,
             torn_down,
             ..
@@ -3507,29 +3654,29 @@ impl DmMachine {
         // correspondent's pseudonym being on record, which is the same test
         // `seed_from_store` uses to decide a resume record exists.
         if correspondence.ratchet.is_none() && correspondence.peer_pk_pc.is_none() {
-            return Vec::new();
+            return out;
         }
         let Some(block_list) = block_list else {
-            return Vec::new();
+            return out;
         };
         if block_list.suppresses_channel(&correspondence.pk_lt) {
-            return Vec::new();
+            return out;
         }
         // The cadence is consumed whether or not the sweep can proceed, so a
         // correspondence that cannot verify anything reports once per cadence
         // rather than once per tick.
         let Some(plan) = correspondence.collection.probe_plan(probe_ms(now_ms)) else {
-            return Vec::new();
+            return out;
         };
         let Some(conversation) = correspondence.conversation() else {
             crate::vtrace!("dm driver: the conversation fingerprint would not derive");
-            return Vec::new();
+            return out;
         };
         // A torn-down conversation plans nothing. The pages were handed back at
         // teardown, and re-planning them would re-open the very records that were
         // released — see `Self::torn_down`.
         if torn_down.contains(&conversation) {
-            return Vec::new();
+            return out;
         }
         let address_root = correspondence.address_root;
         // **An initiator that has not yet seen the acceptance still sweeps**,
@@ -3537,27 +3684,25 @@ impl DmMachine {
         // channel frame at the acceptor's sequence zero. What it cannot do is
         // open anything later than that, which `on_page` decides per slot.
         let ratchet = correspondence.ratchet.as_ref();
-        let mut out = Vec::new();
         for page in plan {
             if sweeping_pages.contains(&(conversation, page)) {
                 continue;
             }
-            let derived = match (ratchet, peer_direction) {
-                (Some(ratchet), _) => DmPageAddress::receiving(&address_root, ratchet, page),
-                (None, Some(direction)) => {
-                    DmPageAddress::receiving_on(&address_root, direction, page)
-                }
-                // No key schedule and no stored outbox to read a direction from,
-                // so there is no plane to name. A correspondence in this state
-                // has never queued anything, which is also nothing to recover.
-                (None, None) => continue,
+            // No key schedule and no stored outbox to read a direction from, so
+            // there is no plane to name. A correspondence in this state has never
+            // queued anything, which is also nothing to recover.
+            let Some(derived) =
+                receiving_page_address(&address_root, ratchet, peer_direction, page)
+            else {
+                continue;
             };
             match derived {
                 Ok(address) => {
                     sweeping_pages.insert((conversation, page));
-                    // Recorded here and nowhere else: this is the only site that
-                    // asks the transport to open a receiving page, so the set can
-                    // neither miss one nor name one that was never opened.
+                    // Recorded wherever a receiving page is asked for, which is here
+                    // and in `sweep_watched_page` — the two sites that issue a
+                    // `SweepPage`. Both record it, so the set can neither miss a page
+                    // nor name one that was never opened.
                     open_recv_pages.insert((conversation, page));
                     out.push(DmEffect::Dht(DhtOp::SweepPage {
                         tag: OpTag::channel(conversation, None, Some(page)),
@@ -3568,6 +3713,218 @@ impl DmMachine {
                 // page whose sweep was never asked for is not one to wait on.
                 Err(e) => crate::vtrace!("dm driver: receiving address derivation failed: {e}"),
             }
+        }
+        // A watch on each page the collection holds one for — the current receiving
+        // page and the next (#234). Armed here, after the plan, because this is the
+        // one place that already knows the conversation is live, unblocked, not torn
+        // down and addressable; and once per cadence rather than once per tick,
+        // because a watch stands until it resolves and re-arming a standing one
+        // would be a second watch on one record.
+        //
+        // **Nothing above this line changes.** The sweep plan is unchanged, the
+        // cadence is unchanged, and the pages named here are already in
+        // `open_recv_pages` — the watched pair is the head of every probe plan — so
+        // a watch opens no record the sweep was not opening anyway.
+        for page in correspondence.collection.watched() {
+            if !arming || watched_pages.contains(&(conversation, page)) {
+                continue;
+            }
+            let Some(derived) =
+                receiving_page_address(&address_root, ratchet, peer_direction, page)
+            else {
+                continue;
+            };
+            match derived {
+                Ok(address) => {
+                    watched_pages.insert((conversation, page));
+                    out.push(DmEffect::Dht(DhtOp::WatchPage {
+                        tag: OpTag::channel(conversation, None, Some(page)),
+                        address,
+                    }));
+                }
+                Err(e) => crate::vtrace!("dm driver: watch address derivation failed: {e}"),
+            }
+        }
+        out
+    }
+
+    /// Fold one resolved page watch (#234).
+    ///
+    /// **A value change is a prompt to read, and the read is the ordinary sweep.**
+    /// The watch carries no bytes, so this issues the same [`DhtOp::SweepPage`] the
+    /// cadence would have issued later, against the same address, folded by the same
+    /// [`Self::on_page`]. There is no second collection path, and a watch that fires
+    /// on a page nothing was written to costs one empty sweep.
+    ///
+    /// **Every other resolution changes nothing at all.** A lost watch, an expired
+    /// one and a transport failure all arrive here — or, for the failure, not even
+    /// here — having already been released from [`Self::watched_pages`], and none of
+    /// them touches the collection, the cursor, the outbox or the cadence. The next
+    /// probe re-arms and sweeps exactly as it would have done.
+    ///
+    /// The whole of a change's handling is [`Self::sweep_watched_page`], which is
+    /// also what answers a change recorded earlier — so one change and one recorded
+    /// change take the identical path, including the re-arm, the block-list consult
+    /// and the amplification floor.
+    fn on_watch(&mut self, now_ms: i64, tag: &OpTag, watch: DmPageWatch) -> Vec<DmEffect> {
+        if watch == DmPageWatch::Lost {
+            return Vec::new();
+        }
+        let (Some(conversation), Some(page)) = (tag.conversation, tag.page) else {
+            return Vec::new();
+        };
+        self.sweep_watched_page(now_ms, conversation, page)
+    }
+
+    /// Sweep one page a value change was reported for, and re-arm its watch — or
+    /// record the change for a later tick to answer (#234).
+    ///
+    /// Reached from [`Self::on_watch`] with a change that has just arrived, and from
+    /// the two places that answer a change recorded earlier: the release of the sweep
+    /// that was in flight when it arrived, and every tick's [`Self::probe`].
+    ///
+    /// **A deferral is a delay, never a drop.** Two conditions defer, and neither can
+    /// be answered by sweeping now:
+    ///
+    /// - **A sweep of the page is already in flight.** It began before the write that
+    ///   caused this change, so it cannot return that write, and a second concurrent
+    ///   sweep of one record is what [`Self::sweeping_pages`] exists to prevent.
+    /// - **The change fell inside [`WATCH_SWEEP_FLOOR_MS`]**, which is the bound on
+    ///   how much DHT read load a correspondent's write rate can create here.
+    ///
+    /// Either way the page goes into [`Self::change_pending`] and the next tick that
+    /// clears both conditions issues exactly one sweep for it.
+    ///
+    /// **The page IS re-armed on the sweeping path, and it has to be.** A watch
+    /// answers once, so a page left unwatched until the next probe would be unwatched
+    /// for most of the cadence — and the first change to spend a watch is routinely a
+    /// re-seed of bytes already collected, which would leave the genuinely new
+    /// message to the sweep the watch exists to pre-empt. The re-arm is bounded by
+    /// the collection: only a page [`Collection::watched`] still names gets one, so a
+    /// page the frontier has moved past stops being watched without anything having
+    /// to cancel it. A deferred change does not re-arm, which is the other half of
+    /// the floor — the next probe arms the watch on its own schedule.
+    ///
+    /// **The block list is consulted here as well as at the probe, and it has to
+    /// be.** A watch armed before a block resolves after it, and the block's rule is
+    /// that a suppressed correspondent's records are *not read* (ISC-C46) — so a
+    /// sweep issued from this path would read the very record the block stopped
+    /// reading, and `on_page` dropping what it returns is too late to satisfy the
+    /// criterion. An unreadable list suppresses, exactly as every other consult in
+    /// this machine does. A blocked or torn-down conversation's pending entry is
+    /// dropped rather than held: there is nothing left for a later tick to collect.
+    fn sweep_watched_page(
+        &mut self,
+        now_ms: i64,
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        page: u64,
+    ) -> Vec<DmEffect> {
+        self.change_pending.remove(&(conversation, page));
+        let Some(index) = self.index_of_conversation(&conversation) else {
+            return Vec::new();
+        };
+        if self.torn_down.contains(&conversation) {
+            return Vec::new();
+        }
+        match self.persist.read_block_list() {
+            Ok(list) if list.suppresses_channel(&self.correspondences[index].pk_lt) => {
+                return Vec::new();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::vtrace!("dm driver: block list unreadable, sweeping no watched page: {e}");
+                return Vec::new();
+            }
+        }
+        let floored = self
+            .watch_swept_ms
+            .get(&(conversation, page))
+            .is_some_and(|last| now_ms >= *last && now_ms - *last < WATCH_SWEEP_FLOOR_MS);
+        if floored || self.sweeping_pages.contains(&(conversation, page)) {
+            self.change_pending.insert((conversation, page));
+            return Vec::new();
+        }
+        // Read before the borrows below, exactly as `probe` reads it: the outbox is
+        // the only durable source of the correspondence's direction.
+        let peer_direction = self
+            .stored_direction(&self.correspondences[index].label, now_ms)
+            .map(Direction::opposite);
+        let correspondence = &self.correspondences[index];
+        let address_root = correspondence.address_root;
+        let Some(derived) = receiving_page_address(
+            &address_root,
+            correspondence.ratchet.as_ref(),
+            peer_direction,
+            page,
+        ) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        match derived {
+            Ok(address) => {
+                self.sweeping_pages.insert((conversation, page));
+                self.open_recv_pages.insert((conversation, page));
+                self.watch_swept_ms.insert((conversation, page), now_ms);
+                out.push(DmEffect::Dht(DhtOp::SweepPage {
+                    tag: OpTag::channel(conversation, None, Some(page)),
+                    address,
+                }));
+            }
+            Err(e) => {
+                crate::vtrace!("dm driver: watched-page address derivation failed: {e}");
+                return out;
+            }
+        }
+        // The re-arm, derived a second time because the address moved into the sweep
+        // above: a `DmPageAddress` carries the conversation's write capability and is
+        // not `Clone` (#244), so two operations on one page are two derivations.
+        let correspondence = &self.correspondences[index];
+        if !correspondence.collection.watched().contains(&page) {
+            return out;
+        }
+        match receiving_page_address(
+            &address_root,
+            correspondence.ratchet.as_ref(),
+            peer_direction,
+            page,
+        ) {
+            Some(Ok(address)) => {
+                self.watched_pages.insert((conversation, page));
+                out.push(DmEffect::Dht(DhtOp::WatchPage {
+                    tag: OpTag::channel(conversation, None, Some(page)),
+                    address,
+                }));
+            }
+            Some(Err(e)) => {
+                crate::vtrace!("dm driver: watch re-arm address derivation failed: {e}");
+            }
+            // Neither a key schedule nor a stored direction, so there is no plane to
+            // name. The sweep above derived one from the same two sources, so this
+            // arm is a skip rather than a failure.
+            None => {}
+        }
+        out
+    }
+
+    /// Issue the sweeps one correspondence's recorded value changes are still owed
+    /// (#234).
+    ///
+    /// Called at the head of every tick's [`Self::probe`], before the cadence gate,
+    /// so a change deferred by the floor waits at most one floor rather than the rest
+    /// of a cadence.
+    fn drain_change_pending(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
+        let Some(conversation) = self.correspondences[index].conversation() else {
+            return Vec::new();
+        };
+        let pending: Vec<u64> = self
+            .change_pending
+            .iter()
+            .filter(|(c, _)| *c == conversation)
+            .map(|(_, page)| *page)
+            .collect();
+        let mut out = Vec::new();
+        for page in pending {
+            out.extend(self.sweep_watched_page(now_ms, conversation, page));
         }
         out
     }
@@ -3636,6 +3993,9 @@ impl DmMachine {
         let Self {
             correspondences,
             sweeping_pages,
+            watched_pages,
+            change_pending,
+            watch_swept_ms,
             publishing_pages,
             open_recv_pages,
             open_send_pages,
@@ -3655,12 +4015,24 @@ impl DmMachine {
             .iter()
             .filter(|(c, page)| *c == conversation && *page < recv_below)
             .map(|(_, page)| *page)
-            .filter(|page| !sweeping_pages.contains(&(conversation, *page)))
+            // A page with an operation of ANY kind still in flight is left for that
+            // operation's release to hand back. A watch counts: it holds the record
+            // open exactly as a sweep does, and a close issued under one takes the
+            // record out from beneath a watch that is still standing on it.
+            .filter(|page| {
+                !sweeping_pages.contains(&(conversation, *page))
+                    && !watched_pages.contains(&(conversation, *page))
+            })
             .collect();
         for page in retiring {
             match DmPageAddress::receiving(&address_root, ratchet, page) {
                 Ok(address) => {
                     open_recv_pages.remove(&(conversation, page));
+                    // The page is handed back, so no watch of it can fire again:
+                    // an owed sweep has nothing left to collect and the floor has
+                    // nothing left to bound.
+                    change_pending.remove(&(conversation, page));
+                    watch_swept_ms.remove(&(conversation, page));
                     out.push(DmEffect::Dht(DhtOp::ClosePage {
                         tag: OpTag::channel(conversation, None, Some(page)),
                         address: DmPageRecord::Receiving(address),
@@ -3753,10 +4125,14 @@ impl DmMachine {
     ///
     /// A no-op for a live conversation, which is every call but the rare one.
     fn close_freed_after_teardown(&mut self, kind: DhtOpKind, tag: &OpTag) -> Vec<DmEffect> {
-        // Only the two operations that hold a page slot free one. Everything else —
-        // a close, an acknowledgement, a doorbell write — names no page to hand back.
+        // Only the operations that hold a page slot free one. Everything else — a
+        // close, an acknowledgement, a doorbell write — names no page to hand back.
+        // A watch holds a receiving page open for as long as it stands, so it frees
+        // one when it resolves — and it is the operation most likely to be the last
+        // one outstanding on a torn-down conversation's page, because it outlives
+        // every sweep issued beside it.
         let sending = match kind {
-            DhtOpKind::SweepPage => false,
+            DhtOpKind::SweepPage | DhtOpKind::WatchPage => false,
             DhtOpKind::PublishPage => true,
             _ => return Vec::new(),
         };
@@ -6858,6 +7234,33 @@ fn retire_finished_legs(
     }
 }
 
+/// Derive one receiving page's address the way every path that reads that plane
+/// must derive it.
+///
+/// **One derivation, so a sweep and a watch cannot address different records.** A
+/// page is named by the address root plus this side's receiving direction, and the
+/// direction has two sources with a strict order: the key schedule where there is
+/// one, and otherwise the direction the outbox recorded — which is what a restarted
+/// party has instead. Two call sites choosing between those independently is two
+/// answers to one question, and the wrong one is a valid address for a record nobody
+/// writes.
+///
+/// `None` is a correspondence with neither source. It has no plane to name and has
+/// never queued anything, so there is also nothing to recover; the caller skips the
+/// page rather than treating it as a failure.
+fn receiving_page_address(
+    address_root: &[u8; ADDRESS_ROOT_LEN],
+    ratchet: Option<&Ratchet>,
+    peer_direction: Option<Direction>,
+    page: u64,
+) -> Option<Result<DmPageAddress<Receiving>, daemonseed_core::dm::paging::DmPageError>> {
+    match (ratchet, peer_direction) {
+        (Some(ratchet), _) => Some(DmPageAddress::receiving(address_root, ratchet, page)),
+        (None, Some(direction)) => Some(DmPageAddress::receiving_on(address_root, direction, page)),
+        (None, None) => None,
+    }
+}
+
 /// Whether a leg at `seq` has a record address on this side's plane.
 ///
 /// Asked before [`OutboxEntry::emit`] spends a rung, and asked with the same
@@ -8309,6 +8712,7 @@ mod tests {
                 idle_tick: Duration::from_secs(30),
                 policy: AdmissionPolicy::Open,
                 pow_difficulty: pow::PowDifficulty::reduced_for_test(4),
+                arm_page_watches: true,
             },
             doorbell_owner,
             keyrec_addr,
@@ -9227,6 +9631,7 @@ mod tests {
                 idle_tick: Duration::from_secs(30),
                 policy: AdmissionPolicy::Open,
                 pow_difficulty: pow::PowDifficulty::reduced_for_test(4),
+                arm_page_watches: true,
             },
             doorbell_owner,
             keyrec_addr,
@@ -10442,6 +10847,331 @@ mod tests {
                 found: 0,
             },
         })
+    }
+
+    /// One page watch's outcome, as the shell would hand it back.
+    fn watch_outcome(
+        conversation: [u8; AR_FINGERPRINT_LEN],
+        page: u64,
+        result: crate::Result<DhtResult>,
+    ) -> DmOutcome {
+        DmOutcome::Dht(DhtOutcome {
+            kind: DhtOpKind::WatchPage,
+            tag: OpTag::channel(conversation, None, Some(page)),
+            result,
+        })
+    }
+
+    /// A value change reported on one page.
+    fn changed() -> crate::Result<DhtResult> {
+        Ok(DhtResult::Watch(DmPageWatch::Changed))
+    }
+
+    /// The conversation and page of every watch a batch of effects asked for.
+    fn watched_channels(effects: &[DmEffect]) -> Vec<([u8; AR_FINGERPRINT_LEN], u64)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::WatchPage { tag, .. }) => Some((tag.conversation?, tag.page?)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Resolve every watch a batch of effects armed, as a transport with no watch
+    /// available would.
+    ///
+    /// `DmPageWatch::Lost` folds to nothing, so on a live conversation this changes
+    /// exactly one thing: the page stops being recorded as watched, and the close
+    /// path may hand it back. A test that plans pages and never resolves their
+    /// watches is a test in which no page is ever closable, which production is not
+    /// — every watch resolves inside its lease.
+    fn release_watches(m: &mut DmMachine, effects: &[DmEffect], now_ms: i64) {
+        for (conversation, page) in watched_channels(effects) {
+            m.on_outcome(
+                now_ms,
+                watch_outcome(conversation, page, Ok(DhtResult::Watch(DmPageWatch::Lost))),
+            );
+        }
+    }
+
+    /// M34c. A value change that arrives while that page's sweep is in flight is
+    /// answered once the sweep returns, not dropped.
+    ///
+    /// **The in-flight sweep cannot answer the change that arrived during it.** It
+    /// began before the write, so its result is the record as it was; and the page
+    /// has already left `watched_pages`, because the watch resolved. Answering
+    /// nothing there leaves the page both unswept and unwatched until the probe
+    /// cadence — the exact wait the watch exists to remove.
+    ///
+    /// The two empty assertions in the middle are the shape of the deferral and are
+    /// not the point on their own: a machine that dropped the change would satisfy
+    /// them too. The pair after the sweep's outcome is what separates the two.
+    #[test]
+    fn a_change_during_an_in_flight_sweep_is_answered_when_it_returns() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_identity();
+        let mut a = machine_as(keys(), &dir_a);
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let conversation = conversation_of(&b, 0);
+
+        let first = b.on_tick(BASE_MS);
+        assert!(
+            swept_channels(&first).contains(&(conversation, 0)),
+            "the fixture needs page 0's sweep in flight: {:?}",
+            swept_channels(&first)
+        );
+        assert!(
+            watched_channels(&first).contains(&(conversation, 0)),
+            "the fixture needs a watch on page 0: {:?}",
+            watched_channels(&first)
+        );
+
+        let during = b.on_outcome(BASE_MS + 1, watch_outcome(conversation, 0, changed()));
+        assert_eq!(
+            swept_channels(&during),
+            Vec::new(),
+            "a page whose sweep is in flight must not be swept a second time"
+        );
+        assert_eq!(
+            watched_channels(&during),
+            Vec::new(),
+            "nor re-armed, which would be a second watch on one record"
+        );
+
+        let after = b.on_outcome(
+            BASE_MS + 2,
+            page_outcome(conversation, 0, Ok(empty_page(conversation))),
+        );
+        assert!(
+            swept_channels(&after).contains(&(conversation, 0)),
+            "the recorded change must be answered once its page was free: {:?}",
+            swept_channels(&after)
+        );
+        assert!(
+            watched_channels(&after).contains(&(conversation, 0)),
+            "and the page re-armed with it: {:?}",
+            watched_channels(&after)
+        );
+    }
+
+    /// M34d. Two value changes inside the sweep floor cost one sweep, and the
+    /// second is collected by the first tick clear of the floor.
+    ///
+    /// **The floor is the amplification bound.** A watch fires on every write the
+    /// correspondent makes, and each firing would otherwise be a full page sweep —
+    /// so the correspondent's typing rate would set this side's DHT read rate. The
+    /// floor caps that; what it must not do is lose a change, which is what the last
+    /// assertion is for.
+    #[test]
+    fn two_changes_inside_the_floor_cost_one_sweep_and_lose_neither() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let b_keys = peer_identity();
+        let mut a = machine_as(keys(), &dir_a);
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let conversation = conversation_of(&b, 0);
+
+        let first = b.on_tick(BASE_MS);
+        release_sweeps(&mut b, &swept_channels(&first), BASE_MS);
+
+        let one = b.on_outcome(BASE_MS + 1, watch_outcome(conversation, 0, changed()));
+        assert_eq!(
+            swept_channels(&one),
+            vec![(conversation, 0)],
+            "the first change must be swept at once, exactly once"
+        );
+        release_sweeps(&mut b, &swept_channels(&one), BASE_MS + 1);
+
+        let two = b.on_outcome(BASE_MS + 2, watch_outcome(conversation, 0, changed()));
+        assert_eq!(
+            swept_channels(&two),
+            Vec::new(),
+            "a second change inside the floor must issue no sweep of its own"
+        );
+        let inside = b.on_tick(BASE_MS + 3);
+        assert_eq!(
+            swept_channels(&inside),
+            Vec::new(),
+            "and a tick still inside the floor must not issue it either"
+        );
+
+        let clear = b.on_tick(BASE_MS + WATCH_SWEEP_FLOOR_MS + 1);
+        assert!(
+            swept_channels(&clear).contains(&(conversation, 0)),
+            "the deferred change must be collected by the first tick clear of the \
+             floor, or the floor drops changes rather than spacing them: {:?}",
+            swept_channels(&clear)
+        );
+    }
+
+    /// M34e. A blocked correspondent's page is not read on a value change.
+    ///
+    /// A watch armed before a block resolves after it, and ISC-C46 is that a
+    /// suppressed correspondent's records are *not read* — so the refusal has to
+    /// happen before the sweep is issued. `on_page` discarding what came back would
+    /// be a read that already happened.
+    ///
+    /// The unblocked half is the mirror control: without it the assertion is
+    /// satisfied by a machine that sweeps nothing on a change at all.
+    #[test]
+    fn a_blocked_correspondents_page_is_not_swept_on_a_change() {
+        for blocked in [false, true] {
+            let dir_a = tempfile::tempdir().expect("temp dir A");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let b_keys = peer_identity();
+            let mut a = machine_as(keys(), &dir_a);
+            let mut b = machine_as(peer_identity(), &dir_b);
+            b.persist.provision_block_list().expect("provision");
+            establish_pair(&mut a, &mut b, &b_keys);
+            let conversation = conversation_of(&b, 0);
+            let first = b.on_tick(BASE_MS);
+            release_sweeps(&mut b, &swept_channels(&first), BASE_MS);
+            if blocked {
+                b.on_command(
+                    BASE_MS,
+                    DmCommand::Block {
+                        pk_lt: Box::new(*keys().signing.public_key()),
+                    },
+                );
+            }
+
+            let out = b.on_outcome(BASE_MS + 1, watch_outcome(conversation, 0, changed()));
+
+            assert_eq!(
+                swept_channels(&out).contains(&(conversation, 0)),
+                !blocked,
+                "blocked={blocked}: the change was answered the wrong way: {:?}",
+                swept_channels(&out)
+            );
+            assert_eq!(
+                watched_channels(&out).contains(&(conversation, 0)),
+                !blocked,
+                "blocked={blocked}: a blocked correspondent's page must not be \
+                 re-armed either"
+            );
+        }
+    }
+
+    /// M34f. A torn-down conversation arms no watch and sweeps nothing on a change
+    /// that arrives after the teardown.
+    ///
+    /// The pages were handed back at the teardown, so a sweep issued from a watch
+    /// would re-open the very records that were released — the failure
+    /// `Self::torn_down` exists to prevent, reached by the one path that does not
+    /// go through the probe plan.
+    #[test]
+    fn a_torn_down_conversation_neither_arms_nor_sweeps_on_a_change() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, _b, _label) = established_initiator(&dir_a, &dir_b);
+        // Read while the channel is live, because the teardown is what the change
+        // below has to be refused by and the fingerprint names the conversation it
+        // arrives for.
+        let conversation = conversation_of(&a, 0);
+        // The teardown: a fresh knock from the same correspondent replaces the
+        // channel and hands every page of the old one back.
+        let dir_b2 = tempfile::tempdir().expect("temp dir B2");
+        let mut b2 = machine_as(peer_identity(), &dir_b2);
+        b2.persist.provision_block_list().expect("provision B2");
+        let (_, entry) = knock_as_initiator(&mut b2, &keys());
+        let torn = a.on_doorbell(BASE_MS, sweep_of(vec![(11, entry)]));
+        assert!(
+            torn.iter()
+                .any(|e| matches!(e, DmEffect::Emit(DmEvent::ChannelLost { .. }))),
+            "the re-knock did not tear the channel down: {torn:?}"
+        );
+
+        let tick = a.on_tick(BASE_MS);
+        assert_eq!(
+            watched_channels(&tick),
+            Vec::new(),
+            "a torn-down conversation must arm no watch: {:?}",
+            watched_channels(&tick)
+        );
+
+        let out = a.on_outcome(BASE_MS + 1, watch_outcome(conversation, 0, changed()));
+        assert_eq!(
+            swept_channels(&out),
+            Vec::new(),
+            "a change on a torn-down conversation must open nothing: {out:?}"
+        );
+        assert_eq!(
+            watched_channels(&out),
+            Vec::new(),
+            "and must re-arm nothing: {out:?}"
+        );
+    }
+
+    /// M34g. A page whose only outstanding operation is a watch is not closed at
+    /// teardown, and is closed once that watch resolves.
+    ///
+    /// **A watch holds the record open exactly as a sweep does.** Closing under one
+    /// hands back a record something is still standing on, and the watch then
+    /// resolves against a session that no longer exists. The `standing == false`
+    /// half is the control: with the watch already resolved, the same teardown
+    /// closes the page immediately, so the deferral below is the watch and not the
+    /// fixture.
+    #[test]
+    fn a_teardown_defers_a_watched_page_until_its_watch_resolves() {
+        for standing in [false, true] {
+            let dir_a = tempfile::tempdir().expect("temp dir A");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let (mut a, _b, _label) = established_initiator(&dir_a, &dir_b);
+            let conversation = conversation_of(&a, 0);
+            let first = a.on_tick(BASE_MS);
+            release_sweeps(&mut a, &swept_channels(&first), BASE_MS);
+            let watched = watched_channels(&first);
+            assert!(
+                watched.contains(&(conversation, 0)),
+                "the fixture needs a watch on page 0: {watched:?}"
+            );
+            if !standing {
+                for (conversation, page) in &watched {
+                    a.on_outcome(
+                        BASE_MS,
+                        watch_outcome(
+                            *conversation,
+                            *page,
+                            Ok(DhtResult::Watch(DmPageWatch::Lost)),
+                        ),
+                    );
+                }
+            }
+
+            // The teardown: a fresh knock from the same correspondent replaces the
+            // channel, which hands every page of the old one back.
+            let dir_b2 = tempfile::tempdir().expect("temp dir B2");
+            let mut b2 = machine_as(peer_identity(), &dir_b2);
+            b2.persist.provision_block_list().expect("provision B2");
+            let (_, entry) = knock_as_initiator(&mut b2, &keys());
+            let torn = a.on_doorbell(BASE_MS + 1, sweep_of(vec![(11, entry)]));
+
+            assert_eq!(
+                closed_pages(&torn).contains(&0),
+                !standing,
+                "standing={standing}: the teardown made the wrong call on page 0: \
+                 {:?}",
+                closed_pages(&torn)
+            );
+            if standing {
+                let resolved = a.on_outcome(
+                    BASE_MS + 2,
+                    watch_outcome(conversation, 0, Ok(DhtResult::Watch(DmPageWatch::Lost))),
+                );
+                assert!(
+                    closed_pages(&resolved).contains(&0),
+                    "the page must be handed back once its watch resolved, or a \
+                     torn-down conversation keeps a record for the session: {:?}",
+                    closed_pages(&resolved)
+                );
+            }
+        }
     }
 
     /// M22b. A page whose sweep is still in flight is not asked for again, and
@@ -13941,6 +14671,10 @@ mod tests {
                 !asked.is_empty(),
                 "page {page}'s plan asked for nothing, so nothing below is open"
             );
+            // The watches this plan armed resolve at once. A watch holds its page
+            // open, so a test that armed one and never resolved it would be
+            // measuring a window that nothing can ever fall out of.
+            release_watches(&mut a, &planned, now);
             run_page_ops(&dht, planned).await;
             assert!(
                 dht.open_page_count() <= width,
@@ -13995,6 +14729,7 @@ mod tests {
             "the settled conversation's plan must be the watched window and nothing \
              else: {planned:?}"
         );
+        release_watches(&mut a, &planned, now);
         run_page_ops(&dht, planned).await;
 
         // The positive control, and it has to be the pages the conversation
@@ -14089,6 +14824,9 @@ mod tests {
             vec![0, 1],
             "the watched pair must be planned, or the flight below is not arranged"
         );
+        // The watches resolve, so the only operation left in flight below is the
+        // sweep this test is about.
+        release_watches(&mut a, &planned, BASE_MS);
         let folded = fold_page_at(&mut a, BASE_MS, conversation, 0, frames(0));
         assert!(
             !messages_in(&folded).is_empty(),
@@ -14104,6 +14842,7 @@ mod tests {
             vec![0],
             "page zero must be back in flight, or the case under test is absent"
         );
+        release_watches(&mut a, &replanned, now);
 
         // Page one's fold settles the last position of page zero and lifts the
         // frontier, so page zero is now retirable in every respect but one.
@@ -14174,8 +14913,10 @@ mod tests {
             "the acceptance must have been published, or no sending page is open"
         );
 
-        // Both in-flight operations come back, so neither direction is skipped for
-        // being busy — the case under test is the teardown, not the guard.
+        // Every in-flight operation comes back, watches included, so no direction is
+        // skipped for being busy — the case under test is the teardown, not the
+        // guard.
+        release_watches(&mut b, &ticked, BASE_MS);
         b.on_outcome(
             BASE_MS,
             page_outcome(conversation, 0, Ok(empty_page(conversation))),
@@ -14651,6 +15392,10 @@ mod tests {
             vec![0, 1],
             "the watched pair must be in flight, or there is no busy page to strand"
         );
+        // The watches resolve, so the sweep is the only thing holding a page at the
+        // teardown below — a standing watch holds one too, and its own oracle is
+        // `a_teardown_defers_a_watched_page_until_its_watch_resolves`.
+        release_watches(&mut b, &ticked, BASE_MS);
         // Page one's sweep comes back; page zero's is left running. So exactly one
         // receiving page is busy at the moment of the teardown.
         b.on_outcome(

@@ -10,7 +10,9 @@ use std::pin::Pin;
 use daemonseed_core::dm::ack_record::DmAckAddress;
 use daemonseed_core::dm::paging::{DmPageAddress, Receiving, Sending};
 
-use crate::actor::{DmPageRecord, DmPageSweep, DoorbellDispatch, DoorbellSweep, VeilidNetHandle};
+use crate::actor::{
+    DmPageRecord, DmPageSweep, DmPageWatch, DoorbellDispatch, DoorbellSweep, VeilidNetHandle,
+};
 use crate::Result;
 
 /// The future one [`DmDht`] call returns: owns its inputs and is `'static`, so the
@@ -51,6 +53,22 @@ pub trait DmDht: Send + Sync + 'static {
 
     /// Sweep one receiving page; empty is the ordinary state of an unwritten page.
     fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> DmDhtFuture<DmPageSweep>;
+
+    /// Watch one receiving page, resolving once the watch has something to say
+    /// (#234).
+    ///
+    /// **The returned future outlives the arming and that is what it is for.** Every
+    /// other method here resolves when its operation finishes; this one resolves when
+    /// the *watched record* does something, so it is pending for as long as the watch
+    /// stands. The arming itself is bounded, and no read permit is held across the
+    /// wait — a watch that sat on one would spend a share of the read budget doing
+    /// nothing for the length of its lease.
+    ///
+    /// [`DmPageWatch::Changed`] says only that the page changed; the page is read by
+    /// [`Self::sweep_dm_page`], here as everywhere. [`DmPageWatch::Lost`] is an
+    /// ordinary answer rather than a failure, and so is an `Err`: neither costs
+    /// anything but the latency of the next scheduled sweep.
+    fn watch_dm_page(&self, address: DmPageAddress<Receiving>) -> DmDhtFuture<DmPageWatch>;
 
     /// Give one channel page's record back; `Ok(false)` is a page nobody opened,
     /// one already reclaimed, or one an operation is still holding.
@@ -98,6 +116,11 @@ impl DmDht for VeilidNetHandle {
     fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> DmDhtFuture<DmPageSweep> {
         let h = self.clone();
         Box::pin(async move { h.sweep_dm_page(address).await })
+    }
+
+    fn watch_dm_page(&self, address: DmPageAddress<Receiving>) -> DmDhtFuture<DmPageWatch> {
+        let h = self.clone();
+        Box::pin(async move { h.watch_dm_page(address).await })
     }
 
     fn close_dm_page(&self, address: DmPageRecord) -> DmDhtFuture<bool> {

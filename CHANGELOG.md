@@ -48,6 +48,15 @@ work lives in the maintainer's own planning notes, not here.
   An example,
   `project_announce_pubkeys`, derives the two public keys a seed bakes (seed on standard input,
   never printed).
+- `daemonseed-veilid-net`: `DmPageWatch` and `VeilidNetHandle::watch_dm_page` — a DHT watch on one
+  receiving channel page, resolving `Changed` on a value change and `Lost` on expiry, on an absent
+  record, or when the record is closed or evicted. The watch is cancelled once it resolves
+  `Changed` and once its lease expires. The DM driver holds a watch on the current and next
+  receiving page and sweeps that page on a change, at most six times per page per probe interval;
+  a change inside that floor, or one arriving while that page's sweep is in flight, is swept by the
+  next tick clear of it. Value changes on channel-page records are never surfaced as
+  `VeilidNetEvent::Inbound` or `VeilidNetEvent::ValueChanged`. The 30-second probe cadence is
+  unchanged and collects every page whether or not a watch is standing (#234).
 - `ISC-A-S27`: no byte in the source tree derives the project-announce signing key or the announce
   owner key.
 - `.github/workflows/ci.yml` — the Definition-of-Done gate on every pull request and on `main`,

@@ -25,11 +25,11 @@ use daemonseed_core::dm::paging::{
 };
 use daemonseed_core::dm::ratchet::Direction;
 
-use crate::actor::{DmPageRecord, DmPageSweep, DoorbellDispatch, DoorbellSweep};
+use crate::actor::{DmPageRecord, DmPageSweep, DmPageWatch, DoorbellDispatch, DoorbellSweep};
 use crate::dm::seam::{DmDht, DmDhtFuture};
 use crate::SweepOutcome;
 
-/// The eight seam methods, in trait order, as counter indices.
+/// The nine seam methods, in trait order, as counter indices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Method {
     FetchKeyRecord,
@@ -37,6 +37,7 @@ pub(crate) enum Method {
     SweepDoorbell,
     PublishPage,
     SweepPage,
+    WatchPage,
     PublishAck,
     FetchAck,
     ClosePage,
@@ -45,12 +46,13 @@ pub(crate) enum Method {
 impl Method {
     /// Every method, so an oracle can assert over the whole set rather than over
     /// the ones it remembered to name.
-    pub(crate) const ALL: [Method; 8] = [
+    pub(crate) const ALL: [Method; 9] = [
         Method::FetchKeyRecord,
         Method::PublishDoorbell,
         Method::SweepDoorbell,
         Method::PublishPage,
         Method::SweepPage,
+        Method::WatchPage,
         Method::PublishAck,
         Method::FetchAck,
         Method::ClosePage,
@@ -63,9 +65,10 @@ impl Method {
             Method::SweepDoorbell => 2,
             Method::PublishPage => 3,
             Method::SweepPage => 4,
-            Method::PublishAck => 5,
-            Method::FetchAck => 6,
-            Method::ClosePage => 7,
+            Method::WatchPage => 5,
+            Method::PublishAck => 6,
+            Method::FetchAck => 7,
+            Method::ClosePage => 8,
         }
     }
 }
@@ -96,6 +99,12 @@ pub(crate) enum MockCall {
     },
     /// A channel page sweep.
     SweepPage {
+        conversation: [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+        page: u64,
+        direction: Direction,
+    },
+    /// A watch armed on a channel page.
+    WatchPage {
         conversation: [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
         page: u64,
         direction: Direction,
@@ -156,6 +165,18 @@ pub(crate) struct MockNetwork {
     /// direction replaces the first, so a fetch always sees the latest
     /// statement.
     acks: Mutex<BTreeMap<AckKey, Vec<u8>>>,
+    /// The watches armed on each page record, by the key the record is held
+    /// under.
+    ///
+    /// **On the network rather than on one mock, which is what makes a watch
+    /// mean anything.** A watch fires because *the other party wrote the
+    /// record*, so the writer and the watcher are two different mocks and the
+    /// record they share is the only thing that connects them — exactly as
+    /// [`MockNetwork::pages`] is what makes one driver's write another's sweep.
+    ///
+    /// A `Vec` per record because nothing forbids two watches on one page; each
+    /// is answered once and then dropped, since a resolved watch is over.
+    watchers: Mutex<BTreeMap<OpenPageKey, Vec<tokio::sync::oneshot::Sender<DmPageWatch>>>>,
 }
 
 /// One record's populated subkeys: slot index to whatever was last written to
@@ -207,6 +228,54 @@ impl MockNetwork {
     /// record releases a handle on it and erases nothing, so an oracle for that
     /// property has to be able to read the record while nobody holds it — which
     /// no seam method can do, since every one of them opens.
+    /// Arm one watch on a page record, to be answered by the next write to it.
+    fn arm_watch(&self, key: OpenPageKey) -> tokio::sync::oneshot::Receiver<DmPageWatch> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.watchers
+            .lock()
+            .expect("mock watchers")
+            .entry(key)
+            .or_default()
+            .push(tx);
+        rx
+    }
+
+    /// Answer every watch armed on one page record, and answer none twice.
+    ///
+    /// **Called by the write path, because that is what a value change is.** A
+    /// watch fires when the record changes, and the only thing that changes a
+    /// record here is a publish to it — so a driver that never writes fires
+    /// nothing, which is the property an oracle for the sweep backstop needs.
+    ///
+    /// A watch nobody is waiting on any more is dropped with everything else:
+    /// the send fails, the entry goes, and there is nothing to report.
+    fn fire_watches(&self, key: OpenPageKey) {
+        let waiters = self
+            .watchers
+            .lock()
+            .expect("mock watchers")
+            .remove(&key)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(DmPageWatch::Changed);
+        }
+    }
+
+    /// Deliver a value change to every watch armed on one page, as a write to it
+    /// would.
+    ///
+    /// The write path fires watches on its own, so this is for the case that has
+    /// no writer to drive it: one driver, a record placed into the network
+    /// directly, or a change on a page this side is only reading.
+    pub(crate) fn deliver_page_change(
+        &self,
+        conversation: [u8; daemonseed_core::dm::firstcontact::AR_FINGERPRINT_LEN],
+        direction: Direction,
+        page: u64,
+    ) {
+        self.fire_watches(open_page_key(conversation, direction, page));
+    }
+
     pub(crate) fn slot_bytes(&self, address: &DmPageRecord, slot: u16) -> Option<Vec<u8>> {
         address.with_owner_seed(|seed| {
             self.pages
@@ -220,7 +289,7 @@ impl MockNetwork {
 
 /// A counting [`DmDht`] with an injected latency.
 pub(crate) struct MockDht {
-    counts: [AtomicU64; 8],
+    counts: [AtomicU64; 9],
     log: Mutex<Vec<MockCall>>,
     /// Doorbell sweeps to hand back, oldest first. An exhausted queue yields the
     /// empty sweep, which is the ordinary state of a doorbell nobody knocked on
@@ -293,6 +362,19 @@ pub(crate) struct MockDht {
     /// Keyed per direction as well as per page, because the two directions of one
     /// page number are two owner seeds and therefore two records.
     open_pages: Mutex<std::collections::BTreeSet<OpenPageKey>>,
+    /// Whether every watch this mock arms is answered `Lost` instead of standing.
+    ///
+    /// **The two cases an oracle needs, and they are the same case.** A transport
+    /// that cannot watch and a watch that expires before anything changed are
+    /// indistinguishable to the caller — both are a `Lost` with nothing collected
+    /// — so one switch covers the expiry run and the no-watch control run alike.
+    /// Settable after construction, for the reason `slow` is: a conversation is
+    /// established over a working seam and the case under test comes afterwards.
+    ///
+    /// Distinct from `fail_on`, which yields an `Err`: `Lost` is the ordinary
+    /// answer of a watch that is simply not there, and a driver must treat the
+    /// two the same way while the mock can still tell them apart.
+    watches_lost: std::sync::atomic::AtomicBool,
 }
 
 /// What [`MockDht::open_pages`] is keyed on: conversation, direction, page.
@@ -344,7 +426,14 @@ impl MockDht {
             published_pages: Mutex::new(Vec::new()),
             net,
             open_pages: Mutex::new(std::collections::BTreeSet::new()),
+            watches_lost: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Make every watch this mock arms answer `Lost` rather than stand, or stop
+    /// doing so. See [`MockDht::watches_lost`].
+    pub(crate) fn set_watches_lost(&self, lost: bool) {
+        self.watches_lost.store(lost, Ordering::SeqCst);
     }
 
     /// A mock whose `method` returns a transport error.
@@ -675,6 +764,15 @@ impl DmDht for MockDht {
                     .or_default()
                     .insert(at.slot(), frame.clone());
             });
+            // The record changed, so every watch on it fires. Under the write that
+            // changed it and not on a schedule of its own, because that is the only
+            // thing a value change ever means — and it is what lets one driver's
+            // publish reach another's watch without either knowing the other exists.
+            self.net.fire_watches(open_page_key(
+                *address.conversation(),
+                address.direction(),
+                at.page(),
+            ));
         }
         Box::pin(async move {
             tokio::time::sleep(latency).await;
@@ -773,6 +871,47 @@ impl DmDht for MockDht {
         })
     }
 
+    fn watch_dm_page(&self, address: DmPageAddress<Receiving>) -> DmDhtFuture<DmPageWatch> {
+        let conversation = *address.conversation();
+        let page = address.page();
+        let direction = address.direction();
+        self.record(
+            Method::WatchPage,
+            MockCall::WatchPage {
+                conversation,
+                page,
+                direction,
+            },
+        );
+        // Held for the reason the sweep holds one: production opens the record
+        // before it can arm anything on it.
+        self.hold_page(conversation, direction, page);
+        let latency = self.latency_for(Method::WatchPage);
+        let boom = self.panics(Method::WatchPage);
+        let dud = self.fails(Method::WatchPage);
+        let lost = self.watches_lost.load(Ordering::SeqCst);
+        // Armed at call time, like the counters: a write landing between this call
+        // and the first poll of the returned future is a change this watch must
+        // see, and an arming that waited for the poll would miss it.
+        let armed = (!lost && !dud && !boom).then(|| {
+            self.net
+                .arm_watch(open_page_key(conversation, direction, page))
+        });
+        Box::pin(async move {
+            tokio::time::sleep(latency).await;
+            assert!(!boom, "scripted seam panic");
+            if dud {
+                return Err(crate::VeilidNetError::Actor("scripted seam failure".into()));
+            }
+            let Some(armed) = armed else {
+                return Ok(DmPageWatch::Lost);
+            };
+            // A dropped sender is a watch nothing will ever answer, which is what
+            // the transport reports when the record is closed under it.
+            Ok(armed.await.unwrap_or(DmPageWatch::Lost))
+        })
+    }
+
     fn close_dm_page(&self, address: DmPageRecord) -> DmDhtFuture<bool> {
         let conversation = *address.conversation();
         let page = address.page();
@@ -787,6 +926,14 @@ impl DmDht for MockDht {
         // back exactly what it held, which is the accepted cost the driver's close
         // signal is written against.
         let closed = self.release_page(conversation, direction, page);
+        // The watch goes with the handle, as it does in production: a closed record
+        // delivers nothing, so every watch on it is dropped and resolves `Lost`
+        // rather than standing on a record this end no longer holds.
+        self.net
+            .watchers
+            .lock()
+            .expect("mock watchers")
+            .remove(&open_page_key(conversation, direction, page));
         self.record(
             Method::ClosePage,
             MockCall::ClosePage {
