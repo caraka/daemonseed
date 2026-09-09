@@ -51,7 +51,10 @@
 //! [`BlockList::decode`] are its at-rest form and
 //! [`crate::storage::dm_store::RecordKind::BlockList`] is its slot: **one
 //! fixed-size sealed file at the store root, created at every open**, holding
-//! up to [`BLOCK_LIST_MAX_ENTRIES`] identities.
+//! up to [`BLOCK_LIST_MAX_ENTRIES`] identities. That store holds five fixed
+//! records per correspondence — resume state, provisional handshake state, the
+//! outbox, the receive cursor and the contact cache — plus this list; never a
+//! message archive.
 //!
 //! Three properties of that placement are the whole of why it is not simply a
 //! serialized set. The record is **profile-level**, because a block names an

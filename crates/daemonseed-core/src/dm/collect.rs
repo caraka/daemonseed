@@ -82,7 +82,10 @@
 //! list, and no notion of a conversation identity — a [`Collection`] is about one
 //! direction of one conversation and knows nothing that would name it.
 //!
-//! **The store is no longer an open question, only an unconnected one.**
+//! **The store is no longer an open question, only an unconnected one.** That
+//! store holds five fixed records per correspondence — resume state, provisional
+//! handshake state, the outbox, the receive cursor and the contact cache — plus
+//! the profile's block list; never a message archive.
 //! [`crate::storage::dm_store`] exists, and a collection's cursor has a record
 //! kind waiting for it — [`RecordKind::ReceiveCursor`](crate::storage::dm_store::RecordKind::ReceiveCursor),
 //! written through [`DmPersist::advance_cursor`](crate::dm::persist::DmPersist::advance_cursor).

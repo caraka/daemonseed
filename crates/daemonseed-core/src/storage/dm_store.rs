@@ -746,7 +746,10 @@ impl core::fmt::Debug for CorrespondenceLabel {
     }
 }
 
-/// Derive the store's at-rest seal key from the profile's at-rest key material.
+/// Derive the store's at-rest seal key from the profile's at-rest key material —
+/// the store being five fixed records per correspondence (resume state,
+/// provisional handshake state, the outbox, the receive cursor and the contact
+/// cache) plus the profile's block list, never a message archive.
 ///
 /// [`crate::dm::provisional::derive_seal_key`]'s construction under this module's
 /// own label pair. Its own label rather than the provisional record's: that key
@@ -870,6 +873,10 @@ fn pad_with_filler(kind: RecordKind, payload: &[u8]) -> Result<Vec<u8>, DmStoreE
 /// The root of a profile's DM records: one directory per correspondence with one
 /// fixed-size file per correspondence record kind inside it, plus one
 /// fixed-size file at the root per profile record kind.
+///
+/// The store holds five fixed records per correspondence — resume state,
+/// provisional handshake state, the outbox, the receive cursor and the contact
+/// cache — plus the profile's block list; never a message archive.
 ///
 /// Holds the derived seal key, so no call site ever passes one and no call site
 /// can pass the wrong one.

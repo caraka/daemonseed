@@ -800,6 +800,8 @@ work lives in the maintainer's own planning notes, not here.
   selected defined share and the serving count, which were previously appended to the legend after
   `[Esc] back`. The trust-history, deprecation and shares legends are shortened so each fits an
   80-column terminal with `[Esc] back` whole (#236).
+- `daemonseed-core`: rustdoc that introduces the DM record store names what it holds — five fixed
+  records per correspondence plus the profile's block list, never a message archive. (#384)
 - A resumed channel's clear ratchet generation is agreed inside the settling legs rather than derived
   on each side: the `RE-ACK` carries the answering party's floor, the initiating party computes
   `reest::agreed_generation` from both floors, and the `RE-CONFIRM` carries the result. Each side

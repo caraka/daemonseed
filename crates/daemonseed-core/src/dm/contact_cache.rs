@@ -82,7 +82,10 @@
 //! ## The record is encoded here and sealed by the store
 //!
 //! [`ContactRecord::encode`] produces a fixed-length plaintext and nothing more;
-//! [`crate::storage::dm_store`] is what seals it. **That is the whole difference
+//! [`crate::storage::dm_store`] is what seals it — a store of five fixed records
+//! per correspondence (resume state, provisional handshake state, the outbox,
+//! the receive cursor and the contact cache) plus the profile's block list,
+//! never a message archive. **That is the whole difference
 //! from [`crate::dm::provisional`], and it follows from where each record can
 //! travel.** `ProvisionalRecord::seal` returns sealed bytes because a
 //! provisional record has a life outside the store. A contact record has none —

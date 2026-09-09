@@ -247,7 +247,9 @@
 //! [`crate::dm::persist`] is the writer (#281). It reads and replaces
 //! [`RecordKind::Outbox`](crate::storage::dm_store::RecordKind::Outbox) through
 //! [`crate::storage::dm_store`], which seals what it is handed and pads it out to
-//! a fixed bucket.
+//! a fixed bucket — a store of five fixed records per correspondence (resume
+//! state, provisional handshake state, the outbox, the receive cursor and the
+//! contact cache) plus the profile's block list, never a message archive.
 //!
 //! **The read-modify-write is the persistence layer's shape, not this module's.**
 //! A sweep, an acknowledgement merge or an enqueue reads the record, decides from

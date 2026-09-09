@@ -188,6 +188,9 @@ dm_labels! {
     /// HKDF-Extract salt for the DM record store's at-rest seal key, rooted in the
     /// profile's at-rest key material — the same root [`DM_PROVISIONAL_SALT`] uses,
     /// under its own salt so the two extractions over that one input cannot collide.
+    /// That store holds five fixed records per correspondence — resume state,
+    /// provisional handshake state, the outbox, the receive cursor and the contact
+    /// cache — plus the profile's block list; never a message archive.
     /// FROZEN.
     DM_STORE_SALT = b"daemonseed/dm/store/salt/v1";
 
