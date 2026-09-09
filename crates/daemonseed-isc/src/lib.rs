@@ -46,7 +46,8 @@
 //!   partials) + A-C37 manifest-frame-budget publish refusal; M13 added C59-C62 circle
 //!   persistence + A-C29/A-C30; M15 C added C63-C65 fetched-content browse/extract + A-C31/A-C32.
 //!   Earlier: alpha2 share_id / share download / public rooms / client-lifecycle / portable.
-//!   alpha3: C77/C78 unified-share + unread; C79/C80 connection resilience; C81 single-instance;
+//!   alpha3: C77/C78 unified-share + unread; C79 connection drop-detection (C80 withdrawn,
+//!   ID reserved); C81 single-instance;
 //!   C82 rename; C83-C86 + A-C38/A-C39 presence heartbeat; C87 + A-C40 graceful-EOS re-subscribe;
 //!   A-C41 presence replay-freshness; C88 + A-C42 GUI Lobby roster;
 //!   C89/C90 client signer authoring + self-determination;
@@ -62,7 +63,7 @@
 //!   C40 DM static key record (publish + verify + rollback guard), #232;
 //!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159;
 //!   WB-ISC-3/4/5/6/7 pos + WB-ISC-1/2/8 neg — the WB-1 presence model, #159.)
-//! - 245 total = 40 server + 128 client + 77 build-family
+//! - 244 total = 40 server + 127 client + 77 build-family
 //!   (WB-ISC 26, CRSH-ISC 29, DL-ISC 22). The per-family tallies above are the
 //!   authoritative breakdown; [`TOTAL`] is the compile-time-asserted sum.
 //!
@@ -230,9 +231,8 @@ pub const ISCS: &[(&str, IscClass)] = &[
     // ── client positive (alpha3 unified-share-model: key-class safety) ──
     ("ISC-C77", IscClass::Positive),
     ("ISC-C78", IscClass::Positive),
-    // ── client positive (alpha3 GUI connection resilience: drop detection + auto-reconnect) ──
+    // ── client positive (alpha3 GUI connection resilience: drop detection) ──
     ("ISC-C79", IscClass::Positive),
-    ("ISC-C80", IscClass::Positive),
     // ── client positive (single-instance profile-root guard) ──
     ("ISC-C81", IscClass::Positive),
     // ── client positive (rename identity: re-seal display name) ──
@@ -440,7 +440,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 245;
+pub const TOTAL: usize = 244;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -580,9 +580,9 @@ mod tests {
                 IscClass::Negative => neg += 1,
             }
         }
-        // ISA `## Criteria` (built, non-deferred): 56 server + 113 client = 169.
+        // ISA `## Criteria` (built, non-deferred): 56 server + 112 client = 168.
         //   server  31 pos + 25 neg = 56  (presence heartbeat #74: A-S23 neg)
-        //   client  79 pos + 34 neg = 113 (M13 C59-C62 + A-C29/A-C30;
+        //   client  78 pos + 34 neg = 112 (M13 C59-C62 + A-C29/A-C30;
         //                                  M15 C  C63-C65 + A-C31/A-C32;
         //                                  M16 A1 C66 + A-C33; A2 C67; A3 C68;
         //                                  A4 C72; C1 C69; C2 C70; C3 C71;
@@ -592,8 +592,9 @@ mod tests {
         //                                  + A-C37 manifest-frame-budget;
         //                                  unified share model C77 pos;
         //                                  client-side unread dot C78 pos, #64;
-        //                                  connection resilience C79 drop-detection #72,
-        //                                  C80 auto-reconnect #71;
+        //                                  connection resilience C79 drop-detection #72
+        //                                  (C80 auto-reconnect withdrawn, its
+        //                                  ID reserved and unregistered);
         //                                  single-instance lock C81 pos, #60;
         //                                  rename-identity re-seal C82 pos, #66;
         //                                  presence heartbeat C83-C85 pos + A-C38/A-C39 neg, #74;
@@ -677,14 +678,14 @@ mod tests {
         //                                  verify, highest-version-wins rollback
         //                                  guard) — the rest of the DM family
         //                                  registers per build slice.
-        //   total   160 pos + 85 neg = 245
+        //   total   159 pos + 85 neg = 244
         //   (A-S27 neg: the project-announce seed is not in the source tree.)
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs, and C26
         //    followed it on 2026-09-07. A-C43 was
         //    added with the TLS-stack removal: daemonseed's own envelopes never
         //    fall below CNSA 2.0 even though the transport under them is not.)
-        assert_eq!(pos, 160, "positive count drift");
+        assert_eq!(pos, 159, "positive count drift");
         assert_eq!(neg, 85, "negative count drift");
     }
 

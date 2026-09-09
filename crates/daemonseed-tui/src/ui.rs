@@ -533,8 +533,10 @@ fn render_blocking_modal(item: &TrustItem, frame: &mut Frame, area: Rect) {
 /// A short toast string for a Transient trust key (ISC-24).
 fn trust_toast_text(key: TrustEventKey) -> String {
     match key {
-        TrustEventKey::ConnectionRateLimited => "server busy — backing off".to_owned(),
         TrustEventKey::UpdateRelayFallbackUsed => "update via fallback relay".to_owned(),
+        // `UpdateRelayFallbackUsed` is the only Transient key, so this arm is
+        // unreachable for callers that route by class. It stays as the fallback
+        // for the next Transient key added.
         other => event_key_string(other).to_owned(),
     }
 }

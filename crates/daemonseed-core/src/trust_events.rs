@@ -13,11 +13,17 @@
 //! ## Stability contract (ISC-C28)
 //!
 //! [`TrustEventKey`] is a **closed wire-stability surface**. Variants may be
-//! *added* but never *renamed or removed*: third-party clients (ISC-C10) and
+//! *added*, are never *renamed*, and are *removed* only when no producer
+//! remains: third-party clients (ISC-C10) and
 //! the on-disk audit log persist the stable string form, so a rename silently
 //! corrupts history. Each key has **exactly one** class — state transitions are
-//! modelled as two distinct keys (e.g. `connection-rate-limited` →
-//! `connection-rate-limited-exhausted`), never as a class change on one key.
+//! modelled as two distinct keys (e.g. `dm-reestablishment-failed` →
+//! `dm-reestablishment-backoff-engaged`), never as a class change on one key.
+//!
+//! A key whose producer no longer exists is removed rather than kept as a
+//! variant nothing can construct. Removal costs what a rename costs: an older
+//! log naming the removed string parses to `None` and its entry lands in
+//! [`TrustEventLog::unreadable_entries`], counted rather than dropped silently.
 //!
 //! ## A-C12 invariants, structurally enforced
 //!
@@ -90,10 +96,6 @@ pub enum TrustEventKey {
     CircleCrossFamilyDeprecated,
     /// No common protocol version at APP_HELLO (ISC-C23).
     NoCommonVersion,
-    /// A connection was refused as rate-limited.
-    ConnectionRateLimited,
-    /// The retry budget for a rate-limited peer is exhausted.
-    ConnectionRateLimitedExhausted,
     /// A release-channel update artifact failed signature verification (ISC-A-C11).
     UpdateVerificationFailed,
     /// An emergency security update is available (ISC-C27).
@@ -208,8 +210,6 @@ pub const ALL_EVENT_KEYS: &[TrustEventKey] = &[
     TrustEventKey::CircleContentBelowMinSuite,
     TrustEventKey::CircleCrossFamilyDeprecated,
     TrustEventKey::NoCommonVersion,
-    TrustEventKey::ConnectionRateLimited,
-    TrustEventKey::ConnectionRateLimitedExhausted,
     TrustEventKey::UpdateVerificationFailed,
     TrustEventKey::EmergencySecurityUpdateAvailable,
     TrustEventKey::UnsupportedIdentityProofSuite,
@@ -244,8 +244,6 @@ pub const fn class_of(key: TrustEventKey) -> TrustEventClass {
         CircleContentBelowMinSuite => Blocking,
         CircleCrossFamilyDeprecated => PersistentNonBlocking,
         NoCommonVersion => Blocking,
-        ConnectionRateLimited => Transient,
-        ConnectionRateLimitedExhausted => PersistentNonBlocking,
         UpdateVerificationFailed => Blocking,
         EmergencySecurityUpdateAvailable => Blocking,
         UnsupportedIdentityProofSuite => Blocking,
@@ -310,8 +308,6 @@ pub const fn event_key_string(key: TrustEventKey) -> &'static str {
         CircleContentBelowMinSuite => "circle-content-below-min-suite",
         CircleCrossFamilyDeprecated => "circle-cross-family-deprecated",
         NoCommonVersion => "no-common-version",
-        ConnectionRateLimited => "connection-rate-limited",
-        ConnectionRateLimitedExhausted => "connection-rate-limited-exhausted",
         UpdateVerificationFailed => "update-verification-failed",
         EmergencySecurityUpdateAvailable => "emergency-security-update-available",
         UnsupportedIdentityProofSuite => "unsupported-identity-proof-suite",
@@ -1130,9 +1126,7 @@ mod tests {
                 SuiteDeprecationCutoffHit => CircleContentBelowMinSuite,
                 CircleContentBelowMinSuite => CircleCrossFamilyDeprecated,
                 CircleCrossFamilyDeprecated => NoCommonVersion,
-                NoCommonVersion => ConnectionRateLimited,
-                ConnectionRateLimited => ConnectionRateLimitedExhausted,
-                ConnectionRateLimitedExhausted => UpdateVerificationFailed,
+                NoCommonVersion => UpdateVerificationFailed,
                 UpdateVerificationFailed => EmergencySecurityUpdateAvailable,
                 EmergencySecurityUpdateAvailable => UnsupportedIdentityProofSuite,
                 UnsupportedIdentityProofSuite => ServerDeprecationPolicyUnreadable,
@@ -1184,11 +1178,6 @@ mod tests {
         assert_eq!(class_of(CircleContentBelowMinSuite), Blocking);
         assert_eq!(class_of(CircleCrossFamilyDeprecated), PersistentNonBlocking);
         assert_eq!(class_of(NoCommonVersion), Blocking);
-        assert_eq!(class_of(ConnectionRateLimited), Transient);
-        assert_eq!(
-            class_of(ConnectionRateLimitedExhausted),
-            PersistentNonBlocking
-        );
         assert_eq!(class_of(UpdateVerificationFailed), Blocking);
         assert_eq!(class_of(EmergencySecurityUpdateAvailable), Blocking);
         assert_eq!(class_of(UnsupportedIdentityProofSuite), Blocking);
@@ -1224,6 +1213,47 @@ mod tests {
             class_of(DmReestablishmentBackoffEngaged),
             PersistentNonBlocking
         );
+
+        // The hand list above cannot silently shrink: every key it named is
+        // collected and compared against the taxonomy. Dropping an assertion —
+        // or removing a variant without removing its assertion — fails here
+        // instead of leaving a shorter list that still passes.
+        let asserted: std::collections::BTreeSet<&'static str> = [
+            ServerKeyRotated,
+            ServerKeyMismatch,
+            SuiteDeprecationPending,
+            SuiteDeprecationCutoffHit,
+            CircleContentBelowMinSuite,
+            CircleCrossFamilyDeprecated,
+            NoCommonVersion,
+            UpdateVerificationFailed,
+            EmergencySecurityUpdateAvailable,
+            UnsupportedIdentityProofSuite,
+            ServerDeprecationPolicyUnreadable,
+            ServerDeprecationPolicyRollback,
+            UpdateRelayFallbackUsed,
+            ServerDeprecationPolicyExpiredOffline,
+            FederationPeerKeyDivergence,
+            ServerSourceUnverified,
+            DmChannelTornDownOnRestart,
+            DmProvisionalHandshakeLost,
+            DmProvisionalRecordUnreadable,
+            DmRecordErasureBlocked,
+            DmCorrespondentStateLost,
+            DmPeerStateRegressed,
+            DmReestablishmentFailed,
+            DmReestablishmentUnconfirmed,
+            DmReestablishmentBackoffEngaged,
+        ]
+        .into_iter()
+        .map(event_key_string)
+        .collect();
+        let all: std::collections::BTreeSet<&'static str> = ALL_EVENT_KEYS
+            .iter()
+            .copied()
+            .map(event_key_string)
+            .collect();
+        assert_eq!(asserted, all, "every key needs a class assertion here");
     }
 
     /// A teardown must reach the audit log, which is what makes it loud rather
@@ -1269,7 +1299,7 @@ mod tests {
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         log.append(TrustEvent::observed(
             1,
-            TrustEventKey::ConnectionRateLimited,
+            TrustEventKey::UpdateRelayFallbackUsed,
             None,
             None,
         ));
@@ -1640,6 +1670,64 @@ mod tests {
             log.unreadable_entries(),
             2,
             "the count is a total, not a boolean"
+        );
+    }
+
+    /// **The two retired keys left the vocabulary, and a log still naming one is
+    /// counted rather than silently shortened.**
+    ///
+    /// Neither `connection-rate-limited` nor `connection-rate-limited-exhausted`
+    /// has a producer. Only the second can appear in a log written before the
+    /// removal: the first was `Transient`, which `append` drops, so no log ever
+    /// held it — which is why the decode half below uses the exhausted string.
+    #[test]
+    fn retired_key_strings_do_not_parse() {
+        for retired in [
+            "connection-rate-limited",
+            "connection-rate-limited-exhausted",
+        ] {
+            assert_eq!(event_key_from_str(retired), None, "{retired} is retired");
+        }
+        // Control: a live key still parses, so the assertions above are about
+        // these two strings and not about a lookup that answers `None` to
+        // everything.
+        assert_eq!(
+            event_key_from_str("no-common-version"),
+            Some(TrustEventKey::NoCommonVersion)
+        );
+
+        // A body a pre-removal build wrote: splice the retired string, with its
+        // own u16 length prefix, over a live key's encoded string.
+        let entries = vec![
+            TrustEvent::observed(1, TrustEventKey::ServerKeyRotated, None, None),
+            TrustEvent::observed(2, TrustEventKey::ServerSourceUnverified, None, None),
+        ];
+        let mut body = encode_log(&log_of(entries));
+        assert_eq!(
+            decode_log(&body, BodyVersion::V2)
+                .expect("control: decodes")
+                .unreadable_entries(),
+            0,
+            "control: nothing is unreadable before the splice"
+        );
+
+        let needle = event_key_string(TrustEventKey::ServerSourceUnverified).as_bytes();
+        let at = body
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("the live key's string is in the body");
+        let retired = b"connection-rate-limited-exhausted";
+        let mut spliced = Vec::new();
+        spliced.extend_from_slice(&(retired.len() as u16).to_le_bytes());
+        spliced.extend_from_slice(retired);
+        body.splice(at - 2..at + needle.len(), spliced);
+
+        let log = decode_log(&body, BodyVersion::V2).expect("still decodes");
+        assert_eq!(log.len(), 1, "the live entry survives");
+        assert_eq!(
+            log.unreadable_entries(),
+            1,
+            "the entry naming the retired key is counted, not dropped silently"
         );
     }
 
@@ -2158,7 +2246,7 @@ mod tests {
 
     /// **Every key but the erasure one encodes no record kind.**
     ///
-    /// `observed` is the only constructor the other twenty-two keys use and it
+    /// `observed` is the only constructor every other key uses and it
     /// cannot set one, so this is a guard against a future careless `Some`
     /// reaching the log — and against the field being populated by default,
     /// which the round-trip tests above would not notice.
@@ -2176,9 +2264,12 @@ mod tests {
             ));
             logged += log.len() - before;
         }
-        assert!(
-            logged >= ALL_EVENT_KEYS.len() - 4,
-            "the fixture must actually log most keys, or this is near-vacuous: {logged}"
+        // Exact, not a floor: of the 25 keys, `append` skips the one Transient
+        // key (`UpdateRelayFallbackUsed`), so 24 reach the log. A floor here
+        // would pass on a fixture that had quietly stopped logging most of them.
+        assert_eq!(
+            logged, 24,
+            "the fixture must log every non-Transient key: {logged}"
         );
         assert_eq!(log.len(), logged, "cap must not have pruned the fixture");
         assert!(

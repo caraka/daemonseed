@@ -5397,7 +5397,7 @@ mod tests {
     fn transient_trust_event_toasts_then_clears_and_is_not_logged() {
         let mut app = drive_to_main();
         app.on_net_event(NetEvent::TrustEvent {
-            key: TrustEventKey::ConnectionRateLimited,
+            key: TrustEventKey::UpdateRelayFallbackUsed,
             server_id: Some("relay#aabbccddeeff".to_owned()),
         });
         assert!(app.transient_trust().is_some(), "toast surfaced (ISC-24)");
@@ -5580,11 +5580,11 @@ mod tests {
     fn transient_trust_renders_toast() {
         let mut app = drive_to_main();
         app.on_net_event(NetEvent::TrustEvent {
-            key: TrustEventKey::ConnectionRateLimited,
+            key: TrustEventKey::UpdateRelayFallbackUsed,
             server_id: Some("relay#aabbccddeeff".to_owned()),
         });
         let text = render_text(&app, 80, 24);
-        assert!(text.contains("backing off"), "toast rendered");
+        assert!(text.contains("fallback relay"), "toast rendered");
     }
 
     /// ISC-25: a LogOnly event renders in the scrollable Trust History view.

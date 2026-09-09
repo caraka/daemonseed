@@ -731,6 +731,13 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Removed
 
+- `daemonseed-core`: `TrustEventKey::ConnectionRateLimited` and
+  `TrustEventKey::ConnectionRateLimitedExhausted`, their `class_of` and stable-string entries, and
+  the `daemonseed-tui` toast that rendered the first as "server busy — backing off". Neither key has
+  had a producer since the reconnect backoff was removed. Neither stable string parses any more. Only
+  `connection-rate-limited-exhausted` can appear in an audit log written before the removal, and such
+  an entry now counts in `TrustEventLog::unreadable_entries`; `connection-rate-limited` was
+  `Transient`, which `append` drops, so no log ever held it.
 - `cargo xtask findings-resolved`. It asserted marker strings in a document kept outside this
   repository, so it could not run from a clean checkout.
 - `daemonseed-core`: `PROJECT_RELEASE_SEED`, `dev_project_release_keypair`,
@@ -776,6 +783,9 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- ISC-C80 is withdrawn and deregistered. It described a reconnect on a capped exponential backoff
+  timer, and the `Backoff` type that was the timer is deleted. `ISA.md` keeps the ID as a reserved
+  tombstone and `daemonseed_isc::TOTAL` falls from 245 to 244.
 - A resumed channel's clear ratchet generation is agreed inside the settling legs rather than derived
   on each side: the `RE-ACK` carries the answering party's floor, the initiating party computes
   `reest::agreed_generation` from both floors, and the `RE-CONFIRM` carries the result. Each side

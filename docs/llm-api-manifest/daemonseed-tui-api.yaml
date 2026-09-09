@@ -57,8 +57,12 @@ modules:
       a Blocking modal that captures input until acknowledged (ISC-22), a set of
       PersistentNonBlocking status badges (ISC-23), a Transient toast that
       auto-dismisses on the next key (ISC-24), and a TrustEventLog surfaced in a
-      scrollable Trust History view (ISC-25, LogOnly); it tracks the last
-      observed close-cause layer (ISC-28). The Servers pane
+      scrollable Trust History view (ISC-25, LogOnly). A close cause is not a
+      trust event: `ConnectionClosed` stores the last `CloseCause` and the
+      status bar renders it as a glyph, a message, and a colour, one per close
+      layer. Nothing in the workspace emits `ConnectionClosed`, so the field is
+      set only by tests and the status bar carries no close cause at runtime.
+      The Servers pane
       surfaces introducer-discovered candidates under a read-only "Discovered
       (introducer)" sub-section — RAM-only, never auto-trusted (ISC-S6 / ISC-C22 /
       ISC-A-C19). Tab cycles focus across all Main-view panes (see MainFocus).
@@ -176,8 +180,13 @@ modules:
       ChatMessage ({ circle_id: u64, sender, body, sent_unix_ms } — attributed to
       the single circle whose key opened the frame, ISC-A-C30), ChatError,
       TrustEvent (a C28 trust-event key + scope, routed
-      by the UI per its affordance class), ConnectionClosed (a C26 close-cause
-      layer), SharesSnapshot ({ local: Vec<LocalShareRow>, remote:
+      by the UI per its affordance class), ConnectionClosed ({ cause:
+      CloseCause } — the layer at which the connection closed; it sets
+      `close_cause` and renders in the status bar, not as a trust event. No
+      code in the workspace emits this variant: it has a declaration, a
+      consumer arm, and tests, and tests are the only thing that sets the
+      field),
+      SharesSnapshot ({ local: Vec<LocalShareRow>, remote:
       Vec<ShareListing>, indexer_status: IndexerStatus } — ISC-17/20),
       SharesError (RPC or storage failure surfaced on the status line),
       IndexerStatus(IndexerStatus) (M14 — a standalone indexer transition,
@@ -290,7 +299,7 @@ public_types:
       - "fn persistent_trust(&self) -> &[TrustItem]      # PersistentNonBlocking badges (ISC-23)"
       - "fn transient_trust(&self) -> Option<&TrustItem> # Transient toast (ISC-24)"
       - "fn trust_log(&self) -> &TrustEventLog           # Trust History audit log (ISC-25)"
-      - "fn close_cause(&self) -> Option<CloseCause>     # last close layer (ISC-28)"
+      - "fn close_cause(&self) -> Option<CloseCause>     # last ConnectionClosed cause; status-bar glyph + message; no producer, set only by tests"
       - "fn history_sel(&self) -> usize                  # Trust History selection (newest-first)"
       - "fn local_shares(&self) -> &[LocalShareRow]      # ISC-17 My-shares pane"
       - "fn visible_public_shares(&self) -> Vec<&ShareListing>  # ISC-17/18 post-filter"
