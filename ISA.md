@@ -1293,12 +1293,15 @@ that record — the acknowledgement cadence at its candidate scan, before the cl
 spent, and the teardown drops the pending set that would otherwise carry the oldest key for a week. A page an operation was holding at teardown is skipped there and handed back when that
 operation's outcome lands, which is the last signal a dead conversation produces. The
 transport's own capacity bound (`rendezvous::DM_PAGE_CACHE_CAPACITY`) remains the backstop for a page
-a close does not reach. **The receiving side has no give-up signal and the record-lock map is
+a close does not reach. **The receiving side's give-up is a measurement and the record-lock map is
 untouched, both deliberately.** The design's prefix-advance-on-give-up rule needs the receiver to
 learn that the sender abandoned a position, and no record carries that — an acknowledgement and a
-frame's piggyback both carry only the receiver's own `high_water` and runs — so a permanently lost
-inbound position pins its conversation's receiving pages until the capacity bound reclaims them, and
-`Collection::abandoned` still has no production caller. `rendezvous::RecordLocks` entries are never
+frame's piggyback both carry only the receiver's own `high_water` and runs — so what releases a
+permanently lost inbound position is the receiver's own horizon (`Collection::sweep_give_ups`, the
+entry below), and its conversation's receiving pages are released after that horizon rather than by
+the capacity bound. A page under a standing watch is skipped by the same in-flight rule as a page
+under a sweep, and handed back by the first settlement pass after that watch resolves.
+`rendezvous::RecordLocks` entries are never
 removed: an entry can only be dropped safely when no task holds a clone of its `Arc`, and a second
 lock created for a record another task is already serializing on would under-serialize it — the
 CRSH-ISC-3 invariant. This change reclaims the open cache and the page ring, which are the two
@@ -1313,8 +1316,10 @@ spanning four distinct pages ends holding the watched window and nothing more),
 `a_torn_down_conversation_plans_nothing_more`,
 `a_page_in_flight_at_teardown_is_handed_back_when_its_outcome_lands`,
 `a_peer_acknowledgement_hands_back_the_sending_page_it_finishes`,
-`a_page_with_a_publish_in_flight_is_not_closed_until_the_outcome_lands` and
-`a_page_is_closed_under_the_id_it_was_opened_with`. ISC-C42 stays open: this bounds the record count
+`a_page_with_a_publish_in_flight_is_not_closed_until_the_outcome_lands`,
+`a_page_is_closed_under_the_id_it_was_opened_with` and
+`a_change_on_a_passed_page_sweeps_once_and_does_not_re_arm` (a page the frontier has passed stops
+being watched by the re-arm declining, and the sweep that re-opened it hands it back). ISC-C42 stays open: this bounds the record count
 and settles nothing else in its text.
 
 **2026-09-08 — the receiver gives up on a position it never collected, on its own clock, and the
@@ -1337,8 +1342,11 @@ permanent losses refuse every later collection and report read messages as undel
 marker on the wire, a frame-shape change carrying a number the receiver can already derive. Pinned by
 `a_gap_past_the_horizon_is_given_up_on`, `a_clock_that_steps_forward_does_not_age_a_gap_by_the_step`,
 `a_gap_filled_from_below_does_not_restart_its_horizon`, `a_split_gap_keeps_its_age_in_both_halves`,
-`a_give_up_with_no_later_traffic_still_publishes_the_moved_cursor` and its mirror
-`a_probe_that_moves_no_cursor_writes_no_acknowledgement`.
+`a_give_up_with_no_later_traffic_still_publishes_the_moved_cursor`, its mirror
+`a_probe_that_moves_no_cursor_writes_no_acknowledgement`, and
+`a_watched_page_the_horizon_finished_closes_one_tick_after_the_watch_is_lost` (a page the horizon
+finishes under a standing watch is handed back by the first settlement pass after that watch
+resolves, and by the pass itself where no watch stands).
 
 **Anti-criteria are verified by negative fixtures**, each of which must be shown to fail before its
 guard lands: replay, clock skew, counter rollback, handle mismatch, forged provenance, a forged share

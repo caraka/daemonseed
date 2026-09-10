@@ -4520,14 +4520,34 @@ impl DmMachine {
     ///   Without that half a single permanently-undelivered message pins the prefix
     ///   and no sending page of the conversation closes again.
     ///
-    /// **The receiving side has no give-up, and that is the wire's doing rather than
-    /// an omission here.** The design's prefix-advance-on-give-up rule needs the
+    /// **The receiving side's give-up is a measurement rather than a signal**, and
+    /// the wire is why. The design's prefix-advance-on-give-up rule needs the
     /// receiver to learn that the sender abandoned a position, and no record carries
     /// that: an acknowledgement and a frame's piggyback both carry the receiver's own
-    /// `high_water` and runs and nothing travelling the other way. So a permanently
-    /// lost inbound position pins `recv_below` at its page, and the receiving pages
-    /// from there on stay open until the transport's capacity bound reclaims them.
-    /// See [`Collection::retired_below`].
+    /// `high_water` and runs and nothing travelling the other way. What replaces it
+    /// is [`Collection::sweep_give_ups`], which abandons a gap that has stayed
+    /// missing for at least `RECEIVE_GIVE_UP_MS` — the age is accumulated in capped
+    /// steps per call rather than read off the wall clock — so a permanently lost
+    /// inbound position pins `recv_below` at its page for that horizon rather than
+    /// for the life of the process. See [`Collection::retired_below`].
+    ///
+    /// **A page under a standing watch is not closed at the horizon that finished
+    /// it, and no later fold of that watch closes it either**: the filter below
+    /// skips a watched page, and [`Self::on_watch`] folds the `Lost` that ends the
+    /// watch to nothing. The close is issued by whichever settlement reaches here
+    /// first once the watch is gone — on a quiet correspondence the following
+    /// tick's [`Self::give_ups`], which runs whether or not anything settled, and
+    /// on a busy one the next sweep or acknowledgement outcome, since
+    /// [`Self::on_page`] and [`Self::on_peer_ack`] settle into
+    /// [`Self::retire_pages`] as well. **Where the watch resolves `Lost`, that
+    /// bounds the delay at its remaining lease plus one tick.** Where it resolves
+    /// `Changed` instead, the sweep that answers it re-opens the page — only the
+    /// re-arm is gated by [`Collection::watched`] — and the close waits on that
+    /// sweep under the in-flight rule below, as it does for a change deferred into
+    /// [`Self::change_pending`] and re-swept by the next probe. A torn-down
+    /// conversation is the exception, and
+    /// the one case where the watch's own outcome closes the page: see
+    /// [`Self::close_freed_after_teardown`].
     ///
     /// **A page whose operation is in flight is skipped, not closed.** Closing a
     /// record mid-sweep turns its remaining reads into `outcome.failed`, the signal
@@ -12032,6 +12052,94 @@ mod tests {
         }
     }
 
+    /// M34h. A value change on a page the frontier has already passed is swept
+    /// exactly once and its watch is not re-armed.
+    ///
+    /// **Nothing on this side cancels a watch, so the re-arm declining to fire is
+    /// the only thing that stops a page being watched.** A watch answers once and
+    /// [`DmMachine::sweep_watched_page`] arms the next one, bounded by
+    /// [`Collection::watched`] — so a page the conversation has moved beyond falls
+    /// out of the watched set by being passed over rather than by anything
+    /// withdrawing it. Without that bound every page ever watched would be watched
+    /// again on each change, and each standing watch holds its record open against
+    /// the capacity bound the close path exists to respect.
+    ///
+    /// **The sweep is issued either way, and that is deliberate**: a change is a
+    /// prompt to read, and a page below the frontier can still hold a position this
+    /// side has not settled.
+    ///
+    /// The page still inside the watched pair is the control: the same notification
+    /// there re-arms, so a machine that had simply stopped re-arming altogether
+    /// fails it.
+    #[test]
+    fn a_change_on_a_passed_page_sweeps_once_and_does_not_re_arm() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, _b, _label) = established_initiator(&dir_a, &dir_b);
+        let conversation = conversation_of(&a, 0);
+
+        // Move the frontier past page zero by settling every position on it and the
+        // first of the next. `abandoned` is the call the receive-side give-up makes
+        // on a gap it has waited out; what this fixture needs of it is only the
+        // settled state it leaves. The frontier follows the cursor's PAGE, so the
+        // position above the page is what lifts it off page zero.
+        for seq in 0..=u64::from(PAGE_SLOTS) {
+            a.correspondences[0]
+                .collection
+                .abandoned(seq)
+                .expect("the position settles");
+        }
+        let watched: Vec<u64> = a.correspondences[0].collection.watched().to_vec();
+        assert!(
+            !watched.contains(&0),
+            "the fixture must have moved the frontier past page zero: {watched:?}"
+        );
+        let inside = watched[0];
+
+        let passed = a.on_outcome(BASE_MS, watch_outcome(conversation, 0, changed()));
+        assert_eq!(
+            swept_pages(&passed),
+            vec![0],
+            "a change is a prompt to read, and exactly one read: {passed:?}"
+        );
+        assert_eq!(
+            watched_channels(&passed),
+            Vec::new(),
+            "a page the frontier has passed was watched again: {passed:?}"
+        );
+
+        // **The sweep re-opens the record**, because the sweeping path records the
+        // page as open before the bound above declines to re-arm it. What hands it
+        // back is that sweep's own outcome, and without this the change would leave
+        // a page nothing plans again open for the session — the count this close
+        // path exists to bound.
+        assert!(
+            a.open_recv_pages.contains(&(conversation, 0)),
+            "the sweep must have recorded the page as open again"
+        );
+        let handed_back = a.on_outcome(
+            BASE_MS,
+            page_outcome(conversation, 0, Ok(empty_page(conversation))),
+        );
+        assert!(
+            closed_pages(&handed_back).contains(&0),
+            "the sweep's own outcome must hand the re-opened page back: {handed_back:?}"
+        );
+
+        let still_watched = a.on_outcome(BASE_MS, watch_outcome(conversation, inside, changed()));
+        assert_eq!(
+            swept_pages(&still_watched),
+            vec![inside],
+            "the control's own change must be read once: {still_watched:?}"
+        );
+        assert_eq!(
+            watched_channels(&still_watched),
+            vec![(conversation, inside)],
+            "a page still inside the watched pair must be re-armed, or the assertion \
+             above passes for a machine that re-arms nothing at all: {still_watched:?}"
+        );
+    }
+
     /// M22b. A page whose sweep is still in flight is not asked for again, and
     /// the sweep's outcome releases it however it ended.
     ///
@@ -15031,6 +15139,159 @@ mod tests {
             ack_high_water(&a, 0, &records[0], Some(3)),
             Some(3),
             "the published record must carry the moved cursor"
+        );
+    }
+
+    /// M34i. A page the receive horizon finishes while a watch stands on it is
+    /// handed back one tick after that watch is lost, and not before.
+    ///
+    /// **Three moments, and the middle one is the finding.** The settlement pass
+    /// that first sees the raised horizon skips the page, because
+    /// [`DmMachine::close_pages`] leaves a watched page to the operation holding
+    /// it. The `Lost` that ends the watch closes nothing either — on a live
+    /// conversation [`DmMachine::on_watch`] folds it to nothing, and only a
+    /// torn-down one reaches [`DmMachine::close_freed_after_teardown`], which is
+    /// what M34g pins. The close comes from the next tick's
+    /// [`DmMachine::give_ups`], the settlement pass that runs whether or not
+    /// anything settled.
+    ///
+    /// So the record outlives its horizon by the watch's remaining lease plus a
+    /// tick. That is a delay and not a leak — the page is handed back, and the
+    /// transport's own capacity bound covers the interval — but it is the shape a
+    /// reader of the close path would not predict from the horizon alone.
+    ///
+    /// **`standing == false` is the control that makes the watch the cause.** With
+    /// the watch already resolved before the horizon, the same fixture closes page
+    /// zero at the very pass the watched arm asserts nothing at — so the deferral
+    /// is the watch and not the tick ordering, which defers that pass either way
+    /// (`give_ups` runs before `probe`, so the pass that raises the horizon is
+    /// never the one that acts on it). The close at the end is what makes the two
+    /// assertions before it non-vacuous: without it, a fixture whose horizon never
+    /// moved would satisfy them by closing nothing anywhere.
+    #[test]
+    fn a_watched_page_the_horizon_finished_closes_one_tick_after_the_watch_is_lost() {
+        for standing in [false, true] {
+            a_watched_page_horizon_close(standing);
+        }
+    }
+
+    /// One arm of M34i: the page's watch either stands into the horizon or was
+    /// resolved before it.
+    fn a_watched_page_horizon_close(standing: bool) {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let conversation = conversation_of(&b, 0);
+
+        // The watch on page zero, armed by the ordinary probe while the frontier
+        // is still there.
+        let armed = b.on_tick(BASE_MS);
+        assert!(
+            watched_channels(&armed).contains(&(conversation, 0)),
+            "the fixture needs a standing watch on page zero: {armed:?}"
+        );
+        release_sweeps(&mut b, &swept_channels(&armed), BASE_MS);
+        if !standing {
+            // The control arm: the watch resolves before the horizon, so nothing
+            // holds page zero when the settlement pass reaches it.
+            for (conversation, page) in watched_channels(&armed) {
+                b.on_outcome(
+                    BASE_MS,
+                    watch_outcome(conversation, page, Ok(DhtResult::Watch(DmPageWatch::Lost))),
+                );
+            }
+        }
+
+        // Everything A sent on page zero is lost, and the one frame that arrives
+        // sits on page one — so page zero is a hole the horizon must finish, and
+        // the frontier moves off it.
+        for seq in 1..u64::from(PAGE_SLOTS) {
+            let _lost = sent_frame(&mut a, &b_keys, BASE_MS, seq, "lost");
+        }
+        let arriving = sent_frame(
+            &mut a,
+            &b_keys,
+            BASE_MS,
+            u64::from(PAGE_SLOTS),
+            "the message that arrives",
+        );
+        let folded = fold_page_at(
+            &mut b,
+            BASE_MS,
+            conversation,
+            1,
+            vec![(position_of(u64::from(PAGE_SLOTS)), arriving)],
+        );
+        assert_eq!(
+            messages_in(&folded).len(),
+            1,
+            "the fixture must have collected the message on page one: {folded:?}"
+        );
+        // The gap the give-up must abandon, read absolutely rather than as a
+        // difference: a fixture that planted no hole would carry the cursor over
+        // nothing and every assertion below would be about a horizon that did
+        // nothing.
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            Some(0),
+            "the hole must hold the cursor at the position below it"
+        );
+        assert_eq!(
+            b.correspondences[0].collection.outstanding(),
+            vec![1..=u64::from(PAGE_SLOTS) - 1],
+            "page zero's lost positions must be the one gap"
+        );
+
+        // The horizon, reached by the probe exactly as production reaches it.
+        let horizon = BASE_MS + HORIZON_MS;
+        age_gaps(&mut b, 0, BASE_MS, horizon - AGE_STEP_MS);
+        let crossed = b.on_tick(horizon);
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            Some(u64::from(PAGE_SLOTS)),
+            "the probe must have given up on page zero and carried the cursor over it: \
+             {crossed:?}"
+        );
+
+        // (1) The settlement pass that first sees the raised horizon. It hands the
+        // page back where nothing holds it, and skips it where the watch does.
+        let deferred = b.on_tick(horizon + 1);
+        assert_eq!(
+            closed_pages(&deferred).contains(&0),
+            !standing,
+            "standing={standing}: the first pass past the horizon made the wrong call \
+             on page zero: {:?}",
+            closed_pages(&deferred)
+        );
+        if !standing {
+            return;
+        }
+
+        // (2) The watch ends. On a live conversation this fold closes nothing.
+        let lost = b.on_outcome(
+            horizon + 2,
+            watch_outcome(conversation, 0, Ok(DhtResult::Watch(DmPageWatch::Lost))),
+        );
+        assert!(
+            !closed_pages(&lost).contains(&0),
+            "the lost watch closed the page itself — the close path moved: {lost:?}"
+        );
+
+        // (3) The next settlement pass hands it back, once.
+        let closed = b.on_tick(horizon + 3);
+        assert_eq!(
+            closed_pages(&closed)
+                .iter()
+                .filter(|page| **page == 0)
+                .count(),
+            1,
+            "the tick after the watch was lost must hand page zero back exactly once: \
+             {:?}",
+            closed_pages(&closed)
         );
     }
 
