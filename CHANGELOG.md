@@ -28,6 +28,19 @@ work lives in the maintainer's own planning notes, not here.
 
 - `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `peer_ack_fetches_failed`, one per fetch of a
   correspondent's acknowledgement record that came back with no answer (#429).
+- `daemonseed-tui`: a direct-message thread, opened with `Enter` on a correspondence row and left
+  with `Esc`. It draws the correspondence's messages, the word for each sent message's
+  `DeliveryState` — `composed`, `on-DHT`, `confirmed-collected`, `undelivered`, never `delivered` —
+  and the latest `RefusalReason` on that correspondence, one phrase per variant. Its composer sends
+  one `DmCommand::Send`, and a painted terminal delivery state — `ConfirmedCollected` or
+  `Undelivered`, the two the driver owes a surfacing for — sends one `DmCommand::Surfaced`, once per
+  sequence number, naming only rows `ui::RenderReport` reports the frame painted. The thread draws
+  its tail and wraps its own rows, so a row that did not fit is answered for by no frame. A
+  `DmEvent::ChannelLost` ends the sequence numbers it names. A correspondence the roster has not called established or blocked carries
+  `DM_HELLO_GRADE`. `App::dm_thread`,
+  `App::dm_thread_correspondence`, `App::dm_compose`, `App::dm_thread_drawn`, `DmThreadRow`,
+  `DM_HELLO_GRADE` and `DmCorrespondence::{thread, unnumbered, refusal, surfaced}` (#235, #339,
+  #418).
 - `daemonseed-tui`: a direct-message pane, opened and closed with `[c]` from any pane that does not
   turn a printable key into text, and closed with `Esc`. It lists the pending contact requests and
   then the correspondences, newest first by the last driver event that named one, with both counts

@@ -194,7 +194,15 @@ fn run(
         App::new()
     };
     while !app.should_quit() {
-        terminal.draw(|frame| ui::render(&app, frame))?;
+        // (#235 / #279) The frame reports which direct-message rows it painted,
+        // and the surfacing answers for those and nothing else. After the draw
+        // and not before: the driver's flag is durable precisely so a crash
+        // between the two re-offers the state. A frame an overlay covered
+        // reports nothing, which `ui::render` decides, because that is where the
+        // overlays are drawn.
+        let mut report = ui::RenderReport::default();
+        terminal.draw(|frame| report = ui::render(&app, frame))?;
+        app.dm_thread_drawn(&report.painted_dm_seqs);
 
         // Drain network events into UI state (non-blocking).
         for event in net.drain_events() {

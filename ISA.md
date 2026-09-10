@@ -549,6 +549,39 @@ moment it is hand-maintained in two places, so it lives only where it cannot dri
 Decisions in force, with the reasoning that makes each hard to vary. Superseded amendments and the
 route taken to reach a decision are not recorded here — the git history and `CHANGELOG.md` hold those.
 
+- **The terminal client's direct-message thread makes ISC-C45's accept gate structural, and draws a
+  delivery state as the design's own word (2026-09-10, #235 / #339 / #418).** A thread opens from a
+  correspondence row and from nowhere else, so an unaccepted contact request has no route to one:
+  the gate is the absence of a correspondence rather than a check that a correspondence is accepted,
+  and no ordering of keys reaches a thread the criterion forbids
+  (`a_thread_renders_only_once_the_request_is_accepted`). A correspondence the roster does not call
+  established carries ISC-C45's hello-grade label, so a state the roster has not stated warns rather
+  than stays quiet (`a_pre_establishment_thread_carries_the_hello_grade_label`). Each
+  `DeliveryState` draws one word from ISC-C39's own vocabulary, and *delivered* is not among them
+  — pinned by a test that reads every drawn row for the whole word, with both halves of its needle
+  controlled (`no_drawn_row_ever_says_delivered`, `a_sent_message_draws_the_word_for_its_delivery_state`).
+  Every `RefusalReason` draws a distinct phrase, checked for presence and for uniqueness, because a
+  reason with no phrase is the silence #418 reports and two reasons sharing one phrase tells the user
+  the wrong thing about one of them (`every_refusal_reason_draws_its_own_phrase`). The durable
+  surfacing is answered after the frame is painted rather than when the state is folded, so a crash
+  between the two re-offers the state, which is what made the flag durable, and only for a state
+  that ENDS a message — `Outbox::end` is the sole edge that sets the flag, so answering a `Composed`
+  draw would spend a sequence number's one answer on a transition nothing owed and leave its ending
+  owed for ever (`a_drawn_delivery_state_is_surfaced_once`). A teardown ends the sequence numbers it
+  names, so a torn-down message stops drawing the word it was queued with
+  (`a_teardown_ends_the_messages_it_names_and_they_surface`). **The one approximation is naming a
+  sent message's body**: neither `Delivery` nor `Refused` identifies the command it answers, and a
+  `Delivery` is emitted by the give-up sweep, the acknowledgement, a write confirmation, a knock and
+  the acceptance path as well as by a send, so a body is claimed only by a statement that could be a
+  fresh send — `Composed`, above every sequence number already heard of — and released only by a
+  refusal reason `DmMachine::send` returns, two of which the introduction path shares. The
+  acceptance is indistinguishable by either test and is the bounded residual; a token on
+  `DmCommand::Send` echoed back is the exact fix and is a change to the driver boundary (`a_delivery_no_send_produced_takes_no_composed_body`,
+  `composed_bodies_pair_with_sequence_numbers_in_order`,
+  `a_refusal_takes_the_body_it_answers_and_no_other`). ISC-C45 stays unticked: this is the terminal
+  client alone, its hello-grade trigger approximates establishment from the startup roster, and the
+  criterion's known-sender clause is the driver's rather than a front end's.
+
 - **A DM page record closes on settlement, and the open set is capped at 128 with the pages a read
   will name again pinned (2026-09-08, #252).** A *receiving* page closes once the contiguous cursor has passed it and
   every slot on it was collected; a *sending* page closes once every slot on it is confirmed

@@ -14,34 +14,62 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap};
 
 use daemonseed_core::backoff::CloseCause;
+use daemonseed_core::dm::outbox::DeliveryState;
 use daemonseed_core::format::human_bytes;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
-use daemonseed_veilid_net::dm::CorrespondentState;
+use daemonseed_veilid_net::dm::{CorrespondentState, RefusalReason};
 
 use crate::app::{
     App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, DM_ACCEPT_KEY, DM_BLOCK_KEY,
-    DM_DECLINE_KEY, DM_PANE_KEY, DirSelection, FetchStatus, FetchUi, IndexerStatus, MainFocus,
-    PreviewKind, Screen, Surface, TrustItem, dm_fingerprint,
+    DM_DECLINE_KEY, DM_HELLO_GRADE, DM_PANE_KEY, DirSelection, DmThreadRow, FetchStatus, FetchUi,
+    IndexerStatus, MainFocus, PreviewKind, Screen, Surface, TrustItem, dm_fingerprint,
 };
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
 /// Draw the current screen.
-pub fn render(app: &App, frame: &mut Frame) {
+/// (#235 / #279) What one painted frame showed that a caller has to answer for.
+///
+/// **A render is the only thing that knows what reached the screen**, and the
+/// durable surfacing turns on exactly that: the driver holds a message's ending
+/// owed until a front end says the user was told, so a claim made from state
+/// rather than from the painted area clears the flag for a row that was clipped
+/// off the bottom. This carries the answer back out of the draw.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RenderReport {
+    /// Sequence numbers whose direct-message thread row was drawn **whole**
+    /// inside the pane. Empty for every screen but an open thread, and empty
+    /// where an overlay covered the pane.
+    pub painted_dm_seqs: Vec<u64>,
+}
+
+pub fn render(app: &App, frame: &mut Frame) -> RenderReport {
     match app.screen() {
-        Screen::Welcome => render_welcome(frame),
-        Screen::Unlock => render_unlock(app, frame),
-        Screen::FirstStart => match app.first_start() {
-            Some(fs) => render_first_start(fs, frame),
-            None => render_placeholder(frame, "First start"),
-        },
+        Screen::Welcome => {
+            render_welcome(frame);
+            RenderReport::default()
+        }
+        Screen::Unlock => {
+            render_unlock(app, frame);
+            RenderReport::default()
+        }
+        Screen::FirstStart => {
+            match app.first_start() {
+                Some(fs) => render_first_start(fs, frame),
+                None => render_placeholder(frame, "First start"),
+            }
+            RenderReport::default()
+        }
         Screen::Main => render_main(app, frame),
         Screen::LoggedInMenu => {
-            // Draw Main underneath, then the menu overlay on top.
+            // Draw Main underneath, then the menu overlay on top. The menu is a
+            // cover like the two below, so the frame shows the user the menu and
+            // not the thread.
             render_main(app, frame);
             render_logged_in_menu(frame);
+            RenderReport::default()
         }
     }
 }
@@ -101,7 +129,7 @@ fn render_logged_in_menu(frame: &mut Frame) {
 /// The post-first-start main view: a connection/circle status bar, the circle
 /// chat transcript, and the focused input (chat compose or circle-join). Trust /
 /// share / server tabs grow here in the later workstreams.
-fn render_main(app: &App, frame: &mut Frame) {
+fn render_main(app: &App, frame: &mut Frame) -> RenderReport {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -116,8 +144,9 @@ fn render_main(app: &App, frame: &mut Frame) {
     // than a focus, so it draws over whichever pane has focus and leaves that
     // focus alone — closing it returns to the pane the user left. It sits below
     // every C28 overlay, which are drawn after this either way.
+    let mut report = RenderReport::default();
     if app.dm_pane_open() {
-        render_dm(app, frame, chunks[1]);
+        report = render_dm(app, frame, chunks[1]);
     } else {
         // The main area shows the server-management list, Trust History, or
         // Shares pane while those screens have focus, otherwise the chat
@@ -139,14 +168,21 @@ fn render_main(app: &App, frame: &mut Frame) {
     // overlay (ISC-19) sits between them — above the chat/shares view but
     // below a security event.
     if let Some(item) = app.transient_trust() {
+        // A three-row strip in the top-right corner, over the status bar rather
+        // than over the pane, so it hides no thread row and the report stands.
         render_transient_toast(item, frame, frame.area());
     }
     if let Some(f) = app.fetch() {
         render_fetch_overlay(f, frame, frame.area());
+        report = RenderReport::default();
     }
     if let Some(item) = app.blocking_trust() {
         render_blocking_modal(item, frame, frame.area());
+        report = RenderReport::default();
     }
+    // Both of the above are drawn over the whole area, so whatever the thread
+    // painted is not what the user saw and this frame answers for nothing.
+    report
 }
 
 /// The active share-fetch overlay (ISC-19): a centered
@@ -1231,7 +1267,13 @@ fn render_deprecation(app: &App, frame: &mut Frame, area: Rect) {
 /// correspondence's thread are the next change's subject; this one answers
 /// "who is waiting, and who do I correspond with", which the identity and the
 /// state answer on their own.
-fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
+fn render_dm(app: &App, frame: &mut Frame, area: Rect) -> RenderReport {
+    // (#235) An open thread replaces the roster in the same area: it is a view
+    // of one correspondence rather than a second pane, and Esc returns to the
+    // list it was opened from.
+    if app.dm_thread().is_some() {
+        return render_dm_thread(app, frame, area);
+    }
     let requests = app.dm_requests();
     let correspondences = app.dm_correspondences();
     let title = format!(
@@ -1294,6 +1336,265 @@ fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
             .title_alignment(Alignment::Left),
     );
     frame.render_widget(body, area);
+    // The roster draws no message, so it answers for nothing.
+    RenderReport::default()
+}
+
+/// (#235) One row of a thread, wrapped to the rows it occupies on screen.
+struct ThreadEntry {
+    /// The sequence number this row reports a delivery state for, where it has
+    /// one. `None` for a received message, the hello-grade label, the empty
+    /// state, an unnumbered body and a refusal — none of which the driver is
+    /// owed an answer about.
+    seq: Option<u64>,
+    /// The screen rows the entry occupies, already wrapped to the pane.
+    rows: Vec<String>,
+    /// How the whole entry draws.
+    style: Style,
+}
+
+/// (#235) Break one thread row into the screen rows it occupies at `width`,
+/// on a space where it can and mid-word where a word is longer than the pane.
+///
+/// **The thread wraps here rather than in the widget**, because the surfacing
+/// has to name what was painted and a `Paragraph` that wraps internally reports
+/// nothing about which rows fell outside the area. The rows that fall outside
+/// are the newest ones, which are exactly the ones whose state has just
+/// changed.
+fn wrap_row(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_len = 0usize;
+    for word in text.split(' ') {
+        let word_len = word.chars().count();
+        if cur_len != 0 && cur_len + 1 + word_len > width {
+            out.push(std::mem::take(&mut cur));
+            cur_len = 0;
+        }
+        if word_len > width {
+            // No break to wrap on: filled across as many rows as it takes.
+            for ch in word.chars() {
+                if cur_len == width {
+                    out.push(std::mem::take(&mut cur));
+                    cur_len = 0;
+                }
+                cur.push(ch);
+                cur_len += 1;
+            }
+            continue;
+        }
+        if cur_len != 0 {
+            cur.push(' ');
+            cur_len += 1;
+        }
+        cur.push_str(word);
+        cur_len += word_len;
+    }
+    out.push(cur);
+    out
+}
+
+/// (#235) One correspondence's thread: the hello-grade label where the
+/// correspondence is not established, the messages in the order this session
+/// heard of them, and the refusal that stopped the last send.
+///
+/// A received message is drawn with its body alone; a sent one carries the word
+/// for the state the driver last reported it in. **None of those words is
+/// "delivered"** — ISC-C39 defaults a message to not-delivered and makes
+/// *confirmed-collected* the strongest claim a verified acknowledgement
+/// supports.
+fn render_dm_thread(app: &App, frame: &mut Frame, area: Rect) -> RenderReport {
+    let Some(pk) = app.dm_thread() else {
+        return RenderReport::default();
+    };
+    let correspondence = app.dm_thread_correspondence();
+    let title = format!(" dm thread · {} ", dm_fingerprint(pk));
+    let width = usize::from(area.width.saturating_sub(2));
+    let height = usize::from(area.height.saturating_sub(2));
+
+    let mut entries: Vec<ThreadEntry> = Vec::new();
+    let mut push = |seq: Option<u64>, text: String, style: Style| {
+        entries.push(ThreadEntry {
+            seq,
+            rows: wrap_row(&text, width),
+            style,
+        });
+    };
+
+    // ISC-C45's user-education requirement. Drawn on anything the roster has
+    // not called established, so a state it has not stated warns rather than
+    // stays quiet: the label is wrong to omit where the correspondence turns
+    // out to be pre-establishment, and merely redundant where it does not.
+    // Blocked is the one state it is drawn on neither way — nothing on a
+    // blocked correspondence is sent, so there is no message for the label to
+    // describe. `DM_HELLO_GRADE` records what this trigger approximates.
+    let labelled = !matches!(
+        correspondence.and_then(|c| c.state),
+        Some(CorrespondentState::Established) | Some(CorrespondentState::Blocked)
+    );
+    if labelled {
+        push(
+            None,
+            DM_HELLO_GRADE.to_owned(),
+            Style::default().fg(Color::Yellow).bold(),
+        );
+    }
+
+    let empty = correspondence.is_none_or(|c| c.thread.is_empty() && c.unnumbered.is_empty());
+    if empty {
+        push(
+            None,
+            "(no messages in this correspondence)".to_owned(),
+            Style::default().fg(Color::DarkGray),
+        );
+    }
+
+    if let Some(correspondence) = correspondence {
+        for row in &correspondence.thread {
+            match row {
+                DmThreadRow::Received { body, .. } => {
+                    push(None, format!("← {body}"), Style::default())
+                }
+                DmThreadRow::Sent { seq, body } => {
+                    // A body this session did not compose is named by its
+                    // sequence number: the state is what the user is owed, and
+                    // the text was never held here to lose.
+                    let text = match body {
+                        Some(body) => body.clone(),
+                        None => format!("message {seq}"),
+                    };
+                    match correspondence.deliveries.get(seq).copied() {
+                        Some(state) => push(
+                            Some(*seq),
+                            format!("→ {text} · {}", delivery_word(state)),
+                            Style::default(),
+                        ),
+                        None => push(Some(*seq), format!("→ {text}"), Style::default()),
+                    }
+                }
+            }
+        }
+        // Handed to the driver, no sequence number yet, so no state to draw.
+        for body in &correspondence.unnumbered {
+            push(None, format!("→ {body}"), Style::default());
+        }
+        if let Some(refusal) = correspondence.refusal.as_ref() {
+            push(
+                None,
+                format!("✗ not sent — {}", refusal_phrase(&refusal.reason)),
+                Style::default().fg(Color::Red).bold(),
+            );
+        }
+    }
+
+    // **The tail, not the head.** A thread grows downward and the row whose
+    // state has just changed is the last one, so a pane that showed the top
+    // would clip away precisely what the user is waiting to see. Whole entries
+    // only: an entry half on screen has its state word on the row that fell
+    // off, and reporting it would answer for something nobody read.
+    let mut first = entries.len();
+    let mut used = 0usize;
+    for (i, entry) in entries.iter().enumerate().rev() {
+        if used + entry.rows.len() > height {
+            break;
+        }
+        used += entry.rows.len();
+        first = i;
+    }
+    // One entry taller than the whole pane still draws — clipped by the widget,
+    // from the bottom — and still answers for nothing.
+    let partial = first == entries.len() && !entries.is_empty();
+    if partial {
+        first = entries.len() - 1;
+    }
+
+    let painted = &entries[first..];
+    let report = RenderReport {
+        painted_dm_seqs: if partial {
+            Vec::new()
+        } else {
+            painted.iter().filter_map(|entry| entry.seq).collect()
+        },
+    };
+
+    let lines: Vec<Line> = painted
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .rows
+                .iter()
+                .map(|row| Line::from(row.clone()).style(entry.style))
+        })
+        .collect();
+
+    // No `Wrap`: every line here is already one screen row wide, and letting
+    // the widget wrap again would put rows on screen this report does not name.
+    let body = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_alignment(Alignment::Left),
+    );
+    frame.render_widget(body, area);
+    report
+}
+
+/// (#235) The word a delivery state is drawn as, one per state.
+///
+/// **No state is drawn as "delivered", and none ever will be.** ISC-C39 makes
+/// the sender default a message to not-delivered and flip it only on a verified
+/// acknowledgement, and *confirmed-collected* is what that acknowledgement
+/// proves — the design's own word for it, kept here rather than softened into a
+/// claim the protocol does not support.
+fn delivery_word(state: DeliveryState) -> &'static str {
+    match state {
+        DeliveryState::Composed => "composed",
+        DeliveryState::OnDht => "on-DHT",
+        DeliveryState::ConfirmedCollected => "confirmed-collected",
+        DeliveryState::Undelivered => "undelivered",
+    }
+}
+
+/// (#339 / #418) What a refusal is drawn as: where the send stopped and, where
+/// the reason implies one, what to do next.
+///
+/// Exhaustive on purpose — a reason with no phrase is a send the user watches
+/// fail in silence, which is the whole of what #418 reports, so a new variant
+/// breaks this match rather than reaching the screen as nothing.
+///
+/// Each phrase is short enough that the row it is drawn on fits an 80-column
+/// terminal whole. A wrapped refusal is still readable, but the second half
+/// lands under the messages it belongs beside.
+fn refusal_phrase(reason: &RefusalReason) -> String {
+    match reason {
+        RefusalReason::NoKeyRecord => "they publish no key record; try again later".to_owned(),
+        RefusalReason::KeyRecordInvalid => "their key record did not verify".to_owned(),
+        RefusalReason::KeyRecordRollback => {
+            "their key record went backwards; it is being written to".to_owned()
+        }
+        RefusalReason::PublishFailed => "the network would not read or write".to_owned(),
+        RefusalReason::StoreFailure => "a local record would not read or write".to_owned(),
+        RefusalReason::AlreadyEstablished => "already a correspondent".to_owned(),
+        RefusalReason::AlreadyInFlight => "an introduction to them is already going out".to_owned(),
+        RefusalReason::MintPanicked => "the proof-of-work mint failed".to_owned(),
+        RefusalReason::TaskPanicked => "a transport task failed; worth one more try".to_owned(),
+        RefusalReason::MintFailed => "the entry would not compose".to_owned(),
+        RefusalReason::Module => "this machine's crypto module failed".to_owned(),
+        RefusalReason::OutboxFull { needed } => {
+            format!("no room for {needed} more bytes; send again later")
+        }
+        RefusalReason::NotEstablishedThisSession => {
+            "not established this session; it must re-establish first".to_owned()
+        }
+        RefusalReason::AwaitingCorrespondentsFirstFrame => {
+            "waiting for their first message; send this again then".to_owned()
+        }
+        RefusalReason::BodyTooLarge => "the message is over the size cap".to_owned(),
+        RefusalReason::SealFailed => "the frame would not key or seal".to_owned(),
+    }
 }
 
 /// (#236) The style a direct-message row draws in, selected or not. Matches the
@@ -1553,22 +1854,38 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
     // focus: the pane owns the keystream while it is open, so the focused
     // pane's keys are not the ones that would work.
     if app.dm_pane_open() {
-        // Named `dm`, matching the `[c] dm` hint that opens it. The whole line
-        // is 69 columns and fits the 78 a bordered block leaves at an 80-column
-        // terminal, so nothing here is truncated. The close hint leads anyway,
-        // because a title truncates from the right at narrower widths and the
-        // way out is what a user in a pane they did not mean to open needs
-        // most.
-        let title = format!(
-            "dm  [{DM_PANE_KEY}]/[Esc] close  [↑/↓] select  [{DM_ACCEPT_KEY}] accept  \
-             [{DM_DECLINE_KEY}] decline  [{DM_BLOCK_KEY}] block"
-        );
-        // A status set before the pane opened is carried rather than hidden:
-        // it is cleared on a focus change, and opening the pane is not one, so
-        // dropping it here would lose the line instead of retiring it.
-        let shown = match app.status() {
-            Some(s) => format!("! {s}"),
-            None => String::new(),
+        // (#235) An open thread takes text, so its block is the composer and
+        // its legend is the thread's keys — the roster's letters are not the
+        // ones that work while a message is being typed. `[Esc] back` ends it
+        // and the whole line is 55 columns, well inside the 78 a bordered block
+        // leaves at an 80-column terminal.
+        let (title, shown) = if app.dm_thread().is_some() {
+            (
+                "dm thread  [Enter] send  [Backspace] delete  [Esc] back".to_owned(),
+                app.dm_compose().to_owned(),
+            )
+        } else {
+            // Named `dm`, matching the `[c] dm` hint that opens it. The whole
+            // line is 76 columns and fits the 78 a bordered block leaves at an
+            // 80-column terminal, so nothing here is truncated — which is why
+            // the cursor keys carry no word: `[Enter] open` had to come from
+            // somewhere and the arrows say what they do. The close hint leads
+            // anyway, because a title truncates from the right at narrower
+            // widths and the way out is what a user in a pane they did not mean
+            // to open needs most.
+            let title = format!(
+                "dm  [{DM_PANE_KEY}]/[Esc] close  [↑/↓]  [Enter] open  \
+                 [{DM_ACCEPT_KEY}] accept  [{DM_DECLINE_KEY}] decline  [{DM_BLOCK_KEY}] block"
+            );
+            // A status set before the pane opened is carried rather than
+            // hidden: it is cleared on a focus change, and opening the pane is
+            // not one, so dropping it here would lose the line instead of
+            // retiring it.
+            let shown = match app.status() {
+                Some(s) => format!("! {s}"),
+                None => String::new(),
+            };
+            (title, shown)
         };
         let body = Paragraph::new(shown).block(
             Block::default()

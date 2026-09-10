@@ -4,7 +4,7 @@
 //! [`App::on_key`]. It performs no terminal I/O, so it is fully unit-testable
 //! and deterministically driveable by the PTY gate harness.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::crypto::suite::SuiteId;
@@ -229,6 +229,26 @@ pub const DM_DECLINE_KEY: char = 'd';
 /// Blocks the selected contact request's sender, sending one
 /// `DmCommand::Block`.
 pub const DM_BLOCK_KEY: char = 'b';
+
+/// (#235 / ISC-C45) The label a thread carries while the correspondence is not
+/// established.
+///
+/// The criterion's own words. A message sent before the correspondent has
+/// replied has no forward secrecy — the ratchet forks on their first frame —
+/// so the property the user has to act on is that this one message is not
+/// covered by it.
+///
+/// **The trigger is an approximation, and it errs toward warning.** The only
+/// statement a front end gets about a correspondence's state is the driver's
+/// startup roster, so the label is drawn wherever that has not said
+/// `CorrespondentState::Established` — which draws it on a correspondence this
+/// session created by accepting a request, where the roster has said nothing at
+/// all, and does not draw it on the initiating side of a re-establishment,
+/// where the ratchet really has been re-rooted and the property really does
+/// hold again. A blocked correspondence is excluded, because nothing on it can
+/// be sent for the label to describe. Closing the gap needs a per-correspondence
+/// establishment fact on the event boundary, which the driver does not publish.
+pub const DM_HELLO_GRADE: &str = "not yet secured; say hello, not secrets";
 
 /// [`DM_PANE_KEY`] with Shift held. Derived rather than written out, so the two
 /// cases of one key cannot drift apart.
@@ -1173,10 +1193,22 @@ pub struct App {
     /// `RequestId` is neither `Hash` nor `Ord`, and it is bounded by
     /// [`PENDING_REQUEST_CAP`] arrivals rather than by keystrokes.
     dm_answered: Vec<RequestId>,
+    /// (#235) The correspondence whose thread is open, or `None` while the pane
+    /// shows its roster.
+    ///
+    /// **Set only from a correspondence row, which is what makes ISC-C45's
+    /// gate structural.** A pending contact request is a row in the block above
+    /// and has no thread: an unknown sender's message is shown as the request's
+    /// own body and nowhere else until the user accepts and the driver reports
+    /// the correspondence that accept created.
+    dm_thread: Option<PkLt>,
+    /// (#235) The open thread's composer buffer. Cleared on send and on leaving
+    /// the thread.
+    dm_compose: String,
 }
 
 /// (#339) One correspondence, as the driver has reported it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct DmCorrespondence {
     /// What the driver's startup DM roster said this correspondence is.
     ///
@@ -1193,6 +1225,56 @@ pub struct DmCorrespondence {
     pub deliveries: BTreeMap<u64, DeliveryState>,
     /// Sequence numbers a loud teardown left undelivered, in arrival order.
     pub undelivered: Vec<u64>,
+    /// (#235) The correspondence's messages, in the order this session heard of
+    /// them — what the thread draws.
+    ///
+    /// A row and a [`Self::deliveries`] entry are minted by the same fold, so a
+    /// sent row always has a state to draw beside it and the state is read from
+    /// there rather than copied here.
+    pub thread: Vec<DmThreadRow>,
+    /// (#235) Bodies handed to the driver that no `DmEvent::Delivery` has named
+    /// a sequence number for yet, oldest first.
+    ///
+    /// The machine answers each accepted send with exactly one `Delivery`
+    /// carrying the sequence number it assigned, and each refused one with
+    /// exactly one `DmEvent::Refused`, both in command order — so the oldest
+    /// body here is the one the next of either answers. Drawn meanwhile, with
+    /// no state word: the body reached the driver, and nothing yet says it
+    /// reached anywhere else.
+    ///
+    /// **Pairing a body to a sequence number is a heuristic, because neither
+    /// event carries anything that identifies the command it answers.** A
+    /// `Delivery` is emitted by the give-up sweep, the acknowledgement, a write
+    /// confirmation, a knock, the acceptance's own first frame and a refused
+    /// acceptance as well as by a send — and several of those name, after a
+    /// restart, sequence numbers this session never composed. So a body is
+    /// taken only by a `Delivery` that could be a fresh send: state
+    /// `DeliveryState::Composed`, and a sequence number above every one this
+    /// correspondence has heard of. A `Refused` takes one only for the reasons
+    /// `DmMachine::send` returns, two of which — a store fault and a crypto
+    /// module fault — the introduction path shares.
+    ///
+    /// **The residual, bounded and closed by one fix.** Two other paths compose
+    /// at `Composed` and sequence zero, which is the shape these tests admit on
+    /// a fresh correspondence: the acceptance, and the knock that opens a first
+    /// contact — the second unreachable from here, which issues no
+    /// `DmCommand::FirstContact`. So a correspondence being accepted in the
+    /// same window as a send can take that send's body. The fix is a token on
+    /// `DmCommand::Send` echoed back on the `Delivery` or `Refused` that answers
+    /// it, which needs a change to the driver boundary rather than to this
+    /// state.
+    pub unnumbered: Vec<String>,
+    /// (#418) The latest refusal on this correspondence, held until a send to
+    /// it succeeds or a newer refusal replaces it.
+    ///
+    /// Per correspondence rather than per session, because that is what a
+    /// thread can draw: a refusal on one conversation says nothing about
+    /// another, and a single slot loses the first the moment the second
+    /// arrives.
+    pub refusal: Option<DmRefusal>,
+    /// (#279) Sequence numbers whose delivery state a painted frame has shown,
+    /// so a redraw does not tell the driver a second time.
+    pub surfaced: BTreeSet<u64>,
     /// The value [`DmState::activity_seq`] had when an event last named this
     /// correspondence — the ordering key the roster is drawn by, newest first.
     ///
@@ -1204,6 +1286,103 @@ pub struct DmCorrespondence {
     /// `0` on a correspondence no event has named, which cannot occur through
     /// the fold — every route that creates one stamps it.
     pub last_activity: u64,
+}
+
+impl std::fmt::Debug for DmCorrespondence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written because `unnumbered` holds plaintext a person typed and
+        // the derive would print it. Lengths only, the way `DmThreadRow` prints
+        // the bodies it holds.
+        f.debug_struct("DmCorrespondence")
+            .field("state", &self.state)
+            .field("deliveries", &self.deliveries)
+            .field("undelivered", &self.undelivered)
+            .field("thread", &self.thread)
+            .field(
+                "unnumbered_lens",
+                &self.unnumbered.iter().map(String::len).collect::<Vec<_>>(),
+            )
+            .field("refusal", &self.refusal)
+            .field("surfaced", &self.surfaced)
+            .field("last_activity", &self.last_activity)
+            .finish()
+    }
+}
+
+impl DmCorrespondence {
+    /// (#235) Record the state a `DeliveryState` statement puts one sequence
+    /// number in, minting its thread row the first time that number is heard
+    /// of.
+    ///
+    /// **The state is replaced unconditionally and the row is minted once**, so
+    /// a sequence number that climbs — or that a teardown ends after it was
+    /// composed — keeps one row and gains the newest word. A row and a state
+    /// therefore exist together for every number this correspondence knows,
+    /// which is what lets the thread draw a state beside every sent message and
+    /// lets the surfacing read the state map alone.
+    fn record_delivery(&mut self, seq: u64, state: DeliveryState, body: Option<String>) {
+        if self.deliveries.insert(seq, state).is_none() {
+            self.thread.push(DmThreadRow::Sent { seq, body });
+        }
+    }
+
+    /// (#235) The highest sequence number any statement has named on this
+    /// correspondence, or `None` before the first.
+    fn highest_seq(&self) -> Option<u64> {
+        self.deliveries.keys().next_back().copied()
+    }
+}
+
+/// (#235) One row of a correspondence's thread.
+///
+/// Two variants rather than a direction field, because the two carry different
+/// facts: a received message arrives whole, with the time its sender claims,
+/// while a sent one is known by the sequence number the driver assigned it and
+/// its body is held only where this session composed it.
+#[derive(Clone, PartialEq, Eq)]
+pub enum DmThreadRow {
+    /// A message the correspondent wrote.
+    Received {
+        /// The message's sequence number on their side of the channel.
+        seq: u64,
+        /// The message body.
+        body: String,
+        /// When the sender says it was sent, in unix milliseconds.
+        sent_unix_ms: i64,
+    },
+    /// A message this side composed.
+    Sent {
+        /// The sequence number the driver assigned it.
+        seq: u64,
+        /// The body, or `None` for a sequence number the driver reported
+        /// without this session having composed it — a message from an earlier
+        /// run whose ending is still owed to the user (#279). Nothing here is
+        /// persisted, so its text is gone and its fate is not.
+        body: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for DmThreadRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // A body is plaintext a person wrote. Length only, as every other DM
+        // body on this boundary prints.
+        match self {
+            Self::Received {
+                seq,
+                body,
+                sent_unix_ms,
+            } => write!(
+                f,
+                "Received {{ seq: {seq}, body_len: {}, sent_unix_ms: {sent_unix_ms} }}",
+                body.len()
+            ),
+            Self::Sent { seq, body } => write!(
+                f,
+                "Sent {{ seq: {seq}, body_len: {:?} }}",
+                body.as_ref().map(String::len)
+            ),
+        }
+    }
 }
 
 /// (#339) The DM state one session has accumulated from [`DmEvent`]s.
@@ -1506,8 +1685,28 @@ impl DmState {
             DmEvent::Delivery { to, seq, state } => {
                 let activity = self.next_activity();
                 let entry = self.correspondences.entry(to.clone()).or_default();
-                entry.deliveries.insert(*seq, *state);
                 entry.last_activity = activity;
+                // (#235) Whether this statement could be answering a send this
+                // session composed. Five paths emit a `Delivery` and only one
+                // of them is a send, so both tests have to hold: a fresh send
+                // is reported `Composed`, and it takes the next sequence number
+                // — one at or below the highest already heard of belongs to a
+                // message that existed before, whose text this session never
+                // held. Fail either and the row is minted with no body, which
+                // says exactly what is known.
+                let earned = *state == DeliveryState::Composed
+                    && entry.highest_seq().is_none_or(|highest| *seq > highest);
+                let body = if earned && !entry.unnumbered.is_empty() {
+                    Some(entry.unnumbered.remove(0))
+                } else {
+                    None
+                };
+                entry.record_delivery(*seq, *state, body);
+                if earned {
+                    // (#418) A send went through, so the refusal that stopped
+                    // the last one is answered and stops being drawn.
+                    entry.refusal = None;
+                }
             }
             DmEvent::Refused {
                 to,
@@ -1519,30 +1718,87 @@ impl DmState {
                 // the audit log lives.
                 event: _,
             } => {
-                self.last_refusal = Some(DmRefusal {
+                let refusal = DmRefusal {
                     to: to.clone(),
                     acceptance: *acceptance,
                     reason: *reason,
-                });
+                };
+                // (#418) Folded onto a correspondence only where one is already
+                // held. A thread is reached from the roster, so every refusal a
+                // key here can provoke names a correspondence this state
+                // already has; creating one would put a row on the roster for
+                // an identity nothing has said is a correspondent.
+                if let Some(entry) = self.correspondences.get_mut(to) {
+                    // (#235) The body stops being drawn only where this refusal
+                    // could be answering a send. `DmMachine::send` returns
+                    // exactly the reasons below; every other reason belongs to
+                    // the first-contact plane, whose refusals are retried on
+                    // each tick and would otherwise eat a queued body per tick.
+                    let from_send_path = matches!(
+                        reason,
+                        RefusalReason::NotEstablishedThisSession
+                            | RefusalReason::AwaitingCorrespondentsFirstFrame
+                            | RefusalReason::OutboxFull { .. }
+                            | RefusalReason::BodyTooLarge
+                            | RefusalReason::SealFailed
+                            | RefusalReason::StoreFailure
+                            | RefusalReason::Module
+                    );
+                    if from_send_path && !entry.unnumbered.is_empty() {
+                        entry.unnumbered.remove(0);
+                    }
+                    // Drawn whatever produced it: a refusal on this
+                    // correspondence is worth showing even where it answers no
+                    // send of ours.
+                    entry.refusal = Some(refusal.clone());
+                }
+                self.last_refusal = Some(refusal);
             }
             // A received message is activity, and for an inbound-only
             // correspondent it may be the ONLY thing this session ever hears:
             // the roster names what was on disk at startup and `Delivery`
             // reports this side's own sends, so a correspondent who writes
-            // without being written to would otherwise have no row at all. The
-            // body is not kept — no surface shows message text yet — but the
-            // fact that they wrote is what orders the roster.
-            DmEvent::Message { from, .. } => {
+            // without being written to would otherwise have no row at all.
+            DmEvent::Message {
+                from,
+                seq,
+                body,
+                sent_unix_ms,
+            } => {
                 let activity = self.next_activity();
-                self.correspondences
-                    .entry(from.clone())
-                    .or_default()
-                    .last_activity = activity;
+                let entry = self.correspondences.entry(from.clone()).or_default();
+                entry.last_activity = activity;
+                let row = DmThreadRow::Received {
+                    seq: *seq,
+                    body: body.clone(),
+                    sent_unix_ms: *sent_unix_ms,
+                };
+                // A collected position is settled before its page is swept
+                // again, so a repeat here is one the driver re-opened rather
+                // than an ordinary re-seed. The row is replaced rather than
+                // added, so the thread holds one row per sequence number
+                // whichever it was.
+                match entry
+                    .thread
+                    .iter_mut()
+                    .find(|r| matches!(r, DmThreadRow::Received { seq: s, .. } if s == seq))
+                {
+                    Some(existing) => *existing = row,
+                    None => entry.thread.push(row),
+                }
             }
             DmEvent::ChannelLost { with, surfaced, .. } => {
                 let activity = self.next_activity();
                 let c = self.correspondences.entry(with.clone()).or_default();
                 c.undelivered.extend(surfaced.iter().copied());
+                // (#235) A teardown is the last word on every sequence number it
+                // names, so it replaces whatever state they held: without this a
+                // torn-down message keeps drawing the word it had when it was
+                // queued, and the ending the user is owed reaches the screen
+                // nowhere.
+                for seq in surfaced {
+                    c.record_delivery(*seq, DeliveryState::Undelivered, None);
+                }
                 c.last_activity = activity;
             }
             DmEvent::DoorbellHealth {
@@ -1711,6 +1967,8 @@ impl App {
             dm_sel: 0,
             pending_dm: Vec::new(),
             dm_answered: Vec::new(),
+            dm_thread: None,
+            dm_compose: String::new(),
         }
     }
 
@@ -2919,6 +3177,75 @@ impl App {
         rows
     }
 
+    /// (#235) The correspondence whose thread is open, or `None` while the pane
+    /// shows its roster.
+    pub fn dm_thread(&self) -> Option<&PkLt> {
+        self.dm_thread.as_ref()
+    }
+
+    /// (#235) The open thread's correspondence — its messages, its delivery
+    /// states, its refusal and the state the roster put it in. `None` unless a
+    /// thread is open.
+    pub fn dm_thread_correspondence(&self) -> Option<&DmCorrespondence> {
+        let pk = self.dm_thread.as_ref()?;
+        self.dm.correspondences.get(pk)
+    }
+
+    /// (#235) The open thread's composer buffer.
+    pub fn dm_compose(&self) -> &str {
+        &self.dm_compose
+    }
+
+    /// (#235 / #279) Record that the frame just painted showed these sequence
+    /// numbers' delivery states, and tell the driver so.
+    ///
+    /// **Called by the render loop after the draw returns, with the set that
+    /// draw actually painted.** The driver holds a `Surfacing::Owed` against
+    /// every message whose ending it has reported, and `DmCommand::Surfaced` is
+    /// the only thing that clears it. Clearing it before the frame was painted
+    /// would lose the notification to any crash in between, which is the failure
+    /// that made the flag durable — and clearing it for a row the pane clipped
+    /// off its bottom loses it to nothing at all. So the caller passes what the
+    /// render reported rather than this reading the state map, which knows every
+    /// sequence number and nothing about the area they had to fit in.
+    ///
+    /// **Only a state that ENDS a message is answered.** The driver owes a
+    /// surfacing for the transitions that end an entry and for no others —
+    /// `Outbox::end` is the one edge that sets the flag, and it runs on the
+    /// give-up, the acknowledgement and the teardown. Answering a `Composed` or
+    /// `OnDht` draw would spend the sequence number's one answer on a
+    /// transition that was never owed, leaving the ending that follows it owed
+    /// for the rest of that session and every session after. It also spares the
+    /// driver an outbox rewrite per send, since recording a surfacing always
+    /// writes.
+    ///
+    /// A number already recorded here is not offered again, so a redraw sends
+    /// nothing and a closed thread sends nothing.
+    pub fn dm_thread_drawn(&mut self, painted: &[u64]) {
+        let Some(to) = self.dm_thread.clone() else {
+            return;
+        };
+        let Some(entry) = self.dm.correspondences.get_mut(&to) else {
+            return;
+        };
+        let seqs: Vec<u64> = painted
+            .iter()
+            .copied()
+            .filter(|seq| {
+                matches!(
+                    entry.deliveries.get(seq),
+                    Some(DeliveryState::ConfirmedCollected) | Some(DeliveryState::Undelivered)
+                )
+            })
+            .filter(|seq| !entry.surfaced.contains(seq))
+            .collect();
+        if seqs.is_empty() {
+            return;
+        }
+        entry.surfaced.extend(seqs.iter().copied());
+        self.pending_dm.push(DmCommand::Surfaced { to, seqs });
+    }
+
     /// (#236) How many rows the direct-message pane draws: every pending
     /// request, then every correspondence.
     fn dm_row_count(&self) -> usize {
@@ -3237,6 +3564,13 @@ impl App {
     /// all, queues nothing: the three actions answer a request, and a
     /// correspondence is not one.
     fn on_key_dm(&mut self, key: KeyEvent) {
+        // (#235) An open thread takes text, so it owns the keystream ahead of
+        // the roster's letters — `c` typed into a message is a message and not
+        // a request to close the pane, the convention every input pane keeps.
+        if self.dm_thread.is_some() {
+            self.on_key_dm_thread(key);
+            return;
+        }
         // Esc carries no case and no chord worth honouring here; every other
         // arm is a letter, so a modifier other than Shift means a different key
         // was pressed and none of them belongs to this pane.
@@ -3244,6 +3578,7 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Enter => self.open_selected_thread(),
             KeyCode::Esc | KeyCode::Char(DM_PANE_KEY) | KeyCode::Char(DM_PANE_KEY_UPPER) => {
                 self.dm_pane = false;
             }
@@ -3275,6 +3610,71 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// (#235) Key handling inside an open thread: printable keys and Backspace
+    /// build the message, Enter sends it, Esc returns to the roster.
+    ///
+    /// Every letter is text here, including the one that opens and closes the
+    /// pane, so the way out is Esc alone — the same bargain the chat compose
+    /// box and the announcement composer make.
+    fn on_key_dm_thread(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.dm_thread = None;
+                self.dm_compose.clear();
+            }
+            KeyCode::Backspace => {
+                self.dm_compose.pop();
+            }
+            KeyCode::Enter if !self.dm_compose.is_empty() => self.send_composed_dm(),
+            // A modifier makes a different key, and a chord is not text.
+            KeyCode::Char(c) if plain_or_shift(&key) => self.dm_compose.push(c),
+            _ => {}
+        }
+    }
+
+    /// (#235) Hand the composed message to the driver as one
+    /// `DmCommand::Send`, and hold its body until a sequence number names it.
+    ///
+    /// The body is drawn from the moment it is queued, without a delivery
+    /// state: it reached the driver, and ISC-C39's fail-safe posture is that
+    /// nothing claims it reached further until a state says so.
+    fn send_composed_dm(&mut self) {
+        let Some(to) = self.dm_thread.clone() else {
+            return;
+        };
+        let body = std::mem::take(&mut self.dm_compose);
+        self.dm
+            .correspondences
+            .entry(to.clone())
+            .or_default()
+            .unnumbered
+            .push(body.clone());
+        self.pending_dm.push(DmCommand::Send { to, body });
+    }
+
+    /// (#235 / ISC-C45) Open the selected correspondence's thread.
+    ///
+    /// **A pending contact request opens nothing.** Requests are drawn above
+    /// the correspondences and the selection indexes both blocks, so a
+    /// selection inside the first block has no correspondence behind it — which
+    /// is the criterion's gate: an unknown sender is a request until the user
+    /// accepts, and the thread exists once the driver reports the
+    /// correspondence that accept created.
+    fn open_selected_thread(&mut self) {
+        let Some(row) = self.dm_sel.checked_sub(self.dm.requests.len()) else {
+            return;
+        };
+        let Some(pk) = self
+            .dm_correspondences()
+            .get(row)
+            .map(|(pk, _)| (*pk).clone())
+        else {
+            return;
+        };
+        self.dm_thread = Some(pk);
+        self.dm_compose.clear();
     }
 
     /// (#236) Claim the selected pending request as answered, returning it the
@@ -5884,7 +6284,10 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| crate::ui::render(app, f)).unwrap();
+        term.draw(|f| {
+            crate::ui::render(app, f);
+        })
+        .unwrap();
         buffer_text(&term)
     }
 
@@ -6880,7 +7283,10 @@ mod tests {
         });
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        term.draw(|f| {
+            crate::ui::render(&app, f);
+        })
+        .unwrap();
         let text = buffer_text(&term);
 
         assert!(text.contains("otter: ping"), "transcript line rendered");
@@ -6903,7 +7309,10 @@ mod tests {
             room: "lobby".to_owned(),
         });
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        term.draw(|f| {
+            crate::ui::render(&app, f);
+        })
+        .unwrap();
         assert!(
             buffer_text(&term).contains("# lobby (public)"),
             "lobby-only compose footer names the public room"
@@ -6912,7 +7321,10 @@ mod tests {
         // Joining a circle flips the indicator to the circle (it takes precedence).
         join_circle(&mut app, 1);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        term.draw(|f| {
+            crate::ui::render(&app, f);
+        })
+        .unwrap();
         let text = buffer_text(&term);
         // The footer names the circle. (A wide emoji's trailing skip-cell flattens
         // to an extra space in TestBackend, so match up to the glyph, not past it —
@@ -7358,7 +7770,10 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        term.draw(|f| {
+            crate::ui::render(&app, f);
+        })
+        .unwrap();
         let text = buffer_text(&term);
         assert!(
             !text.contains("BUYNOW spam"),
@@ -7382,7 +7797,10 @@ mod tests {
 
         let yellow_cells = |app: &App| -> usize {
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-            term.draw(|f| crate::ui::render(app, f)).unwrap();
+            term.draw(|f| {
+                crate::ui::render(app, f);
+            })
+            .unwrap();
             term.backend()
                 .buffer()
                 .content()
@@ -7519,7 +7937,10 @@ mod tests {
         app.on_key(press(KeyCode::Enter));
 
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        term.draw(|f| crate::ui::render(&app, f)).unwrap();
+        term.draw(|f| {
+            crate::ui::render(&app, f);
+        })
+        .unwrap();
         let text = buffer_text(&term);
         assert!(text.contains("relay#aabbccddeeff"), "server id rendered");
         assert!(text.contains("TRUSTED"), "trust slider rendered");
@@ -8172,7 +8593,10 @@ mod tests {
             ],
         });
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|frame| crate::ui::render(&app, frame)).unwrap();
+        term.draw(|frame| {
+            crate::ui::render(&app, frame);
+        })
+        .unwrap();
         let text = buffer_text(&term);
         assert!(
             text.contains("report.pdf") && text.contains("notes.md"),
@@ -8493,7 +8917,10 @@ mod tests {
         assert_eq!(app.fetch().unwrap().preview_cursor, visible - 1);
         // Render at a standard terminal; the last file must be on-screen.
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        term.draw(|frame| crate::ui::render(&app, frame)).unwrap();
+        term.draw(|frame| {
+            crate::ui::render(&app, frame);
+        })
+        .unwrap();
         let text = buffer_text(&term);
         assert!(
             text.contains("file39.bin"),
@@ -8774,14 +9201,22 @@ mod tests {
     /// `buffer_text` concatenates every row into one string with no separator,
     /// so it cannot answer either question — this splits on the real width.
     fn buffer_rows(app: &App, w: u16, h: u16) -> Vec<String> {
+        buffer_rows_reported(app, w, h).0
+    }
+
+    /// The drawn screen and what that frame reported painting — the pair the
+    /// binary's own loop works with.
+    fn buffer_rows_reported(app: &App, w: u16, h: u16) -> (Vec<String>, crate::ui::RenderReport) {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| crate::ui::render(app, f)).unwrap();
+        let mut report = crate::ui::RenderReport::default();
+        term.draw(|f| report = crate::ui::render(app, f)).unwrap();
         let buf = term.backend().buffer().clone();
-        (0..h)
+        let rows = (0..h)
             .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
-            .collect()
+            .collect();
+        (rows, report)
     }
 
     /// Define `n` share roots named `mine00`..; leaves focus on Shares.
@@ -10731,5 +11166,851 @@ mod tests {
             "the pane opened from a focus that turns the key into text"
         );
         assert_eq!(app.compose(), "c", "the character was swallowed");
+    }
+
+    // ── #235: the thread, its composer, its refusals and its delivery states ──
+
+    /// A pane with one established correspondence, its thread open.
+    fn dm_thread_app(tag: u8) -> App {
+        let mut app = dm_pane_app();
+        dm_roster(&mut app, &[tag]);
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.dm_thread(),
+            Some(&dm_pk(tag)),
+            "the thread did not open on the only correspondence row"
+        );
+        app
+    }
+
+    /// Whether a drawn row says "delivered" — the whole word, not a longer one
+    /// that contains it.
+    fn says_delivered(row: &str) -> bool {
+        row.split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| word.eq_ignore_ascii_case("delivered"))
+    }
+
+    /// Every delivery state, paired with the word it must draw.
+    ///
+    /// The match below names each variant, so a state added to the enum breaks
+    /// this list rather than reaching the screen with no word — the reason the
+    /// table is not a count.
+    fn delivery_states() -> Vec<(DeliveryState, &'static str)> {
+        let table = vec![
+            (DeliveryState::Composed, "composed"),
+            (DeliveryState::OnDht, "on-DHT"),
+            (DeliveryState::ConfirmedCollected, "confirmed-collected"),
+            (DeliveryState::Undelivered, "undelivered"),
+        ];
+        for (state, _) in &table {
+            match state {
+                DeliveryState::Composed
+                | DeliveryState::OnDht
+                | DeliveryState::ConfirmedCollected
+                | DeliveryState::Undelivered => {}
+            }
+        }
+        table
+    }
+
+    /// Paint one frame at 80x24 and answer for what it reported — the binary's
+    /// own draw-then-record pair, in one call.
+    fn dm_paint_and_record(app: &mut App) {
+        let (_, report) = buffer_rows_reported(app, 80, 24);
+        app.dm_thread_drawn(&report.painted_dm_seqs);
+    }
+
+    /// Fold one `DmEvent::Delivery`.
+    fn dm_delivery(app: &mut App, tag: u8, seq: u64, state: DeliveryState) {
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Delivery {
+            to: dm_pk(tag),
+            seq,
+            state,
+        })));
+    }
+
+    /// Fold one `DmEvent::Refused`.
+    fn dm_refused(app: &mut App, tag: u8, reason: RefusalReason) {
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Refused {
+            to: dm_pk(tag),
+            acceptance: Acceptance::Unconfirmed,
+            reason,
+            event: None,
+        })));
+    }
+
+    /// Type a message into the open thread and send it.
+    fn dm_compose_and_send(app: &mut App, body: &str) {
+        for c in body.chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        app.on_key(press(KeyCode::Enter));
+    }
+
+    /// Compose one message on the open thread and drive it to `state`.
+    ///
+    /// Always through `Composed` first, because that is the only statement the
+    /// machine makes about a fresh send and the only one that can claim the
+    /// composed body. A state reported without it belongs to a message this
+    /// session never composed, which is a different fixture.
+    fn dm_send_and_report(app: &mut App, tag: u8, body: &str, state: DeliveryState) {
+        dm_compose_and_send(app, body);
+        dm_delivery(app, tag, 0, DeliveryState::Composed);
+        if state != DeliveryState::Composed {
+            dm_delivery(app, tag, 0, state);
+        }
+    }
+
+    /// ISC-C45: an unknown sender is a contact request, and the thread renders
+    /// on accept and not before.
+    ///
+    /// Three points, because the gate fails differently at each: the request row
+    /// must open nothing, the answer alone must open nothing — the driver
+    /// reports no event for an accept, so nothing yet says a correspondence
+    /// exists — and the correspondence the accept created must open it.
+    #[test]
+    fn a_thread_renders_only_once_the_request_is_accepted() {
+        let mut app = dm_pane_app();
+        // A correspondence is present throughout, so the gate below is answering
+        // "is the selected row a request" and not "is there anything to open" —
+        // the two are indistinguishable on an empty roster, and only the second
+        // is a property of the gate.
+        dm_roster(&mut app, &[7]);
+        dm_contact_request(&mut app, 5);
+        assert_eq!(app.dm_requests().len(), 1, "the fixture holds one request");
+        assert_eq!(
+            app.dm_correspondences().len(),
+            1,
+            "the fixture holds one correspondence, so the gate has something to open"
+        );
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.iter().any(|row| row.contains("pending request from")),
+            "control: the request must be on screen; drew:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(app.dm_sel(), 0, "the selection must be on the request row");
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            app.dm_thread().is_none(),
+            "a pending contact request opened a thread"
+        );
+
+        app.on_key(press(KeyCode::Char(DM_ACCEPT_KEY)));
+        app.on_key(press(KeyCode::Enter));
+        assert!(
+            app.dm_thread().is_none(),
+            "the accept alone opened a thread, before anything confirmed it"
+        );
+
+        // The driver names the correspondence the accept created. It is the
+        // newest statement, so it draws directly below the request row.
+        dm_roster(&mut app, &[5]);
+        app.on_key(press(KeyCode::Down));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.dm_thread(),
+            Some(&dm_pk(5)),
+            "the accepted correspondence opened no thread"
+        );
+        assert!(
+            dm_pane_rows(&app)
+                .iter()
+                .any(|row| row.contains("no messages in this correspondence")),
+            "the thread drew no empty state"
+        );
+    }
+
+    /// Each delivery state draws its own word, beside the message it belongs
+    /// to.
+    #[test]
+    fn a_sent_message_draws_the_word_for_its_delivery_state() {
+        for (state, word) in delivery_states() {
+            let mut app = dm_thread_app(5);
+            dm_send_and_report(&mut app, 5, "hi", state);
+
+            let rows = dm_pane_rows(&app);
+            let wanted = format!("→ hi · {word}");
+            assert!(
+                rows.contains(&wanted),
+                "{state:?} must draw {wanted:?}; drew:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    /// ISC-C39: no state is ever drawn as "delivered".
+    ///
+    /// The needle is checked both ways first, because the whole test rests on
+    /// it: one that never matches passes on every screen, and one that matches
+    /// inside a longer word fails on the truthful "undelivered".
+    #[test]
+    fn no_drawn_row_ever_says_delivered() {
+        assert!(
+            says_delivered("→ hi · delivered"),
+            "control: the needle must find the word it looks for"
+        );
+        assert!(
+            !says_delivered("→ hi · undelivered"),
+            "control: the needle must not fire inside a longer word"
+        );
+
+        for (state, word) in delivery_states() {
+            let mut app = dm_thread_app(5);
+            // Every row kind the thread can draw, so the sweep below reads all
+            // of them rather than only a sent one.
+            app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Message {
+                from: dm_pk(5),
+                seq: 0,
+                body: "theirs".to_owned(),
+                sent_unix_ms: 1,
+            })));
+            dm_send_and_report(&mut app, 5, "hi", state);
+            dm_compose_and_send(&mut app, "queued");
+            dm_refused(&mut app, 5, RefusalReason::BodyTooLarge);
+            dm_compose_and_send(&mut app, "waiting");
+
+            let rows = dm_pane_rows(&app);
+            // The sweep is vacuous on a thread that draws nothing, so each row
+            // kind is asserted present before it is read for the word.
+            assert!(
+                rows.contains(&format!("→ hi · {word}")),
+                "{state:?} drew no sent row; drew:\n{}",
+                rows.join("\n")
+            );
+            assert!(
+                rows.contains(&"← theirs".to_owned()),
+                "no received row; drew:\n{}",
+                rows.join("\n")
+            );
+            assert!(
+                rows.contains(&"→ waiting".to_owned()),
+                "no unnumbered row; drew:\n{}",
+                rows.join("\n")
+            );
+            assert!(
+                rows.iter().any(|row| row.starts_with("✗ not sent")),
+                "no refusal row; drew:\n{}",
+                rows.join("\n")
+            );
+
+            for row in rows {
+                assert!(!says_delivered(&row), "{state:?} drew {row:?}");
+            }
+        }
+    }
+
+    /// #339 / #418: every refusal reason reaches the thread as its own phrase.
+    ///
+    /// Two failures are covered. A reason with no phrase is the silence #418
+    /// reports, and the row's absence catches it. Two reasons sharing one
+    /// phrase tells the user the wrong thing about one of them, and the
+    /// uniqueness check catches that.
+    #[test]
+    fn every_refusal_reason_draws_its_own_phrase() {
+        // The match names every variant, so a reason added to the enum breaks
+        // this list rather than arriving on screen as nothing.
+        let reasons = [
+            RefusalReason::NoKeyRecord,
+            RefusalReason::KeyRecordInvalid,
+            RefusalReason::KeyRecordRollback,
+            RefusalReason::PublishFailed,
+            RefusalReason::StoreFailure,
+            RefusalReason::AlreadyEstablished,
+            RefusalReason::AlreadyInFlight,
+            RefusalReason::MintPanicked,
+            RefusalReason::TaskPanicked,
+            RefusalReason::MintFailed,
+            RefusalReason::Module,
+            RefusalReason::OutboxFull { needed: 12 },
+            RefusalReason::NotEstablishedThisSession,
+            RefusalReason::AwaitingCorrespondentsFirstFrame,
+            RefusalReason::BodyTooLarge,
+            RefusalReason::SealFailed,
+        ];
+        for reason in reasons {
+            match reason {
+                RefusalReason::NoKeyRecord
+                | RefusalReason::KeyRecordInvalid
+                | RefusalReason::KeyRecordRollback
+                | RefusalReason::PublishFailed
+                | RefusalReason::StoreFailure
+                | RefusalReason::AlreadyEstablished
+                | RefusalReason::AlreadyInFlight
+                | RefusalReason::MintPanicked
+                | RefusalReason::TaskPanicked
+                | RefusalReason::MintFailed
+                | RefusalReason::Module
+                | RefusalReason::OutboxFull { .. }
+                | RefusalReason::NotEstablishedThisSession
+                | RefusalReason::AwaitingCorrespondentsFirstFrame
+                | RefusalReason::BodyTooLarge
+                | RefusalReason::SealFailed => {}
+            }
+        }
+
+        let mut drawn: Vec<String> = Vec::new();
+        for reason in reasons {
+            let mut app = dm_thread_app(5);
+            let before = dm_pane_rows(&app);
+            assert!(
+                !before.iter().any(|row| row.starts_with("✗ not sent")),
+                "control: the thread must draw no refusal before one arrives"
+            );
+
+            app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Refused {
+                to: dm_pk(5),
+                acceptance: Acceptance::Unconfirmed,
+                reason,
+                event: None,
+            })));
+
+            let rows = dm_pane_rows(&app);
+            let row = rows
+                .iter()
+                .find(|row| row.starts_with("✗ not sent"))
+                .unwrap_or_else(|| {
+                    panic!("{reason:?} drew no refusal row; drew:\n{}", rows.join("\n"))
+                })
+                .clone();
+            assert!(
+                row.len() > "✗ not sent — ".len(),
+                "{reason:?} drew an empty phrase: {row:?}"
+            );
+            assert!(
+                !drawn.contains(&row),
+                "{reason:?} drew a phrase another reason already draws: {row:?}"
+            );
+            drawn.push(row);
+        }
+        assert_eq!(
+            drawn.len(),
+            reasons.len(),
+            "a reason drew nothing and was not caught above"
+        );
+    }
+
+    /// A refusal stops being drawn once a send to that correspondent goes
+    /// through (#418).
+    #[test]
+    fn a_successful_send_retires_the_refusal_it_follows() {
+        let mut app = dm_thread_app(5);
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Refused {
+            to: dm_pk(5),
+            acceptance: Acceptance::Unconfirmed,
+            reason: RefusalReason::AwaitingCorrespondentsFirstFrame,
+            event: None,
+        })));
+        assert!(
+            dm_pane_rows(&app)
+                .iter()
+                .any(|row| row.starts_with("✗ not sent")),
+            "control: the refusal must be drawn before the send that retires it"
+        );
+
+        dm_send_and_report(&mut app, 5, "hi", DeliveryState::Composed);
+        assert!(
+            !dm_pane_rows(&app)
+                .iter()
+                .any(|row| row.starts_with("✗ not sent")),
+            "the refusal survived a send that succeeded"
+        );
+    }
+
+    /// The composer hands one `DmCommand::Send` to the driver and draws the
+    /// body straight away, with no delivery state — it reached the driver, and
+    /// nothing yet says it reached further.
+    #[test]
+    fn composing_and_sending_queues_one_send_command() {
+        let mut app = dm_thread_app(5);
+        let _ = app.take_pending_dm();
+
+        for c in "hello".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        assert_eq!(app.dm_compose(), "hello");
+        app.on_key(press(KeyCode::Backspace));
+        assert_eq!(app.dm_compose(), "hell", "Backspace did not rub out");
+        app.on_key(press(KeyCode::Char('o')));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.dm_compose(), "", "the composer did not clear on send");
+
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected one command, got {cmds:?}");
+        match &cmds[0] {
+            DmCommand::Send { to, body } => {
+                assert_eq!(to, &dm_pk(5), "the send named the wrong correspondent");
+                assert_eq!(body, "hello");
+            }
+            other => panic!("expected a Send, got {other:?}"),
+        }
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.iter().any(|row| *row == "→ hello"),
+            "the composed body was not drawn, or was drawn with a state nothing reported; drew:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// ISC-C45's user-education requirement: a correspondence that is not
+    /// established carries the hello-grade label.
+    ///
+    /// The established case is the control — a label drawn on every thread
+    /// marks nothing.
+    #[test]
+    fn a_pre_establishment_thread_carries_the_hello_grade_label() {
+        let app = dm_thread_app(5);
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("no messages in this correspondence")),
+            "control: the established thread must have drawn, or its silence \
+             about the label says nothing; drew:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains(DM_HELLO_GRADE)),
+            "control: an established correspondence must not carry the label"
+        );
+
+        let mut app = dm_pane_app();
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Roster {
+            correspondents: vec![daemonseed_veilid_net::dm::Correspondent {
+                pk_lt: dm_pk(6),
+                state: CorrespondentState::Pending,
+            }],
+        })));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.dm_thread(), Some(&dm_pk(6)));
+        assert!(
+            dm_pane_rows(&app)
+                .iter()
+                .any(|row| row.contains(DM_HELLO_GRADE)),
+            "a correspondence awaiting acceptance drew no hello-grade label; drew:\n{}",
+            dm_pane_rows(&app).join("\n")
+        );
+    }
+
+    /// #279: a delivery state the frame drew is surfaced to the driver exactly
+    /// once, so the durable flag clears and a redraw does not clear it twice.
+    #[test]
+    fn a_drawn_delivery_state_is_surfaced_once() {
+        // The control: the same state, folded with no thread open, is drawn
+        // nowhere and must be surfaced nowhere.
+        let mut closed = dm_pane_app();
+        dm_roster(&mut closed, &[5]);
+        closed.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::Delivery {
+            to: dm_pk(5),
+            seq: 0,
+            state: DeliveryState::Undelivered,
+        })));
+        let _ = closed.take_pending_dm();
+        let _ = dm_pane_rows(&closed);
+        dm_paint_and_record(&mut closed);
+        assert!(
+            closed.take_pending_dm().is_empty(),
+            "control: a state no thread drew was surfaced anyway"
+        );
+
+        // A state that ends nothing is owed nothing: the driver sets its
+        // durable flag only where an entry ends, so answering at `Composed`
+        // would spend the sequence number's one answer on a transition that was
+        // never outstanding and leave the ending owed for ever.
+        let mut app = dm_thread_app(5);
+        dm_send_and_report(&mut app, 5, "hi", DeliveryState::Composed);
+        let _ = app.take_pending_dm();
+        assert!(
+            dm_pane_rows(&app).contains(&"→ hi · composed".to_owned()),
+            "control: the composed state must be on screen"
+        );
+        dm_paint_and_record(&mut app);
+        assert!(
+            app.take_pending_dm().is_empty(),
+            "a composed state was surfaced, spending an answer nothing owed"
+        );
+
+        dm_delivery(&mut app, 5, 0, DeliveryState::ConfirmedCollected);
+        assert!(
+            dm_pane_rows(&app).contains(&"→ hi · confirmed-collected".to_owned()),
+            "the terminal state must be on screen before it is surfaced"
+        );
+
+        dm_paint_and_record(&mut app);
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected one command, got {cmds:?}");
+        match &cmds[0] {
+            DmCommand::Surfaced { to, seqs } => {
+                assert_eq!(to, &dm_pk(5));
+                assert_eq!(seqs, &vec![0]);
+            }
+            other => panic!("expected a Surfaced, got {other:?}"),
+        }
+
+        let _ = dm_pane_rows(&app);
+        dm_paint_and_record(&mut app);
+        assert!(
+            app.take_pending_dm().is_empty(),
+            "a redraw surfaced the same state a second time"
+        );
+    }
+
+    /// A `Delivery` that no send could have produced takes no composed body.
+    ///
+    /// Five paths emit one, and after a restart they name sequence numbers this
+    /// session never composed — a week-old message acknowledged while a fresh
+    /// body waits for its number. Pairing on arrival alone draws that body as
+    /// *confirmed-collected*, which is a stronger claim than any acknowledgement
+    /// of it supports.
+    #[test]
+    fn a_delivery_no_send_produced_takes_no_composed_body() {
+        let mut app = dm_thread_app(5);
+        dm_compose_and_send(&mut app, "hi");
+        assert!(
+            dm_pane_rows(&app).contains(&"→ hi".to_owned()),
+            "control: the body must be waiting for a number"
+        );
+
+        // Terminal, and for a sequence number nothing here has heard of.
+        dm_delivery(&mut app, 5, 3, DeliveryState::ConfirmedCollected);
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&"→ message 3 · confirmed-collected".to_owned()),
+            "the unknown sequence drew no row of its own; drew:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.contains(&"→ hi".to_owned()),
+            "the composed body was claimed by a delivery no send produced; drew:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            !rows.contains(&"→ hi · confirmed-collected".to_owned()),
+            "a composed body was drawn as collected on somebody else's acknowledgement"
+        );
+
+        // And the body is still there for the number it is owed.
+        dm_delivery(&mut app, 5, 4, DeliveryState::Composed);
+        assert!(
+            dm_pane_rows(&app).contains(&"→ hi · composed".to_owned()),
+            "the body did not pair with the send that earned it"
+        );
+    }
+
+    /// Bodies pair with sequence numbers oldest first.
+    #[test]
+    fn composed_bodies_pair_with_sequence_numbers_in_order() {
+        let mut app = dm_thread_app(5);
+        dm_compose_and_send(&mut app, "one");
+        dm_compose_and_send(&mut app, "two");
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&"→ one".to_owned()) && rows.contains(&"→ two".to_owned()),
+            "control: both bodies must be waiting; drew:\n{}",
+            rows.join("\n")
+        );
+
+        dm_delivery(&mut app, 5, 1, DeliveryState::Composed);
+        dm_delivery(&mut app, 5, 2, DeliveryState::Composed);
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&"→ one · composed".to_owned()),
+            "the first body did not take the first number; drew:\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows.contains(&"→ two · composed".to_owned()),
+            "the second body did not take the second number; drew:\n{}",
+            rows.join("\n")
+        );
+
+        // The second number climbing must move the second body's word, which is
+        // what a reversed pairing gets wrong while both read `composed`.
+        dm_delivery(&mut app, 5, 2, DeliveryState::OnDht);
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&"→ two · on-DHT".to_owned()),
+            "the bodies are paired in the wrong order; drew:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// A refused body stops being drawn, and only a refusal the send path
+    /// returns takes one.
+    #[test]
+    fn a_refusal_takes_the_body_it_answers_and_no_other() {
+        let mut app = dm_thread_app(5);
+        dm_compose_and_send(&mut app, "gone");
+        assert!(
+            dm_pane_rows(&app).contains(&"→ gone".to_owned()),
+            "control: the body must be drawn before it is refused"
+        );
+
+        dm_refused(&mut app, 5, RefusalReason::BodyTooLarge);
+        assert!(
+            !dm_pane_rows(&app).iter().any(|row| row.contains("gone")),
+            "a refused body is still drawn as though it were on its way"
+        );
+
+        // The next send takes the next number, so nothing was left misaligned.
+        dm_compose_and_send(&mut app, "next");
+        dm_delivery(&mut app, 5, 9, DeliveryState::Composed);
+        assert!(
+            dm_pane_rows(&app).contains(&"→ next · composed".to_owned()),
+            "the queue was left misaligned by the refusal"
+        );
+
+        // A first-contact-plane refusal answers no send here and must take
+        // nothing: it is retried every tick, so one failure would otherwise eat
+        // a queued body per tick.
+        let mut app = dm_thread_app(6);
+        dm_compose_and_send(&mut app, "kept");
+        dm_refused(&mut app, 6, RefusalReason::NoKeyRecord);
+        assert!(
+            dm_pane_rows(&app).contains(&"→ kept".to_owned()),
+            "a refusal from the first-contact plane ate a queued body"
+        );
+    }
+
+    /// A teardown is the last word on the messages it names.
+    ///
+    /// Without it a torn-down message keeps the word it had when it was queued,
+    /// and the ending the user is owed reaches the screen nowhere.
+    #[test]
+    fn a_teardown_ends_the_messages_it_names_and_they_surface() {
+        let mut app = dm_thread_app(5);
+        dm_send_and_report(&mut app, 5, "hi", DeliveryState::Composed);
+        let _ = app.take_pending_dm();
+        assert!(
+            dm_pane_rows(&app).contains(&"→ hi · composed".to_owned()),
+            "control: the message must be drawn as composed first"
+        );
+
+        app.on_net_event(NetEvent::Dm(std::sync::Arc::new(DmEvent::ChannelLost {
+            with: dm_pk(5),
+            cause: daemonseed_core::dm::provisional::TeardownCause::NoProvisionalRecord,
+            event: TrustEventKey::DmCorrespondentStateLost,
+            surfaced: vec![0],
+        })));
+
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&"→ hi · undelivered".to_owned()),
+            "the teardown left a superseded word on screen; drew:\n{}",
+            rows.join("\n")
+        );
+
+        dm_paint_and_record(&mut app);
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected one command, got {cmds:?}");
+        match &cmds[0] {
+            DmCommand::Surfaced { to, seqs } => {
+                assert_eq!(to, &dm_pk(5));
+                assert_eq!(seqs, &vec![0]);
+            }
+            other => panic!("expected a Surfaced, got {other:?}"),
+        }
+    }
+
+    /// A thread taller than its pane answers only for the rows the pane
+    /// painted.
+    ///
+    /// The pane shows the tail, because a thread grows downward and the state
+    /// that just changed is on the last row. So the newest endings are answered
+    /// for and the oldest — scrolled off the top, on no screen anybody read —
+    /// are left owed, which is the direction the durable flag exists to fail in.
+    #[test]
+    fn a_thread_taller_than_its_pane_answers_only_for_what_it_painted() {
+        // 24 rows: three of status bar, three of input, eighteen of pane, of
+        // which sixteen are inside its border. Twenty-five messages cannot fit.
+        const SENT: u64 = 25;
+        let mut app = dm_thread_app(5);
+        for seq in 0..SENT {
+            dm_compose_and_send(&mut app, &format!("m{seq}"));
+            dm_delivery(&mut app, 5, seq, DeliveryState::Composed);
+            dm_delivery(&mut app, 5, seq, DeliveryState::ConfirmedCollected);
+        }
+        let _ = app.take_pending_dm();
+
+        let (rows, report) = buffer_rows_reported(&app, 80, 24);
+        let drawn: Vec<String> = rows
+            .iter()
+            .filter_map(|row| {
+                Some(
+                    row.strip_prefix('│')?
+                        .strip_suffix('│')?
+                        .trim_end()
+                        .to_owned(),
+                )
+            })
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert!(
+            !report.painted_dm_seqs.is_empty(),
+            "control: the frame must have painted something to answer for"
+        );
+        assert!(
+            report.painted_dm_seqs.len() < SENT as usize,
+            "control: the pane must be too small for all {SENT} rows, or this \
+             test proves nothing; it reported {}",
+            report.painted_dm_seqs.len()
+        );
+        // The tail is what is on screen.
+        let newest = SENT - 1;
+        assert!(
+            report.painted_dm_seqs.contains(&newest),
+            "the newest message was not painted; reported {:?}",
+            report.painted_dm_seqs
+        );
+        assert!(
+            !report.painted_dm_seqs.contains(&0),
+            "the oldest message was reported painted from a pane that cannot \
+             hold it; reported {:?}",
+            report.painted_dm_seqs
+        );
+        for seq in &report.painted_dm_seqs {
+            assert!(
+                drawn.contains(&format!("→ m{seq} · confirmed-collected")),
+                "seq {seq} was reported painted and is on no drawn row; drew:\n{}",
+                drawn.join("\n")
+            );
+        }
+
+        app.dm_thread_drawn(&report.painted_dm_seqs);
+        let cmds = app.take_pending_dm();
+        assert_eq!(cmds.len(), 1, "expected one command, got {cmds:?}");
+        match &cmds[0] {
+            DmCommand::Surfaced { seqs, .. } => {
+                assert_eq!(
+                    seqs, &report.painted_dm_seqs,
+                    "the answer named sequence numbers the frame did not paint"
+                );
+                assert!(
+                    !seqs.contains(&0),
+                    "a clipped message's ending was cleared with the driver"
+                );
+            }
+            other => panic!("expected a Surfaced, got {other:?}"),
+        }
+    }
+
+    /// A wrapped body still occupies the rows it needs, so the tail fill counts
+    /// screen rows and not messages.
+    #[test]
+    fn a_wrapped_body_costs_the_rows_it_occupies() {
+        let mut app = dm_thread_app(5);
+        // Four bodies, each three screen rows wide in a 78-column pane.
+        let long = "w ".repeat(100);
+        for seq in 0..6u64 {
+            dm_compose_and_send(&mut app, long.trim_end());
+            dm_delivery(&mut app, 5, seq, DeliveryState::Composed);
+            dm_delivery(&mut app, 5, seq, DeliveryState::Undelivered);
+        }
+        let _ = app.take_pending_dm();
+
+        let (_, report) = buffer_rows_reported(&app, 80, 24);
+        assert!(
+            !report.painted_dm_seqs.is_empty(),
+            "control: something must have been painted"
+        );
+        assert!(
+            report.painted_dm_seqs.len() < 6,
+            "a wrapped body was counted as one row: {:?}",
+            report.painted_dm_seqs
+        );
+        assert!(
+            report.painted_dm_seqs.contains(&5),
+            "the newest wrapped body was not painted: {:?}",
+            report.painted_dm_seqs
+        );
+    }
+
+    /// Leaving a thread sends nothing.
+    ///
+    /// Esc is the only way out, so a change that routed it through the send
+    /// would ship a half-typed message with every other assertion here still
+    /// green.
+    #[test]
+    fn leaving_a_thread_sends_nothing() {
+        let mut app = dm_thread_app(5);
+        let _ = app.take_pending_dm();
+        for c in "secret".chars() {
+            app.on_key(press(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.dm_compose(),
+            "secret",
+            "control: the buffer must be set"
+        );
+
+        app.on_key(press(KeyCode::Esc));
+
+        let cmds = app.take_pending_dm();
+        assert!(cmds.is_empty(), "leaving the thread sent {cmds:?}");
+        assert_eq!(
+            app.dm_compose(),
+            "",
+            "the buffer survived leaving the thread"
+        );
+        assert!(app.dm_thread().is_none(), "Esc did not leave the thread");
+        assert!(
+            !dm_pane_rows(&app).iter().any(|row| row.contains("secret")),
+            "the abandoned draft is still drawn"
+        );
+    }
+
+    /// Both direct-message legends fit an 80-column terminal, and the thread's
+    /// way out is whole.
+    #[test]
+    fn the_direct_message_legends_fit_eighty_columns() {
+        // The control is a legend one column too long for the block, cut the
+        // way the block cuts it. The assertion below must fail on it.
+        let over = format!("dm thread  {}  [Esc] back", "x".repeat(60));
+        let cut: String = over.chars().take(78).collect();
+        assert!(
+            !legend_text(&format!("┌{cut}┐")).ends_with("[Esc] back"),
+            "the control legend must fail the assertion the real one passes"
+        );
+
+        let mut app = dm_thread_app(5);
+        let rows = buffer_rows(&app, 80, 24);
+        // Counted in characters rather than display width: every glyph in
+        // these legends is single-width, and the crate that measures width is
+        // not a dependency here. A legend that grows a wide glyph needs the
+        // real measure.
+        let legend = legend_text(&rows[rows.len() - 3]);
+        assert!(
+            legend.chars().count() <= 78,
+            "the thread legend is {} columns: {legend:?}",
+            legend.chars().count()
+        );
+        assert!(
+            legend.ends_with("[Esc] back"),
+            "the thread legend truncated its way out: {legend:?}"
+        );
+
+        // The roster legend grew a hint in the same change, and it has no
+        // `[Esc] back` — its way out leads instead, so the last hint is what
+        // truncation reaches first.
+        app.on_key(press(KeyCode::Esc));
+        assert!(app.dm_thread().is_none(), "Esc did not leave the thread");
+        assert!(
+            app.dm_pane_open(),
+            "Esc left the pane as well as the thread"
+        );
+        let rows = buffer_rows(&app, 80, 24);
+        let legend = legend_text(&rows[rows.len() - 3]);
+        assert!(
+            legend.chars().count() <= 78,
+            "the roster legend is {} columns: {legend:?}",
+            legend.chars().count()
+        );
+        assert!(
+            legend.ends_with(&format!("[{DM_BLOCK_KEY}] block")),
+            "the roster legend truncated its last hint: {legend:?}"
+        );
     }
 }
