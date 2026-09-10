@@ -2987,6 +2987,29 @@ mod tests {
         })
     }
 
+    /// The acknowledgement fetches `with`'s last `ChannelHealth` in `events`
+    /// counted as answered with an error, or zero where it emitted none.
+    ///
+    /// Keyed on the correspondent, because the counters are per-correspondence
+    /// and a driver holding two of them interleaves their reports.
+    fn failed_ack_fetches(
+        events: &[DmEvent],
+        with: &[u8; daemonseed_core::identity::keys::IDENTITY_PK_LEN],
+    ) -> u64 {
+        events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                DmEvent::ChannelHealth {
+                    with: reported,
+                    peer_ack_fetches_failed,
+                    ..
+                } if reported.as_ref() == with => Some(*peer_ack_fetches_failed),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
     /// The sequence numbers reported undelivered in `events`.
     fn undelivered(events: &[DmEvent]) -> Vec<u64> {
         deliveries(events)
@@ -5501,6 +5524,14 @@ mod tests {
             last_health(&a_events).map_or(0, |h| h.4),
             0,
             "A deferred the piggybacked acknowledgement instead of folding it: {a_events:?}"
+        );
+        // The refused fetches reach the counter through the driver's own path —
+        // the seam, `dispatch`'s tag, and the machine's fold of the failure —
+        // which is the only place that chain is exercised end to end.
+        assert!(
+            failed_ack_fetches(&a_events, b_keys.signing.public_key()) >= 1,
+            "every fetch on A's seam was refused and none of them was counted: \
+             {a_events:?}"
         );
 
         handle_a.send(DmCommand::Shutdown).await.expect("stop A");

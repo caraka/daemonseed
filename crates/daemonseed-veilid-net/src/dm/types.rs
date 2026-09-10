@@ -425,6 +425,32 @@ pub enum DmEvent {
         /// nothing at all. Counted rather than surfaced: the sender's own re-seed
         /// ladder and give-up already carry the user-visible consequence.
         peer_acks_unverified: u64,
+        /// Fetches of the correspondent's acknowledgement record the seam
+        /// answered with an error: the read errored, the read was cut off at its
+        /// bound and abandoned, or the record would not open.
+        ///
+        /// **Counted here rather than on the doorbell's counters because the
+        /// record belongs to this correspondence's acknowledgement plane.** Its
+        /// address derives from the conversation's own secret address root and
+        /// it is read only for a correspondence holding an unacknowledged
+        /// message, so a fetch that fails names exactly one correspondent — the
+        /// same one `peer_acks_unverified` and the rest are counted against. The
+        /// doorbell's counters describe this identity's own inbound plane, which
+        /// no correspondent's acknowledgement record is part of.
+        ///
+        /// **Each of those is one count, because the seam answers all of them
+        /// alike.** A read cut off at its bound is reported as the transport
+        /// failure an erroring read produces, and every one of them says the
+        /// same thing: the record's state is unknown. `Ok(None)` — the
+        /// authoritative empty slot — is a record that answered and is not
+        /// counted here, and neither is a fetch whose task panicked, which
+        /// reaches the driver as a panic rather than as an answer.
+        ///
+        /// The fetch is re-planned by every tick that still finds the outbox
+        /// unacknowledged, so a correspondent whose record never answers raises
+        /// this once a tick for as long as the message stands, and nothing else
+        /// states an answer of this kind.
+        peer_ack_fetches_failed: u64,
         /// Receive-cursor records found unreadable and replaced.
         ///
         /// A `cursor.bin` that is the wrong width, does not authenticate, or
@@ -829,6 +855,7 @@ impl core::fmt::Debug for DmEvent {
                 peer_acks_deferred,
                 peer_acks_clipped,
                 peer_acks_unverified,
+                peer_ack_fetches_failed,
                 leg_folds_deferred,
                 leg_unaddressable,
                 ..
@@ -842,6 +869,7 @@ impl core::fmt::Debug for DmEvent {
                      peer_acks_deferred: {peer_acks_deferred}, \
                      peer_acks_clipped: {peer_acks_clipped}, \
                      peer_acks_unverified: {peer_acks_unverified}, \
+                     peer_ack_fetches_failed: {peer_ack_fetches_failed}, \
                      leg_folds_deferred: {leg_folds_deferred}, \
                      leg_unaddressable: {leg_unaddressable} }}"
                 )

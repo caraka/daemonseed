@@ -1387,6 +1387,8 @@ pub struct DmChannelHealth {
     pub peer_acks_clipped: u64,
     /// Standalone acknowledgement records that did not verify.
     pub peer_acks_unverified: u64,
+    /// Acknowledgement fetches that errored or were abandoned at their bound.
+    pub peer_ack_fetches_failed: u64,
     /// Receive-cursor records found unreadable and replaced.
     pub cursor_records_repaired: u64,
     /// Re-establishment legs that opened and whose fold could not finish.
@@ -1404,7 +1406,9 @@ impl std::fmt::Debug for DmChannelHealth {
             f,
             ", partial_sweeps: {}, already_consumed: {}, unopenable: {}, \
              peer_pseudonym_unknown: {}, peer_acks_deferred: {}, peer_acks_clipped: {}, \
-             peer_acks_unverified: {}, cursor_records_repaired: {} }}",
+             peer_acks_unverified: {}, peer_ack_fetches_failed: {}, \
+             cursor_records_repaired: {}, leg_folds_deferred: {}, \
+             leg_unaddressable: {} }}",
             self.partial_sweeps,
             self.already_consumed,
             self.unopenable,
@@ -1412,7 +1416,10 @@ impl std::fmt::Debug for DmChannelHealth {
             self.peer_acks_deferred,
             self.peer_acks_clipped,
             self.peer_acks_unverified,
-            self.cursor_records_repaired
+            self.peer_ack_fetches_failed,
+            self.cursor_records_repaired,
+            self.leg_folds_deferred,
+            self.leg_unaddressable
         )
     }
 }
@@ -1558,6 +1565,7 @@ impl DmState {
                 peer_acks_deferred,
                 peer_acks_clipped,
                 peer_acks_unverified,
+                peer_ack_fetches_failed,
                 cursor_records_repaired,
                 leg_folds_deferred,
                 leg_unaddressable,
@@ -1571,6 +1579,7 @@ impl DmState {
                     peer_acks_deferred: *peer_acks_deferred,
                     peer_acks_clipped: *peer_acks_clipped,
                     peer_acks_unverified: *peer_acks_unverified,
+                    peer_ack_fetches_failed: *peer_ack_fetches_failed,
                     cursor_records_repaired: *cursor_records_repaired,
                     leg_folds_deferred: *leg_folds_deferred,
                     leg_unaddressable: *leg_unaddressable,
@@ -10006,6 +10015,7 @@ mod tests {
             peer_acks_deferred: 0,
             peer_acks_clipped: 0,
             peer_acks_unverified: 0,
+            peer_ack_fetches_failed: 0,
             cursor_records_repaired: 0,
             leg_folds_deferred: 0,
             leg_unaddressable: 0,

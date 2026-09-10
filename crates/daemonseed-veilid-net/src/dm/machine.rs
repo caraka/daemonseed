@@ -1166,6 +1166,7 @@ struct ChannelCounters {
     peer_acks_deferred: u64,
     peer_acks_clipped: u64,
     peer_acks_unverified: u64,
+    peer_ack_fetches_failed: u64,
     cursor_records_repaired: u64,
     leg_folds_deferred: u64,
     leg_unaddressable: u64,
@@ -1659,6 +1660,7 @@ impl Correspondence {
             peer_acks_deferred: self.health.peer_acks_deferred,
             peer_acks_clipped: self.health.peer_acks_clipped,
             peer_acks_unverified: self.health.peer_acks_unverified,
+            peer_ack_fetches_failed: self.health.peer_ack_fetches_failed,
             cursor_records_repaired: self.health.cursor_records_repaired,
             leg_folds_deferred: self.health.leg_folds_deferred,
             leg_unaddressable: self.health.leg_unaddressable,
@@ -2490,18 +2492,19 @@ impl DmMachine {
                 let folded = match result {
                     Err(e) => {
                         crate::vtrace!("dm driver: operation failed: {e}");
+                        let mut effects = self.count_failed_fetch(kind, &tag);
                         // An introduction whose fetch or write failed on the
                         // transport is refused rather than left in flight: the
                         // front end may ask again, and a silently retained
                         // introduction would refuse that second ask as a duplicate.
-                        match tag.introduction {
-                            Some(recipient) => self.refuse_introduction(
-                                &recipient,
+                        if let Some(recipient) = tag.introduction.as_ref() {
+                            effects.extend(self.refuse_introduction(
+                                recipient,
                                 RefusalReason::PublishFailed,
                                 None,
-                            ),
-                            None => Vec::new(),
+                            ));
                         }
+                        effects
                     }
                     Ok(DhtResult::Doorbell(sweep)) => self.on_doorbell(now_ms, sweep),
                     Ok(DhtResult::KeyRecord(record)) => match tag.introduction {
@@ -2625,6 +2628,43 @@ impl DmMachine {
             | DhtOpKind::ClosePage
             | DhtOpKind::PinPages => {}
         }
+    }
+
+    /// Count a fetch the seam answered with an error against the correspondence
+    /// it was asked for, and state the count.
+    ///
+    /// **The acknowledgement fetch is the only read on this seam that names a
+    /// conversation.** A key-record fetch belongs to an introduction, which has
+    /// no correspondence to be counted against and whose failure already reaches
+    /// the front end as a refusal; a page sweep counts each read that did not
+    /// answer inside the [`crate::SweepOutcome`] it returns. So an
+    /// acknowledgement fetch is the one whose error nothing else states.
+    ///
+    /// Every error the seam answers with is one count, for the reason
+    /// `peer_ack_fetches_failed` gives on [`DmEvent::ChannelHealth`]: a read cut
+    /// off at its bound is reported as the transport failure an erroring read
+    /// produces, and each leaves the record's state unknown.
+    ///
+    /// **Counted against the correspondence as it stands now, not as it stood
+    /// when the fetch was asked for.** A conversation the machine no longer
+    /// holds — removed while its fetch was in flight — has nothing to count
+    /// against and is passed over; a torn-down conversation is still here and is
+    /// still counted, since a teardown stops the planning of new fetches and
+    /// says nothing about one already outstanding.
+    fn count_failed_fetch(&mut self, kind: DhtOpKind, tag: &OpTag) -> Vec<DmEffect> {
+        if kind != DhtOpKind::FetchAck {
+            return Vec::new();
+        }
+        let Some(conversation) = tag.conversation else {
+            return Vec::new();
+        };
+        let Some(index) = self.index_of_conversation(&conversation) else {
+            return Vec::new();
+        };
+        let correspondence = &mut self.correspondences[index];
+        let before = correspondence.health;
+        correspondence.health.peer_ack_fetches_failed += 1;
+        correspondence.health_event(before).into_iter().collect()
     }
 
     /// When the shell should next wake the machine if nothing else happens.
@@ -21971,6 +22011,231 @@ mod tests {
                 "torn_down={torn_down}: the leg's rung went {before} -> {after}"
             );
         }
+    }
+
+    /// Tell `m` that one operation of `kind` on `conversation` was answered with
+    /// an error by the seam — the shape it hands back for a read that errored,
+    /// one abandoned at its bound, and a record that would not open alike.
+    ///
+    /// The tag names the conversation and no page, which is what both
+    /// operations on the acknowledgement record carry.
+    fn dht_failed(
+        m: &mut DmMachine,
+        now_ms: i64,
+        kind: DhtOpKind,
+        conversation: [u8; AR_FINGERPRINT_LEN],
+    ) -> Vec<DmEffect> {
+        m.on_outcome(
+            now_ms,
+            DmOutcome::Dht(DhtOutcome {
+                kind,
+                tag: OpTag::channel(conversation, None, None),
+                result: Err(crate::VeilidNetError::Routing(
+                    "the acknowledgement record did not answer".to_string(),
+                )),
+            }),
+        )
+    }
+
+    /// [`dht_failed`] for the acknowledgement fetch.
+    fn ack_fetch_failed(
+        m: &mut DmMachine,
+        now_ms: i64,
+        conversation: [u8; AR_FINGERPRINT_LEN],
+    ) -> Vec<DmEffect> {
+        dht_failed(m, now_ms, DhtOpKind::FetchAck, conversation)
+    }
+
+    /// The counters every `ChannelHealth` in a batch of effects reported, as
+    /// `(with, peer_ack_fetches_failed)`.
+    fn fetch_failures_stated(effects: &[DmEffect]) -> Vec<(PkLt, u64)> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::ChannelHealth {
+                    with,
+                    peer_ack_fetches_failed,
+                    ..
+                }) => Some((with.clone(), *peer_ack_fetches_failed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M83. **An acknowledgement fetch that came back with no answer is counted
+    /// once, against the correspondence that asked for it.**
+    ///
+    /// A read abandoned at its bound is reported as the transport failure an
+    /// erroring read produces, so this is what an unanswered acknowledgement
+    /// record looks like by the time the machine sees it. Nothing else states
+    /// it: the tag carries no introduction to refuse, and the fetch is
+    /// re-planned by every tick that still finds the outbox unacknowledged, so
+    /// without the counter a correspondent whose record never answers is
+    /// indistinguishable from one who has confirmed nothing yet.
+    ///
+    /// **The control is the same conversation answering.** It runs first and
+    /// settles the message the fixture sent, so the fetch path is doing its
+    /// ordinary work rather than nothing at all — and a counter that moved on
+    /// every fetch rather than on the failing ones would fail there.
+    #[test]
+    fn an_acknowledgement_fetch_that_did_not_answer_is_counted() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to: Box::new(*b_keys.signing.public_key()),
+                body: "unanswered".into(),
+            },
+        );
+        let conversation = conversation_of(&a, 0);
+
+        let settled = ack_fetched(
+            &mut a,
+            BASE_MS,
+            conversation,
+            ack_record_from(&b, 0, &[0, 1]),
+        );
+        assert_eq!(
+            deliveries_in(&settled),
+            vec![(1, DeliveryState::ConfirmedCollected)],
+            "the answering fetch must settle the message it confirms: {settled:?}"
+        );
+        assert_eq!(
+            a.correspondences[0].health.peer_ack_fetches_failed, 0,
+            "a fetch that answered was counted as one that did not"
+        );
+
+        let effects = ack_fetch_failed(&mut a, BASE_MS, conversation);
+        assert_eq!(
+            a.correspondences[0].health.peer_ack_fetches_failed, 1,
+            "an unanswered fetch must move the counter by exactly one"
+        );
+        let stated: Vec<u64> = fetch_failures_stated(&effects)
+            .into_iter()
+            .map(|(_, count)| count)
+            .collect();
+        assert_eq!(
+            stated,
+            vec![1],
+            "the unanswered fetch must be stated exactly once: {effects:?}"
+        );
+    }
+
+    /// M84. **Only the acknowledgement fetch moves the fetch counter, not every
+    /// failure that names the conversation.**
+    ///
+    /// The counter is a statement about reads of one record, and the standalone
+    /// acknowledgement WRITE to that same record fails on the same transport
+    /// under an identical tag — the conversation, no page. So the operation's
+    /// kind is the only thing separating them, and a count taken on the tag
+    /// alone would be the union of a read fault and a write fault reported as
+    /// the read one.
+    ///
+    /// The fetch afterwards is the positive control: it proves this fixture's
+    /// conversation can move the counter at all, so the zero above is the kind
+    /// being read and not a correspondence the fold never found.
+    #[test]
+    fn a_failure_that_is_not_an_acknowledgement_fetch_is_not_counted() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        let conversation = conversation_of(&a, 0);
+
+        let effects = dht_failed(&mut a, BASE_MS, DhtOpKind::PublishAck, conversation);
+        assert_eq!(
+            a.correspondences[0].health.peer_ack_fetches_failed, 0,
+            "a failed acknowledgement WRITE was counted as a failed fetch"
+        );
+        assert_eq!(
+            fetch_failures_stated(&effects),
+            Vec::new(),
+            "a failed acknowledgement write stated channel health: {effects:?}"
+        );
+
+        ack_fetch_failed(&mut a, BASE_MS, conversation);
+        assert_eq!(
+            a.correspondences[0].health.peer_ack_fetches_failed, 1,
+            "the fixture's own conversation cannot move the counter, so the \
+             zero above proves nothing"
+        );
+    }
+
+    /// M85. **A failed fetch is counted against the correspondence its tag
+    /// names, not against the first one this side holds.**
+    ///
+    /// The counters are per-correspondence and the event carries the
+    /// correspondent it belongs to, so a count landing on whichever
+    /// correspondence came first would attribute a silent correspondent's dead
+    /// record to somebody who is answering normally — and every conversation on
+    /// a client that holds several would read as faulty as its worst one.
+    ///
+    /// A's second correspondence is the one whose fetch fails, so the first
+    /// staying at zero is the assertion with teeth.
+    #[test]
+    fn a_failed_fetch_is_counted_against_its_own_correspondence() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let dir_c = tempfile::tempdir().expect("temp dir C");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision B");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        // A's second correspondence, established the way the first one was: the
+        // knock, the acceptance C queues for it, and A's fold of that page.
+        let c_keys = third_identity();
+        let mut c = machine_as(third_identity(), &dir_c);
+        c.persist.provision_block_list().expect("provision C");
+        let entry = knock_as_initiator(&mut a, &c_keys);
+        let out = c.on_doorbell(BASE_MS, sweep_of(vec![entry]));
+        let request = out
+            .iter()
+            .find_map(|e| match e {
+                DmEffect::Emit(DmEvent::ContactRequest { request, .. }) => Some(request.clone()),
+                _ => None,
+            })
+            .expect("C was not offered the knock");
+        c.on_command(BASE_MS, DmCommand::Accept { request });
+        let label_c = c.correspondences[0].label;
+        let acceptance = queued_frame_at(&c, &label_c, 0, BASE_MS);
+        let with_c = conversation_of(&a, 1);
+        let out = fold_page_at(
+            &mut a,
+            BASE_MS,
+            with_c,
+            0,
+            vec![(position_of(0), acceptance)],
+        );
+        assert!(
+            a.correspondences[1].peer_pk_pc.is_some(),
+            "the acceptance did not install C's pseudonym: {out:?}"
+        );
+
+        let effects = ack_fetch_failed(&mut a, BASE_MS, with_c);
+        assert_eq!(
+            a.correspondences[0].health.peer_ack_fetches_failed, 0,
+            "C's failed fetch was counted against B"
+        );
+        assert_eq!(
+            a.correspondences[1].health.peer_ack_fetches_failed, 1,
+            "C's failed fetch was not counted against C"
+        );
+        assert_eq!(
+            fetch_failures_stated(&effects),
+            vec![(Box::new(*c_keys.signing.public_key()), 1)],
+            "the count must be stated once, naming C: {effects:?}"
+        );
     }
 
     /// Every page a batch of effects asks the transport to close.

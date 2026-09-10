@@ -26,6 +26,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `peer_ack_fetches_failed`, one per fetch of a
+  correspondent's acknowledgement record that came back with no answer (#429).
 - `daemonseed-tui`: a direct-message pane, opened and closed with `[c]` from any pane that does not
   turn a printable key into text, and closed with `Esc`. It lists the pending contact requests and
   then the correspondences, newest first by the last driver event that named one, with both counts

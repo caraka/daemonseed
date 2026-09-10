@@ -513,7 +513,7 @@ types:
       ChannelLost{with,cause,event,surfaced}, ReestablishmentAnomaly{with,event},
       ChannelDirectionUnknown{with},
       DoorbellHealth{outcome,admission,pending_full},
-      ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified,cursor_records_repaired},
+      ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified,peer_ack_fetches_failed,cursor_records_repaired,leg_folds_deferred,leg_unaddressable},
       ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
       BlockListUnreadable, SpentTokensNotPersisted. Roster is emitted once, before
       the driver's first tick, and names every correspondence on disk exactly once
@@ -536,8 +536,10 @@ types:
       is installed yet — once per sweep that saw them, so a position stuck across
       four sweeps counts four. peer_acks_deferred counts peer acknowledgements that
       would not merge into the retained state, peer_acks_clipped counts claims above
-      the highest sequence this side has sent, and peer_acks_unverified counts
-      fetched records that did not decode or did not verify.
+      the highest sequence this side has sent, peer_acks_unverified counts
+      fetched records that did not decode or did not verify, and
+      peer_ack_fetches_failed counts fetches of that record that came back with
+      no answer, an erroring read and one abandoned at its bound alike.
       cursor_records_repaired counts receive-cursor records found unreadable and
       replaced with this session's own page. leg_folds_deferred counts
       re-establishment legs that opened and whose fold could not finish, whose
