@@ -339,6 +339,74 @@ async fn rendezvous_key_for(
     Ok(RendezvousHandle::new(key, shape))
 }
 
+/// How long one raw record open may run before it is abandoned (#430).
+///
+/// The same bound as [`SWEEP_GET_TIMEOUT`], and deliberately not a second number:
+/// both cover one DHT round trip that this side cannot cancel.
+///
+/// **The headroom over veilid's own budget is 5s, not the whole 15.** An open
+/// inspects subkey 0 under `get_value_timeout_ms`, 10 000 ms in veilid's defaults,
+/// which daemonseed does not override — so an open that answers at all normally
+/// answers inside that, and this bound is what covers the case where it does not.
+/// **The wait for veilid's per-record lifetime lock is inside our bound too**
+/// (`storage_manager/open_record.rs` takes it before the inspect), so a record
+/// another task is already opening spends part of the 15s queued rather than
+/// reading.
+///
+/// **The two opens of [`open_or_create`] are bounded separately**, so a call whose
+/// first open elapses and whose reopen then elapses spends twice this.
+pub const OPEN_TIMEOUT: std::time::Duration = SWEEP_GET_TIMEOUT;
+
+/// Run one raw record open under an un-gated-op permit, bounded by
+/// [`OPEN_TIMEOUT`] (#430).
+///
+/// **What is held, and when it is released.** The permit is acquired first and
+/// `open` is polled only inside the bound, so the bound covers the open itself
+/// and never the wait for a permit — the split
+/// [`actor::gated_bounded_get`](crate::actor) uses on the read lane. An open that
+/// has not answered when the bound expires is abandoned: the future is dropped
+/// and the permit released with it, so an unanswered open cannot hold one of the
+/// [`DHT_GATE_MARGIN`](crate::dht_gate::DHT_GATE_MARGIN) un-gated permits past
+/// the bound. Two things the caller holds are released by the same return: the
+/// **record lock**, which every open site awaits this under, so an open with no
+/// bound held it for the life of the process and every publish, fetch, sweep and
+/// repair of that record waited on it; and the **dispatch-lane permit** a write
+/// path holds across its whole publish — the floor lane is a single permit, so an
+/// unbounded open reached through one stopped every floor write in the process,
+/// not only writes to that record.
+///
+/// **What is not bounded is the `create_dht_record` between
+/// [`open_or_create`]'s two opens**, and that is safe only because the create is
+/// local: it mints a keypair and writes the local store under that record's own
+/// lock, with no network round trip to wait on.
+///
+/// An open cut off at the bound is reported as `VeilidAPIError::Timeout`, which
+/// keeps two properties the callers depend on: it is **not** `KeyNotFound`, so
+/// [`open_or_create`] reads it as a transport fault and creates nothing, and it
+/// is the same error type a refusing open returns, so every caller's existing
+/// `Err` handling covers it and surfaces it as [`VeilidNetError::Routing`].
+async fn gated_bounded_open<T>(
+    gate: &Arc<DhtGate>,
+    what: &str,
+    open: impl std::future::Future<Output = std::result::Result<T, veilid_core::VeilidAPIError>>,
+) -> std::result::Result<T, veilid_core::VeilidAPIError> {
+    let opened = {
+        let _ungated = gate.acquire_ungated().await;
+        tokio::time::timeout(OPEN_TIMEOUT, open).await
+    };
+    match opened {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            // The error itself carries no message, so what elapsed is said here.
+            crate::vtrace!(
+                "{what}: open exceeded {}s, abandoned",
+                OPEN_TIMEOUT.as_secs()
+            );
+            Err(veilid_core::VeilidAPIError::Timeout)
+        }
+    }
+}
+
 /// Open the circle's rendezvous record, creating it deterministically if it is
 /// not yet on the network. Every member holds the owner secret, so any member
 /// can do either. Returns the (deterministic) record key.
@@ -367,15 +435,18 @@ pub async fn open_or_create(
     crate::vtrace!("open_or_create: rendezvous key={key:?}; trying open#1");
     // §RS-2 margin limiter: each raw `open_dht_record` is an un-gated DHT op, so it
     // holds an un-gated-op permit across the call — peak open concurrency ≤ margin(2)
-    // by construction (CRSH-ISC-14), never a census argument. Acquired at raw-call
-    // granularity (not spanning the whole fn) so the margin is occupied only for the
-    // open RPC, and `create_dht_record` between the two opens runs without it.
-    // CRSH-ISC-17: `open_or_create` issues no gated GET, so no read-pool permit is ever
-    // held while this limiter permit is acquired (the single-permit rule is respected).
-    let open1 = {
-        let _ungated = gate.acquire_ungated().await;
-        rc.open_dht_record(key.clone(), Some(owner.clone())).await
-    };
+    // by construction (CRSH-ISC-14), never a census argument. The permit is taken at
+    // raw-call granularity inside `gated_bounded_open`, so the margin is occupied only
+    // for the open RPC and for at most `OPEN_TIMEOUT`, and `create_dht_record` between
+    // the two opens runs without it. CRSH-ISC-17: `open_or_create` issues no gated GET,
+    // so no read-pool permit is ever held while this limiter permit is acquired (the
+    // single-permit rule is respected).
+    let open1 = gated_bounded_open(
+        gate,
+        "open_or_create",
+        rc.open_dht_record(key.clone(), Some(owner.clone())),
+    )
+    .await;
     // Only a genuine absence justifies creating. Every other error — `Timeout`,
     // `TryAgain`, `NoConnection` — is a transport fault on a record that may well
     // already exist, and creating on one manufactures a network record nobody asked
@@ -413,12 +484,16 @@ pub async fn open_or_create(
             }
         }
     }
-    let r = {
-        let _ungated = gate.acquire_ungated().await;
-        rc.open_dht_record(key.clone(), Some(owner.clone())).await
-    }
+    let r = gated_bounded_open(
+        gate,
+        "open_or_create reopen",
+        rc.open_dht_record(key.clone(), Some(owner.clone())),
+    )
+    .await
     .map(|_| handle)
-    .map_err(|e| VeilidNetError::Routing(e.to_string()));
+    // Named, because an abandoned open surfaces as a bare `Timeout` that says
+    // nothing about which open it was.
+    .map_err(|e| VeilidNetError::Routing(format!("open_or_create reopen: {e}")));
     crate::vtrace!(
         "open_or_create: reopen {}",
         if r.is_ok() { "ok -> Ok" } else { "ERR" }
@@ -473,14 +548,17 @@ pub async fn open_only(
     let handle = rendezvous_key(api, owner, shape).await?;
     let key = handle.key().clone();
     crate::vtrace!("open_only: rendezvous key={key:?}; trying open (no create)");
-    // §RS-2 margin limiter, for the reason `open_or_create` gives: the raw open is an
-    // un-gated DHT op and holds an un-gated-op permit across the call, acquired at
-    // raw-call granularity. This function issues no gated GET, so the single-permit
-    // rule (CRSH-ISC-17) is respected.
-    let opened = {
-        let _ungated = gate.acquire_ungated().await;
-        rc.open_dht_record(key, Some(owner.clone())).await
-    };
+    // §RS-2 margin limiter and the open's own bound, for the reason `open_or_create`
+    // gives: the raw open is an un-gated DHT op and holds an un-gated-op permit across
+    // the call, taken at raw-call granularity inside `gated_bounded_open`. This
+    // function issues no gated GET, so the single-permit rule (CRSH-ISC-17) is
+    // respected.
+    let opened = gated_bounded_open(
+        gate,
+        "open_only",
+        rc.open_dht_record(key, Some(owner.clone())),
+    )
+    .await;
     match opened {
         Ok(_) => {
             crate::vtrace!("open_only: open ok -> Some");
@@ -492,7 +570,7 @@ pub async fn open_only(
         }
         Err(e) => {
             crate::vtrace!("open_only: open failed ({e}) -> Err");
-            Err(VeilidNetError::Routing(e.to_string()))
+            Err(VeilidNetError::Routing(format!("open_only: {e}")))
         }
     }
 }
@@ -538,14 +616,12 @@ pub async fn open_read_only(
     let handle = rendezvous_key_from_owner_public(api, owner_public, shape).await?;
     let key = handle.key().clone();
     crate::vtrace!("open_read_only: rendezvous key={key:?}; trying open (no writer, no create)");
-    // §RS-2 margin limiter, for the reason `open_or_create` gives: the raw open is an
-    // un-gated DHT op and holds an un-gated-op permit across the call, acquired at
-    // raw-call granularity. This function issues no gated GET, so the single-permit
-    // rule (CRSH-ISC-17) is respected.
-    let opened = {
-        let _ungated = gate.acquire_ungated().await;
-        rc.open_dht_record(key, None).await
-    };
+    // §RS-2 margin limiter and the open's own bound, for the reason `open_or_create`
+    // gives: the raw open is an un-gated DHT op and holds an un-gated-op permit across
+    // the call, taken at raw-call granularity inside `gated_bounded_open`. This
+    // function issues no gated GET, so the single-permit rule (CRSH-ISC-17) is
+    // respected.
+    let opened = gated_bounded_open(gate, "open_read_only", rc.open_dht_record(key, None)).await;
     match opened {
         Ok(_) => {
             crate::vtrace!("open_read_only: open ok -> Some");
@@ -557,7 +633,7 @@ pub async fn open_read_only(
         }
         Err(e) => {
             crate::vtrace!("open_read_only: open failed ({e}) -> Err");
-            Err(VeilidNetError::Routing(e.to_string()))
+            Err(VeilidNetError::Routing(format!("open_read_only: {e}")))
         }
     }
 }
@@ -3310,6 +3386,348 @@ mod tests {
         assert!(
             elapsed < SWEEP_GET_TIMEOUT + std::time::Duration::from_secs(1),
             "the sweep ended at the bound, not later: {elapsed:?}"
+        );
+    }
+
+    // ── #430: an unanswered open must not hold the margin permit or the lock ──
+    /// An open that never answers is abandoned at [`OPEN_TIMEOUT`], which releases
+    /// the un-gated permit it holds and returns to the caller, so the record lock the
+    /// caller took around it is released too.
+    ///
+    /// **Both are pinned by what proceeds afterwards rather than by reading a
+    /// number.** Every un-gated permit is given to an open that never answers — the
+    /// margin is the whole pool, so `available_ungated() == 0` is the control that
+    /// they really are in flight — and a later acquire can only succeed if an
+    /// abandoned open gave its permit back. One of the two is held under a record
+    /// lock, the way `actor::fetch_dm_ack` takes it, and a lock this side can take
+    /// afterwards is a lock the abandoned open let go of.
+    ///
+    /// Runs on tokio's paused clock, so the asserted wait is virtual time advanced by
+    /// the bound's own timer. The outer timeout is what turns a permit that is never
+    /// released into a failed assertion instead of a test that hangs.
+    #[tokio::test(start_paused = true)]
+    async fn an_open_that_never_answers_releases_its_permit_and_its_record_lock() {
+        const MARGIN: usize = crate::dht_gate::DHT_GATE_MARGIN;
+        let gate = DhtGate::new();
+        let record_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+
+        let mut wedged = Vec::new();
+        for held in 0..MARGIN {
+            let (gate, lock) = (gate.clone(), record_lock.clone());
+            wedged.push(tokio::spawn(async move {
+                // One of them opens under the record lock, as the DM fetch handlers do;
+                // the others are opens of other records, which take no lock of ours.
+                let _guard = if held == 0 {
+                    Some(lock.lock().await)
+                } else {
+                    None
+                };
+                gated_bounded_open(
+                    &gate,
+                    "wedged open",
+                    std::future::pending::<std::result::Result<(), veilid_core::VeilidAPIError>>(),
+                )
+                .await
+            }));
+        }
+        // Let every wedged open reach its permit before anything else asks for one —
+        // asserted rather than assumed, because a pool that was never emptied would
+        // satisfy the acquire below without any permit having come back.
+        for _ in 0..(4 * MARGIN) {
+            if gate.available_ungated() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.available_ungated(),
+            0,
+            "the unanswered opens hold every un-gated permit"
+        );
+        // The other half of the same control: one of them really is holding the record
+        // lock. Without this, a fixture that took no lock at all would satisfy every
+        // lock assertion below by never having contended for one.
+        assert!(
+            record_lock.try_lock().is_err(),
+            "the wedged open holds the record lock — this fixture is not exercising the \
+             lock at all"
+        );
+
+        let started = tokio::time::Instant::now();
+        let later_open = tokio::time::timeout(
+            OPEN_TIMEOUT + std::time::Duration::from_secs(30),
+            gate.acquire_ungated(),
+        )
+        .await
+        .expect(
+            "a later open acquires a permit — an unanswered open released its own at the \
+             bound instead of holding it for the life of the process",
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= OPEN_TIMEOUT,
+            "the unanswered open was given its full bound before being abandoned: {waited:?}"
+        );
+        assert!(
+            waited < OPEN_TIMEOUT + std::time::Duration::from_secs(1),
+            "the permit came back at the bound, not later: {waited:?}"
+        );
+        // Read at the moment the bound fired, and before the tasks are joined: after a
+        // join the lock is free because the task ended, which says nothing about when
+        // the open let go of it.
+        assert!(
+            record_lock.try_lock().is_ok(),
+            "the record lock is free at the bound — the abandoned open returned and its \
+             guard went with it"
+        );
+
+        assert_eq!(
+            wedged.len(),
+            MARGIN,
+            "every wedged open is joined below, or the loop asserts over nothing"
+        );
+        assert!(
+            !wedged.is_empty(),
+            "a margin of zero wedges nothing and the loop below would assert over an \
+             empty set"
+        );
+        for task in wedged {
+            let err = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("the abandoned open returns")
+                .expect("the wedged open's task finished")
+                .expect_err("an abandoned open is a failure, never an opened record");
+            assert!(
+                matches!(err, veilid_core::VeilidAPIError::Timeout),
+                "an abandoned open is reported as a timeout: {err:?}"
+            );
+            // `open_or_create` treats `KeyNotFound` alone as absence and creates on it,
+            // so an elapsed open reported that way would manufacture a network record
+            // every time a slow node failed to answer.
+            assert!(
+                !matches!(err, veilid_core::VeilidAPIError::KeyNotFound { .. }),
+                "an abandoned open must never read as an absence: {err:?}"
+            );
+        }
+        drop(later_open);
+    }
+
+    /// **The bound covers the open, never the wait for a permit.** Every un-gated
+    /// permit is held elsewhere for twice the bound, and the open that finally gets
+    /// one answers instantly, so a bound taken around the acquire as well would
+    /// spend itself waiting and abandon an open that had not yet begun.
+    ///
+    /// The emptied pool is the control: without it the open would take a permit
+    /// immediately and pass whichever side of the acquire the bound sat on.
+    #[tokio::test(start_paused = true)]
+    async fn the_bound_never_covers_the_wait_for_a_permit() {
+        const MARGIN: usize = crate::dht_gate::DHT_GATE_MARGIN;
+        let gate = DhtGate::new();
+
+        for _ in 0..MARGIN {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                let _permit = gate.acquire_ungated().await;
+                tokio::time::sleep(OPEN_TIMEOUT * 2).await;
+            });
+        }
+        for _ in 0..(4 * MARGIN) {
+            if gate.available_ungated() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gate.available_ungated(),
+            0,
+            "the holders took every un-gated permit, so the open below must wait for one"
+        );
+
+        let opened = gated_bounded_open(&gate, "instant open", async {
+            Ok::<_, veilid_core::VeilidAPIError>(())
+        })
+        .await;
+        assert!(
+            opened.is_ok(),
+            "an open that answers instantly was abandoned for time spent waiting on a \
+             permit it had not been given yet: {opened:?}"
+        );
+    }
+
+    /// The bound must not disturb the two outcomes it is wrapped around: an open that
+    /// answers is passed through unchanged, and an erroring one keeps its own error —
+    /// which is what leaves `KeyNotFound` intact as [`open_only`]'s absence signal.
+    /// Both give the un-gated permit back, so an open that answers costs the margin
+    /// nothing beyond its own duration.
+    #[tokio::test]
+    async fn a_bounded_open_passes_an_answer_through_and_keeps_an_error() {
+        let gate = DhtGate::new();
+        let full = gate.available_ungated();
+        assert_eq!(
+            full,
+            crate::dht_gate::DHT_GATE_MARGIN,
+            "the fixture starts with the whole margin free"
+        );
+
+        let opened = gated_bounded_open(&gate, "answering open", async {
+            Ok::<_, veilid_core::VeilidAPIError>(7u32)
+        })
+        .await
+        .expect("an answering open reaches the caller as an answer");
+        assert_eq!(
+            opened, 7,
+            "the open's own result reaches the caller unchanged"
+        );
+        assert_eq!(
+            gate.available_ungated(),
+            full,
+            "an answering open gives its permit back"
+        );
+
+        let err = gated_bounded_open(&gate, "erroring open", async {
+            Err::<u32, _>(veilid_core::VeilidAPIError::TryAgain {
+                message: "boom".to_string(),
+            })
+        })
+        .await
+        .expect_err("an erroring open is a failure, never an opened record");
+        assert!(
+            matches!(err, veilid_core::VeilidAPIError::TryAgain { ref message } if message == "boom"),
+            "the open's own error reaches the caller unchanged, variant included: {err:?}"
+        );
+        assert_eq!(
+            gate.available_ungated(),
+            full,
+            "an erroring open gives its permit back"
+        );
+    }
+
+    /// **Every record open reaches the network only through the bounded opener.** The
+    /// bound and the un-gated permit live in one function, so an open function that
+    /// took its own permit and awaited `open_dht_record` directly would be unbounded
+    /// again with every gate still green — the shape needs a live DHT to observe, so
+    /// it is pinned from the source.
+    ///
+    /// Needles are assembled from fragments so this test's own source text does not
+    /// self-match, as the sibling source probes do; the production half is taken by
+    /// cutting at the tests module's own marker, because `#[cfg(test)]` appears on
+    /// items above it too.
+    #[test]
+    fn every_record_open_goes_through_the_bounded_opener() {
+        // The code half of a module: everything above its tests module — or the whole
+        // file, for a module that has none — with comment lines dropped, so a rustdoc
+        // line naming the raw open is read as the prose it is rather than as an open
+        // site.
+        fn code(src: &str) -> String {
+            src.split_once("\n#[cfg(test)]\nmod tests {")
+                .map_or(src, |(prod, _)| prod)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let raw: String = ["open_dht", "_record("].concat();
+        let bounded: String = ["gated_bounded", "_open("].concat();
+        let permit: String = ["acquire", "_ungated()"].concat();
+
+        let prod = code(include_str!("rendezvous.rs"));
+        let prod = prod.as_str();
+
+        for opener in [
+            "\npub async fn open_or_create(",
+            "\npub async fn open_only(",
+            "\npub async fn open_read_only(",
+        ] {
+            let start = prod
+                .find(opener)
+                .expect("an open function's definition moved");
+            let body = &prod[start..];
+            let body = &body[..body
+                .find("\n}\n")
+                .expect("an open function's closing brace moved")];
+            // Positive control: this is the function's real body. A slice that cut to
+            // nothing would satisfy the assertions below while reading no code at all.
+            assert!(
+                body.contains(raw.as_str()),
+                "{opener} does not open a record — this probe is matching the wrong text"
+            );
+            assert!(
+                body.contains(bounded.as_str()),
+                "{opener} must open through the bounded opener"
+            );
+            assert!(
+                !body.contains(permit.as_str()),
+                "{opener} takes its own un-gated permit; an open outside the bounded \
+                 opener is an unbounded open again"
+            );
+        }
+
+        assert_eq!(
+            prod.matches(raw.as_str()).count(),
+            4,
+            "a record is opened at exactly four sites outside the tests: two in \
+             `open_or_create` and one in each of `open_only` and `open_read_only`. A \
+             fifth is an open site nothing here accounts for"
+        );
+        assert_eq!(
+            prod.matches(bounded.as_str()).count(),
+            4,
+            "every one of those sites calls the bounded opener"
+        );
+        assert_eq!(
+            prod.matches(permit.as_str()).count(),
+            1,
+            "the un-gated permit is taken in exactly one place outside the tests — the \
+             bounded opener — so no open can hold one without a bound on it"
+        );
+
+        // **The bound is only worth as much as the file boundary it is pinned inside.**
+        // Other modules of this crate take un-gated permits of their own — the page
+        // watch, its cancel, the subscribe and repair watches — and a record opened
+        // under one of those would be unbounded with every count above unchanged. So
+        // every OTHER source file in the crate must open no record at all. The walk is
+        // over the directory rather than a list of module names, so a module added
+        // later is covered without anyone remembering to add it here.
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut examined: Vec<String> = Vec::new();
+        let mut pending = vec![src_dir.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("the crate's source directory reads") {
+                let path = entry.expect("a source directory entry reads").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let name = path
+                    .strip_prefix(&src_dir)
+                    .expect("every file walked is under the source directory")
+                    .display()
+                    .to_string();
+                if name == "rendezvous.rs" {
+                    continue;
+                }
+                let other = code(&std::fs::read_to_string(&path).expect("a source file reads"));
+                assert_eq!(
+                    other.matches(raw.as_str()).count(),
+                    0,
+                    "{name} opens a DHT record. Every open belongs in `rendezvous`, \
+                     behind the bounded opener; an open here would run under whatever \
+                     permit and lock this module happens to hold, with no bound on it"
+                );
+                examined.push(name);
+            }
+        }
+        // Positive control: the needle that found nothing in those files is the one that
+        // finds four sites in this one, and the walk really reached the module holding
+        // the crate's other un-gated permits.
+        assert!(
+            examined.iter().any(|name| name == "actor.rs"),
+            "the walk did not reach the module that holds the crate's other un-gated \
+             permits: {examined:?}"
         );
     }
 
