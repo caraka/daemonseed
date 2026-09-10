@@ -824,6 +824,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `unopenable` counts one refusal per position,
+  not one per probe of it (#442).
 - ISC-C80 is withdrawn and deregistered. It described a reconnect on a capped exponential backoff
   timer, and the `Backoff` type that was the timer is deleted. `ISA.md` keeps the ID as a reserved
   tombstone and `daemonseed_isc::TOTAL` falls from 245 to 244.

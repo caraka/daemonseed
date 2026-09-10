@@ -36,13 +36,13 @@ use daemonseed_core::dm::ack_cadence::{self, StandaloneAckCadence};
 use daemonseed_core::dm::ack_record::{self, DmAckAddress};
 use daemonseed_core::dm::admission::{AdmissionCounters, AdmissionOutcome, Admitter, SeenSet};
 use daemonseed_core::dm::block_list::{BlockList, BlockListError};
-use daemonseed_core::dm::collect::Collection;
+use daemonseed_core::dm::collect::{Collection, MAX_BACKFILL_PAGES, WATCHED_PAGES};
 use daemonseed_core::dm::doorbell;
 use daemonseed_core::dm::firstcontact::{
     self, recipient_hash, FirstContactError, FirstContactRequest, FirstContactState,
     VerifiedFirstContact, AR_FINGERPRINT_LEN, ROOT_LEN,
 };
-use daemonseed_core::dm::frame::{self, AuthorKeys, WORST_CASE_SEALED_FRAME_LEN};
+use daemonseed_core::dm::frame::{self, AuthorKeys, DmFrameError, WORST_CASE_SEALED_FRAME_LEN};
 use daemonseed_core::dm::keyrec::KEM_EK_LEN;
 use daemonseed_core::dm::keyrec::{
     self, DmKeyRecordError, KeyRecordCache, DM_KEYREC_OWNER_SEED_LEN,
@@ -976,6 +976,15 @@ struct Correspondence {
     offered_this_session: Vec<u64>,
     /// This correspondence's channel-plane accounting, cumulative.
     health: ChannelCounters,
+    /// The positions this session has already offered and refused, so a probe
+    /// re-presenting them refuses them once per key-schedule state rather than
+    /// once per probe.
+    ///
+    /// **In memory only.** It records what this session has already decided, and
+    /// a restart has decided nothing: the key schedule is gone, the collection
+    /// rebuilds from the stored cursor, and every position comes back to be
+    /// looked at once more.
+    refusals: RefusalMemory,
     /// When this side last wrote a standalone acknowledgement for the receiving
     /// direction, and whether anything has been collected since.
     ///
@@ -1160,6 +1169,394 @@ struct ChannelCounters {
     cursor_records_repaired: u64,
     leg_folds_deferred: u64,
     leg_unaddressable: u64,
+}
+
+/// How many pages one correspondence remembers refusals for.
+///
+/// The probe plan's own width: a plan names the watched pair and at most
+/// [`MAX_BACKFILL_PAGES`] pages behind them, so a memory this wide covers every
+/// page one probe can present.
+const REFUSED_PAGES: usize = WATCHED_PAGES + MAX_BACKFILL_PAGES;
+
+/// How much of a refused slot's bytes [`RefusalMemory`] keeps.
+///
+/// A prefix of the slot's SHA-384. What the memory needs of the bytes is only
+/// that they are the same bytes, and a whole frame kept for every slot of every
+/// remembered page would be megabytes per correspondence.
+const REFUSAL_DIGEST_LEN: usize = 32;
+
+/// What this side's ability to open a slot depends on.
+///
+/// Every input the fold consults before it calls a slot unopenable, reduced to
+/// values that compare: the key schedule in force, whether the correspondent's
+/// pseudonym and direction are known, and the discriminators [`fold_leg`] picks
+/// its candidates and its attempt window from. A refusal is a statement about
+/// bytes **under this state**, so a memory of refusals keyed on anything less
+/// goes on refusing a position the state has since made openable.
+///
+/// **Secret material is named by the numbers that move with it, never carried.**
+/// A committed root changes only where `reconnect_gen` advances and a candidate
+/// root only where an acceptance slot fills, so the generations stand in for
+/// both and nothing here holds a key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OpenState {
+    /// The generation of the live key schedule, or `None` where there is none.
+    ///
+    /// [`Correspondence::live`] rather than the ratchet alone: a schedule
+    /// without a pseudonym or roots opens nothing either.
+    ratchet: Option<u32>,
+    /// Whether the correspondent's pseudonym is known. Without it only an
+    /// acceptance opens.
+    peer_pk_pc_known: bool,
+    /// The direction the correspondent writes in, or `None` where the outbox
+    /// does not say — in which case no leg can be scanned at all.
+    peer_direction: Option<Direction>,
+    /// The resume record's leg-scan state, or `None` where no record read.
+    scan: Option<LegScanState>,
+}
+
+/// The resume record's leg-scan discriminators.
+///
+/// Exactly what [`fold_leg`] reads to choose its candidates and to place each
+/// attempt window: move any of them and a slot the scan refused may open on the
+/// next pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LegScanState {
+    /// The generation this side has committed.
+    reconnect_gen: u32,
+    /// The generation of this side's outstanding initiation, if one stands —
+    /// what admits the `RE-ACK` candidate.
+    own_slot_gen: Option<u32>,
+    /// The acceptance this side gave — its generation, its attempt, and whether
+    /// it is confirmed — which is what admits the `RE-CONFIRM` candidate.
+    ///
+    /// **The attempt is here because the generation alone does not move when a
+    /// candidate is replaced.** [`ReEstGate::admit`] admits any initiation above
+    /// the one seen, and the acceptance that follows installs a different
+    /// candidate root under the same generation; where the new attempt is inside
+    /// the window already scanned, nothing else in this state changes, and a
+    /// slot refused under the superseded candidate would stay refused.
+    acceptance: Option<(u32, u32, bool)>,
+    /// Where the `RE-EST` and `RE-CONFIRM` attempt windows start.
+    last_seen_re_est: u32,
+    /// Where the `RE-ACK` attempt window starts.
+    last_seen_re_ack: u32,
+    /// Whether a superseded root is still retained — the fourth candidate.
+    retained: bool,
+}
+
+impl OpenState {
+    /// The state one fold decides its refusals under.
+    fn of(
+        correspondence: &Correspondence,
+        peer_direction: Option<Direction>,
+        record: Option<&ResumeRecord>,
+    ) -> Self {
+        Self {
+            ratchet: correspondence
+                .live()
+                .map(|(ratchet, _, _)| ratchet.generation()),
+            peer_pk_pc_known: correspondence.peer_pk_pc.is_some(),
+            peer_direction,
+            scan: record.map(|record| LegScanState {
+                reconnect_gen: record.reconnect_gen(),
+                own_slot_gen: record.own_slot().map(OwnSlot::generation),
+                acceptance: record
+                    .acceptance()
+                    .map(|slot| (slot.generation(), slot.attempt().get(), slot.confirmed())),
+                last_seen_re_est: record.last_seen_re_est(),
+                last_seen_re_ack: record.last_seen_re_ack(),
+                retained: record.retained().is_some(),
+            }),
+        }
+    }
+}
+
+/// The positions this correspondence has already offered and refused, so a probe
+/// that re-presents them costs one consult rather than one refusal.
+///
+/// **It lives beside [`ChannelCounters`] rather than inside [`Collection`]
+/// because a refusal is a verdict about bytes under a key schedule, and the
+/// collection is the pure half that holds neither.**
+/// [`Collection::observe_page`] is given a page number and slot indices, opens
+/// no frame and derives no key; a memory there would have to be handed the
+/// bytes, the ratchet and the resume record to say anything at all, which is
+/// this half of the fold and is described here.
+///
+/// **An entry is keyed on the position AND on the bytes, and held under an
+/// [`OpenState`].** The position alone would eat a slot the correspondent
+/// rewrote; the bytes alone would go on refusing a leg the next scan window can
+/// open. So an entry stands only while the state it was taken under stands, and
+/// every entry is dropped the moment that state moves.
+///
+/// **Only a verdict about the bytes is remembered.** A refusal a store fault, an
+/// unreadable record or a faulted scan candidate produced is not — see
+/// [`refusal_is_a_verdict`] — so a fault costs a re-offer on the next probe
+/// rather than a position suppressed for as long as the session lasts.
+///
+/// **The state is read once per fold, and the two events that move it mid-fold
+/// clear the memory outright.** A frame that opens and a leg that is consumed
+/// both call [`Self::forget`] where they happen, so the slots of that page still
+/// to come are checked against nothing rather than against entries taken under a
+/// state that has since moved. What remains is that an entry recorded after such
+/// an event carries the [`OpenState`] read at the top of the fold; the next
+/// fold's [`Self::hold`] compares against the state as it then is and drops it,
+/// so that residue over-clears rather than over-suppresses.
+///
+/// Bounded twice over: [`REFUSED_PAGES`] pages, each holding one entry per slot
+/// of the record.
+struct RefusalMemory {
+    /// The state every entry below was refused under.
+    under: OpenState,
+    /// A monotone stamp, advanced every time a page is consulted or written, so
+    /// eviction can name the page that has gone longest untouched.
+    clock: u64,
+    /// The remembered pages, at most [`REFUSED_PAGES`] of them.
+    pages: Vec<RefusedPage>,
+}
+
+/// One page's refused slots.
+struct RefusedPage {
+    /// The page these slots belong to.
+    page: u64,
+    /// [`RefusalMemory::clock`] as it stood when this page was last consulted or
+    /// written — what eviction orders on.
+    touched: u64,
+    /// One entry per slot of the record, `None` where the slot has not been
+    /// refused. Sized from [`PAGE_SLOTS`], so a wider record widens this.
+    slots: [Option<[u8; REFUSAL_DIGEST_LEN]>; PAGE_SLOTS as usize],
+}
+
+impl RefusalMemory {
+    /// A memory holding nothing.
+    fn new() -> Self {
+        Self {
+            under: OpenState::default(),
+            clock: 0,
+            pages: Vec::new(),
+        }
+    }
+
+    /// Is there anything to consult?
+    fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// Stamp a page as consulted or written now, and return the entry.
+    fn touch(&mut self, page: u64) -> Option<&mut RefusedPage> {
+        self.clock = self.clock.saturating_add(1);
+        let now = self.clock;
+        let held = self.pages.iter_mut().find(|held| held.page == page)?;
+        held.touched = now;
+        Some(held)
+    }
+
+    /// Hold the entries against the state this fold decides under, dropping them
+    /// where it has moved.
+    fn hold(&mut self, under: OpenState) {
+        if self.under != under {
+            self.pages.clear();
+            self.under = under;
+        }
+    }
+
+    /// Drop every entry: the ratchet has accepted something, so this side's
+    /// receive state has moved.
+    ///
+    /// **Conservative, and deliberately not an enumeration.** [`Self::hold`]
+    /// compares every input the leg scan reads, which is why a leg needs no
+    /// clearing of its own. The ratchet's receive state is the half an
+    /// [`OpenState`] does not model — the chain cursor, the skipped-key cache,
+    /// the ephemeral window — and rather than reason about which refusals each
+    /// of those could turn into an open, an open drops the lot. It costs a
+    /// `Vec::clear` on a path that has just done an AEAD open, and it makes the
+    /// memory's correctness independent of the ratchet's internals.
+    ///
+    /// **The obvious motivating case is NOT one the ratchet produces.** A frame
+    /// further ahead than `ratchet::MAX_SKIP` is not refused: `catch_up`
+    /// abandons the keys past the window and opens it anyway. Only a gap past
+    /// `ratchet::MAX_CATCH_UP` refuses, and that is a wider backlog than one
+    /// outbox holds.
+    fn forget(&mut self) {
+        self.pages.clear();
+    }
+
+    /// Forget the pages no probe plan will name again.
+    ///
+    /// Takes [`Collection::retired_below`]'s answer, so the memory is released
+    /// by the same settlement that releases the page record itself.
+    fn retire_below(&mut self, page: u64) {
+        self.pages.retain(|held| held.page >= page);
+    }
+
+    /// Has this position already been refused, for these exact bytes, under the
+    /// state now held?
+    ///
+    /// A consult stamps the page whether or not the bytes match, because being
+    /// asked about is what says a page is still in the probe window.
+    fn suppresses(&mut self, at: PagePosition, encoded: &[u8]) -> bool {
+        let Some(digest) = refusal_digest(encoded) else {
+            return false;
+        };
+        let slot = usize::from(at.slot());
+        self.touch(at.page())
+            .is_some_and(|held| held.slots[slot] == Some(digest))
+    }
+
+    /// Remember that these bytes at this position did not open.
+    fn refuse(&mut self, at: PagePosition, encoded: &[u8]) {
+        let Some(digest) = refusal_digest(encoded) else {
+            return;
+        };
+        let slot = usize::from(at.slot());
+        if let Some(held) = self.touch(at.page()) {
+            held.slots[slot] = Some(digest);
+            return;
+        }
+        // **The page longest untouched goes first, never the lowest.** The
+        // lowest page is the one a plan is most likely to name again: backfill
+        // takes the oldest holes first, and `Collection::retired_below` is
+        // pinned at a permanent hole's page for the whole give-up horizon, so a
+        // frontier walking upward under a standing hole would evict the two
+        // pages every plan carries and keep the stale ones above them.
+        if self.pages.len() >= REFUSED_PAGES {
+            if let Some(stalest) = self
+                .pages
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, held)| held.touched)
+                .map(|(index, _)| index)
+            {
+                self.pages.remove(stalest);
+            }
+        }
+        let mut fresh = RefusedPage {
+            page: at.page(),
+            touched: self.clock,
+            slots: [None; PAGE_SLOTS as usize],
+        };
+        fresh.slots[slot] = Some(digest);
+        self.pages.push(fresh);
+    }
+}
+
+/// A refused slot's bytes, reduced to what [`RefusalMemory`] keeps of them.
+///
+/// `None` where the hash itself fails, which leaves the slot unremembered and
+/// the next probe refusing it again — what happened before the memory existed.
+fn refusal_digest(encoded: &[u8]) -> Option<[u8; REFUSAL_DIGEST_LEN]> {
+    let digest = match oxicrypt_sha::sha384(encoded) {
+        Ok(digest) => digest,
+        Err(e) => {
+            crate::vtrace!("dm driver: a refused slot would not digest: {e}");
+            return None;
+        }
+    };
+    let mut out = [0u8; REFUSAL_DIGEST_LEN];
+    out.copy_from_slice(&digest[..REFUSAL_DIGEST_LEN]);
+    Some(out)
+}
+
+/// May a slot the leg scan called `NotALeg` be remembered as refused?
+///
+/// **Only where the scan reached that answer without faulting.** [`scanned`]
+/// maps a module, derivation or signature fault to the same `None` an ordinary
+/// miss gives, so the two are indistinguishable at [`LegOutcome::NotALeg`] — and
+/// a sick crypto module scanning the correspondent's own `RE-EST` would
+/// otherwise refuse that slot for the life of the session, because nothing on
+/// the correspondent's side moves this side's [`OpenState`] while it waits for
+/// an answer. The same fold already books a faulted scan as
+/// `leg_folds_deferred`, which is the counter for exactly this: a decision not
+/// taken, to be retried.
+///
+/// The two counter readings are the whole discriminator: `faults` is
+/// out-parameter state [`fold_leg`] advances, so a reading taken immediately
+/// before the call and one taken after it differ exactly when a candidate
+/// faulted.
+fn refusal_is_a_verdict(faults_before: u64, faults_after: u64) -> bool {
+    faults_before == faults_after
+}
+
+/// Is an open-path frame failure a verdict about the bytes, or a fault of this
+/// host?
+///
+/// **The same split [`refusal_is_a_verdict`] makes for the leg scan, on the
+/// arm that reaches it first.** A frame that did not authenticate is a
+/// statement about the bytes and holds on every later probe of the same slot;
+/// a crypto-module, signing, sealing or entropy failure is a condition here,
+/// and remembering one would suppress every populated slot the page carried
+/// under a state nothing moves — so the correspondent's messages would stay
+/// unread until it wrote a fresh position or an exchange re-rooted the channel.
+///
+/// The excluded variants are the ones whose own rustdoc names them local rather
+/// than adversarial: [`DmFrameError::Module`] (*"a crypto-module condition,
+/// never an adversary"*), [`DmFrameError::Signing`], [`DmFrameError::Sealing`]
+/// and [`DmFrameError::EntropySource`]. The last three are seal-side and are
+/// not expected on this path at all, which is a reason to name them rather than
+/// to leave the match open. Everything else — [`DmFrameError::Aead`] above all,
+/// the uniform authentication verdict — is about the bytes.
+fn frame_refusal_is_a_verdict(e: &DmFrameError) -> bool {
+    !matches!(
+        e,
+        DmFrameError::Module(_)
+            | DmFrameError::Signing(_)
+            | DmFrameError::Sealing(_)
+            | DmFrameError::EntropySource
+    )
+}
+
+/// Fill `slot` with this correspondence's resume record if it has not been read
+/// yet, and leave it alone if it has.
+///
+/// **The record is opened once per swept page, not once per slot.** It is a
+/// sealed blob carrying a signing key, and a page holding one leg among sixteen
+/// frames would otherwise pay the AEAD open sixteen times. The outer `None` is
+/// *not read yet*; the inner one is *there is no record*, which is the state
+/// `DmMachine::resume_channel` surfaces as unresumable and in which no leg can
+/// have been sealed.
+fn read_resume_once(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    slot: &mut Option<Option<ResumeRecord>>,
+) {
+    if slot.is_some() {
+        return;
+    }
+    *slot = Some(match persist.read_resume(label) {
+        Ok(record) => record,
+        Err(e) => {
+            crate::vtrace!("dm driver: the resume record will not read for a leg scan: {e}");
+            None
+        }
+    });
+}
+
+/// Record a refusal, holding the memory against this fold's state the first time
+/// one is recorded.
+///
+/// The state is a function of the resume record, so this is where a page that
+/// refuses something pays for the read — a page whose every frame opens does
+/// not. `held` carries the once-per-fold decision across the slot loop.
+fn remember_refusal(
+    persist: &DmPersist,
+    correspondence: &mut Correspondence,
+    resume: &mut Option<Option<ResumeRecord>>,
+    held: &mut bool,
+    peer_direction: Option<Direction>,
+    at: PagePosition,
+    encoded: &[u8],
+) {
+    if !*held {
+        read_resume_once(persist, &correspondence.label, resume);
+        let under = OpenState::of(
+            correspondence,
+            peer_direction,
+            resume.as_ref().and_then(Option::as_ref),
+        );
+        correspondence.refusals.hold(under);
+        *held = true;
+    }
+    correspondence.refusals.refuse(at, encoded);
 }
 
 impl core::fmt::Debug for Correspondence {
@@ -4208,6 +4605,11 @@ impl DmMachine {
     fn retire_pages(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
         let recv_below = self.correspondences[index].collection.retired_below();
         let send_below = self.correspondences[index].own_ack.settled_pages_below();
+        // A refusal of a page no plan will name again is a refusal nothing will
+        // ever consult, released by the settlement that releases the record.
+        self.correspondences[index]
+            .refusals
+            .retire_below(recv_below);
         let mut out = self.close_pages(index, recv_below, send_below);
         let block_list = self.pin_block_list();
         out.extend(self.refresh_pins(now_ms, block_list.as_ref()));
@@ -4589,9 +4991,25 @@ impl DmMachine {
             }
         }
 
-        // Read lazily and once, then threaded through every leg fold on this
-        // page — see the leg arm below.
+        // **Read lazily and at most once, then shared by everything on this page
+        // that needs it** — every leg fold, and the refusal memory, which can
+        // neither be consulted nor added to without the state its entries stand
+        // under. A page whose every frame opens never reads it: the record is a
+        // sealed blob carrying a signing key, and paying that open on the
+        // ordinary message path would be a cost this memory exists to remove.
         let mut resume: Option<Option<ResumeRecord>> = None;
+        // Whether `refusals` has been held against this fold's state yet.
+        let mut refusals_held = false;
+        if !correspondence.refusals.is_empty() {
+            read_resume_once(persist, &correspondence.label, &mut resume);
+            let under = OpenState::of(
+                correspondence,
+                peer_direction,
+                resume.as_ref().and_then(Option::as_ref),
+            );
+            correspondence.refusals.hold(under);
+            refusals_held = true;
+        }
         let mut scans: u64 = 0;
         let mut scan_faults: u64 = 0;
         let recipient = match recipient_hash(identity.signing.public_key()) {
@@ -4606,6 +5024,16 @@ impl DmMachine {
             let Some(encoded) = bytes.get(&at) else {
                 continue;
             };
+            // **Refused once per state, not once per probe.** These exact bytes
+            // at this position have already been through the parse, the ratchet
+            // and the leg scan under the state this fold is deciding under, and
+            // the answer was no. A probe re-presents an unsettled position every
+            // cadence for as long as the correspondence cannot open it, so
+            // without this the same no is paid for again every thirty seconds
+            // and `unopenable` counts probes rather than refusals.
+            if correspondence.refusals.suppresses(at, encoded) {
+                continue;
+            }
             // **Set by every path that hands the slot to the re-establishment
             // scan, and read once below.** A leg is not a channel frame — it is
             // a fixed-length AEAD blob under a key derived from the retained
@@ -4688,6 +5116,10 @@ impl DmMachine {
                 };
                 match opened {
                     Ok(Ok((verified, installed))) => {
+                        // The ratchet's receive state has moved, which is the
+                        // half an `OpenState` does not model — see
+                        // `RefusalMemory::forget`.
+                        correspondence.refusals.forget();
                         // **One act: install the pseudonym, and erase the record
                         // that existed only until it arrived.** Past this point the
                         // conversation is verifiable and `ss0` — which roots `RK0`
@@ -4821,6 +5253,19 @@ impl DmMachine {
                     Ok(Err(e)) => {
                         crate::vtrace!("dm driver: a swept frame did not authenticate: {e}");
                         correspondence.health.unopenable += 1;
+                        // A local fault decided nothing about these bytes — see
+                        // `frame_refusal_is_a_verdict`.
+                        if frame_refusal_is_a_verdict(&e) {
+                            remember_refusal(
+                                persist,
+                                correspondence,
+                                &mut resume,
+                                &mut refusals_held,
+                                peer_direction,
+                                at,
+                                encoded,
+                            );
+                        }
                     }
                 }
             }
@@ -4836,23 +5281,7 @@ impl DmMachine {
                 correspondence.health.unopenable += 1;
                 continue;
             };
-            // **The record is opened once per page, not once per slot.** It is a
-            // sealed blob carrying a signing key, and a page holding one leg
-            // among sixteen frames would otherwise pay the AEAD open sixteen
-            // times. The outer `None` is *not read yet*; the inner one is *there
-            // is no record*, which is the state `resume_channel` surfaces as
-            // unresumable and in which no leg can have been sealed.
-            if resume.is_none() {
-                resume = Some(match persist.read_resume(&correspondence.label) {
-                    Ok(record) => record,
-                    Err(e) => {
-                        crate::vtrace!(
-                            "dm driver: the resume record will not read for a leg scan: {e}"
-                        );
-                        None
-                    }
-                });
-            }
+            read_resume_once(persist, &correspondence.label, &mut resume);
             let Some(record) = resume.as_ref().and_then(Option::as_ref) else {
                 correspondence.health.unopenable += 1;
                 continue;
@@ -4880,6 +5309,9 @@ impl DmMachine {
                     continue;
                 }
             };
+            // Read before the fold and again after it, because the fold is what
+            // moves it — see `refusal_is_a_verdict`.
+            let faults_before = scan_faults;
             let fold = fold_leg(
                 persist,
                 correspondence,
@@ -4893,7 +5325,24 @@ impl DmMachine {
             );
             out.extend(fold.effects);
             match fold.outcome {
-                LegOutcome::NotALeg => correspondence.health.unopenable += 1,
+                LegOutcome::NotALeg => {
+                    correspondence.health.unopenable += 1;
+                    // A scan that faulted did not decide anything about these
+                    // bytes, and the same fold books it as deferred below.
+                    if refusal_is_a_verdict(faults_before, scan_faults) {
+                        remember_refusal(
+                            persist,
+                            correspondence,
+                            &mut resume,
+                            &mut refusals_held,
+                            // The binding the leg arm unwrapped, back in the
+                            // shape the state compares.
+                            Some(peer_direction),
+                            at,
+                            encoded,
+                        );
+                    }
+                }
                 // **The position stays unsettled and nothing was written.** The
                 // fold decided nothing, so settling here would walk past the
                 // only copy of a frame this side still owes an answer to; the
@@ -4912,6 +5361,11 @@ impl DmMachine {
                 // the same page see the state its predecessor persisted rather
                 // than the state the page was read at.
                 LegOutcome::Consumed => {
+                    // A consumed leg commits a record and may install a schedule,
+                    // so every entry taken under the state this fold started from
+                    // is now stale — including for the slots of this page still
+                    // to come.
+                    correspondence.refusals.forget();
                     resume = Some(Some(working));
                     if correspondence.collection.collected(at).is_err() {
                         correspondence.owed_acks.push(at);
@@ -5827,6 +6281,7 @@ impl DmMachine {
                         owed_acks: Vec::new(),
                         offered_this_session: Vec::new(),
                         health: ChannelCounters::default(),
+                        refusals: RefusalMemory::new(),
                         ack_cadence: StandaloneAckCadence::new(),
                         owes_give_up_ack: false,
                         pending_sent_ms: Vec::new(),
@@ -6509,6 +6964,7 @@ impl DmMachine {
                 owed_acks: Vec::new(),
                 offered_this_session: Vec::new(),
                 health: ChannelCounters::default(),
+                refusals: RefusalMemory::new(),
                 ack_cadence: StandaloneAckCadence::new(),
                 owes_give_up_ack: false,
                 pending_sent_ms: Vec::new(),
@@ -8850,6 +9306,7 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            refusals: RefusalMemory::new(),
             ack_cadence: StandaloneAckCadence::new(),
             owes_give_up_ack: false,
             pending_sent_ms: Vec::new(),
@@ -10158,6 +10615,7 @@ mod tests {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            refusals: RefusalMemory::new(),
             ack_cadence: StandaloneAckCadence::new(),
             owes_give_up_ack: false,
             pending_sent_ms: Vec::new(),
@@ -10289,6 +10747,7 @@ mod tests {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            refusals: RefusalMemory::new(),
             ack_cadence: StandaloneAckCadence::new(),
             owes_give_up_ack: false,
             pending_sent_ms: Vec::new(),
@@ -13760,6 +14219,7 @@ mod tests {
             owed_acks: Vec::new(),
             offered_this_session: Vec::new(),
             health: ChannelCounters::default(),
+            refusals: RefusalMemory::new(),
             ack_cadence: StandaloneAckCadence::new(),
             owes_give_up_ack: false,
             pending_sent_ms: Vec::new(),
@@ -13838,6 +14298,17 @@ mod tests {
         let last = out.len() - 1;
         out[last] ^= 0xFF;
         out
+    }
+
+    /// The sequence numbers of the messages in a batch of effects.
+    fn message_seqs(effects: &[DmEffect]) -> Vec<u64> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Message { seq, .. }) => Some(*seq),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The message bodies in a batch of effects.
@@ -19645,6 +20116,471 @@ mod tests {
             leg_entries(&b.machine, &b.label, t1),
             queued_once,
             "the replay queued a second answer"
+        );
+    }
+
+    /// M78. **A leg scan that faulted is not a verdict about the bytes, and is
+    /// not remembered as one.**
+    ///
+    /// `scanned` maps a module, derivation or signature fault to the same `None`
+    /// an ordinary miss gives, so a faulted scan and bytes that are genuinely
+    /// not a leg arrive at `LegOutcome::NotALeg` indistinguishable. Remembering
+    /// the first would refuse the correspondent's own `RE-EST` for the life of
+    /// the session — nothing the correspondent does moves this side's
+    /// `OpenState` while it waits for an answer — and the same fold already
+    /// books that scan as `leg_folds_deferred`.
+    ///
+    /// **Asserted on the predicate, because no fixture can make a healthy crypto
+    /// module fault.** The wiring is read at the one call site: `faults_before`
+    /// is `scan_faults` immediately before `fold_leg`, which takes it as the
+    /// `faults` out-parameter, and the reading after the call is the same
+    /// counter.
+    #[test]
+    fn a_faulted_leg_scan_is_not_remembered_as_a_refusal() {
+        assert!(
+            refusal_is_a_verdict(3, 3),
+            "a scan that faulted nowhere decided about the bytes and must be \
+             remembered"
+        );
+        assert!(
+            !refusal_is_a_verdict(3, 4),
+            "a scan that faulted decided nothing and must not be remembered"
+        );
+    }
+
+    /// M80. **A frame that opens re-offers every remembered refusal.**
+    ///
+    /// The one clearing path `RefusalMemory::hold` cannot cover: an open moves
+    /// the ratchet's receive state, which an `OpenState` does not model, so the
+    /// memory is dropped outright rather than reasoned about. Without it a
+    /// refusal recorded under a live key schedule stands until something else
+    /// moves the state, which on a conversation that is only receiving is never.
+    ///
+    /// **The generation is settled before anything is remembered**, by opening
+    /// one ordinary frame first. Without that the second open would also advance
+    /// `Ratchet::generation`, `hold` would clear on the state comparison alone,
+    /// and the clearing under test would not be the one that ran.
+    ///
+    /// **What this does NOT claim.** The case the clearing is written for — a
+    /// position refused because it sits too far ahead of the chain — is not one
+    /// the ratchet produces: `catch_up` abandons the keys past
+    /// `ratchet::MAX_SKIP` and opens the frame anyway, and the gap that does
+    /// refuse, `ratchet::MAX_CATCH_UP`, is wider than one outbox holds. So what
+    /// is pinned here is the clearing itself, not a message recovered by it.
+    #[test]
+    fn a_frame_that_opens_re_offers_every_remembered_refusal() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        let label_a = sole_label(&a);
+        let b_pk = *b_keys.signing.public_key();
+        let queued = queue_sends(&mut a, &b_pk, 2);
+        let conversation = conversation_of(&b, 0);
+        let fold = |b: &mut DmMachine, seq: u64, bytes: Vec<u8>| {
+            fold_page_at(
+                b,
+                BASE_MS,
+                conversation,
+                position_of(seq).page(),
+                vec![(position_of(seq), bytes)],
+            )
+        };
+
+        // The generation settles here, so nothing below moves the state.
+        let opened = fold(
+            &mut b,
+            queued[0],
+            queued_frame_at(&a, &label_a, queued[0], BASE_MS),
+        );
+        assert_eq!(
+            message_seqs(&opened),
+            vec![queued[0]],
+            "the first ordinary frame did not open, so the generation is not settled"
+        );
+        let settled = b.correspondences[0]
+            .ratchet
+            .as_ref()
+            .expect("a live ratchet")
+            .generation();
+
+        // A slot on a page of its own that no key schedule opens.
+        let garbage = vec![0xA5u8; daemonseed_core::dm::reest::LEG_LEN];
+        let stale = position_of(queued[0]).seq() + u64::from(PAGE_SLOTS);
+        let before = b.correspondences[0].health.unopenable;
+        fold(&mut b, stale, garbage.clone());
+        assert_eq!(
+            b.correspondences[0].health.unopenable,
+            before + 1,
+            "the stale slot was not refused"
+        );
+        assert!(
+            b.correspondences[0]
+                .refusals
+                .suppresses(position_of(stale), &garbage),
+            "the refusal was not remembered, so the clearing below has no subject"
+        );
+        fold(&mut b, stale, garbage.clone());
+        assert_eq!(
+            b.correspondences[0].health.unopenable,
+            before + 1,
+            "the remembered refusal was not consulted"
+        );
+
+        // One ordinary frame opens, at the generation already settled.
+        let opened = fold(
+            &mut b,
+            queued[1],
+            queued_frame_at(&a, &label_a, queued[1], BASE_MS),
+        );
+        assert_eq!(
+            message_seqs(&opened),
+            vec![queued[1]],
+            "the second ordinary frame did not open, so nothing cleared the memory"
+        );
+        assert_eq!(
+            b.correspondences[0]
+                .ratchet
+                .as_ref()
+                .expect("a live ratchet")
+                .generation(),
+            settled,
+            "the frame that cleared the memory also moved the generation, so the \
+             state comparison could have cleared it instead"
+        );
+
+        fold(&mut b, stale, garbage);
+        assert_eq!(
+            b.correspondences[0].health.unopenable,
+            before + 2,
+            "the refusal survived a frame that opened, so nothing re-offers a \
+             position once the ratchet has moved"
+        );
+    }
+    /// M81. **A frame that reaches the ratchet and fails to authenticate is
+    /// refused once, not once per probe.**
+    ///
+    /// The ordinary channel path, which M76 and M77 do not reach: both of those
+    /// take the re-establishment arm. A frame whose sealed body has been
+    /// tampered with parses, is placed by the ratchet, and fails its own
+    /// authentication — and the ratchet spends nothing, so it fails identically
+    /// on every later probe of the same slot.
+    ///
+    /// **The leg-scan counter is what says which arm ran.** A slot handed to the
+    /// scan raises it; one refused at the authentication does not, so a count
+    /// that did not move is what distinguishes this arm from the one M76 pins.
+    #[test]
+    fn a_frame_that_fails_to_authenticate_is_refused_once() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let mut a = machine(&dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), &dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+
+        let label_a = sole_label(&a);
+        let b_pk = *b_keys.signing.public_key();
+        let seq = queue_sends(&mut a, &b_pk, 1)[0];
+        // `tampered` rather than garbage: the clear header survives, so the
+        // frame parses and the AEAD is what refuses it.
+        let forged = tampered(&queued_frame_at(&a, &label_a, seq, BASE_MS));
+
+        let conversation = conversation_of(&b, 0);
+        let before = b.correspondences[0].health.unopenable;
+        let before_scans = b.leg_scan_candidates;
+        for probe in 0..4 {
+            fold_page_at(
+                &mut b,
+                BASE_MS,
+                conversation,
+                position_of(seq).page(),
+                vec![(position_of(seq), forged.clone())],
+            );
+            assert_eq!(
+                b.correspondences[0].health.unopenable,
+                before + 1,
+                "probe {probe} refused a frame that had already failed to \
+                 authenticate at that position"
+            );
+        }
+        assert_eq!(
+            b.leg_scan_candidates, before_scans,
+            "the slot was handed to the leg scan, so this is not a test of the \
+             authentication arm"
+        );
+    }
+
+    /// M86. **A frame open that failed on a local fault is not a verdict about
+    /// the bytes, and is not remembered as one.**
+    ///
+    /// The twin of M78 on the arm that reaches the ratchet. `open_swept` returns
+    /// one `Err` type for both a frame that did not authenticate — a statement
+    /// about the bytes, true on every later probe — and a crypto-module failure
+    /// here, which says nothing about them. Remembering the second suppresses
+    /// every populated slot the page carried, under a state a correspondent
+    /// waiting on us cannot move.
+    ///
+    /// **Asserted on the predicate, because no fixture can make a healthy crypto
+    /// module fault.** The wiring is read at the one call site: the arm calls
+    /// this on the same `e` it has just traced, and calls `remember_refusal`
+    /// only when it answers true.
+    #[test]
+    fn a_frame_open_that_failed_on_a_local_fault_is_not_remembered_as_a_refusal() {
+        assert!(
+            !frame_refusal_is_a_verdict(&DmFrameError::Module(
+                oxicrypt_module::Error::IntegrityNotAttested
+            )),
+            "a crypto-module failure decided nothing about the bytes and must not \
+             be remembered"
+        );
+        assert!(
+            !frame_refusal_is_a_verdict(&DmFrameError::EntropySource),
+            "an entropy failure decided nothing about the bytes and must not be \
+             remembered"
+        );
+        assert!(
+            frame_refusal_is_a_verdict(&DmFrameError::Aead),
+            "the uniform authentication verdict must be remembered, or the memory \
+             holds nothing on the ordinary channel path"
+        );
+        assert!(
+            frame_refusal_is_a_verdict(&DmFrameError::Signature),
+            "an authorship signature that did not verify is a verdict about the \
+             bytes and must be remembered"
+        );
+    }
+
+    /// M79. **The page evicted is the one longest untouched, never the lowest.**
+    ///
+    /// A probe plan's backfill names the LOWEST pages holding a hole, and
+    /// `Collection::retired_below` is pinned at a permanent hole's page for the
+    /// whole give-up horizon — so under a standing hole the low pages are
+    /// presented on every probe while the frontier walks upward. Evicting by
+    /// page number drops exactly the pages every plan carries and keeps the ones
+    /// that have stopped being probed, which is the case this memory exists to
+    /// make cheap.
+    #[test]
+    fn the_page_evicted_is_the_one_longest_untouched() {
+        // The memory digests the bytes it remembers, so this test needs the
+        // crypto module a machine-building fixture would have brought with it.
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let bytes = vec![0xA5u8; daemonseed_core::dm::reest::LEG_LEN];
+        let at = |page: u64| PagePosition::new(page, 0).expect("a slot of the record");
+        let width = u64::try_from(REFUSED_PAGES).expect("a small width");
+
+        let mut memory = RefusalMemory::new();
+        for page in 0..width {
+            memory.refuse(at(page), &bytes);
+        }
+        // Page zero is consulted again, as the backfill under a standing hole is
+        // on every probe; the pages above it are not.
+        assert!(
+            memory.suppresses(at(0), &bytes),
+            "page zero was never remembered, so the eviction below has no subject"
+        );
+
+        memory.refuse(at(width), &bytes);
+        assert!(
+            memory.suppresses(at(0), &bytes),
+            "the page every probe consults was evicted"
+        );
+        assert!(
+            !memory.suppresses(at(1), &bytes),
+            "nothing was evicted at all, so the assertion above tests no bound"
+        );
+    }
+
+    /// M82. **Retirement releases exactly the pages below the bound.**
+    ///
+    /// The memory is released by the settlement that releases the page record
+    /// itself, so its bound is `Collection::retired_below`'s: a page at the
+    /// bound is still named by a plan and must survive.
+    #[test]
+    fn retirement_releases_the_pages_below_the_bound_and_no_others() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let bytes = vec![0xA5u8; daemonseed_core::dm::reest::LEG_LEN];
+        let at = |page: u64| PagePosition::new(page, 0).expect("a slot of the record");
+
+        let mut memory = RefusalMemory::new();
+        for page in 0..4 {
+            memory.refuse(at(page), &bytes);
+        }
+        assert!(
+            memory.suppresses(at(0), &bytes),
+            "page zero was never remembered, so the retirement below has no subject"
+        );
+
+        memory.retire_below(2);
+        assert!(
+            !memory.suppresses(at(0), &bytes),
+            "page zero was not released"
+        );
+        assert!(
+            !memory.suppresses(at(1), &bytes),
+            "page one was not released"
+        );
+        assert!(
+            memory.suppresses(at(2), &bytes),
+            "the page AT the bound was released, and a plan still names it"
+        );
+        assert!(
+            memory.suppresses(at(3), &bytes),
+            "a page above the bound was released"
+        );
+    }
+
+    /// M76. **A refused position is refused once per key-schedule state, not
+    /// once per probe.**
+    ///
+    /// `Collection::observe_page` returns every unsettled populated position on
+    /// every probe, and a slot this side cannot open is left unsettled on
+    /// purpose. So without a memory of what it has already refused, a
+    /// correspondence that can open nothing pays the whole parse-and-scan cost
+    /// again every cadence, and `unopenable` climbs at a rate set by the probe
+    /// interval rather than counting refusals (#442).
+    ///
+    /// **The leg-scan counter is the positive control.** *"The count did not
+    /// move"* is satisfied by a machine that stopped folding pages at all; a
+    /// scan that ran on the first probe and did not run on the next three is
+    /// what says the memory is where the difference is.
+    ///
+    /// **The last stretch is the other half of the claim.** A refusal is a
+    /// verdict under this side's own opening state, so an exchange that gives B
+    /// a fresh key schedule — a generation advanced, an acceptance settled, a
+    /// scan window moved — must put every remembered position back in front of
+    /// the fold rather than leave it suppressed for the life of the session.
+    #[test]
+    fn a_refused_position_is_refused_once_per_key_schedule_state() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+
+        // Bytes B cannot open on a page it still watches: leg-length, so they
+        // reach every scan candidate, and on a page none of the legs below is
+        // addressed to.
+        let page = 3u64;
+        let stale: Vec<(PagePosition, Vec<u8>)> = (0..3u16)
+            .map(|slot| {
+                (
+                    PagePosition::new(page, slot).expect("a slot of the record"),
+                    vec![0xA5u8; daemonseed_core::dm::reest::LEG_LEN],
+                )
+            })
+            .collect();
+        let filled = u64::try_from(stale.len()).expect("a small fixture");
+        let conversation = b.conversation();
+
+        let before = b.machine.correspondences[0].health.unopenable;
+        let before_scans = b.machine.leg_scan_candidates;
+        fold_page_at(&mut b.machine, BASE_MS, conversation, page, stale.clone());
+        assert_eq!(
+            b.machine.correspondences[0].health.unopenable,
+            before + filled,
+            "the first probe did not refuse every populated slot"
+        );
+        assert!(
+            b.machine.leg_scan_candidates > before_scans,
+            "no slot reached the leg scan, so the probes below are skipping nothing"
+        );
+        // A3.9's bound, on the slots this probe actually presented.
+        assert!(
+            b.machine.leg_scan_candidates - before_scans <= LEG_SCAN_CANDIDATES * filled,
+            "{filled} swept slots cost {} leg-scan candidates, above the bound of {}",
+            b.machine.leg_scan_candidates - before_scans,
+            LEG_SCAN_CANDIDATES * filled
+        );
+
+        for probe in 1..=3 {
+            let scans = b.machine.leg_scan_candidates;
+            fold_page_at(&mut b.machine, BASE_MS, conversation, page, stale.clone());
+            assert_eq!(
+                b.machine.correspondences[0].health.unopenable,
+                before + filled,
+                "probe {probe} refused a position that was already refused"
+            );
+            assert_eq!(
+                b.machine.leg_scan_candidates, scans,
+                "probe {probe} scanned a position that was already refused"
+            );
+        }
+
+        // ── the three legs, so B ends the exchange on a fresh key schedule ───
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        let (_, t3) = carry_one_leg(&mut a, &mut b, t2);
+        assert!(
+            b.machine.correspondences[0].ratchet.is_some(),
+            "B came out of the exchange with no key schedule, so the probe below \
+             is not after a change of one"
+        );
+        assert_eq!(
+            b.resume().reconnect_gen(),
+            1,
+            "B did not advance its generation, so its opening state did not move"
+        );
+
+        let before = b.machine.correspondences[0].health.unopenable;
+        fold_page_at(&mut b.machine, t3, conversation, page, stale);
+        assert_eq!(
+            b.machine.correspondences[0].health.unopenable,
+            before + filled,
+            "a key schedule that could open what the old one could not was never \
+             offered the positions the old one refused"
+        );
+    }
+
+    /// M77. **A refused position whose bytes change is looked at again.**
+    ///
+    /// The other half of M76's memory: it is keyed on the bytes as well as on
+    /// the position, because a page slot carries whatever was written to it and
+    /// a refusal is a statement about what was there. Keyed on the position
+    /// alone it would swallow the correspondent's own leg the moment anything
+    /// unopenable had occupied that slot first — a slot anyone can write, since
+    /// page owner-write authority is symmetric.
+    #[test]
+    fn a_refused_position_is_offered_again_when_its_bytes_change() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (seq, page, leg, t1) = publish_one_leg(&mut a, BASE_MS);
+
+        // The position A's initiation is addressed to, occupied first by bytes
+        // that open as nothing.
+        let garbage = vec![0xA5u8; daemonseed_core::dm::reest::LEG_LEN];
+        let before = b.machine.correspondences[0].health.unopenable;
+        deliver(&mut b, t1, seq, page, garbage.clone());
+        assert_eq!(
+            b.machine.correspondences[0].health.unopenable,
+            before + 1,
+            "the position was not refused"
+        );
+        // **The memory itself, not the count.** The count rises by one whether
+        // or not anything was remembered, so without this the delivery below
+        // would be a re-offer from an empty memory rather than from one holding
+        // that position.
+        assert!(
+            b.machine.correspondences[0]
+                .refusals
+                .suppresses(position_of(seq), &garbage),
+            "the refusal was not remembered, so there is nothing here to re-offer"
+        );
+
+        deliver(&mut b, t1, seq, page, leg);
+        assert_eq!(
+            b.machine.correspondences[0].health.unopenable,
+            before + 1,
+            "the initiation was refused unread at a position the memory held"
+        );
+        assert!(
+            b.resume().acceptance().is_some(),
+            "B did not answer the initiation, so the leg was never folded"
         );
     }
 

@@ -45,6 +45,10 @@ getrandom = { workspace = true }
 uuid = { workspace = true }
 # Zeroizing<String> for the profile passphrase DmDriverParts carries.
 zeroize = { workspace = true }
+# The digest a refused page slot is remembered by, so the same bytes at the same
+# position are refused once per key-schedule state rather than once per probe.
+# Already in this crate's lock via daemonseed-core.
+oxicrypt-sha = { workspace = true }
 
 [dev-dependencies]
 # Named again here purely to switch daemonseed-core's `testing` feature on while

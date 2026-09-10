@@ -367,6 +367,14 @@ pub enum DmEvent {
         /// owner-write authority is symmetric, so an unopenable frame is an
         /// ordinary input — the correspondent's own writes are what the
         /// authorship signature separates from everybody else's.
+        ///
+        /// **One count per refusal, not one per probe.** The driver remembers
+        /// the positions it has refused and the bytes it refused there, so the
+        /// same bytes at the same position are not counted again on the next
+        /// probe. That memory is bounded and is dropped whenever this side could
+        /// now open what it could not — a frame that opens, a key schedule, a
+        /// pseudonym, a correspondent direction or a leg-scan window that moves
+        /// — and a dropped entry is a position offered, and counted, again.
         unopenable: u64,
         /// Unsettled positions left alone, once each per sweep that saw them,
         /// because the correspondent's pseudonym key is not known here yet.
