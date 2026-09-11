@@ -1686,7 +1686,14 @@ modules:
       OutboxEntry, OutboxError> add one, taking the caller's clock as the compose
       time; a repeat is OutboxError::DuplicateSequence, and a message the record
       could not then hold is OutboxError::Full { seq, needed, capacity } with
-      needed the would-be total and Display rendering the excess. publish(seq,
+      needed the would-be total and Display rendering the excess. An
+      enqueue_awaiting_key reservation is priced at frame::WORST_CASE_SEALED_FRAME_LEN
+      plus its length prefix and the entry's fixed fields, cumulatively over the
+      reservations the record already holds, which bounds waiting messages per
+      correspondence at dm_store::OUTBOX_CAPACITY divided by that price; the charge
+      is released at publish, which prices the frame it received, and it is charged
+      against further reservations only, not against enqueue_sealed or publish.
+      publish(seq,
       now_ms, frame, sealed_under_gen) installs the sealed frame on an AwaitingKey
       entry and is the only public way to do so — OutboxEntry::publish is pub(crate) — because
       installing a frame is the other edge that grows the record and is gated the
@@ -1697,7 +1704,21 @@ modules:
       OutboxError> answers whether a sealed entry of that size would be accepted,
       through the same private gate the enqueue passes, so the two answers cannot
       differ; a caller that cannot know its frame's length before sealing passes
-      frame::WORST_CASE_SEALED_FRAME_LEN. prune() -> usize removes entries that are terminal
+      frame::WORST_CASE_SEALED_FRAME_LEN; it runs the enqueue gate, so a sequence the
+      record already holds is OutboxError::DuplicateSequence. room_to_publish(seq,
+      now_ms, frame_len) -> Result<(), OutboxError> is the same question for a sequence
+      the record does hold, asking what publish asks in the same order:
+      OutboxError::UnknownSequence for an absent sequence, OutboxError::AlreadyPublished
+      for an entry not awaiting a key, OutboxError::GaveUp past its window,
+      OutboxError::Full when the frame would not fit. Its Ok is meaningful only for a
+      reservation.
+      sealing_plan(now_ms) -> Vec<SealingStep> classifies every AwaitingKey entry in
+      ascending sequence as SealingStep::GivenUp(seq) (past its window: end it
+      Undelivered, mint nothing), SealingStep::Admitted(seq) (a worst-case frame fits:
+      mint, seal, publish at that sequence) or SealingStep::Stop(seq) (it does not
+      fit: mint nothing, leave it and every later entry waiting). It mutates nothing,
+      prices each admission against the frames the steps before it install, and ends
+      at its first Stop. prune() -> usize removes entries that are terminal
       AND already Surfacing::Clear, returning how many went, and is the only thing
       that shrinks the record: without it the record grows with lifetime rather
       than owed messages and every persist fails permanently past capacity.
@@ -1767,7 +1788,10 @@ modules:
       Outbox::publish(seq, now_ms, frame, sealed_under_gen) is the only edge that
       installs a frame and accepts only AwaitingKey, returning OutboxError::AlreadyPublished
       otherwise; OutboxEntry::publish is pub(crate) so the frame install cannot
-      bypass the capacity check. emit(now_ms) -> Result<&[u8], OutboxError>
+      bypass the capacity check. It places the entry on RESEED_LADDER's first rung
+      under RESEED_JITTER_FRAC rather than leaving it due at now_ms, so messages
+      sealed at one settlement do not fall due together; the rung a key-fetch retry
+      consumed is not carried over and the give-up clock is untouched. emit(now_ms) -> Result<&[u8], OutboxError>
       returns the stored bytes borrowed and advances the schedule;
       retry_key_fetch(now_ms) advances it for an unsealed entry. Neither takes a
       jitter unit: both call ReseedSchedule::schedule_next_jittered, which draws
@@ -1792,6 +1816,8 @@ modules:
       and OnDht means the transport confirmed a write, not that the DHT holds
       the value (a losing set_dht_value also returns success).
       ReseedSchedule::new(now_ms) starts due immediately;
+      ReseedSchedule::first_rung_jittered(now_ms) starts due at RESEED_LADDER's first
+      rung under RESEED_JITTER_FRAC, with that rung consumed;
       ReseedSchedule::deferred(now_ms) starts due at a delay drawn from
       RECONNECT_FIRST_DISPATCH +/- RECONNECT_JITTER_FRAC — A5.5's
       reconnect-cadence band, hours rather than the ladder's opening minute —

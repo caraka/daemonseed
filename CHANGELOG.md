@@ -26,6 +26,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-core`: `Outbox::sealing_plan` and `SealingStep` (`dm::outbox`) — the entries awaiting a
+  key, in ascending sequence, each classified `GivenUp`, `Admitted` or `Stop`. The plan mutates
+  nothing and ends at its first `Stop`; the caller mints a key for an `Admitted` step and for no
+  other. `Outbox::room_to_publish` answers the same admission question for one held sequence without
+  writing (#453).
 - `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `peer_ack_fetches_failed`, one per fetch of a
   correspondent's acknowledgement record that came back with no answer (#429).
 - `daemonseed-tui`: a direct-message thread, opened with `Enter` on a correspondence row and left
@@ -847,6 +852,15 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-core`: `Outbox::enqueue_awaiting_key` prices each reservation at
+  `dm::frame::WORST_CASE_SEALED_FRAME_LEN` plus its length prefix and the entry's fixed fields,
+  cumulatively over the
+  reservations already held, and refuses `OutboxError::Full` past `dm_store::OUTBOX_CAPACITY`. The
+  charge is released at `Outbox::publish`, which prices the frame it received; it is charged against
+  further reservations and not against `Outbox::enqueue_sealed` or `Outbox::publish` (#453).
+- `daemonseed-core`: `Outbox::publish` places the entry on `RESEED_LADDER`'s first rung under
+  `RESEED_JITTER_FRAC` rather than leaving it due at `now_ms`. `ReseedSchedule::first_rung_jittered`
+  (#453).
 - `daemonseed-core`: `Ratchet::receive` takes the frame header's `chain_base` as the receiving
   chain's base when that chain has opened nothing, at its own generation as well as at a new one,
   walking to the frame's `seq` under `MAX_CATCH_UP` and committing after the frame opens. A chain

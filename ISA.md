@@ -1009,6 +1009,18 @@ route taken to reach a decision are not recorded here — the git history and `C
   between the two; that margin is the documented floor of the record and is accepted. Two copies
   of the predicate were refused because they drift.
 
+- **A message composed with no key schedule is charged the room its frame will need at compose, and
+  the charge binds further reservations only.** Such an entry holds no bytes and takes a whole frame
+  the moment a key exists, so it is priced at `WORST_CASE_SEALED_FRAME_LEN` plus its fixed overhead,
+  cumulatively over the reservations the record already holds, and refused as full past
+  `OUTBOX_CAPACITY`; the charge is released when its frame is installed, which prices the frame
+  received. A sealed enqueue and a frame install are priced at the bytes they carry and never against
+  that hold, because the re-establishment legs that unblock a reservation ride the same record in the
+  same direction — refusing them by the room its own waiting messages hold would leave every one of
+  those messages to its give-up. What reconciles the hold with the record's real occupancy is the
+  ascending pass that admits each waiting message before minting its key and stops at the first
+  refusal.
+
 - **A give-up is reported before its surfacing is cleared, and the clear waits for the front end
   to say the report was shown.** Clearing in the same write that discovers the give-up persists the
   clear while the report is still in memory, so a crash between the two loses the report — the

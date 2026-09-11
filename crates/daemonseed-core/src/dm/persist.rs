@@ -4172,7 +4172,13 @@ mod tests {
     fn plant_over_threshold(outbox: &mut Outbox, t0: i64, later: i64) -> u64 {
         for seq in 1..=PRUNABLE {
             outbox
-                .enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, t0)
+                .enqueue_sealed(
+                    seq,
+                    OutboxTarget::ChannelPage,
+                    t0,
+                    SealedFrame::new(vec![0x5A; 64]),
+                    0,
+                )
                 .expect("enqueues");
         }
         let given_up = outbox.sweep_give_ups(later);
@@ -4274,7 +4280,13 @@ mod tests {
 
         p.update_outbox(&l, Direction::AToB, t0, |outbox| {
             for seq in 1..=PRUNABLE {
-                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, t0)?;
+                outbox.enqueue_sealed(
+                    seq,
+                    OutboxTarget::ChannelPage,
+                    t0,
+                    SealedFrame::new(vec![0x5A; 64]),
+                    0,
+                )?;
             }
             let given_up = outbox.sweep_give_ups(later);
             outbox.record_surfaced(&given_up);
@@ -4446,7 +4458,13 @@ mod tests {
         let highest_pad = pad - 1;
         for seq in pad..pad + PRUNABLE {
             outbox
-                .enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, t0)
+                .enqueue_sealed(
+                    seq,
+                    OutboxTarget::ChannelPage,
+                    t0,
+                    SealedFrame::new(vec![0x5A; 64]),
+                    0,
+                )
                 .expect("enqueues");
         }
         let given_up = outbox.sweep_give_ups(later);
@@ -4767,7 +4785,13 @@ mod tests {
 
         p.update_outbox(&l, Direction::AToB, t0, |outbox| {
             for seq in 1..=PRUNABLE {
-                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, t0)?;
+                outbox.enqueue_sealed(
+                    seq,
+                    OutboxTarget::ChannelPage,
+                    t0,
+                    SealedFrame::new(vec![0x5A; 64]),
+                    0,
+                )?;
             }
             let given_up = outbox.sweep_give_ups(later);
             outbox.record_surfaced(&given_up);

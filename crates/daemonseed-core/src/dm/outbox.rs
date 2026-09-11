@@ -278,6 +278,7 @@ use crate::backoff::apply_jitter;
 use crate::crypto::suite::{Registry, SuiteId, SuiteIdError};
 use crate::dm::ack::AckState;
 use crate::dm::doorbell::DOORBELL_SLOTS;
+use crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN;
 use crate::dm::paging::{PagePosition, position_of};
 use crate::dm::provisional::TeardownCause;
 use crate::dm::push_lp;
@@ -490,6 +491,27 @@ fn lifecycle_payload_len(lifecycle: &Lifecycle) -> usize {
 /// The exact bytes one entry contributes to [`Outbox::encode`]'s output.
 fn entry_encoded_len(entry: &OutboxEntry) -> usize {
     ENTRY_FIXED_LEN + target_encoded_len(entry.target) + lifecycle_payload_len(&entry.lifecycle)
+}
+
+/// Bytes a [`Lifecycle::AwaitingKey`] entry holds room for beyond what it
+/// currently encodes to: the length prefix and the largest frame
+/// [`crate::dm::frame::seal`] can produce.
+///
+/// A reservation encodes to nothing beyond its fixed fields today and to a whole
+/// frame the moment a key schedule exists, and it is the *later* size that has to
+/// fit — a frame minted for a position the record then refuses is spent for
+/// nothing. So the reservation is priced at what it may yet become.
+const RESERVED_FRAME_CHARGE: usize = 8 + WORST_CASE_SEALED_FRAME_LEN;
+
+/// What the record would encode to with a `frame_len` frame installed on an entry
+/// whose lifecycle costs `current_payload` now.
+///
+/// **One arithmetic for the refusal and for the forecast.** [`Outbox::publish`]
+/// refuses on it, [`Outbox::room_to_publish`] answers on it without writing, and
+/// [`Outbox::sealing_plan`] walks it forward across a batch. A second expression
+/// of the same rule is a rule that can disagree with itself.
+fn publish_needed(encoded_len: usize, current_payload: usize, frame_len: usize) -> usize {
+    encoded_len + (8 + frame_len).saturating_sub(current_payload)
 }
 
 /// What can go wrong driving or decoding an outbox.
@@ -1009,6 +1031,28 @@ impl ReseedSchedule {
         }
     }
 
+    /// A schedule whose first emission is due at the ladder's first rung under
+    /// [`RESEED_JITTER_FRAC`], with that rung consumed.
+    ///
+    /// **The difference from [`Self::new`] is one drawn delay, and it is what
+    /// stops a batch beating together.** `Self::new` is due at `now_ms`, which is
+    /// right for an entry composed with a frame already sealed — it is ready to
+    /// write. An entry whose frame arrives later is not alone: every message that
+    /// waited on the same key schedule becomes writable in the same pass, and
+    /// due-now makes them one burst against one record.
+    ///
+    /// **The difference from [`Self::deferred`] is the scale and the rung.**
+    /// `deferred` draws from [`RECONNECT_FIRST_DISPATCH`], hours wide, to break a
+    /// whole device's restart-gated legs apart, and leaves the ladder standing at
+    /// its first rung because nothing has been emitted. This one is an ordinary
+    /// first dispatch on an ordinary cadence, so it consumes rung 0 exactly as
+    /// the first emission of any other entry does.
+    pub fn first_rung_jittered(now_ms: i64) -> Self {
+        let mut schedule = Self::new(now_ms);
+        schedule.schedule_next_jittered(now_ms);
+        schedule
+    }
+
     /// How many emissions have been scheduled, saturating at the ladder's end.
     pub fn rung(&self) -> u32 {
         self.rung
@@ -1237,11 +1281,8 @@ impl OutboxEntry {
         frame: SealedFrame,
         sealed_under_gen: u32,
     ) -> Result<(), OutboxError> {
-        if !matches!(self.lifecycle, Lifecycle::AwaitingKey) {
-            return Err(OutboxError::AlreadyPublished(self.seq));
-        }
-        if self.is_given_up(now_ms) {
-            return Err(OutboxError::GaveUp(self.seq));
+        if let Some(refusal) = self.publish_refusal(now_ms) {
+            return Err(refusal);
         }
         self.lifecycle = Lifecycle::AwaitingCollection(frame);
         // Recorded by the same call that installs the frame, so provenance and
@@ -1249,6 +1290,27 @@ impl OutboxEntry {
         // always names the chain that sealed it.
         self.sealed_under_gen = sealed_under_gen;
         Ok(())
+    }
+
+    /// Why this entry would refuse a frame at `now_ms`, or `None` if it would
+    /// take one — everything [`Self::publish`] checks about the *entry*, asked
+    /// without mutating it.
+    ///
+    /// **The state refusals and the capacity refusal are separate questions and
+    /// this one is asked first.** A record near its capacity would otherwise
+    /// answer [`OutboxError::Full`] for an entry that is past its window or
+    /// already holds a frame, and the caller would read a transient
+    /// no-room-right-now where the truth is a message it must surface or a frame
+    /// it must not install twice. Priced second, the capacity answer is only ever
+    /// given about an entry that would actually take the frame.
+    fn publish_refusal(&self, now_ms: i64) -> Option<OutboxError> {
+        if !matches!(self.lifecycle, Lifecycle::AwaitingKey) {
+            return Some(OutboxError::AlreadyPublished(self.seq));
+        }
+        if self.is_given_up(now_ms) {
+            return Some(OutboxError::GaveUp(self.seq));
+        }
+        None
     }
 
     /// Whether an emission is due at `now_ms`.
@@ -1479,6 +1541,34 @@ pub struct TeardownOutcome {
     pub surfaced: Vec<u64>,
 }
 
+/// What a sealing pass should do with one message that is waiting for a key.
+///
+/// One step per [`Lifecycle::AwaitingKey`] entry, in ascending sequence, as
+/// produced by [`Outbox::sealing_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealingStep {
+    /// The give-up window closed before a key schedule existed. **Mint
+    /// nothing**: the message is already past the point where sealing it could
+    /// deliver it.
+    ///
+    /// **[`Outbox::sweep_give_ups`] is what ends such an entry
+    /// [`Lifecycle::Undelivered`] and owes its surfacing** — there is no
+    /// per-entry discharge, and none is needed, because the window is a property
+    /// of the clock rather than of this pass. A caller that sweeps before
+    /// planning sees no step of this kind at all. The variant names what a sweep
+    /// will end, so a caller reading the plan knows which of its waiting messages
+    /// are not going to be sealed; it is not an instruction to act on one entry.
+    GivenUp(u64),
+    /// The record can take a worst-case frame at this position. Derive the key,
+    /// seal, install the frame at this same sequence through [`Outbox::publish`],
+    /// which places the entry on the ladder's first rung.
+    Admitted(u64),
+    /// The record refuses a worst-case frame at this position. **Mint nothing**,
+    /// leave this entry and every later one waiting, and stop. The plan carries
+    /// no step after this one.
+    Stop(u64),
+}
+
 /// Everything one sender still owes one correspondent on one direction.
 ///
 /// Keyed by sequence number, which is monotonic per direction across the whole
@@ -1620,6 +1710,23 @@ impl Outbox {
     /// the number the sweep needs is the one that was current when these bytes
     /// were produced. It also raises [`Self::last_clear_gen`], which is the
     /// header's copy of the same fact.
+    ///
+    /// **The entry lands on the ladder's first rung with the ordinary jitter,
+    /// not due at `now_ms`.** A reservation's schedule is due immediately from
+    /// the moment it is composed and nothing advances it while no key schedule
+    /// exists, so every message waiting on one correspondence falls due together
+    /// at the first pass after a key schedule arrives — with k waiting, that is
+    /// k+1 writes to one record in one pass, legible as a burst to anything
+    /// co-hosting it. Drawing each entry's first dispatch from
+    /// [`RESEED_LADDER`]'s first rung under [`RESEED_JITTER_FRAC`] spreads the
+    /// batch the way every other first dispatch is spread.
+    ///
+    /// **The rung a key-fetch retry consumed is not carried over.** Those
+    /// advances counted attempts to *fetch a key*
+    /// ([`OutboxEntry::retry_key_fetch`]), not emissions of these bytes — the
+    /// frame installed here has never been written once. The give-up clock is
+    /// untouched: it runs from compose, and the seven days a message is owed do
+    /// not grow because its key took days to arrive.
     pub fn publish(
         &mut self,
         seq: u64,
@@ -1631,9 +1738,17 @@ impl Outbox {
             .entries
             .get(&seq)
             .ok_or(OutboxError::UnknownSequence(seq))?;
-        let current = lifecycle_payload_len(&entry.lifecycle);
-        let after = 8 + frame.len();
-        let needed = self.encoded_len() + after.saturating_sub(current);
+        // The entry's own refusals first, asked without mutating it: a near-full
+        // record must not answer `Full` about an entry that is past its window or
+        // already holds a frame.
+        if let Some(refusal) = entry.publish_refusal(now_ms) {
+            return Err(refusal);
+        }
+        let needed = publish_needed(
+            self.encoded_len(),
+            lifecycle_payload_len(&entry.lifecycle),
+            frame.len(),
+        );
         if needed > OUTBOX_CAPACITY {
             return Err(OutboxError::Full {
                 seq,
@@ -1641,10 +1756,12 @@ impl Outbox {
                 capacity: OUTBOX_CAPACITY,
             });
         }
-        self.entries
+        let entry = self
+            .entries
             .get_mut(&seq)
-            .ok_or(OutboxError::UnknownSequence(seq))?
-            .publish(now_ms, frame, sealed_under_gen)?;
+            .ok_or(OutboxError::UnknownSequence(seq))?;
+        entry.publish(now_ms, frame, sealed_under_gen)?;
+        entry.schedule = ReseedSchedule::first_rung_jittered(now_ms);
         // A raise, never a set: the counter is monotone, and an entry published
         // out of order must not pull it back.
         self.last_clear_gen = self.last_clear_gen.max(sealed_under_gen);
@@ -1728,6 +1845,35 @@ impl Outbox {
     /// a sequence this record already holds, which the enqueue gate then
     /// refuses — turning a bookkeeping omission into a refusal at compose time
     /// (A4.8, `docs/design/direct-messaging.md:1056`).
+    ///
+    /// **The room the frame will need is charged here, not when the frame
+    /// arrives.** A reservation encodes to its fixed fields alone, so pricing it
+    /// at what it encodes to admits any number of them and defers every refusal
+    /// to a moment when a key has already been minted — and a key minted for a
+    /// position the record then refuses is spent for nothing, leaving the message
+    /// at a consumed position until its give-up. So the gate prices this entry at
+    /// `RESERVED_FRAME_CHARGE`, cumulatively with every reservation already
+    /// held, and refuses [`OutboxError::Full`] past
+    /// [`crate::storage::dm_store::OUTBOX_CAPACITY`]. Waiting messages per
+    /// correspondence are bounded by that capacity divided by one reservation's
+    /// price — [`crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN`] plus the length
+    /// prefix and the entry's fixed fields.
+    ///
+    /// **The charge is released at [`Self::publish`], not carried for life.** The
+    /// entry then encodes to the frame it actually received and stops holding
+    /// room for one, so a frame smaller than the worst case frees the difference
+    /// to the next caller. The alternative — holding the worst case until the
+    /// entry is terminal — would refuse sends the record could take, on bytes
+    /// nothing will ever write.
+    ///
+    /// **The hold is charged against further reservations and against nothing
+    /// else.** [`Self::enqueue_sealed`] and [`Self::publish`] are priced at the
+    /// bytes they actually carry, because the entries that unblock a reservation
+    /// ride this same record: a re-establishment leg charged against the room its
+    /// own waiting messages are holding is refused, and the reservations it would
+    /// have freed then wait out their give-up. The hold bounds how many messages
+    /// may wait; [`Self::sealing_plan`] is what reconciles that bound with the
+    /// record's real occupancy when the keys finally exist.
     pub fn enqueue_awaiting_key(
         &mut self,
         seq: u64,
@@ -1742,6 +1888,75 @@ impl Outbox {
         self.entries
             .get_mut(&seq)
             .ok_or(OutboxError::UnknownSequence(seq))
+    }
+
+    /// What to do with every message waiting for a key, in ascending sequence —
+    /// **without minting, sealing or mutating anything**.
+    ///
+    /// The caller walks the steps in order and, for each
+    /// [`SealingStep::Admitted`], derives the key, seals, installs the frame at
+    /// that same sequence through [`Self::publish`], and lets that call place the
+    /// entry on the ladder. For a [`SealingStep::GivenUp`] it ends the entry
+    /// [`Lifecycle::Undelivered`] and surfaces it.
+    ///
+    /// **A key is minted for an admitted step and for nothing else.** That is the
+    /// whole reason this exists rather than the caller sealing and letting
+    /// [`Self::publish`] refuse: a ratchet has no step backwards, so a key minted
+    /// for a position the record then refuses is spent unrecoverably, and the
+    /// message sits at a consumed position — unsendable, and reported as still
+    /// being prepared — until its give-up seven days later. That is the #291
+    /// shape, arriving on the one path where the expensive part is minted before
+    /// the record is asked. A given-up entry is the same waste with a second
+    /// certainty attached: its window has already closed, so the frame could not
+    /// be delivered even if it fitted.
+    ///
+    /// **The stop ends the plan, and a later entry is not examined.** Sequence
+    /// order is delivery order, so admitting a later message over one the record
+    /// refuses would reorder the conversation and strand the refused message
+    /// behind messages composed after it. A refusal is a full record, which the
+    /// batch itself is filling — so the entry after a stop would be refused too
+    /// in all but a contrived case, and the one that matters is the first.
+    ///
+    /// **A given-up entry does not stop the batch.** It mints nothing and it
+    /// grows the record by nothing, so nothing behind it is blocked by it.
+    ///
+    /// The occupancy the admissions are priced against walks forward across the
+    /// batch: each admitted step is charged a worst-case frame before the next is
+    /// examined, so a plan never admits more than the record can hold. It is
+    /// priced by `publish_needed`, which is what [`Self::publish`] refuses on,
+    /// so a step this call admits is one that call takes **on the record as it
+    /// stood when the plan was made**.
+    ///
+    /// **That makes the plan a snapshot, and the caller owes it exclusivity.**
+    /// This is `&self`: a sealed enqueue landing between the plan and the publish
+    /// takes the room an admitted step was priced against, and the key is minted
+    /// by then. So walk the plan under the same exclusive access to the record
+    /// that produced it, and never across a write — re-run the plan, or re-ask
+    /// [`Self::room_to_publish`], immediately before each key is minted.
+    pub fn sealing_plan(&self, now_ms: i64) -> Vec<SealingStep> {
+        let mut steps = Vec::new();
+        let mut projected = self.encoded_len();
+        for entry in self.entries.values() {
+            if !matches!(entry.lifecycle, Lifecycle::AwaitingKey) {
+                continue;
+            }
+            if entry.is_given_up(now_ms) {
+                steps.push(SealingStep::GivenUp(entry.seq));
+                continue;
+            }
+            // A reservation's lifecycle costs nothing, so the growth is the whole
+            // of a worst-case frame. Taken from the running total rather than
+            // from `encoded_len()`, which does not yet know about the frames the
+            // steps before this one will install.
+            let needed = publish_needed(projected, 0, WORST_CASE_SEALED_FRAME_LEN);
+            if needed > OUTBOX_CAPACITY {
+                steps.push(SealingStep::Stop(entry.seq));
+                break;
+            }
+            projected = needed;
+            steps.push(SealingStep::Admitted(entry.seq));
+        }
+        steps
     }
 
     /// Enqueue a message that was sealed at compose — the ordinary path. The
@@ -1803,7 +2018,71 @@ impl Outbox {
         target: OutboxTarget,
         frame_len: usize,
     ) -> Result<(), OutboxError> {
-        self.admits(seq, target, 8 + frame_len)
+        self.admits(seq, target, 8 + frame_len, 0)
+    }
+
+    /// Whether a worst-case frame could be installed on the entry at `seq` right
+    /// now, **without minting anything to find out** — the question
+    /// [`Self::room_for`] asks about a sequence the record does not yet hold.
+    ///
+    /// The two are not interchangeable and the difference is the dedup:
+    /// [`Self::room_for`] runs the whole enqueue gate, which refuses a sequence
+    /// the record already carries as [`OutboxError::DuplicateSequence`]. A
+    /// reservation owns its sequence from the moment it is composed, so that gate
+    /// answers the wrong question about it. This one asks exactly what
+    /// [`Self::publish`] asks, in the same order: the entry's own refusals
+    /// first, through the same predicate, then the growth by `publish_needed`.
+    ///
+    /// **Capacity alone would be a pre-ask that says yes where the publish says
+    /// no**, which is the orphaned-key shape this call exists to prevent: an
+    /// entry that already holds a frame, or whose window has closed, refuses the
+    /// install however much room the record has, and a caller that had minted a
+    /// key on the strength of a capacity-only answer has spent it for nothing.
+    ///
+    /// `UnknownSequence` for a sequence the record does not hold,
+    /// `AlreadyPublished` for an entry that is not awaiting a key, `GaveUp` past
+    /// its window, `Full` when the frame would not fit, `Ok` otherwise. **The
+    /// `Ok` is only meaningful for a reservation** — every other lifecycle is
+    /// refused by the gate above before the growth is priced at all, so no answer
+    /// here describes what installing a frame on a settled entry would cost.
+    pub fn room_to_publish(
+        &self,
+        seq: u64,
+        now_ms: i64,
+        frame_len: usize,
+    ) -> Result<(), OutboxError> {
+        let entry = self
+            .entries
+            .get(&seq)
+            .ok_or(OutboxError::UnknownSequence(seq))?;
+        if let Some(refusal) = entry.publish_refusal(now_ms) {
+            return Err(refusal);
+        }
+        let needed = publish_needed(
+            self.encoded_len(),
+            lifecycle_payload_len(&entry.lifecycle),
+            frame_len,
+        );
+        if needed > OUTBOX_CAPACITY {
+            return Err(OutboxError::Full {
+                seq,
+                needed,
+                capacity: OUTBOX_CAPACITY,
+            });
+        }
+        Ok(())
+    }
+
+    /// Bytes every reservation this record already holds is holding room for.
+    ///
+    /// Counted rather than stored, so it cannot drift from the entries it
+    /// describes.
+    fn reservation_hold(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| matches!(entry.lifecycle, Lifecycle::AwaitingKey))
+            .count()
+            * RESERVED_FRAME_CHARGE
     }
 
     /// The admission gate every enqueue passes: the target, the sequence space,
@@ -1811,7 +2090,10 @@ impl Outbox {
     ///
     /// `payload_len` is what the entry's lifecycle costs *beyond* its tag, so a
     /// caller pricing a sealed entry passes the length prefix plus the frame and
-    /// one pricing an entry that carries no bytes passes zero.
+    /// one pricing an entry that carries no bytes passes zero. `hold` is room the
+    /// record is already holding for entries it has admitted but not yet grown —
+    /// see [`Self::enqueue_awaiting_key`] for which callers pass it and why the
+    /// others pass zero.
     ///
     /// **One body, consulted by both the enqueue and the ask** — see
     /// [`Self::room_for`]. Nothing mutates here, so a refusal on either road
@@ -1822,6 +2104,7 @@ impl Outbox {
         seq: u64,
         target: OutboxTarget,
         payload_len: usize,
+        hold: usize,
     ) -> Result<(), OutboxError> {
         validate_target(target)?;
         // Below the high-water the entry is GONE rather than absent, so
@@ -1853,7 +2136,7 @@ impl Outbox {
         // Priced from the candidate's own fields rather than by inserting and
         // measuring.
         let needed =
-            self.encoded_len() + ENTRY_FIXED_LEN + target_encoded_len(target) + payload_len;
+            self.encoded_len() + hold + ENTRY_FIXED_LEN + target_encoded_len(target) + payload_len;
         if needed > OUTBOX_CAPACITY {
             return Err(OutboxError::Full {
                 seq,
@@ -1891,7 +2174,15 @@ impl Outbox {
         lifecycle: Lifecycle,
         sealed_under_gen: u32,
     ) -> Result<&mut OutboxEntry, OutboxError> {
-        self.admits(seq, target, lifecycle_payload_len(&lifecycle))?;
+        // A reservation is priced at the frame it may yet be handed, cumulatively
+        // with every reservation the record already holds; everything else is
+        // priced at the bytes it actually carries. See
+        // `Self::enqueue_awaiting_key`.
+        let (payload_len, hold) = match &lifecycle {
+            Lifecycle::AwaitingKey => (RESERVED_FRAME_CHARGE, self.reservation_hold()),
+            settled => (lifecycle_payload_len(settled), 0),
+        };
+        self.admits(seq, target, payload_len, hold)?;
         let entry = OutboxEntry {
             seq,
             target,
@@ -3610,29 +3901,33 @@ mod tests {
         use crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN;
         use crate::storage::dm_store::OUTBOX_CAPACITY;
 
-        // The hole a single enqueue-time gate leaves, and it is the design's own
-        // dominant path rather than an exotic one: `enqueue_awaiting_key` exists
-        // precisely for a recipient whose key record could not be fetched, and
-        // `publish` is the documented edge that resolves it. Those entries are
-        // admitted carrying NO frame, so hundreds fit trivially — and every frame
-        // arrives afterwards.
+        // The hole a single enqueue-time gate leaves. The compose gate charges a
+        // reservation the frame it may yet be handed, so the room is held — but
+        // it is held against further reservations and not against the sealed
+        // entries that arrive in between, which is the design's own dominant
+        // path: the legs that re-establish a channel ride this same record, in
+        // this same direction, between the compose and the seal. So the record
+        // can be full by the time the frames arrive, and every frame is the
+        // expensive part.
         let target = OutboxTarget::Doorbell { slot: 0 };
         let mut ob = empty();
-        for seq in 1..=500 {
+        let reserved = 8u64;
+        for seq in 1..=reserved {
             ob.enqueue_awaiting_key(seq, target, T0)
                 .unwrap_or_else(|e| panic!("frameless entry {seq} must fit: {e}"));
         }
         assert!(
             ob.encoded_len() < OUTBOX_CAPACITY,
-            "500 frameless entries must sit well inside the bucket — that is what \
+            "the frameless entries must sit well inside the bucket — that is what \
              makes this the interesting case"
         );
+        fill_to_one_frame_short(&mut ob, 1_000);
 
         // Now the frames arrive. Without the second gate every one of these returns
         // Ok and the record ends multiples over capacity, unwritable, with each
         // frame's ratchet position and nonce already spent.
         let mut refused_at = None;
-        for seq in 1..=500 {
+        for seq in 1..=reserved {
             let frame = SealedFrame::new(vec![0xA5; WORST_CASE_SEALED_FRAME_LEN]);
             if let Err(e) = ob.publish(seq, T0, frame, 0) {
                 assert!(
@@ -3644,7 +3939,7 @@ mod tests {
             }
         }
         let refused_at = refused_at.expect(
-            "publishing 500 worst-case frames onto frameless entries must be refused \
+            "publishing worst-case frames onto frameless entries must be refused \
              before the bucket overflows",
         );
         assert!(
@@ -5351,6 +5646,24 @@ mod tests {
         );
         assert_eq!(*ob.entry(1).unwrap().lifecycle(), Lifecycle::AwaitingKey);
         assert_eq!(ob.sweep_give_ups(T0 + GIVE_UP_MS), vec![1]);
+
+        // And the record's own door answers the window rather than the capacity,
+        // on a record with no room to spare: a driver told `Full` about a message
+        // past its window would retry a message it owes the user a surfacing for.
+        let mut full = empty();
+        full.enqueue_awaiting_key(1, channel(), T0).expect("fits");
+        fill_to_one_frame_short(&mut full, 1_000);
+        assert_eq!(
+            full.publish(
+                1,
+                T0 + GIVE_UP_MS,
+                SealedFrame::new(vec![0x11; WORST_CASE_SEALED_FRAME_LEN]),
+                0
+            ),
+            Err(OutboxError::GaveUp(1)),
+            "a near-full record reported the capacity where the window is the reason"
+        );
+        assert_eq!(*full.entry(1).unwrap().lifecycle(), Lifecycle::AwaitingKey);
     }
 
     /// **A terminal refusal and an overdue one are different answers**, because
@@ -6309,5 +6622,479 @@ mod tests {
 
         // Positive control: the untouched header decodes.
         assert!(Outbox::decode(&good, T0).is_ok());
+    }
+
+    // ── reservations, the sealing plan, and the settlement's jitter ─────────
+
+    /// What one channel-page reservation is charged at compose: its fixed
+    /// fields, its target byte, and the frame it holds room for.
+    fn reservation_price() -> usize {
+        ENTRY_FIXED_LEN + target_encoded_len(CHANNEL) + RESERVED_FRAME_CHARGE
+    }
+
+    /// Grow `ob` with sealed entries until exactly one worst-case frame of
+    /// headroom is left, and hand back the next unused sequence.
+    ///
+    /// Every entry is priced from the constants rather than from a chosen size,
+    /// so a change to the entry layout or to either capacity moves the fixture
+    /// with it instead of leaving it aimed at the wrong boundary.
+    fn fill_to_one_frame_short(ob: &mut Outbox, mut seq: u64) -> u64 {
+        let overhead = ENTRY_FIXED_LEN + target_encoded_len(CHANNEL) + 8;
+        while OUTBOX_CAPACITY - ob.encoded_len() > RESERVED_FRAME_CHARGE {
+            let excess = OUTBOX_CAPACITY - ob.encoded_len() - RESERVED_FRAME_CHARGE;
+            assert!(
+                excess >= overhead,
+                "the fill cannot land on the boundary: {excess} bytes left, \
+                 {overhead} of entry overhead before a single frame byte"
+            );
+            let len = (excess - overhead).min(WORST_CASE_SEALED_FRAME_LEN);
+            ob.enqueue_sealed(seq, CHANNEL, T0, SealedFrame::new(vec![0xA5; len]), 0)
+                .unwrap_or_else(|e| panic!("fill entry {seq} must fit: {e}"));
+            seq += 1;
+        }
+        assert_eq!(
+            OUTBOX_CAPACITY - ob.encoded_len(),
+            RESERVED_FRAME_CHARGE,
+            "the fixture is not one worst-case frame short of capacity"
+        );
+        seq
+    }
+
+    /// **A full record stops the batch at the first entry it cannot take, and
+    /// everything behind that entry stays waiting.**
+    ///
+    /// The reservations are admitted while the record is empty and the record
+    /// fills afterwards, which is the ordinary shape: the legs that re-establish
+    /// a channel ride the same record, in the same direction, between the moment
+    /// a message is composed and the moment a key exists to seal it.
+    #[test]
+    fn a_sealing_plan_stops_at_the_first_entry_the_record_cannot_take() {
+        let mut ob = empty();
+        for seq in 1..=4u64 {
+            ob.enqueue_awaiting_key(seq, channel(), T0)
+                .unwrap_or_else(|e| panic!("reservation {seq} must fit: {e}"));
+        }
+        fill_to_one_frame_short(&mut ob, 1_000);
+
+        let steps = ob.sealing_plan(T0);
+        assert_eq!(
+            steps,
+            vec![SealingStep::Admitted(1), SealingStep::Stop(2)],
+            "one frame of headroom admits one entry and stops at the next"
+        );
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| matches!(s, SealingStep::Admitted(_)))
+                .count(),
+            1,
+            "the admitted count must be exactly the number of frames that fit"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, SealingStep::Admitted(3) | SealingStep::Admitted(4))),
+            "an entry behind the stop was classified: {steps:?}"
+        );
+
+        // The plan wrote nothing: every reservation is still waiting for a key.
+        for seq in 1..=4u64 {
+            assert!(
+                matches!(
+                    ob.entry(seq).expect("reservation present").lifecycle(),
+                    Lifecycle::AwaitingKey
+                ),
+                "the plan mutated entry {seq}"
+            );
+        }
+
+        // Positive control: the one admitted step is one `publish` takes, and the
+        // entry behind it is one `publish` refuses.
+        ob.publish(
+            1,
+            T0,
+            SealedFrame::new(vec![0x11; WORST_CASE_SEALED_FRAME_LEN]),
+            0,
+        )
+        .expect("the admitted step must publish");
+        assert!(
+            matches!(
+                ob.publish(
+                    2,
+                    T0,
+                    SealedFrame::new(vec![0x22; WORST_CASE_SEALED_FRAME_LEN]),
+                    0
+                ),
+                Err(OutboxError::Full { seq: 2, .. })
+            ),
+            "the stop must be a refusal the record actually makes"
+        );
+    }
+
+    /// **The pre-ask answers every refusal the install would make, not only the
+    /// capacity one.**
+    ///
+    /// A pre-ask that says yes where the install says no is the orphaned key the
+    /// whole admission rule exists to prevent, so each of the four answers is
+    /// pinned by variant rather than by `is_err`.
+    #[test]
+    fn room_to_publish_answers_what_the_install_would() {
+        let mut ob = empty();
+        ob.enqueue_awaiting_key(1, channel(), T0).expect("fits");
+        ob.enqueue_awaiting_key(2, channel(), T0).expect("fits");
+        ob.enqueue_awaiting_key(3, channel(), T0).expect("fits");
+
+        // A reservation on a record with room.
+        assert_eq!(
+            ob.room_to_publish(1, T0, WORST_CASE_SEALED_FRAME_LEN),
+            Ok(())
+        );
+
+        // An entry that already holds a frame.
+        ob.publish(2, T0, frame(0x22), 0).expect("publishes");
+        assert_eq!(
+            ob.room_to_publish(2, T0, WORST_CASE_SEALED_FRAME_LEN),
+            Err(OutboxError::AlreadyPublished(2))
+        );
+
+        // A reservation past its window, on the same record that answered `Ok`
+        // for its neighbour at the earlier clock.
+        assert_eq!(
+            ob.room_to_publish(3, T0 + GIVE_UP_MS, WORST_CASE_SEALED_FRAME_LEN),
+            Err(OutboxError::GaveUp(3))
+        );
+
+        // The same reservation, the same clock, on a record with one frame of
+        // headroom that the frame it is asking about has just taken.
+        fill_to_one_frame_short(&mut ob, 1_000);
+        assert_eq!(
+            ob.room_to_publish(1, T0, WORST_CASE_SEALED_FRAME_LEN),
+            Ok(()),
+            "one frame of headroom must admit one frame"
+        );
+        ob.publish(
+            1,
+            T0,
+            SealedFrame::new(vec![0x11; WORST_CASE_SEALED_FRAME_LEN]),
+            0,
+        )
+        .expect("the headroom takes it");
+        assert!(
+            matches!(
+                ob.room_to_publish(3, T0, WORST_CASE_SEALED_FRAME_LEN),
+                Err(OutboxError::Full { seq: 3, .. })
+            ),
+            "a record with no headroom must refuse Full"
+        );
+
+        // Positive control on the sequence itself.
+        assert_eq!(
+            ob.room_to_publish(404, T0, WORST_CASE_SEALED_FRAME_LEN),
+            Err(OutboxError::UnknownSequence(404))
+        );
+    }
+
+    /// **The pre-ask and the install agree at the byte, in both directions.**
+    ///
+    /// Each is the other's control: a `room_to_publish` that said no where the
+    /// install says yes refuses sends the record would take, and one that said
+    /// yes where the install says no is the orphaned key. A comparison that is
+    /// not run at the boundary cannot tell a `>` from a `>=`, so the lengths
+    /// walked here straddle the exact fit — where the record ends at precisely
+    /// its capacity and must be taken.
+    #[test]
+    fn room_to_publish_agrees_with_the_install_at_the_boundary() {
+        let mut base = empty();
+        base.enqueue_awaiting_key(1, channel(), T0).expect("fits");
+        fill_to_one_frame_short(&mut base, 1_000);
+
+        // The headroom is one whole worst-case frame and its length prefix, so
+        // that length is the exact fit and one byte more is the first refusal.
+        let exact = WORST_CASE_SEALED_FRAME_LEN;
+        let mut fitted = 0;
+        let mut refused = 0;
+        for len in exact - 2..=exact + 2 {
+            let asked = base.room_to_publish(1, T0, len);
+            let mut installing = base.clone();
+            let installed = installing.publish(1, T0, SealedFrame::new(vec![0x11; len]), 0);
+            match (&asked, &installed) {
+                (Ok(()), Ok(())) => fitted += 1,
+                (Err(OutboxError::Full { .. }), Err(OutboxError::Full { .. })) => refused += 1,
+                _ => panic!("at {len} the ask said {asked:?} and the install said {installed:?}"),
+            }
+            if len == exact {
+                assert_eq!(
+                    asked,
+                    Ok(()),
+                    "a frame that ends the record at exactly its capacity must be taken"
+                );
+                assert_eq!(
+                    installing.encoded_len(),
+                    OUTBOX_CAPACITY,
+                    "the exact-fit case is not exact"
+                );
+            }
+        }
+        // Both halves witnessed: a loop that only ever fitted, or only ever
+        // refused, would agree with itself and prove nothing about the boundary.
+        assert_eq!(fitted, 3, "the lengths at or below the exact fit must fit");
+        assert_eq!(refused, 2, "the lengths past the exact fit must be refused");
+    }
+
+    /// **A reservation past its window is classified given-up, and the batch
+    /// carries on behind it.**
+    ///
+    /// The give-up mints nothing and grows the record by nothing, so nothing
+    /// behind it is blocked — which is what separates it from a stop.
+    #[test]
+    fn a_reservation_past_its_window_is_given_up_without_stopping_the_batch() {
+        let mut ob = empty();
+        ob.enqueue_awaiting_key(1, channel(), T0).expect("fits");
+        let later = T0 + GIVE_UP_MS;
+        ob.enqueue_awaiting_key(2, channel(), later).expect("fits");
+
+        let steps = ob.sealing_plan(later);
+        assert_eq!(
+            steps,
+            vec![SealingStep::GivenUp(1), SealingStep::Admitted(2)],
+            "the aged reservation is given up and the fresh one behind it is admitted"
+        );
+
+        // Positive control on the clock: one millisecond earlier the same record
+        // admits both, so the classification is the window and not the order.
+        assert_eq!(
+            ob.sealing_plan(later - 1),
+            vec![SealingStep::Admitted(1), SealingStep::Admitted(2)],
+            "the give-up fired before its window closed"
+        );
+    }
+
+    /// **The reservation past the bound is refused at compose, with the record
+    /// full as the reason.**
+    ///
+    /// The count is derived from the capacity and one reservation's price, so it
+    /// moves with either rather than pinning a number that a layout change makes
+    /// silently wrong.
+    #[test]
+    fn a_reservation_past_the_bound_is_refused_when_it_is_composed() {
+        let fits = ((OUTBOX_CAPACITY - OUTBOX_HEADER_LEN) / reservation_price()) as u64;
+        assert!(
+            fits > 1,
+            "the derivation collapsed to a degenerate bound: {fits}"
+        );
+
+        let mut ob = empty();
+        for seq in 1..=fits {
+            ob.enqueue_awaiting_key(seq, channel(), T0)
+                .unwrap_or_else(|e| panic!("reservation {seq} of {fits} must fit: {e}"));
+        }
+        assert_eq!(
+            ob.len() as u64,
+            fits,
+            "the record did not take every reservation the bound allows"
+        );
+
+        let refused = ob.enqueue_awaiting_key(fits + 1, channel(), T0);
+        assert!(
+            matches!(
+                refused,
+                Err(OutboxError::Full {
+                    seq,
+                    capacity: OUTBOX_CAPACITY,
+                    ..
+                }) if seq == fits + 1
+            ),
+            "the reservation past the bound must be refused Full: {refused:?}"
+        );
+        assert_eq!(
+            ob.len() as u64,
+            fits,
+            "a refused reservation must not enter the record"
+        );
+    }
+
+    /// **The room a reservation holds binds further reservations and nothing
+    /// else.**
+    ///
+    /// A record whose reservations have taken the whole bound still admits a
+    /// sealed entry, because the re-establishment legs that unblock those
+    /// reservations ride this record in this direction — charged the hold, they
+    /// would be refused and every message waiting on them would reach its give-up
+    /// instead of its correspondent. The refused reservation beside it is the
+    /// control: the hold is in force, and the sealed enqueue is passing it rather
+    /// than finding it absent.
+    #[test]
+    fn the_reservation_hold_binds_reservations_and_not_a_sealed_enqueue() {
+        let fits = ((OUTBOX_CAPACITY - OUTBOX_HEADER_LEN) / reservation_price()) as u64;
+        let mut ob = empty();
+        for seq in 1..=fits {
+            ob.enqueue_awaiting_key(seq, channel(), T0)
+                .unwrap_or_else(|e| panic!("reservation {seq} of {fits} must fit: {e}"));
+        }
+
+        // The hold is in force and all but exhausts the record.
+        assert!(
+            ob.encoded_len() + ob.reservation_hold() + reservation_price() > OUTBOX_CAPACITY,
+            "the fixture has room for another reservation, so it holds nothing back"
+        );
+        assert!(
+            matches!(
+                ob.enqueue_awaiting_key(fits + 1, channel(), T0),
+                Err(OutboxError::Full { .. })
+            ),
+            "the control failed: one more reservation must be refused"
+        );
+
+        // And the sealed entry goes in regardless, priced on the bytes it
+        // carries: the record's real occupancy is its reservations' fixed fields
+        // and nothing more.
+        ob.enqueue_sealed(
+            fits + 2,
+            OutboxTarget::ReEstablishmentLeg,
+            T0,
+            SealedFrame::new(vec![0x5A; WORST_CASE_SEALED_FRAME_LEN]),
+            0,
+        )
+        .expect("a sealed entry must not be charged the reservations' hold");
+        assert!(
+            ob.encoded_len() <= OUTBOX_CAPACITY,
+            "the record was taken past its capacity: {}",
+            ob.encoded_len()
+        );
+    }
+
+    /// **Messages sealed at one settlement do not fall due together.**
+    ///
+    /// Every reservation is due from the moment it is composed and nothing
+    /// advances it while no key schedule exists, so without a draw at the seal
+    /// the whole batch writes to one record in one pass.
+    ///
+    /// **The assertions are the ones a fair draw cannot fail.** Every due time
+    /// lies inside the first rung's band and none is the settlement itself,
+    /// which is the property; and the batch is not a single shared value, which
+    /// is the failure. Exact pairwise distinctness is deliberately not asserted:
+    /// the band is truncated to milliseconds, so two draws colliding is a thing a
+    /// correct implementation does, while every draw of a whole batch landing on
+    /// one value is not.
+    #[test]
+    fn messages_sealed_at_one_settlement_do_not_fall_due_together() {
+        const K: u64 = 8;
+        let mut ob = empty();
+        for seq in 1..=K {
+            ob.enqueue_awaiting_key(seq, channel(), T0).expect("fits");
+        }
+        let settled = T0 + 60_000;
+        for seq in 1..=K {
+            ob.publish(seq, settled, frame(seq as u8), 7)
+                .unwrap_or_else(|e| panic!("entry {seq} must publish: {e}"));
+        }
+
+        let dues: Vec<i64> = (1..=K)
+            .map(|seq| {
+                ob.entry(seq)
+                    .expect("published entry present")
+                    .schedule()
+                    .next_due_ms()
+            })
+            .collect();
+        assert_eq!(dues.len(), K as usize, "the fixture lost an entry");
+        assert!(
+            dues.iter().any(|due| *due != dues[0]),
+            "every entry drew the same due time, which is the burst: {dues:?}"
+        );
+
+        let rung = RESEED_LADDER[0].as_millis() as f64;
+        let low = settled + (rung * (1.0 - RESEED_JITTER_FRAC)) as i64;
+        let high = settled + (rung * (1.0 + RESEED_JITTER_FRAC)) as i64;
+        for (seq, due) in (1..=K).zip(&dues) {
+            assert!(
+                *due > settled,
+                "entry {seq} is due at the settlement itself, which is due-now"
+            );
+            assert!(
+                (low..=high).contains(due),
+                "entry {seq} is due at {due}, outside the first rung's band [{low}, {high}]"
+            );
+            assert_eq!(
+                ob.entry(seq).expect("present").schedule().rung(),
+                1,
+                "entry {seq} did not consume the first rung"
+            );
+        }
+    }
+
+    /// **The order the contract forbids: a plan never admits behind a stop, and
+    /// a frame is refused on an entry whose window has closed.**
+    ///
+    /// Both halves are the same failure seen from two sides. An admission behind
+    /// a stop mints a key for a position the record refuses; a frame installed
+    /// past the give-up mints one for a message that can no longer be delivered.
+    /// Either leaves the message at a consumed position, unsendable, reported as
+    /// still being prepared until its window closes.
+    #[test]
+    fn a_plan_admits_nothing_behind_its_stop_and_a_closed_window_refuses_a_frame() {
+        let mut ob = empty();
+        for seq in 1..=5u64 {
+            ob.enqueue_awaiting_key(seq, channel(), T0).expect("fits");
+        }
+        fill_to_one_frame_short(&mut ob, 1_000);
+
+        let steps = ob.sealing_plan(T0);
+        assert!(!steps.is_empty(), "the plan classified nothing at all");
+        let stop = steps
+            .iter()
+            .position(|s| matches!(s, SealingStep::Stop(_)))
+            .expect("the fixture must produce a stop");
+        assert_eq!(
+            stop,
+            steps.len() - 1,
+            "a stop must be the last step: {steps:?}"
+        );
+        // Before anything quantifies over `steps[..stop]`: the fixture leaves one
+        // worst-case frame of headroom, so exactly one entry is admitted ahead of
+        // the stop. Without this, a plan that admitted nothing — `[Stop(1)]` —
+        // satisfies both the position assertion and the emptily-true `all` below.
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| matches!(s, SealingStep::Admitted(_)))
+                .count(),
+            1,
+            "the headroom must admit exactly one entry ahead of the stop: {steps:?}"
+        );
+        assert!(
+            steps[..stop]
+                .iter()
+                .all(|s| !matches!(s, SealingStep::Stop(_))),
+            "the plan carries more than one stop: {steps:?}"
+        );
+
+        // The other side: a frame on an entry past its window.
+        let mut aged = empty();
+        aged.enqueue_awaiting_key(1, channel(), T0).expect("fits");
+        let past = T0 + GIVE_UP_MS;
+        assert_eq!(
+            aged.sealing_plan(past),
+            vec![SealingStep::GivenUp(1)],
+            "the plan must classify the aged entry given-up rather than admitting it"
+        );
+        assert_eq!(
+            aged.publish(1, past, frame(1), 0),
+            Err(OutboxError::GaveUp(1)),
+            "a frame on an entry past its window must be refused"
+        );
+        assert!(
+            matches!(
+                aged.entry(1).expect("present").lifecycle(),
+                Lifecycle::AwaitingKey
+            ),
+            "the refusal must leave the entry exactly as it was"
+        );
+
+        // Positive control: the same call one millisecond inside the window
+        // installs the frame, so the refusal is the window and not the path.
+        let mut live = empty();
+        live.enqueue_awaiting_key(1, channel(), T0).expect("fits");
+        assert!(live.publish(1, past - 1, frame(1), 0).is_ok());
     }
 }
