@@ -847,6 +847,10 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-core`: `Ratchet::receive` takes the frame header's `chain_base` as the receiving
+  chain's base when that chain has opened nothing, at its own generation as well as at a new one,
+  walking to the frame's `seq` under `MAX_CATCH_UP` and committing after the frame opens. A chain
+  that has consumed a position keeps its base (#452).
 - `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `unopenable` counts one refusal per position,
   not one per probe of it (#442).
 - ISC-C80 is withdrawn and deregistered. It described a reconnect on a capped exponential backoff

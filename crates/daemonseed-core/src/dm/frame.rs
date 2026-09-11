@@ -1188,7 +1188,9 @@ mod tests {
     use super::*;
     use crate::dm::firstcontact::{FRAME_KIND_FIRST_CONTACT, recipient_hash};
     use crate::dm::paging::{PAGE_SLOTS, position_of};
-    use crate::dm::ratchet::{EphemeralDecapKey, FIRST_RECIPIENT_CHANNEL_SEQ, Ratchet, Role};
+    use crate::dm::ratchet::{
+        EphemeralDecapKey, FIRST_RECIPIENT_CHANNEL_SEQ, Ratchet, ReconnectSide, Role,
+    };
     use crate::identity::keys::{Identity, IdentityKeys, derive_identity_keys};
     use crate::identity::mnemonic::Mnemonic;
     use oxicrypt_sha::sha384;
@@ -2022,6 +2024,163 @@ mod tests {
 
         let second = p.send("and again");
         assert_eq!(p.recv(&second).unwrap().seq, 2);
+    }
+
+    /// A receiving chain that has opened nothing takes its base from the frame's
+    /// clear header, and here it does so on the production path: a real seal, a
+    /// real parse, and the ratchet driving [`ParsedFrame::open`].
+    ///
+    /// **The control is the point.** `chain_base` is bound in the AAD, so the
+    /// base the chain re-bases to and the base the sender sealed under must be
+    /// the same number or the frame cannot open. A passthrough closure derives a
+    /// key and asks nothing of it; only a real open puts the two in contact.
+    #[test]
+    fn a_re_based_receive_chain_opens_a_sealed_frame_and_refuses_an_edited_base() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let a = alice();
+        let b = bob();
+        let a_pc = keys(PHRASE_B);
+
+        // The initiating side opened at the lowest sequence still awaiting a key;
+        // the answering side at the number it was told its correspondent would
+        // write next, which is higher.
+        let rerooted = crate::dm::resume::reroot(
+            &crate::dm::resume::CommittedRoot::from_bytes(
+                &[0x5c; crate::dm::ratchet::ROOT_KEY_LEN],
+            ),
+            &[0x09; 32],
+        )
+        .expect("the module is operational");
+        let ar = [0x71u8; ROOT_LEN];
+        let mut writer = Ratchet::reestablished(
+            &rerooted,
+            Role::Initiator,
+            ReconnectSide::Initiated {
+                last_persisted_generation: 6,
+            },
+            7,
+            37,
+            &ar,
+        )
+        .expect("the initiating side opens");
+        let mut answering = Ratchet::reestablished(
+            &rerooted,
+            Role::Recipient,
+            ReconnectSide::Answered {
+                last_persisted_generation: 6,
+                peer_next_send_seq: 40,
+            },
+            7,
+            900,
+            &ar,
+        )
+        .expect("the answering side opens");
+
+        let out = writer.send_next().expect("the reserved position mints");
+        assert_eq!(out.header.chain_base, 37);
+        assert_eq!(out.header.seq, 37);
+        let rcpt = recipient_hash(b.signing.public_key()).unwrap();
+        let bytes = seal(
+            out,
+            &[1u8; ROOT_LEN],
+            &a_pc.signing,
+            a.signing.public_key(),
+            &rcpt,
+            SENT,
+            "waiting since before the exchange",
+            None,
+        )
+        .expect("the frame seals");
+
+        let dir = answering.recv_direction();
+        let author = AuthorKeys {
+            pc: a_pc.signing.public_key(),
+            lt: a.signing.public_key(),
+        };
+        let open_with = |r: &mut Ratchet, frame: &[u8]| {
+            let parsed = parse(frame).unwrap();
+            let at = position_of(parsed.header().seq);
+            r.receive(parsed.header(), parsed.eph_ct(), parsed.eph_ek(), |mk| {
+                parsed.open(mk, &[1u8; ROOT_LEN], dir, at, &rcpt, author)
+            })
+        };
+
+        // The control runs FIRST, so the honest open cannot be what left the
+        // chain unable to take it: the same frame with the AAD-bound base edited
+        // to the number the chain started on. The chain's fields are private to
+        // the ratchet, so what is asserted here is what a caller can observe —
+        // the refusal, the unchanged loss counts, and, below, that the honest
+        // frame still opens afterwards. That last one is the state assertion: a
+        // chain that had committed a base of 40 on this failed frame could never
+        // derive the key the honest frame at base 37 was sealed under.
+        let losses = answering.losses();
+        let edit_base_to = |to: u64| {
+            let mut decoded = wire::DmChannelFrame::decode(&bytes[..]).unwrap();
+            decoded.chain_base = to;
+            decoded.encode_to_vec()
+        };
+
+        // A base ABOVE the frame's own sequence never reaches the AEAD: the
+        // receive path refuses that shape outright, before any key is derived.
+        assert!(
+            matches!(
+                open_with(&mut answering, &edit_base_to(40)),
+                Err(crate::dm::ratchet::RatchetError::SeqBeforeChainBase {
+                    chain_base: 40,
+                    seq: 37
+                })
+            ),
+            "a base above the frame's own sequence must be refused outright"
+        );
+
+        // A base BELOW it is a shape the chain would re-base to, so this one does
+        // reach the open — and fails there, because the AAD binds the base the
+        // sender actually sealed under.
+        assert!(
+            matches!(
+                open_with(&mut answering, &edit_base_to(36)).expect("no key-schedule failure"),
+                Err(DmFrameError::Aead)
+            ),
+            "an edited base must fail the AEAD open"
+        );
+        assert_eq!(
+            answering.losses(),
+            losses,
+            "a frame that did not open moved the loss counts"
+        );
+
+        // The open is itself the proof of the re-base: a chain still positioned
+        // at 40 would derive a different key for sequence 37, and `chain_base` is
+        // bound in the AAD, so the frame would not open at all.
+        let opened = open_with(&mut answering, &bytes)
+            .expect("no key-schedule failure")
+            .expect("the frame opened");
+        assert_eq!(opened.body, "waiting since before the exchange");
+        assert_eq!(opened.seq, 37);
+
+        // And the cursor landed one past it rather than anywhere else.
+        let next_out = writer.send_next().expect("the next position mints");
+        assert_eq!(next_out.header.seq, 38);
+        let next_bytes = seal(
+            next_out,
+            &[1u8; ROOT_LEN],
+            &a_pc.signing,
+            a.signing.public_key(),
+            &rcpt,
+            SENT,
+            "the one after",
+            None,
+        )
+        .expect("the frame seals");
+        let second = open_with(&mut answering, &next_bytes)
+            .expect("no key-schedule failure")
+            .expect("the frame opened");
+        assert_eq!(second.seq, 38);
+        assert_eq!(
+            answering.losses().pending,
+            0,
+            "the two frames were contiguous, so nothing was stepped over"
+        );
     }
 
     /// Both directions, over a real generation step: the recipient's reply

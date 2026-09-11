@@ -317,8 +317,17 @@ pub enum ReconnectSide {
         /// stands between a forged or replayed settling leg and a chain opened
         /// on a number this party has already written under.
         last_persisted_generation: u32,
-        /// The sequence number the peer's first frame under the re-rooted chain
-        /// will carry.
+        /// Where to open the receiving chain until its first frame says
+        /// otherwise.
+        ///
+        /// **Provisional, and right only while the correspondent has nothing
+        /// waiting from before the exchange.** A message composed while the
+        /// correspondence held no key schedule keeps the sequence it reserved,
+        /// and the correspondent opens its chain at the lowest such number
+        /// rather than one past its settling leg — below this value. So this is
+        /// the base to assume, not the base to insist on: the chain takes the
+        /// `chain_base` of the first frame it opens ([`Ratchet::receive`]), and
+        /// this value stands only where that frame agrees with it.
         ///
         /// Known to the answering side because a `RE-EST` rides the outbox at
         /// its own sequence position and is fetched from the address that
@@ -973,6 +982,53 @@ impl Chain {
                 direction,
             },
         ))
+    }
+
+    /// Take `chain_base` as this chain's own base, if it has opened nothing.
+    ///
+    /// **"Opened nothing" is `next == base`, the chain's own two fields and no
+    /// other state.** A chain is built with its cursor on its base.
+    /// [`Self::advance_to`] is the only thing that moves the cursor *off* the
+    /// base, and it leaves it one past the key it returned; this function moves
+    /// both fields together, and only while they already agree. So the two
+    /// separate at the first key this chain ever produces and nothing can make
+    /// them agree again. A chain that has opened anything keeps the base it has,
+    /// and a frame below its cursor is refused by `advance_to` as
+    /// [`RatchetError::AlreadyConsumed`].
+    ///
+    /// **This reaches every receiving chain that has opened nothing, not only a
+    /// re-established one.** The first-contact recipient's chain ([`Ratchet::recipient`])
+    /// is in exactly this state until its first frame opens, and so is any chain
+    /// a generation step has just created. That is safe everywhere for the same
+    /// two reasons. Against a legitimate sender it is a no-op: both sides derive
+    /// the same base, so the header states the base the chain already holds and
+    /// nothing moves. Against anyone else a different base is simply a different
+    /// key — and `chain_base` is bound into the AEAD's AAD and into the
+    /// authorship signature's preimage (`dm::frame`), so a frame naming a base
+    /// its sender did not use cannot open, and a re-base that does not commit
+    /// leaves nothing behind.
+    ///
+    /// **The key is the first key of the chain either way, so the move is the
+    /// two cursors and nothing else.** A chain's key is stepped only as positions
+    /// are minted; an unopened chain still holds the key its root derived, which
+    /// is the key for whichever position it calls its base. Re-basing therefore
+    /// costs no derivation, in either direction and however far.
+    ///
+    /// **The base moves up as readily as down.** The case this exists for moves
+    /// it down — a correspondent whose chain opened below where this side
+    /// assumed. Upward is admitted on the same terms because the position of the
+    /// base is what the key at a sequence is derived from: a base this side did
+    /// not take is a key neither end agrees on, so a frame naming a base above
+    /// this chain's would never open, and refusing to follow it would leave the
+    /// direction unable to open anything at all rather than costing one message.
+    /// Nothing is given up by following it, because a chain that has opened
+    /// nothing holds no position anything could still arrive at.
+    fn rebase_unopened(mut self, chain_base: u64) -> Self {
+        if self.next == self.base {
+            self.base = chain_base;
+            self.next = chain_base;
+        }
+        self
     }
 
     /// Derive every remaining key up to (but not including) `end` and discard the
@@ -1698,6 +1754,27 @@ impl Ratchet {
     /// [`RatchetError::AlreadyConsumed`]: its key was used once and destroyed.
     /// Re-seeding means duplicates are ordinary traffic, so a caller is expected to
     /// discard them by content address before reaching here.
+    ///
+    /// **A receiving chain that has opened nothing takes its base from the
+    /// frame's header, at its own generation as well as at a new one**
+    /// (`Chain::rebase_unopened`), whichever way that chain was opened — the
+    /// first-contact recipient's included, where it is a no-op because both
+    /// sides derive the same base. A frame under a fresh generation has always
+    /// opened its chain at the `chain_base` the header names; a chain opened by
+    /// [`Self::reestablished`] as the answering side of a re-establishment is
+    /// positioned by its caller instead, at a sequence that is right only while
+    /// the correspondent has nothing older waiting, so its first frame is where
+    /// it learns the correspondent's real base. Once it has opened anything the
+    /// header's base is ignored, as it is for every other chain.
+    ///
+    /// **Trusting the header for this buys bounded work and nothing else.** The
+    /// base is unauthenticated when it is read, so what it is allowed to reach is
+    /// the walk from it to `header.seq` — bounded by [`MAX_CATCH_UP`] and refused
+    /// past it as [`RatchetError::BacklogTooWide`] — and the position of two
+    /// cursors on a clone. Nothing is written to this ratchet until `open`
+    /// succeeds, which it can only do under the key derived at the base the
+    /// sender actually used. That is the trust this path already places in the
+    /// same field at every generation step.
     pub fn receive<T, E>(
         &mut self,
         header: &FrameHeader,
@@ -1783,7 +1860,11 @@ impl Ratchet {
             };
             (drained, abandoned, Some(next_root), chain)
         } else {
-            let chain = self.recv.clone().ok_or(RatchetError::NotYetEstablished)?;
+            let chain = self
+                .recv
+                .clone()
+                .ok_or(RatchetError::NotYetEstablished)?
+                .rebase_unopened(header.chain_base);
             (Vec::new(), 0, None, chain)
         };
 
@@ -3090,6 +3171,233 @@ mod tests {
             minted.header.chain_base, target,
             "the chain's base is not the counter the step left"
         );
+    }
+
+    /// Every field of the receiving chain a frame could move, and the loss counts
+    /// beside it. One field compared would pass a refusal that moved any of the
+    /// others.
+    fn assert_recv_state_unchanged(r: &Ratchet, before: &Chain, losses: DeliveryLosses) {
+        let after = r.recv.as_ref().expect("a receiving chain");
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.direction, before.direction);
+        assert_eq!(after.base, before.base);
+        assert_eq!(after.next, before.next);
+        assert_eq!(after.key.as_bytes(), before.key.as_bytes());
+        assert_eq!(r.losses(), losses);
+    }
+
+    /// The answering side of a re-establishment is opened at the sequence its
+    /// correspondent was expected to write next, and that is the wrong number
+    /// whenever the correspondent had a message reserved from before the
+    /// exchange. Its first frame states where that chain really begins, and the
+    /// chain, having opened nothing, takes it.
+    #[test]
+    fn an_unopened_receiving_chain_takes_its_base_from_the_first_frame() {
+        let (mut writer, _) = reestablished_pair(7, 37, 900);
+        let (_, mut answering) = reestablished_pair(7, 40, 900);
+        {
+            let chain = answering.recv.as_ref().expect("a receiving chain");
+            assert_eq!(chain.base, 40);
+            assert_eq!(chain.next, chain.base, "the fixture opened the chain");
+        }
+
+        let reserved = writer.send_next().expect("the reserved position mints");
+        assert_eq!(reserved.header.chain_base, 37);
+        assert_eq!(reserved.header.seq, 37);
+        deliver_ok(&mut answering, &reserved);
+
+        {
+            let chain = answering.recv.as_ref().expect("a receiving chain");
+            assert_eq!(chain.base, 37, "the base the header stated");
+            assert_eq!(chain.next, 38);
+        }
+
+        // The positions the exchange's own legs hold are stepped over, and the
+        // frame past them opens on the chain the first frame based.
+        writer.skip_send_to(40).expect("a forward step");
+        let past_the_legs = writer.send_next().expect("the next position mints");
+        assert_eq!(past_the_legs.header.chain_base, 37);
+        assert_eq!(past_the_legs.header.seq, 40);
+        deliver_ok(&mut answering, &past_the_legs);
+
+        let chain = answering.recv.as_ref().expect("a receiving chain");
+        assert_eq!(chain.base, 37, "a chain that has opened is not re-based");
+        assert_eq!(chain.next, 41);
+
+        // The two leg positions are walked as ordinary catch-up: their keys are
+        // kept for a message that may still arrive, not written off.
+        let losses = answering.losses();
+        assert_eq!(losses.pending, 2, "one key per position stepped over");
+        assert_eq!(losses.abandoned, 0);
+        assert_eq!(losses.evicted, 0);
+        for seq in [38, 39] {
+            assert!(
+                answering.skipped.contains(&KeySlot {
+                    generation: past_the_legs.header.generation,
+                    direction: answering.recv_direction(),
+                    seq,
+                }),
+                "the key for a stepped-over position waits in the cache"
+            );
+        }
+    }
+
+    /// The re-base reaches every receiving chain that has opened nothing, and a
+    /// first-contact recipient's chain is in that state until its first frame.
+    /// There it must do nothing: both sides derive the same base, so the header
+    /// states what the chain already holds.
+    #[test]
+    fn the_first_contact_recipient_chain_is_not_moved_by_its_first_frame() {
+        let (mut initiator, mut recipient) = pair();
+        {
+            let chain = recipient.recv.as_ref().expect("a receiving chain");
+            assert_eq!(chain.base, FIRST_INITIATOR_CHANNEL_SEQ);
+            assert_eq!(chain.next, chain.base, "the chain has opened nothing");
+        }
+
+        let opening = initiator.send_next().expect("the opening frame mints");
+        assert_eq!(opening.header.chain_base, FIRST_INITIATOR_CHANNEL_SEQ);
+        deliver_ok(&mut recipient, &opening);
+
+        let chain = recipient.recv.as_ref().expect("a receiving chain");
+        assert_eq!(
+            chain.base, FIRST_INITIATOR_CHANNEL_SEQ,
+            "the header stated the base the chain already held"
+        );
+        assert_eq!(chain.next, FIRST_INITIATOR_CHANNEL_SEQ + 1);
+    }
+
+    /// The base moves up as readily as down. A correspondent whose chain opened
+    /// above where this side assumed states so in the same field, and the chain
+    /// follows it rather than deriving keys neither end agrees on.
+    #[test]
+    fn an_unopened_receiving_chain_follows_a_base_above_its_own() {
+        let (mut writer, _) = reestablished_pair(7, 40, 900);
+        let (_, mut answering) = reestablished_pair(7, 37, 900);
+        {
+            let chain = answering.recv.as_ref().expect("a receiving chain");
+            assert_eq!(chain.base, 37);
+            assert_eq!(chain.next, chain.base, "the chain has opened nothing");
+        }
+
+        let higher = writer.send_next().expect("a frame at 40");
+        assert_eq!(higher.header.chain_base, 40);
+        assert_eq!(higher.header.seq, 40);
+        deliver_ok(&mut answering, &higher);
+
+        let chain = answering.recv.as_ref().expect("a receiving chain");
+        assert_eq!(chain.base, 40, "the base the header stated");
+        assert_eq!(chain.next, 41);
+    }
+
+    /// Once a chain has opened a frame its base is settled, and a frame below it
+    /// is a position whose key was used once and destroyed. The header's base is
+    /// ignored from then on, exactly as it is for every chain that has consumed.
+    #[test]
+    fn a_receiving_chain_that_has_opened_ignores_a_lower_base() {
+        let (mut settled, mut answering) = reestablished_pair(7, 40, 900);
+        let (mut writer, _) = reestablished_pair(7, 37, 900);
+
+        deliver_ok(&mut answering, &settled.send_next().expect("a frame at 40"));
+        let before = answering.recv.clone().expect("a receiving chain");
+        let losses = answering.losses();
+
+        let lower = writer.send_next().expect("a frame at 37");
+        let err = deliver(&mut answering, &lower).expect_err("a rewind is refused");
+        assert!(
+            matches!(err, RatchetError::AlreadyConsumed { generation, seq }
+                if generation == lower.header.generation && seq == lower.header.seq),
+            "refused as a consumed position, got {err:?}"
+        );
+        assert_recv_state_unchanged(&answering, &before, losses);
+    }
+
+    /// The base is read before anything authenticates it, so what it is allowed
+    /// to buy is one catch-up of walking and no more. A frame naming a base
+    /// further than that from its own position is refused by distance, and
+    /// nothing moves.
+    #[test]
+    fn a_base_further_than_one_catch_up_from_the_frame_is_refused() {
+        let (mut writer, _) = reestablished_pair(7, 37, 900);
+        let (_, mut answering) = reestablished_pair(7, 40, 900);
+        let before = answering.recv.clone().expect("a receiving chain");
+        let losses = answering.losses();
+
+        let frame = writer.send_next().expect("a frame at 37");
+        let far = FrameHeader {
+            generation: frame.header.generation,
+            chain_base: frame.header.chain_base,
+            seq: frame.header.chain_base + MAX_CATCH_UP + 1,
+        };
+        let err = answering
+            .receive(&far, frame.eph_ct.as_deref(), &frame.eph_ek, |k| {
+                Ok::<_, ()>(*k.as_bytes())
+            })
+            .expect_err("a base that far from the frame is refused");
+        assert!(
+            matches!(err, RatchetError::BacklogTooWide { gap, max }
+                if gap == MAX_CATCH_UP + 1 && max == MAX_CATCH_UP),
+            "refused by distance, got {err:?}"
+        );
+        assert_recv_state_unchanged(&answering, &before, losses);
+    }
+
+    /// The re-base is computed against a clone and committed only after the
+    /// frame's authenticated encryption opens. `open` is where that verification
+    /// happens and its `Err` is what a bad tag or a corrupted ciphertext reaches
+    /// this path as, so a chain handed one is left able to take the real frame.
+    #[test]
+    fn a_re_base_commits_nothing_when_the_frame_does_not_open() {
+        let (mut writer, _) = reestablished_pair(7, 37, 900);
+        let (_, mut answering) = reestablished_pair(7, 40, 900);
+        let before = answering.recv.clone().expect("a receiving chain");
+        let losses = answering.losses();
+
+        let frame = writer.send_next().expect("a frame at 37");
+        let outcome = answering
+            .receive(
+                &frame.header,
+                frame.eph_ct.as_deref(),
+                &frame.eph_ek,
+                |_| Err::<[u8; 32], ()>(()),
+            )
+            .expect("no key-schedule failure");
+        assert!(outcome.is_err(), "the frame opened");
+        assert_recv_state_unchanged(&answering, &before, losses);
+
+        deliver_ok(&mut answering, &frame);
+        let chain = answering.recv.as_ref().expect("a receiving chain");
+        assert_eq!(chain.base, 37);
+        assert_eq!(chain.next, 38);
+    }
+
+    /// Control for why the re-base lives on an already-open chain rather than on
+    /// one created when the first frame lands. A ratchet with no receiving chain
+    /// takes the generation-switch path, which needs the encapsulation that
+    /// created the generation — and a resumed root's frames carry none, because
+    /// the root came out of the exchange.
+    #[test]
+    fn a_ratchet_with_no_receiving_chain_refuses_a_frame_carrying_no_encapsulation() {
+        let (mut writer, _) = reestablished_pair(7, 37, 900);
+        let (mut deferred, _) = reestablished_pair(7, 37, 900);
+        assert!(deferred.recv.is_none(), "the fixture opened a chain");
+
+        let frame = writer.send_next().expect("a frame at 37");
+        assert!(
+            frame.eph_ct.is_none(),
+            "a resumed root repeats no ciphertext"
+        );
+        let err = deferred
+            .receive(&frame.header, frame.eph_ct.as_deref(), &frame.eph_ek, |k| {
+                Ok::<_, ()>(*k.as_bytes())
+            })
+            .expect_err("a first frame with no encapsulation is refused");
+        assert!(
+            matches!(err, RatchetError::MissingCiphertext { generation }
+                if generation == frame.header.generation),
+            "refused for the missing encapsulation, got {err:?}"
+        );
+        assert!(deferred.recv.is_none(), "the refusal opened a chain");
     }
 
     /// Generations belong to one sender each and alternate. This is what makes a

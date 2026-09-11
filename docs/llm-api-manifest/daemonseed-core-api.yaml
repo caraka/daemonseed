@@ -1014,6 +1014,11 @@ modules:
       if the closure returns Ok; it runs the previous chain out to the arriving
       chain_base so messages in flight across a step stay readable, and serves an
       already-skipped position from the cache without touching anything else. A
+      receiving chain that has opened nothing takes the header's chain_base as its
+      own base, at its current generation as well as at a new one, walks to the
+      frame's seq under MAX_CATCH_UP and commits after the closure returns Ok; a
+      chain that has consumed a position keeps its base and refuses a lower seq
+      not held in the skipped-key cache as AlreadyConsumed. A
       frame at generation G decapsulates with the ephemeral published at G-1, so
       no selector rides the wire; ephemerals are kept indexed by publishing
       generation over EPHEMERAL_WINDOW (2). FrameHeader { generation, chain_base,
