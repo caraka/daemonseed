@@ -131,6 +131,13 @@ work lives in the maintainer's own planning notes, not here.
   `RatchetError::ReestablishedGenerationNotAhead { generation, persisted }` on either side (#404).
 - `daemonseed_core::dm::ratchet::Ratchet::can_send() -> bool` — whether a chain is in hand to mint
   from, or a peer ephemeral to open one against (#404).
+- `daemonseed_core::dm::ratchet::Ratchet::skip_send_to(seq) -> Result<(), RatchetError>` — steps the
+  sending chain to `seq`, deriving and discarding the key at every position between the counter and
+  it. Bounded by `MAX_SKIP`; a target below the counter is refused with
+  `RatchetError::AlreadyConsumed` and one past the bound with `RatchetError::BacklogTooWide`, both
+  with no state change, and a target equal to the counter is a no-op; a ratchet that holds no sending
+  chain yet is positioned at a forward target, deriving nothing. The receiver holds one key per
+  stepped-over position in its skipped-key cache until eviction (#451).
 - `daemonseed_core::dm::reest::agreed_generation(own_floor: u32, peer_floor: u32) -> u32` — the clear
   ratchet generation a resumed channel opens at, one past the higher of the two floors, saturating at
   `u32::MAX` (#404).

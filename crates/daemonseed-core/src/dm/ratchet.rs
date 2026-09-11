@@ -1501,8 +1501,14 @@ impl Ratchet {
         let chain = self.send.clone().ok_or(RatchetError::NotYetEstablished)?;
         let seq = self.next_send_seq;
         let (skipped, abandoned, key, chain) = chain.advance_to(seq)?;
-        debug_assert!(skipped.is_empty(), "sending never skips its own chain");
-        debug_assert_eq!(abandoned, 0, "sending never walks past its own chain");
+        debug_assert!(
+            skipped.is_empty(),
+            "send_next mints only its own position; skip_send_to is what steps a sending chain over others"
+        );
+        debug_assert_eq!(
+            abandoned, 0,
+            "send_next walks no position; skip_send_to is what steps a sending chain over others"
+        );
 
         let header = FrameHeader {
             generation: chain.generation,
@@ -1525,6 +1531,99 @@ impl Ratchet {
             eph_ct: self.gen_ct.clone(),
             eph_ek,
         })
+    }
+
+    /// Step the sending chain to `seq`, deriving and discarding the key at every
+    /// position between the counter and it.
+    ///
+    /// **The outbox, not the chain, decides which positions are spent.** A
+    /// sequence number addresses a write-once page slot, and the record that
+    /// hands those numbers out is the authority on which of them are already
+    /// spoken for. This is how a caller holding that record gives up the
+    /// positions the chain does not own: each one's key is derived and dropped,
+    /// and the counter lands on `seq`, which [`Self::send_next`] then mints. A
+    /// `seq` already equal to the counter is nothing to step over and is
+    /// accepted as such, changing nothing.
+    ///
+    /// **The receiver walks the gap as ordinary catch-up.** The next frame names
+    /// a position further along the chain, and the receiving ratchet steps to it
+    /// exactly as it steps to a frame whose predecessors have not arrived yet.
+    ///
+    /// **Bounded by [`MAX_SKIP`], not by [`MAX_CATCH_UP`]**, and refused past it
+    /// rather than truncated. Two reasons, both about the far end. A gap wider
+    /// than [`MAX_SKIP`] is one the receiver abandons keys across, which would
+    /// report permanent loss to that user for positions no message was ever
+    /// written to. And a gap near [`MAX_CATCH_UP`] would spend the receiver's
+    /// whole catch-up budget on this step, leaving one ordinary lost message
+    /// enough to push the next frame past the bound and wedge that direction
+    /// until the next generation. Inside [`MAX_SKIP`] the receiver walks the gap
+    /// without abandoning anything and keeps its full [`MAX_CATCH_UP`] for real
+    /// loss. A wider target is refused as [`RatchetError::BacklogTooWide`].
+    ///
+    /// A target **below** the counter is refused as
+    /// [`RatchetError::AlreadyConsumed`]: that position is minted and gone, and
+    /// re-minting it would put two messages under one key at one page slot.
+    /// Neither refusal changes anything, so a caller that computed a target
+    /// wrongly can still send at the position it already had.
+    ///
+    /// **A chain not yet opened is positioned, not walked, and that is not a
+    /// refusal.** The answering side of a re-establishment holds no sending
+    /// chain until its correspondent's first frame licenses the generation step,
+    /// and the generation step that frame licenses cuts the new chain at this
+    /// counter — so a
+    /// forward target with no chain present has no keys to derive and nothing to
+    /// discard, and moving the counter is the whole of the operation. The rewind
+    /// and the bound are checked first and refuse exactly as they do on an open
+    /// chain. Refusing the step outright would make it unreachable on the one
+    /// side that must take it before it can send anything at all.
+    ///
+    /// **The cost is the receiver's, and it is a cache cost.** This side reports
+    /// nothing — no message was lost, so nothing reaches [`Self::losses`] here.
+    /// The receiving side holds one key per stepped-over position in its
+    /// skipped-key cache, bounded by [`SKIPPED_KEY_CAPACITY`]. Nothing ever
+    /// takes them, so they are what eviction reaches first once that cache
+    /// fills, and each one evicted counts in that side's `losses().evicted`
+    /// exactly as any evicted key does.
+    pub fn skip_send_to(&mut self, seq: u64) -> Result<(), RatchetError> {
+        if seq == self.next_send_seq {
+            return Ok(());
+        }
+        if seq < self.next_send_seq {
+            return Err(RatchetError::AlreadyConsumed {
+                generation: self.send.as_ref().map_or(self.generation, |c| c.generation),
+                seq,
+            });
+        }
+        let stepped = seq - self.next_send_seq;
+        if stepped > MAX_SKIP as u64 {
+            return Err(RatchetError::BacklogTooWide {
+                gap: stepped,
+                max: MAX_SKIP as u64,
+            });
+        }
+        // **A chain not yet opened is positioned, not walked.** The answering
+        // side of a re-establishment holds no sending chain until the
+        // correspondent's first frame licenses the generation step, and that
+        // step cuts the chain at this counter — so there is nothing here to
+        // derive keys from and nothing to discard, and moving the counter is the
+        // whole of the operation. Refusing instead would make the step
+        // unreachable on the one side that has to take it before it can send.
+        let Some(chain) = self.send.clone() else {
+            self.next_send_seq = seq;
+            return Ok(());
+        };
+        // `advance_to` leaves the chain positioned after the key it returns, so
+        // the last position to step over is the one below the target and `seq`
+        // itself is left unminted. Every key it hands back is dropped here, and
+        // each of these types zeroizes as it goes.
+        //
+        // Cloned above for the same reason `send_next` clones: `advance_to`
+        // consumes the chain, so a refusal part way through must not be able to
+        // destroy it.
+        let (_stepped_over, _walked_past, _last_walked, chain) = chain.advance_to(seq - 1)?;
+        self.send = Some(chain);
+        self.next_send_seq = seq;
+        Ok(())
     }
 
     /// Take a generation step: encapsulate to the peer's latest ephemeral, re-root
@@ -2797,6 +2896,200 @@ mod tests {
         let reply = b.send_next().unwrap();
         assert_eq!(reply.header.seq, FIRST_RECIPIENT_CHANNEL_SEQ);
         assert_eq!(b.send_next().unwrap().header.seq, 1);
+    }
+
+    /// The positions an outbox has already spent are stepped over, not sealed at:
+    /// the sender lands on the position it was told to, and the receiver walks the
+    /// gap as it walks any batch written while it was away.
+    #[test]
+    fn a_stepped_sending_chain_seals_past_the_positions_it_walked() {
+        let (mut a, mut b) = pair();
+        let opening = a.send_next().unwrap();
+        deliver_ok(&mut b, &opening);
+
+        let spent_first = a.next_send_seq();
+        a.skip_send_to(spent_first + 2).expect("a forward step");
+        assert_eq!(a.next_send_seq(), spent_first + 2);
+        assert_eq!(
+            a.send.as_ref().expect("a sending chain").next,
+            spent_first + 2,
+            "the chain moved with the counter, not only the counter"
+        );
+
+        let out = a.send_next().unwrap();
+        assert_eq!(out.header.seq, spent_first + 2);
+        deliver_ok(&mut b, &out);
+
+        let losses = b.losses();
+        assert_eq!(losses.pending, 2, "one key per position stepped over");
+        assert_eq!(losses.evicted, 0);
+        assert_eq!(losses.abandoned, 0);
+        for seq in [spent_first, spent_first + 1] {
+            assert!(
+                b.skipped.contains(&KeySlot {
+                    generation: out.header.generation,
+                    direction: b.recv_direction(),
+                    seq,
+                }),
+                "the key for a stepped-over position waits in the cache"
+            );
+        }
+    }
+
+    /// Every field of the sending chain a step could move, and the counter beside
+    /// it. One field compared would pass a step that moved any of the others.
+    fn assert_send_state_unchanged(r: &Ratchet, before: &Chain, counter: u64) {
+        assert_eq!(r.next_send_seq(), counter);
+        let after = r.send.as_ref().expect("a sending chain");
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.direction, before.direction);
+        assert_eq!(after.base, before.base);
+        assert_eq!(after.next, before.next);
+        assert_eq!(after.key.as_bytes(), before.key.as_bytes());
+    }
+
+    /// A position below the counter has been minted and destroyed. Re-minting one
+    /// would put two messages under one key at one page slot, so the step refuses
+    /// it and leaves the chain able to send where it already stood. The counter's
+    /// own position is unminted and is nothing to step over, so it is accepted.
+    #[test]
+    fn a_sending_chain_refuses_a_step_that_would_rewind_it() {
+        let (mut a, _b) = pair();
+        a.send_next().unwrap();
+        let counter = a.next_send_seq();
+        let before = a.send.clone().expect("a sending chain");
+
+        for target in [0, counter - 1] {
+            let err = a.skip_send_to(target).expect_err("a rewind is refused");
+            assert!(
+                matches!(err, RatchetError::AlreadyConsumed { generation, seq }
+                    if generation == before.generation && seq == target),
+                "refused as a consumed position on this chain's generation, got {err:?}"
+            );
+            assert_send_state_unchanged(&a, &before, counter);
+        }
+
+        a.skip_send_to(counter)
+            .expect("the counter's own position is nothing to step over");
+        assert_send_state_unchanged(&a, &before, counter);
+
+        assert_eq!(
+            a.send_next().unwrap().header.seq,
+            counter,
+            "the position the step left standing"
+        );
+    }
+
+    /// The step is bounded at what a receiver keeps rather than at what it will
+    /// walk, so the gap costs the far end cache slots and never abandoned keys or
+    /// its catch-up budget. The refusal is the bound rather than a blanket one: a
+    /// target exactly at it is taken.
+    #[test]
+    fn a_sending_chain_refuses_a_step_past_the_retention_bound() {
+        let (mut a, mut b) = pair();
+        let opening = a.send_next().unwrap();
+        deliver_ok(&mut b, &opening);
+        let counter = a.next_send_seq();
+        let before = a.send.clone().expect("a sending chain");
+
+        let err = a
+            .skip_send_to(counter + MAX_SKIP as u64 + 1)
+            .expect_err("a step past the bound is refused");
+        assert!(
+            matches!(err, RatchetError::BacklogTooWide { gap, max }
+                if gap == MAX_SKIP as u64 + 1 && max == MAX_SKIP as u64),
+            "refused by distance, got {err:?}"
+        );
+        assert_send_state_unchanged(&a, &before, counter);
+
+        a.skip_send_to(counter + MAX_SKIP as u64)
+            .expect("a step of exactly what a receiver retains");
+        assert_eq!(a.next_send_seq(), counter + MAX_SKIP as u64);
+
+        // The maximal step leaves a chain that still seals, and the far end walks
+        // the whole of it as retention rather than as loss.
+        let out = a.send_next().expect("the chain still mints");
+        assert_eq!(out.header.seq, counter + MAX_SKIP as u64);
+        deliver_ok(&mut b, &out);
+        let losses = b.losses();
+        assert_eq!(
+            losses.pending, MAX_SKIP,
+            "one retained key per position stepped over"
+        );
+        assert_eq!(losses.abandoned, 0, "the far end abandoned nothing");
+        assert_eq!(losses.evicted, 0);
+    }
+
+    /// **A chain that has not opened is positioned by the step, and the chain
+    /// the generation step later cuts starts at that counter.**
+    ///
+    /// The answering side of a re-establishment holds a receiving chain and
+    /// waits for its correspondent's first frame, so there is nothing to walk
+    /// and nothing to discard; the counter is the whole of the state the step
+    /// can move. The second half is what makes the first half worth anything —
+    /// a step that moved the counter and left the chain to open somewhere else
+    /// would be worse than a refusal.
+    #[test]
+    fn a_chain_that_has_not_opened_is_positioned_by_the_step() {
+        let (mut initiator, mut answerer) = reestablished_pair(7, 40, 900);
+        assert!(!answerer.can_send(), "the fixture opened a sending chain");
+        let before = answerer.next_send_seq();
+        let target = before + 3;
+
+        answerer
+            .skip_send_to(target)
+            .expect("a forward step with no chain is accepted");
+        assert_eq!(answerer.next_send_seq(), target);
+        assert!(
+            answerer.send.is_none(),
+            "the step opened a chain of its own"
+        );
+
+        // The rewind and the bound still refuse, and neither moves the counter.
+        assert!(
+            matches!(
+                answerer.skip_send_to(target - 1),
+                Err(RatchetError::AlreadyConsumed { .. })
+            ),
+            "a rewind on an unopened chain was accepted"
+        );
+        assert!(
+            matches!(
+                answerer.skip_send_to(target + MAX_SKIP as u64 + 1),
+                Err(RatchetError::BacklogTooWide { .. })
+            ),
+            "a target past the bound was accepted"
+        );
+        assert_eq!(
+            answerer.next_send_seq(),
+            target,
+            "a refused step moved the counter"
+        );
+
+        // The correspondent's first frame is what opens this side's chain, and
+        // it opens at the counter the step left.
+        let outbound = initiator.send_next().expect("the initiating side mints");
+        let header = outbound.header;
+        answerer
+            .receive::<(), ()>(
+                &header,
+                outbound.eph_ct.as_deref(),
+                &outbound.eph_ek,
+                |_| Ok(()),
+            )
+            .expect("the frame reaches the ratchet")
+            .expect("the frame opens");
+        let minted = answerer
+            .send_next()
+            .expect("the first frame licensed the generation step");
+        assert_eq!(
+            minted.header.seq, target,
+            "the chain opened somewhere other than the counter the step left"
+        );
+        assert_eq!(
+            minted.header.chain_base, target,
+            "the chain's base is not the counter the step left"
+        );
     }
 
     /// Generations belong to one sender each and alternate. This is what makes a

@@ -995,7 +995,20 @@ modules:
       generation step when the peer has published an ephemeral newer than the one
       last stepped against, mints a fresh ephemeral, and returns Outbound { key,
       header, eph_ct, eph_ek } — eph_ct repeats on EVERY message of a generation
-      so losing the message that opened it costs only that message. receive(
+      so losing the message that opened it costs only that message.
+      skip_send_to(seq: u64) -> Result<(), RatchetError> steps the sending chain
+      to seq, deriving and discarding the key at every position between the
+      counter and it, so the outbox rather than the chain decides which positions
+      are spent; it is bounded by MAX_SKIP, and refuses a target below the counter
+      with AlreadyConsumed and one past the bound with BacklogTooWide, in both
+      cases with no state change, while a target equal to the counter is accepted
+      and changes nothing. Where no sending chain exists yet — the answering side
+      of a re-establishment — a forward target moves the counter alone, deriving
+      nothing, and the chain the generation step later cuts starts there. The
+      stepping side counts nothing into its own losses(); the receiver walks the
+      gap as ordinary catch-up and holds one key per stepped-over position in its
+      skipped-key cache, bounded by SKIPPED_KEY_CAPACITY, counting each one it
+      evicts in its own losses().evicted. receive(
       header, eph_ct, peer_eph_ek, open) takes the caller's open-and-verify as a
       closure, computes every state change against clones, and applies them ONLY
       if the closure returns Ok; it runs the previous chain out to the arriving
