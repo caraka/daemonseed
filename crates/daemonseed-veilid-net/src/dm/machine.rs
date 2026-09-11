@@ -2456,6 +2456,7 @@ impl DmMachine {
                 Some(PanickedJob::PageSweep { conversation, page }) => {
                     self.sweeping_pages.remove(&(conversation, page));
                     self.close_freed_after_teardown(
+                        now_ms,
                         DhtOpKind::SweepPage,
                         &OpTag::channel(conversation, None, Some(page)),
                     )
@@ -2472,6 +2473,7 @@ impl DmMachine {
                 Some(PanickedJob::PagePublish { conversation, page }) => {
                     release_publish(&mut self.publishing_pages, conversation, page);
                     self.close_freed_after_teardown(
+                        now_ms,
                         DhtOpKind::PublishPage,
                         &OpTag::channel(conversation, None, Some(page)),
                     )
@@ -2488,7 +2490,7 @@ impl DmMachine {
                 // The release may have freed the last page a torn-down conversation
                 // was holding, and no later signal would reach it. Collected before
                 // the result is folded, so a fold that returns early cannot drop it.
-                let mut freed = self.close_freed_after_teardown(kind, &tag);
+                let mut freed = self.close_freed_after_teardown(now_ms, kind, &tag);
                 let folded = match result {
                     Err(e) => {
                         crate::vtrace!("dm driver: operation failed: {e}");
@@ -4573,7 +4575,30 @@ impl DmMachine {
     /// collection from its stored cursor and probes from there, so it can happen.
     /// This is the accepted cost of a bounded record count: one open, against a
     /// count that would otherwise only rise.
-    fn close_pages(&mut self, index: usize, recv_below: u64, send_below: u64) -> Vec<DmEffect> {
+    ///
+    /// **The receiving half is keyed on what [`Self::probe`] opens on** — the
+    /// address root plus a key schedule or the stored outbox direction, through the
+    /// one helper both use ([`receiving_page_address`]) — so the close derives the
+    /// same address the open derived. An outbox read that fails at close time skips
+    /// the page, which the next settlement offers again. The sending half keeps the
+    /// key schedule gate for the reason stated at it below.
+    fn close_pages(
+        &mut self,
+        now_ms: i64,
+        index: usize,
+        recv_below: u64,
+        send_below: u64,
+    ) -> Vec<DmEffect> {
+        // Read before the destructure below borrows the machine, and only where
+        // there is no key schedule to derive from: the outbox is the one durable
+        // record of the direction, and a correspondence holding a ratchet addresses
+        // its plane from that without paying for the read.
+        let peer_direction = if self.correspondences[index].ratchet.is_none() {
+            self.stored_direction(&self.correspondences[index].label, now_ms)
+                .map(Direction::opposite)
+        } else {
+            None
+        };
         let Self {
             correspondences,
             sweeping_pages,
@@ -4586,13 +4611,15 @@ impl DmMachine {
             ..
         } = self;
         let correspondence = &correspondences[index];
-        // No ratchet, no address to derive. A correspondence with no live channel
-        // opened no page this session, so there is nothing of its to hand back.
-        let Some((ratchet, _, _)) = correspondence.live() else {
+        // Derived from the address root, so one correspondence answers the same way
+        // with or without a key schedule — which is the tag every page of it was
+        // recorded under when it was opened.
+        let Some(conversation) = correspondence.conversation() else {
+            crate::vtrace!("dm driver: the conversation fingerprint would not derive");
             return Vec::new();
         };
-        let conversation = *ratchet.ar_fingerprint();
         let address_root = correspondence.address_root;
+        let ratchet = correspondence.ratchet.as_ref();
         let mut out = Vec::new();
 
         let retiring: Vec<u64> = open_recv_pages
@@ -4609,7 +4636,15 @@ impl DmMachine {
             })
             .collect();
         for page in retiring {
-            match DmPageAddress::receiving(&address_root, ratchet, page) {
+            // Neither a key schedule nor a stored direction: no plane to name, which
+            // is also the state in which nothing opened this page. Left in the set
+            // for the reason a failed derivation below is.
+            let Some(derived) =
+                receiving_page_address(&address_root, ratchet, peer_direction, page)
+            else {
+                continue;
+            };
+            match derived {
                 Ok(address) => {
                     open_recv_pages.remove(&(conversation, page));
                     // The page is handed back, so no watch of it can fire again:
@@ -4629,6 +4664,17 @@ impl DmMachine {
             }
         }
 
+        // **Not because a sending address needs the ratchet** — a re-establishment
+        // leg derives one from the stored direction alone, and its page is recorded
+        // here. It is the BOUND that needs it: `send_below` is
+        // `own_ack.settled_pages_below()`, and the ceiling `fold_peer_ack` merges a
+        // correspondent's acknowledgement against is `ratchet.next_send_seq()`, so
+        // the settlement this filter reads does not arrive for a side holding no key
+        // schedule. Such a page is handed back by the close that follows the
+        // re-establishment, under the key schedule it installs.
+        let Some((ratchet, _, _)) = correspondence.live() else {
+            return out;
+        };
         let retiring: Vec<u64> = open_send_pages
             .iter()
             .filter(|(c, page)| *c == conversation && *page < send_below)
@@ -4670,7 +4716,7 @@ impl DmMachine {
         self.correspondences[index]
             .refusals
             .retire_below(recv_below);
-        let mut out = self.close_pages(index, recv_below, send_below);
+        let mut out = self.close_pages(now_ms, index, recv_below, send_below);
         let block_list = self.pin_block_list();
         out.extend(self.refresh_pins(now_ms, block_list.as_ref()));
         out
@@ -4837,7 +4883,7 @@ impl DmMachine {
     /// is the one case where a page below the frontier and a page above it are
     /// equally finished.
     fn close_all_pages(&mut self, now_ms: i64, index: usize) -> Vec<DmEffect> {
-        let mut out = self.close_pages(index, u64::MAX, u64::MAX);
+        let mut out = self.close_pages(now_ms, index, u64::MAX, u64::MAX);
         // A torn-down conversation pins nothing, and the pin has to be withdrawn
         // rather than left standing: a page this close could not reach — one an
         // operation was inside — would otherwise stay pinned against the capacity
@@ -4871,7 +4917,12 @@ impl DmMachine {
     /// the pages it holds.
     ///
     /// A no-op for a live conversation, which is every call but the rare one.
-    fn close_freed_after_teardown(&mut self, kind: DhtOpKind, tag: &OpTag) -> Vec<DmEffect> {
+    fn close_freed_after_teardown(
+        &mut self,
+        now_ms: i64,
+        kind: DhtOpKind,
+        tag: &OpTag,
+    ) -> Vec<DmEffect> {
         // Only the operations that hold a page slot free one. Everything else — a
         // close, an acknowledgement, a doorbell write — names no page to hand back.
         // A watch holds a receiving page open for as long as it stands, so it frees
@@ -4898,9 +4949,9 @@ impl DmMachine {
         // no other signal coming.
         let above = page.saturating_add(1);
         if sending {
-            self.close_pages(index, 0, above)
+            self.close_pages(now_ms, index, 0, above)
         } else {
-            self.close_pages(index, above, 0)
+            self.close_pages(now_ms, index, above, 0)
         }
     }
 
@@ -16756,6 +16807,341 @@ mod tests {
             pinned_all_receiving(&effects),
             Some(true),
             "the pinned records must be of the receiving stream"
+        );
+    }
+
+    /// A correspondence read back from the store: the correspondent's pseudonym and
+    /// the outbox's direction are on record, and there is no key schedule.
+    ///
+    /// Returns the restarted machine and its conversation fingerprint, which is
+    /// derived from the address root because there is no ratchet to read one off.
+    fn resumed_from_disk(
+        dir_a: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+    ) -> (DmMachine, [u8; AR_FINGERPRINT_LEN]) {
+        let mut a = machine(dir_a);
+        let b_keys = peer_identity();
+        let mut b = machine_as(peer_identity(), dir_b);
+        b.persist.provision_block_list().expect("provision");
+        establish_pair(&mut a, &mut b, &b_keys);
+        drop(b);
+
+        let restarted = machine_as(peer_identity(), dir_b);
+        let conversation = assert_resumed(&restarted);
+        (restarted, conversation)
+    }
+
+    /// [`resumed_from_disk`], holding one entry that cannot seal without a chain.
+    ///
+    /// **Unsealed, because that is what opens a re-establishment.** The load-time
+    /// pass reads A4.2's cause 2 — an entry composed while no chain exists — and an
+    /// already-sealed entry is cause 1, which re-seeds on its own ladder and asks
+    /// for no handshake. A fixture that queued an ordinary send over the live
+    /// channel before the restart would leave the restarted side writing no leg at
+    /// all. The entry itself never reaches the wire: a channel address descends from
+    /// the ratchet, so what is published is the leg alone.
+    fn resumed_from_disk_owing_a_message(
+        dir_a: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+    ) -> (DmMachine, [u8; AR_FINGERPRINT_LEN]) {
+        let (restarted, conversation) = resumed_from_disk(dir_a, dir_b);
+        let label = restarted.correspondences[0].label;
+        let outbox = restarted
+            .persist
+            .read_outbox(&label, BASE_MS)
+            .expect("the outbox reads")
+            .expect("an established correspondence has one");
+        queue_unsealed(
+            &restarted,
+            &label,
+            outbox.direction(),
+            outbox.next_send_seq(),
+        );
+        (restarted, conversation)
+    }
+
+    /// The three things that make a correspondence the restored case, and its
+    /// conversation fingerprint.
+    fn assert_resumed(m: &DmMachine) -> [u8; AR_FINGERPRINT_LEN] {
+        assert_eq!(
+            m.correspondences.len(),
+            1,
+            "the seed found no correspondence, so nothing below is about a resume"
+        );
+        assert!(
+            m.correspondences[0].ratchet.is_none(),
+            "the fixture kept a key schedule across the restart, so it is not the \
+             case under test"
+        );
+        assert!(
+            m.correspondences[0].peer_pk_pc.is_some(),
+            "the fixture holds no pseudonym, so this correspondence would not be \
+             planned for either"
+        );
+        m.correspondences[0]
+            .conversation()
+            .expect("an address root that hashes")
+    }
+
+    /// Every page a batch of effects asks the transport to close on the receiving
+    /// plane.
+    fn receiving_closes(effects: &[DmEffect]) -> Vec<u64> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Dht(DhtOp::ClosePage {
+                    tag,
+                    address: DmPageRecord::Receiving(_),
+                }) => tag.page,
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// M22o. **A correspondence restored from disk hands back the receiving pages
+    /// it was swept on** (#447).
+    ///
+    /// `DmMachine::probe` plans a correspondence holding a key schedule OR the
+    /// correspondent's stored pseudonym, and addresses the second through the
+    /// direction the outbox recorded. A close keyed on a live channel reaches none
+    /// of the pages that second state opens, so they are released only by the
+    /// transport's capacity bound — a reclamation that chooses the oldest record
+    /// rather than the finished one, and that lands hardest on the conversation
+    /// least able to afford it.
+    ///
+    /// The controls are two. The state before the horizon: page zero is asserted
+    /// open and unclosed while its gap is merely standing, so the close afterwards
+    /// is the settlement and not the passage of time. And the bound itself:
+    /// `retired_below` is read absolutely at both ends, so a fixture that retired
+    /// nothing could not satisfy the close below.
+    #[tokio::test(start_paused = true)]
+    async fn a_restored_correspondence_hands_back_its_receiving_pages() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut b, conversation) = resumed_from_disk(&dir_a, &dir_b);
+        let dht = std::sync::Arc::new(MockDht::new(Duration::from_millis(1)));
+
+        // A hole the horizon can finish: one position of page one settled and every
+        // position below it missing. The position is settled directly, standing in
+        // for the path production reaches it by — a consumed re-establishment leg,
+        // which folds on the stored direction alone and settles its position with no
+        // key schedule, leaving the positions beneath it outstanding.
+        b.correspondences[0]
+            .collection
+            .collected(position_of(u64::from(PAGE_SLOTS)))
+            .expect("the first settled position");
+        assert_eq!(
+            b.correspondences[0].collection.outstanding(),
+            vec![0..=u64::from(PAGE_SLOTS) - 1],
+            "page zero's positions must be the one gap"
+        );
+        assert_eq!(
+            b.correspondences[0].collection.retired_below(),
+            0,
+            "a standing gap must retire nothing, or the close below is not the \
+             give-up"
+        );
+
+        // Every page operation goes through the mock, so the records the close is
+        // judged against are the ones the OPEN actually took out. Without that the
+        // close is only ever read as a page number, and a page number survives an
+        // address derived on the wrong direction — the two streams of one
+        // conversation are told apart by direction alone.
+        let armed = b.on_tick(BASE_MS);
+        assert!(
+            b.open_recv_pages.contains(&(conversation, 0)),
+            "the probe opened no receiving page zero, so the close below has no \
+             subject: {armed:?}"
+        );
+        let swept = swept_channels(&armed);
+        let watches = watched_channels(&armed);
+        run_page_ops(&dht, armed).await;
+        assert!(
+            dht.open_page_count() > 0,
+            "the transport holds no record, so a close of one could reclaim nothing"
+        );
+        release_sweeps(&mut b, &swept, BASE_MS);
+        for (watched, page) in watches {
+            let out = b.on_outcome(
+                BASE_MS,
+                watch_outcome(watched, page, Ok(DhtResult::Watch(DmPageWatch::Lost))),
+            );
+            run_page_ops(&dht, out).await;
+        }
+
+        let standing = b.on_tick(BASE_MS + 1);
+        assert!(
+            closed_pages(&standing).is_empty(),
+            "a page no settlement has finished was handed back: {standing:?}"
+        );
+
+        // The horizon, reached by the probe exactly as production reaches it.
+        let horizon = BASE_MS + HORIZON_MS;
+        age_gaps(&mut b, 0, BASE_MS, horizon - AGE_STEP_MS);
+        let crossed = b.on_tick(horizon);
+        assert_eq!(
+            b.correspondences[0].collection.contiguous_through(),
+            Some(u64::from(PAGE_SLOTS)),
+            "the probe must have given up on page zero and carried the cursor over \
+             it: {crossed:?}"
+        );
+        assert_eq!(
+            b.correspondences[0].collection.retired_below(),
+            1,
+            "the give-up must finish page zero and no page above it"
+        );
+        // The crossing tick plans the watched pair and nothing under it — a settled
+        // page is named by no gap and by no span — so page zero is left free for the
+        // settlement below rather than back in flight.
+        assert!(
+            !swept_channels(&crossed).is_empty(),
+            "the crossing tick planned no sweep at all, so the claim below holds \
+             vacuously: {crossed:?}"
+        );
+        assert!(
+            !swept_channels(&crossed).iter().any(|(_, page)| *page == 0),
+            "the crossing tick re-swept the finished page, so the close below would \
+             be skipped as in flight: {crossed:?}"
+        );
+
+        let closed = b.on_tick(horizon + 1);
+        let handed_back = closed_pages(&closed);
+        assert_eq!(
+            handed_back.len(),
+            1,
+            "exactly the one finished page must be handed back: {closed:?}"
+        );
+        assert_eq!(
+            handed_back,
+            vec![0],
+            "the page handed back is not the one the give-up finished: {closed:?}"
+        );
+        assert!(
+            !b.open_recv_pages.contains(&(conversation, 0)),
+            "and it must leave the open set"
+        );
+
+        // The address, not the page number. A close reclaims a record only where it
+        // derived the one the sweep opened, and the mock keys a record on the
+        // conversation, the DIRECTION and the page — so a close addressed on this
+        // side's own sending direction asks for a record nothing here opened and
+        // releases nothing, while still reporting page zero.
+        run_page_ops(&dht, closed).await;
+        let (asked, reclaimed) = closes_seen(&dht);
+        assert!(
+            asked > 0,
+            "the transport was asked for no close at all, so the equality below \
+             holds vacuously"
+        );
+        assert_eq!(
+            asked, reclaimed,
+            "every close asked for must have released a record the transport was \
+             holding; a close of an unopened page reclaims nothing"
+        );
+    }
+
+    /// M22p. **Widening the receiving half of the close does not widen the sending
+    /// half.**
+    ///
+    /// The receiving half is keyed on the address root plus a key schedule or the
+    /// stored outbox direction; the sending half is keyed on the key schedule,
+    /// because the bound it filters by — `own_ack.settled_pages_below()` — only
+    /// advances under a ceiling the ratchet supplies.
+    ///
+    /// **The fixture holds a sending page, so the gate is reached rather than
+    /// skipped.** A ratchet-less side CAN open one: the `ReEstablishmentLeg` arm
+    /// derives its address from the stored direction and records the page. A test
+    /// whose `open_send_pages` were empty would leave the sending loop unreachable
+    /// and pass whatever the gate said, so the leg is published first and asserted
+    /// held. The page is handed back by the close that follows the
+    /// re-establishment, under the key schedule it installs.
+    ///
+    /// The teardown bound is the widest one there is, so a sending close that this
+    /// state could produce at all would appear here.
+    #[test]
+    fn a_restored_correspondence_closes_no_sending_page() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut b, conversation) = resumed_from_disk_owing_a_message(&dir_a, &dir_b);
+        let peer_pk = *keys().signing.public_key();
+
+        let armed = b.on_tick(BASE_MS);
+        assert!(
+            !swept_channels(&armed).is_empty(),
+            "the resumed correspondence was not swept, so it holds no page either \
+             way: {armed:?}"
+        );
+        release_sweeps(&mut b, &swept_channels(&armed), BASE_MS);
+        // A watched page is held by its watch rather than by the bound, so the
+        // teardown below would skip every page this correspondence holds.
+        for (watched, page) in watched_channels(&armed) {
+            b.on_outcome(
+                BASE_MS,
+                watch_outcome(watched, page, Ok(DhtResult::Watch(DmPageWatch::Lost))),
+            );
+        }
+
+        // The re-establishment leg, whose first dispatch is drawn from a band of
+        // hours — so the clock moves by rungs rather than by milliseconds. Every
+        // tick's sweeps and watches are released as they are armed: a page in flight
+        // or under a watch is skipped by the close for that reason rather than by
+        // the gate, which would satisfy the claim below without it.
+        let mut now = BASE_MS;
+        let mut writes = Vec::new();
+        for _ in 0..8 {
+            now = past_the_reconnect_band(now);
+            let effects = b.on_tick(now);
+            writes = page_writes(&effects);
+            release_sweeps(&mut b, &swept_channels(&effects), now);
+            for (watched, page) in watched_channels(&effects) {
+                b.on_outcome(
+                    now,
+                    watch_outcome(watched, page, Ok(DhtResult::Watch(DmPageWatch::Lost))),
+                );
+            }
+            if !writes.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            writes.len(),
+            1,
+            "a correspondence with no key schedule published no leg, so the sending \
+             half of the close below is never reached"
+        );
+        let (leg_seq, leg_page, _) = writes.remove(0);
+        // The write releases its slot: a page with a publish in flight is skipped by
+        // the close for that reason alone, which would satisfy the claim below
+        // without the gate ever being consulted.
+        assert!(
+            b.open_send_pages.contains(&(conversation, leg_page)),
+            "the leg's sending page {leg_page} is not held, so the close reaches no \
+             sending page to refuse: {:?}",
+            b.open_send_pages
+        );
+        written(&mut b, now, conversation, &peer_pk, leg_seq);
+        assert!(
+            b.open_send_pages.contains(&(conversation, leg_page)),
+            "the write outcome released the leg's page, so the close below reaches \
+             no sending page: {:?}",
+            b.open_send_pages
+        );
+
+        let torn = b.close_all_pages(now, 0);
+        let closed = closed_pages(&torn);
+        assert!(
+            !closed.is_empty(),
+            "the teardown handed nothing back, so the two planes below are not being \
+             told apart: {torn:?}"
+        );
+        assert_eq!(
+            closed.len(),
+            receiving_closes(&torn).len(),
+            "a page of the sending plane was handed back: {torn:?}"
+        );
+        assert!(
+            b.open_send_pages.contains(&(conversation, leg_page)),
+            "the leg's page left the open set, so something handed it back"
         );
     }
 

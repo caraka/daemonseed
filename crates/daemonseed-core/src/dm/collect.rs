@@ -368,10 +368,10 @@ impl Collection {
     /// message log the caller consults before displaying, or a settled set that
     /// survives the restart alongside the cursor.
     ///
-    /// It is unreachable in the current build for an unrelated reason — a
-    /// resumed correspondence has no key schedule, so it opens nothing — and
-    /// that is a reason to state the limit here rather than to leave it
-    /// unwritten.
+    /// A resumed correspondence reaches it only through a consumed
+    /// re-establishment leg, which settles its position with no key schedule and
+    /// so does not display anything; every other position stays unopenable until
+    /// one is installed.
     ///
     /// `page` above [`MAX_PAGE`] yields [`Self::new`], because such a page holds
     /// no position and a probe started there would never find a message. The

@@ -840,6 +840,10 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-veilid-net`: the DM page close is keyed on the address root plus a key schedule or the
+  stored outbox direction, the same key the probe opens on, so a correspondence restored from disk
+  hands its receiving pages back. The sending half still requires a key schedule, which is the
+  ceiling its own acknowledgement advances under (#447).
 - `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `unopenable` counts one refusal per position,
   not one per probe of it (#442).
 - ISC-C80 is withdrawn and deregistered. It described a reconnect on a capped exponential backoff
