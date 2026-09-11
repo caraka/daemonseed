@@ -362,7 +362,10 @@ types:
       no handshake. A resume record already carrying an attempt is re-emitted as
       its stored bytes at the sequence its own slot records, queued only if the
       outbox does not already hold that sequence, and never resealed; a sequence
-      the outbox has moved past cannot be re-emitted at all and is surfaced. The
+      the outbox has pruned cannot be re-emitted at all and is surfaced. Before
+      the survey the pass ends every reservation this process holds no body for,
+      Undelivered and owing its surfacing, so a restart on its own opens no
+      exchange. The
       pass runs once per load and is re-owed on a store fault, bounded at eight
       consecutive faults. An outbox standing behind the resume record's durable
       send floor stops it, sweeping nothing and opening nothing. Three states
@@ -383,10 +386,27 @@ types:
       sealed under the root it opened under, committed, and then queued; a repeat
       changes nothing. An opened RE-ACK at or above the current attempt completes
       the exchange, seals and queues the settling RE-CONFIRM, and opens the
-      resumed ratchet one position past it. An opened RE-CONFIRM settles the
-      exchange this side answered, advancing the generation and retiring the
-      superseded root. Either completion runs the dead-chain sweep and retires
-      every finished leg. An RE-EST opened under the retained root at an already
+      resumed ratchet at the outbox's lowest sequence still awaiting a key, or
+      one position past the settling leg where nothing is waiting. An opened
+      RE-CONFIRM settles the exchange this side answered, advancing the
+      generation and retiring the superseded root; that side's sending chain is
+      cut at its own lowest waiting sequence, or at the outbox's next_send_seq
+      where nothing is waiting, by the generation step the correspondent's first
+      frame licenses. Either completion runs the dead-chain sweep and retires
+      every finished leg. Once a key schedule exists, every waiting entry is
+      swept for its give-up and then sealed in ascending sequence — the chain
+      stepped to each entry's own position with Ratchet::skip_send_to, the frame
+      installed at that same sequence through Outbox::publish, which places it on
+      the first re-seed rung with jitter; each frame carries its entry's
+      composed_at_ms as its sent_unix_ms, not the clock of the pass that sealed
+      it. The batch stops at the first
+      SealingStep::Stop, leaving that entry and every later one waiting for a
+      later tick. Once the record holds no entry awaiting a key — whether the
+      batch sealed them or they ended — the chain is stepped to the outbox's
+      next_send_seq, which is one past the highest position the outbox has spent;
+      while an entry is still waiting the step does not run, because that entry
+      sits below that number. An entry whose position the chain has already spent
+      is ended Undelivered rather than left awaiting a key. An RE-EST opened under the retained root at an already
       committed generation is deduped and reported once per session as
       DmEvent::ReestablishmentAnomaly carrying
       TrustEventKey::DmPeerStateRegressed. The same cadence carries the
@@ -485,10 +505,29 @@ types:
       one, are unchanged. Send seals on an established channel: the outbox is
       priced against frame::WORST_CASE_SEALED_FRAME_LEN before the ratchet steps,
       the frame carries the collection's acknowledgement piggybacked, and the
-      queued sequence is reported as Delivery{state: Composed}. Surfaced clears
+      queued sequence is reported as Delivery{state: Composed}. On a
+      correspondence that holds a resume record and no key schedule, Send instead
+      reserves the outbox's next sequence through Outbox::enqueue_awaiting_key —
+      no capacity pre-ask, since nothing is minted — holds the body in the
+      process's memory keyed by correspondence and sequence, reports
+      Delivery{seq, state: Composed} once at that sequence, and, where no key
+      schedule is held, sets the re-establishment pass owed with its backoff
+      cleared; a reservation taken on a correspondence that already holds one
+      arms nothing, and resume_channel opens no attempt while a key schedule
+      stands. The reservation starts
+      above any sequence the resume record's handshake slots hold. Every later
+      report for that message names the same sequence. The waiting entries are
+      sealed when a key schedule is installed, in ascending sequence, each at the
+      sequence it reserved. At load a reservation whose body this process does
+      not hold is ended Undelivered and surfaced before the survey runs, so a
+      restart opens no exchange. A Send on a correspondence whose outbox already
+      holds an entry awaiting a key reserves too, whatever key schedule it holds,
+      so the queue keeps its order; that decision precedes the
+      AwaitingCorrespondentsFirstFrame refusal. Surfaced clears
       the surfacing owed on the named sequence numbers. Send is refused with
       RefusalReason::NotEstablishedThisSession when no ratchet is held for that
-      identity, AwaitingCorrespondentsFirstFrame on the answering side of a
+      identity and no resume record stands behind it, or the conversation is torn
+      down, AwaitingCorrespondentsFirstFrame on the answering side of a
       completed re-establishment until the correspondent's first frame opens this
       side's chain, OutboxFull{needed} when the record cannot take another
       message, BodyTooLarge over DM_BODY_CAP, and SealFailed when the frame will

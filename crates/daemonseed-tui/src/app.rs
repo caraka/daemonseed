@@ -1309,20 +1309,54 @@ impl std::fmt::Debug for DmCorrespondence {
     }
 }
 
+/// How far along a delivery state is, for the one comparison
+/// [`DmCorrespondence::record_delivery`] makes.
+///
+/// **Both terminal states rank above every live one, and equally.** Neither
+/// `ConfirmedCollected` nor `Undelivered` can be superseded — nothing follows a
+/// message's end — and ranking them against each other would let a re-offered
+/// terminal statement rewrite the other, which is a claim no observation
+/// supports. Ordering within the live states is the one the driver moves them
+/// through.
+fn delivery_rank(state: DeliveryState) -> u8 {
+    match state {
+        DeliveryState::Composed => 0,
+        DeliveryState::OnDht => 1,
+        DeliveryState::ConfirmedCollected | DeliveryState::Undelivered => 2,
+    }
+}
+
 impl DmCorrespondence {
     /// (#235) Record the state a `DeliveryState` statement puts one sequence
     /// number in, minting its thread row the first time that number is heard
     /// of.
     ///
-    /// **The state is replaced unconditionally and the row is minted once**, so
-    /// a sequence number that climbs — or that a teardown ends after it was
+    /// **The row is minted once and the state only ever moves forward**, so a
+    /// sequence number that climbs — or that a teardown ends after it was
     /// composed — keeps one row and gains the newest word. A row and a state
     /// therefore exist together for every number this correspondence knows,
     /// which is what lets the thread draw a state beside every sent message and
     /// lets the surfacing read the state map alone.
+    ///
+    /// **A statement that would move the word backwards is recorded as the row
+    /// it already has.** The same sequence is reported more than once — a
+    /// message composed while no key schedule existed is reported composed at
+    /// its reserved number, and the ordinary path reports that number again as
+    /// it climbs — and the re-offer that carries an owed surfacing across a
+    /// restart can arrive after a later statement. Taking the lower word would
+    /// draw a message as less delivered than the client has already been told it
+    /// is, which is the one direction a delivery indicator must never move.
     fn record_delivery(&mut self, seq: u64, state: DeliveryState, body: Option<String>) {
-        if self.deliveries.insert(seq, state).is_none() {
-            self.thread.push(DmThreadRow::Sent { seq, body });
+        match self.deliveries.entry(seq) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(state);
+                self.thread.push(DmThreadRow::Sent { seq, body });
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if delivery_rank(state) > delivery_rank(*slot.get()) {
+                    slot.insert(state);
+                }
+            }
         }
     }
 
@@ -11734,6 +11768,34 @@ mod tests {
         assert!(
             rows.contains(&"→ two · on-DHT".to_owned()),
             "the bodies are paired in the wrong order; drew:\n{}",
+            rows.join("\n")
+        );
+
+        // One report at one sequence attaches one body, once. A message composed
+        // while its correspondence held no key schedule is reported at the
+        // sequence it reserved and every later report for it names that same
+        // number, so a repeat at a number already paired must take nothing —
+        // there is no third body here, and a pairing that consumed one would
+        // stop drawing a body the user is still owed.
+        dm_compose_and_send(&mut app, "three");
+        dm_delivery(&mut app, 5, 2, DeliveryState::Composed);
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.contains(&"→ three".to_owned()),
+            "a repeated report at a paired sequence took a second body; drew:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.starts_with("→ two")).count(),
+            1,
+            "the second body was drawn more than once; drew:\n{}",
+            rows.join("\n")
+        );
+        // And the repeat did not drag the second body's word back: a later
+        // report is what the row shows, whatever arrives after it.
+        assert!(
+            rows.contains(&"→ two · on-DHT".to_owned()),
+            "a repeated older report overwrote a newer state; drew:\n{}",
             rows.join("\n")
         );
     }

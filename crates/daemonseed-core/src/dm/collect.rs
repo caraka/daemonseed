@@ -1240,6 +1240,112 @@ mod tests {
         assert_eq!(plan, vec![9, 10, 1, 3], "watched pair, then the older hole");
     }
 
+    /// **A position still waiting for a key holds the prefix below the legs
+    /// written above it, costs one run, and its page is re-read every probe
+    /// interval.**
+    ///
+    /// A message composed while the sender held no key schedule keeps the
+    /// sequence it reserved, and the exchange that rebuilds the schedule rides
+    /// the same outbox at higher positions — so for the life of the exchange the
+    /// receiver sees the legs settled above an unwritten position. The
+    /// acknowledgement that describes that is the prefix plus exactly one run,
+    /// and the waiting page is the oldest hole, which is the first thing the
+    /// backfill re-reads.
+    ///
+    /// The waiting position is placed on the page *before* the legs, which is
+    /// the one case in [`PAGE_SLOTS`] where the backfill has work to do at all —
+    /// at every other slot the position shares the legs' page, which is already
+    /// watched.
+    #[test]
+    fn a_position_waiting_below_two_legs_costs_one_run_and_is_backfilled() {
+        let slots = PAGE_SLOTS as u64;
+        // The last slot of page 0; the two legs open page 1.
+        let waiting = slots - 1;
+        let mut c = Collection::new();
+        for seq in 0..waiting {
+            collect(&mut c, seq);
+        }
+        collect(&mut c, slots);
+        collect(&mut c, slots + 1);
+
+        assert_eq!(
+            c.contiguous_through(),
+            Some(waiting - 1),
+            "the prefix did not stop below the waiting position"
+        );
+        assert_eq!(
+            c.outstanding(),
+            vec![waiting..=waiting],
+            "the waiting position is not the only hole"
+        );
+        assert_eq!(
+            c.ack().runs(),
+            1,
+            "the two legs settled as other than a single run"
+        );
+        assert!(
+            c.ack().is_settled(slots) && c.ack().is_settled(slots + 1),
+            "the run does not cover both legs"
+        );
+        assert!(
+            !c.ack().is_settled(waiting),
+            "the waiting position was settled, so there is no hole to backfill"
+        );
+
+        // The receiver has reached the legs' page; the waiting one is behind it.
+        reach(&mut c, 1, &[0]);
+        let plan = c.probe_plan(0).expect("a plan at the first probe");
+        assert!(
+            plan.contains(&0),
+            "the backfill did not re-read the waiting position's page: {plan:?}"
+        );
+        // And it comes back round every probe interval, which is what bounds how
+        // long the message waits once its frame is finally published.
+        assert!(
+            c.probe_plan(PROBE_INTERVAL_MS - 1).is_none(),
+            "a second plan inside one interval"
+        );
+        let again = c
+            .probe_plan(PROBE_INTERVAL_MS)
+            .expect("a plan one interval later");
+        assert!(
+            again.contains(&0),
+            "the waiting page fell out of the plan: {again:?}"
+        );
+    }
+
+    /// **The run cap refuses rather than truncating**, which is what bounds the
+    /// shape above: one waiting position costs one run, and a client that
+    /// accumulated a run per re-establishment would reach this.
+    #[test]
+    fn holes_past_the_run_cap_are_refused() {
+        let mut c = Collection::new();
+        // Every settled position isolated, so each is a run of its own and none
+        // folds into the prefix — nothing is ever collected at zero.
+        for run in 1..=MAX_ACK_RUNS as u64 {
+            c.collected(at(run * 2))
+                .expect("inside the cap, so this is the control");
+        }
+        assert_eq!(
+            c.ack().runs(),
+            MAX_ACK_RUNS,
+            "the fixture built fewer runs than the cap, so the refusal below \
+             would be about something else"
+        );
+        let refused = c
+            .collected(at((MAX_ACK_RUNS as u64 + 1) * 2))
+            .expect_err("the run past the cap was admitted");
+        assert!(
+            matches!(refused, crate::dm::ack::AckError::TooManyRuns { .. }),
+            "refused for a reason other than the run cap: {refused:?}"
+        );
+        assert_eq!(
+            c.ack().runs(),
+            MAX_ACK_RUNS,
+            "the refusal changed the state it refused"
+        );
+    }
+
     /// A gappy conversation must not turn every probe into a sweep of its whole
     /// history — the op-gate is shared with the rest of the client.
     #[test]

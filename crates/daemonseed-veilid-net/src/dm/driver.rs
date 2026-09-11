@@ -3898,9 +3898,10 @@ mod tests {
     ///
     /// **A ratchet has no at-rest record**, and the pseudonym pair is homed in a
     /// resume record that cannot be written until the channel has re-established
-    /// once — so a correspondence that outlived its process is on disk and
-    /// cannot be spoken on. The driver says so in as many words rather than
-    /// queueing a message that will never move.
+    /// once — so a correspondence that outlived its process is on disk with no
+    /// key schedule. A send on it reserves the outbox's next sequence, reports
+    /// the message composed there, and is what opens the exchange that rebuilds
+    /// the key schedule; nothing is refused.
     ///
     /// **The cursor is read against a `read_through` of zero**, which is what
     /// the new session has genuinely swept, so a stored page above zero is
@@ -3910,7 +3911,7 @@ mod tests {
     /// property asserted here: `Some(0)`, not `None`, which is what a collection
     /// built by `Collection::new()` would report.
     #[tokio::test(start_paused = true)]
-    async fn a_correspondence_from_a_previous_session_is_seeded_and_refused() {
+    async fn a_correspondence_from_a_previous_session_is_seeded_and_a_send_reserves() {
         let dir_a = tempfile::tempdir().expect("temp dir A");
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let wall = Arc::new(AtomicI64::new(BASE_MS));
@@ -4033,14 +4034,29 @@ mod tests {
             .expect("send");
         settle().await;
         let events = drain(&mut evt_b2);
+        assert!(
+            refusals(&events).is_empty(),
+            "a send on a correspondence from a previous session reserves a sequence \
+             rather than being refused, got {events:?}"
+        );
+        let composed: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                DmEvent::Delivery {
+                    seq,
+                    state: DeliveryState::Composed,
+                    ..
+                } => Some(*seq),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            refusals(&events),
-            vec![RefusalReason::NotEstablishedThisSession],
-            "a send on a correspondence from a previous session must be refused \
-             in as many words, got {events:?}"
+            composed.len(),
+            1,
+            "exactly one composed report for the one send, got {events:?}"
         );
         // The correspondence is still exactly the one that was established: the
-        // refusal is about the key schedule, not about a lost record.
+        // reservation joins its record, it does not open a second one.
         assert_eq!(only_label(&store_b), label_b);
 
         // The second driver stops before the third starts: two drivers over one

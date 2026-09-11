@@ -264,13 +264,15 @@
 //! here would be a second answer free to disagree with the first.
 //!
 //! **This record holds no plaintext.** An `AwaitingKey` entry reserves its
-//! sequence number and carries its schedule; the message *text* lives in
-//! [`crate::transcript`], where a client's own sent messages already live. The
-//! consequence is stated rather than hidden: a draft blocked on a key fetch does
-//! not survive a restart in this record — the sequence number and the give-up
-//! clock do. The alternative was putting user plaintext into a second at-rest
-//! structure — a wider blast radius for a copy of something the transcript
-//! already holds, and one more place to have to erase.
+//! sequence number and carries its schedule; the message *body* lives in the
+//! sending process's memory, keyed by correspondence and sequence, until a key
+//! schedule exists and the sealing pass installs the frame. The consequence is
+//! stated rather than hidden: a body does not survive a restart, so a
+//! reservation read back off this record has nothing to seal, and the load ends
+//! it [`Lifecycle::Undelivered`] and owes its surfacing. What the record keeps
+//! across a restart is the sequence number and the give-up clock. The
+//! alternative was putting user plaintext into a second at-rest structure — a
+//! wider blast radius, and one more place to have to erase.
 
 use core::time::Duration;
 
@@ -832,9 +834,12 @@ pub enum OutboxTarget {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lifecycle {
-    /// § Task 2: *"the recipient's key record unfetchable — evicted or wiped;
-    /// retry key fetch on the same backoff."* Nothing is sealed and nothing is
-    /// published; the schedule drives the key fetch instead of a re-seed.
+    /// A reservation: the sequence is taken and the give-up clock is running,
+    /// and nothing is sealed or published. The body lives in the sending
+    /// process's memory until a key schedule exists, at which point the sealing
+    /// pass encrypts it and installs the frame at this same sequence; a restart
+    /// separates the two, and the entry is ended [`Lifecycle::Undelivered`] at
+    /// load rather than waiting out a window it can never be sealed inside.
     AwaitingKey,
     /// Sealed and published, re-seeding on the ladder until an ack or the
     /// give-up.
@@ -1486,7 +1491,15 @@ impl OutboxEntry {
 
     /// Advance the schedule for an `AwaitingKey` entry's key-fetch retry.
     ///
-    /// § Task 2 puts the key fetch *"on the same backoff"*, and it has no bytes
+    /// **This is not how a reservation reaches the wire.** An `AwaitingKey`
+    /// entry holds a sequence for a message whose body lives in the sending
+    /// process's memory, and the sealing pass installs its frame once a key
+    /// schedule exists; nothing outside this module's own tests calls this.
+    /// It is kept for § Task 2's *"the recipient's key record unfetchable —
+    /// evicted or wiped; retry key fetch on the same backoff"*, which is a
+    /// different cause that reaches the same lifecycle.
+    ///
+    /// § Task 2 puts that key fetch *"on the same backoff"*, and it has no bytes
     /// to emit — so it is a separate call rather than [`Self::emit`] returning an
     /// empty slice, which would be a second meaning for the same return value.
     ///
@@ -1721,12 +1734,11 @@ impl Outbox {
     /// [`RESEED_LADDER`]'s first rung under [`RESEED_JITTER_FRAC`] spreads the
     /// batch the way every other first dispatch is spread.
     ///
-    /// **The rung a key-fetch retry consumed is not carried over.** Those
-    /// advances counted attempts to *fetch a key*
-    /// ([`OutboxEntry::retry_key_fetch`]), not emissions of these bytes — the
-    /// frame installed here has never been written once. The give-up clock is
-    /// untouched: it runs from compose, and the seven days a message is owed do
-    /// not grow because its key took days to arrive.
+    /// **Any rung the entry spent while it was a reservation is not carried
+    /// over.** Those advances counted something other than emissions of these
+    /// bytes — the frame installed here has never been written once. The give-up
+    /// clock is untouched: it runs from compose, and the seven days a message is
+    /// owed do not grow because it waited for a key schedule.
     pub fn publish(
         &mut self,
         seq: u64,
@@ -1797,7 +1809,8 @@ impl Outbox {
     ///
     /// Entries that hold no frame ([`Lifecycle::AwaitingKey`]) are untouched:
     /// they were never sealed under any chain, so a re-establishment does not
-    /// kill them — they seal against the new one when their key fetch succeeds.
+    /// kill them — they are what it exists to unblock, and the sealing pass
+    /// seals them under the schedule it installs.
     ///
     /// **[`OutboxTarget::ReEstablishmentLeg`] entries are untouched, and that
     /// exemption is what A3.12 asks provenance for.** A leg hangs off no ratchet
@@ -1930,9 +1943,13 @@ impl Outbox {
     /// **That makes the plan a snapshot, and the caller owes it exclusivity.**
     /// This is `&self`: a sealed enqueue landing between the plan and the publish
     /// takes the room an admitted step was priced against, and the key is minted
-    /// by then. So walk the plan under the same exclusive access to the record
-    /// that produced it, and never across a write — re-run the plan, or re-ask
-    /// [`Self::room_to_publish`], immediately before each key is minted.
+    /// by then. So the whole batch — the plan, every mint, every publish — runs
+    /// under one exclusive access to the record, and inside that access the
+    /// plan's answer is the authoritative one: nothing can take the room it
+    /// priced, so no step re-asks. A caller that cannot hold the record across
+    /// the batch has one option, which is to re-run the plan after whatever
+    /// released it; there is no per-step ask that would make a walk across a
+    /// write safe.
     pub fn sealing_plan(&self, now_ms: i64) -> Vec<SealingStep> {
         let mut steps = Vec::new();
         let mut projected = self.encoded_len();
@@ -2238,8 +2255,10 @@ impl Outbox {
     /// bytes freed belonged to messages that are finished and acknowledged. It
     /// cannot free an *owed* frame, which is what fills the bucket in ordinary use.
     ///
-    /// **Three things a caller must decide before wiring this, none of which this
-    /// module can answer.** They are why nothing calls it yet.
+    /// **Three properties a caller carries, none of which this module can
+    /// decide.** [`crate::dm::persist::DmPersist::update_outbox`] calls this on
+    /// the way into every write past its own size threshold, so these hold in
+    /// production rather than in prospect.
     ///
     /// 1. **Pruning erases delivery history from the drawing surface.**
     ///    `DmPersist::read_outbox` exists "for drawing the outbox", and
@@ -2476,6 +2495,49 @@ impl Outbox {
             return false;
         }
         entry.lifecycle = Lifecycle::Undelivered;
+        true
+    }
+
+    /// The lowest sequence still waiting for a key, if any.
+    ///
+    /// **The number a resumed sending chain opens at.** A reservation keeps the
+    /// sequence it took at compose, and a key schedule refuses to derive a key
+    /// for any position below its chain's first — so a chain opened above the
+    /// lowest reservation can never seal it. The chain steps over the positions
+    /// between with [`crate::dm::ratchet::Ratchet::skip_send_to`], because this
+    /// record and not the chain is the authority on which are spent.
+    ///
+    /// `None` where nothing is waiting, which is where the chain opens exactly
+    /// where it opened before this existed.
+    pub fn first_awaiting_key(&self) -> Option<u64> {
+        self.entries
+            .values()
+            .find(|entry| matches!(entry.lifecycle, Lifecycle::AwaitingKey))
+            .map(|entry| entry.seq)
+    }
+
+    /// End a reservation whose body the sending process no longer holds.
+    ///
+    /// **The body lives in memory and the reservation lives here, so a restart
+    /// separates them.** What comes back off disk is a sequence number, a
+    /// give-up clock and nothing to encrypt; no later pass can produce the bytes,
+    /// and leaving the entry would keep a message the user believes is on its way
+    /// waiting out seven days for a key that could be minted and would have
+    /// nothing to seal. [`Lifecycle::Undelivered`] is the honest end, and unlike
+    /// [`Self::abandon_leg`] it takes [`Surfacing::Owed`]: the user composed this
+    /// message, so its fate is a delivery report they are owed.
+    ///
+    /// `false`, and nothing changed, for an absent sequence or any lifecycle but
+    /// [`Lifecycle::AwaitingKey`] — an entry that already holds a frame has bytes
+    /// to re-seed and is not this call's subject.
+    pub fn abandon_reservation(&mut self, seq: u64) -> bool {
+        let Some(entry) = self.entries.get_mut(&seq) else {
+            return false;
+        };
+        if !matches!(entry.lifecycle, Lifecycle::AwaitingKey) {
+            return false;
+        }
+        entry.end(Lifecycle::Undelivered);
         true
     }
 

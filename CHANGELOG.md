@@ -26,11 +26,22 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-veilid-net`: `DmCommand::Send` on a correspondence that holds a resume record and no
+  key schedule reserves the outbox's next sequence through `Outbox::enqueue_awaiting_key`, holds the
+  body in the process's memory keyed by correspondence and sequence, reports
+  `DmEvent::Delivery { seq, state: Composed }` once at that sequence, and — where no key schedule is
+  held — arms `resume_channel`, whose survey then opens a re-establishment on that entry. The frame
+  is sealed with the entry's compose time as its `sent_unix_ms`. A correspondence with no resume
+  record, or one torn down, is refused `NotEstablishedThisSession` (#454).
+- `daemonseed-core`: `Outbox::first_awaiting_key` — the lowest sequence still awaiting a key, or
+  `None`. `Outbox::abandon_reservation` — ends the `AwaitingKey` entry at one sequence
+  `Undelivered` and owes its surfacing; `false` for any other lifecycle or an absent sequence
+  (#454).
 - `daemonseed-core`: `Outbox::sealing_plan` and `SealingStep` (`dm::outbox`) — the entries awaiting a
   key, in ascending sequence, each classified `GivenUp`, `Admitted` or `Stop`. The plan mutates
   nothing and ends at its first `Stop`; the caller mints a key for an `Admitted` step and for no
-  other. `Outbox::room_to_publish` answers the same admission question for one held sequence without
-  writing (#453).
+  other. `Outbox::room_to_publish` is the single-sequence form of the plan's admission question,
+  answered for a sequence the record already holds, without writing (#453).
 - `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `peer_ack_fetches_failed`, one per fetch of a
   correspondent's acknowledgement record that came back with no answer (#429).
 - `daemonseed-tui`: a direct-message thread, opened with `Enter` on a correspondence row and left
@@ -852,6 +863,24 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-veilid-net`: a resumed sending chain opens at that side's lowest sequence still
+  awaiting a key, and where nothing is waiting at one past the settling leg on the initiating side
+  and at the outbox's `next_send_seq` on the answering side. When a key schedule is installed — as
+  the exchange settles on the initiating side, and as the first received frame opens the sending
+  chain on the answering side — every waiting entry is swept for its give-up, then sealed in
+  ascending sequence, installed at its own sequence through `Outbox::publish`, and placed on the
+  first re-seed rung with jitter; the chain steps over the positions the outbox holds on legs. A
+  batch stops at the first `SealingStep::Stop` and resumes on a later tick (#454).
+- `daemonseed-veilid-net`: a stored re-establishment leg is read as stale from the outbox's prune
+  mark rather than from `next_send_seq`, in `resume_channel`'s survey and in the re-queue (#454).
+- `daemonseed-veilid-net`: `DmCommand::Send` on a correspondence whose outbox holds an entry
+  awaiting a key reserves the next sequence rather than sealing at the schedule's counter, ahead of
+  the `AwaitingCorrespondentsFirstFrame` refusal (#454).
+- `daemonseed-tui`: `DmState::fold` records a delivery state only where it is at or beyond the one
+  already held for that sequence (#454).
+- `daemonseed-core`: the `dm::outbox` module doc states that a waiting message's body lives in the
+  sending process's memory until sealed and that a reservation read back without one is ended
+  `Undelivered` at load (#454).
 - `daemonseed-core`: `Outbox::enqueue_awaiting_key` prices each reservation at
   `dm::frame::WORST_CASE_SEALED_FRAME_LEN` plus its length prefix and the entry's fixed fields,
   cumulatively over the

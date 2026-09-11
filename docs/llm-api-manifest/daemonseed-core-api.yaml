@@ -1706,8 +1706,9 @@ modules:
       differ; a caller that cannot know its frame's length before sealing passes
       frame::WORST_CASE_SEALED_FRAME_LEN; it runs the enqueue gate, so a sequence the
       record already holds is OutboxError::DuplicateSequence. room_to_publish(seq,
-      now_ms, frame_len) -> Result<(), OutboxError> is the same question for a sequence
-      the record does hold, asking what publish asks in the same order:
+      now_ms, frame_len) -> Result<(), OutboxError> is the single-sequence form of the
+      admission question sealing_plan answers for every waiting entry at once, for a
+      sequence the record does hold, asking what publish asks in the same order:
       OutboxError::UnknownSequence for an absent sequence, OutboxError::AlreadyPublished
       for an entry not awaiting a key, OutboxError::GaveUp past its window,
       OutboxError::Full when the frame would not fit. Its Ok is meaningful only for a
@@ -1718,7 +1719,16 @@ modules:
       mint, seal, publish at that sequence) or SealingStep::Stop(seq) (it does not
       fit: mint nothing, leave it and every later entry waiting). It mutates nothing,
       prices each admission against the frames the steps before it install, and ends
-      at its first Stop. prune() -> usize removes entries that are terminal
+      at its first Stop. first_awaiting_key() -> Option<u64> is the lowest sequence
+      still awaiting a key, None where nothing is waiting; it is the position a
+      resumed sending chain opens at. abandon_reservation(seq: u64) -> bool ends the
+      AwaitingKey entry at that sequence Lifecycle::Undelivered and owes its
+      surfacing, for a reservation whose body the sending process no longer holds;
+      false and nothing changed for an absent sequence or any other lifecycle. The
+      record holds no plaintext: a waiting message's body lives in the sending
+      process's memory keyed by correspondence and sequence, so a reservation read
+      back after a restart has nothing to seal and is ended at load.
+      prune() -> usize removes entries that are terminal
       AND already Surfacing::Clear, returning how many went, and is the only thing
       that shrinks the record: without it the record grows with lifetime rather
       than owed messages and every persist fails permanently past capacity.

@@ -49,7 +49,7 @@ use daemonseed_core::dm::keyrec::{
 };
 use daemonseed_core::dm::outbox::{
     DeliveryState, Lifecycle, OutboxEntry, OutboxError, OutboxTarget, ReseedSchedule, SealedFrame,
-    GIVE_UP_MS,
+    SealingStep, GIVE_UP_MS,
 };
 use daemonseed_core::dm::paging::{
     position_of, DmPageAddress, PagePosition, Receiving, Sending, ADDRESS_ROOT_LEN, PAGE_SLOTS,
@@ -1131,6 +1131,29 @@ struct Correspondence {
     /// at a day's cadence for ever with nothing said after the first fault. One
     /// further event names that, once.
     resume_ceiling_surfaced: bool,
+    /// The bodies of messages composed on this correspondence while it held no
+    /// key schedule, keyed by the sequence each reserved.
+    ///
+    /// **This process's memory is the whole of the store.** A reservation in the
+    /// outbox record holds a sequence number and a give-up clock and no bytes,
+    /// so the plaintext has to live somewhere until a key exists to encrypt it,
+    /// and the alternative was a second at-rest structure holding user plaintext
+    /// — a wider blast radius and one more thing to erase. The cost is stated
+    /// rather than hidden: a restart loses every body here, and the reservation
+    /// it leaves behind is ended [`Lifecycle::Undelivered`] at load
+    /// ([`Outbox::abandon_reservation`]) rather than waiting out a give-up for a
+    /// key that would have nothing to seal.
+    ///
+    /// **Keyed by sequence because the sequence is permanent.** The number a
+    /// message reserves at compose is the one its frame is sealed at, the one
+    /// its entry is filed under and the one its delivery report names, so the
+    /// key cannot go stale between the reservation and the seal.
+    ///
+    /// An entry is removed when its frame is installed
+    /// ([`DmMachine::seal_waiting`]) or when its reservation ends, and never
+    /// otherwise. Ordered so the sealing pass takes them in the ascending order
+    /// [`Outbox::sealing_plan`] produces.
+    unsealed_bodies: std::collections::BTreeMap<u64, String>,
 }
 
 /// The recipient key-record address half of a
@@ -2075,6 +2098,15 @@ impl DmMachine {
                 // it re-queues is due on the same tick.
                 out.extend(self.reest_upkeep(now_ms, index));
                 out.extend(self.repair_cursor(index));
+                // **What re-arms a batch a full record stopped.** The pass
+                // itself is driven by the page fold that installs a key
+                // schedule; a stop leaves entries waiting on room that only an
+                // acknowledgement or a give-up frees, and both of those reach
+                // the record through this tick. Before the give-up sweep, so a
+                // frame installed here is not swept on the same tick it was
+                // sealed, and before the emission scan, so it is published on
+                // this tick rather than the next.
+                self.seal_waiting(now_ms, index);
                 out.extend(self.give_ups(now_ms, index));
                 out.extend(self.due_emissions(now_ms, index));
                 out.extend(self.probe(now_ms, index, block_list.as_ref()));
@@ -2817,6 +2849,15 @@ impl DmMachine {
                 None,
             ))];
         };
+        // **No key schedule is a reservation, not a refusal — where a resume
+        // record stands behind it.** That is the state every established
+        // correspondence comes back in: what survives at rest is the material
+        // the three-leg exchange rebuilds a schedule from, and the schedule
+        // itself does not. The message takes its sequence now and is sealed at
+        // that same number once the exchange settles.
+        if self.correspondences[index].ratchet.is_none() {
+            return self.reserve(now_ms, to, index, body);
+        }
         let Some((ratchet, _, _)) = self.correspondences[index].live() else {
             return vec![DmEffect::Emit(refused(
                 to,
@@ -2824,14 +2865,43 @@ impl DmMachine {
                 None,
             ))];
         };
+        let label = self.correspondences[index].label;
+
+        // **A message composed while the record still holds a reservation joins
+        // the queue rather than jumping it, and that is decided before the
+        // waiting-for-the-first-frame refusal below.** Two reasons, and both
+        // point the same way. Ordering: a message admitted at the schedule's
+        // counter would be sealed before entries composed earlier, because the
+        // counter sits on the lowest waiting position until the batch that
+        // seals it can run. Reachability: that counter IS the lowest waiting
+        // entry's sequence, so pricing a send against it asks the record for a
+        // number it already holds and is refused as a duplicate — reaching the
+        // user as a store fault for as long as the reservation stands. A
+        // correspondence with nothing waiting is unaffected, and is still
+        // refused below until its correspondent writes.
+        match self.persist.read_outbox(&label, now_ms) {
+            Ok(Some(outbox)) if outbox.first_awaiting_key().is_some() => {
+                return self.reserve(now_ms, to, index, body);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::vtrace!("dm driver: the outbox could not be read: {e}");
+                return vec![DmEffect::Emit(refused(
+                    to,
+                    RefusalReason::StoreFailure,
+                    None,
+                ))];
+            }
+        }
+
         // **A ratchet with no chain to mint from is refused here** — before the
         // outbox ask, before the ratchet steps, and before anything is written.
         // The one state that reaches it is the answering side of a
-        // re-establishment, whose chain opens on the correspondent's first frame
-        // under the re-rooted root; asking [`Ratchet::send_next`] instead would
-        // report a live channel's ordinary waiting state as a failure of this
-        // machine's crypto module, after a sequence number had been priced
-        // against it.
+        // re-establishment with nothing already waiting, whose chain opens on
+        // the correspondent's first frame under the re-rooted root; asking
+        // [`Ratchet::send_next`] instead would report a live channel's ordinary
+        // waiting state as a failure of this machine's crypto module, after a
+        // sequence number had been priced against it.
         if !ratchet.can_send() {
             return vec![DmEffect::Emit(refused(
                 to,
@@ -2839,7 +2909,6 @@ impl DmMachine {
                 None,
             ))];
         }
-        let label = self.correspondences[index].label;
         let direction = ratchet.send_direction();
         let next_seq = ratchet.next_send_seq();
 
@@ -2986,6 +3055,426 @@ impl DmMachine {
         })]
     }
 
+    /// Reserve a sequence for a message composed while this correspondence holds
+    /// a resume record and no key schedule, and arm the pass that rebuilds one.
+    ///
+    /// **The reservation is the standing cause the re-establishment runs for.**
+    /// [`Self::resume_channel`] surveys the outbox and opens an exchange only
+    /// where it finds an entry awaiting a key; nothing else in the build creates
+    /// one, so without this the survey finds nothing on every tick of every
+    /// session and a restarted correspondence never comes back.
+    ///
+    /// **No capacity pre-ask, and that is not an omission.** A reservation mints
+    /// nothing and carries no bytes, so there is no key to burn and nothing to
+    /// discover too late — the refusal the outbox owes is its own, raised by the
+    /// enqueue at the moment it is asked.
+    /// [`Outbox::room_for`](daemonseed_core::dm::outbox::Outbox::room_for) prices
+    /// a *sealed* send and passes no hold, so asking it here would price this
+    /// message against room the reservations already standing are not holding,
+    /// and answer a question about a sequence the record is about to take.
+    /// [`Outbox::enqueue_awaiting_key`] charges the worst-case frame cumulatively
+    /// and is the one gate that bounds how many messages may wait.
+    ///
+    /// **The report is [`DeliveryState::Composed`] at the reserved sequence, and
+    /// it is made once.** Every later report for this message names the same
+    /// number, because the frame is installed at the sequence the reservation
+    /// took rather than re-sequenced to wherever the resumed chain opens.
+    ///
+    /// A correspondence with no resume record behind it, or one that has been
+    /// torn down, reaches none of this: it is refused exactly as before, because
+    /// no exchange this could arm would ever complete.
+    fn reserve(&mut self, now_ms: i64, to: &PkLt, index: usize, body: String) -> Vec<DmEffect> {
+        if self.torn_down_conversation(index) {
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::NotEstablishedThisSession,
+                None,
+            ))];
+        }
+        let label = self.correspondences[index].label;
+        // **The resume record, not the contact record, is what makes this
+        // reachable.** `resume_channel` treats an absent one as A3.15 row 6's
+        // `absent` half — nothing can sign a leg, so nothing can ever rebuild a
+        // schedule — and a reservation armed against that would wait out its
+        // give-up for an exchange no pass can open.
+        // **A leg's stored position is spoken for even when the outbox does not
+        // know it yet.** A leg is sealed and committed to the resume record
+        // before it is queued, so a crash in that window leaves a record holding
+        // bytes bound to a sequence the outbox's counter has not passed — and the
+        // pass that re-queues them enqueues at that same number, because the
+        // seal key and the signature both bind it. A reservation handed that
+        // number takes it first, the re-queue is refused as a duplicate, and the
+        // correspondence can neither send the message nor re-establish the
+        // channel that would let it. So the reservation starts above both slots.
+        let leg_floor = match self.persist.read_resume(&label) {
+            Ok(Some(record)) => record
+                .own_slot()
+                .map(|slot| slot.seq())
+                .into_iter()
+                .chain(record.confirm_slot().map(|slot| slot.seq()))
+                .map(|seq| seq.saturating_add(1))
+                .max()
+                .unwrap_or(0),
+            Ok(None) => {
+                return vec![DmEffect::Emit(refused(
+                    to,
+                    RefusalReason::NotEstablishedThisSession,
+                    None,
+                ))];
+            }
+            Err(e) => {
+                crate::vtrace!("dm driver: the resume record will not read: {e}");
+                return vec![DmEffect::Emit(refused(
+                    to,
+                    RefusalReason::StoreFailure,
+                    None,
+                ))];
+            }
+        };
+        let Some(direction) = self.stored_direction(&label, now_ms) else {
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::StoreFailure,
+                None,
+            ))];
+        };
+        // **After the record checks, not before**, so a correspondence that
+        // would be refused `NotEstablishedThisSession` on the sealed path is
+        // refused that way here too whatever the body's size. Checked before the
+        // record is touched, on the same terms as the sealed path: a body the
+        // seal would refuse must not take a sequence number.
+        if body.len() > firstcontact::DM_BODY_CAP {
+            return vec![DmEffect::Emit(refused(
+                to,
+                RefusalReason::BodyTooLarge,
+                None,
+            ))];
+        }
+        // The sequence is read and taken under one lock: a number read and then
+        // enqueued in a second call could be taken in between, and the enqueue
+        // would refuse it as a duplicate.
+        let reserved = self
+            .persist
+            .update_outbox(&label, direction, now_ms, |outbox| {
+                let seq = outbox.next_send_seq().max(leg_floor);
+                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, now_ms)?;
+                Ok(Mutation::Changed(seq))
+            });
+        let seq = match reserved {
+            Ok(seq) => seq,
+            Err(DmPersistError::Outbox(OutboxError::Full { needed, .. })) => {
+                return vec![DmEffect::Emit(refused(
+                    to,
+                    RefusalReason::OutboxFull { needed },
+                    None,
+                ))];
+            }
+            Err(e) => {
+                crate::vtrace!("dm driver: a sequence could not be reserved: {e}");
+                return vec![DmEffect::Emit(refused(
+                    to,
+                    RefusalReason::StoreFailure,
+                    None,
+                ))];
+            }
+        };
+        let correspondence = &mut self.correspondences[index];
+        correspondence.unsealed_bodies.insert(seq, body);
+        // **Armed only where there is no key schedule to seal with, and the
+        // backoff cleared with it.** A message composed on a correspondence that
+        // already holds one is waiting for room or for its correspondent's first
+        // frame, not for an exchange — and arming here would open a fresh
+        // attempt on a live resumed channel, whose completion sweeps every entry
+        // sealed under the generation it replaces. So the flag is set for the
+        // state that has no other way forward, and for nothing else. Where it is
+        // set, the pass runs on the next tick rather than waiting out a rung a
+        // previous fault pushed it to: a message the user just composed is the
+        // event that makes the exchange worth opening now.
+        if correspondence.ratchet.is_none() {
+            correspondence.resume_owed = true;
+            correspondence.resume_retry_due_ms = None;
+        }
+        vec![DmEffect::Emit(DmEvent::Delivery {
+            to: Box::new(**to),
+            seq,
+            state: DeliveryState::Composed,
+        })]
+    }
+
+    /// Seal every message waiting on this correspondence, in ascending sequence,
+    /// each at the number it reserved.
+    ///
+    /// **Run from two call sites, for the two states that install a key
+    /// schedule and for the tick that re-arms them.** [`Self::on_page`] covers
+    /// both installations, because both happen inside a page fold: the
+    /// initiating side's exchange settles in a leg fold, and the answering
+    /// side's sending chain is cut by the generation step its correspondent's
+    /// first frame licenses. [`Self::on_tick`] runs it again once per
+    /// correspondence, which is what a [`SealingStep::Stop`] waits for — a stop
+    /// leaves its entry and every later one holding their bodies, and what frees
+    /// the room is an acknowledgement settling frames or a give-up ending them,
+    /// both of which reach the record through the tick.
+    ///
+    /// **The sweep runs first.** [`Outbox::sweep_give_ups`] ends every
+    /// reservation past its window and owes each a surfacing, which
+    /// [`Self::give_ups`] reads on the next tick — so a message the exchange
+    /// outran costs no key at all, and the plan below never sees a
+    /// [`SealingStep::GivenUp`].
+    ///
+    /// **One exclusive access to the record, and never a write across the
+    /// plan.** [`Outbox::sealing_plan`] prices each admission against the frames
+    /// the steps before it will install, so a sealed enqueue landing between the
+    /// plan and a publish takes room an admitted step was priced against — and
+    /// the key is minted by then. The plan, the seals and the publishes are all
+    /// inside one `update_outbox`, which makes the plan's admission the
+    /// authoritative answer for the whole batch — nothing can take the room it
+    /// priced, so no step re-asks.
+    ///
+    /// **A position the schedule has spent is never left under an entry that is
+    /// still awaiting a key.** A mint is a step with no step back, and three
+    /// things can fail after one: the seal, the install, and the record write
+    /// that carries the whole batch. The schedule is this process's and survives
+    /// all three; the record does not — the persistence layer discards its
+    /// decoded copy on a failed write. So an entry whose position has been spent
+    /// is ended [`Lifecycle::Undelivered`] rather than left waiting, both where
+    /// the failure happens and on the next pass, where an admitted step below
+    /// the counter is the signature of exactly this. Without that the next pass
+    /// asks the schedule to step backwards, is refused, and the correspondence
+    /// can never send again.
+    ///
+    /// **The message is lost and said so, which is the honest end** — its body
+    /// lives only in this process and its position can never be re-minted.
+    /// Rolling the schedule back instead would need a copy of it, and a second
+    /// live copy of a key schedule is a worse thing to have than a lost message.
+    ///
+    /// **The bodies are released only after the write answers.** They are the
+    /// one part of the batch that is free to hold, so a failed write leaves
+    /// every one of them in hand for the next pass rather than discarding user
+    /// text the record never took.
+    ///
+    /// **The counter is reconciled to the record whether or not anything was
+    /// sealed, and that is not an optimisation.** A chain opens at the lowest
+    /// waiting sequence; if that reservation then ends — its window closes, or
+    /// its body is lost — the record holds a terminal entry at a position the
+    /// counter still points at, and every later send prices `room_for` against
+    /// it and is refused as a duplicate for the life of the session. So once
+    /// nothing is waiting, the counter is stepped to the outbox's
+    /// `next_send_seq`, which is also what carries it over the exchange's own
+    /// legs. **While something IS waiting the step must not run**: the waiting
+    /// entry sits below that number and a chain stepped past it could never
+    /// derive its key again.
+    fn seal_waiting(&mut self, now_ms: i64, index: usize) {
+        let label = self.correspondences[index].label;
+        let Some(direction) = self.stored_direction(&label, now_ms) else {
+            return;
+        };
+        // Disjoint borrows, as `send` takes them: the identity is read while the
+        // correspondence is held mutably for the ratchet step, and the persist
+        // layer holds the record's lock around both.
+        let Self {
+            identity,
+            persist,
+            correspondences,
+            ..
+        } = self;
+        let correspondence = &mut correspondences[index];
+        let recipient = match recipient_hash(&correspondence.pk_lt) {
+            Ok(h) => h,
+            Err(e) => {
+                crate::vtrace!("dm driver: recipient hash failed: {e}");
+                return;
+            }
+        };
+        let (Some(ratchet), Some(signing_pc), Some(channel)) = (
+            correspondence.ratchet.as_mut(),
+            correspondence.signing_pc.as_ref(),
+            correspondence.channel.as_ref(),
+        ) else {
+            return;
+        };
+        // The answering side holds a receiving chain until the correspondent's
+        // first frame publishes an ephemeral to step against. Asked here rather
+        // than discovered inside `send_next`, which reports it as a mint that
+        // failed after a position has been priced against it.
+        if !ratchet.can_send() {
+            return;
+        }
+        let identity_pk = identity.signing.public_key();
+        let bodies = &correspondence.unsealed_bodies;
+        let ack = correspondence.collection.ack();
+        // The bodies the record has actually taken. Released only once the write
+        // answers, so a failed one leaves every body in hand.
+        let mut taken: Vec<u64> = Vec::new();
+        let sealed_any = persist.update_outbox(&label, direction, now_ms, |outbox| {
+            let mut changed = !outbox.sweep_give_ups(now_ms).is_empty();
+            for step in outbox.sealing_plan(now_ms) {
+                let seq = match step {
+                    SealingStep::Admitted(seq) => seq,
+                    // The sweep above has already ended these, so the plan
+                    // cannot name one. Traced rather than asserted: a plan that
+                    // disagreed with the sweep would be a bug in the record, and
+                    // aborting the driver over one correspondence is worse than
+                    // leaving its body in memory for the next pass.
+                    SealingStep::GivenUp(seq) => {
+                        crate::vtrace!(
+                            "dm driver: sequence {seq} is past its window after a sweep"
+                        );
+                        // Not released here: the entry is terminal, so
+                        // `Self::give_ups` reconciles the body map against the
+                        // record's own reservations on the next tick, which is
+                        // the one place every ending edge is seen.
+                        continue;
+                    }
+                    // Every later entry is left waiting with its body held.
+                    SealingStep::Stop(seq) => {
+                        crate::vtrace!(
+                            "dm driver: the record has no room for sequence {seq}, so it and \
+                             everything after it wait"
+                        );
+                        break;
+                    }
+                };
+                // A reservation with no body behind it is one this process did
+                // not compose. `resume_channel` ends these at load, so reaching
+                // one here means a body was dropped after its reservation was
+                // taken; ending it is the same honest answer.
+                let Some(body) = bodies.get(&seq) else {
+                    if outbox.abandon_reservation(seq) {
+                        changed = true;
+                    }
+                    continue;
+                };
+                // **The send time is the COMPOSE time, not this pass's clock.**
+                // A waiting message may sit for the whole of an exchange, and
+                // the sealed frame carries the time the user sent it — stamping
+                // the settlement instead would show every waiting message as
+                // sent at the moment the channel came back, hours after it was
+                // written. The record holds it because the give-up is measured
+                // from it.
+                let Some(composed_at_ms) = outbox.entry(seq).map(OutboxEntry::composed_at_ms)
+                else {
+                    crate::vtrace!("dm driver: the plan admitted sequence {seq} with no entry");
+                    continue;
+                };
+                // **A position the schedule is already past was minted by a pass
+                // that then failed**, so it can never be re-minted and this entry
+                // can never be sealed. Ended here rather than asked for: asking
+                // would be refused as already consumed, break the batch, and
+                // leave the same entry to wedge every pass after it.
+                if ratchet.next_send_seq() > seq {
+                    crate::vtrace!(
+                        "dm driver: sequence {seq} was minted by a pass that did not finish"
+                    );
+                    if outbox.abandon_reservation(seq) {
+                        changed = true;
+                    }
+                    continue;
+                }
+                // A no-op where the counter already stands here. On the
+                // answering side there is no chain yet — the generation step the
+                // correspondent's first frame licenses cuts one at this counter
+                // — and `Ratchet::skip_send_to` positions such a chain rather
+                // than refusing, which is what makes this reachable there at all.
+                if let Err(e) = ratchet.skip_send_to(seq) {
+                    crate::vtrace!("dm driver: the chain would not step to sequence {seq}: {e}");
+                    break;
+                }
+                // **No second capacity ask here, and that is not an omission.**
+                // [`Outbox::sealing_plan`] prices every admission against the
+                // frames the steps before it will install, using the same gate
+                // [`Outbox::publish`] refuses on — and the plan and the publishes
+                // share this one exclusive access to the record, so nothing can
+                // change between them. Inside this closure the plan's answer is
+                // the authoritative one, and a re-ask would be a second answer
+                // free to disagree with it for no reason. The publish below is
+                // still checked; it simply cannot refuse an admitted step.
+                let outbound = match ratchet.send_next() {
+                    Ok(outbound) => outbound,
+                    Err(e) => {
+                        crate::vtrace!("dm driver: the ratchet refused to mint a key: {e}");
+                        break;
+                    }
+                };
+                debug_assert_eq!(
+                    outbound.header.seq, seq,
+                    "the chain minted a position other than the one the plan admitted"
+                );
+                let sealed_under_gen = outbound.header.generation;
+                let sealed = match frame::seal(
+                    outbound,
+                    &channel.chan_id,
+                    signing_pc,
+                    identity_pk,
+                    &recipient,
+                    composed_at_ms,
+                    body,
+                    Some(ack),
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        // The position is spent and its frame does not exist, so
+                        // the entry is ended rather than left at a number
+                        // nothing can ever mint again.
+                        crate::vtrace!("dm driver: a waiting frame would not seal: {e}");
+                        if outbox.abandon_reservation(seq) {
+                            changed = true;
+                        }
+                        break;
+                    }
+                };
+                if let Err(e) =
+                    outbox.publish(seq, now_ms, SealedFrame::new(sealed), sealed_under_gen)
+                {
+                    crate::vtrace!("dm driver: sequence {seq} sealed and would not install: {e}");
+                    if outbox.abandon_reservation(seq) {
+                        changed = true;
+                    }
+                    break;
+                }
+                taken.push(seq);
+                changed = true;
+            }
+            // **The reconcile, run whether or not this batch sealed anything.**
+            // The chain opens at the lowest waiting sequence; once nothing is
+            // waiting there — whether because it was sealed, or because it ended
+            // — the counter still points at a position the record now holds, and
+            // every later send prices `room_for` against it and is refused as a
+            // duplicate for the life of the session. Stepping to the outbox's
+            // own `next_send_seq` clears that and carries the counter over the
+            // exchange's legs in the same move.
+            //
+            // **A waiting entry is exactly when it must NOT run.** That entry
+            // sits *below* this number, and a chain stepped past it could never
+            // derive its key again — the message would be stranded by the very
+            // step meant to unstrand the next one.
+            if outbox.first_awaiting_key().is_none() {
+                if let Err(e) = ratchet.skip_send_to(outbox.next_send_seq()) {
+                    crate::vtrace!(
+                        "dm driver: the chain would not step over the spent positions: {e}"
+                    );
+                }
+            }
+            Ok(if changed {
+                Mutation::Changed(())
+            } else {
+                Mutation::Unchanged(())
+            })
+        });
+        if let Err(e) = sealed_any {
+            // The record was not written, so every body stays in hand. The
+            // schedule HAS moved over the positions this batch minted, and the
+            // next pass ends those entries rather than asking it to step back —
+            // see the loop's first guard.
+            crate::vtrace!("dm driver: the sealing pass did not run: {e}");
+            return;
+        }
+        // The write answered, so the bodies the record took are released.
+        let bodies = &mut correspondence.unsealed_bodies;
+        for seq in taken {
+            bodies.remove(&seq);
+        }
+    }
+
     /// The UI has shown these delivery states, so stop re-offering them (#279).
     ///
     /// **This is the only thing that clears the durable flag**, and it runs
@@ -3078,20 +3567,38 @@ impl DmMachine {
                     .filter(|e| e.delivery_state() == DeliveryState::Undelivered)
                     .map(|e| e.seq())
                     .collect();
-                let out = (owed, given_up);
+                // **What the record still holds a reservation for**, so the
+                // bodies this process is keeping can be trimmed to it below. A
+                // body is plaintext the user typed; once its entry has ended —
+                // by the sweep above, by a load-time abandonment, or by any
+                // other edge — nothing will ever seal it, and keeping it is a
+                // copy of a dead message held for the life of the session.
+                let reserved: Vec<u64> = outbox
+                    .iter()
+                    .filter(|e| matches!(e.lifecycle(), Lifecycle::AwaitingKey))
+                    .map(OutboxEntry::seq)
+                    .collect();
+                let out = (owed, given_up, reserved);
                 Ok(if swept.is_empty() {
                     Mutation::Unchanged(out)
                 } else {
                     Mutation::Changed(out)
                 })
             });
-        let (owed, given_up) = match owed {
+        let (owed, given_up, reserved) = match owed {
             Ok(pair) => pair,
             Err(e) => {
                 crate::vtrace!("dm driver: the give-up sweep failed: {e}");
                 return Vec::new();
             }
         };
+        // The body memory mirrors the record's reservations, and this is where it
+        // is reconciled: the sealing pass releases a body as it publishes one,
+        // and every OTHER way an entry ends — the give-up above most of all —
+        // reaches the body only here.
+        self.correspondences[index]
+            .unsealed_bodies
+            .retain(|seq, _| reserved.contains(seq));
         // **The give-up settles the position for the page close, and only on this
         // side.** A message this sender abandoned is one nothing will re-seed and
         // nothing will ever ask about again, so the page holding it is finished
@@ -3281,6 +3788,18 @@ impl DmMachine {
         let held_seq = held.as_ref().map(|(seq, _)| *seq);
         let reroot_gen = record.reroot_ratchet_gen();
         let floor = record.send_floor();
+        // **What this process can still seal, read before the survey asks what is
+        // waiting.** A reservation's body lives in memory alone, so one read back
+        // off a record this process did not compose has nothing behind it — and
+        // an exchange opened for it would spend attempts on a message no pass
+        // could ever seal. Every such entry is ended below, inside the same
+        // exclusive access, so `unsealed_pending` describes only mail this
+        // session can actually send.
+        let held_bodies: Vec<u64> = self.correspondences[index]
+            .unsealed_bodies
+            .keys()
+            .copied()
+            .collect();
         let surveyed = self
             .persist
             .update_outbox(&label, direction, now_ms, |outbox| {
@@ -3298,6 +3817,23 @@ impl DmMachine {
                         position,
                     }));
                 }
+                // Before the sweep and before the survey: a reservation this
+                // process holds no body for is ended `Undelivered`, owing its
+                // surfacing in the record, which `DmMachine::give_ups` reads
+                // later in this same tick. Ending it here is what stops the
+                // decision below opening an exchange for it.
+                let bodyless: Vec<u64> = outbox
+                    .iter()
+                    .filter(|entry| matches!(entry.lifecycle(), Lifecycle::AwaitingKey))
+                    .map(OutboxEntry::seq)
+                    .filter(|seq| !held_bodies.contains(seq))
+                    .collect();
+                let mut abandoned = 0usize;
+                for seq in bodyless {
+                    if outbox.abandon_reservation(seq) {
+                        abandoned += 1;
+                    }
+                }
                 let fired = outbox.sweep_dead_chain(reroot_gen);
                 // **Keyed on the stored sequence, not on a live frame's bytes.**
                 // `OutboxEntry::frame` answers `Some` only while an entry is
@@ -3308,10 +3844,21 @@ impl DmMachine {
                 let leg = held_seq.map(|seq| {
                     if outbox.entry(seq).is_some() {
                         LegState::Queued
-                    } else if outbox.next_send_seq() > seq {
+                    } else if outbox.pruned_high_water() > seq {
                         // The sequence was spent and its entry has since been
                         // pruned. The bytes are bound to that position and
                         // cannot move to another.
+                        //
+                        // **Read off the prune mark, not off `next_send_seq`.**
+                        // The counter is one past the highest number handed out,
+                        // and a message composed while this leg was committed
+                        // and not yet queued is deliberately placed ABOVE the
+                        // leg's own position — so the counter passes a position
+                        // that is still perfectly usable, and reading it here
+                        // would abandon a live attempt on the strength of the
+                        // reservation that is waiting for it. The prune mark
+                        // answers the question the state actually asks: has this
+                        // entry existed and been reclaimed?
                         LegState::Stale
                     } else {
                         LegState::Missing
@@ -3324,7 +3871,7 @@ impl DmMachine {
                     next_seq: outbox.next_send_seq(),
                     leg,
                 };
-                Ok(if fired.is_empty() {
+                Ok(if fired.is_empty() && abandoned == 0 {
                     Mutation::Unchanged(survey)
                 } else {
                     Mutation::Changed(survey)
@@ -3413,6 +3960,14 @@ impl DmMachine {
             (None, _) => {}
         }
         if !unsealed_pending {
+            self.correspondences[index].resume_owed = false;
+            return Vec::new();
+        }
+        // **A correspondence that already holds a key schedule needs no
+        // exchange, whatever is waiting.** The completion of one sweeps every
+        // entry sealed below the generation it re-roots to, so an attempt opened
+        // over a live channel ends the very frames this session just sealed.
+        if self.correspondences[index].live().is_some() {
             self.correspondences[index].resume_owed = false;
             return Vec::new();
         }
@@ -5472,6 +6027,14 @@ impl DmMachine {
         if let Some(entry) = owed_erase {
             self.pending_erase.push(entry);
         }
+        // **Both states that install a key schedule are reached by folding a
+        // page**, so this is where the waiting messages are sealed: the
+        // initiating side's exchange settles in a leg fold above, and the
+        // answering side's sending chain is cut by the generation step the
+        // correspondent's first frame licenses. Run before the page release
+        // below, so a frame installed here is on the ladder when the pages this
+        // fold finished are closed.
+        self.seal_waiting(now_ms, index);
         // The fold that settled a position is the signal that may have finished a
         // page, so the release is asked for here rather than on the tick: a timer
         // would either lag the settlement or ask when nothing had changed.
@@ -6359,6 +6922,7 @@ impl DmMachine {
                         resume_retry_due_ms: None,
                         resume_surfaced: false,
                         resume_ceiling_surfaced: false,
+                        unsealed_bodies: std::collections::BTreeMap::new(),
                     });
                 }
                 // **The acceptance fires here, in the same call**, because the
@@ -7040,6 +7604,7 @@ impl DmMachine {
                 resume_retry_due_ms: None,
                 resume_surfaced: false,
                 resume_ceiling_surfaced: false,
+                unsealed_bodies: std::collections::BTreeMap::new(),
             });
         }
 
@@ -7295,6 +7860,33 @@ fn stored_direction(
         Ok(None) => None,
         Err(e) => {
             crate::vtrace!("dm driver: the outbox would not read: {e}");
+            None
+        }
+    }
+}
+
+/// The lowest sequence the stored outbox still holds a reservation at.
+///
+/// **The number a resumed sending chain opens at**, and `None` where nothing is
+/// waiting, which is where each side's chain opens exactly where it did before
+/// waiting messages existed. Free for the reason [`stored_direction`] is: the
+/// re-establishment folds run with the machine destructured.
+///
+/// A store that will not answer reads as nothing waiting, which opens the chain
+/// where the build always opened it and leaves any reservation to be sealed by a
+/// later pass or ended at its give-up — the direction every other refusal here
+/// takes, and never a chain opened at a number this side cannot justify.
+fn first_awaiting_key(
+    persist: &DmPersist,
+    label: &CorrespondenceLabel,
+    direction: Direction,
+    now_ms: i64,
+) -> Option<u64> {
+    match persist.read_outbox(label, now_ms) {
+        Ok(Some(outbox)) if outbox.direction() == direction => outbox.first_awaiting_key(),
+        Ok(_) => None,
+        Err(e) => {
+            crate::vtrace!("dm driver: the outbox would not read for what is waiting: {e}");
             None
         }
     }
@@ -8178,7 +8770,14 @@ fn requeue_leg(
         }
         // The sequence was spent and its entry pruned. The bytes are bound to
         // that position and cannot move to another, so there is no re-emit.
-        if outbox.next_send_seq() > seq {
+        //
+        // **The prune mark, not `next_send_seq`.** A message composed while this
+        // leg was committed and not yet queued is placed above the leg's own
+        // position, so the counter passes a position the record is still holding
+        // for these bytes; the prune mark is what says an entry existed here and
+        // has been reclaimed. Same reading as `LegState`'s, and the two have to
+        // agree or one of them decides and the other refuses.
+        if outbox.pruned_high_water() > seq {
             return Ok(Mutation::Unchanged(false));
         }
         let entry = outbox.enqueue_sealed(
@@ -8605,9 +9204,15 @@ fn fold_re_ack(
         &confirm_bytes,
         LegDispatch::Ladder,
     );
-    // **The chain opens one past the settling leg's own position.** A
-    // `RE-CONFIRM` rides the outbox at its own sequence, so the first content
-    // frame of the resumed channel takes the next one.
+    // **The chain opens at the lowest sequence still waiting for a key, and one
+    // past the settling leg only where nothing is waiting.** A message composed
+    // while this correspondence held no schedule keeps the number it reserved,
+    // which is below every leg of the exchange it caused; a chain opened above it
+    // could never derive its key. The positions in between — this side's own legs
+    // — are stepped over by the sealing pass, which holds the record that knows
+    // which of them are spent.
+    let waiting = first_awaiting_key(persist, &label, our_direction, now_ms);
+    let next_send_seq = waiting.unwrap_or_else(|| our_seq.saturating_add(1));
     let ratchet = match Ratchet::reestablished(
         &rerooted,
         role_for(our_direction),
@@ -8615,7 +9220,7 @@ fn fold_re_ack(
             last_persisted_generation: floor_gen,
         },
         ratchet_gen,
-        our_seq.saturating_add(1),
+        next_send_seq,
         &correspondence.address_root,
     ) {
         Ok(ratchet) => ratchet,
@@ -8733,17 +9338,27 @@ fn fold_re_confirm(
         correspondence.resume_retry_due_ms = None;
         return LegFold::consumed();
     };
+    // **This side's own chain opens at its lowest waiting sequence too**, and it
+    // opens later than this call: `Ratchet::reestablished` gives the answering
+    // party a receiving chain only, and the sending chain is cut at this counter
+    // by the generation step the correspondent's first frame triggers. So the
+    // number handed over here is the number that chain will start from.
+    let waiting = first_awaiting_key(persist, &label, our_direction, now_ms);
+    let next_send_seq = waiting.unwrap_or(our_seq);
     let ratchet = match Ratchet::reestablished(
         &candidate,
         role_for(our_direction),
         ReconnectSide::Answered {
             last_persisted_generation: floor_gen,
-            // The settling leg rode the peer's outbox at this position, so the
-            // first content frame of the resumed chain takes the next one.
+            // **Provisional.** The settling leg rode the peer's outbox at this
+            // position, so this is where that party's chain starts when it has
+            // nothing waiting; where it has, its chain opens lower. The receive
+            // chain re-bases from the first frame's own `chain_base` rather than
+            // insisting on this — see the field's own documentation.
             peer_next_send_seq: seq.saturating_add(1),
         },
         ratchet_gen,
-        our_seq,
+        next_send_seq,
         &correspondence.address_root,
     ) {
         Ok(ratchet) => ratchet,
@@ -9389,6 +10004,7 @@ fn seed_from_store(persist: &DmPersist) -> Vec<Correspondence> {
             resume_retry_due_ms: None,
             resume_surfaced: false,
             resume_ceiling_surfaced: false,
+            unsealed_bodies: std::collections::BTreeMap::new(),
             rearm_faults: 0,
             // Nothing is owed on a record read back from disk: the pseudonym
             // it holds is already written down, and one it does not hold has
@@ -10691,6 +11307,7 @@ mod tests {
             resume_retry_due_ms: None,
             resume_surfaced: false,
             resume_ceiling_surfaced: false,
+            unsealed_bodies: std::collections::BTreeMap::new(),
         });
         assert_eq!(
             m.only_next_send_seq(),
@@ -10823,6 +11440,7 @@ mod tests {
             resume_retry_due_ms: None,
             resume_surfaced: false,
             resume_ceiling_surfaced: false,
+            unsealed_bodies: std::collections::BTreeMap::new(),
         });
         assert_eq!(
             m.only_next_send_seq(),
@@ -14383,6 +15001,7 @@ mod tests {
             resume_retry_due_ms: None,
             resume_surfaced: false,
             resume_ceiling_surfaced: false,
+            unsealed_bodies: std::collections::BTreeMap::new(),
         });
 
         let out = m.fire_accept(BASE_MS, 0);
@@ -17824,19 +18443,51 @@ mod tests {
             .expect("the entry queues");
     }
 
+    /// Compose one message on the only correspondence of a machine that holds no
+    /// key schedule, through the command a user reaches, and return the sequence
+    /// it reserved.
+    ///
+    /// **The way a reservation is made after a restart.** [`queue_unsealed`]
+    /// writes the record entry and the body together, which is the state a
+    /// compose leaves within one session; across a restart only the command can
+    /// produce it, because the body has to be one this process holds.
+    fn compose_unsealed(m: &mut DmMachine, now_ms: i64) -> u64 {
+        let to = m.correspondences[0].pk_lt.clone();
+        let effects = m.on_command(
+            now_ms,
+            DmCommand::Send {
+                to,
+                body: "waiting for a chain".into(),
+            },
+        );
+        let composed = composed_seqs(&effects);
+        assert_eq!(
+            composed.len(),
+            1,
+            "the send did not report exactly one composed message: {effects:?}"
+        );
+        composed[0]
+    }
+
     /// Queue one entry that has no chain to seal against — A4.2's cause 2, and
     /// the only state that opens a re-establishment.
-    fn queue_unsealed(m: &DmMachine, label: &CorrespondenceLabel, direction: Direction, seq: u64) {
+    fn queue_unsealed(
+        m: &mut DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+        seq: u64,
+    ) {
         queue_unsealed_at(m, label, direction, seq, BASE_MS);
     }
 
-    /// [`queue_unsealed`] at a named instant.
+    /// Write a reservation into the record and NOTHING into memory — the state a
+    /// restart leaves, where the sequence and the give-up clock survive and the
+    /// body does not.
     ///
-    /// A test running hours past [`BASE_MS`] needs the composition stamp to be
-    /// its own clock: an entry composed at [`BASE_MS`] and read a give-up window
-    /// later is ended by the give-up, which is a fact about the clock and would
-    /// be read as whatever the test was actually asking about.
-    fn queue_unsealed_at(
+    /// For tests whose subject is what a correspondence still *owes* rather than
+    /// what it can still send. [`queue_unsealed`] is the other half and is what a
+    /// compose leaves behind.
+    fn queue_bodyless_reservation(
         m: &DmMachine,
         label: &CorrespondenceLabel,
         direction: Direction,
@@ -17849,6 +18500,42 @@ mod tests {
                 Ok(Mutation::Changed(()))
             })
             .expect("the entry queues");
+    }
+
+    /// [`queue_unsealed`] at a named instant.
+    ///
+    /// A test running hours past [`BASE_MS`] needs the composition stamp to be
+    /// its own clock: an entry composed at [`BASE_MS`] and read a give-up window
+    /// later is ended by the give-up, which is a fact about the clock and would
+    /// be read as whatever the test was actually asking about.
+    ///
+    /// **The body goes into memory beside the record entry, because that is what
+    /// a compose leaves behind.** A reservation is two facts — a sequence in the
+    /// record and a body this process holds — and a fixture that writes only the
+    /// first builds the state a *restart* leaves, which the load ends
+    /// undelivered. Tests whose subject is that state drive it directly; every
+    /// other test wants a message this session can still send.
+    fn queue_unsealed_at(
+        m: &mut DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+        seq: u64,
+        now_ms: i64,
+    ) {
+        m.persist
+            .update_outbox(label, direction, now_ms, |outbox| {
+                outbox.enqueue_awaiting_key(seq, OutboxTarget::ChannelPage, now_ms)?;
+                Ok(Mutation::Changed(()))
+            })
+            .expect("the entry queues");
+        let index = m
+            .correspondences
+            .iter()
+            .position(|c| c.label == *label)
+            .expect("the correspondence this entry belongs to");
+        m.correspondences[index]
+            .unsealed_bodies
+            .insert(seq, "waiting for a chain".into());
     }
 
     /// Put one established correspondence into the state a crash between the
@@ -17958,6 +18645,21 @@ mod tests {
             .collect()
     }
 
+    /// Every sequence one batch of effects reported composed.
+    fn composed_seqs(effects: &[DmEffect]) -> Vec<u64> {
+        effects
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Delivery {
+                    seq,
+                    state: DeliveryState::Composed,
+                    ..
+                }) => Some(*seq),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The sequence numbers one batch of effects reports as undelivered.
     fn undelivered_seqs(effects: &[DmEffect]) -> Vec<u64> {
         effects
@@ -17981,13 +18683,18 @@ mod tests {
     /// seal key and its signature preimage, so bytes replayed at another
     /// position open at an address the peer is not reading and verify against a
     /// preimage it does not compute.
+    ///
+    /// **The committed attempt is the cause under test, not waiting mail.** The
+    /// leg branch of the load-time pass runs before the survey asks what is
+    /// waiting, so this needs no reservation — and a reservation written before
+    /// the drop below would be one whose body no process holds, which the load
+    /// ends rather than carries.
     #[test]
     fn a_crash_between_the_commit_and_the_queue_re_emits_the_stored_leg() {
         let dir = tempfile::tempdir().expect("temp dir");
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let label = {
             let (a, _b, label) = established_initiator(&dir, &dir_b);
-            queue_unsealed(&a, &label, Direction::AToB, 40);
             crash_after_committing_an_attempt(&a, &label, Direction::AToB);
             label
         };
@@ -18072,13 +18779,16 @@ mod tests {
     /// reported lost over an entry that is sitting right there, already
     /// surfaced by the give-up that ended it. That is what the silence assertion
     /// below catches; the sequence assertion alone does not.
+    ///
+    /// **The committed attempt is the cause under test**, on the same terms as
+    /// the test above: the leg branch runs before the survey, so no waiting mail
+    /// is needed and none would survive the drop.
     #[test]
     fn a_second_load_does_not_queue_the_same_leg_twice() {
         let dir = tempfile::tempdir().expect("temp dir");
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let label = {
             let (a, _b, label) = established_initiator(&dir, &dir_b);
-            queue_unsealed(&a, &label, Direction::AToB, 40);
             crash_after_committing_an_attempt(&a, &label, Direction::AToB);
             label
         };
@@ -18246,7 +18956,9 @@ mod tests {
                 Direction::BToA,
                 "the acceptor's outbox is not the direction this test is about"
             );
-            queue_unsealed(&b, &label_b, Direction::BToA, 40);
+            // The committed attempt is the cause; the leg branch of the pass
+            // runs before the survey asks what is waiting, and a reservation
+            // written here would not survive the rebuild below.
             crash_after_committing_an_attempt(&b, &label_b, Direction::BToA);
             label_b
         };
@@ -18285,15 +18997,19 @@ mod tests {
             let dir_b = tempfile::tempdir().expect("temp dir B");
             let label = {
                 let (a, _b, label) = established_initiator(&dir, &dir_b);
-                if unsealed {
-                    queue_unsealed(&a, &label, Direction::AToB, 40);
-                } else {
+                if !unsealed {
                     queue_at_generation(&a, &label, Direction::AToB, 40, 0);
                 }
                 label
             };
             let mut a = machine(&dir);
             a.persist.provision_block_list().expect("provision");
+            // Composed after the restart, because a reservation's body lives in
+            // the composing process and a restart is what separates it from its
+            // record entry.
+            if unsealed {
+                compose_unsealed(&mut a, BASE_MS);
+            }
             a.on_tick(BASE_MS);
             assert_eq!(
                 read_resume(&a, &label).attempt().map(|a| a.get()),
@@ -18321,7 +19037,6 @@ mod tests {
             let dir_b = tempfile::tempdir().expect("temp dir B");
             let label = {
                 let (a, _b, label) = established_initiator(&dir, &dir_b);
-                queue_unsealed(&a, &label, Direction::AToB, 40);
                 let stored = read_resume(&a, &label);
                 a.persist
                     .commit_resume(
@@ -18342,6 +19057,9 @@ mod tests {
             };
             let mut a = machine(&dir);
             a.persist.provision_block_list().expect("provision");
+            // The standing cause, composed after the restart so its body is one
+            // this process holds.
+            compose_unsealed(&mut a, BASE_MS);
             a.on_tick(BASE_MS);
             assert_eq!(
                 read_resume(&a, &label).attempt().is_some(),
@@ -18412,11 +19130,13 @@ mod tests {
             let dir = tempfile::tempdir().expect("temp dir");
             let dir_b = tempfile::tempdir().expect("temp dir B");
             let (a, _b, label) = established_initiator(&dir, &dir_b);
-            queue_unsealed(&a, &label, Direction::AToB, 40);
             drop(a);
 
             let mut a = machine(&dir);
             a.persist.provision_block_list().expect("provision");
+            // The standing cause, composed after the restart so its body is one
+            // this process holds.
+            compose_unsealed(&mut a, BASE_MS);
             let good = corrupt(&a, &label, kind);
 
             let faulted = a.on_tick(BASE_MS);
@@ -18544,11 +19264,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let (a, _b, label) = established_initiator(&dir, &dir_b);
-        queue_unsealed(&a, &label, Direction::AToB, 40);
         drop(a);
 
         let mut a = machine(&dir);
         a.persist.provision_block_list().expect("provision");
+        // The unreadable record is the whole cause: the pass faults at the read,
+        // before it has a direction to survey with, so no waiting mail is needed
+        // and none would have survived the drop above.
         let _good = corrupt(&a, &label, RecordKind::Resume);
 
         let first = a.on_tick(BASE_MS);
@@ -18599,7 +19321,6 @@ mod tests {
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let label = {
             let (a, _b, label) = established_initiator(&dir, &dir_b);
-            queue_unsealed(&a, &label, Direction::AToB, 40);
             let (seq, _) = crash_after_committing_an_attempt(&a, &label, Direction::AToB);
             // The leg's sequence spent and its entry pruned: the position the
             // stored bytes are bound to no longer exists.
@@ -18634,6 +19355,9 @@ mod tests {
 
         let mut a = machine(&dir);
         a.persist.provision_block_list().expect("provision");
+        // The standing cause, composed after the restart so its body is one this
+        // process holds.
+        compose_unsealed(&mut a, BASE_MS);
         let out = a.on_tick(BASE_MS);
         assert_eq!(
             lost(&out).iter().map(|(key, _)| *key).collect::<Vec<_>>(),
@@ -18677,12 +19401,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let (a, _b, label) = established_initiator(&dir, &dir_b);
-        queue_unsealed(&a, &label, Direction::AToB, 40);
+        // The attempt's own position is read off the outbox counter and the
+        // crash leaves no entry at it, so the counter has to be carried past it
+        // by something else or the message composed below would be handed the
+        // very sequence the stored leg's bytes are bound to.
+        queue_at_generation(&a, &label, Direction::AToB, 40, 0);
         let (seq, _) = crash_after_committing_an_attempt(&a, &label, Direction::AToB);
         drop(a);
 
         let mut a = machine(&dir);
         a.persist.provision_block_list().expect("provision");
+        // The control the sweep is read against, composed after the restart so
+        // its body is one this process holds.
+        let waiting = compose_unsealed(&mut a, BASE_MS);
         a.on_tick(BASE_MS);
         assert!(
             a.persist
@@ -18719,11 +19450,11 @@ mod tests {
             clock > BASE_MS + GIVE_UP_MS,
             "the clock never reached the give-up, so half this test is vacuous"
         );
-        // The unsealed entry the fixture queued IS a user message and gives up
+        // The unsealed entry the fixture composed IS a user message and gives up
         // at seven days like any other — it is the control that says the sweep
         // ran at all. The leg's own sequence must not be in that list.
         assert!(
-            surfaced.contains(&40),
+            surfaced.contains(&waiting),
             "the give-up sweep never fired, so the leg's absence proves nothing"
         );
         assert!(
@@ -18782,14 +19513,17 @@ mod tests {
         }
     }
 
-    /// Establish A and B, queue one message A cannot seal, then drop both
-    /// machines and rebuild them over the same stores.
+    /// Establish A and B, drop both machines, rebuild them over the same
+    /// stores, then have A compose one message it cannot seal.
     ///
-    /// **The mail is queued before the drop and unsealed on purpose.** A4.2's
-    /// cause 2 is the only standing cause that opens a re-establishment: *"an
-    /// entry composed while no chain exists"*. Without one the load-time pass
-    /// finds nothing owed and opens no attempt, and every assertion below would
-    /// be about a handshake that never started.
+    /// **The mail is composed AFTER the restart, through `DmCommand::Send`.**
+    /// A4.2's cause 2 is the only standing cause that opens a re-establishment:
+    /// *"an entry composed while no chain exists"*. A reservation holds its body
+    /// in the composing process's memory, so one written before the drop comes
+    /// back with nothing to seal and the load ends it undelivered — which is the
+    /// contract, and which would leave every assertion below about a handshake
+    /// that never started. Composing through the command after the rebuild is
+    /// what a user does, and it is the only thing that arms the pass.
     ///
     /// **What the rebuilt pair holds is asserted here, because this is the one
     /// place the restart happens** and every caller inherits it.
@@ -18810,11 +19544,10 @@ mod tests {
     ) -> (Side, Side, (u16, Vec<u8>)) {
         let (a, b, label_a, knock) = established_initiator_with_knock(dir_a, dir_b);
         let label_b = b.correspondences[0].label;
-        queue_unsealed(&a, &label_a, Direction::AToB, pending_seq);
         drop(a);
         drop(b);
 
-        let machine_a = machine(dir_a);
+        let mut machine_a = machine(dir_a);
         machine_a
             .persist
             .provision_block_list()
@@ -18872,6 +19605,23 @@ mod tests {
                 .as_slice(),
             "B restored a keypair A does not verify against"
         );
+        // The standing cause, composed the way a user composes it. The command
+        // reserves the outbox's next sequence and arms the pass that surveys for
+        // it; `pending_seq` is what that number has to be for the assertions
+        // every caller makes about it to be about this entry.
+        let to = machine_a.correspondences[0].pk_lt.clone();
+        let composed = machine_a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to,
+                body: "waiting for a chain".into(),
+            },
+        );
+        assert_eq!(
+            composed_seqs(&composed),
+            vec![pending_seq],
+            "the send did not reserve the sequence this fixture is built around: {composed:?}"
+        );
         (
             Side {
                 machine: machine_a,
@@ -18917,6 +19667,12 @@ mod tests {
     /// first dispatch is drawn from a band of hours (A5.5), so a fixture ticking
     /// at second scale would report *"no leg was published"* for a leg that is
     /// simply not due yet.
+    ///
+    /// **Every write of the batch is carried, not the first of them.** The tick
+    /// that publishes a settling leg is also the tick that publishes whatever
+    /// the sealing pass just installed, and the two share a page whenever their
+    /// sequences do — so the correspondent sweeps the page with every slot the
+    /// sender wrote, which is what a real sweep hands it.
     fn carry_one_leg(from: &mut Side, to: &mut Side, at_ms: i64) -> (Vec<DmEffect>, i64) {
         let mut clock = at_ms;
         let mut writes = Vec::new();
@@ -18929,21 +19685,46 @@ mod tests {
                 break;
             }
         }
+        // **A leg moved, and the batch is exactly one page.** The first is what
+        // the caller asked for; the second is what the `== 1` assertion this
+        // replaced was really buying — a page write nobody expected, from some
+        // other entry of the same record, would otherwise be folded in silently.
+        let legs = pending_legs(&from.machine, &from.label, clock);
+        let leg_writes = writes
+            .iter()
+            .filter(|(seq, _, _)| legs.contains(seq))
+            .count();
         assert_eq!(
-            writes.len(),
+            leg_writes,
             1,
-            "expected exactly one page write to carry, got {}",
-            writes.len()
+            "expected exactly one leg among the writes to carry: {:?} against legs {legs:?}",
+            writes.iter().map(|(seq, _, _)| *seq).collect::<Vec<_>>()
         );
-        let (seq, page, bytes) = writes.remove(0);
         let conversation = to.conversation();
-        let folded = fold_page_at(
-            &mut to.machine,
-            clock,
-            conversation,
-            page,
-            vec![(position_of(seq), bytes)],
+        let mut by_page: std::collections::BTreeMap<u64, Vec<(PagePosition, Vec<u8>)>> =
+            std::collections::BTreeMap::new();
+        for (seq, page, bytes) in writes {
+            by_page
+                .entry(page)
+                .or_default()
+                .push((position_of(seq), bytes));
+        }
+        assert_eq!(
+            by_page.len(),
+            1,
+            "the batch straddled pages: {:?}",
+            by_page.keys().collect::<Vec<_>>()
         );
+        let mut folded = Vec::new();
+        for (page, slots) in by_page {
+            folded.extend(fold_page_at(
+                &mut to.machine,
+                clock,
+                conversation,
+                page,
+                slots,
+            ));
+        }
         (folded, clock)
     }
 
@@ -19260,6 +20041,1353 @@ mod tests {
              cannot be read and nothing below is about the entry"
         );
         (a, b, knock, t3)
+    }
+
+    /// Compose one message on a side that holds no key schedule and return the
+    /// sequence it reserved.
+    fn reserve_on(side: &mut Side, at_ms: i64, body: &str) -> u64 {
+        let to = side.machine.correspondences[0].pk_lt.clone();
+        let out = side.machine.on_command(
+            at_ms,
+            DmCommand::Send {
+                to,
+                body: body.into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&out),
+            Vec::new(),
+            "a message composed with no key schedule was refused: {out:?}"
+        );
+        let composed = composed_seqs(&out);
+        assert_eq!(
+            composed.len(),
+            1,
+            "the send did not report exactly one composed message: {out:?}"
+        );
+        composed[0]
+    }
+
+    /// **Messages composed while no key schedule exists are sealed at the
+    /// sequences they reserved, and the send after them takes the next one.**
+    ///
+    /// Four messages, one of them composed between an in-flight exchange's legs,
+    /// so the batch straddles the two positions the exchange itself spends. Every
+    /// one is opened by the correspondent under the body it was composed with —
+    /// which is what says the reserved number and the sealed number are the same
+    /// number, since a frame opens only at the position its key was minted for.
+    ///
+    /// **The control is the rule this replaces.** A chain opened one past the
+    /// settling leg cannot derive a key below its own first position, and the
+    /// refusal is read off the live schedule rather than described: stepping it
+    /// back to the lowest reserved sequence is refused as already consumed, which
+    /// is the state every waiting message would have been left in.
+    #[test]
+    fn messages_composed_with_no_chain_seal_at_the_sequences_they_reserved() {
+        const FIRST: &str = "waiting for a chain";
+        const SECOND: &str = "the second before any leg";
+        const THIRD: &str = "the third before any leg";
+        const BETWEEN: &str = "composed between the legs";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        // The fixture's own compose is the first of the batch.
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        let second = reserve_on(&mut a, BASE_MS, SECOND);
+        let third = reserve_on(&mut a, BASE_MS, THIRD);
+
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        // Composed after the initiation rode the outbox, so its number is above
+        // that leg's and below the settling one.
+        let between = reserve_on(&mut a, t1, BETWEEN);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+
+        let reserved = vec![1, second, third, between];
+        assert_eq!(
+            reserved.len(),
+            4,
+            "the batch is the subject of every assertion below"
+        );
+
+        // A's next tick publishes the settling leg and everything the sealing
+        // pass installed when the exchange completed.
+        let mut clock = t2;
+        let mut writes = Vec::new();
+        for _ in 0..8 {
+            clock = past_the_reconnect_band(clock);
+            let effects = a.machine.on_tick(clock);
+            writes = page_writes(&effects);
+            if !writes.is_empty() {
+                break;
+            }
+        }
+        let published: Vec<u64> = writes.iter().map(|(seq, _, _)| *seq).collect();
+        for seq in &reserved {
+            assert!(
+                published.contains(seq),
+                "sequence {seq} was not published with the batch: {published:?}"
+            );
+        }
+        let pages: std::collections::BTreeSet<u64> =
+            writes.iter().map(|(_, page, _)| *page).collect();
+        assert_eq!(
+            pages.len(),
+            1,
+            "the batch straddled pages, so one fold does not carry it: {pages:?}"
+        );
+
+        // **Folded twice.** The frames ride beside the leg that settles the
+        // exchange, and a slot offered before the settlement reaches a side with
+        // no key schedule; the correspondent's own backfill re-reads the page,
+        // and this is that read.
+        let conversation = b.conversation();
+        let page = writes[0].1;
+        let slots: Vec<(PagePosition, Vec<u8>)> = writes
+            .iter()
+            .map(|(seq, _, bytes)| (position_of(*seq), bytes.clone()))
+            .collect();
+        let mut opened = fold_page_at(&mut b.machine, clock, conversation, page, slots.clone());
+        opened.extend(fold_page_at(
+            &mut b.machine,
+            clock,
+            conversation,
+            page,
+            slots,
+        ));
+        assert_eq!(
+            messages_in(&opened),
+            vec![
+                FIRST.to_string(),
+                SECOND.to_string(),
+                THIRD.to_string(),
+                BETWEEN.to_string(),
+            ],
+            "the correspondent did not open every waiting message at its own \
+             sequence: {opened:?}"
+        );
+
+        // A further send takes the position after the settling leg, which is the
+        // highest the outbox has spent.
+        let confirm = a
+            .resume()
+            .confirm_slot()
+            .expect("the completion persisted a settling leg")
+            .seq();
+        assert_eq!(
+            a.machine.only_next_send_seq(),
+            Some(confirm.saturating_add(1)),
+            "the chain did not step over the positions the outbox holds"
+        );
+
+        // The control: the rule this replaces opened the chain here, and a chain
+        // here cannot reach the sequence the first message reserved.
+        let chain = a.machine.correspondences[0]
+            .ratchet
+            .as_mut()
+            .expect("the initiating side holds a schedule");
+        assert!(
+            matches!(
+                chain.skip_send_to(1),
+                Err(daemonseed_core::dm::ratchet::RatchetError::AlreadyConsumed { .. })
+            ),
+            "a chain opened past the reserved sequences reached one of them"
+        );
+    }
+
+    /// **A send with no key schedule reports composed once and arms the pass that
+    /// rebuilds one.**
+    ///
+    /// The report is the contract the client pairs a body against: one
+    /// [`DeliveryState::Composed`] at one sequence, and every later report for
+    /// the message names that same number. The arming is what makes the
+    /// reservation a standing cause rather than a message that waits out its
+    /// give-up — `resume_channel`'s survey opens an attempt only where it finds
+    /// an entry awaiting a key.
+    ///
+    /// **The pass is run to completion FIRST, and that is what makes the arming
+    /// visible.** A correspondence seeded from disk owes the pass anyway, so a
+    /// send on a freshly loaded machine would open an attempt whether or not it
+    /// re-armed anything — the assertion would hold over a build that armed
+    /// nothing. One tick with no mail settles the pass and clears the flag, and
+    /// only the send can set it again.
+    #[test]
+    fn a_reservation_reports_composed_once_and_arms_the_re_establishment() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (a, _b, label) = established_initiator(&dir_a, &dir_b);
+        drop(a);
+
+        let mut a = machine(&dir_a);
+        a.persist.provision_block_list().expect("provision");
+        a.on_tick(BASE_MS);
+        assert!(
+            !a.correspondences[0].resume_owed,
+            "the load-time pass did not settle, so the flag below is not the \
+             send's doing"
+        );
+        assert!(
+            read_resume(&a, &label).attempt().is_none(),
+            "a tick with no mail opened an attempt, so the one below proves nothing"
+        );
+        let to = a.correspondences[0].pk_lt.clone();
+        let out = a.on_command(
+            BASE_MS,
+            DmCommand::Send {
+                to,
+                body: "the standing cause".into(),
+            },
+        );
+        let reports: Vec<(u64, DeliveryState)> = out
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Delivery { seq, state, .. }) => Some((*seq, *state)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "the send reported other than once: {out:?}"
+        );
+        assert_eq!(
+            reports[0].1,
+            DeliveryState::Composed,
+            "the send reported a state other than composed: {out:?}"
+        );
+        let seq = reports[0].0;
+        assert!(
+            a.correspondences[0].resume_owed,
+            "the send did not arm the pass, so the correspondence will sit \
+             addressable and mute"
+        );
+
+        a.on_tick(BASE_MS);
+        assert!(
+            read_resume(&a, &label).attempt().is_some(),
+            "the next tick opened no attempt, so the reservation is not a \
+             standing cause"
+        );
+        assert_eq!(
+            outbox_state(&a, &label, seq, BASE_MS),
+            DeliveryState::Composed,
+            "the entry at the reported sequence is not the reservation"
+        );
+    }
+
+    /// **A reservation whose body this process does not hold is ended at load,
+    /// surfaced, and opens no exchange.**
+    ///
+    /// A body lives in the composing process's memory, so a restart separates it
+    /// from the record entry that reserved its sequence. The entry that comes
+    /// back has nothing to seal and no pass can ever produce it, so it is ended
+    /// undelivered rather than left to wait out seven days — and because the
+    /// survey runs after that ending, a restart on its own puts nothing on the
+    /// wire.
+    #[test]
+    fn a_reservation_with_no_body_is_ended_at_load_and_opens_nothing() {
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (a, _b, label) = established_initiator(&dir_a, &dir_b);
+        drop(a);
+
+        let seq = {
+            let mut first = machine(&dir_a);
+            first.persist.provision_block_list().expect("provision");
+            let seq = compose_unsealed(&mut first, BASE_MS);
+            assert_eq!(
+                outbox_state(&first, &label, seq, BASE_MS),
+                DeliveryState::Composed,
+                "the first run did not leave a reservation to read back"
+            );
+            seq
+        };
+
+        let mut a = machine(&dir_a);
+        a.persist.provision_block_list().expect("provision");
+        let effects = a.on_tick(BASE_MS);
+
+        // The ending comes before the survey, so this is the assertion the
+        // ordering buys and it is read first.
+        assert!(
+            read_resume(&a, &label).attempt().is_none(),
+            "a restart on its own opened an exchange"
+        );
+        assert_eq!(
+            page_writes(&effects),
+            Vec::new(),
+            "a restart on its own put something on the wire: {effects:?}"
+        );
+        assert_eq!(
+            undelivered_seqs(&effects),
+            vec![seq],
+            "the body-less reservation was not surfaced: {effects:?}"
+        );
+        assert_eq!(
+            outbox_state(&a, &label, seq, BASE_MS),
+            DeliveryState::Undelivered,
+            "the body-less reservation was left waiting for a key"
+        );
+    }
+
+    /// **The answering side seals its own waiting messages only once the
+    /// correspondent's first frame has opened its sending chain.**
+    ///
+    /// A3.2's asymmetry: the party that answered a re-establishment holds a
+    /// receiving chain until the initiating party writes the first frame under
+    /// the re-rooted root. A pass that sealed before that would be asking a
+    /// schedule with no sending chain to mint, and the message would be reported
+    /// as a failure of the crypto module rather than as the ordinary wait it is.
+    #[test]
+    fn the_answering_side_seals_its_waiting_mail_after_the_first_frame_arrives() {
+        const WAITING: &str = "composed on the answering side";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        // Composed while this side still holds no key schedule at all, which is
+        // the only state the command reserves in. Once the settling leg lands
+        // this side holds a receiving chain, and a send is refused at the
+        // command under A3.2's asymmetry instead.
+        let seq = reserve_on(&mut b, t2, WAITING);
+        let (_, t3) = carry_one_leg(&mut a, &mut b, t2);
+        assert!(
+            b.machine.correspondences[0].ratchet.is_some(),
+            "the answering side did not settle, so it has no chain to be waiting on"
+        );
+        assert_eq!(
+            outbox_state(&b.machine, &b.label, seq, t3),
+            DeliveryState::Composed,
+            "the answering side's entry is not the reservation this is about"
+        );
+        assert!(
+            !is_sealed(&b.machine, &b.label, seq, t3),
+            "the answering side sealed before its correspondent had written"
+        );
+
+        let opened = carry_one_message(&mut a, &mut b, t3, "the first frame under the root");
+        assert_eq!(
+            messages_in(&opened),
+            vec!["the first frame under the root".to_string()],
+            "the answering side did not open the first frame: {opened:?}"
+        );
+
+        assert!(
+            is_sealed(&b.machine, &b.label, seq, t3),
+            "the first frame opened the sending chain and the waiting message \
+             was not sealed"
+        );
+    }
+
+    /// Grow one stored outbox with a single sealed entry sized so its sealing
+    /// plan admits exactly one reservation and stops at the next, and return the
+    /// sequence that entry took.
+    ///
+    /// The length is searched against a clone rather than computed, because the
+    /// arithmetic the plan prices with is private to the outbox; the search asks
+    /// the plan itself and the caller asserts the shape it settled on.
+    /// Repeated because the persistence layer prunes terminal entries on the way
+    /// into every `update_outbox` past a size threshold, and a filled record is
+    /// always past it: the first write after the fill reclaims the legs the
+    /// exchange finished with and hands back room the fill had just taken. Each
+    /// round re-measures after that prune has run, so the count converges.
+    fn fill_until_one_reservation_admits(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+        now_ms: i64,
+        from: u64,
+    ) -> Vec<u64> {
+        let mut used = Vec::new();
+        for round in 0..8u64 {
+            let at = from + round;
+            let placed = m
+                .persist
+                .update_outbox(label, direction, now_ms, |outbox| {
+                    let admitted = |ob: &daemonseed_core::dm::outbox::Outbox| {
+                        ob.sealing_plan(now_ms)
+                            .iter()
+                            .filter(|step| matches!(step, SealingStep::Admitted(_)))
+                            .count()
+                    };
+                    if admitted(outbox) <= 1 {
+                        return Ok(Mutation::Unchanged(false));
+                    }
+                    let mut low = 0usize;
+                    let mut high = daemonseed_core::storage::dm_store::OUTBOX_CAPACITY;
+                    let mut chosen = None;
+                    while low <= high {
+                        let mid = low + (high - low) / 2;
+                        let mut probe = outbox.clone();
+                        let fits = probe
+                            .enqueue_sealed(
+                                at,
+                                OutboxTarget::ChannelPage,
+                                now_ms,
+                                SealedFrame::new(vec![0xA5; mid]),
+                                0,
+                            )
+                            .is_ok();
+                        if !fits {
+                            if mid == 0 {
+                                break;
+                            }
+                            high = mid - 1;
+                            continue;
+                        }
+                        let count = admitted(&probe);
+                        if count > 1 {
+                            low = mid + 1;
+                        } else {
+                            if count == 1 {
+                                chosen = Some(mid);
+                            }
+                            if mid == 0 {
+                                break;
+                            }
+                            high = mid - 1;
+                        }
+                    }
+                    let len = chosen.expect("a filler length leaving exactly one admission");
+                    outbox.enqueue_sealed(
+                        at,
+                        OutboxTarget::ChannelPage,
+                        now_ms,
+                        SealedFrame::new(vec![0xA5; len]),
+                        0,
+                    )?;
+                    Ok(Mutation::Changed(true))
+                })
+                .expect("the filler fits");
+            if !placed {
+                return used;
+            }
+            used.push(at);
+        }
+        panic!("the fill never settled on exactly one admission");
+    }
+
+    /// One correspondence's stored sealing plan, read the way the pass reads it.
+    fn plan_of(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+        now_ms: i64,
+    ) -> Vec<SealingStep> {
+        m.persist
+            .update_outbox(label, direction, now_ms, |outbox| {
+                Ok(Mutation::Unchanged(outbox.sealing_plan(now_ms)))
+            })
+            .expect("the outbox reads")
+    }
+
+    /// End and reclaim every entry sealed below `gen`, so the room they held
+    /// comes back.
+    fn free_filled_room(
+        m: &DmMachine,
+        label: &CorrespondenceLabel,
+        direction: Direction,
+        now_ms: i64,
+        gen: u32,
+    ) -> usize {
+        m.persist
+            .update_outbox(label, direction, now_ms, |outbox| {
+                let ended = outbox.sweep_dead_chain(gen);
+                outbox.record_surfaced(&ended);
+                let pruned = outbox.prune();
+                Ok(Mutation::Changed(pruned))
+            })
+            .expect("the record reads")
+    }
+
+    /// The lifecycles of one stored outbox, by sequence.
+    fn reservations(m: &DmMachine, label: &CorrespondenceLabel, now_ms: i64) -> Vec<u64> {
+        m.persist
+            .read_outbox(label, now_ms)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .iter()
+            .filter(|entry| matches!(entry.lifecycle(), Lifecycle::AwaitingKey))
+            .map(OutboxEntry::seq)
+            .collect()
+    }
+
+    /// **A record that cannot take the whole batch seals what fits, leaves the
+    /// rest waiting with their bodies and their keys unminted, and does not step
+    /// the chain past the entry it stopped at.**
+    ///
+    /// The counter is the assertion that matters. A chain stepped to the
+    /// outbox's next sequence after a stopped batch can never derive a key below
+    /// that position again, so the entries the stop was protecting would be
+    /// stranded by the very step meant to make the next ordinary send possible.
+    #[test]
+    fn a_full_record_stops_the_batch_and_leaves_the_chain_at_the_stopped_entry() {
+        const FIRST: &str = "the one that fits";
+        const SECOND: &str = "the one the record stops at";
+        const THIRD: &str = "the one behind it";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+
+        // Composed on the side that has answered and not yet settled, which is
+        // the one state where a reservation can be made and the record filled
+        // before any key exists to seal it.
+        let first = reserve_on(&mut b, t2, FIRST);
+        let second = reserve_on(&mut b, t2, SECOND);
+        let third = reserve_on(&mut b, t2, THIRD);
+        assert_eq!(
+            vec![second, third],
+            vec![first + 1, first + 2],
+            "the three reservations are not contiguous, so the counter \
+             assertions below are not about consecutive positions"
+        );
+
+        let (_, t3) = carry_one_leg(&mut a, &mut b, t2);
+        assert!(
+            b.machine.correspondences[0].ratchet.is_some(),
+            "the answering side did not settle"
+        );
+        assert_eq!(
+            reservations(&b.machine, &b.label, t3),
+            vec![first, second, third],
+            "the settlement sealed something before the correspondent had written"
+        );
+
+        let fillers =
+            fill_until_one_reservation_admits(&b.machine, &b.label, Direction::BToA, t3, third + 1);
+        assert!(!fillers.is_empty(), "the fixture placed no filler");
+        // The control the whole test rests on, read the way the pass reads it
+        // and after every prune the fill provoked.
+        assert_eq!(
+            plan_of(&b.machine, &b.label, Direction::BToA, t3),
+            vec![SealingStep::Admitted(first), SealingStep::Stop(second)],
+            "the record does not admit exactly one of the three"
+        );
+
+        // Folded ONCE, unlike `carry_one_message`, which folds the same bytes a
+        // second time to catch a double open. A second fold runs the sealing
+        // pass a second time, and the batch this test is about must be observed
+        // after exactly one.
+        let recipient = a.machine.correspondences[0].pk_lt.clone();
+        let sent = a
+            .machine
+            .only_next_send_seq()
+            .expect("the initiating side holds one live correspondence");
+        let composed = a.machine.on_command(
+            t3,
+            DmCommand::Send {
+                to: recipient,
+                body: "the first frame under the root".into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&composed),
+            Vec::new(),
+            "the first frame was refused: {composed:?}"
+        );
+        let frame = queued_frame_at(&a.machine, &a.label, sent, t3);
+        let conversation = b.conversation();
+        let opened = fold_page_at(
+            &mut b.machine,
+            t3,
+            conversation,
+            position_of(sent).page(),
+            vec![(position_of(sent), frame)],
+        );
+        assert_eq!(
+            messages_in(&opened),
+            vec!["the first frame under the root".to_string()],
+            "the answering side did not open the first frame: {opened:?}"
+        );
+
+        assert!(
+            is_sealed(&b.machine, &b.label, first, t3),
+            "the entry the record had room for was not sealed"
+        );
+        assert_eq!(
+            reservations(&b.machine, &b.label, t3),
+            vec![second, third],
+            "the stopped entries did not stay waiting for a key"
+        );
+        let held: Vec<u64> = b.machine.correspondences[0]
+            .unsealed_bodies
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(
+            held,
+            vec![second, third],
+            "the stopped entries' bodies were released"
+        );
+        assert_eq!(
+            b.machine.correspondences[0]
+                .ratchet
+                .as_ref()
+                .expect("the answering side holds a schedule")
+                .next_send_seq(),
+            second,
+            "the chain stepped past the entry the record stopped at, which \
+             strands it and everything behind it"
+        );
+
+        // Room comes back, and the tick is what re-arms the batch.
+        let pruned = free_filled_room(&b.machine, &b.label, Direction::BToA, t3, 1);
+        assert!(pruned > 0, "the fixture reclaimed nothing");
+        let stored = b
+            .machine
+            .persist
+            .read_outbox(&b.label, t3)
+            .expect("the outbox reads")
+            .expect("the outbox exists");
+        for filler in &fillers {
+            assert!(
+                stored.entry(*filler).is_none(),
+                "filler {filler} is still holding the room the batch stopped on"
+            );
+        }
+
+        b.machine.on_tick(t3);
+
+        assert_eq!(
+            reservations(&b.machine, &b.label, t3),
+            Vec::<u64>::new(),
+            "the re-armed batch left something waiting"
+        );
+        for seq in [second, third] {
+            assert!(
+                is_sealed(&b.machine, &b.label, seq, t3),
+                "sequence {seq} was not sealed by the re-armed batch"
+            );
+        }
+        assert!(
+            b.machine.correspondences[0].unsealed_bodies.is_empty(),
+            "a sealed entry's body was kept"
+        );
+        let next = b
+            .machine
+            .persist
+            .read_outbox(&b.label, t3)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .next_send_seq();
+        assert_eq!(
+            b.machine.correspondences[0]
+                .ratchet
+                .as_ref()
+                .expect("the answering side holds a schedule")
+                .next_send_seq(),
+            next,
+            "with nothing left waiting the chain did not step to the outbox's \
+             next sequence"
+        );
+    }
+
+    /// **A compose while mail is waiting joins the queue; a compose the record
+    /// has no room for is refused in the record's own words.**
+    ///
+    /// The schedule's counter sits on the lowest waiting position, so a send
+    /// priced at that counter asks the record for a sequence it already holds.
+    /// That is refused as a duplicate and reaches the user as a store fault —
+    /// nothing they can act on — so the reservation path takes it instead and
+    /// the conversation keeps its order. Where the record is genuinely full the
+    /// reservation's own gate refuses first, with the capacity it needed, which
+    /// IS actionable.
+    ///
+    /// **Both halves matter and they are different refusals.** A build that
+    /// reserved unconditionally would report a full record as a queued message;
+    /// one that never reserved would report an ordinary queue as a store fault.
+    #[test]
+    fn a_compose_while_mail_waits_joins_the_queue_or_is_refused_on_capacity() {
+        const FIRST: &str = "the one that fits";
+        const SECOND: &str = "the one the record stops at";
+        const LATER: &str = "composed while the batch was stopped";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b, reserved, settled) =
+            answering_side_with_reservations(&dir_a, &dir_b, &[(0, FIRST), (0, SECOND)]);
+        assert_eq!(reserved.len(), 2, "the batch is the subject of this test");
+        let (first, second) = (reserved[0], reserved[1]);
+        // The fixture's second compose is the queue-joining half: it ran while
+        // the first reservation stood and the record had room, and it took the
+        // next sequence rather than being refused.
+        assert_eq!(
+            second,
+            first + 1,
+            "the second compose did not join the queue behind the first"
+        );
+
+        let fillers = fill_until_one_reservation_admits(
+            &b.machine,
+            &b.label,
+            Direction::BToA,
+            settled,
+            // Contiguous with the reservations: the counter is carried over the
+            // filler positions by one bounded step, and a gap wider than the
+            // schedule's own bound is a fixture that cannot reconcile.
+            second + 1,
+        );
+        assert!(!fillers.is_empty(), "the fixture placed no filler");
+        assert_eq!(
+            plan_of(&b.machine, &b.label, Direction::BToA, settled),
+            vec![SealingStep::Admitted(first), SealingStep::Stop(second)],
+            "the record does not admit exactly one of the two"
+        );
+
+        let opened = deliver_one_message(&mut a, &mut b, settled, "the first frame under the root");
+        assert_eq!(
+            messages_in(&opened),
+            vec!["the first frame under the root".to_string()],
+            "the answering side did not open the first frame: {opened:?}"
+        );
+        assert_eq!(
+            reservations(&b.machine, &b.label, settled),
+            vec![second],
+            "the batch did not stop where this test needs it to"
+        );
+        assert_eq!(
+            b.machine.correspondences[0]
+                .ratchet
+                .as_ref()
+                .expect("the answering side holds a schedule")
+                .next_send_seq(),
+            second,
+            "the chain is not parked on the stopped entry, so a plain send \
+             would not be refused as a duplicate anyway"
+        );
+
+        let to = b.machine.correspondences[0].pk_lt.clone();
+        let composed = b.machine.on_command(
+            settled,
+            DmCommand::Send {
+                to,
+                body: LATER.into(),
+            },
+        );
+        // **Refused on capacity, not as a store fault.** The record is full of
+        // the frames the batch could not grow past, so a reservation's own
+        // worst-case charge does not fit either — and the user is told that
+        // rather than being told the store broke.
+        assert!(
+            matches!(
+                refusals_in(&composed).as_slice(),
+                [RefusalReason::OutboxFull { .. }]
+            ),
+            "a compose against a full record was not refused on capacity: {composed:?}"
+        );
+        assert_eq!(
+            composed_seqs(&composed),
+            Vec::<u64>::new(),
+            "a refused compose reported a message composed: {composed:?}"
+        );
+        assert_eq!(
+            reservations(&b.machine, &b.label, settled),
+            vec![second],
+            "a refused compose changed the queue"
+        );
+
+        // Room comes back; the queue drains in order and a compose is taken
+        // again, at the sequence after the ones that were waiting.
+        let pruned = free_filled_room(&b.machine, &b.label, Direction::BToA, settled, 1);
+        assert!(pruned > 0, "the fixture reclaimed nothing");
+        b.machine.on_tick(settled);
+        assert_eq!(
+            reservations(&b.machine, &b.label, settled),
+            Vec::<u64>::new(),
+            "the re-armed batch left something waiting"
+        );
+        for seq in [first, second] {
+            assert!(
+                is_sealed(&b.machine, &b.label, seq, settled),
+                "sequence {seq} was not sealed by the re-armed batch"
+            );
+        }
+        let to = b.machine.correspondences[0].pk_lt.clone();
+        let after = b.machine.on_command(
+            settled,
+            DmCommand::Send {
+                to,
+                body: LATER.into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&after),
+            Vec::new(),
+            "a compose after the queue drained was refused: {after:?}"
+        );
+        assert!(
+            composed_seqs(&after)
+                .first()
+                .is_some_and(|seq| *seq > second),
+            "the compose after the drain did not follow the queue: {after:?}"
+        );
+    }
+
+    /// **A message the exchange outran is ended undelivered with no key minted,
+    /// and the one still in its window is sealed at the sequence it reserved.**
+    ///
+    /// A reservation is admitted at no cost and holds no bytes, so its window
+    /// can close while it waits. Minting for it would spend a position on a
+    /// message that cannot be delivered even if it fitted, and would leave that
+    /// position consumed under an entry nothing will ever publish.
+    #[test]
+    fn a_reservation_the_exchange_outran_is_ended_with_no_key_minted() {
+        const IN_WINDOW: &str = "composed after the window closed on the first";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        // The fixture's own compose is at BASE_MS and is the one that ages out.
+        let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
+        let aged = 1u64;
+        let past = BASE_MS + GIVE_UP_MS + 1;
+        let live = reserve_on(&mut a, past, IN_WINDOW);
+        assert!(
+            live > aged,
+            "the in-window message did not take a later sequence than the aged one"
+        );
+
+        // Collected across every tick of the run: the report is one-shot per
+        // session, so a fixture that reads only the last tick reads nothing.
+        let opening = a.machine.on_tick(past);
+        a.surfaced.extend(undelivered_seqs(&opening));
+        let (_, t1) = carry_one_leg(&mut a, &mut b, past);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        a.surfaced.extend(undelivered_seqs(&a.machine.on_tick(t2)));
+        assert!(
+            a.machine.correspondences[0].ratchet.is_some(),
+            "the initiating side did not complete the exchange"
+        );
+
+        assert_eq!(
+            outbox_state(&a.machine, &a.label, aged, t2),
+            DeliveryState::Undelivered,
+            "the message the exchange outran was not ended"
+        );
+        assert!(
+            !is_sealed(&a.machine, &a.label, aged, t2),
+            "a key was minted for a message past its window"
+        );
+        assert!(
+            a.surfaced.contains(&aged),
+            "the ended message was not surfaced: {:?}",
+            a.surfaced
+        );
+        assert!(
+            !a.machine.correspondences[0]
+                .unsealed_bodies
+                .contains_key(&aged),
+            "the ended message's body was kept"
+        );
+
+        assert!(
+            is_sealed(&a.machine, &a.label, live, t2),
+            "the message still in its window was not sealed"
+        );
+        assert_eq!(
+            reservations(&a.machine, &a.label, t2),
+            Vec::<u64>::new(),
+            "the batch left something waiting"
+        );
+        let chain = a.machine.correspondences[0]
+            .ratchet
+            .as_ref()
+            .expect("the initiating side holds a schedule");
+        assert!(
+            chain.next_send_seq() > live,
+            "the chain did not pass the sealed position"
+        );
+
+        // The body the correspondent opens is the one that was still in window,
+        // and it is the only one. The settling leg goes first, because until it
+        // lands the correspondent holds no chain for the re-rooted root; the
+        // message rides beside it and is re-read from the page afterwards, which
+        // is what the receiver's own backfill does.
+        let (_, t3) = carry_one_leg(&mut a, &mut b, t2);
+        let frame = queued_frame_at(&a.machine, &a.label, live, t3);
+        let conversation = b.conversation();
+        let opened = fold_page_at(
+            &mut b.machine,
+            t3,
+            conversation,
+            position_of(live).page(),
+            vec![(position_of(live), frame)],
+        );
+        assert_eq!(
+            messages_in(&opened),
+            vec![IN_WINDOW.to_string()],
+            "the correspondent did not open the in-window message at its own \
+             sequence: {opened:?}"
+        );
+    }
+
+    /// Drive the answering side to a settled exchange holding reservations it
+    /// cannot yet seal, and hand back the two sides and the settlement's clock.
+    ///
+    /// The FIRST is composed before the settling leg lands, which is the only
+    /// window where that side holds no key schedule at all. Every later one is
+    /// composed after it, at a clock the caller names — reachable because a
+    /// correspondence with a reservation standing reserves rather than being
+    /// refused, which is what keeps the queue in order.
+    ///
+    /// **The clocks only ever move forward.** A record refuses to decode
+    /// entries composed after the instant it is read at, so a compose stamped
+    /// before the legs already in the record fails as a store fault.
+    fn answering_side_with_reservations(
+        dir_a: &tempfile::TempDir,
+        dir_b: &tempfile::TempDir,
+        composes: &[(i64, &str)],
+    ) -> (Side, Side, Vec<u64>, i64) {
+        let (first_body, rest) = composes.split_first().expect("at least one compose");
+        let (mut a, mut b) = restart_both(dir_a, dir_b, 1);
+        a.machine.on_tick(BASE_MS);
+        let (_, t1) = carry_one_leg(&mut a, &mut b, BASE_MS);
+        let (_, t2) = carry_one_leg(&mut b, &mut a, t1);
+        let mut reserved = vec![reserve_on(&mut b, t2, first_body.1)];
+        let (_, t3) = carry_one_leg(&mut a, &mut b, t2);
+        for (after, body) in rest {
+            reserved.push(reserve_on(&mut b, t3.saturating_add(*after), body));
+        }
+        assert!(
+            b.machine.correspondences[0].ratchet.is_some(),
+            "the answering side did not settle"
+        );
+        let latest = t3.saturating_add(rest.iter().map(|(after, _)| *after).max().unwrap_or(0));
+        assert_eq!(
+            reservations(&b.machine, &b.label, latest),
+            reserved,
+            "the settlement sealed or lost a reservation before any frame arrived"
+        );
+        (a, b, reserved, latest)
+    }
+
+    /// Send one message from `from` and fold it into `to` at `at_ms`, once.
+    fn deliver_one_message(
+        from: &mut Side,
+        to: &mut Side,
+        at_ms: i64,
+        body: &str,
+    ) -> Vec<DmEffect> {
+        let recipient = from.machine.correspondences[0].pk_lt.clone();
+        let seq = from
+            .machine
+            .only_next_send_seq()
+            .expect("the sending side holds one live correspondence");
+        let composed = from.machine.on_command(
+            at_ms,
+            DmCommand::Send {
+                to: recipient,
+                body: body.into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&composed),
+            Vec::new(),
+            "the message was refused, so there is nothing to carry: {composed:?}"
+        );
+        let frame = queued_frame_at(&from.machine, &from.label, seq, at_ms);
+        let conversation = to.conversation();
+        fold_page_at(
+            &mut to.machine,
+            at_ms,
+            conversation,
+            position_of(seq).page(),
+            vec![(position_of(seq), frame)],
+        )
+    }
+
+    /// **A batch whose lowest entry has aged out still seals the rest.**
+    ///
+    /// The chain opens at the lowest waiting sequence. When that one's window
+    /// closes before the batch can run, the sweep ends it and the first entry
+    /// the plan admits is a LATER number — so the chain has to be moved forward
+    /// before it can mint, on a side that has no chain to move yet. That is the
+    /// step `Ratchet::skip_send_to` performs on an unopened chain, and without
+    /// it this batch stops on its first entry and never restarts.
+    ///
+    /// **The ending is the pass's own sweep, not the tick's.** Everything below
+    /// happens inside the page fold that opens the correspondent's first frame;
+    /// no tick runs between the compose and the assertions, so
+    /// `DmMachine::give_ups` has not been reached and the entry's terminal state
+    /// can only have come from the sweep the sealing pass runs first.
+    #[test]
+    fn a_batch_whose_lowest_entry_aged_out_seals_the_rest() {
+        const AGED: &str = "composed first and outrun";
+        const LIVE: &str = "composed second and still in window";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b, reserved, settled) = answering_side_with_reservations(
+            &dir_a,
+            &dir_b,
+            // The first is composed at the settlement; the second half a give-up
+            // window after it. The frame below arrives a full window after the
+            // first, which puts it past its own and leaves the second inside its.
+            &[(0, AGED), (GIVE_UP_MS / 2, LIVE)],
+        );
+        assert_eq!(reserved.len(), 2, "the batch is the subject of this test");
+        let (aged, live) = (reserved[0], reserved[1]);
+        assert!(live > aged, "the reservations are not in compose order");
+
+        let late = settled + GIVE_UP_MS / 2 + 1;
+        let opened = deliver_one_message(&mut a, &mut b, late, "the first frame under the root");
+        assert_eq!(
+            messages_in(&opened),
+            vec!["the first frame under the root".to_string()],
+            "the answering side did not open the first frame: {opened:?}"
+        );
+
+        assert_eq!(
+            outbox_state(&b.machine, &b.label, aged, late),
+            DeliveryState::Undelivered,
+            "the entry the exchange outran was not ended"
+        );
+        assert!(
+            !is_sealed(&b.machine, &b.label, aged, late),
+            "a key was minted for an entry past its window"
+        );
+        assert!(
+            is_sealed(&b.machine, &b.label, live, late),
+            "the batch stopped on the aged entry instead of stepping over it"
+        );
+        assert_eq!(
+            reservations(&b.machine, &b.label, late),
+            Vec::<u64>::new(),
+            "the batch left something waiting"
+        );
+
+        // The chain is usable afterwards, which is the half a stopped batch
+        // fails silently: the counter is past the sealed position and an
+        // ordinary send goes through at the record's next sequence.
+        let next = b
+            .machine
+            .persist
+            .read_outbox(&b.label, late)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .next_send_seq();
+        let to = b.machine.correspondences[0].pk_lt.clone();
+        let composed = b.machine.on_command(
+            late,
+            DmCommand::Send {
+                to,
+                body: "an ordinary send after the batch".into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&composed),
+            Vec::new(),
+            "an ordinary send after the batch was refused: {composed:?}"
+        );
+        assert_eq!(
+            composed_seqs(&composed),
+            vec![next],
+            "the send did not take the record's next sequence: {composed:?}"
+        );
+        assert!(
+            is_sealed(&b.machine, &b.label, next, late),
+            "the ordinary send queued no frame"
+        );
+    }
+
+    /// **A chain parked on a sequence that then ends does not wedge the
+    /// conversation.**
+    ///
+    /// The chain opens at the lowest waiting sequence, so if that reservation
+    /// ends before anything seals it the counter is left pointing at a position
+    /// the record now holds as terminal — and every later send prices `room_for`
+    /// against it, is refused as a duplicate, and reaches the user as a store
+    /// fault for the life of the session. The reconcile after the batch is what
+    /// closes that, and it has to run on a batch that sealed nothing at all.
+    #[test]
+    fn a_chain_parked_on_an_ended_reservation_still_sends() {
+        const AGED: &str = "the only waiting message, outrun";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b, reserved, settled) =
+            answering_side_with_reservations(&dir_a, &dir_b, &[(0, AGED)]);
+        assert_eq!(reserved.len(), 1, "this test is about a single reservation");
+        let aged = reserved[0];
+
+        let late = settled + GIVE_UP_MS + 1;
+        let opened = deliver_one_message(&mut a, &mut b, late, "the first frame under the root");
+        assert_eq!(
+            messages_in(&opened),
+            vec!["the first frame under the root".to_string()],
+            "the answering side did not open the first frame: {opened:?}"
+        );
+        assert_eq!(
+            outbox_state(&b.machine, &b.label, aged, late),
+            DeliveryState::Undelivered,
+            "the only waiting entry was not ended, so the chain is not parked \
+             on a terminal position"
+        );
+        assert!(
+            !is_sealed(&b.machine, &b.label, aged, late),
+            "a key was minted for an entry past its window"
+        );
+
+        let next = b
+            .machine
+            .persist
+            .read_outbox(&b.label, late)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .next_send_seq();
+        let to = b.machine.correspondences[0].pk_lt.clone();
+        let composed = b.machine.on_command(
+            late,
+            DmCommand::Send {
+                to,
+                body: "the send a parked chain refuses".into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&composed),
+            Vec::new(),
+            "a send after the parked entry ended was refused: {composed:?}"
+        );
+        assert_eq!(
+            composed_seqs(&composed),
+            vec![next],
+            "the send did not take the record's next sequence: {composed:?}"
+        );
+        assert!(
+            is_sealed(&b.machine, &b.label, next, late),
+            "the send queued no frame"
+        );
+    }
+
+    /// **A record write that fails takes nothing with it: every body is still
+    /// held and every entry is still awaiting a key.**
+    ///
+    /// The bodies are this process's and the record is not, so a write that does
+    /// not land must not be read as one that did — a body released against a
+    /// frame the record never took is a message lost with no report.
+    #[test]
+    fn a_failed_record_write_keeps_every_body_and_every_reservation() {
+        use daemonseed_core::storage::dm_store::RecordKind;
+
+        const WAITING: &str = "held across a write that fails";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b, reserved, t3) =
+            answering_side_with_reservations(&dir_a, &dir_b, &[(0, WAITING)]);
+        assert_eq!(reserved.len(), 1, "this test is about a single reservation");
+        let waiting = reserved[0];
+
+        let good = corrupt(&b.machine, &b.label, RecordKind::Outbox);
+        let before = b.machine.correspondences[0]
+            .ratchet
+            .as_ref()
+            .expect("the answering side holds a schedule")
+            .next_send_seq();
+
+        let opened = deliver_one_message(&mut a, &mut b, t3, "the first frame under the root");
+        assert_eq!(
+            messages_in(&opened),
+            vec!["the first frame under the root".to_string()],
+            "the first frame did not open, so the pass never ran: {opened:?}"
+        );
+        assert_eq!(
+            b.machine.correspondences[0]
+                .unsealed_bodies
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![waiting],
+            "a body was released against a record write that failed"
+        );
+        assert_eq!(
+            b.machine.correspondences[0]
+                .ratchet
+                .as_ref()
+                .expect("the answering side holds a schedule")
+                .next_send_seq(),
+            before,
+            "the schedule moved on a pass whose record would not read"
+        );
+
+        restore(&b.machine, &b.label, RecordKind::Outbox, &good);
+        assert_eq!(
+            reservations(&b.machine, &b.label, t3),
+            vec![waiting],
+            "the restored record does not hold the reservation"
+        );
+
+        b.machine.on_tick(t3);
+        assert!(
+            is_sealed(&b.machine, &b.label, waiting, t3),
+            "the next pass did not seal what the failed write left waiting"
+        );
+        assert!(
+            b.machine.correspondences[0].unsealed_bodies.is_empty(),
+            "the sealed entry's body was kept"
+        );
+    }
+
+    /// **A send while mail waits on a LIVE channel reserves and opens no
+    /// exchange.**
+    ///
+    /// The reservation path is reached two ways, and only one of them is a
+    /// correspondence with no key schedule. Arming the re-establishment from the
+    /// other opens a fresh attempt over a channel that is already speakable —
+    /// and the completion of that attempt runs the dead-chain sweep, which ends
+    /// every entry sealed below the generation it re-roots to: the frames this
+    /// session just sealed, reported to the user as undelivered.
+    #[test]
+    fn a_send_while_mail_waits_on_a_live_channel_opens_no_attempt() {
+        const WAITING: &str = "composed before the correspondent wrote";
+        const SECOND: &str = "composed behind it, on a live channel";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (_a, mut b, reserved, settled) =
+            answering_side_with_reservations(&dir_a, &dir_b, &[(0, WAITING)]);
+        assert_eq!(reserved.len(), 1, "one reservation is the premise");
+        assert!(
+            b.machine.correspondences[0].live().is_some(),
+            "the answering side holds no schedule, so this is the other route \
+             into the reservation path"
+        );
+        // One tick first, so the flag the pre-settlement compose set is cleared
+        // and the assertion after the send is about that send alone.
+        b.machine.on_tick(settled);
+        assert!(
+            !b.machine.correspondences[0].resume_owed,
+            "the pass did not settle, so the flag below is not the send's doing"
+        );
+        let before = read_resume(&b.machine, &b.label)
+            .attempt()
+            .map(Attempt::get);
+
+        let to = b.machine.correspondences[0].pk_lt.clone();
+        let composed = b.machine.on_command(
+            settled,
+            DmCommand::Send {
+                to,
+                body: SECOND.into(),
+            },
+        );
+        assert_eq!(
+            refusals_in(&composed),
+            Vec::new(),
+            "the second send was refused: {composed:?}"
+        );
+        assert_eq!(
+            composed_seqs(&composed).len(),
+            1,
+            "the second send reported other than once: {composed:?}"
+        );
+        assert!(
+            !b.machine.correspondences[0].resume_owed,
+            "a send on a live channel armed the re-establishment"
+        );
+
+        b.machine.on_tick(settled);
+        assert_eq!(
+            read_resume(&b.machine, &b.label)
+                .attempt()
+                .map(Attempt::get),
+            before,
+            "the tick opened an attempt over a live channel"
+        );
+        assert!(
+            !b.machine.correspondences[0].resume_owed,
+            "the pass left itself owed on a live channel"
+        );
+    }
+
+    /// **A waiting message is sealed with the time it was composed.**
+    ///
+    /// A reservation can sit for the whole of an exchange, so stamping the pass's
+    /// own clock would show every waiting message as sent at the moment the
+    /// channel came back rather than when the user wrote it. The record holds
+    /// the compose time because the give-up is measured from it.
+    #[test]
+    fn a_waiting_message_carries_its_compose_time() {
+        const WAITING: &str = "written long before the channel came back";
+
+        let dir_a = tempfile::tempdir().expect("temp dir A");
+        let dir_b = tempfile::tempdir().expect("temp dir B");
+        let (mut a, mut b, reserved, settled) =
+            answering_side_with_reservations(&dir_a, &dir_b, &[(0, WAITING)]);
+        assert_eq!(reserved.len(), 1, "one reservation is the premise");
+        let waiting = reserved[0];
+        let composed_at = b
+            .machine
+            .persist
+            .read_outbox(&b.label, settled)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .entry(waiting)
+            .expect("the reservation is there")
+            .composed_at_ms();
+
+        // The seal happens a long way after the compose, so the two times cannot
+        // be confused for one another.
+        let late = settled + GIVE_UP_MS / 2;
+        assert!(
+            late > composed_at,
+            "the fixture did not separate the compose from the seal"
+        );
+        let opened = deliver_one_message(&mut a, &mut b, late, "the first frame under the root");
+        assert_eq!(
+            messages_in(&opened),
+            vec!["the first frame under the root".to_string()],
+            "the answering side did not open the first frame: {opened:?}"
+        );
+        assert!(
+            is_sealed(&b.machine, &b.label, waiting, late),
+            "the waiting message was not sealed"
+        );
+
+        // Carried the other way and read off the frame the correspondent opens.
+        let frame = queued_frame_at(&b.machine, &b.label, waiting, late);
+        let conversation = a.conversation();
+        let seen = fold_page_at(
+            &mut a.machine,
+            late,
+            conversation,
+            position_of(waiting).page(),
+            vec![(position_of(waiting), frame)],
+        );
+        let stamps: Vec<i64> = seen
+            .iter()
+            .filter_map(|e| match e {
+                DmEffect::Emit(DmEvent::Message { sent_unix_ms, .. }) => Some(*sent_unix_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stamps.len(),
+            1,
+            "the correspondent opened other than one message: {seen:?}"
+        );
+        assert_eq!(
+            stamps[0], composed_at,
+            "the frame was stamped with the seal time, not the compose time"
+        );
+    }
+
+    /// Whether the entry at `seq` holds a frame yet.
+    fn is_sealed(m: &DmMachine, label: &CorrespondenceLabel, seq: u64, now_ms: i64) -> bool {
+        m.persist
+            .read_outbox(label, now_ms)
+            .expect("the outbox reads")
+            .expect("the outbox exists")
+            .entry(seq)
+            .expect("the entry is there")
+            .frame()
+            .is_some()
     }
 
     /// Rewrite one correspondence's resume record with a different re-root
@@ -19849,7 +21977,7 @@ mod tests {
         // Composed on the acceptor's own clock so the give-up — a fact about the
         // clock, not about the entry — cannot end it and be read as the teardown.
         let seq = next_send_seq(&b, t3);
-        queue_unsealed_at(&b.machine, &b.label, Direction::BToA, seq, t3);
+        queue_unsealed_at(&mut b.machine, &b.label, Direction::BToA, seq, t3);
 
         let admitted_before = b.machine.admission.admitted;
         let out = b.machine.on_doorbell(t3, sweep_of(vec![knock]));
@@ -19909,7 +22037,7 @@ mod tests {
         let (_a, mut b, _knock, t3) = re_established_pair(&dir_a, &dir_b);
 
         let seq = next_send_seq(&b, t3);
-        queue_unsealed_at(&b.machine, &b.label, Direction::BToA, seq, t3);
+        queue_unsealed_at(&mut b.machine, &b.label, Direction::BToA, seq, t3);
 
         // A knocking from a store that holds nothing, which is what makes this a
         // fresh introduction rather than a re-send: a new store yields a new
@@ -20115,7 +22243,16 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(writes.len(), 1, "expected exactly one page write");
+        // **The leg, not whatever else the same tick published.** The tick that
+        // dispatches a settling leg is also the tick that dispatches the
+        // messages the sealing pass installed when the exchange completed, so
+        // the batch carries more than one write and only one of them is the leg.
+        let legs = pending_legs(&side.machine, &side.label, clock);
+        let mut writes: Vec<_> = writes
+            .into_iter()
+            .filter(|(seq, _, _)| legs.contains(seq))
+            .collect();
+        assert_eq!(writes.len(), 1, "expected exactly one leg page write");
         let (seq, page, bytes) = writes.remove(0);
         (seq, page, bytes, clock)
     }
@@ -20153,7 +22290,7 @@ mod tests {
         let dir_a = tempfile::tempdir().expect("temp dir A");
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let (mut a, mut b) = restart_both(&dir_a, &dir_b, 1);
-        queue_unsealed(&b.machine, &b.label, Direction::BToA, 1);
+        queue_unsealed(&mut b.machine, &b.label, Direction::BToA, 1);
 
         a.machine.on_tick(BASE_MS);
         b.machine.on_tick(BASE_MS);
@@ -21069,18 +23206,11 @@ mod tests {
             a.machine.correspondences[0].resume_owed,
             "the pass was not left owed, so a replacement waits for a restart"
         );
-        // Mail waiting again, queued BEFORE the next tick: A4.2's cause 2 is the
-        // only standing cause that opens an attempt, and the entry the fixture
-        // started with gave up on the same tick the leg did — a tick with no
-        // mail settles the pass and there is nothing left to re-open.
-        a.machine
-            .persist
-            .update_outbox(&a.label, Direction::AToB, past, |outbox| {
-                let next = outbox.next_send_seq();
-                outbox.enqueue_awaiting_key(next, OutboxTarget::ChannelPage, past)?;
-                Ok(Mutation::Changed(()))
-            })
-            .expect("the fixture queues");
+        // Mail waiting again, composed BEFORE the next tick: A4.2's cause 2 is
+        // the only standing cause that opens an attempt, and the entry the
+        // fixture started with gave up on the same tick the leg did — a tick
+        // with no mail settles the pass and there is nothing left to re-open.
+        compose_unsealed(&mut a.machine, past);
         // Said once, not once per tick.
         assert_eq!(
             anomalies(&a.machine.on_tick(past + 1)),
@@ -21801,7 +23931,11 @@ mod tests {
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let _label = {
             let (a, _b, label) = established_initiator(&dir, &dir_b);
-            queue_unsealed(&a, &label, Direction::AToB, 40);
+            // Body-less on purpose: this machine is dropped below, so what the
+            // rebuilt one reads back is a reservation whose body is gone — and
+            // the mail such a correspondence still owes is exactly what the
+            // event under test has to name.
+            queue_bodyless_reservation(&a, &label, Direction::AToB, 40, BASE_MS);
             a.persist
                 .store()
                 .critical_section(&label, |guard| -> Result<(), DmPersistError> {
@@ -21837,7 +23971,6 @@ mod tests {
         let dir_b = tempfile::tempdir().expect("temp dir B");
         let _label = {
             let (a, _b, label) = established_initiator(&dir, &dir_b);
-            queue_unsealed(&a, &label, Direction::AToB, 40);
             let stored = read_resume(&a, &label);
             a.persist
                 .commit_resume(
@@ -21862,11 +23995,14 @@ mod tests {
 
         let mut a = machine(&dir);
         a.persist.provision_block_list().expect("provision");
+        // The mail the window is holding, composed after the restart so its body
+        // is one this process holds.
+        let waiting = compose_unsealed(&mut a, BASE_MS);
         let out = a.on_tick(BASE_MS);
 
         assert_eq!(
             lost(&out),
-            vec![(TrustEventKey::DmChannelTornDownOnRestart, vec![40])],
+            vec![(TrustEventKey::DmChannelTornDownOnRestart, vec![waiting])],
             "an exhausted window was not surfaced with the mail it holds: {out:?}"
         );
     }
@@ -21987,47 +24123,105 @@ mod tests {
         );
     }
 
-    /// M51. **A correspondence with no ratchet refuses a send in as many
-    /// words.**
+    /// M51. **A correspondence with no key schedule and no resume record refuses
+    /// a send in as many words; one with a resume record reserves instead.**
     ///
-    /// Pinned because the re-emit's sequence recovery no longer depends on it,
-    /// and something else might: a path that queued on a downed channel would
-    /// move `next_send_seq` under a committed attempt's stored position.
+    /// The resume record is the whole of the difference. It holds the material
+    /// the three-leg exchange rebuilds a key schedule from, so a message
+    /// composed beside one has a route to the wire and takes its sequence now;
+    /// without one nothing can sign a leg, no exchange can ever complete, and a
+    /// reservation would wait out its give-up for a key that is never coming.
+    ///
+    /// The reserving half also pins what `next_send_seq` does: the record's
+    /// counter rises at compose, which is what stops a later attempt being
+    /// addressed at a position this message already owns.
     #[test]
-    fn a_correspondence_with_no_ratchet_refuses_a_send() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let dir_b = tempfile::tempdir().expect("temp dir B");
-        let peer_pk = {
-            let (a, _b, _label) = established_initiator(&dir, &dir_b);
-            *a.correspondences[0].pk_lt
-        };
+    fn a_send_with_no_key_schedule_reserves_or_is_refused_by_the_resume_record() {
+        use daemonseed_core::storage::dm_store::RecordKind;
 
-        let mut a = machine(&dir);
-        a.persist.provision_block_list().expect("provision");
-        assert!(
-            a.correspondences[0].ratchet.is_none(),
-            "the reload kept a ratchet, so this proves nothing"
-        );
-        let out = a.on_command(
-            BASE_MS,
-            DmCommand::Send {
-                to: Box::new(peer_pk),
-                body: "into a channel that is down".into(),
-            },
-        );
+        for resume_record in [false, true] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let dir_b = tempfile::tempdir().expect("temp dir B");
+            let (peer_pk, label) = {
+                let (a, _b, label) = established_initiator(&dir, &dir_b);
+                (*a.correspondences[0].pk_lt, label)
+            };
 
-        let reasons: Vec<RefusalReason> = out
-            .iter()
-            .filter_map(|e| match e {
-                DmEffect::Emit(DmEvent::Refused { reason, .. }) => Some(*reason),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            reasons,
-            vec![RefusalReason::NotEstablishedThisSession],
-            "a send on a ratchet-less correspondence was not refused: {out:?}"
-        );
+            let mut a = machine(&dir);
+            a.persist.provision_block_list().expect("provision");
+            assert!(
+                a.correspondences[0].ratchet.is_none(),
+                "the reload kept a ratchet, so this proves nothing"
+            );
+            if !resume_record {
+                a.persist
+                    .store()
+                    .critical_section(&label, |guard| -> Result<(), DmPersistError> {
+                        guard.delete(RecordKind::Resume)?;
+                        Ok(())
+                    })
+                    .expect("the fixture removes it");
+            }
+            let before = a
+                .persist
+                .read_outbox(&label, BASE_MS)
+                .expect("the outbox reads")
+                .expect("the outbox exists")
+                .next_send_seq();
+
+            let out = a.on_command(
+                BASE_MS,
+                DmCommand::Send {
+                    to: Box::new(peer_pk),
+                    body: "into a channel that is down".into(),
+                },
+            );
+
+            let reasons: Vec<RefusalReason> = out
+                .iter()
+                .filter_map(|e| match e {
+                    DmEffect::Emit(DmEvent::Refused { reason, .. }) => Some(*reason),
+                    _ => None,
+                })
+                .collect();
+            let after = a
+                .persist
+                .read_outbox(&label, BASE_MS)
+                .expect("the outbox reads")
+                .expect("the outbox exists")
+                .next_send_seq();
+            if resume_record {
+                assert_eq!(
+                    reasons,
+                    Vec::new(),
+                    "a send beside a resume record was refused: {out:?}"
+                );
+                assert_eq!(
+                    composed_seqs(&out),
+                    vec![before],
+                    "the send did not report the sequence it reserved: {out:?}"
+                );
+                assert_eq!(
+                    after,
+                    before.saturating_add(1),
+                    "the reservation did not spend its sequence"
+                );
+                assert!(
+                    a.correspondences[0].resume_owed,
+                    "the reservation did not arm the pass that rebuilds a schedule"
+                );
+            } else {
+                assert_eq!(
+                    reasons,
+                    vec![RefusalReason::NotEstablishedThisSession],
+                    "a send with no resume record behind it was not refused: {out:?}"
+                );
+                assert_eq!(
+                    after, before,
+                    "a refused send spent a sequence number anyway"
+                );
+            }
+        }
     }
 
     /// M70. **A page's later leg reads the state its predecessor committed.**
@@ -22158,9 +24352,20 @@ mod tests {
                 let (a, _b, label) = established_initiator(&dir_a, &dir_b);
                 (a, label)
             };
+            // **Neither arm holds a key schedule, so the teardown is the only
+            // difference between them.** The pass exists for a correspondence
+            // that has none — one that still holds a live schedule needs no
+            // exchange and is refused whatever is waiting — so a control arm
+            // that kept one would be asserting a state the pass never runs in.
+            a.correspondences[0].ratchet = None;
+            assert!(
+                a.correspondences[0].live().is_none(),
+                "torn_down={torn_down}: the arm still holds a schedule, so the \
+                 pass would refuse it for the wrong reason"
+            );
             // A4.2's cause 2, the only standing cause that opens a
             // re-establishment: an entry composed while no chain can seal it.
-            queue_unsealed(&a, &label, Direction::AToB, 1);
+            queue_unsealed(&mut a, &label, Direction::AToB, 1);
             let before = read_resume(&a, &label).attempt().map(Attempt::get);
             a.correspondences[0].resume_owed = true;
 
