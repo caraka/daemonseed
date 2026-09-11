@@ -16,13 +16,20 @@
 //!    the settling legs, so the number the sender seals under is the number the
 //!    correspondent opens at.
 //!
+//!    **A restart on its own starts nothing.** The exchange has one standing
+//!    cause: a message composed while the correspondence holds no key schedule.
+//!    Such a message reserves its sequence number at once, holds no frame, and
+//!    arms the exchange that will give it a key. So each side is commanded to
+//!    send before anything is waited for, and the two waiting messages are what
+//!    open the exchange.
+//!
 //!    **The two sides are not symmetric, and the asymmetry is the second
 //!    claim.** The party that asked for the re-establishment owns the only chain
-//!    under the re-rooted root, so it speaks first; the answering party holds a
-//!    receiving chain until that first frame publishes the ephemeral its own
-//!    chain steps off, and a send issued before then is refused with
-//!    [`RefusalReason::AwaitingCorrespondentsFirstFrame`] and spends nothing.
-//!    Once the first frame lands, the answer crosses the other way.
+//!    under the re-rooted root, so its waiting message is sealed as the exchange
+//!    settles. The answering party holds a receiving chain until that first
+//!    frame publishes the ephemeral its own chain steps off, so its own waiting
+//!    message is sealed a hop later, when that frame opens. Each keeps the
+//!    sequence it reserved.
 //!
 //! ## What only this oracle can see
 //!
@@ -51,8 +58,8 @@
 //!
 //! ## What is asserted, and what it rests on
 //!
-//! The resume records are read from disk on both sides before any send is
-//! issued, because a message crossing says nothing about a re-establishment
+//! The resume records are read from disk on both sides before any message is
+//! followed, because a message crossing says nothing about a re-establishment
 //! having produced the keys that carried it:
 //!
 //! - each side's `reconnect_gen` is 1, which only a completed exchange writes;
@@ -63,26 +70,27 @@
 //!
 //! **Which side asked for the re-establishment is decided by the network, not by
 //! this oracle.** Both sides defer a first dispatch into the same band and the
-//! exchange runs on whichever draw came up first, so the roles are read off the
-//! answers rather than assumed: both sides are commanded to send at the same
-//! moment, exactly one composes, and the other names
-//! [`RefusalReason::AwaitingCorrespondentsFirstFrame`]. That the pair splits is
-//! itself the asymmetry claim — a build where both sides could mint, or neither,
-//! fails here rather than in an assertion about a role picked in advance.
+//! exchange runs on whichever draw came up first, so nothing here names a role:
+//! every assertion is written per side and holds whichever way the draws fell.
 //!
-//! The refused side's outbox counter is read before and after to show nothing
-//! was spent: a refusal taken after the ratchet stepped would burn a sequence
-//! number the correspondent's contiguous prefix waits on for the give-up, which
-//! no other observable would show.
+//! Each side's outbox counter is read before and after its send, because the
+//! reservation is the claim. The message is reported composed at the sequence
+//! the counter held, the counter moves by exactly that one, and nothing further
+//! is spent until the exchange's own legs ride the same outbox.
 //!
-//! Both frames are then followed the whole way. Each is opened by its
-//! correspondent at the sequence its sender's outbox reported, with the exact
-//! body, and each sender's outbox settles on a verified acknowledgement. The
-//! bodies and the acknowledgements are counted once more after a settling
-//! window, because a sender re-seeds the same bytes into the same slot until it
-//! is acknowledged: the frames are still on the network and still being swept
-//! while that window runs, so a build that folded on arrival rather than on
-//! settlement reports a second copy into it.
+//! Four frames are then followed the whole way. Each side's waiting message is
+//! opened by its correspondent at the sequence that side's outbox reported at
+//! compose, with the exact body — which is what says the reserved number and the
+//! sealed number are one number, since a frame opens only at the position its
+//! key was minted for. Each side then sends once more, and that frame takes a
+//! position above the ones the exchange's own legs occupy, which is the outbox
+//! rather than the key schedule deciding where a resumed chain continues. Every
+//! sender's outbox settles on a verified acknowledgement. The bodies and the
+//! acknowledgements are counted once more after a settling window, because a
+//! sender re-seeds the same bytes into the same slot until it is acknowledged:
+//! the frames are still on the network and still being swept while that window
+//! runs, so a build that folded on arrival rather than on settlement reports a
+//! second copy into it.
 //!
 //! `#[ignore]` — both tests attach to the PUBLIC Veilid network. Where attach is
 //! blocked, `attach_and_wait` returns `NotReady` after the full 180 s timeout.
@@ -177,22 +185,26 @@ const POLL: Duration = Duration::from_secs(30);
 /// expose a double fold is a PAGE sweep, 16 subkey reads of several seconds
 /// each, and it is not planned until the probe cadence next comes round; so the
 /// window has to cover a whole probe interval, the page sweep it plans, and a
-/// second round of both. It is what makes the refusal list a claim as well:
-/// `Side::refusals` reads what has been buffered, so a second refusal arriving
-/// behind the first would be invisible to a list read the moment one matched.
+/// second round of both. It is what makes an empty refusal list a claim as well:
+/// `Side::refusals` reads what has been buffered, so a refusal arriving after
+/// the last hop would be invisible to a list read the moment the bodies matched.
 const SETTLE: Duration = Duration::from_secs(300);
 
 /// The bodies under test. Distinct from each other, from the knock, and from
 /// anything a zero fill or a padding could produce, so a frame opened at the
 /// wrong position could not pass for the right one.
 ///
-/// One per side on the resumed channel, because which side speaks first is the
-/// network's choice: each side is commanded to send its own, and the body that
-/// arrives says which side minted the frame.
+/// Two per side on the resumed channel, and the pair is what tells the two
+/// sealing sites apart: the waiting body was composed while the correspondence
+/// held no key schedule and is sealed at the sequence it reserved, and the
+/// resumed body is sent once the channel carries keys and takes a position above
+/// the exchange's own legs. The body that arrives says which of the two it is.
 const KNOCK_BODY: &str = "hello";
 const A_BODY: &str = "first real message";
-const A_RESUMED_BODY: &str = "from the first party, onto the resumed channel";
-const B_RESUMED_BODY: &str = "from the second party, onto the resumed channel";
+const A_WAITING_BODY: &str = "from A, composed while no key schedule existed";
+const B_WAITING_BODY: &str = "from B, composed while no key schedule existed";
+const A_RESUMED_BODY: &str = "from A, sent once the resumed channel carried keys";
+const B_RESUMED_BODY: &str = "from B, sent once the resumed channel carried keys";
 
 /// The budget for a whole re-establishment: the band a first dispatch is drawn
 /// from, then three legs, each of which is a page write and the correspondent's
@@ -335,19 +347,6 @@ impl Side {
                 Err(_) => return,
             }
         }
-    }
-
-    /// Forget every event buffered so far, so a later wait can only be answered
-    /// by something that happens after this point.
-    ///
-    /// [`Self::wait_for`] scans what it has already buffered, which is what
-    /// makes the hops above composable and is exactly wrong before a command
-    /// whose answer must be told apart from an earlier event of the same shape.
-    /// It is wrong for the same reason in front of a count: everything a whole
-    /// establishment and a whole re-establishment emitted is still buffered, and
-    /// a tally over that measures the run rather than the claim.
-    fn forget(&mut self) {
-        self.seen.clear();
     }
 
     /// Every refusal reason this side has been given.
@@ -661,9 +660,9 @@ async fn first_contact(
     );
 }
 
-/// Both sides restart, re-establish over the network, and carry a message each
-/// way on the resumed channel — the party that asked for the re-establishment
-/// first.
+/// Both sides restart, each composes a message while it holds no key schedule,
+/// and those two waiting messages open the re-establishment that carries them —
+/// each at the sequence it reserved, with a further message each way after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "attaches to the public Veilid network and waits out the reconnect band; opt-in, run with --ignored"]
 async fn a_re_established_correspondence_carries_a_message_each_way_over_the_real_network() {
@@ -793,23 +792,104 @@ async fn a_re_established_correspondence_carries_a_message_each_way_over_the_rea
 
     let (handle_a, evt_a) = DmDriver::spawn(parts(a_again, Arc::clone(&node_a), profile_a.path()));
     let (handle_b, evt_b) = DmDriver::spawn(parts(b_again, Arc::clone(&node_b), profile_b.path()));
-    let mut side_a = Side::new("A", evt_a);
-    let mut side_b = Side::new("B", evt_b);
-    eprintln!("both stores restarted; waiting out the reconnect band");
+    let mut sides = [Side::new("A", evt_a), Side::new("B", evt_b)];
+    let handles = [&handle_a, &handle_b];
+    let stores = [&store_a, &store_b];
+    let labels = [&label_a, &label_b];
+    // Whom each side addresses, and the two bodies it mints.
+    let peers = [&b_pk, &a_pk];
+    let waiting_bodies = [A_WAITING_BODY, B_WAITING_BODY];
+    let resumed_bodies = [A_RESUMED_BODY, B_RESUMED_BODY];
+    eprintln!("both stores restarted");
+
+    // ── each side composes, and the two waiting messages open the exchange ───
+    //
+    // **This is what causes the re-establishment.** A restart is not an emission
+    // event: the survey that decides whether to open an attempt opens one only
+    // where the outbox holds a message awaiting a key, and at load there is
+    // none. A send on a correspondence that holds a resume record and no key
+    // schedule reserves the outbox's next sequence, holds its body in the
+    // sending process, reports itself composed at that sequence, and arms the
+    // exchange — so the sends come first and the wait follows them.
+    let spent_before = [
+        next_send_seq(stores[0], labels[0]),
+        next_send_seq(stores[1], labels[1]),
+    ];
+    for i in [0, 1] {
+        handles[i]
+            .send(DmCommand::Send {
+                to: peers[i].clone(),
+                body: waiting_bodies[i].into(),
+            })
+            .await
+            .expect("the send queues");
+    }
+
+    // A command is answered off the driver's own queue rather than over the
+    // network, so both answers are in hand in well under a hop.
+    //
+    // **The composition is recognised by its sequence, not merely by its
+    // state.** Every outbox entry reports its own state changes, so a match on
+    // the state alone would take some other entry for the message commanded here
+    // and carry its sequence into every assertion below.
+    let mut waiting_seq = [0u64; 2];
+    for i in [0, 1] {
+        let ours = spent_before[i];
+        let answered = sides[i]
+            .wait_for(
+                "the message composed with no key schedule is reported",
+                HOP,
+                |e| match e {
+                    DmEvent::Delivery {
+                        state: DeliveryState::Composed,
+                        seq,
+                        ..
+                    } if *seq == ours => Some(Ok(*seq)),
+                    DmEvent::Refused { reason, .. } => Some(Err(*reason)),
+                    _ => None,
+                },
+            )
+            .await;
+        waiting_seq[i] = answered.unwrap_or_else(|reason| {
+            panic!(
+                "{}: a message composed on a restarted correspondence was refused {reason:?}",
+                sides[i].who
+            )
+        });
+    }
+
+    // **One sequence spent, and only the one.** A reservation takes its number
+    // at compose and keeps it, so the number that answered the command is the
+    // number the frame is eventually sealed at. Read from disk rather than from
+    // the event, because the report names a sequence and says nothing about how
+    // far the counter moved to give it one.
+    for i in [0, 1] {
+        assert_eq!(
+            next_send_seq(stores[i], labels[i]),
+            waiting_seq[i].saturating_add(1),
+            "{}: composing the waiting message did not spend exactly its own sequence",
+            sides[i].who
+        );
+    }
+    eprintln!("both sides hold a message awaiting a key; waiting out the reconnect band");
 
     // ── the re-establishment ─────────────────────────────────────────────────
     //
-    // Neither side is told to do this. Each opens an attempt at load, defers its
-    // first dispatch into the band, and the exchange runs on whichever draw came
-    // up first. Both records are waited on, because a generation that advanced
-    // at one end says only that that end folded something.
+    // Neither side is told to do this. Each defers its first dispatch into the
+    // band on its waiting message's own schedule, and the exchange runs on
+    // whichever draw came up first. Both records are waited on, because a
+    // generation that advanced at one end says only that that end folded
+    // something.
     let budget = reestablishment_budget();
-    let (after_a, after_b) = wait_for_reestablishment(
-        (&mut side_a, &store_a, &label_a),
-        (&mut side_b, &store_b, &label_b),
-        budget,
-    )
-    .await;
+    let (after_a, after_b) = {
+        let [side_one, side_two] = &mut sides;
+        wait_for_reestablishment(
+            (side_one, &store_a, &label_a),
+            (side_two, &store_b, &label_b),
+            budget,
+        )
+        .await
+    };
 
     // Compared without printing on either side of the comparison: a committed
     // root is the secret a resumed channel's keys descend from, and a failure
@@ -827,154 +907,131 @@ async fn a_re_established_correspondence_carries_a_message_each_way_over_the_rea
         "the two sides committed different roots, so they are not on one channel"
     );
 
-    // ── which side may speak first, asked of both at once ────────────────────
+    // ── each waiting message is opened at the sequence it reserved ───────────
     //
-    // The party that asked for the re-establishment owns the only chain under
-    // the re-rooted root, so it composes and the other cannot until that first
-    // frame publishes the ephemeral its own chain steps off. Which party that is
-    // was settled by the two independent dispatch draws hours ago and is not
-    // recorded anywhere this side of the exchange, so the roles are taken from
-    // the answers: both are commanded together, and the pair splitting one way
-    // or the other is what is asserted.
-    //
-    // Everything buffered is dropped first — an establishment and a whole
-    // re-establishment sit in each stream, and the tallies at the end are about
-    // the two frames below.
-    let mut sides = [side_a, side_b];
-    let handles = [&handle_a, &handle_b];
-    let stores = [&store_a, &store_b];
-    let labels = [&label_a, &label_b];
-    // Whom each side addresses, and the body it mints.
-    let peers = [&b_pk, &a_pk];
-    let bodies = [A_RESUMED_BODY, B_RESUMED_BODY];
-
-    let spent_before = [
-        next_send_seq(stores[0], labels[0]),
-        next_send_seq(stores[1], labels[1]),
-    ];
+    // **The budget covers two hops, and the asymmetry is why.** The party that
+    // asked for the re-establishment owns the only chain under the re-rooted
+    // root, so its waiting message is sealed as the exchange settles. The
+    // answering party's sending chain is cut by that first frame, so its own
+    // waiting message is sealed a hop later. Which party is which was settled by
+    // the two independent dispatch draws hours ago and is not asserted: the
+    // budget admits either order, and both messages have to arrive.
     for i in [0, 1] {
-        sides[i].forget();
+        let peer = 1 - i;
+        let ours = waiting_seq[i];
+        let opened = sides[peer]
+            .wait_for(
+                "the correspondent opens the waiting message",
+                HOP * 2,
+                |e| match e {
+                    DmEvent::Message { seq, body, .. } if *seq == ours => Some(body.clone()),
+                    _ => None,
+                },
+            )
+            .await;
+        assert_eq!(
+            opened, waiting_bodies[i],
+            "{}: the body recovered at sequence {ours} is not the one that was sealed",
+            sides[peer].who
+        );
+    }
+
+    // ── and a further send on each side seals above the exchange's own legs ──
+    //
+    // The waiting message sat below the positions the legs took, so a chain that
+    // simply continued from it would ask the record for a number it already
+    // holds. The outbox is the authority on what is spent: the next send takes
+    // its next sequence, above every leg this side rode, and the chain steps
+    // over the positions in between.
+    //
+    // **A floor rather than an exact number, because both sides arm.** Each side
+    // may open its own attempt before either has answered the other's, so a side
+    // that ends up answering can have spent a position on an abandoned
+    // initiation as well as on the leg it sent. What holds whatever the draws
+    // did is that at least one leg sits between the waiting message and this
+    // send. The outbox counter is read rather than the key schedule's because
+    // the outbox is what decides where a resumed chain continues: the sealing
+    // pass carries the chain over the positions the legs took, so by the time
+    // the waiting message has been opened the two counters agree, and the
+    // outbox is the one that is authoritative.
+    let mut resumed_seq = [0u64; 2];
+    for i in [0, 1] {
+        resumed_seq[i] = next_send_seq(stores[i], labels[i]);
+        assert!(
+            resumed_seq[i] >= waiting_seq[i].saturating_add(2),
+            "{}: the exchange rode this outbox, so the next send sits above its legs; \
+             the waiting message took {} and the next sequence is {}",
+            sides[i].who,
+            waiting_seq[i],
+            resumed_seq[i]
+        );
         handles[i]
             .send(DmCommand::Send {
                 to: peers[i].clone(),
-                body: bodies[i].into(),
+                body: resumed_bodies[i].into(),
             })
             .await
-            .expect("the send queues");
+            .expect("the further send queues");
     }
-
-    // A command is answered off the driver's own queue rather than over the
-    // network, so both answers are in hand in well under a hop.
-    //
-    // **The composition is recognised by its sequence, not merely by its
-    // state.** A re-establishment leg is an outbox entry like any other and
-    // reports its own state changes, so a match on the state alone would take
-    // the first leg still settling behind the exchange for the frame commanded
-    // here — and carry its sequence into every assertion below.
-    let mut answered: Vec<Result<(), RefusalReason>> = Vec::new();
     for i in [0, 1] {
-        let ours = spent_before[i];
-        answered.push(
-            sides[i]
-                .wait_for(
-                    "the send on the resumed channel is answered",
-                    HOP,
-                    |e| match e {
-                        DmEvent::Delivery {
-                            state: DeliveryState::Composed,
-                            seq,
-                            ..
-                        } if *seq == ours => Some(Ok(())),
-                        DmEvent::Refused { reason, .. } => Some(Err(*reason)),
-                        _ => None,
-                    },
-                )
-                .await,
+        let ours = resumed_seq[i];
+        let answered = sides[i]
+            .wait_for("the further send is composed", HOP, |e| match e {
+                DmEvent::Delivery {
+                    seq,
+                    state: DeliveryState::Composed,
+                    ..
+                } if *seq == ours => Some(Ok(())),
+                DmEvent::Refused { reason, .. } => Some(Err(*reason)),
+                _ => None,
+            })
+            .await;
+        answered.unwrap_or_else(|reason| {
+            panic!(
+                "{}: a send on the resumed channel was refused {reason:?}",
+                sides[i].who
+            )
+        });
+        assert_eq!(
+            next_send_seq(stores[i], labels[i]),
+            ours.saturating_add(1),
+            "{}: the further send did not spend exactly its own sequence",
+            sides[i].who
         );
     }
-    let (first, second) = match (answered[0], answered[1]) {
-        (Ok(()), Err(RefusalReason::AwaitingCorrespondentsFirstFrame)) => (0, 1),
-        (Err(RefusalReason::AwaitingCorrespondentsFirstFrame), Ok(())) => (1, 0),
-        (a, b) => panic!(
-            "exactly one side holds a chain to mint from on a resumed channel; \
-             {} answered {a:?} and {} answered {b:?}",
-            sides[0].who, sides[1].who
-        ),
-    };
-    let first_seq = spent_before[first];
-    eprintln!(
-        "[{:>7.1}s] {} asked for the re-establishment and speaks first; {} waits",
-        sides[first].at(),
-        sides[first].who,
-        sides[second].who
-    );
-    assert_eq!(
-        next_send_seq(stores[first], labels[first]),
-        spent_before[first].saturating_add(1),
-        "{}: the composed frame spent no sequence number",
-        sides[first].who
-    );
-    // **Nothing was spent on the refusal.** One taken after the ratchet stepped
-    // would burn a sequence number the correspondent's contiguous prefix then
-    // waits on for the give-up — invisible in every other observable, which is
-    // why this reads the counter rather than trusting the ordering. A completed
-    // exchange opens no further attempt, so nothing else moves this number here.
-    assert_eq!(
-        next_send_seq(stores[second], labels[second]),
-        spent_before[second],
-        "{}: the refusal spent a sequence number",
-        sides[second].who
-    );
+    for i in [0, 1] {
+        let peer = 1 - i;
+        let ours = resumed_seq[i];
+        let opened = sides[peer]
+            .wait_for(
+                "the correspondent opens the further message",
+                HOP,
+                |e| match e {
+                    DmEvent::Message { seq, body, .. } if *seq == ours => Some(body.clone()),
+                    _ => None,
+                },
+            )
+            .await;
+        assert_eq!(
+            opened, resumed_bodies[i],
+            "{}: the body recovered at sequence {ours} is not the one that was sealed",
+            sides[peer].who
+        );
+    }
 
-    // ── the first frame crosses, and opens the other side's chain ────────────
-    let opened = sides[second]
-        .wait_for(
-            "the waiting side collects the first frame",
-            HOP,
-            |e| match e {
-                DmEvent::Message { seq, body, .. } if *seq == first_seq => Some(body.clone()),
-                _ => None,
-            },
-        )
-        .await;
-    assert_eq!(
-        opened, bodies[first],
-        "{}: the body recovered is not the one that was sealed",
-        sides[second].who
-    );
-
-    // ── and the answer crosses the other way ─────────────────────────────────
-    //
-    // The same body the refusal above turned away, which put nothing on the
-    // network, so it can only arrive from this send.
-    let second_seq = next_send_seq(stores[second], labels[second]);
-    handles[second]
-        .send(DmCommand::Send {
-            to: peers[second].clone(),
-            body: bodies[second].into(),
-        })
-        .await
-        .expect("the answer queues");
-    let answer = sides[first]
-        .wait_for("the first side collects the answer", HOP, |e| match e {
-            DmEvent::Message { seq, body, .. } if *seq == second_seq => Some(body.clone()),
-            _ => None,
-        })
-        .await;
-    assert_eq!(
-        answer, bodies[second],
-        "{}: the body recovered is not the one that was sealed",
-        sides[first].who
-    );
-
-    // ── both outboxes settle on the correspondent's acknowledgement ──────────
+    // ── every outbox settles on the correspondent's acknowledgement ──────────
     //
     // Either path is a pass and both are real: an ordinary frame carries its
     // sender's whole collection state inside its own signature, and a standalone
     // cadence writes the same statement to a record derived from the address
     // root alone. Which arrives first is a race between two live cadences, and
     // the property is that the sender's outbox settles.
-    for (i, seq) in [(first, first_seq), (second, second_seq)] {
+    for (i, seq) in [
+        (0, waiting_seq[0]),
+        (1, waiting_seq[1]),
+        (0, resumed_seq[0]),
+        (1, resumed_seq[1]),
+    ] {
         sides[i]
             .wait_for("the frame is confirmed collected", ACK_HOP, |e| {
                 matches!(
@@ -994,53 +1051,48 @@ async fn a_re_established_correspondence_carries_a_message_each_way_over_the_rea
     let [side_one, side_two] = &mut sides;
     tokio::join!(side_one.drain_for(SETTLE), side_two.drain_for(SETTLE));
 
-    assert_eq!(
-        sides[second].messages(),
-        vec![(first_seq, bodies[first].to_string())],
-        "{}: the first frame was not shown exactly once and alone: {:?}",
-        sides[second].who,
-        sides[second].seen
-    );
-    assert_eq!(
-        sides[first].messages(),
-        vec![(second_seq, bodies[second].to_string())],
-        "{}: the answer was not shown exactly once and alone: {:?}",
-        sides[first].who,
-        sides[first].seen
-    );
-    assert_eq!(
-        sides[first].delivery_count(first_seq, DeliveryState::ConfirmedCollected),
-        1,
-        "{}: the first frame was not reported collected exactly once: {:?}",
-        sides[first].who,
-        sides[first].seen
-    );
-    assert_eq!(
-        sides[second].delivery_count(second_seq, DeliveryState::ConfirmedCollected),
-        1,
-        "{}: the answer was not reported collected exactly once: {:?}",
-        sides[second].who,
-        sides[second].seen
-    );
-    assert_eq!(
-        sides[first].refusals(),
-        Vec::new(),
-        "{}: the side holding the chain was refused: {:?}",
-        sides[first].who,
-        sides[first].seen
-    );
-    assert_eq!(
-        sides[second].refusals(),
-        vec![RefusalReason::AwaitingCorrespondentsFirstFrame],
-        "{}: the send before the first frame drew more than the one refusal: {:?}",
-        sides[second].who,
-        sides[second].seen
-    );
+    for i in [0, 1] {
+        let peer = 1 - i;
+        assert_eq!(
+            sides[peer].messages(),
+            vec![
+                (waiting_seq[i], waiting_bodies[i].to_string()),
+                (resumed_seq[i], resumed_bodies[i].to_string()),
+            ],
+            "{}: the two frames were not shown exactly once each, in order, and alone: {:?}",
+            sides[peer].who,
+            sides[peer].seen
+        );
+    }
+    for (i, seq) in [
+        (0, waiting_seq[0]),
+        (1, waiting_seq[1]),
+        (0, resumed_seq[0]),
+        (1, resumed_seq[1]),
+    ] {
+        assert_eq!(
+            sides[i].delivery_count(seq, DeliveryState::ConfirmedCollected),
+            1,
+            "{}: sequence {seq} was not reported collected exactly once: {:?}",
+            sides[i].who,
+            sides[i].seen
+        );
+    }
+    for i in [0, 1] {
+        assert_eq!(
+            sides[i].refusals(),
+            Vec::new(),
+            "{}: a send on the resumed channel was refused: {:?}",
+            sides[i].who,
+            sides[i].seen
+        );
+    }
 
     eprintln!(
         "live DM restart oracle: knock -> accept -> message -> both stores restart -> \
-         re-establishment on one committed root -> a message each way on the resumed \
-         channel, both outboxes confirmed collected, in {:.1}s",
+         a message composed on each side with no key schedule -> re-establishment on one \
+         committed root -> both waiting messages opened at the sequences they reserved and \
+         a further message each way, every outbox confirmed collected, in {:.1}s",
         sides[0].at()
     );
 

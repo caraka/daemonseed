@@ -1975,6 +1975,13 @@ work lives in the maintainer's own planning notes, not here.
   floor, so a gate reloaded after a completion — which zeroes the acceptance slot — still drops the
   generations that handshake closed. (#404)
 
+### Changed
+
+- `daemonseed-veilid-net`: the `two_node_dm_restart` resumed oracle commands a send on each side
+  before it waits for the re-establishment, so the two waiting messages are what open the exchange,
+  and asserts each is opened by its correspondent at the sequence its outbox reported at compose
+  (#455).
+
 ## [0.36.3] — 2026-07-28
 
 ### Added
