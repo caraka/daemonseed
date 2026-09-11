@@ -840,6 +840,10 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `docs/design/direct-messaging.md`: the direct-messaging design of record — founding claims with
+  probes, substrate facts, records, keys and forward secrecy, flows, delivery, eviction detection,
+  abuse bounds, write budget, wire change, multi-device foundations and open questions. The earlier
+  design moves to `docs/design/superseded/direct-messaging-2026-07-27.md`.
 - `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `unopenable` counts one refusal per position,
   not one per probe of it (#442).
 - ISC-C80 is withdrawn and deregistered. It described a reconnect on a capped exponential backoff

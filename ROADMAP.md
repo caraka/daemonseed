@@ -24,7 +24,7 @@ doc under `docs/design/`. When a design is accepted, its component deliverables
 become GitHub issues and the entry here is removed — but the design doc stays as
 the design-of-record.
 
-- **Direct messaging** — FROZEN 2026-07-28 and decomposed into GitHub issues; the design-of-record [`docs/design/direct-messaging.md`](docs/design/direct-messaging.md) (DRAFT v6) persists as rationale. (Per convention a frozen+decomposed design leaves `Designs`; retained here only as a one-line pointer until the build slices land, then delete.)
+- **Direct messaging** — asynchronous, first-contact-capable private messaging over DHT records; the design-of-record [`docs/design/direct-messaging.md`](docs/design/direct-messaging.md) persists as rationale.
 - **Operator space management** — the announce/MOTD channel's authority, retention, ordering, revocation, and limits, currently being addressed one issue at a time against assumptions each next issue contradicts. Problem statement, verified ground truth, and the unresolved key-custody fork: [`docs/design/operator-space-management.md`](docs/design/operator-space-management.md) (OPEN — pre-design, nothing ratified).
 
 
