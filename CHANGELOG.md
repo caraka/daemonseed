@@ -37,6 +37,18 @@ work lives in the maintainer's own planning notes, not here.
   `DmAck`, `DmAckBody`, `FirstContactEntry`, `FirstContactBody`, `DmChannelFrame` and
   `DmChannelBody`, which remain in the schema for the code that still writes them and leave it when
   that code does; additive on the `daemonseed.v1` package, so SemVer MINOR (#466).
+- `daemonseed-core`: `dm::chain`, the per-direction key schedule — `initiate` / `accept` seeding both
+  directions' roots from the hello's shared secret, `Conversation::seal` opening a turn when the
+  reading half names an unseen peer turn or `force_next_turn` is set and `Receiving::open`
+  recomputing the root from the own turn the header's `m` names, the sending half holding its chain as an
+  `Option` before its first own turn and the reading half before the peer's first turn, `OWN_TURNS_RETAINED` own turns held so crossing turns both
+  open, every message key zeroized after one use, `Conversation::snapshot` / `restore` over
+  `ConversationSnapshot` for a restart, `ChainError::SecretGone` / `AlreadyOpened` / `OutOfOrder` /
+  `TurnFieldsIncomplete` as the refusals, `reset_all` over conversations returning one
+  `ResetAction::RotateAdvert`, and the `daemonseed/dm/channel/root…`, `…/chain…`, `…/mk` and `…/ck`
+  domain labels (#464).
+- `daemonseed-core`: `dm::advert::AdvertKeys::rotate_now`, an unconditional rotation for the reset
+  path, retaining the retired key from the moment of the call (#464).
 - `daemonseed-core`: `dm::drop` and `dm::channel`, the two conversation record layouts — the drop's
   `DROP_SUBKEYS` × `DROP_SLOT_LEN` hello record with `seal_hello` / `open_hello`, slot-bound by
   `slot_for` and refusing `SlotMismatch`, `pow_tag` at `DROP_POW_BITS` and the `HelloAttempt`

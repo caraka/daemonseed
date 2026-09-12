@@ -71,6 +71,7 @@ pub mod ack_record;
 pub mod admission;
 pub mod advert;
 pub mod block_list;
+pub mod chain;
 pub mod channel;
 pub mod collect;
 pub mod contact_cache;

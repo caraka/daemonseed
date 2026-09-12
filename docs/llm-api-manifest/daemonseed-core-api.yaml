@@ -2220,7 +2220,10 @@ modules:
       -> Result<Rotation, AdvertError> prunes, then rotates once now >= not_before +
       ROTATION_PERIOD_SECS (one week), retiring the current key and minting the next
       serial at not_before = now; Rotation is Rotated or Unchanged and is #[must_use],
-      a rotation being published by writing advert_bytes to subkey 0. A retired key's
+      a rotation being published by writing advert_bytes to subkey 0. rotate_now(now,
+      fill) -> Result<(), AdvertError> rotates unconditionally for the reset path,
+      sharing the rotation body with rotate_if_due and anchoring the retired key's
+      retention at now rather than at a due moment. A retired key's
       retention runs from the moment it was DUE to stop being current, not from the
       call, so a late poll does not extend it; prune(now) drops it one further
       ROTATION_PERIOD_SECS after that moment, and previous_serial() /
@@ -2334,6 +2337,58 @@ modules:
       data control_aad(), and the key does not step per turn. ChannelOwnerSeed and
       ControlKey are zeroize-on-drop redacting newtypes. The module holds no clock,
       performs no I/O, and takes the identity secret as a parameter.
+      Sub-module dm::chain is the per-direction key schedule. initiate(ss0, fill) ->
+      Result<Opening { ratchet_pk, conversation }, ChainError> opens a conversation as
+      the initiator, with turn 0 of its own direction already open and ratchet_pk the
+      key its channel opening publishes; accept(ss0, initiator_ratchet_pk) ->
+      Result<Conversation, ChainError> opens it as the acceptor, whose reading half
+      starts with the initiator's turn 0 open and whose own turn 0 is a ratchet turn.
+      Both seed each direction's root with HKDF-SHA384(salt=
+      daemonseed/dm/channel/root-salt/v1, ikm=ss0, info=daemonseed/dm/channel/root/v1);
+      a turn's root is HKDF-SHA384(salt=previous root, ikm=lp(peer ss) || lp(own ss),
+      info=daemonseed/dm/channel/root/v1), its chain key HKDF-SHA384(salt=
+      daemonseed/dm/channel/chain-salt/v1, ikm=root, info=daemonseed/dm/channel/chain/v1),
+      and one step HKDF-SHA384(salt=daemonseed/dm/channel/step-salt/v1, ikm=chain key)
+      expanded under daemonseed/dm/channel/mk/v1 and daemonseed/dm/channel/ck/v1 as
+      siblings. Conversation::seal(body, device_id, fill) ->
+      Result<(channel::MessageHeader, Vec<u8>), ChainError> is the only public seal: it
+      opens a turn when the reading half names a peer turn above the one the sending half
+      last saw or when force_next_turn() has been called, minting a RatchetKeypair,
+      encapsulating to the peer's latest ratchet key and writing kem_ct and the fresh
+      public key into the header, and otherwise continues the turn and writes neither.
+      Every message steps the chain, seals the body under channel::message_aad(&header),
+      and zeroizes the message key's buffer before returning; the cursor the header
+      publishes is the reading half's next_seq. Direction::seal and set_cursor are
+      crate-private and there is no sending_mut, so PendingTurnNotTaken is an internal
+      invariant; Direction::turn() and next_seq() read the position and force_next_turn()
+      sets the flag. Direction and Receiving each hold their chain as an Option, absent
+      on the sending half before its first own turn and on the reading half before the
+      peer's first turn, so the chain both sides derive from
+      the shared seed root is not reachable from the acceptor's sending half.
+      Receiving::open(&header, ciphertext) -> Result<Vec<u8>, ChainError> decapsulates
+      with the own turn header.m names, recomputes the root, steps the chain one
+      position, opens and zeroizes the key; retained_own_turns() is at most
+      OWN_TURNS_RETAINED (2), which is what lets crossing turns both open, and the older
+      is dropped once a message encapsulated to the newer has opened. Conversation wraps
+      the two halves, carrying each side's turn secret across to the other, with seal /
+      open / sending / receiving. ChainError is Kdf, Entropy, NoPeerKey,
+      SecretGone { named } for an own turn outside the window, AlreadyOpened { seq },
+      OutOfOrder { expected, found }, NoTurn, TurnFieldsIncomplete for a header carrying
+      kem_ct without kem_pk or the reverse (refused before any derivation),
+      PendingTurnNotTaken, Aead and Module. Conversation::snapshot() ->
+      ConversationSnapshot { sending: DirectionState { root, chain, n, m_seen, seq,
+      cursor, peer_pk, peer_ss, pending_turn, force_turn }, receiving: ReceivingState {
+      root, chain, n, next_seq, own_turns, peer_latest } } and
+      Conversation::restore(ConversationSnapshot) carry a conversation across a restart;
+      OwnTurn { m, keypair, ss } and PeerTurn { m, pk, ss } are the turn records they
+      hold, and snapshot takes a copy so a caller persists state before the write that
+      depends on it. reset_all(&mut [Conversation]) -> ResetAction sets the force-turn
+      flag on every conversation and returns one ResetAction::RotateAdvert for the whole
+      slice — the advert is one record per identity — which the caller performs through
+      AdvertKeys::rotate_now; this module rotates nothing. Root, ChainKey, MessageKey, TurnSecret and
+      RatchetDecapKey are zeroize-on-drop redacting newtypes, including inside a
+      snapshot. The module holds no clock,
+      performs no I/O, and takes entropy as a fill function.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

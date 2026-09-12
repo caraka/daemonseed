@@ -526,6 +526,51 @@ dm_labels! {
     /// length-prefixed; binding the serial is what makes a relayed hello land in a
     /// channel the reader refuses. FROZEN.
     DM_CHANNEL_OPENING_SIG = b"daemonseed/dm/channel/opening-sig/v1";
+
+    /// HKDF-Extract salt for a conversation direction's seed root, rooted in the
+    /// shared secret of the hello that named the channel. Distinct from
+    /// [`DM_CHANNEL_CONTROL_SALT`], which extracts the control key from that same
+    /// secret, so the two derivations over one input cannot collide. FROZEN.
+    DM_CHANNEL_ROOT_SALT = b"daemonseed/dm/channel/root-salt/v1";
+
+    /// HKDF-Expand `info` for a conversation direction's root
+    /// ([`crate::dm::chain`]), both for the seed root and for every turn's
+    /// successor.
+    ///
+    /// **Its own label rather than [`DM_RATCHET_ROOT`]'s or
+    /// [`DM_RATCHET_STEP`]'s.** Those two belong to the ongoing-channel ratchet,
+    /// whose root is one per conversation and carries both directions; this one is
+    /// per direction and steps per turn, so a value of one kind must never be
+    /// derivable as a value of the other. FROZEN.
+    DM_CHANNEL_ROOT = b"daemonseed/dm/channel/root/v1";
+
+    /// HKDF-Extract salt for a turn's chain key, rooted in that turn's root.
+    /// FROZEN.
+    DM_CHANNEL_CHAIN_SALT = b"daemonseed/dm/channel/chain-salt/v1";
+
+    /// HKDF-Expand `info` for a turn's chain key.
+    ///
+    /// **One label for both directions, unlike [`DM_CHAIN_A2B`] and
+    /// [`DM_CHAIN_B2A`].** Those two separate directions that share a root for the
+    /// life of a conversation. Here the two directions share only the SEED root,
+    /// derived from `ss0` and therefore one value on both sides, and diverge at
+    /// each side's first own turn; from there each root is its own. A
+    /// per-direction label would not separate the seed — both sides derive both
+    /// halves of it — so what keeps the two directions off one chain is
+    /// [`crate::dm::chain::Direction`] holding no chain until its first own turn.
+    /// FROZEN.
+    DM_CHANNEL_CHAIN = b"daemonseed/dm/channel/chain/v1";
+
+    /// HKDF-Extract salt for one symmetric step along a turn's chain. FROZEN.
+    DM_CHANNEL_STEP_SALT = b"daemonseed/dm/channel/step-salt/v1";
+
+    /// HKDF-Expand `info` for the message key at a chain position. FROZEN.
+    DM_CHANNEL_MK = b"daemonseed/dm/channel/mk/v1";
+
+    /// HKDF-Expand `info` for the successor chain key. Sibling of
+    /// [`DM_CHANNEL_MK`] under one extraction, so learning a message key never
+    /// yields the chain it came from. FROZEN.
+    DM_CHANNEL_CK = b"daemonseed/dm/channel/ck/v1";
 }
 
 #[cfg(test)]
@@ -614,6 +659,16 @@ mod tests {
             b"daemonseed/dm/channel/opening-sig/v1"
         );
         assert_eq!(DM_CHANNEL_MSG_AAD, b"daemonseed/dm/channel/msg-aad/v1");
+        assert_eq!(DM_CHANNEL_ROOT_SALT, b"daemonseed/dm/channel/root-salt/v1");
+        assert_eq!(DM_CHANNEL_ROOT, b"daemonseed/dm/channel/root/v1");
+        assert_eq!(
+            DM_CHANNEL_CHAIN_SALT,
+            b"daemonseed/dm/channel/chain-salt/v1"
+        );
+        assert_eq!(DM_CHANNEL_CHAIN, b"daemonseed/dm/channel/chain/v1");
+        assert_eq!(DM_CHANNEL_STEP_SALT, b"daemonseed/dm/channel/step-salt/v1");
+        assert_eq!(DM_CHANNEL_MK, b"daemonseed/dm/channel/mk/v1");
+        assert_eq!(DM_CHANNEL_CK, b"daemonseed/dm/channel/ck/v1");
     }
 
     /// No label is a prefix of another.
@@ -691,7 +746,7 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 67] = [
+        let pinned: [(&[u8], &[u8]); 74] = [
             (DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3".as_slice()),
             (DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1".as_slice()),
             (
@@ -714,6 +769,15 @@ mod tests {
                 b"daemonseed/dm/chain/step-salt/v1".as_slice(),
             ),
             (
+                DM_CHANNEL_CHAIN,
+                b"daemonseed/dm/channel/chain/v1".as_slice(),
+            ),
+            (
+                DM_CHANNEL_CHAIN_SALT,
+                b"daemonseed/dm/channel/chain-salt/v1".as_slice(),
+            ),
+            (DM_CHANNEL_CK, b"daemonseed/dm/channel/ck/v1".as_slice()),
+            (
                 DM_CHANNEL_CONTROL,
                 b"daemonseed/dm/channel/control/v1".as_slice(),
             ),
@@ -725,6 +789,7 @@ mod tests {
                 DM_CHANNEL_CONTROL_SALT,
                 b"daemonseed/dm/channel/control-salt/v1".as_slice(),
             ),
+            (DM_CHANNEL_MK, b"daemonseed/dm/channel/mk/v1".as_slice()),
             (
                 DM_CHANNEL_MSG_AAD,
                 b"daemonseed/dm/channel/msg-aad/v1".as_slice(),
@@ -737,7 +802,16 @@ mod tests {
                 DM_CHANNEL_OWNER,
                 b"daemonseed/dm/channel/owner/v1".as_slice(),
             ),
+            (DM_CHANNEL_ROOT, b"daemonseed/dm/channel/root/v1".as_slice()),
+            (
+                DM_CHANNEL_ROOT_SALT,
+                b"daemonseed/dm/channel/root-salt/v1".as_slice(),
+            ),
             (DM_CHANNEL_SALT, b"daemonseed/dm/channel/salt/v1".as_slice()),
+            (
+                DM_CHANNEL_STEP_SALT,
+                b"daemonseed/dm/channel/step-salt/v1".as_slice(),
+            ),
             (DM_CHAN_ID, b"daemonseed/dm/chanid/v2".as_slice()),
             (DM_CK, b"daemonseed/dm/ck/v2".as_slice()),
             (

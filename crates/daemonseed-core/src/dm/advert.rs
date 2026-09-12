@@ -732,14 +732,48 @@ impl AdvertKeys {
         if now < due_at {
             return Ok(Rotation::Unchanged);
         }
+        self.rotate(now, due_at, fill)?;
+        Ok(Rotation::Rotated)
+    }
+
+    /// Rotate whether or not a rotation is due: the current key retires at
+    /// `now` and a fresh keypair becomes current at the next serial with
+    /// `not_before = now`.
+    ///
+    /// This is the reset path (`docs/design/direct-messaging.md` § Keys and
+    /// forward secrecy, *Reset*), which rotates the advert immediately rather
+    /// than waiting for the schedule. The retention anchor is `now` here and
+    /// not a due moment, because there is none: the key is being retired early
+    /// on purpose, so its window runs from when that happened.
+    pub fn rotate_now(
+        &mut self,
+        now: u64,
+        fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+    ) -> Result<(), AdvertError> {
+        self.prune(now);
+        self.rotate(now, now, fill)
+    }
+
+    /// The rotation body both paths share: mint at the next serial, move the
+    /// current key into the retained slot, and anchor its retention at
+    /// `retired_at`.
+    ///
+    /// Shared so the two entry points cannot disagree about what a rotation
+    /// does — only about when it happens and what the retention runs from.
+    fn rotate(
+        &mut self,
+        now: u64,
+        retired_at: u64,
+        fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+    ) -> Result<(), AdvertError> {
         let next_serial = self.current.serial.saturating_add(1);
         let fresh = generate(next_serial, now, fill)?;
         let retired = std::mem::replace(&mut self.current, fresh);
         self.previous = Some(RetiredKey {
             key: retired,
-            retired_at: due_at,
+            retired_at,
         });
-        Ok(Rotation::Rotated)
+        Ok(())
     }
 
     /// Recover the secret a sender encapsulated to the advert key at
@@ -1332,6 +1366,50 @@ mod tests {
         );
         assert_eq!(k.serial(), 1, "a call that reported Unchanged rotated");
         assert_eq!(k.previous_serial(), None, "the expired key was not pruned");
+    }
+
+    /// The reset path rotates off the schedule, and the key it retires stays
+    /// usable for one retention period measured from that moment.
+    ///
+    /// Control: the same instant through `rotate_if_due` reports `Unchanged`,
+    /// so the rotation below is `rotate_now` and not a rotation that was due
+    /// anyway.
+    #[test]
+    fn a_reset_rotates_off_schedule_and_retains_for_a_full_period() {
+        let a = alice();
+        let mut ent = SeededEntropy::at(21);
+        let mut k = AdvertKeys::new(day(0), |b| ent.fill(b)).unwrap();
+        let bytes = k.advert_bytes(&a.signing).unwrap();
+        let advert = verify(a.signing.public_key(), &bytes).unwrap();
+        let hello = encapsulate_to(&advert, day(0), |b| ent.fill(b)).unwrap();
+
+        assert_eq!(
+            k.rotate_if_due(day(3), |b| ent.fill(b)).unwrap(),
+            Rotation::Unchanged,
+            "the control: nothing is due on day 3"
+        );
+        k.rotate_now(day(3), |b| ent.fill(b)).unwrap();
+        assert_eq!(k.serial(), 1);
+        assert_eq!(k.previous_serial(), Some(0));
+        assert_eq!(k.previous_retired_at(), Some(day(3)));
+
+        // The retired key still opens the hello encapsulated to it, up to one
+        // retention period after the reset.
+        k.prune(day(9));
+        assert!(
+            k.decapsulate(hello.serial, &hello.ciphertext)
+                .unwrap()
+                .is_some(),
+            "the retired key is still held on day 9"
+        );
+        k.prune(day(10));
+        assert_eq!(k.previous_serial(), None);
+        assert!(
+            k.decapsulate(hello.serial, &hello.ciphertext)
+                .unwrap()
+                .is_none(),
+            "the retired key is gone a full period after the reset"
+        );
     }
 
     /// A restart rebuilds the same keys, current and retained.
