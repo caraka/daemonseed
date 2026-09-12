@@ -75,6 +75,7 @@ pub mod chain;
 pub mod channel;
 pub mod collect;
 pub mod contact_cache;
+pub mod delivery;
 pub mod domain;
 pub mod doorbell;
 pub mod drop;

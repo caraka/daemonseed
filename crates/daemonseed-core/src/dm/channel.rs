@@ -416,6 +416,19 @@ pub fn slot_for(seq: u64) -> u16 {
     1 + (seq % RING_SLOTS) as u16
 }
 
+/// Whether message `seq` has been collected, given the peer's published
+/// cursor.
+///
+/// The cursor is the count of messages the peer has collected contiguously
+/// from sequence 0 (§ Delivery), so it collects `seq` exactly when it is
+/// strictly above it: a cursor equal to `seq` counts the messages below it and
+/// not `seq` itself. [`Ring::advance_peer_collected`] takes the same cursor
+/// and [`crate::dm::store::Store::delete_outbox_through`] frees a slot on this
+/// predicate, so the two cannot disagree about which slots are still owed.
+pub fn collected(seq: u64, peer_cursor: u64) -> bool {
+    peer_cursor > seq
+}
+
 /// Derive the owner seed for one direction of one conversation:
 /// `HKDF-SHA-384(salt = DM_CHANNEL_SALT, ikm = identity_seed, info =
 /// DM_CHANNEL_OWNER ‖ lp(peer identity pk) ‖ lp(BE64(generation)))`.

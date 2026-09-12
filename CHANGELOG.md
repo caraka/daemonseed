@@ -26,6 +26,16 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-core`: `dm::delivery`, the direct-messaging delivery rules — `channel::collected(seq, peer_cursor)`,
+  re-exported here, true exactly when the correspondent's published cursor is above the sequence and
+  now also the predicate `Store::delete_outbox_through` frees a slot on;
+  `next_poll_interval(outstanding_since_secs, now_secs, fill)` and `next_poll_interval_os` drawing an
+  outstanding slot's next poll from `advert::POLL_INTERVAL_MIN`..=`POLL_INTERVAL_MAX` while the message's
+  age is below `BACKOFF_AFTER_SECS` and returning `BACKOFF_POLL_INTERVAL` at or above it; and the teardown
+  as `prepare_delete(store, peer, closed_marker)` returning `ChannelErase { lookup_key, marker }` for the
+  transport to erase and `finish_delete(store, peer)` dropping the conversation and outbox records through
+  `Store::delete_conv` afterwards, with `ClosedMarker::control` building the closed `channel::Control`
+  record (#473).
 - `daemonseed-core`: `dm::store`, the direct-messaging layer's on-disk state over
   `storage::dm_store` — `Store::persist_advert_keys` for the advert KEM secrets and serial,
   `persist_conv` for a correspondence's peer identity key, both channel lookup keys, generation,

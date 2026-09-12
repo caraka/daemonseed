@@ -565,7 +565,10 @@ impl Store {
             let mut table = read_outbox(Some(&raw))?;
             let mut changed = false;
             for slot in table.iter_mut() {
-                if slot.as_ref().is_some_and(|e| e.seq < cursor) {
+                if slot
+                    .as_ref()
+                    .is_some_and(|e| crate::dm::channel::collected(e.seq, cursor))
+                {
                     *slot = None;
                     changed = true;
                 }

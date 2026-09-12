@@ -2441,6 +2441,36 @@ modules:
       The module holds no clock, mutates no key-schedule state, writes no
       message body, and stores no channel opening — an evicted opening is
       re-signed from the identity key and the generation.
+      Sub-module dm::delivery decides whether a message written to this side's
+      channel has reached the correspondent, how often to look at its slot while
+      it has not, and what a client hands the transport to tear a conversation
+      down. collected(seq, peer_cursor) -> bool is re-exported from dm::channel,
+      where it is defined, and is true exactly when peer_cursor is above seq;
+      POLL_INTERVAL_MIN and POLL_INTERVAL_MAX are re-exported from dm::advert, so
+      the pre-backoff band has one definition.
+      next_poll_interval(outstanding_since_secs, now_secs, fill: FnMut(&mut [u8])
+      -> Result<(), ()>) -> Duration draws the next poll uniformly from that band
+      while the message's age is below BACKOFF_AFTER_SECS (604800), and returns
+      BACKOFF_POLL_INTERVAL (86400 seconds) at or above it without drawing; a fill
+      error degrades to the band's fixed midpoint, and a now_secs below
+      outstanding_since_secs reads as age zero. next_poll_interval_os(
+      outstanding_since_secs, now_secs) -> Duration is the same over the OS
+      CSPRNG. The clock is an argument and the module reads none.
+      A teardown is two calls around the caller's own erase. prepare_delete(
+      &Store, &CorrespondenceLabel, closed_marker: bool) -> Result<ChannelErase,
+      StoreError> reads the conversation and returns ChannelErase { lookup_key,
+      marker: Option<ClosedMarker { collected_cursor }> } without changing
+      anything; lookup_key names this side's channel record for the transport to
+      erase, collected_cursor is my_collected as read there, and
+      ClosedMarker::control(Option<ChannelOpening>) -> channel::Control builds the
+      closed control record the caller seals with channel::seal_control.
+      finish_delete(&Store, &CorrespondenceLabel) -> Result<(), StoreError> drops
+      the conversation and outbox records through Store::delete_conv once the
+      erase has been performed, and the caller stops polling the correspondence
+      once it returns; a crash between the two leaves the conversation intact and
+      the caller re-runs both, the erase being idempotent. Both refuse
+      StoreError::MissingConversation where the correspondence holds no
+      conversation record. The module performs no network write.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.
