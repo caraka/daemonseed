@@ -30,9 +30,47 @@ mod tests {
     use prost::Message;
 
     use crate::v1::{
-        AppHello, AppHelloAck, AppHelloReject, CotFrame, DmKeyRecord, KeySelector, ProtocolVersion,
-        SuiteId,
+        AppHello, AppHelloAck, AppHelloReject, CotFrame, DmAdvert, DmChannelControl,
+        DmChannelOpening, DmChannelSlot, DmHello, DmKeyRecord, DmMessageHeader, KeySelector,
+        ProtocolVersion, SuiteId,
     };
+
+    /// ML-KEM-1024 encapsulation key and ciphertext width.
+    const KEM_LEN: usize = 1568;
+
+    /// ML-DSA-87 signature width.
+    const SIG_LEN: usize = 4627;
+
+    /// ML-DSA-87 public key width.
+    const IDENTITY_PK_LEN: usize = 2592;
+
+    /// A `CotFrame` carrying a lobby rendezvous address and an opaque payload,
+    /// encoded byte for byte under the field numbers the v0.36.3 schema
+    /// assigns: `asset_address` is field 1 and `payload` is field 2, so the
+    /// stream is tag `0x0a`, length 48, the address, tag `0x12`, length 22,
+    /// the payload.
+    ///
+    /// `git show v0.36.3:crates/daemonseed-proto/proto/daemonseed/v1/cot.proto`
+    /// carries those same two numbers, so this literal is the released
+    /// encoding and not merely the current one. Pinning it as bytes rather
+    /// than re-encoding at test time is what gives the test its teeth: a
+    /// renumbering of either field makes the decode below read something
+    /// other than what these bytes were built from.
+    const LOBBY_COT_FRAME_V0_36_3: &[u8] = &[
+        0x0a, 0x30, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+        0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a,
+        0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x12, 0x16, 0x6c, 0x6f, 0x62, 0x62, 0x79, 0x2d, 0x66, 0x72,
+        0x61, 0x6d, 0x65, 0x2d, 0x63, 0x69, 0x70, 0x68, 0x65, 0x72, 0x74, 0x65, 0x78, 0x74,
+    ];
+
+    /// The address those bytes were built from: the 48 octets `0x00..=0x2f`.
+    fn lobby_asset_address() -> Vec<u8> {
+        (0u8..48).collect()
+    }
+
+    /// The payload those bytes were built from.
+    const LOBBY_PAYLOAD: &[u8] = b"lobby-frame-ciphertext";
 
     /// `SuiteId` round-trips through prost encode/decode preserving the
     /// `value` field. M3 adds `SuiteId` to the v1 module; this test exists
@@ -172,5 +210,254 @@ mod tests {
         assert_eq!(KeySelector::Unspecified as i32, 0);
         assert_eq!(KeySelector::Static as i32, 1);
         assert_eq!(KeySelector::default(), KeySelector::Unspecified);
+    }
+
+    /// A lobby `CotFrame` encoded under the v0.36.3 schema decodes under the
+    /// current one, field for field.
+    ///
+    /// The point of the pinned literal is what it catches: the bytes fix
+    /// `asset_address` at field 1 and `payload` at field 2, so renumbering
+    /// either field in `cot.proto` makes this decode read something other than
+    /// the values the bytes were built from, and the assertions below fail.
+    /// Adding messages to the package cannot affect it, which is the property
+    /// an additive change is claiming.
+    ///
+    /// The pin is the mechanism, not the assertions: re-encoding a `CotFrame`
+    /// at test time and comparing it to itself would agree with any numbering
+    /// whatsoever, so only a literal fixed to the released bytes detects a
+    /// renumbering. The control block below covers field 1 by rewriting that
+    /// field's tag; the literal covers field 2, whose length and contents the
+    /// decode reads back unchanged only while `payload` is still field 2.
+    #[test]
+    fn lobby_cot_frame_from_v0_36_3_decodes_unchanged() {
+        let decoded = CotFrame::decode(LOBBY_COT_FRAME_V0_36_3).unwrap();
+        assert_eq!(decoded.asset_address, lobby_asset_address());
+        assert_eq!(decoded.asset_address.len(), 48);
+        assert_eq!(decoded.payload, LOBBY_PAYLOAD);
+
+        // Control. Byte 0 is `asset_address`'s tag, field 1 wire type 2
+        // (`0x0a`); rewriting it to `0x1a` is field 3 at the same wire type —
+        // the encoding a renumbering of `asset_address` would produce. The
+        // frame still decodes, because an unknown field is skipped, and that
+        // is exactly why a decode that merely succeeds proves nothing: the
+        // address comes back empty instead of the 48 octets above.
+        let mut renumbered = LOBBY_COT_FRAME_V0_36_3.to_vec();
+        assert_eq!(renumbered[0], 0x0a);
+        renumbered[0] = 0x1a;
+        let after = CotFrame::decode(renumbered.as_slice()).unwrap();
+        assert_ne!(after.asset_address, lobby_asset_address());
+        assert!(after.asset_address.is_empty());
+        assert_eq!(after.payload, LOBBY_PAYLOAD);
+    }
+
+    /// The six conversation-record messages round-trip at the widths
+    /// `docs/design/direct-messaging.md` § Records states, and a
+    /// `DmMessageHeader` carrying one turn field without the other is
+    /// representable on the wire.
+    ///
+    /// The schema does not forbid that half-populated header, and cannot: two
+    /// `optional` fields are independent in proto3. The pairing is enforced a
+    /// layer up, by `daemonseed_core::dm::channel::MessageHeader::decode`,
+    /// which refuses one turn field without the other with
+    /// `ChannelError::TurnFieldsIncomplete`. This test pins the boundary: the
+    /// wire carries it, the decoder rejects it.
+    #[test]
+    fn dm_conversation_records_round_trip_at_design_widths() {
+        let advert = DmAdvert {
+            serial: 3,
+            not_before: 1_700_000_000,
+            kem_pk: vec![0x11; KEM_LEN],
+            signature: vec![0x22; SIG_LEN],
+        };
+        let decoded = DmAdvert::decode(advert.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, advert);
+        assert_eq!(decoded.kem_pk.len(), KEM_LEN);
+        assert_eq!(decoded.signature.len(), SIG_LEN);
+
+        let hello = DmHello {
+            kem_ct: vec![0x33; KEM_LEN],
+            sealed: vec![0x44; 12 + 64 + 16],
+            pow_tag: vec![0x55; 8],
+        };
+        let decoded = DmHello::decode(hello.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, hello);
+        assert_eq!(decoded.kem_ct.len(), KEM_LEN);
+
+        let opening = DmChannelOpening {
+            writer_identity_pk: vec![0x66; IDENTITY_PK_LEN],
+            recipient_identity_pk: vec![0x77; IDENTITY_PK_LEN],
+            first_ratchet_pk: vec![0x88; KEM_LEN],
+            advert_serial: 3,
+            signature: vec![0x99; SIG_LEN],
+        };
+        let decoded = DmChannelOpening::decode(opening.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, opening);
+        assert_eq!(decoded.writer_identity_pk.len(), IDENTITY_PK_LEN);
+        assert_eq!(decoded.recipient_identity_pk.len(), IDENTITY_PK_LEN);
+        assert_eq!(decoded.first_ratchet_pk.len(), KEM_LEN);
+        assert_eq!(decoded.signature.len(), SIG_LEN);
+
+        let control = DmChannelControl {
+            opening: Some(opening.clone()),
+            collected_cursor: 12,
+            closed: false,
+        };
+        let decoded = DmChannelControl::decode(control.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, control);
+        assert_eq!(decoded.opening.unwrap(), opening);
+
+        // A control record before its opening is written: the message field is
+        // absent, which is a different state from an opening of zero bytes.
+        let bare = DmChannelControl {
+            opening: None,
+            collected_cursor: 0,
+            closed: true,
+        };
+        let decoded = DmChannelControl::decode(bare.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, bare);
+        assert!(decoded.opening.is_none());
+        assert!(decoded.closed);
+
+        let turn_header = DmMessageHeader {
+            device_id: 0,
+            n: 4,
+            m: 2,
+            seq: 17,
+            cursor: 9,
+            kem_ct: Some(vec![0xaa; KEM_LEN]),
+            kem_pk: Some(vec![0xbb; KEM_LEN]),
+        };
+        let decoded = DmMessageHeader::decode(turn_header.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, turn_header);
+        assert_eq!(decoded.kem_ct.as_ref().unwrap().len(), KEM_LEN);
+        assert_eq!(decoded.kem_pk.as_ref().unwrap().len(), KEM_LEN);
+
+        let continuing = DmMessageHeader {
+            kem_ct: None,
+            kem_pk: None,
+            ..turn_header.clone()
+        };
+        let decoded = DmMessageHeader::decode(continuing.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, continuing);
+        assert!(decoded.kem_ct.is_none());
+        assert!(decoded.kem_pk.is_none());
+
+        // One turn field without the other. It encodes, it decodes, and it
+        // comes back exactly as written — the schema carries it and the core
+        // decoder is what refuses it.
+        let half = DmMessageHeader {
+            kem_ct: Some(vec![0xcc; KEM_LEN]),
+            kem_pk: None,
+            ..turn_header.clone()
+        };
+        let decoded = DmMessageHeader::decode(half.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, half);
+        assert!(decoded.kem_ct.is_some());
+        assert!(decoded.kem_pk.is_none());
+
+        let slot = DmChannelSlot {
+            header: Some(turn_header.clone()),
+            body: vec![0xdd; 12 + 256 + 16],
+        };
+        let decoded = DmChannelSlot::decode(slot.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, slot);
+        assert_eq!(decoded.header.unwrap(), turn_header);
+    }
+
+    /// Every field of every conversation-record message, pinned to the field
+    /// number it carries in this schema.
+    ///
+    /// Each value below uses the smallest contents that still encode — one
+    /// byte per `bytes` field, small non-zero integers, both turn fields set
+    /// on the header, the opening present in the control — so the literal it
+    /// is compared against is almost entirely tags. Renumbering any field of
+    /// any of the six changes its tag byte and fails the assertion for that
+    /// message; the round-trip test above would not notice, because a
+    /// re-encode agrees with whatever numbering it was built under.
+    ///
+    /// The pin is updated only by a deliberate schema change, and a schema
+    /// change that alters an existing number is forbidden here: MINOR bumps in
+    /// this package are additive-only, so in practice the literals move only
+    /// when a new field is added and its own bytes appear.
+    #[test]
+    fn dm_record_field_numbers_are_pinned() {
+        // 0x08 field 1 varint · 0x10 field 2 varint · 0x1a field 3 bytes
+        // · 0x22 field 4 bytes
+        let advert = DmAdvert {
+            serial: 1,
+            not_before: 2,
+            kem_pk: vec![0x01],
+            signature: vec![0x02],
+        };
+        assert_eq!(
+            advert.encode_to_vec(),
+            vec![0x08, 0x01, 0x10, 0x02, 0x1a, 0x01, 0x01, 0x22, 0x01, 0x02],
+        );
+
+        // 0x0a field 1 bytes · 0x12 field 2 bytes · 0x1a field 3 bytes
+        let hello = DmHello {
+            kem_ct: vec![0x01],
+            sealed: vec![0x02],
+            pow_tag: vec![0x03],
+        };
+        assert_eq!(
+            hello.encode_to_vec(),
+            vec![0x0a, 0x01, 0x01, 0x12, 0x01, 0x02, 0x1a, 0x01, 0x03],
+        );
+
+        // 0x0a field 1 bytes · 0x12 field 2 bytes · 0x1a field 3 bytes
+        // · 0x20 field 4 varint · 0x2a field 5 bytes
+        let opening = DmChannelOpening {
+            writer_identity_pk: vec![0x01],
+            recipient_identity_pk: vec![0x02],
+            first_ratchet_pk: vec![0x03],
+            advert_serial: 4,
+            signature: vec![0x05],
+        };
+        let opening_bytes = vec![
+            0x0a, 0x01, 0x01, 0x12, 0x01, 0x02, 0x1a, 0x01, 0x03, 0x20, 0x04, 0x2a, 0x01, 0x05,
+        ];
+        assert_eq!(opening.encode_to_vec(), opening_bytes);
+
+        // 0x0a field 1 message (length 14, the opening above) · 0x10 field 2
+        // varint · 0x18 field 3 varint
+        let control = DmChannelControl {
+            opening: Some(opening),
+            collected_cursor: 7,
+            closed: true,
+        };
+        let mut expected = vec![0x0a, 0x0e];
+        expected.extend_from_slice(&opening_bytes);
+        expected.extend_from_slice(&[0x10, 0x07, 0x18, 0x01]);
+        assert_eq!(control.encode_to_vec(), expected);
+
+        // 0x08 field 1 varint · 0x10 field 2 varint · 0x18 field 3 varint
+        // · 0x20 field 4 varint · 0x28 field 5 varint · 0x32 field 6 bytes
+        // · 0x3a field 7 bytes
+        let header = DmMessageHeader {
+            device_id: 1,
+            n: 2,
+            m: 3,
+            seq: 4,
+            cursor: 5,
+            kem_ct: Some(vec![0x06]),
+            kem_pk: Some(vec![0x07]),
+        };
+        let header_bytes = vec![
+            0x08, 0x01, 0x10, 0x02, 0x18, 0x03, 0x20, 0x04, 0x28, 0x05, 0x32, 0x01, 0x06, 0x3a,
+            0x01, 0x07,
+        ];
+        assert_eq!(header.encode_to_vec(), header_bytes);
+
+        // 0x0a field 1 message (length 16, the header above) · 0x12 field 2
+        // bytes
+        let slot = DmChannelSlot {
+            header: Some(header),
+            body: vec![0x08],
+        };
+        let mut expected = vec![0x0a, 0x10];
+        expected.extend_from_slice(&header_bytes);
+        expected.extend_from_slice(&[0x12, 0x01, 0x08]);
+        assert_eq!(slot.encode_to_vec(), expected);
     }
 }

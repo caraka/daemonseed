@@ -26,6 +26,12 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-proto`: `DmAdvert`, `DmHello`, `DmChannelOpening`, `DmChannelControl`,
+  `DmMessageHeader` and `DmChannelSlot` in `dm.proto` — the conversation records as wire-visible
+  messages, with the header's turn fields optional, alongside `KeySelector`, `DmKeyRecord`,
+  `DmAck`, `DmAckBody`, `FirstContactEntry`, `FirstContactBody`, `DmChannelFrame` and
+  `DmChannelBody`, which remain in the schema for the code that still writes them and leave it when
+  that code does; additive on the `daemonseed.v1` package, so SemVer MINOR (#466).
 - `daemonseed-core`: `dm::drop` and `dm::channel`, the two conversation record layouts — the drop's
   `DROP_SUBKEYS` × `DROP_SLOT_LEN` hello record with `seal_hello` / `open_hello`, slot-bound by
   `slot_for` and refusing `SlotMismatch`, `pow_tag` at `DROP_POW_BITS` and the `HelloAttempt`

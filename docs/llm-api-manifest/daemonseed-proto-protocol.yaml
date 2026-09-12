@@ -150,6 +150,21 @@ modules:
     depends_on: []
     iscs: [S4, S20, A-S2, A-S5]
 
+  - name: dm
+    description: >-
+      Direct-messaging records. Not a gRPC surface: there is no service
+      stanza and no RPC. The types listed under this module state the
+      FIELD SET of the conversation records; a daemonseed client writes
+      and reads each record as the fixed-width, length-prefixed layout
+      defined in daemonseed-core (dm::advert, dm::drop, dm::channel), and
+      those layouts — not a protobuf encoding of the types below — are
+      the bytes a Veilid subkey holds. Confidentiality is the AES-256-GCM
+      seal inside the record, so a storage node sees sealed bytes and no
+      forgeable authorship. Generated into daemonseed_proto::v1.
+    no_std: false
+    depends_on: []
+    iscs: [C38, C39, C40, C41, C42, A-C20]
+
 # ─────────────────────────────────────────────────────────────────────
 # Types — protobuf messages and enums (all in package daemonseed.v1)
 # ─────────────────────────────────────────────────────────────────────
@@ -1031,6 +1046,197 @@ types:
         description: >-
           Detached ML-DSA-87 provenance signature over the domain-separated input
           (room ‖ requester_pubkey ‖ sent_unix_ms); a bad signature drops it.
+
+  # ── dm.proto ───────────────────────────────────────────────────────
+
+  - name: DmAdvert
+    module: dm
+    kind: message
+    description: >-
+      The advert record's subkey 0: an identity's current ML-KEM-1024 public
+      key under that identity's own signature. The reader verifies against the
+      identity public key it derived the record's address from, never against
+      anything carried here — the record carries no public key.
+    iscs: [C38, C40]
+    fields:
+      - name: serial
+        type: uint64
+        tag: 1
+        description: The rotation counter this advert asserts, rising by one per rotation.
+      - name: not_before
+        type: uint64
+        tag: 2
+        description: Unix seconds at which this advert's key becomes current.
+      - name: kem_pk
+        type: bytes
+        tag: 3
+        description: The identity's current ML-KEM-1024 public key, exactly 1568 bytes.
+      - name: signature
+        type: bytes
+        tag: 4
+        description: >-
+          ML-DSA-87 signature, exactly 4627 bytes, over the length-prefixed
+          (identity pubkey, serial, not_before, kem_pk) preimage.
+
+  - name: DmHello
+    module: dm
+    kind: message
+    description: >-
+      One slot of a drop record: a hello, the first-contact message that
+      discloses a channel's lookup key to its recipient and to nobody else.
+    iscs: [C38, C41]
+    fields:
+      - name: kem_ct
+        type: bytes
+        tag: 1
+        description: >-
+          ML-KEM-1024 ciphertext, exactly 1568 bytes, encapsulated to the
+          recipient's advert key.
+      - name: sealed
+        type: bytes
+        tag: 2
+        description: >-
+          nonce(12) ‖ ciphertext ‖ tag(16) over the channel lookup key and the
+          slot value r, AES-256-GCM under the key derived from the encapsulated
+          shared secret.
+      - name: pow_tag
+        type: bytes
+        tag: 3
+        description: >-
+          The proof-of-work tag over the ciphertext, r and the recipient
+          identity, present on every hello and checked on every read.
+
+  - name: DmChannelOpening
+    module: dm
+    kind: message
+    description: >-
+      A channel's opening: who writes the channel, who it is addressed to, and
+      the ratchet key the recipient answers.
+    iscs: [C38, C42]
+    fields:
+      - name: writer_identity_pk
+        type: bytes
+        tag: 1
+        description: >-
+          The writer's long-term ML-DSA-87 identity public key, exactly 2592
+          bytes.
+      - name: recipient_identity_pk
+        type: bytes
+        tag: 2
+        description: >-
+          The ML-DSA-87 identity public key the writer addresses this channel
+          to, exactly 2592 bytes.
+      - name: first_ratchet_pk
+        type: bytes
+        tag: 3
+        description: The writer's first ratchet ML-KEM-1024 public key, exactly 1568 bytes.
+      - name: advert_serial
+        type: uint64
+        tag: 4
+        description: The serial of the advert the writer encapsulated to.
+      - name: signature
+        type: bytes
+        tag: 5
+        description: >-
+          ML-DSA-87 signature, exactly 4627 bytes, over the length-prefixed
+          (writer key, recipient key, first ratchet key, advert serial)
+          preimage.
+
+  - name: DmChannelControl
+    module: dm
+    kind: message
+    description: >-
+      A channel's control subkey: the opening, the writer's collection cursor
+      over the reverse direction, and whether the writer has closed the
+      conversation.
+    iscs: [C39, C42]
+    fields:
+      - name: opening
+        type: DmChannelOpening
+        tag: 1
+        description: >-
+          The channel opening, absent until it is written; a proto3 message
+          field is absent-or-present, which is the distinction this field
+          needs.
+      - name: collected_cursor
+        type: uint64
+        tag: 2
+        description: >-
+          How many of the peer's messages the writer has collected contiguously
+          from sequence zero.
+      - name: closed
+        type: bool
+        tag: 3
+        description: Whether the writer has torn this conversation down.
+
+  - name: DmMessageHeader
+    module: dm
+    kind: message
+    description: >-
+      The clear header of one message on a channel: the ratchet position the
+      message key comes from, the sequence, the cursor, and the turn fields.
+      Every field is bound as associated data to the body it heads, so a
+      rewritten field leaves a body that does not open.
+    iscs: [C38, C42]
+    fields:
+      - name: device_id
+        type: uint32
+        tag: 1
+        description: Which of the writer's devices writes this message.
+      - name: n
+        type: uint64
+        tag: 2
+        description: The writer's turn number this message's key comes from.
+      - name: m
+        type: uint64
+        tag: 3
+        description: The peer turn number the writer had read when it started turn n.
+      - name: seq
+        type: uint64
+        tag: 4
+        description: The message's sequence number within this direction.
+      - name: cursor
+        type: uint64
+        tag: 5
+        description: >-
+          How many of the peer's messages the writer has collected contiguously
+          from sequence zero.
+      - name: kem_ct
+        type: optional bytes
+        tag: 6
+        description: >-
+          The turn's ML-KEM-1024 ciphertext, exactly 1568 bytes, present on a
+          turn's first message together with kem_pk and absent on every other
+          message.
+      - name: kem_pk
+        type: optional bytes
+        tag: 7
+        description: >-
+          The writer's fresh ratchet ML-KEM-1024 public key, exactly 1568
+          bytes, present on a turn's first message together with kem_ct and
+          absent on every other message.
+
+  - name: DmChannelSlot
+    module: dm
+    kind: message
+    description: >-
+      One slot of a channel's message ring: the clear header and the sealed
+      body it heads.
+    iscs: [C42, A-C20]
+    fields:
+      - name: header
+        type: DmMessageHeader
+        tag: 1
+        description: >-
+          The clear ratchet header, which a reader needs before it can derive
+          the key that opens the body.
+      - name: body
+        type: bytes
+        tag: 2
+        description: >-
+          nonce(12) ‖ ciphertext ‖ tag(16) over the message body, AES-256-GCM
+          under this position's message key, binding the header as associated
+          data.
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions — gRPC service RPC methods, served over the post-Authenticated

@@ -358,3 +358,153 @@ message DmChannelBody {
   // long-term key the initiator knocked at.
   bytes bind_lt = 7;
 }
+
+// The field set of the conversation layer's DHT records
+// (`docs/design/direct-messaging.md` § Records).
+//
+// A daemonseed client writes and reads each record as the fixed-width,
+// length-prefixed layout defined in `daemonseed-core` — `dm::advert`,
+// `dm::drop` and `dm::channel` — and those bytes are what a Veilid subkey
+// holds. The messages below state the field set of those layouts for a reader
+// of the schema; a protobuf decoder does not parse the record bytes.
+//
+// Where § Records and the core module differ on a record's fields, the core
+// module is the source. The channel opening is such a case: it carries
+// `recipient_identity_pk`, which `dm::channel::ChannelOpening` has and
+// § Records does not list.
+//
+// `DmAdvert`, `DmHello`, `DmChannelOpening`, `DmChannelControl`,
+// `DmMessageHeader` and `DmChannelSlot` are the records § Records defines,
+// while `KeySelector`, `DmKeyRecord`, `DmAck`, `DmAckBody`,
+// `FirstContactEntry`, `FirstContactBody`, `DmChannelFrame` and
+// `DmChannelBody` remain in the schema for the code that still writes them and
+// leave the schema when that code does.
+
+// The advert record's subkey 0: an identity's current ML-KEM-1024 public key
+// under that identity's own signature.
+//
+// A reader verifies the signature against the identity public key it derived
+// this record's address from, never against anything carried here — the record
+// carries no public key precisely so there is nothing to substitute.
+message DmAdvert {
+  // The rotation counter this advert asserts, rising by one per rotation.
+  uint64 serial = 1;
+
+  // Unix seconds at which this advert's key becomes current.
+  uint64 not_before = 2;
+
+  // The identity's current ML-KEM-1024 public key, exactly 1568 bytes.
+  bytes kem_pk = 3;
+
+  // ML-DSA-87 signature, exactly 4627 bytes, over the preimage
+  // `daemonseed/dm/advert/sig/v1` followed by the identity public key,
+  // `serial` as a big-endian 64-bit integer, `not_before` as a big-endian
+  // 64-bit integer, and `kem_pk` — each of those four prefixed with its own
+  // big-endian 64-bit length.
+  bytes signature = 4;
+}
+
+// One slot of a drop record: a hello, the first-contact message that discloses
+// a channel's lookup key to its recipient and to nobody else.
+message DmHello {
+  // ML-KEM-1024 ciphertext, exactly 1568 bytes, encapsulated to the
+  // recipient's advert key.
+  bytes kem_ct = 1;
+
+  // `nonce(12) ‖ ciphertext ‖ tag(16)` over the channel lookup key and the
+  // slot value `r`, AES-256-GCM under the key derived from the encapsulated
+  // shared secret.
+  bytes sealed = 2;
+
+  // The proof-of-work tag over the ciphertext, `r` and the recipient
+  // identity, exactly 8 bytes, present on every hello and checked on every
+  // read.
+  bytes pow_tag = 3;
+}
+
+// A channel's opening: who writes the channel, who it is addressed to, and the
+// ratchet key the recipient answers.
+message DmChannelOpening {
+  // The writer's long-term ML-DSA-87 identity public key, exactly 2592 bytes.
+  bytes writer_identity_pk = 1;
+
+  // The ML-DSA-87 identity public key the writer addresses this channel to,
+  // exactly 2592 bytes.
+  bytes recipient_identity_pk = 2;
+
+  // The writer's first ratchet ML-KEM-1024 public key, exactly 1568 bytes.
+  bytes first_ratchet_pk = 3;
+
+  // The serial of the advert the writer encapsulated to.
+  uint64 advert_serial = 4;
+
+  // ML-DSA-87 signature, exactly 4627 bytes, over the preimage
+  // `daemonseed/dm/channel/opening-sig/v1` followed by the writer identity
+  // key, the recipient identity key, the first ratchet key, and
+  // `advert_serial` as a big-endian 64-bit integer — each of those four
+  // prefixed with its own big-endian 64-bit length.
+  bytes signature = 5;
+}
+
+// A channel's control subkey: the opening, the writer's collection cursor over
+// the reverse direction, and whether the writer has closed the conversation.
+message DmChannelControl {
+  // The channel opening, absent until it is written; a proto3 message field is
+  // absent-or-present, which is the distinction this field needs.
+  DmChannelOpening opening = 1;
+
+  // How many of the peer's messages the writer has collected contiguously from
+  // sequence zero.
+  uint64 collected_cursor = 2;
+
+  // Whether the writer has torn this conversation down.
+  bool closed = 3;
+}
+
+// The clear header of one message on a channel: the ratchet position the
+// message key comes from, the sequence, the cursor, and the turn fields.
+//
+// Every field here is bound as associated data to the body it heads, so a
+// rewritten field leaves a body that does not open.
+message DmMessageHeader {
+  // Which of the writer's devices writes this message. Reserved: a
+  // single-device installation writes zero and nothing reads it.
+  uint32 device_id = 1;
+
+  // The writer's turn number this message's key comes from.
+  uint64 n = 2;
+
+  // The peer turn number the writer had read when it started turn `n`.
+  uint64 m = 3;
+
+  // The message's sequence number within this direction.
+  uint64 seq = 4;
+
+  // How many of the peer's messages the writer has collected contiguously from
+  // sequence zero.
+  uint64 cursor = 5;
+
+  // The turn's ML-KEM-1024 ciphertext, exactly 1568 bytes, present on a turn's
+  // first message together with `kem_pk` and absent on every other message.
+  optional bytes kem_ct = 6;
+
+  // The writer's fresh ratchet ML-KEM-1024 public key, exactly 1568 bytes,
+  // present on a turn's first message together with `kem_ct` and absent on
+  // every other message.
+  optional bytes kem_pk = 7;
+}
+
+// One slot of a channel's message ring: the clear header and the sealed body
+// it heads.
+message DmChannelSlot {
+  // The clear ratchet header, which a reader needs before it can derive the
+  // key that opens the body.
+  DmMessageHeader header = 1;
+
+  // `nonce(12) ‖ ciphertext ‖ tag(16)` over the message body, AES-256-GCM
+  // under this position's message key. The associated data is
+  // `daemonseed/dm/channel/msg-aad/v1` followed by the core's encoding of the
+  // header (`dm::channel::message_aad`), never a protobuf encoding of
+  // `DmMessageHeader`.
+  bytes body = 2;
+}

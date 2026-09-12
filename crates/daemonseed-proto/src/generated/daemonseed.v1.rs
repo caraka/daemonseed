@@ -997,6 +997,141 @@ pub struct DmChannelBody {
     #[prost(bytes = "vec", tag = "7")]
     pub bind_lt: ::prost::alloc::vec::Vec<u8>,
 }
+/// The advert record's subkey 0: an identity's current ML-KEM-1024 public key
+/// under that identity's own signature.
+///
+/// A reader verifies the signature against the identity public key it derived
+/// this record's address from, never against anything carried here — the record
+/// carries no public key precisely so there is nothing to substitute.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmAdvert {
+    /// The rotation counter this advert asserts, rising by one per rotation.
+    #[prost(uint64, tag = "1")]
+    pub serial: u64,
+    /// Unix seconds at which this advert's key becomes current.
+    #[prost(uint64, tag = "2")]
+    pub not_before: u64,
+    /// The identity's current ML-KEM-1024 public key, exactly 1568 bytes.
+    #[prost(bytes = "vec", tag = "3")]
+    pub kem_pk: ::prost::alloc::vec::Vec<u8>,
+    /// ML-DSA-87 signature, exactly 4627 bytes, over the preimage
+    /// `daemonseed/dm/advert/sig/v1` followed by the identity public key,
+    /// `serial` as a big-endian 64-bit integer, `not_before` as a big-endian
+    /// 64-bit integer, and `kem_pk` — each of those four prefixed with its own
+    /// big-endian 64-bit length.
+    #[prost(bytes = "vec", tag = "4")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// One slot of a drop record: a hello, the first-contact message that discloses
+/// a channel's lookup key to its recipient and to nobody else.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmHello {
+    /// ML-KEM-1024 ciphertext, exactly 1568 bytes, encapsulated to the
+    /// recipient's advert key.
+    #[prost(bytes = "vec", tag = "1")]
+    pub kem_ct: ::prost::alloc::vec::Vec<u8>,
+    /// `nonce(12) ‖ ciphertext ‖ tag(16)` over the channel lookup key and the
+    /// slot value `r`, AES-256-GCM under the key derived from the encapsulated
+    /// shared secret.
+    #[prost(bytes = "vec", tag = "2")]
+    pub sealed: ::prost::alloc::vec::Vec<u8>,
+    /// The proof-of-work tag over the ciphertext, `r` and the recipient
+    /// identity, exactly 8 bytes, present on every hello and checked on every
+    /// read.
+    #[prost(bytes = "vec", tag = "3")]
+    pub pow_tag: ::prost::alloc::vec::Vec<u8>,
+}
+/// A channel's opening: who writes the channel, who it is addressed to, and the
+/// ratchet key the recipient answers.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmChannelOpening {
+    /// The writer's long-term ML-DSA-87 identity public key, exactly 2592 bytes.
+    #[prost(bytes = "vec", tag = "1")]
+    pub writer_identity_pk: ::prost::alloc::vec::Vec<u8>,
+    /// The ML-DSA-87 identity public key the writer addresses this channel to,
+    /// exactly 2592 bytes.
+    #[prost(bytes = "vec", tag = "2")]
+    pub recipient_identity_pk: ::prost::alloc::vec::Vec<u8>,
+    /// The writer's first ratchet ML-KEM-1024 public key, exactly 1568 bytes.
+    #[prost(bytes = "vec", tag = "3")]
+    pub first_ratchet_pk: ::prost::alloc::vec::Vec<u8>,
+    /// The serial of the advert the writer encapsulated to.
+    #[prost(uint64, tag = "4")]
+    pub advert_serial: u64,
+    /// ML-DSA-87 signature, exactly 4627 bytes, over the preimage
+    /// `daemonseed/dm/channel/opening-sig/v1` followed by the writer identity
+    /// key, the recipient identity key, the first ratchet key, and
+    /// `advert_serial` as a big-endian 64-bit integer — each of those four
+    /// prefixed with its own big-endian 64-bit length.
+    #[prost(bytes = "vec", tag = "5")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+}
+/// A channel's control subkey: the opening, the writer's collection cursor over
+/// the reverse direction, and whether the writer has closed the conversation.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmChannelControl {
+    /// The channel opening, absent until it is written; a proto3 message field is
+    /// absent-or-present, which is the distinction this field needs.
+    #[prost(message, optional, tag = "1")]
+    pub opening: ::core::option::Option<DmChannelOpening>,
+    /// How many of the peer's messages the writer has collected contiguously from
+    /// sequence zero.
+    #[prost(uint64, tag = "2")]
+    pub collected_cursor: u64,
+    /// Whether the writer has torn this conversation down.
+    #[prost(bool, tag = "3")]
+    pub closed: bool,
+}
+/// The clear header of one message on a channel: the ratchet position the
+/// message key comes from, the sequence, the cursor, and the turn fields.
+///
+/// Every field here is bound as associated data to the body it heads, so a
+/// rewritten field leaves a body that does not open.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmMessageHeader {
+    /// Which of the writer's devices writes this message. Reserved: a
+    /// single-device installation writes zero and nothing reads it.
+    #[prost(uint32, tag = "1")]
+    pub device_id: u32,
+    /// The writer's turn number this message's key comes from.
+    #[prost(uint64, tag = "2")]
+    pub n: u64,
+    /// The peer turn number the writer had read when it started turn `n`.
+    #[prost(uint64, tag = "3")]
+    pub m: u64,
+    /// The message's sequence number within this direction.
+    #[prost(uint64, tag = "4")]
+    pub seq: u64,
+    /// How many of the peer's messages the writer has collected contiguously from
+    /// sequence zero.
+    #[prost(uint64, tag = "5")]
+    pub cursor: u64,
+    /// The turn's ML-KEM-1024 ciphertext, exactly 1568 bytes, present on a turn's
+    /// first message together with `kem_pk` and absent on every other message.
+    #[prost(bytes = "vec", optional, tag = "6")]
+    pub kem_ct: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// The writer's fresh ratchet ML-KEM-1024 public key, exactly 1568 bytes,
+    /// present on a turn's first message together with `kem_ct` and absent on
+    /// every other message.
+    #[prost(bytes = "vec", optional, tag = "7")]
+    pub kem_pk: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+/// One slot of a channel's message ring: the clear header and the sealed body
+/// it heads.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DmChannelSlot {
+    /// The clear ratchet header, which a reader needs before it can derive the
+    /// key that opens the body.
+    #[prost(message, optional, tag = "1")]
+    pub header: ::core::option::Option<DmMessageHeader>,
+    /// `nonce(12) ‖ ciphertext ‖ tag(16)` over the message body, AES-256-GCM
+    /// under this position's message key. The associated data is
+    /// `daemonseed/dm/channel/msg-aad/v1` followed by the core's encoding of the
+    /// header (`dm::channel::message_aad`), never a protobuf encoding of
+    /// `DmMessageHeader`.
+    #[prost(bytes = "vec", tag = "2")]
+    pub body: ::prost::alloc::vec::Vec<u8>,
+}
 /// Which key an initiator encapsulated `ss0` to when opening a conversation.
 ///
 /// Alpha always writes `KEY_SELECTOR_STATIC`. The enum exists so that
