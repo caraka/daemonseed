@@ -26,6 +26,20 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-core`: `dm::flows`, the direct-messaging first-contact flow over `dm::advert`, `dm::drop`,
+  `dm::channel`, `dm::chain` and `dm::store` — the `Records` trait carrying every record-store read and
+  write, `first_contact(store, records, me, peer_identity_pk, body, fill, now)` creating the conversation
+  record before any record write, persisting the outbox entry before the channel writes, persisting the
+  outstanding hello whole before the drop write and reading that write back once, `resume_first_contact`
+  rewriting a persisted hello unchanged, `refresh_first_contact` re-encapsulating an outstanding hello to
+  a rotated advert key, `collect` returning `Surfaced::Dropped` / `StartedOver` / `Accepted` /
+  `ContactRequest` per verified hello and skipping a slot it cannot read, open or verify, `accept` writing
+  this side's channel opening and a hello back into the correspondent's drop, `recognise_acceptance`
+  recording the correspondent's channel lookup key and hello secret, and `send_message` / `collect_batch`
+  as the ordinary-message and cursor paths (#474).
+- `daemonseed-core`: `dm::store` conversation records carry `cursor_published`, `awaiting_acceptance`,
+  `own_hello_secret`, `own_hello_kem_ct`, `peer_hello_secret`, `peer_advert_serial` and `own_opening`;
+  `CONV_RECORD_LEN` is 36763 (#474).
 - `daemonseed-core`: `dm::delivery`, the direct-messaging delivery rules — `channel::collected(seq, peer_cursor)`,
   re-exported here, true exactly when the correspondent's published cursor is above the sequence and
   now also the predicate `Store::delete_outbox_through` frees a slot on;

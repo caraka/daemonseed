@@ -2827,7 +2827,7 @@ mod tests {
         assert_eq!(RecordKind::AdvertKeys.capacity(), ADVERT_KEYS_RECORD_LEN);
         assert_eq!(ADVERT_KEYS_RECORD_LEN, 6_398);
         assert_eq!(RecordKind::Conversation.capacity(), CONV_RECORD_LEN);
-        assert_eq!(CONV_RECORD_LEN, 23_722);
+        assert_eq!(CONV_RECORD_LEN, 36_763);
         assert_eq!(
             RecordKind::ConversationOutbox.capacity(),
             CONV_OUTBOX_RECORD_LEN

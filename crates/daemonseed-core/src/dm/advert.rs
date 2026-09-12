@@ -165,6 +165,18 @@ redacted_secret_newtype! {
     boxed pub struct AdvertSharedSecret([u8; ml_kem::SHARED_SECRET_LEN]);
 }
 
+impl AdvertSharedSecret {
+    /// A secret over bytes read back from the profile's at-rest store.
+    ///
+    /// The counterpart of [`Self::as_bytes`], for the one caller that writes a
+    /// hello secret down and reads it again ([`crate::dm::store`]). A
+    /// conversation outlives the encapsulation that established it, and the
+    /// secret cannot be re-derived from anything the conversation record holds.
+    pub(crate) fn from_bytes(bytes: &[u8; ml_kem::SHARED_SECRET_LEN]) -> Self {
+        Self(Box::new(*bytes))
+    }
+}
+
 /// Why an advert operation failed.
 ///
 /// `PartialEq` is implemented by hand rather than derived because neither

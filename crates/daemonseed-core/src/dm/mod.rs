@@ -8,19 +8,10 @@
 //! secret, and publishes; the recipient decapsulates whenever they next come
 //! online. No handshake round-trip, no session, no new transport.
 //!
-//! Four record kinds carry it, and the shape of each is part of its address:
-//!
-//! | Record | Schema | Role |
-//! |---|---|---|
-//! | key record ([`keyrec`]) | `dflt(1)` | the identity's published static KEM key — all of DM discovery |
-//! | doorbell | `dflt(32)` | sender-blind first-contact entries, the only unauthenticated write surface |
-//! | channel page | `dflt(16)` | the established conversation, owner-write-gated so no third party can forge or erase it |
-//! | ack record ([`ack_record`]) | `dflt(1)` | one direction's settled state, sealed and owner-write-gated, rewritten in place |
-//!
-//! Only the doorbell is world-writable, and it carries no conversation content.
-//!
-//! Built in dependency order as GitHub issues #232–#236; modules land as their
-//! slices do.
+//! `docs/design/direct-messaging.md` is implemented by [`advert`], [`mod@drop`],
+//! [`channel`], [`chain`], [`store`], [`delivery`] and [`flows`]. The other
+//! modules under `dm/` are the transport's current wiring and are counted
+//! outside the layer by `cargo xtask dm-size`.
 
 /// Append a `u64` big-endian length prefix and the bytes.
 ///
@@ -80,6 +71,7 @@ pub mod domain;
 pub mod doorbell;
 pub mod drop;
 pub mod firstcontact;
+pub mod flows;
 pub mod frame;
 pub mod keyrec;
 pub mod outbox;

@@ -2405,11 +2405,22 @@ modules:
       load_conv(&CorrespondenceLabel) -> Result<Option<ConvState>, StoreError> carry
       ConvState { peer_identity_pk, outgoing_lookup_key, incoming_lookup_key,
       generation, conversation: chain::ConversationSnapshot, send_seq,
-      peer_collected, my_collected, outstanding_hello: Option<OutstandingHello {
-      slot, r, kem_ct, sealed, advert_serial }> } as RecordKind::Conversation;
-      OutstandingHello holds the sealed hello as written to the drop slot, so a
-      rewrite after an abort or an eviction is byte-identical rather than a fresh
-      encapsulation under a different ss0. update_conv(peer, FnOnce(&mut ConvState)
+      peer_collected, my_collected, cursor_published, awaiting_acceptance,
+      outstanding_hello: Option<OutstandingHello { slot, r, kem_ct, sealed,
+      advert_serial }>, own_hello_secret: Option<advert::AdvertSharedSecret>,
+      own_hello_kem_ct, peer_hello_secret: Option<advert::AdvertSharedSecret>,
+      peer_advert_serial, own_opening: Option<[u8; channel::OPENING_LEN]> } as
+      RecordKind::Conversation. OutstandingHello holds the sealed hello as
+      written to the drop slot, so a rewrite after an abort or an eviction is
+      byte-identical rather than a fresh encapsulation under a different ss0.
+      cursor_published is the cursor already in this side's control subkey and is
+      at most my_collected; awaiting_acceptance is true while this side's own
+      first contact has not been accepted. own_hello_secret and
+      peer_hello_secret seal and open control subkeys and never a message body;
+      own_hello_kem_ct is the encapsulation the own hello carries; own_opening is
+      the signed opening as published, persisted because the ML-DSA signature is
+      randomized; peer_advert_serial is the serial the correspondent's opening
+      binds, so a resumed acceptance re-verifies it. A decode refuses a cursor_published above my_collected. update_conv(peer, FnOnce(&mut ConvState)
       -> R) -> Result<R, StoreError> is the only door that changes an established
       record, one critical_section for the whole of it, and refuses
       StoreError::MissingConversation where there is no record; no whole-record
@@ -2434,7 +2445,7 @@ modules:
       width in zeros. A decoder refuses an unknown version, an outbox entry whose
       sequence is not its ring position, a hello slot at or above DROP_SUBKEYS,
       and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6398),
-      CONV_RECORD_LEN (23722) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
+      CONV_RECORD_LEN (36763) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
       widths and are the RecordKind buckets. StoreError is Store(DmStoreError),
       Corrupt { kind, reason }, OutboxSlotOccupied, CiphertextTooLong,
       MissingConversation, ConversationExists and MissingAdvertKeys.
@@ -2471,6 +2482,78 @@ modules:
       the caller re-runs both, the erase being idempotent. Both refuse
       StoreError::MissingConversation where the correspondence holds no
       conversation record. The module performs no network write.
+      Sub-module dm::flows drives first contact and the ordinary message and
+      cursor paths over dm::advert, dm::drop, dm::channel, dm::chain and
+      dm::store. Records is the trait carrying every record-store read and
+      write: read_advert(&AdvertOwnerSeed, subkeys), read_drop_slot /
+      write_drop_slot / erase_drop_slot(&DropOwnerSeed, subkeys, slot),
+      open_channel(&ChannelOwnerSeed, subkeys) -> [u8; HELLO_LOOKUP_KEY_LEN],
+      and read_channel / write_channel(lookup_key, subkey). Each write method
+      performs exactly one write; open_channel writes none and reports the
+      record's lookup key. subkeys is the record's subkey count, part of the
+      record's identity and so of its address. RecordError wraps a transport's
+      own error; FlowError is Advert, Drop, Channel, Chain, Store, Records,
+      NoAdvert, NoOpening, NotOutstanding, AlreadyEstablished,
+      AwaitingAcceptance, DropFull, Incomplete and HelloLength. Me { signer, identity_seed } is this side's
+      identity, FIRST_GENERATION is 0 and MAX_REPICKS is 1.
+      first_contact(store, records, me, peer_identity_pk, body, fill, now) ->
+      Result<FirstContact, FlowError> holds one conversation per correspondent
+      identity: a correspondent with a conversation record resumes from it —
+      FirstContact::Rewrote { peer, hello_slot } where a hello is outstanding,
+      FirstContact::Opened { peer, outgoing_lookup_key, hello_slot, repicks }
+      where the previous run stopped earlier, FlowError::AlreadyEstablished
+      where the conversation is established. A fresh contact reads and verifies
+      the correspondent's advert, creates the conversation record before any
+      record write, names the channel to the transport and records its lookup
+      key, persists the outbox entry before the channel writes, writes the
+      opening at channel::CONTROL_SUBKEY and message sequence 0 at its ring
+      slot, persists the outstanding hello whole and writes it at
+      drop::slot_for(r), reads it back once and re-picks at most MAX_REPICKS
+      times; a further clobber is FlowError::DropFull with the hello left
+      persisted. At most four writes. resume_first_contact(store, records,
+      peer) -> Result<Resumed, FlowError> rewrites a persisted hello unchanged
+      and reports Nothing or Rewrote(slot). refresh_first_contact(store,
+      records, me, peer, fill, now) -> Result<bool, FlowError> re-encapsulates
+      an outstanding hello to a rotated advert key, re-seals the opening,
+      sequence 0 and the hello, persists all three and rewrites them; false
+      where the correspondent's serial is unchanged or lower. collect(store,
+      records, me, advert_keys, is_blocked) -> Result<Vec<Surfaced>, FlowError>
+      scans the drop, tries the current and the previous advert secret, and
+      verifies each channel opening against this identity and the serial it was
+      encapsulated to; an unreadable slot, one that opens under neither secret
+      and one whose opening does not verify are skipped and the scan continues.
+      A verified hello is Surfaced::Dropped for a blocked identity,
+      Accepted(Acceptance) where this side's own first contact is awaiting one,
+      AlreadyCollected where the hello names the channel this side already
+      reads (its slot is erased), StartedOver for any other established
+      correspondent, ContactRequest { identity, lookup_key, first_ratchet_pk,
+      slot, advert_serial, shared_secret } for an unknown one, and Failed {
+      identity, error } where settling that one correspondent failed — the scan
+      carries on past it, and only a failure of this side's own store returns.
+      accept(store, records, me, request, reply, fill, now) -> Result<Accepted {
+      peer, outgoing_lookup_key, bodies, hello_slot, repicks }, FlowError>
+      holds one conversation per correspondent identity: a half-done acceptance
+      is carried to completion from the record, one whose hello back is placed
+      is FlowError::AlreadyEstablished. It creates the conversation record,
+      reads the correspondent's ring, erases the hello slot, writes this side's
+      opening and cursor at CONTROL_SUBKEY with the reply in its ring slot, and
+      writes a hello naming this channel into the correspondent's drop, read
+      back like any other. recognise_acceptance(store, records, me, peer, lookup_key,
+      peer_secret, slot) -> Result<Acceptance { peer, lookup_key, peer_cursor,
+      bodies }, FlowError> records the correspondent's channel lookup key and
+      hello secret, reads its cursor and any reply, clears the outstanding hello
+      and awaiting_acceptance, and erases the slot. send_message(store, records,
+      peer, body, fill) -> Result<u64, FlowError> persists the ciphertext and
+      the advanced send_seq and writes one ring slot; it is
+      FlowError::AwaitingAcceptance while awaiting_acceptance is set. collect_batch(store,
+      records, peer) -> Result<Batch { bodies, my_collected, cursor_published },
+      FlowError> reads the correspondent's ring from this side's cursor and
+      publishes the new cursor in one control write where my_collected is above
+      the record's cursor_published, sealed under own_hello_secret and carrying
+      own_opening. peer_cursor(store, records, peer) ->
+      Result<Option<u64>, FlowError> reads the correspondent's published cursor
+      under peer_hello_secret. The module opens no socket, reads no clock and
+      draws no entropy of its own.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

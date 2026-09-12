@@ -62,12 +62,14 @@ use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_ml_kem as ml_kem;
 use zeroize::Zeroizing;
 
-use crate::dm::advert::{AdvertDecapKey, AdvertKeys, AdvertSnapshot, RetiredSnapshot};
+use crate::dm::advert::{
+    AdvertDecapKey, AdvertKeys, AdvertSharedSecret, AdvertSnapshot, RetiredSnapshot,
+};
 use crate::dm::chain::{
     CHAIN_KEY_LEN, ChainKey, ConversationSnapshot, DirectionState, OWN_TURNS_RETAINED, OwnTurn,
     PeerTurn, ROOT_LEN, RatchetDecapKey, RatchetKeypair, ReceivingState, Root, TurnSecret,
 };
-use crate::dm::channel::{CHANNEL_SUBKEY_LEN, RING_SLOTS};
+use crate::dm::channel::{CHANNEL_SUBKEY_LEN, OPENING_LEN, RING_SLOTS};
 use crate::dm::drop::{DROP_SUBKEYS, HELLO_LEN, HELLO_LOOKUP_KEY_LEN, HELLO_R_LEN};
 use crate::storage::dm_store::{
     CorrespondenceLabel, DmStore, DmStoreError, Locked, LockedProfile, RecordKind,
@@ -149,7 +151,14 @@ pub const CONV_RECORD_LEN: usize = CONV_MAGIC.len()
     + 8
     + 8
     + 8
+    + 8
+    + 1
     + HELLO_FIELD_LEN
+    + (1 + ml_kem::SHARED_SECRET_LEN)
+    + (1 + ml_kem::CT_LEN)
+    + (1 + ml_kem::SHARED_SECRET_LEN)
+    + (1 + 8)
+    + (1 + OPENING_LEN)
     + SNAPSHOT_LEN;
 
 /// Bytes one outbox entry takes: an occupancy flag, the sequence it holds, the
@@ -303,8 +312,49 @@ pub struct ConvState {
     pub peer_collected: u64,
     /// This side's cursor over the correspondent's messages.
     pub my_collected: u64,
+    /// The cursor this side has published into its own control subkey.
+    ///
+    /// Below [`Self::my_collected`] while a collection has been recorded and
+    /// not yet published, which is the state a stop between the two leaves.
+    pub cursor_published: u64,
+    /// Whether this side's own first contact is still awaiting an acceptance.
+    ///
+    /// Distinct from [`Self::outstanding_hello`], which is set on both sides
+    /// of a first contact: a hello of this side's own is outstanding whether
+    /// it opened the conversation or accepted one.
+    pub awaiting_acceptance: bool,
     /// The hello awaiting collection, while there is one.
     pub outstanding_hello: Option<OutstandingHello>,
+    /// The secret this side's own hello established.
+    ///
+    /// Seals this side's control subkey and nothing else. Absent until this
+    /// side has encapsulated a hello of its own.
+    pub own_hello_secret: Option<AdvertSharedSecret>,
+    /// The encapsulation this side's own hello carries.
+    ///
+    /// Persisted beside the secret because it is what the correspondent
+    /// decapsulates to reach it: a rewritten hello that carried a fresh
+    /// ciphertext would establish a secret this record does not hold.
+    pub own_hello_kem_ct: Option<Box<[u8; ml_kem::CT_LEN]>>,
+    /// The secret the correspondent's hello established.
+    ///
+    /// Opens the correspondent's control subkey and nothing else. Absent until
+    /// the correspondent's hello has been opened.
+    pub peer_hello_secret: Option<AdvertSharedSecret>,
+    /// The advert serial the correspondent's channel opening binds.
+    ///
+    /// The serial of this side's own advert that the correspondent
+    /// encapsulated to, which is what refuses a hello relayed into a channel
+    /// addressed to somebody else. Persisted so an acceptance completed by a
+    /// later run re-verifies that opening rather than trusting this record.
+    pub peer_advert_serial: Option<u64>,
+    /// This side's signed channel opening, as the bytes its control subkey
+    /// carries.
+    ///
+    /// Persisted rather than rebuilt: the ML-DSA signature is randomized, so a
+    /// rewritten control record would otherwise carry an opening whose bytes
+    /// differ from the one already published.
+    pub own_opening: Option<Box<[u8; OPENING_LEN]>>,
 }
 
 impl core::fmt::Debug for ConvState {
@@ -316,6 +366,8 @@ impl core::fmt::Debug for ConvState {
             .field("send_seq", &self.send_seq)
             .field("peer_collected", &self.peer_collected)
             .field("my_collected", &self.my_collected)
+            .field("cursor_published", &self.cursor_published)
+            .field("awaiting_acceptance", &self.awaiting_acceptance)
             .field("outstanding_hello", &self.outstanding_hello.is_some())
             .finish_non_exhaustive()
     }
@@ -440,11 +492,10 @@ impl Store {
     /// through [`Store::update_conv`], which reads under the same lock it writes
     /// under and so cannot spell that.
     ///
-    /// `#[cfg_attr(not(test), allow(dead_code))]`: the correspondence that
-    /// calls this is established by the first-contact path, which is not built
-    /// yet, and `pub(crate)` is what keeps a whole-record write unspellable
-    /// from outside the crate in the meantime.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// `pub(crate)`: the correspondence is established by
+    /// [`crate::dm::flows::first_contact`] and [`crate::dm::flows::accept`],
+    /// and crate visibility is what keeps a whole-record write unspellable
+    /// from outside.
     pub(crate) fn create_conv(
         &self,
         peer: &CorrespondenceLabel,
@@ -951,6 +1002,8 @@ pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
     w.u64(state.send_seq);
     w.u64(state.peer_collected);
     w.u64(state.my_collected);
+    w.u64(state.cursor_published);
+    w.u8(u8::from(state.awaiting_acceptance));
     match &state.outstanding_hello {
         Some(h) => {
             w.u8(PRESENT);
@@ -965,6 +1018,23 @@ pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
             w.padded(&[], HELLO_FIELD_LEN - 1);
         }
     }
+    w.opt(
+        state.own_hello_secret.as_ref().map(|s| &s.as_bytes()[..]),
+        ml_kem::SHARED_SECRET_LEN,
+    );
+    w.opt(
+        state.own_hello_kem_ct.as_ref().map(|c| c.as_slice()),
+        ml_kem::CT_LEN,
+    );
+    w.opt(
+        state.peer_hello_secret.as_ref().map(|s| &s.as_bytes()[..]),
+        ml_kem::SHARED_SECRET_LEN,
+    );
+    w.opt_u64(state.peer_advert_serial);
+    w.opt(
+        state.own_opening.as_ref().map(|o| o.as_slice()),
+        OPENING_LEN,
+    );
 
     let sending = &state.conversation.sending;
     w.bytes(sending.root.as_bytes());
@@ -1013,6 +1083,11 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
     let send_seq = r.u64()?;
     let peer_collected = r.u64()?;
     let my_collected = r.u64()?;
+    let cursor_published = r.u64()?;
+    let awaiting_acceptance = r.flag()?;
+    if cursor_published > my_collected {
+        return Err(r.corrupt("the published cursor is above this side's collection cursor"));
+    }
     if peer_collected > send_seq {
         return Err(r.corrupt("the correspondent's cursor is above this side's send sequence"));
     }
@@ -1032,6 +1107,18 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
             );
         }
     }
+
+    let own_hello_secret = r
+        .opt_array::<{ ml_kem::SHARED_SECRET_LEN }>()?
+        .as_deref()
+        .map(AdvertSharedSecret::from_bytes);
+    let own_hello_kem_ct = r.opt_array::<{ ml_kem::CT_LEN }>()?.map(|b| Box::new(*b));
+    let peer_hello_secret = r
+        .opt_array::<{ ml_kem::SHARED_SECRET_LEN }>()?
+        .as_deref()
+        .map(AdvertSharedSecret::from_bytes);
+    let peer_advert_serial = r.opt_u64()?;
+    let own_opening = r.opt_array::<OPENING_LEN>()?.map(|b| Box::new(*b));
 
     let sending_root = r.array::<ROOT_LEN>()?;
     let sending = DirectionState {
@@ -1074,6 +1161,8 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         send_seq,
         peer_collected,
         my_collected,
+        cursor_published,
+        awaiting_acceptance,
         outstanding_hello: has_hello.then_some(OutstandingHello {
             slot: hello_slot,
             r: *hello_r,
@@ -1081,6 +1170,11 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
             sealed: hello_sealed,
             advert_serial: hello_serial,
         }),
+        own_hello_secret,
+        own_hello_kem_ct,
+        peer_hello_secret,
+        peer_advert_serial,
+        own_opening,
     })
 }
 
@@ -1284,7 +1378,14 @@ mod tests {
             send_seq,
             peer_collected,
             my_collected,
+            cursor_published: my_collected,
+            awaiting_acceptance: false,
             outstanding_hello: hello,
+            own_hello_secret: Some(shared_secret(0x44)),
+            own_hello_kem_ct: Some(Box::new([0x77u8; ml_kem::CT_LEN])),
+            peer_hello_secret: Some(shared_secret(0x55)),
+            peer_advert_serial: Some(9),
+            own_opening: Some(Box::new([0x66u8; OPENING_LEN])),
         }
     }
 
@@ -1369,6 +1470,61 @@ mod tests {
         assert_ne!(hello.advert_serial, u64::MAX);
         assert_eq!(hello.sealed.len(), HELLO_LEN);
         assert_ne!(&hello.sealed[ml_kem::CT_LEN..], &[0u8; 8][..]);
+        // The five fields the cursor and control-record paths depend on, each
+        // asserted against the value written rather than against a default.
+        assert_eq!(conv.state.cursor_published, state.cursor_published);
+        assert_eq!(conv.state.peer_advert_serial, Some(9));
+        assert_eq!(conv.state.awaiting_acceptance, state.awaiting_acceptance);
+        assert_eq!(
+            conv.state
+                .own_hello_secret
+                .as_ref()
+                .expect("the own hello secret round trips")
+                .as_bytes(),
+            shared_secret(0x44).as_bytes()
+        );
+        assert_eq!(
+            conv.state
+                .peer_hello_secret
+                .as_ref()
+                .expect("the peer hello secret round trips")
+                .as_bytes(),
+            shared_secret(0x55).as_bytes()
+        );
+        assert_eq!(
+            conv.state
+                .own_hello_kem_ct
+                .as_ref()
+                .expect("the hello encapsulation round trips")
+                .as_slice(),
+            &[0x77u8; ml_kem::CT_LEN][..]
+        );
+        assert_eq!(
+            conv.state
+                .own_opening
+                .as_ref()
+                .expect("the opening round trips")
+                .as_slice(),
+            &[0x66u8; OPENING_LEN][..]
+        );
+        // The control on the three absence-capable fields: the same record
+        // with all three absent round trips as absent, so `Some` above is the
+        // value written and not a decoder that always reports one.
+        let bare = conv_state(&a, 0, 0, 0, None);
+        let bare = ConvState {
+            own_hello_secret: None,
+            own_hello_kem_ct: None,
+            peer_hello_secret: None,
+            peer_advert_serial: None,
+            own_opening: None,
+            ..bare
+        };
+        let decoded = decode_conv(&encode_conv(&bare)).expect("a bare record decodes");
+        assert!(decoded.own_hello_secret.is_none());
+        assert!(decoded.own_hello_kem_ct.is_none());
+        assert!(decoded.peer_hello_secret.is_none());
+        assert!(decoded.peer_advert_serial.is_none());
+        assert!(decoded.own_opening.is_none());
         assert_eq!(
             conv.outstanding_outbox,
             vec![OutboxEntry {
@@ -1768,7 +1924,14 @@ mod tests {
                         send_seq: 0,
                         peer_collected: 0,
                         my_collected: 0,
+                        cursor_published: 0,
+                        awaiting_acceptance: false,
                         outstanding_hello: None,
+                        own_hello_secret: None,
+                        own_hello_kem_ct: None,
+                        peer_hello_secret: None,
+                        peer_advert_serial: None,
+                        own_opening: None,
                     },
                 )
                 .unwrap();
@@ -1785,7 +1948,14 @@ mod tests {
                         send_seq: 0,
                         peer_collected: 0,
                         my_collected: 0,
+                        cursor_published: 0,
+                        awaiting_acceptance: false,
                         outstanding_hello: None,
+                        own_hello_secret: None,
+                        own_hello_kem_ct: None,
+                        peer_hello_secret: None,
+                        peer_advert_serial: None,
+                        own_opening: None,
                     },
                 )
                 .unwrap();
@@ -2280,8 +2450,10 @@ mod tests {
     /// Byte offset of the conversation record's `send_seq`.
     const CONV_SEND_SEQ_AT: usize =
         CONV_MAGIC.len() + 1 + ml_dsa::PK_LEN + 2 * HELLO_LOOKUP_KEY_LEN + 8;
-    /// Byte offset of the conversation record's hello presence flag.
-    const CONV_HELLO_AT: usize = CONV_SEND_SEQ_AT + 8 + 8 + 8;
+    /// Byte offset of the conversation record's hello presence flag: past
+    /// `send_seq`, `peer_collected`, `my_collected`, `cursor_published` and
+    /// the `awaiting_acceptance` flag.
+    const CONV_HELLO_AT: usize = CONV_SEND_SEQ_AT + 8 + 8 + 8 + 8 + 1;
 
     /// A good conversation record with a hello, as bytes.
     fn conv_bytes_with_hello() -> Vec<u8> {

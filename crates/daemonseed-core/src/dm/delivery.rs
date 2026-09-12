@@ -268,7 +268,14 @@ mod tests {
             send_seq: 3,
             peer_collected: 1,
             my_collected: MY_COLLECTED,
+            cursor_published: MY_COLLECTED,
+            awaiting_acceptance: false,
             outstanding_hello: None,
+            own_hello_secret: None,
+            own_hello_kem_ct: None,
+            peer_hello_secret: None,
+            peer_advert_serial: None,
+            own_opening: None,
         };
         store.create_conv(&peer, &state).expect("create");
         store
