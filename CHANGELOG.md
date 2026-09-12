@@ -26,6 +26,9 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-veilid-net`: `schedule::DirectMessageWrite`, the nine writes the direct-messaging layer
+  makes, with `ALL`, `class()` and `kind()`, and `WriteRequest::direct_message`, which fixes every
+  one of them to `WriteClass::Chat` and `WriteKind::Ring` (#461).
 - `xtask`: `cargo xtask dm-size`, a `preflight` gate step counting the direct-messaging layer's
   lines, tests included, refusing above the ceiling read from `DM_SIZE_CEILING` and on any module
   under `dm/` that names no founding claim and is not on the subcommand's outside list, whose

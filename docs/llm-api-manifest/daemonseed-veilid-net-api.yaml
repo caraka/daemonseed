@@ -154,6 +154,15 @@ modules:
       - daemonseed_veilid_net::actor
       - daemonseed_veilid_net::error
       - daemonseed_veilid_net::rendezvous
+  - name: daemonseed_veilid_net::schedule
+    description: >-
+      The WB-3 write scheduler — the single funnel every DHT write enters, ordering
+      across records by WriteClass, holding each record's writes in enqueue order,
+      coalescing redundant current-state writes on their logical id, and flushing chat
+      and tombstone writes within the close budget.
+    no_std: false
+    depends_on:
+      - daemonseed_veilid_net::error
 
 # ─────────────────────────────────────────────────────────────────────
 # Types
@@ -782,6 +791,96 @@ types:
         description: The veilid KeyPair — address, read, watch, create and write.
       - name: ReadOnly
         description: The OwnerPublic — address, read and watch a record that already exists.
+  - name: RecordId
+    module: daemonseed_veilid_net::schedule
+    kind: type_alias
+    description: "[u8; 32] — a DHT record's identity, the rendezvous owner seed. The scope a write's enqueue order and coalescing are measured in."
+  - name: WriteClass
+    module: daemonseed_veilid_net::schedule
+    kind: enum
+    description: >-
+      A write's priority class, highest first. `rank()` is the sort key, 1 to 5.
+      Reordering by class is across records only; one record's writes dispatch in
+      enqueue order whatever their classes.
+    variants:
+      - name: Chat
+        description: Rank 1 — chat / user-action writes. Draws the dedicated chat dispatch pool, is never counted against the non-chat window, and is retained by the shutdown flush.
+      - name: SessionBoundary
+        description: Rank 2 — presence join/leave and share withdraw.
+      - name: AdvertRefresh
+        description: Rank 3 — share-advert refresh.
+      - name: Keepalive
+        description: Rank 4 — presence beacon and operator MOTD keepalive.
+      - name: Republish
+        description: Rank 5 — post-warmup republish writes.
+  - name: WriteKind
+    module: daemonseed_veilid_net::schedule
+    kind: enum
+    description: >-
+      How a write interacts with coalescing and dominance. The key is the logical id,
+      never the physical subkey.
+    variants:
+      - name: Ring
+        description: An append-ring write; never coalesced and never dropped. Carries no logical id.
+      - name: "CurrentState { logical_id: String }"
+        description: A last-writer-wins write; a queued one is dropped when a newer write for the same record and logical id arrives, and its reply resolves Ok.
+      - name: "Tombstone { logical_id: String }"
+        description: A withdraw; never coalesced, and it dominates same-id current-state writes queued or in flight, which are dropped rather than landing after it.
+  - name: WriteRequest
+    module: daemonseed_veilid_net::schedule
+    kind: struct
+    description: >-
+      One write submitted to the funnel, generic over the sink's dispatch token.
+      WriteSchedulerHandle::enqueue takes it; WriteRequest::direct_message builds the
+      direct-messaging shape of it.
+    fields:
+      - name: record
+        type: RecordId
+        description: The target DHT record — the enqueue-order and coalescing scope.
+      - name: class
+        type: WriteClass
+        description: The priority class.
+      - name: kind
+        type: WriteKind
+        description: The coalescing and dominance behavior.
+      - name: deadline
+        type: "Option<Instant>"
+        description: A hard DHT expiry; once passed the write dispatches ahead of class order on the floor lane.
+      - name: item
+        type: D
+        description: The opaque dispatch token handed to the WriteSink at dispatch.
+      - name: reply
+        type: "Option<oneshot::Sender<Result<()>>>"
+        description: Fired with the write result, or Ok when the write is coalesced away by a winning same-id write.
+  - name: DirectMessageWrite
+    module: daemonseed_veilid_net::schedule
+    kind: enum
+    description: >-
+      A write named by the direct-messaging write budget. A request built by
+      WriteRequest::direct_message carries WriteClass::Chat plus WriteKind::Ring and no
+      other shape: the class draws the chat dispatch lane and is retained by the
+      shutdown flush, the kind is what the funnel never coalesces and never drops. A
+      Chat-class WriteKind::CurrentState write is coalescible, so the class alone does
+      not carry that. `ALL` is the array of every variant.
+    variants:
+      - name: Advert
+        description: ADVERT subkey 0 — the signed advert carrying the current ML-KEM-1024 public key.
+      - name: Hello
+        description: A DROP slot — one first-contact hello.
+      - name: HelloErase
+        description: A DROP slot — the recipient's erasure of a hello it has collected.
+      - name: ChannelOpening
+        description: CHAN subkey 0 — the channel opening.
+      - name: MessageSlot
+        description: A CHAN message-ring subkey — one message.
+      - name: Cursor
+        description: CHAN subkey 0 — the writer's collected cursor.
+      - name: SlotRepair
+        description: A CHAN message-ring subkey — the rewrite of a slot a storage node evicted.
+      - name: ClosedMarker
+        description: CHAN subkey 0 — the marker naming the conversation closed, written before the record is erased.
+      - name: ChannelErase
+        description: The erasure of the writer's own channel record, on delete-conversation.
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions
@@ -1963,6 +2062,55 @@ functions:
       type: PublicKey
       description: The VLD0 public key get_dht_record_key consumes.
 
+  # ── schedule ─────────────────────────────────────────────────────────
+  - name: DirectMessageWrite::class
+    module: daemonseed_veilid_net::schedule
+    description: The priority class of every direct-messaging write. Total, const.
+    signature: "pub const fn class(self) -> WriteClass"
+    parameters: []
+    returns:
+      type: WriteClass
+      description: WriteClass::Chat, for every variant.
+  - name: DirectMessageWrite::kind
+    module: daemonseed_veilid_net::schedule
+    description: >-
+      The coalescing behavior of every direct-messaging write. Ring takes no logical id:
+      it is the kind the funnel never coalesces, so there is no coalescing key to name.
+      Total, const.
+    signature: "pub const fn kind(self) -> WriteKind"
+    parameters: []
+    returns:
+      type: WriteKind
+      description: WriteKind::Ring, for every variant.
+  - name: WriteRequest::direct_message
+    module: daemonseed_veilid_net::schedule
+    description: >-
+      The funnel request for one direct-messaging write. class and kind come from write
+      and deadline is None, so a direct-messaging write reaches the queue in one shape.
+      A chat-lane write dispatches on its own pool at any queue depth and has no use for
+      the deadline override.
+    signature: "impl<D> WriteRequest<D> { pub fn direct_message(record: RecordId, write: DirectMessageWrite, item: D, reply: Option<oneshot::Sender<Result<()>>>) -> Self }"
+    parameters:
+      - name: record
+        type: RecordId
+        direction: in
+        description: The target DHT record — the enqueue-order and coalescing scope.
+      - name: write
+        type: DirectMessageWrite
+        direction: in
+        description: Which direct-messaging write this is; it fixes the class and the kind.
+      - name: item
+        type: D
+        direction: in
+        description: The opaque dispatch token handed to the WriteSink at dispatch.
+      - name: reply
+        type: "Option<oneshot::Sender<Result<()>>>"
+        direction: in
+        description: Fired with the write result.
+    returns:
+      type: "WriteRequest<D>"
+      description: The request to hand WriteSchedulerHandle::enqueue.
+
 # ─────────────────────────────────────────────────────────────────────
 # Error types
 # ─────────────────────────────────────────────────────────────────────
@@ -2014,6 +2162,10 @@ error_types:
 # ─────────────────────────────────────────────────────────────────────
 
 constants:
+  - name: DirectMessageWrite::ALL
+    module: daemonseed_veilid_net::schedule
+    type: "[DirectMessageWrite; 9]"
+    description: Every DirectMessageWrite variant, in the order the direct-messaging flows reach them.
   - name: PROJECT_ANNOUNCE_OWNER_PUBKEY
     module: daemonseed_veilid_net::identity
     type: "[u8; 32]"

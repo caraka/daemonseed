@@ -223,6 +223,94 @@ pub struct WriteRequest<D> {
     pub reply: Option<oneshot::Sender<Result<()>>>,
 }
 
+/// A write the direct-messaging layer makes (`docs/design/direct-messaging.md`
+/// § Substrate facts).
+///
+/// A request built by [`WriteRequest::direct_message`] enters the funnel as
+/// [`WriteClass::Chat`] plus [`WriteKind::Ring`] and in no other shape:
+/// [`Self::class`] and [`Self::kind`] return those two values for every variant. The
+/// halves carry different properties — the class draws the I4 chat lane and is retained
+/// by the I7 shutdown flush, while the kind is what the funnel never coalesces and
+/// never drops (I3, WB-ISC-11). A `Chat`-class [`WriteKind::CurrentState`] write is
+/// coalescible, so the class alone does not carry that.
+///
+/// The variants name the writes `docs/design/direct-messaging.md` § Write budget
+/// budgets. That budget counts every write and allows for none the funnel removes: a
+/// message is outstanding until the recipient's cursor passes it, so a write that does
+/// not land returns as a rewrite.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectMessageWrite {
+    /// ADVERT subkey 0 — the signed advert carrying the current ML-KEM-1024 public key.
+    Advert,
+    /// A DROP slot — one first-contact hello.
+    Hello,
+    /// A DROP slot — the recipient's erasure of a hello it has collected.
+    HelloErase,
+    /// CHAN subkey 0 — the channel opening.
+    ChannelOpening,
+    /// A CHAN message-ring subkey — one message.
+    MessageSlot,
+    /// CHAN subkey 0 — the writer's collected cursor.
+    Cursor,
+    /// A CHAN message-ring subkey — the rewrite of a slot a storage node evicted.
+    SlotRepair,
+    /// CHAN subkey 0 — the marker naming the conversation closed, written before the
+    /// record is erased.
+    ClosedMarker,
+    /// The erasure of the writer's own channel record, on delete-conversation.
+    ChannelErase,
+}
+
+impl DirectMessageWrite {
+    /// Every variant, in the order the layer's flows reach them.
+    pub const ALL: [Self; 9] = [
+        Self::Advert,
+        Self::Hello,
+        Self::HelloErase,
+        Self::ChannelOpening,
+        Self::MessageSlot,
+        Self::Cursor,
+        Self::SlotRepair,
+        Self::ClosedMarker,
+        Self::ChannelErase,
+    ];
+
+    /// The priority class of every direct-messaging write.
+    pub const fn class(self) -> WriteClass {
+        WriteClass::Chat
+    }
+
+    /// The coalescing behavior of every direct-messaging write. `Ring` takes no
+    /// logical id: it is the kind the funnel never coalesces, so there is no
+    /// coalescing key to name.
+    pub const fn kind(self) -> WriteKind {
+        WriteKind::Ring
+    }
+}
+
+impl<D> WriteRequest<D> {
+    /// The funnel request for one direct-messaging write. `class` and `kind` come from
+    /// `write` and `deadline` is `None`, so a request built here carries the one shape
+    /// [`DirectMessageWrite`] states and the caller chooses none of it. A chat-lane
+    /// write dispatches on its own pool at any queue depth, so it has no use for the
+    /// I6b deadline override.
+    pub fn direct_message(
+        record: RecordId,
+        write: DirectMessageWrite,
+        item: D,
+        reply: Option<oneshot::Sender<Result<()>>>,
+    ) -> Self {
+        Self {
+            record,
+            class: write.class(),
+            kind: write.kind(),
+            deadline: None,
+            item,
+            reply,
+        }
+    }
+}
+
 /// Tunable scheduler parameters. Defaults track the WB-2/WB-5.1 freeze.
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerConfig {
@@ -1107,6 +1195,68 @@ mod tests {
         [n; 32]
     }
 
+    /// The production array the test drives, under a shorter name.
+    const ALL: [DirectMessageWrite; 9] = DirectMessageWrite::ALL;
+
+    /// The label a direct-messaging write carries in the sink log. The match is
+    /// exhaustive, so a variant added to [`DirectMessageWrite`] fails to compile here
+    /// until it is named. Whether that variant also reaches
+    /// [`DirectMessageWrite::ALL`] is not something the compiler checks — an array
+    /// missing it still compiles.
+    fn dm_label(w: DirectMessageWrite) -> &'static str {
+        match w {
+            DirectMessageWrite::Advert => "advert",
+            DirectMessageWrite::Hello => "hello",
+            DirectMessageWrite::HelloErase => "hello-erase",
+            DirectMessageWrite::ChannelOpening => "opening",
+            DirectMessageWrite::MessageSlot => "slot",
+            DirectMessageWrite::Cursor => "cursor",
+            DirectMessageWrite::SlotRepair => "repair",
+            DirectMessageWrite::ClosedMarker => "closed",
+            DirectMessageWrite::ChannelErase => "channel-erase",
+        }
+    }
+
+    /// A funnel request for one direct-messaging write, built through the constructor
+    /// that fixes its class and kind.
+    fn dm_req(
+        record: RecordId,
+        write: DirectMessageWrite,
+        label: &str,
+    ) -> (WriteRequest<MockItem>, oneshot::Receiver<Result<()>>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            WriteRequest::direct_message(
+                record,
+                write,
+                MockItem {
+                    label: label.to_owned(),
+                },
+                Some(tx),
+            ),
+            rx,
+        )
+    }
+
+    /// The class-4 backlog WB-ISC-10 saturates the funnel with: one keepalive on each
+    /// of [`PRESSURE_RECORDS`] distinct records, far more than the window holds, so
+    /// most of it is still queued when a close arrives.
+    fn enqueue_pressure(h: &WriteSchedulerHandle<MockItem>) {
+        for r in 0..PRESSURE_RECORDS {
+            let (rq, _rx) = req(
+                rec_id(r),
+                WriteClass::Keepalive,
+                WriteKind::CurrentState {
+                    logical_id: format!("m-{r}"),
+                },
+                &format!("pressure-{r}"),
+            );
+            h.enqueue(rq);
+        }
+    }
+
+    const PRESSURE_RECORDS: u8 = 50;
+
     /// A request carrying a hard `deadline` (I6b) — dispatches via the floor lane once
     /// the deadline is due (WB-5.1 / I5″.5). For floor-lane oracles.
     fn req_deadline(
@@ -1783,6 +1933,178 @@ mod tests {
             "an uncoalesced class-4 write must still be shed at shutdown, or this leg \
              passes on a drain that stopped shedding altogether: {flushed:?}"
         );
+    }
+
+    // ── #461 direct-messaging writes ──────────────────────────────────────────
+    /// Every [`DirectMessageWrite`] variant reaches the sink exactly once and in
+    /// enqueue order per record, under a saturated class-4 backlog and across a
+    /// graceful close: none is coalesced away and none is shed. The variants go in
+    /// twice — the whole set behind one in-flight write on a single record, where a
+    /// coalescible write is lost, and one per record.
+    ///
+    /// Leg 2 is the control on the fixture: the same enqueue with a coalescible `kind`
+    /// loses writes to coalescing, and a class-4 write beside them is shed at the
+    /// close. Without it leg 1 passes on a queue that was never under pressure or a
+    /// close that stopped shedding. Leg 3 pins the two values the constructor fixes.
+    #[tokio::test(start_paused = true)]
+    async fn issue_461_direct_messaging_writes_survive_pressure_and_close() {
+        // Every variant is driven, and each is distinguishable in the sink log: two
+        // variants sharing a label would let one stand in for the other in every
+        // count below.
+        let labels: std::collections::BTreeSet<&str> = ALL.into_iter().map(dm_label).collect();
+        assert_eq!(
+            labels.len(),
+            ALL.len(),
+            "each variant needs its own label: {labels:?}"
+        );
+
+        // ── Leg 1: every variant lands, in order, under pressure and across close ──
+        let sink = MockSink::new(Duration::from_secs(2));
+        let h = WriteScheduler::spawn(sink.clone(), SchedulerConfig::default());
+        enqueue_pressure(&h);
+
+        let shared = rec_id(100);
+        let expected_same: Vec<String> = ALL
+            .into_iter()
+            .enumerate()
+            .map(|(i, w)| format!("dm-same-{i}-{}", dm_label(w)))
+            .collect();
+        // The funnel dispatches on every enqueue, so the head is in flight before the
+        // next enqueue is processed and the writes behind it are queued when the close
+        // arrives — the position a coalescible write is lost from.
+        let (head, _h0) = dm_req(shared, ALL[0], &expected_same[0]);
+        h.enqueue(head);
+        for (i, w) in ALL.into_iter().enumerate().skip(1) {
+            let (rq, _r) = dm_req(shared, w, &expected_same[i]);
+            h.enqueue(rq);
+        }
+        // The same set again, one variant per record.
+        let expected_solo: Vec<String> = ALL
+            .into_iter()
+            .map(|w| format!("dm-solo-{}", dm_label(w)))
+            .collect();
+        for (i, w) in ALL.into_iter().enumerate() {
+            let (rq, _r) = dm_req(rec_id(110 + i as u8), w, &expected_solo[i]);
+            h.enqueue(rq);
+        }
+
+        h.shutdown(Duration::from_secs(30)).await;
+
+        let log = sink.log();
+        let dm: Vec<(String, DispatchLane)> = log
+            .iter()
+            .filter(|r| r.label.starts_with("dm-"))
+            .map(|r| (r.label.clone(), r.lane))
+            .collect();
+        for label in expected_same.iter().chain(expected_solo.iter()) {
+            let n = dm.iter().filter(|(l, _)| l == label).count();
+            assert_eq!(
+                n, 1,
+                "{label} must reach the sink exactly once (got {n}): a direct-messaging \
+                 write is never coalesced and never shed: {dm:?}"
+            );
+        }
+        let same_order: Vec<String> = dm
+            .iter()
+            .filter(|(l, _)| l.starts_with("dm-same-"))
+            .map(|(l, _)| l.clone())
+            .collect();
+        assert_eq!(
+            same_order, expected_same,
+            "the shared record dispatched out of enqueue order: {dm:?}"
+        );
+        for (label, lane) in &dm {
+            assert_eq!(
+                *lane,
+                DispatchLane::Chat,
+                "{label} drew {lane:?} — the lane is computed from the head's class at \
+                 dispatch, so it is the live class and not what the caller asked for"
+            );
+        }
+        // The pressure is real from both sides: the funnel dispatched some of the
+        // backlog, so the queue was live, and most of it was still queued at the close
+        // and shed there.
+        let backlog_landed = log
+            .iter()
+            .filter(|r| r.label.starts_with("pressure-"))
+            .count();
+        assert!(
+            backlog_landed > 0 && backlog_landed < usize::from(PRESSURE_RECORDS),
+            "some of the class-4 backlog must reach the sink and most of it must still \
+             be queued and shed at the close; neither holds with no backlog enqueued \
+             ({backlog_landed} of {PRESSURE_RECORDS} landed)"
+        );
+
+        // ── Leg 2: the control — the same enqueue with a coalescible kind ──
+        let sink2 = MockSink::new(Duration::from_secs(2));
+        let h2 = WriteScheduler::spawn(sink2.clone(), SchedulerConfig::default());
+        enqueue_pressure(&h2);
+        let cs = |id: &str| WriteKind::CurrentState {
+            logical_id: id.to_string(),
+        };
+        // Same shape as leg 1: dispatch-on-enqueue puts the head in flight, so the
+        // writes behind it are queued, which is where coalescing applies.
+        let (head2, _c0) = req(shared, WriteClass::Chat, cs("dm-slot"), "cs-same-0");
+        h2.enqueue(head2);
+        for i in 1..ALL.len() {
+            let (rq, _c) = req(
+                shared,
+                WriteClass::Chat,
+                cs("dm-slot"),
+                &format!("cs-same-{i}"),
+            );
+            h2.enqueue(rq);
+        }
+        // A class-4 write beside them on its own logical id, so the close's shed is
+        // what removes it rather than tombstone dominance or coalescing.
+        let (weak, _cw) = req(shared, WriteClass::Keepalive, cs("weak-id"), "weak");
+        h2.enqueue(weak);
+        h2.shutdown(Duration::from_secs(30)).await;
+
+        let labels2: Vec<String> = sink2.log().into_iter().map(|r| r.label).collect();
+        let coalescible_landed = labels2.iter().filter(|l| l.starts_with("cs-same-")).count();
+        // Which ones landed, so "fewer than ALL.len()" cannot be satisfied by none of
+        // them dispatching: the in-flight head, and the last writer on the logical id
+        // the writes behind it share.
+        let survivor = format!("cs-same-{}", ALL.len() - 1);
+        assert!(
+            labels2.iter().any(|l| l == "cs-same-0") && labels2.contains(&survivor),
+            "the head and the last writer on the shared logical id must both land, or \
+             the count below reads a fixture that dispatched nothing: {labels2:?}"
+        );
+        assert!(
+            coalescible_landed < ALL.len(),
+            "a current-state kind on one logical id must lose writes to coalescing in \
+             this fixture, or leg 1's queue never held a write long enough to coalesce \
+             ({coalescible_landed} of {} landed): {labels2:?}",
+            ALL.len()
+        );
+        assert!(
+            !labels2.iter().any(|l| l == "weak"),
+            "a queued class-4 write must be shed at the close, or leg 1 passes on a \
+             close that sheds nothing: {labels2:?}"
+        );
+
+        // ── Leg 3: the class and kind the constructor fixes ──
+        for w in ALL {
+            assert_eq!(w.class(), WriteClass::Chat, "{w:?} is chat-class");
+            assert_eq!(w.kind(), WriteKind::Ring, "{w:?} is a ring write");
+            let (rq, _r) = dm_req(rec_id(200), w, "constants");
+            assert_eq!(
+                rq.class,
+                WriteClass::Chat,
+                "direct_message must fix the class: {w:?}"
+            );
+            assert_eq!(
+                rq.kind,
+                WriteKind::Ring,
+                "direct_message must fix the kind: {w:?}"
+            );
+            assert!(
+                rq.deadline.is_none(),
+                "direct_message must leave no deadline: {w:?}"
+            );
+        }
     }
 
     /// I6b deadline override: a class-4 write past its deadline dispatches ahead of
