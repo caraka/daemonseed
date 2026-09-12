@@ -2250,6 +2250,90 @@ modules:
       key. AdvertOwnerSeed, AdvertDecapKey and AdvertSharedSecret are zeroize-on-drop
       redacting newtypes. The module holds no clock and performs no I/O: wall time is
       a u64 of Unix seconds from the caller and entropy is a fill function.
+      Sub-module dm::drop is the world-writable first-contact record.
+      derive_owner_seed(recipient_pubkey) is HKDF-SHA384(salt=
+      daemonseed/dm/drop/salt/v1, ikm=recipient ML-DSA-87 pubkey, info=
+      daemonseed/dm/drop/owner/v1), world-derivable and therefore world-writable;
+      DROP_SUBKEYS (256) is the record's o_cnt and a writer builds its RecordShape
+      from it, DROP_SLOT_LEN (4096) is one slot and holds one hello.
+      seal_hello(encap, lookup_key, r, recipient_pubkey) -> Result<Vec<u8>, DropError>
+      emits HELLO_LEN (1668) bytes, kem_ct(1568) || nonce(12) || ciphertext(64) ||
+      tag(16) || pow_tag(8), sealed under k_hello = HKDF(ss0,
+      daemonseed/dm/drop/hello/v1) with associated data daemonseed/dm/drop/aad/v1 ||
+      lp(kem_ct) || lp(recipient pubkey); hello_key(ss0) derives that key.
+      open_hello(ss0, bytes, recipient_pubkey, slot) -> Result<Hello { lookup_key,
+      r }, DropError> length-gates to HELLO_LEN, shape-checks the tag against
+      DROP_POW_BITS (0), opens the seal, recomputes the tag over the recovered r, and
+      refuses SlotMismatch { expected, found } when slot_for(r) is not the slot the
+      bytes were read from, so a hello copied into another slot does not open there.
+      At DROP_POW_BITS zero the tag's value check binds nothing the AEAD does not
+      already bind, and the caller has already paid a decapsulation to reach the call;
+      the tag is carried and checked so raising the difficulty is a change to a
+      constant. DropError separates Length (expected, actual), BadTag, Aead (uniform
+      over wrong ss0, tampering and AAD mismatch), SlotMismatch, Kdf, Entropy and
+      Module. pow_tag(kem_ct, r, recipient_pubkey) is the first DROP_POW_TAG_LEN (8)
+      bytes of SHA-384 over pow_input = daemonseed/dm/drop/pow/v1 || lp(kem_ct) ||
+      lp(r) || lp(recipient pubkey). slot_for(r) is the last byte of SHA-384 over
+      daemonseed/dm/drop/slot/v1 || lp(r), reduced mod DROP_SUBKEYS, unbiased because
+      256 divides 2^8. repick(fill) draws a fresh r. after_read_back(written, found)
+      -> ReadBack is Landed only when found is Some(written) and Clobbered otherwise,
+      an absent value included; ReadBack is #[must_use]. HelloAttempt::new(r) holds r
+      and slot(), read_back(written, found, fill) settles one read-back and on
+      Clobbered moves to a fresh r and slot, repicks() counting them. DropOwnerSeed
+      and HelloKey are zeroize-on-drop redacting newtypes. The module holds no clock
+      and performs no I/O.
+      Sub-module dm::channel is one direction of a conversation, written only by its
+      owner. CHANNEL_SUBKEYS (64) is the record's o_cnt, CONTROL_SUBKEY (0) is the
+      control subkey and RING_SLOTS (63) the message ring; slot_for(seq) is 1 + (seq
+      mod RING_SLOTS). CHANNEL_SUBKEY_LEN (16384) is one subkey,
+      MESSAGE_HEADER_MAX_LEN (3188) a header carrying both turn fields,
+      SEALED_CONTROL_MAX_LEN (11432) a sealed control record, and MESSAGE_BODY_MAX_LEN
+      (13168) is derived as CHANNEL_SUBKEY_LEN less the header maximum and the AEAD
+      envelope overhead. derive_owner_seed(identity_seed, peer_identity_pk, generation)
+      -> Result<ChannelOwnerSeed, ChannelError> is HKDF-SHA384(salt=
+      daemonseed/dm/channel/salt/v1, ikm=identity ML-DSA seed, info=
+      daemonseed/dm/channel/owner/v1 || lp(peer pubkey) || lp(BE64(generation))); the
+      seed is the VLD0 secret key and the record's lookup key derives from the public
+      half, computed by the transport layer, so equal seeds address equal records.
+      Ring::new holds the send side and restore(send_seq, peer_collected) ->
+      Result<Ring, ChannelError> rebuilds it, refusing CorruptState { send_seq,
+      peer_collected } on a cursor above what was sent rather than clamping it;
+      reserve() ->
+      Result<u64, ChannelError> returns the next sequence and advances send_seq, or
+      refuses ChannelError::RingFull { send_seq, peer_collected } with send_seq
+      unchanged once uncollected() reaches RING_SLOTS; advance_peer_collected(cursor)
+      never moves backwards and never past send_seq. MessageHeader { device_id: u32,
+      n, m, seq, cursor, kem_ct: Option<Box<[u8; 1568]>>, kem_pk: Option<Box<[u8;
+      1568]>> } encodes as BE32(device_id) || BE64(n) || BE64(m) || BE64(seq) ||
+      BE64(cursor) || lp(kem_ct) || lp(kem_pk), each optional empty when absent;
+      continuing(device_id, n, m, seq, cursor) builds one without the turn fields and
+      starts_turn() is true when both are present. cursor is the writer's contiguous
+      collected count over the peer's messages, so a reply carries it and the control
+      subkey is written only when there is no reply. message_aad(header) is
+      daemonseed/dm/channel/msg-aad/v1 || the encoded header, and is the associated
+      data a message body is sealed under, so a rewritten clear field leaves a body
+      that does not open.
+      decode(bytes) -> Result<(MessageHeader, &[u8]), ChannelError> returns the header
+      and the sealed body after it, refusing Malformed on bytes that run out,
+      FieldLength { expected, actual } on a turn field of the wrong width and
+      TurnFieldsIncomplete on one turn field without the other. device_id is reserved:
+      DEVICE_ID_SINGLE_DEVICE (0) is what a single-device installation writes.
+      ChannelOpening { writer_identity_pk, recipient_identity_pk, first_ratchet_pk,
+      advert_serial, signature } is built by build(signer, recipient_identity_pk,
+      first_ratchet_pk, advert_serial), encodes to OPENING_LEN (11387) bytes and signs
+      opening_signing_input = daemonseed/dm/channel/opening-sig/v1 || lp(writer
+      pubkey) || lp(recipient pubkey) || lp(first ratchet pubkey) ||
+      lp(BE64(advert_serial)). decode(bytes) reads the fields and does NOT verify
+      them; verify(expected_recipient_pk, expected_advert_serial) checks the signature
+      under the identity public key the opening carries, then the recipient, then the
+      serial, returning ChannelError::Signature, ChannelError::Recipient and
+      ChannelError::AdvertSerial { expected, found } as distinct failures. Control { opening: Option<ChannelOpening>, collected_cursor,
+      closed } encodes as lp(opening) || BE64(collected_cursor) || closed(1);
+      seal_control(ss_hello, control) and open_control(ss_hello, bytes) seal it under
+      k_control = HKDF(ss_hello, daemonseed/dm/channel/control/v1) with associated
+      data control_aad(), and the key does not step per turn. ChannelOwnerSeed and
+      ControlKey are zeroize-on-drop redacting newtypes. The module holds no clock,
+      performs no I/O, and takes the identity secret as a parameter.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

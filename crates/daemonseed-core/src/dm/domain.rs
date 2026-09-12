@@ -455,6 +455,77 @@ dm_labels! {
     /// leg kind, the direction, the generation, the attempt and the leg's
     /// payload follow it, each length-prefixed. FROZEN.
     DM_REEST_SIG = b"daemonseed/dm/reest/sig/v1";
+
+    /// HKDF-Extract salt for the DROP's owner-seed derivation, rooted in the
+    /// RECIPIENT's published identity key. Distinct from every other salt over that
+    /// same public input, so two derivations from one identity key cannot collide
+    /// onto one address. FROZEN.
+    DM_DROP_SALT = b"daemonseed/dm/drop/salt/v1";
+
+    /// HKDF-Expand `info` for the drop's Veilid owner seed, derived from the
+    /// recipient's full ML-DSA-87 public key. World-derivable — and therefore
+    /// world-WRITABLE — by design: a stranger holding only the recipient's published
+    /// identity must be able to reach it, which is what first contact is. FROZEN.
+    DM_DROP_OWNER = b"daemonseed/dm/drop/owner/v1";
+
+    /// HKDF-Extract salt for the hello seal key, rooted in `ss0` — the secret an
+    /// encapsulation to the recipient's advert key yields. FROZEN.
+    DM_DROP_HELLO_SALT = b"daemonseed/dm/drop/hello-salt/v1";
+
+    /// HKDF-Expand `info` for `k_hello`, the key a hello's `lookup_key ‖ r` is
+    /// sealed under. FROZEN.
+    DM_DROP_HELLO = b"daemonseed/dm/drop/hello/v1";
+
+    /// AEAD associated-data prefix for a hello. The ML-KEM ciphertext and the
+    /// recipient's identity public key follow it, each length-prefixed, so a
+    /// ciphertext cannot be lifted from one hello into another and a hello written
+    /// at one identity's drop does not open at another's. FROZEN.
+    DM_DROP_AAD = b"daemonseed/dm/drop/aad/v1";
+
+    /// Proof-of-work domain for a hello's tag. The ML-KEM ciphertext, `r` and the
+    /// recipient's identity public key follow it, each length-prefixed. FROZEN.
+    DM_DROP_POW = b"daemonseed/dm/drop/pow/v1";
+
+    /// Domain prefix for the digest that picks a hello's slot, with `r`
+    /// length-prefixed after it. The slot is the digest's last byte, so this label
+    /// is what stops it coinciding with a digest taken over the same `r` for another
+    /// purpose. FROZEN.
+    DM_DROP_SLOT = b"daemonseed/dm/drop/slot/v1";
+
+    /// HKDF-Extract salt for a CHANNEL owner-seed derivation, rooted in the writer's
+    /// identity SECRET. Not world-derivable, unlike the advert's and the drop's:
+    /// only the writer, or another device holding the same recovery phrase, computes
+    /// this address. FROZEN.
+    DM_CHANNEL_SALT = b"daemonseed/dm/channel/salt/v1";
+
+    /// HKDF-Expand `info` prefix for one direction's Veilid owner seed. The peer's
+    /// identity public key and the conversation generation follow it, each
+    /// length-prefixed, so the two directions of one conversation and two
+    /// generations of one pair are four distinct records. FROZEN.
+    DM_CHANNEL_OWNER = b"daemonseed/dm/channel/owner/v1";
+
+    /// HKDF-Extract salt for the control subkey's seal key, rooted in the shared
+    /// secret of the hello that named the channel. FROZEN.
+    DM_CHANNEL_CONTROL_SALT = b"daemonseed/dm/channel/control-salt/v1";
+
+    /// HKDF-Expand `info` for `k_control`, the key the control subkey — the channel
+    /// opening and the writer's collection cursor — is sealed under. FROZEN.
+    DM_CHANNEL_CONTROL = b"daemonseed/dm/channel/control/v1";
+
+    /// AEAD associated-data prefix for the control subkey, with the subkey number
+    /// length-prefixed after it. FROZEN.
+    DM_CHANNEL_CONTROL_AAD = b"daemonseed/dm/channel/control-aad/v1";
+
+    /// AEAD associated-data prefix for a channel message. The encoded message
+    /// header follows it, so every clear field the header carries is bound to the
+    /// body it heads and a rewritten field on a genuine slot fails to open. FROZEN.
+    DM_CHANNEL_MSG_AAD = b"daemonseed/dm/channel/msg-aad/v1";
+
+    /// Signature domain for a channel opening. The writer's identity public key, its
+    /// first ratchet public key and the advert serial follow it, each
+    /// length-prefixed; binding the serial is what makes a relayed hello land in a
+    /// channel the reader refuses. FROZEN.
+    DM_CHANNEL_OPENING_SIG = b"daemonseed/dm/channel/opening-sig/v1";
 }
 
 #[cfg(test)]
@@ -520,6 +591,29 @@ mod tests {
         assert_eq!(DM_REEST_ROOT, b"daemonseed/dm/reest/root/v1");
         assert_eq!(DM_REEST_CHAN_ID, b"daemonseed/dm/reest/chanid/v1");
         assert_eq!(DM_REEST_NEXT, b"daemonseed/dm/reest/next/v1");
+        assert_eq!(DM_DROP_SALT, b"daemonseed/dm/drop/salt/v1");
+        assert_eq!(DM_DROP_OWNER, b"daemonseed/dm/drop/owner/v1");
+        assert_eq!(DM_DROP_HELLO_SALT, b"daemonseed/dm/drop/hello-salt/v1");
+        assert_eq!(DM_DROP_HELLO, b"daemonseed/dm/drop/hello/v1");
+        assert_eq!(DM_DROP_AAD, b"daemonseed/dm/drop/aad/v1");
+        assert_eq!(DM_DROP_POW, b"daemonseed/dm/drop/pow/v1");
+        assert_eq!(DM_DROP_SLOT, b"daemonseed/dm/drop/slot/v1");
+        assert_eq!(DM_CHANNEL_SALT, b"daemonseed/dm/channel/salt/v1");
+        assert_eq!(DM_CHANNEL_OWNER, b"daemonseed/dm/channel/owner/v1");
+        assert_eq!(
+            DM_CHANNEL_CONTROL_SALT,
+            b"daemonseed/dm/channel/control-salt/v1"
+        );
+        assert_eq!(DM_CHANNEL_CONTROL, b"daemonseed/dm/channel/control/v1");
+        assert_eq!(
+            DM_CHANNEL_CONTROL_AAD,
+            b"daemonseed/dm/channel/control-aad/v1"
+        );
+        assert_eq!(
+            DM_CHANNEL_OPENING_SIG,
+            b"daemonseed/dm/channel/opening-sig/v1"
+        );
+        assert_eq!(DM_CHANNEL_MSG_AAD, b"daemonseed/dm/channel/msg-aad/v1");
     }
 
     /// No label is a prefix of another.
@@ -597,7 +691,7 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 53] = [
+        let pinned: [(&[u8], &[u8]); 67] = [
             (DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3".as_slice()),
             (DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1".as_slice()),
             (
@@ -619,6 +713,31 @@ mod tests {
                 DM_CHAIN_STEP_SALT,
                 b"daemonseed/dm/chain/step-salt/v1".as_slice(),
             ),
+            (
+                DM_CHANNEL_CONTROL,
+                b"daemonseed/dm/channel/control/v1".as_slice(),
+            ),
+            (
+                DM_CHANNEL_CONTROL_AAD,
+                b"daemonseed/dm/channel/control-aad/v1".as_slice(),
+            ),
+            (
+                DM_CHANNEL_CONTROL_SALT,
+                b"daemonseed/dm/channel/control-salt/v1".as_slice(),
+            ),
+            (
+                DM_CHANNEL_MSG_AAD,
+                b"daemonseed/dm/channel/msg-aad/v1".as_slice(),
+            ),
+            (
+                DM_CHANNEL_OPENING_SIG,
+                b"daemonseed/dm/channel/opening-sig/v1".as_slice(),
+            ),
+            (
+                DM_CHANNEL_OWNER,
+                b"daemonseed/dm/channel/owner/v1".as_slice(),
+            ),
+            (DM_CHANNEL_SALT, b"daemonseed/dm/channel/salt/v1".as_slice()),
             (DM_CHAN_ID, b"daemonseed/dm/chanid/v2".as_slice()),
             (DM_CK, b"daemonseed/dm/ck/v2".as_slice()),
             (
@@ -637,6 +756,16 @@ mod tests {
                 DM_DOORBELL_SLOT_SALT,
                 b"daemonseed/dm/doorbell/slot-salt/v1".as_slice(),
             ),
+            (DM_DROP_AAD, b"daemonseed/dm/drop/aad/v1".as_slice()),
+            (DM_DROP_HELLO, b"daemonseed/dm/drop/hello/v1".as_slice()),
+            (
+                DM_DROP_HELLO_SALT,
+                b"daemonseed/dm/drop/hello-salt/v1".as_slice(),
+            ),
+            (DM_DROP_OWNER, b"daemonseed/dm/drop/owner/v1".as_slice()),
+            (DM_DROP_POW, b"daemonseed/dm/drop/pow/v1".as_slice()),
+            (DM_DROP_SALT, b"daemonseed/dm/drop/salt/v1".as_slice()),
+            (DM_DROP_SLOT, b"daemonseed/dm/drop/slot/v1".as_slice()),
             (DM_FC_AAD, b"daemonseed/dm/fc/aad/v1".as_slice()),
             (DM_FC_POW, b"daemonseed/dm/fc/pow/v1".as_slice()),
             (DM_FC_SALT, b"daemonseed/dm/fc/salt/v1".as_slice()),

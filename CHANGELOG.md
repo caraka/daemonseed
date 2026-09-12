@@ -26,6 +26,16 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-core`: `dm::drop` and `dm::channel`, the two conversation record layouts — the drop's
+  `DROP_SUBKEYS` × `DROP_SLOT_LEN` hello record with `seal_hello` / `open_hello`, slot-bound by
+  `slot_for` and refusing `SlotMismatch`, `pow_tag` at `DROP_POW_BITS` and the `HelloAttempt`
+  read-back re-pick, and the channel's `CHANNEL_SUBKEYS` subkeys with `derive_owner_seed` over
+  identity secret, peer key and generation, `Ring` backpressure at `RING_SLOTS` over a `restore`
+  that refuses `CorruptState`, `MessageHeader` carrying the collection cursor with `message_aad`
+  binding it to the body, `ChannelOpening` binding writer, recipient, ratchet key and advert
+  serial, `Control` with `seal_control` / `open_control`, the `CHANNEL_SUBKEY_LEN`-derived
+  `MESSAGE_BODY_MAX_LEN`, and the `daemonseed/dm/drop/…` and `daemonseed/dm/channel/…` domain
+  labels (#463).
 - `daemonseed-core`: `dm::advert`, the advert record and the key state behind it — `build` /
   `verify` over `serial ‖ not_before ‖ kem_pk ‖ signature` at subkey 0 of an
   `ADVERT_SUBKEYS`-subkey record, `AdvertKeys` weekly rotation retaining the key before it for one
