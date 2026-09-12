@@ -40,6 +40,16 @@ pub(crate) fn os_fill(buf: &mut [u8; 8]) -> Result<(), ()> {
     getrandom::fill(buf).map_err(|_| ())
 }
 
+/// The same source, slice-typed, for callers that draw buffers of more than one
+/// size — key generation and encapsulation seeds alongside an interval draw.
+///
+/// One definition rather than a second `getrandom` call beside each of them: the
+/// production entropy source and its discarded error belong in one place, and a
+/// module that grew its own would be the copy nobody keeps in step.
+pub(crate) fn os_fill_bytes(buf: &mut [u8]) -> Result<(), ()> {
+    getrandom::fill(buf).map_err(|_| ())
+}
+
 /// Draw a jitter unit, degrading to `0.0` — the band centre, i.e. no jitter — if
 /// the source fails.
 ///

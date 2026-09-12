@@ -26,6 +26,14 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-core`: `dm::advert`, the advert record and the key state behind it — `build` /
+  `verify` over `serial ‖ not_before ‖ kem_pk ‖ signature` at subkey 0 of an
+  `ADVERT_SUBKEYS`-subkey record, `AdvertKeys` weekly rotation retaining the key before it for one
+  further period from the moment it was due to retire, `snapshot` / `restore` across a restart,
+  `AdvertReader` highest-serial-wins over a replayed advert, `VerifiedAdvert::usable_at` and
+  `CLOCK_SKEW_SECS`, `next_poll_interval` / `next_poll_interval_os`, `repair_needed` and `on_poll`
+  over an `InspectReport`, `encapsulate_to` and `hello_needs_rewrite`, and the
+  `daemonseed/dm/advert/…` domain labels (#462).
 - `daemonseed-veilid-net`: `schedule::DirectMessageWrite`, the nine writes the direct-messaging layer
   makes, with `ALL`, `class()` and `kind()`, and `WriteRequest::direct_message`, which fixes every
   one of them to `WriteClass::Chat` and `WriteKind::Ring` (#461).

@@ -2193,6 +2193,63 @@ modules:
       encoding. Together the ceiling and the anchor reset bound attempt −
       last_seen by C, so the legitimate current attempt is always inside the
       receiver's scan window.
+      Sub-module dm::advert is the advert record and the key state behind it.
+      derive_owner_seed(identity_pubkey) is HKDF-SHA384(salt=
+      daemonseed/dm/advert/salt/v1, ikm=identity ML-DSA-87 pubkey, info=
+      daemonseed/dm/advert/owner/v1), world-derivable, so any holder of the pubkey
+      computes the address; ADVERT_SUBKEYS (64) is the record's o_cnt and a writer
+      builds its RecordShape from it, ADVERT_SUBKEY (0) is the advert and subkeys 1
+      to 63 are reserved for per-device keys and unwritten. build(signer, serial,
+      not_before, kem_pk) -> Result<Vec<u8>, AdvertError> emits ADVERT_LEN (6211)
+      bytes, serial(BE64) || not_before(BE64) || kem_pk(1568) || signature(4627),
+      signing daemonseed/dm/advert/sig/v1 || lp(pubkey) || lp(serial_be) ||
+      lp(not_before_be) || lp(kem_pk); verify(identity_pubkey, bytes) ->
+      Result<VerifiedAdvert, AdvertError> length-gates the whole record BEFORE any
+      ML-DSA call and verifies against the caller-supplied pubkey the address was
+      derived from — the record carries no pubkey. AdvertError separates Length
+      (expected, actual) from Signature (verify-path, uniform — a record signed
+      under another identity fails as a tampered one does), Regressed (seen,
+      highest), Unusable (now, not_before), Signing (local, carries the cause),
+      Entropy and Module. VerifiedAdvert::usable_at(now) is the window a sender may
+      encapsulate in: from not_before - CLOCK_SKEW_SECS (3600) to, exclusive,
+      not_before + 2 * ROTATION_PERIOD_SECS. AdvertReader::accept(advert) ->
+      Result<VerifiedAdvert, AdvertError> keeps the highest serial verified and
+      returns Regressed on a lower one, equal accepted;
+      highest() reads it. One reader per correspondent: it holds no identity binding.
+      AdvertKeys::new(now_unix_secs, fill) opens at serial 0; rotate_if_due(now, fill)
+      -> Result<Rotation, AdvertError> prunes, then rotates once now >= not_before +
+      ROTATION_PERIOD_SECS (one week), retiring the current key and minting the next
+      serial at not_before = now; Rotation is Rotated or Unchanged and is #[must_use],
+      a rotation being published by writing advert_bytes to subkey 0. A retired key's
+      retention runs from the moment it was DUE to stop being current, not from the
+      call, so a late poll does not extend it; prune(now) drops it one further
+      ROTATION_PERIOD_SECS after that moment, and previous_serial() /
+      previous_retired_at() read it. decapsulate(serial, ciphertext) ->
+      Result<Option<AdvertSharedSecret>, AdvertError> selects the current or retained
+      key BY SERIAL; Ok(None) is no key holding that serial and Err is a module
+      refusal. ML-KEM decapsulation uses implicit rejection, so trying both secrets in
+      turn has no failure signal. snapshot() -> AdvertSnapshot { serial, not_before,
+      decapsulation_key, previous: Option<RetiredSnapshot { serial, retired_at,
+      decapsulation_key }> } and restore(snapshot) carry the state across a restart;
+      the snapshot holds secret halves only, the public ones being recoverable from
+      them. advert_bytes(signer) is the canonical encoding of the current key.
+      InspectReport { local_seq, network_seq } is what one subkey's inspect_dht_record
+      under DHTReportScope::SyncSet reported; repair_needed is true when network_seq
+      is absent or differs from local_seq in either direction — the record is
+      world-writable and a self-read is served the local copy, so the sequence number
+      is the only signal. on_poll(signer, report, fetched) ->
+      Result<Vec<AdvertAction>, AdvertError> returns exactly one
+      AdvertAction::Rewrite(bytes) when repair is needed or fetched differs from the
+      canonical encoding, nothing otherwise, and signs nothing when it returns
+      nothing. next_poll_interval(fill) draws from POLL_INTERVAL_MIN (40 min) to
+      POLL_INTERVAL_MAX (60 min) and next_poll_interval_os() is that draw over the OS
+      CSPRNG. encapsulate_to(advert, now, fill) -> HelloEncapsulation { serial,
+      shared_secret, ciphertext } refuses with Unusable outside usable_at, and
+      hello_needs_rewrite(outstanding_serial, observed) is true only when the observed
+      serial is GREATER, so a replayed older advert never sends a hello to a retired
+      key. AdvertOwnerSeed, AdvertDecapKey and AdvertSharedSecret are zeroize-on-drop
+      redacting newtypes. The module holds no clock and performs no I/O: wall time is
+      a u64 of Unix seconds from the caller and entropy is a fill function.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

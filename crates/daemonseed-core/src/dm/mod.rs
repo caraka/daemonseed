@@ -69,6 +69,7 @@ pub mod ack_budget;
 pub mod ack_cadence;
 pub mod ack_record;
 pub mod admission;
+pub mod advert;
 pub mod block_list;
 pub mod collect;
 pub mod contact_cache;

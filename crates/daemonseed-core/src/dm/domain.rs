@@ -68,6 +68,23 @@ macro_rules! dm_labels {
 }
 
 dm_labels! {
+    /// HKDF-Extract salt for the ADVERT's owner-seed derivation, rooted in the
+    /// advertising identity's published ML-DSA-87 public key. Distinct from every
+    /// other salt over that same public input, so two derivations from one key
+    /// cannot collide onto one address. FROZEN.
+    DM_ADVERT_SALT = b"daemonseed/dm/advert/salt/v1";
+
+    /// HKDF-Expand `info` for the advert's Veilid owner seed, derived from the
+    /// identity's full ML-DSA-87 public key. World-derivable by design: anyone
+    /// holding the public key computes the address, which is what makes an
+    /// identity's current ML-KEM-1024 public key findable. FROZEN.
+    DM_ADVERT_OWNER = b"daemonseed/dm/advert/owner/v1";
+
+    /// Signature domain for the [`crate::dm::advert`] record's inner ML-DSA-87
+    /// signature. The identity public key, the serial, the validity start and the
+    /// ML-KEM-1024 public key follow it, each length-prefixed. FROZEN.
+    DM_ADVERT_SIG = b"daemonseed/dm/advert/sig/v1";
+
     /// HKDF-Extract salt for the KEY-RECORD derivation rooted in a published identity
     /// key. Non-empty and normative — no implicit zero-salt. The doorbell derives from
     /// the same kind of input under its own salt ([`DM_DOORBELL_SALT`]); the two must
@@ -480,6 +497,9 @@ mod tests {
         assert_eq!(DM_MSG_AAD, b"daemonseed/dm/msg/aad/v4");
         assert_eq!(DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1");
         assert_eq!(DM_ADDR_ROOT, b"daemonseed/dm/addr/root/v3");
+        assert_eq!(DM_ADVERT_SALT, b"daemonseed/dm/advert/salt/v1");
+        assert_eq!(DM_ADVERT_OWNER, b"daemonseed/dm/advert/owner/v1");
+        assert_eq!(DM_ADVERT_SIG, b"daemonseed/dm/advert/sig/v1");
         assert_eq!(DM_CHAN_ID, b"daemonseed/dm/chanid/v2");
         assert_eq!(DM_PAGE_SALT, b"daemonseed/dm/page/salt/v1");
         assert_eq!(DM_PAGE_ADDR, b"daemonseed/dm/page/addr/v4");
@@ -577,7 +597,7 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 50] = [
+        let pinned: [(&[u8], &[u8]); 53] = [
             (DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3".as_slice()),
             (DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1".as_slice()),
             (
@@ -588,6 +608,9 @@ mod tests {
             (DM_ACK_SEAL, b"daemonseed/dm/ack/seal/v3".as_slice()),
             (DM_ACK_SIG, b"daemonseed/dm/ack/sig/v3".as_slice()),
             (DM_ADDR_ROOT, b"daemonseed/dm/addr/root/v3".as_slice()),
+            (DM_ADVERT_OWNER, b"daemonseed/dm/advert/owner/v1".as_slice()),
+            (DM_ADVERT_SALT, b"daemonseed/dm/advert/salt/v1".as_slice()),
+            (DM_ADVERT_SIG, b"daemonseed/dm/advert/sig/v1".as_slice()),
             (DM_BIND_LT, b"daemonseed/dm/bind/lt/v1".as_slice()),
             (DM_CHAIN_A2B, b"daemonseed/dm/chain/a2b/v2".as_slice()),
             (DM_CHAIN_B2A, b"daemonseed/dm/chain/b2a/v2".as_slice()),
