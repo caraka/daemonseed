@@ -2243,8 +2243,8 @@ modules:
       canonical encoding, nothing otherwise, and signs nothing when it returns
       nothing. next_poll_interval(fill) draws from POLL_INTERVAL_MIN (40 min) to
       POLL_INTERVAL_MAX (60 min) and next_poll_interval_os() is that draw over the OS
-      CSPRNG. encapsulate_to(advert, now, fill) -> HelloEncapsulation { serial,
-      shared_secret, ciphertext } refuses with Unusable outside usable_at, and
+      CSPRNG. encapsulate_to(advert, now, fill) -> Result<HelloEncapsulation,
+      AdvertError> yielding { serial, shared_secret, ciphertext } refuses with Unusable outside usable_at, and
       hello_needs_rewrite(outstanding_serial, observed) is true only when the observed
       serial is GREATER, so a replayed older advert never sends a hello to a retired
       key. AdvertOwnerSeed, AdvertDecapKey and AdvertSharedSecret are zeroize-on-drop
@@ -2679,6 +2679,68 @@ modules:
       - daemonseed_core::profile::config
     iscs:
       - C28
+    added_in: unreleased
+
+  - name: daemonseed_core::dm::advert
+    description: >-
+      The advert record and the key state behind it. An identity's current
+      ML-KEM-1024 public key sits at ADVERT_SUBKEY of a world-derivable
+      ADVERT_SUBKEYS-subkey record under that identity's own ML-DSA-87
+      signature; AdvertKeys rotates it every ROTATION_PERIOD_SECS and retains
+      the key before it for one further period. The module holds no clock and
+      performs no I/O: wall time is a u64 of Unix seconds from the caller and
+      entropy is a fill function.
+    no_std: false
+    depends_on:
+      - daemonseed_core::identity::keys
+      - daemonseed_core::secret_seed
+      - daemonseed_core::dm::domain
+    iscs:
+      - C40
+      - A-C20
+    added_in: unreleased
+
+  - name: daemonseed_core::dm::drop
+    description: >-
+      The world-writable first-contact record. A drop is DROP_SUBKEYS subkeys of
+      DROP_SLOT_LEN bytes holding one sealed hello each; the owner seed derives
+      from the recipient's published identity key, so any sender computes the
+      address and any party may write or erase. The slot is a function of the
+      sealed value r alone, and a hello read from another slot is refused. The
+      module holds no clock and performs no I/O.
+    no_std: false
+    depends_on:
+      - daemonseed_core::dm::advert
+      - daemonseed_core::dm::pow
+      - daemonseed_core::dm::domain
+      - daemonseed_core::aead_envelope
+      - daemonseed_core::secret_seed
+    iscs:
+      - C41
+      - A-C21
+    added_in: unreleased
+
+  - name: daemonseed_core::dm::channel
+    description: >-
+      One direction of a conversation, written only by its owner. A channel is
+      CHANNEL_SUBKEYS subkeys: CONTROL_SUBKEY carries the sealed opening,
+      collection cursor and close flag, and RING_SLOTS message slots carry a
+      header and a sealed body each. The owner seed derives from the writer's
+      identity secret, the peer's identity public key and a generation number.
+      The module holds no clock, performs no I/O, and takes the identity secret
+      as a parameter.
+    no_std: false
+    depends_on:
+      - daemonseed_core::dm::advert
+      - daemonseed_core::dm::domain
+      - daemonseed_core::identity::keys
+      - daemonseed_core::aead_envelope
+      - daemonseed_core::secret_seed
+    iscs:
+      - C39
+      - C42
+      - A-C22
+      - A-C23
     added_in: unreleased
 
   - name: daemonseed_core::backoff
@@ -4891,6 +4953,288 @@ types:
           The file's ordered chunk addresses. The bytes are the
           concatenation of the chunks in this order; each address is the SHA-384
           of that chunk. An empty file is size 0, chunks [].
+
+
+  # ── dm::advert ──────────────────────────────────────────────────────
+  - name: AdvertOwnerSeed
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: >-
+      The Veilid record-owner seed for an identity's advert, ADVERT_OWNER_SEED_LEN
+      bytes, boxed. World-derivable from the identity public key, so holding it
+      confers write access and the record's authority rests on the inner signature.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+  - name: AdvertDecapKey
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: An ML-KEM-1024 decapsulation key an identity holds for one advert serial, boxed.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+  - name: AdvertSharedSecret
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: The ML-KEM-1024 shared secret ss0 an encapsulation to an advert key yields, boxed.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+  - name: VerifiedAdvert
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: >-
+      An advert whose signature verified under the identity public key its address
+      was derived from. Only verify constructs one.
+    fields:
+      - name: serial
+        type: u64
+        description: The rotation counter this advert asserts.
+      - name: not_before
+        type: u64
+        description: Unix seconds at which this advert's key becomes current.
+      - name: kem_pk
+        type: "Box<[u8; ml_kem::EK_LEN]>"
+        description: The identity's current ML-KEM-1024 public key.
+  - name: AdvertReader
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: >-
+      Highest-serial-wins state for one correspondent's advert. Holds no identity
+      binding, so a caller keeps one per correspondent.
+  - name: Rotation
+    module: daemonseed_core::dm::advert
+    kind: enum
+    description: Whether rotate_if_due minted a new key. #[must_use].
+    variants:
+      - name: Rotated
+        description: A new serial is current and advert_bytes must be written to ADVERT_SUBKEY.
+      - name: Unchanged
+        description: The current key is still current.
+  - name: AdvertSnapshot
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: >-
+      AdvertKeys state across a restart. Holds the secret halves only; the public
+      ones are recoverable from them.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+    fields:
+      - name: serial
+        type: u64
+        description: The current key's serial.
+      - name: not_before
+        type: u64
+        description: The current key's validity start.
+      - name: decapsulation_key
+        type: AdvertDecapKey
+        description: The current key's decapsulation half.
+      - name: previous
+        type: "Option<RetiredSnapshot>"
+        description: The retained previous key, absent before the first rotation and after a prune.
+  - name: RetiredSnapshot
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: The retained previous key within an AdvertSnapshot.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+    fields:
+      - name: serial
+        type: u64
+        description: The retired key's serial.
+      - name: retired_at
+        type: u64
+        description: Unix seconds at which the key was due to stop being current.
+      - name: decapsulation_key
+        type: AdvertDecapKey
+        description: The retired key's decapsulation half.
+  - name: AdvertKeys
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: >-
+      The current advert key and the retained previous one. Rotates on
+      ROTATION_PERIOD_SECS, decapsulates by serial across both, and snapshots to
+      AdvertSnapshot. Its Debug prints no key material.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+  - name: InspectReport
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: >-
+      What one subkey's inspect_dht_record under DHTReportScope::SyncSet reported.
+    fields:
+      - name: local_seq
+        type: "Option<u64>"
+        description: The sequence number of the local copy, absent when there is none.
+      - name: network_seq
+        type: "Option<u64>"
+        description: The sequence number the network holds, absent when the subkey is unwritten or evicted.
+  - name: AdvertAction
+    module: daemonseed_core::dm::advert
+    kind: enum
+    description: What on_poll asks the caller to do.
+    variants:
+      - name: Rewrite
+        description: "Rewrite(Vec<u8>) — write these canonical bytes to ADVERT_SUBKEY."
+  - name: HelloEncapsulation
+    module: daemonseed_core::dm::advert
+    kind: struct
+    description: One encapsulation to an advert key, the input a drop hello is sealed from.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+    fields:
+      - name: serial
+        type: u64
+        description: The advert serial encapsulated to.
+      - name: shared_secret
+        type: AdvertSharedSecret
+        description: ss0, the secret both parties derive the hello key from.
+      - name: ciphertext
+        type: "Box<[u8; ml_kem::CT_LEN]>"
+        description: The ML-KEM-1024 ciphertext the hello carries in the clear.
+
+  # ── dm::drop ────────────────────────────────────────────────────────
+  - name: DropOwnerSeed
+    module: daemonseed_core::dm::drop
+    kind: struct
+    description: >-
+      The Veilid record-owner seed for an identity's drop, DROP_OWNER_SEED_LEN
+      bytes, boxed. World-derivable and therefore world-writable: a slot's
+      contents are never trusted for being where they are.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+  - name: HelloKey
+    module: daemonseed_core::dm::drop
+    kind: struct
+    description: The AES-256 key a hello is sealed under, HKDF(ss0, daemonseed/dm/drop/hello/v1), boxed.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+  - name: Hello
+    module: daemonseed_core::dm::drop
+    kind: struct
+    description: The recovered contents of a hello that opened and matched its slot.
+    fields:
+      - name: lookup_key
+        type: "[u8; HELLO_LOOKUP_KEY_LEN]"
+        description: The sender's channel record lookup key.
+      - name: r
+        type: "[u8; HELLO_R_LEN]"
+        description: The value that picks the slot.
+  - name: ReadBack
+    module: daemonseed_core::dm::drop
+    kind: enum
+    description: What one read-back of a written slot settled. #[must_use].
+    variants:
+      - name: Landed
+        description: The bytes found are the bytes written.
+      - name: Clobbered
+        description: Anything else, an absent value included; the sender draws a fresh r and rewrites.
+  - name: HelloAttempt
+    module: daemonseed_core::dm::drop
+    kind: struct
+    description: >-
+      One sender's outstanding hello: the r it drew, the slot that r picks, and how
+      many times the pair has been repicked after a Clobbered read-back.
+
+  # ── dm::channel ─────────────────────────────────────────────────────
+  - name: ChannelOwnerSeed
+    module: daemonseed_core::dm::channel
+    kind: struct
+    description: >-
+      The Veilid record-owner seed for one direction of a conversation,
+      CHANNEL_OWNER_SEED_LEN bytes, boxed. The VLD0 secret key, so equal seeds
+      address equal records.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+  - name: ControlKey
+    module: daemonseed_core::dm::channel
+    kind: struct
+    description: >-
+      The AES-256 key the control subkey is sealed under,
+      HKDF(ss_hello, daemonseed/dm/channel/control/v1), boxed. It does not step
+      per turn.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+  - name: Ring
+    module: daemonseed_core::dm::channel
+    kind: struct
+    description: >-
+      The send side of the message ring: the next sequence to reserve and the
+      peer's collection cursor. Backpressure at RING_SLOTS uncollected.
+  - name: MessageHeader
+    module: daemonseed_core::dm::channel
+    kind: struct
+    description: >-
+      The clear header heading one message slot. Its Debug renders the turn fields
+      as present or absent rather than as key material.
+    fields:
+      - name: device_id
+        type: u32
+        description: Which device of the writer's wrote this. Reserved; a single-device installation writes DEVICE_ID_SINGLE_DEVICE.
+      - name: n
+        type: u64
+        description: The writer's turn number this message's key came from.
+      - name: m
+        type: u64
+        description: The peer turn number the writer had read when it started turn n.
+      - name: seq
+        type: u64
+        description: The message's sequence within this direction.
+      - name: cursor
+        type: u64
+        description: How many of the peer's messages the writer has collected contiguously from sequence 0.
+      - name: kem_ct
+        type: "Option<Box<[u8; ml_kem::CT_LEN]>>"
+        description: The turn's ML-KEM ciphertext, on a turn's first message only.
+      - name: kem_pk
+        type: "Option<Box<[u8; ml_kem::EK_LEN]>>"
+        description: The writer's fresh ratchet public key, on a turn's first message only.
+  - name: ChannelOpening
+    module: daemonseed_core::dm::channel
+    kind: struct
+    description: >-
+      The statement in the control subkey that binds this record to its writer,
+      its recipient, the first ratchet key and the advert serial encapsulated to.
+      Its Debug prints lengths rather than key material. decode does not verify;
+      verify does.
+    fields:
+      - name: writer_identity_pk
+        type: "Box<[u8; ml_dsa::PK_LEN]>"
+        description: The writer's long-term identity public key, which the signature verifies under.
+      - name: recipient_identity_pk
+        type: "Box<[u8; ml_dsa::PK_LEN]>"
+        description: The identity this direction is written to.
+      - name: first_ratchet_pk
+        type: "Box<[u8; ml_kem::EK_LEN]>"
+        description: The writer's first ratchet public key.
+      - name: advert_serial
+        type: u64
+        description: The advert serial the conversation's hello encapsulated to.
+      - name: signature
+        type: "Box<[u8; ml_dsa::SIG_LEN]>"
+        description: ML-DSA-87 signature over opening_signing_input.
+  - name: Control
+    module: daemonseed_core::dm::channel
+    kind: struct
+    description: The sealed contents of CONTROL_SUBKEY.
+    fields:
+      - name: opening
+        type: "Option<ChannelOpening>"
+        description: The channel opening, present until the conversation is established.
+      - name: collected_cursor
+        type: u64
+        description: How many of the peer's messages the writer has collected contiguously, when no reply carries it.
+      - name: closed
+        type: bool
+        description: Whether the writer has closed this direction.
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions — every public function. Each references its module.
@@ -8290,6 +8634,973 @@ functions:
       type: i64
       description: sent_unix_ms if within [now − 24h, now + 120s], else the nearest window edge.
 
+
+  # ── dm::advert ──────────────────────────────────────────────────────
+  - name: "advert::derive_owner_seed"
+    module: daemonseed_core::dm::advert
+    description: >-
+      Derives the world-derivable Veilid owner seed for an identity's advert.
+      Every reader and the owner compute the same value, which is what makes the
+      record findable from a public key alone.
+    signature: "pub fn derive_owner_seed(identity_pubkey: &[u8; ml_dsa::PK_LEN]) -> Result<AdvertOwnerSeed, AdvertError>"
+    parameters:
+      - name: identity_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The identity's long-term ML-DSA-87 public key.
+    returns:
+      type: "Result<AdvertOwnerSeed, AdvertError>"
+      description: The owner seed, or Kdf / Module on a crypto-module refusal.
+  - name: "advert::signing_input"
+    module: daemonseed_core::dm::advert
+    description: >-
+      Builds the advert signature preimage, daemonseed/dm/advert/sig/v1 followed
+      by the identity public key, the serial, the validity start and the
+      ML-KEM-1024 public key, each length-prefixed.
+    signature: "pub fn signing_input(identity_pubkey: &[u8; ml_dsa::PK_LEN], serial: u64, not_before: u64, kem_pk: &[u8; ml_kem::EK_LEN]) -> Vec<u8>"
+    parameters:
+      - name: identity_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The signing identity's public key.
+      - name: serial
+        type: u64
+        direction: in
+        description: The rotation counter the advert asserts.
+      - name: not_before
+        type: u64
+        direction: in
+        description: Unix seconds at which the key becomes current.
+      - name: kem_pk
+        type: "&[u8; ml_kem::EK_LEN]"
+        direction: in
+        description: The ML-KEM-1024 public key being published.
+    returns:
+      type: "Vec<u8>"
+      description: The preimage both build and verify sign over.
+  - name: "advert::build"
+    module: daemonseed_core::dm::advert
+    description: Emits ADVERT_LEN bytes, serial || not_before || kem_pk || signature, signed under the identity key.
+    signature: "pub fn build(signer: &SignKeypair, serial: u64, not_before: u64, kem_pk: &[u8; ml_kem::EK_LEN]) -> Result<Vec<u8>, AdvertError>"
+    parameters:
+      - name: signer
+        type: "&SignKeypair"
+        direction: in
+        description: The identity's long-term signing keypair.
+      - name: serial
+        type: u64
+        direction: in
+        description: The rotation counter the advert asserts.
+      - name: not_before
+        type: u64
+        direction: in
+        description: Unix seconds at which the key becomes current.
+      - name: kem_pk
+        type: "&[u8; ml_kem::EK_LEN]"
+        direction: in
+        description: The ML-KEM-1024 public key being published.
+    returns:
+      type: "Result<Vec<u8>, AdvertError>"
+      description: The record bytes, or Signing on a local signature failure.
+  - name: "advert::verify"
+    module: daemonseed_core::dm::advert
+    description: >-
+      Length-gates the whole record before any ML-DSA call and verifies it
+      against the caller-supplied public key the address was derived from. The
+      record carries no public key.
+    signature: "pub fn verify(identity_pubkey: &[u8; ml_dsa::PK_LEN], bytes: &[u8]) -> Result<VerifiedAdvert, AdvertError>"
+    parameters:
+      - name: identity_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The identity public key the record's address was derived from.
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: The bytes read from ADVERT_SUBKEY.
+    returns:
+      type: "Result<VerifiedAdvert, AdvertError>"
+      description: The verified advert, Length on a wrong width, or Signature — uniform across tampering and a foreign signer.
+  - name: "advert::next_poll_interval"
+    module: daemonseed_core::dm::advert
+    description: Draws the next advert poll delay from POLL_INTERVAL_MIN to POLL_INTERVAL_MAX.
+    signature: "pub fn next_poll_interval(mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>) -> Duration"
+    parameters:
+      - name: fill
+        type: "impl FnMut(&mut [u8]) -> Result<(), ()>"
+        direction: in
+        description: The caller's entropy source; the minimum is used when it refuses.
+    returns:
+      type: Duration
+      description: The delay before the next poll.
+  - name: "advert::next_poll_interval_os"
+    module: daemonseed_core::dm::advert
+    description: next_poll_interval over the OS CSPRNG.
+    signature: "pub fn next_poll_interval_os() -> Duration"
+    parameters: []
+    returns:
+      type: Duration
+      description: The delay before the next poll.
+  - name: "advert::repair_needed"
+    module: daemonseed_core::dm::advert
+    description: >-
+      True when network_seq is absent or differs from local_seq in either
+      direction. The record is world-writable and a self-read is served the local
+      copy, so the sequence number is the only signal.
+    signature: "pub fn repair_needed(report: &InspectReport) -> bool"
+    parameters:
+      - name: report
+        type: "&InspectReport"
+        direction: in
+        description: What one subkey's inspect reported.
+    returns:
+      type: bool
+      description: Whether the advert must be rewritten.
+  - name: "advert::encapsulate_to"
+    module: daemonseed_core::dm::advert
+    description: Encapsulates to a verified advert's key, refusing Unusable outside VerifiedAdvert::usable_at.
+    signature: "pub fn encapsulate_to(advert: &VerifiedAdvert, now: u64, mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>) -> Result<HelloEncapsulation, AdvertError>"
+    parameters:
+      - name: advert
+        type: "&VerifiedAdvert"
+        direction: in
+        description: The correspondent's verified advert.
+      - name: now
+        type: u64
+        direction: in
+        description: Unix seconds, from the caller.
+      - name: fill
+        type: "impl FnMut(&mut [u8]) -> Result<(), ()>"
+        direction: in
+        description: The caller's entropy source.
+    returns:
+      type: "Result<HelloEncapsulation, AdvertError>"
+      description: The serial, shared secret and ciphertext, Unusable outside the window, or Entropy.
+  - name: "advert::hello_needs_rewrite"
+    module: daemonseed_core::dm::advert
+    description: >-
+      True only when the observed serial is greater than the outstanding one, so a
+      replayed older advert never sends a hello to a retired key.
+    signature: "pub fn hello_needs_rewrite(outstanding_serial: u64, observed: &VerifiedAdvert) -> bool"
+    parameters:
+      - name: outstanding_serial
+        type: u64
+        direction: in
+        description: The serial the outstanding hello was sealed to.
+      - name: observed
+        type: "&VerifiedAdvert"
+        direction: in
+        description: The advert just verified.
+    returns:
+      type: bool
+      description: Whether the hello must be resealed and rewritten.
+  - name: "VerifiedAdvert::usable_at"
+    module: daemonseed_core::dm::advert
+    description: >-
+      The window a sender may encapsulate in: from not_before - CLOCK_SKEW_SECS
+      to, exclusive, not_before + 2 * ROTATION_PERIOD_SECS.
+    signature: "pub fn usable_at(&self, now: u64) -> bool"
+    parameters:
+      - name: now
+        type: u64
+        direction: in
+        description: Unix seconds, from the caller.
+    returns:
+      type: bool
+      description: Whether the key may be encapsulated to at that moment.
+  - name: "AdvertReader::new"
+    module: daemonseed_core::dm::advert
+    description: Opens a reader holding no serial yet.
+    signature: "pub fn new() -> Self"
+    parameters: []
+    returns:
+      type: AdvertReader
+      description: A reader for one correspondent.
+  - name: "AdvertReader::highest"
+    module: daemonseed_core::dm::advert
+    description: The highest serial accepted so far.
+    signature: "pub fn highest(&self) -> Option<u64>"
+    parameters: []
+    returns:
+      type: "Option<u64>"
+      description: The serial, absent before the first accept.
+  - name: "AdvertReader::accept"
+    module: daemonseed_core::dm::advert
+    description: >-
+      Keeps the highest serial verified and returns Regressed on a lower one; an
+      equal serial is accepted.
+    signature: "pub fn accept(&mut self, advert: VerifiedAdvert) -> Result<VerifiedAdvert, AdvertError>"
+    parameters:
+      - name: advert
+        type: VerifiedAdvert
+        direction: in
+        description: A just-verified advert for this correspondent.
+    returns:
+      type: "Result<VerifiedAdvert, AdvertError>"
+      description: The advert back, or Regressed { seen, highest }.
+  - name: "Rotation::happened"
+    module: daemonseed_core::dm::advert
+    description: Whether a rotation minted a new key.
+    signature: "pub fn happened(self) -> bool"
+    parameters: []
+    returns:
+      type: bool
+      description: True for Rotated.
+  - name: "AdvertKeys::new"
+    module: daemonseed_core::dm::advert
+    description: Opens the key state at serial 0 with not_before set to now.
+    signature: "pub fn new(now: u64, fill: impl FnMut(&mut [u8]) -> Result<(), ()>) -> Result<Self, AdvertError>"
+    parameters:
+      - name: now
+        type: u64
+        direction: in
+        description: Unix seconds, from the caller.
+      - name: fill
+        type: "impl FnMut(&mut [u8]) -> Result<(), ()>"
+        direction: in
+        description: The caller's entropy source for ML-KEM key generation.
+    returns:
+      type: "Result<AdvertKeys, AdvertError>"
+      description: The key state, or Entropy / Module.
+  - name: "AdvertKeys::serial"
+    module: daemonseed_core::dm::advert
+    description: The current key's serial.
+    signature: "pub fn serial(&self) -> u64"
+    parameters: []
+    returns:
+      type: u64
+      description: The rotation counter.
+  - name: "AdvertKeys::not_before"
+    module: daemonseed_core::dm::advert
+    description: The current key's validity start.
+    signature: "pub fn not_before(&self) -> u64"
+    parameters: []
+    returns:
+      type: u64
+      description: Unix seconds.
+  - name: "AdvertKeys::encapsulation_key"
+    module: daemonseed_core::dm::advert
+    description: The current key's ML-KEM-1024 public half, the value an advert publishes.
+    signature: "pub fn encapsulation_key(&self) -> &[u8; ml_kem::EK_LEN]"
+    parameters: []
+    returns:
+      type: "&[u8; ml_kem::EK_LEN]"
+      description: The public key.
+  - name: "AdvertKeys::previous_serial"
+    module: daemonseed_core::dm::advert
+    description: The retained previous key's serial.
+    signature: "pub fn previous_serial(&self) -> Option<u64>"
+    parameters: []
+    returns:
+      type: "Option<u64>"
+      description: The serial, absent before the first rotation and after a prune.
+  - name: "AdvertKeys::previous_retired_at"
+    module: daemonseed_core::dm::advert
+    description: >-
+      The moment the retained key was due to stop being current. Retention runs
+      from there, not from the call, so a late poll does not extend it.
+    signature: "pub fn previous_retired_at(&self) -> Option<u64>"
+    parameters: []
+    returns:
+      type: "Option<u64>"
+      description: Unix seconds, absent when no key is retained.
+  - name: "AdvertKeys::snapshot"
+    module: daemonseed_core::dm::advert
+    description: The state a caller persists across a restart.
+    signature: "pub fn snapshot(&self) -> AdvertSnapshot"
+    parameters: []
+    returns:
+      type: AdvertSnapshot
+      description: The secret halves, serials and validity times.
+  - name: "AdvertKeys::restore"
+    module: daemonseed_core::dm::advert
+    description: Rebuilds the key state from a snapshot, recovering the public halves from the secret ones.
+    signature: "pub fn restore(snapshot: AdvertSnapshot) -> Self"
+    parameters:
+      - name: snapshot
+        type: AdvertSnapshot
+        direction: in
+        description: A snapshot taken before the restart.
+    returns:
+      type: AdvertKeys
+      description: The key state as it stood.
+  - name: "AdvertKeys::prune"
+    module: daemonseed_core::dm::advert
+    description: >-
+      Drops the retained key one ROTATION_PERIOD_SECS after the moment it was due
+      to stop being current.
+    signature: "pub fn prune(&mut self, now: u64)"
+    parameters:
+      - name: now
+        type: u64
+        direction: in
+        description: Unix seconds, from the caller.
+    returns:
+      type: "()"
+      description: Nothing; the retained key is dropped when its retention has run out.
+  - name: "AdvertKeys::rotate_if_due"
+    module: daemonseed_core::dm::advert
+    description: >-
+      Prunes, then rotates once now is at or past not_before + ROTATION_PERIOD_SECS,
+      retiring the current key and minting the next serial at not_before = now.
+    signature: "pub fn rotate_if_due(&mut self, now: u64, fill: impl FnMut(&mut [u8]) -> Result<(), ()>) -> Result<Rotation, AdvertError>"
+    parameters:
+      - name: now
+        type: u64
+        direction: in
+        description: Unix seconds, from the caller.
+      - name: fill
+        type: "impl FnMut(&mut [u8]) -> Result<(), ()>"
+        direction: in
+        description: The caller's entropy source for ML-KEM key generation.
+    returns:
+      type: "Result<Rotation, AdvertError>"
+      description: Rotated or Unchanged, #[must_use]; a Rotated is published by writing advert_bytes to ADVERT_SUBKEY.
+  - name: "AdvertKeys::decapsulate"
+    module: daemonseed_core::dm::advert
+    description: >-
+      Selects the current or retained key by serial. ML-KEM decapsulation uses
+      implicit rejection, so trying both secrets in turn carries no failure signal.
+    signature: "pub fn decapsulate(&self, serial: u64, ciphertext: &[u8; ml_kem::CT_LEN]) -> Result<Option<AdvertSharedSecret>, AdvertError>"
+    parameters:
+      - name: serial
+        type: u64
+        direction: in
+        description: The serial the sender encapsulated to.
+      - name: ciphertext
+        type: "&[u8; ml_kem::CT_LEN]"
+        direction: in
+        description: The ML-KEM-1024 ciphertext from the hello.
+    returns:
+      type: "Result<Option<AdvertSharedSecret>, AdvertError>"
+      description: The shared secret, Ok(None) when no key holds that serial, Err on a module refusal.
+  - name: "AdvertKeys::advert_bytes"
+    module: daemonseed_core::dm::advert
+    description: The canonical encoding of the current key, the bytes ADVERT_SUBKEY must hold.
+    signature: "pub fn advert_bytes(&self, signer: &SignKeypair) -> Result<Vec<u8>, AdvertError>"
+    parameters:
+      - name: signer
+        type: "&SignKeypair"
+        direction: in
+        description: The identity's long-term signing keypair.
+    returns:
+      type: "Result<Vec<u8>, AdvertError>"
+      description: ADVERT_LEN bytes, or Signing.
+  - name: "AdvertKeys::on_poll"
+    module: daemonseed_core::dm::advert
+    description: >-
+      Returns exactly one AdvertAction::Rewrite when repair is needed or the
+      fetched bytes differ from the canonical encoding, and nothing otherwise;
+      it signs nothing when it returns nothing.
+    signature: "pub fn on_poll(&self, signer: &SignKeypair, report: &InspectReport, fetched: Option<&[u8]>) -> Result<Vec<AdvertAction>, AdvertError>"
+    parameters:
+      - name: signer
+        type: "&SignKeypair"
+        direction: in
+        description: The identity's long-term signing keypair.
+      - name: report
+        type: "&InspectReport"
+        direction: in
+        description: What the subkey's inspect reported.
+      - name: fetched
+        type: "Option<&[u8]>"
+        direction: in
+        description: The bytes the poll read back, absent when none were fetched.
+    returns:
+      type: "Result<Vec<AdvertAction>, AdvertError>"
+      description: The single rewrite to perform, or an empty vector.
+
+  # ── dm::drop ────────────────────────────────────────────────────────
+  - name: "drop::derive_owner_seed"
+    module: daemonseed_core::dm::drop
+    description: >-
+      Derives the drop's Veilid owner seed from the recipient's published identity
+      key. World-derivable, and therefore world-writable: a stranger holding only
+      the recipient's identity reaches it, which is what first contact is.
+    signature: "pub fn derive_owner_seed(recipient_pubkey: &[u8; ml_dsa::PK_LEN]) -> Result<DropOwnerSeed, DropError>"
+    parameters:
+      - name: recipient_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The recipient's long-term ML-DSA-87 public key.
+    returns:
+      type: "Result<DropOwnerSeed, DropError>"
+      description: The owner seed, or Kdf / Module.
+  - name: "drop::hello_key"
+    module: daemonseed_core::dm::drop
+    description: Derives the AEAD key a hello is sealed under, HKDF(ss0, daemonseed/dm/drop/hello/v1).
+    signature: "pub fn hello_key(ss0: &advert::AdvertSharedSecret) -> Result<HelloKey, DropError>"
+    parameters:
+      - name: ss0
+        type: "&advert::AdvertSharedSecret"
+        direction: in
+        description: The secret from encapsulating to the recipient's advert key.
+    returns:
+      type: "Result<HelloKey, DropError>"
+      description: The hello key, or Kdf / Module.
+  - name: "drop::hello_aad"
+    module: daemonseed_core::dm::drop
+    description: >-
+      Builds the associated data a hello is sealed under,
+      daemonseed/dm/drop/aad/v1 || lp(kem_ct) || lp(recipient pubkey).
+    signature: "pub fn hello_aad(kem_ct: &[u8; ml_kem::CT_LEN], recipient_pubkey: &[u8; ml_dsa::PK_LEN]) -> Vec<u8>"
+    parameters:
+      - name: kem_ct
+        type: "&[u8; ml_kem::CT_LEN]"
+        direction: in
+        description: The hello's ML-KEM-1024 ciphertext.
+      - name: recipient_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The recipient's identity public key.
+    returns:
+      type: "Vec<u8>"
+      description: The associated data both seal_hello and open_hello use.
+  - name: "drop::pow_input"
+    module: daemonseed_core::dm::drop
+    description: >-
+      Builds the tag preimage, daemonseed/dm/drop/pow/v1 || lp(kem_ct) || lp(r) ||
+      lp(recipient pubkey).
+    signature: "pub fn pow_input(kem_ct: &[u8; ml_kem::CT_LEN], r: &[u8; HELLO_R_LEN], recipient_pubkey: &[u8; ml_dsa::PK_LEN]) -> Vec<u8>"
+    parameters:
+      - name: kem_ct
+        type: "&[u8; ml_kem::CT_LEN]"
+        direction: in
+        description: The hello's ML-KEM-1024 ciphertext.
+      - name: r
+        type: "&[u8; HELLO_R_LEN]"
+        direction: in
+        description: The value that picks the slot.
+      - name: recipient_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The recipient's identity public key.
+    returns:
+      type: "Vec<u8>"
+      description: The preimage pow_tag hashes.
+  - name: "drop::pow_tag"
+    module: daemonseed_core::dm::drop
+    description: >-
+      The first DROP_POW_TAG_LEN bytes of SHA-384 over pow_input. Raising
+      DROP_POW_BITS is the whole of raising the difficulty.
+    signature: "pub fn pow_tag(kem_ct: &[u8; ml_kem::CT_LEN], r: &[u8; HELLO_R_LEN], recipient_pubkey: &[u8; ml_dsa::PK_LEN]) -> Result<[u8; DROP_POW_TAG_LEN], DropError>"
+    parameters:
+      - name: kem_ct
+        type: "&[u8; ml_kem::CT_LEN]"
+        direction: in
+        description: The hello's ML-KEM-1024 ciphertext.
+      - name: r
+        type: "&[u8; HELLO_R_LEN]"
+        direction: in
+        description: The value that picks the slot.
+      - name: recipient_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The recipient's identity public key.
+    returns:
+      type: "Result<[u8; DROP_POW_TAG_LEN], DropError>"
+      description: The tag, or Module.
+  - name: "drop::slot_for"
+    module: daemonseed_core::dm::drop
+    description: >-
+      The last byte of SHA-384 over daemonseed/dm/drop/slot/v1 || lp(r), reduced
+      mod DROP_SUBKEYS. Unbiased because DROP_SUBKEYS divides 2^8 exactly.
+    signature: "pub fn slot_for(r: &[u8; HELLO_R_LEN]) -> Result<u16, DropError>"
+    parameters:
+      - name: r
+        type: "&[u8; HELLO_R_LEN]"
+        direction: in
+        description: The value that picks the slot.
+    returns:
+      type: "Result<u16, DropError>"
+      description: The subkey the hello belongs in, or Module.
+  - name: "drop::repick"
+    module: daemonseed_core::dm::drop
+    description: Draws a fresh r, which moves the hello to a different slot.
+    signature: "pub fn repick(mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>) -> Result<[u8; HELLO_R_LEN], DropError>"
+    parameters:
+      - name: fill
+        type: "impl FnMut(&mut [u8]) -> Result<(), ()>"
+        direction: in
+        description: The caller's entropy source.
+    returns:
+      type: "Result<[u8; HELLO_R_LEN], DropError>"
+      description: The fresh r, or Entropy.
+  - name: "drop::seal_hello"
+    module: daemonseed_core::dm::drop
+    description: >-
+      Emits HELLO_LEN bytes, kem_ct || nonce || ciphertext || tag || pow_tag,
+      sealing the channel lookup key and r under the hello key.
+    signature: "pub fn seal_hello(encap: &advert::HelloEncapsulation, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], r: &[u8; HELLO_R_LEN], recipient_pubkey: &[u8; ml_dsa::PK_LEN]) -> Result<Vec<u8>, DropError>"
+    parameters:
+      - name: encap
+        type: "&advert::HelloEncapsulation"
+        direction: in
+        description: The encapsulation to the recipient's advert key.
+      - name: lookup_key
+        type: "&[u8; HELLO_LOOKUP_KEY_LEN]"
+        direction: in
+        description: The sender's own channel record lookup key.
+      - name: r
+        type: "&[u8; HELLO_R_LEN]"
+        direction: in
+        description: The value that picks the slot.
+      - name: recipient_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The recipient's identity public key, bound by the associated data and the tag.
+    returns:
+      type: "Result<Vec<u8>, DropError>"
+      description: The hello bytes, or Kdf / Entropy / Module.
+  - name: "drop::open_hello"
+    module: daemonseed_core::dm::drop
+    description: >-
+      Length-gates to HELLO_LEN, shape-checks the tag against DROP_POW_BITS, opens
+      the seal, recomputes the tag over the recovered r, and refuses SlotMismatch
+      when slot_for(r) is not the slot the bytes were read from, so a hello copied
+      into another slot does not open there.
+    signature: "pub fn open_hello(ss0: &advert::AdvertSharedSecret, bytes: &[u8], recipient_pubkey: &[u8; ml_dsa::PK_LEN], slot: u16) -> Result<Hello, DropError>"
+    parameters:
+      - name: ss0
+        type: "&advert::AdvertSharedSecret"
+        direction: in
+        description: The secret recovered by decapsulating the hello's ciphertext.
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: The slot's contents.
+      - name: recipient_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The recipient's identity public key.
+      - name: slot
+        type: u16
+        direction: in
+        description: The subkey the bytes were read from.
+    returns:
+      type: "Result<Hello, DropError>"
+      description: The lookup key and r, or Length / BadTag / Aead — uniform over wrong ss0, tampering and AAD mismatch — or SlotMismatch { expected, found }.
+  - name: "drop::after_read_back"
+    module: daemonseed_core::dm::drop
+    description: Settles one read-back of a written slot.
+    signature: "pub fn after_read_back(written: &[u8], found: Option<&[u8]>) -> ReadBack"
+    parameters:
+      - name: written
+        type: "&[u8]"
+        direction: in
+        description: The bytes the sender wrote.
+      - name: found
+        type: "Option<&[u8]>"
+        direction: in
+        description: The bytes the read returned, absent when the subkey held nothing.
+    returns:
+      type: ReadBack
+      description: Landed only when found is Some(written), Clobbered otherwise. #[must_use].
+  - name: "HelloAttempt::new"
+    module: daemonseed_core::dm::drop
+    description: Opens an attempt on the slot the given r picks.
+    signature: "pub fn new(r: [u8; HELLO_R_LEN]) -> Result<Self, DropError>"
+    parameters:
+      - name: r
+        type: "[u8; HELLO_R_LEN]"
+        direction: in
+        description: The value that picks the slot.
+    returns:
+      type: "Result<HelloAttempt, DropError>"
+      description: The attempt, or Module from slot_for.
+  - name: "HelloAttempt::r"
+    module: daemonseed_core::dm::drop
+    description: The r this attempt currently holds.
+    signature: "pub fn r(&self) -> &[u8; HELLO_R_LEN]"
+    parameters: []
+    returns:
+      type: "&[u8; HELLO_R_LEN]"
+      description: The value the hello is sealed with and the slot derives from.
+  - name: "HelloAttempt::slot"
+    module: daemonseed_core::dm::drop
+    description: The subkey this attempt writes to.
+    signature: "pub fn slot(&self) -> u16"
+    parameters: []
+    returns:
+      type: u16
+      description: slot_for of the current r.
+  - name: "HelloAttempt::repicks"
+    module: daemonseed_core::dm::drop
+    description: How many times a Clobbered read-back has moved this attempt to a fresh r.
+    signature: "pub fn repicks(&self) -> u32"
+    parameters: []
+    returns:
+      type: u32
+      description: The repick count.
+  - name: "HelloAttempt::read_back"
+    module: daemonseed_core::dm::drop
+    description: >-
+      Settles one read-back and, on Clobbered, moves to a fresh r and slot and
+      counts the repick.
+    signature: "pub fn read_back(&mut self, written: &[u8], found: Option<&[u8]>, fill: impl FnMut(&mut [u8]) -> Result<(), ()>) -> Result<ReadBack, DropError>"
+    parameters:
+      - name: written
+        type: "&[u8]"
+        direction: in
+        description: The bytes the sender wrote.
+      - name: found
+        type: "Option<&[u8]>"
+        direction: in
+        description: The bytes the read returned.
+      - name: fill
+        type: "impl FnMut(&mut [u8]) -> Result<(), ()>"
+        direction: in
+        description: The caller's entropy source, used only on a Clobbered.
+    returns:
+      type: "Result<ReadBack, DropError>"
+      description: What the read-back settled, or Entropy / Module from the repick.
+
+  # ── dm::channel ─────────────────────────────────────────────────────
+  - name: "channel::slot_for"
+    module: daemonseed_core::dm::channel
+    description: The ring subkey a sequence writes to, 1 + (seq mod RING_SLOTS), so CONTROL_SUBKEY is never taken.
+    signature: "pub fn slot_for(seq: u64) -> u16"
+    parameters:
+      - name: seq
+        type: u64
+        direction: in
+        description: The message's sequence within this direction.
+    returns:
+      type: u16
+      description: The subkey holding that message.
+  - name: "channel::derive_owner_seed"
+    module: daemonseed_core::dm::channel
+    description: >-
+      Derives the channel's Veilid owner seed from the writer's identity seed, the
+      peer's identity public key and the generation. The seed is the VLD0 secret
+      key and the lookup key derives from its public half, so equal seeds address
+      equal records.
+    signature: "pub fn derive_owner_seed(identity_seed: &[u8; ML_DSA_SEED_LEN], peer_identity_pk: &[u8; ml_dsa::PK_LEN], generation: u64) -> Result<ChannelOwnerSeed, ChannelError>"
+    parameters:
+      - name: identity_seed
+        type: "&[u8; ML_DSA_SEED_LEN]"
+        direction: in
+        description: The writer's own ML-DSA-87 seed.
+      - name: peer_identity_pk
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The correspondent's identity public key.
+      - name: generation
+        type: u64
+        direction: in
+        description: The conversation generation, which moves the record on a re-establishment.
+    returns:
+      type: "Result<ChannelOwnerSeed, ChannelError>"
+      description: The owner seed, or Kdf / Module.
+  - name: "channel::control_key"
+    module: daemonseed_core::dm::channel
+    description: >-
+      Derives the key the control subkey is sealed under,
+      HKDF(ss_hello, daemonseed/dm/channel/control/v1). It does not step per turn.
+    signature: "pub fn control_key(ss_hello: &advert::AdvertSharedSecret) -> Result<ControlKey, ChannelError>"
+    parameters:
+      - name: ss_hello
+        type: "&advert::AdvertSharedSecret"
+        direction: in
+        description: The secret the conversation's hello established.
+    returns:
+      type: "Result<ControlKey, ChannelError>"
+      description: The control key, or Kdf / Module.
+  - name: "channel::control_aad"
+    module: daemonseed_core::dm::channel
+    description: The associated data the control record is sealed under.
+    signature: "pub fn control_aad() -> Vec<u8>"
+    parameters: []
+    returns:
+      type: "Vec<u8>"
+      description: The control subkey's domain label.
+  - name: "channel::message_aad"
+    module: daemonseed_core::dm::channel
+    description: >-
+      daemonseed/dm/channel/msg-aad/v1 followed by the encoded header, the
+      associated data a message body is sealed under, so a rewritten clear field
+      leaves a body that does not open.
+    signature: "pub fn message_aad(header: &MessageHeader) -> Vec<u8>"
+    parameters:
+      - name: header
+        type: "&MessageHeader"
+        direction: in
+        description: The header that will head the slot.
+    returns:
+      type: "Vec<u8>"
+      description: The associated data for the body seal.
+  - name: "channel::opening_signing_input"
+    module: daemonseed_core::dm::channel
+    description: >-
+      Builds the opening's signature preimage, daemonseed/dm/channel/opening-sig/v1
+      followed by the writer public key, the recipient public key, the first ratchet
+      public key and the advert serial, each length-prefixed.
+    signature: "pub fn opening_signing_input(writer_identity_pk: &[u8; ml_dsa::PK_LEN], recipient_identity_pk: &[u8; ml_dsa::PK_LEN], first_ratchet_pk: &[u8; ml_kem::EK_LEN], advert_serial: u64) -> Vec<u8>"
+    parameters:
+      - name: writer_identity_pk
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The writer's identity public key.
+      - name: recipient_identity_pk
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The identity this direction is written to.
+      - name: first_ratchet_pk
+        type: "&[u8; ml_kem::EK_LEN]"
+        direction: in
+        description: The writer's first ratchet public key.
+      - name: advert_serial
+        type: u64
+        direction: in
+        description: The advert serial the conversation's hello encapsulated to.
+    returns:
+      type: "Vec<u8>"
+      description: The preimage ChannelOpening::build signs and verify checks.
+  - name: "channel::seal_control"
+    module: daemonseed_core::dm::channel
+    description: Seals an encoded Control under the control key with control_aad.
+    signature: "pub fn seal_control(ss_hello: &advert::AdvertSharedSecret, control: &Control) -> Result<Vec<u8>, ChannelError>"
+    parameters:
+      - name: ss_hello
+        type: "&advert::AdvertSharedSecret"
+        direction: in
+        description: The secret the conversation's hello established.
+      - name: control
+        type: "&Control"
+        direction: in
+        description: The control record to seal.
+    returns:
+      type: "Result<Vec<u8>, ChannelError>"
+      description: At most SEALED_CONTROL_MAX_LEN bytes, or Kdf / Aead / Module.
+  - name: "channel::open_control"
+    module: daemonseed_core::dm::channel
+    description: Opens the control subkey's bytes and decodes the Control inside.
+    signature: "pub fn open_control(ss_hello: &advert::AdvertSharedSecret, bytes: &[u8]) -> Result<Control, ChannelError>"
+    parameters:
+      - name: ss_hello
+        type: "&advert::AdvertSharedSecret"
+        direction: in
+        description: The secret the conversation's hello established.
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: The control subkey's contents.
+    returns:
+      type: "Result<Control, ChannelError>"
+      description: The control record, or Aead / Malformed / Kdf / Module.
+  - name: "Ring::new"
+    module: daemonseed_core::dm::channel
+    description: Opens the send side at sequence 0 with nothing collected.
+    signature: "pub fn new() -> Self"
+    parameters: []
+    returns:
+      type: Ring
+      description: A fresh send side.
+  - name: "Ring::restore"
+    module: daemonseed_core::dm::channel
+    description: >-
+      Rebuilds the send side, refusing CorruptState on a cursor above what was sent
+      rather than clamping it.
+    signature: "pub fn restore(send_seq: u64, peer_collected: u64) -> Result<Self, ChannelError>"
+    parameters:
+      - name: send_seq
+        type: u64
+        direction: in
+        description: The next sequence to reserve.
+      - name: peer_collected
+        type: u64
+        direction: in
+        description: How many of this direction's messages the peer has collected contiguously.
+    returns:
+      type: "Result<Ring, ChannelError>"
+      description: The send side, or CorruptState { send_seq, peer_collected }.
+  - name: "Ring::send_seq"
+    module: daemonseed_core::dm::channel
+    description: The next sequence reserve will return.
+    signature: "pub fn send_seq(&self) -> u64"
+    parameters: []
+    returns:
+      type: u64
+      description: The send position.
+  - name: "Ring::peer_collected"
+    module: daemonseed_core::dm::channel
+    description: How many of this direction's messages the peer has collected contiguously.
+    signature: "pub fn peer_collected(&self) -> u64"
+    parameters: []
+    returns:
+      type: u64
+      description: The collection cursor.
+  - name: "Ring::uncollected"
+    module: daemonseed_core::dm::channel
+    description: How many sent messages the peer has not yet collected.
+    signature: "pub fn uncollected(&self) -> u64"
+    parameters: []
+    returns:
+      type: u64
+      description: send_seq less peer_collected, the figure backpressure is measured on.
+  - name: "Ring::reserve"
+    module: daemonseed_core::dm::channel
+    description: >-
+      Returns the next sequence and advances the send position, or refuses RingFull
+      with send_seq unchanged once uncollected reaches RING_SLOTS.
+    signature: "pub fn reserve(&mut self) -> Result<u64, ChannelError>"
+    parameters: []
+    returns:
+      type: "Result<u64, ChannelError>"
+      description: The reserved sequence, or RingFull { send_seq, peer_collected }.
+  - name: "Ring::advance_peer_collected"
+    module: daemonseed_core::dm::channel
+    description: Moves the collection cursor, never backwards and never past send_seq.
+    signature: "pub fn advance_peer_collected(&mut self, cursor: u64)"
+    parameters:
+      - name: cursor
+        type: u64
+        direction: in
+        description: The cursor the peer reported.
+    returns:
+      type: "()"
+      description: Nothing; a cursor outside the range leaves the ring unchanged.
+  - name: "MessageHeader::continuing"
+    module: daemonseed_core::dm::channel
+    description: Builds a header without the turn fields, for a message that continues a turn.
+    signature: "pub fn continuing(device_id: u32, n: u64, m: u64, seq: u64, cursor: u64) -> Self"
+    parameters:
+      - name: device_id
+        type: u32
+        direction: in
+        description: Which device of the writer's wrote this.
+      - name: n
+        type: u64
+        direction: in
+        description: The writer's turn number.
+      - name: m
+        type: u64
+        direction: in
+        description: The peer turn number the writer had read when it started turn n.
+      - name: seq
+        type: u64
+        direction: in
+        description: The message's sequence within this direction.
+      - name: cursor
+        type: u64
+        direction: in
+        description: The writer's contiguous collected count over the peer's messages.
+    returns:
+      type: MessageHeader
+      description: A header with both turn fields absent.
+  - name: "MessageHeader::starts_turn"
+    module: daemonseed_core::dm::channel
+    description: Whether this message opens a turn, which is true exactly when both turn fields are present.
+    signature: "pub fn starts_turn(&self) -> bool"
+    parameters: []
+    returns:
+      type: bool
+      description: True on a turn's first message.
+  - name: "MessageHeader::encode"
+    module: daemonseed_core::dm::channel
+    description: >-
+      Encodes as BE32(device_id) || BE64(n) || BE64(m) || BE64(seq) ||
+      BE64(cursor) || lp(kem_ct) || lp(kem_pk), each optional field empty when absent.
+    signature: "pub fn encode(&self) -> Vec<u8>"
+    parameters: []
+    returns:
+      type: "Vec<u8>"
+      description: At most MESSAGE_HEADER_MAX_LEN bytes.
+  - name: "MessageHeader::decode"
+    module: daemonseed_core::dm::channel
+    description: Reads the header and returns the sealed body after it.
+    signature: "pub fn decode(bytes: &[u8]) -> Result<(Self, &[u8]), ChannelError>"
+    parameters:
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: One message slot's contents.
+    returns:
+      type: "Result<(MessageHeader, &[u8]), ChannelError>"
+      description: The header and the body, Malformed on bytes that run out, FieldLength { expected, actual } on a turn field of the wrong width, TurnFieldsIncomplete on one turn field without the other.
+  - name: "ChannelOpening::build"
+    module: daemonseed_core::dm::channel
+    description: Builds and signs the opening under the writer's long-term key.
+    signature: "pub fn build(signer: &SignKeypair, recipient_identity_pk: &[u8; ml_dsa::PK_LEN], first_ratchet_pk: &[u8; ml_kem::EK_LEN], advert_serial: u64) -> Result<Self, ChannelError>"
+    parameters:
+      - name: signer
+        type: "&SignKeypair"
+        direction: in
+        description: The writer's long-term signing keypair.
+      - name: recipient_identity_pk
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The identity this direction is written to.
+      - name: first_ratchet_pk
+        type: "&[u8; ml_kem::EK_LEN]"
+        direction: in
+        description: The writer's first ratchet public key.
+      - name: advert_serial
+        type: u64
+        direction: in
+        description: The advert serial the conversation's hello encapsulated to.
+    returns:
+      type: "Result<ChannelOpening, ChannelError>"
+      description: The signed opening, or Signing.
+  - name: "ChannelOpening::encode"
+    module: daemonseed_core::dm::channel
+    description: Encodes the opening to OPENING_LEN bytes.
+    signature: "pub fn encode(&self) -> Vec<u8>"
+    parameters: []
+    returns:
+      type: "Vec<u8>"
+      description: OPENING_LEN bytes.
+  - name: "ChannelOpening::decode"
+    module: daemonseed_core::dm::channel
+    description: Reads the fields and does NOT verify them; verify does that.
+    signature: "pub fn decode(bytes: &[u8]) -> Result<Self, ChannelError>"
+    parameters:
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: OPENING_LEN bytes from the control record.
+    returns:
+      type: "Result<ChannelOpening, ChannelError>"
+      description: The opening, or Length { expected, actual }.
+  - name: "ChannelOpening::verify"
+    module: daemonseed_core::dm::channel
+    description: >-
+      Checks the signature under the identity public key the opening carries, then
+      the recipient, then the serial.
+    signature: "pub fn verify(&self, expected_recipient_pk: &[u8; ml_dsa::PK_LEN], expected_advert_serial: u64) -> Result<(), ChannelError>"
+    parameters:
+      - name: expected_recipient_pk
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The identity the reader expects the opening to name.
+      - name: expected_advert_serial
+        type: u64
+        direction: in
+        description: The advert serial the reader expects.
+    returns:
+      type: "Result<(), ChannelError>"
+      description: Ok, or Signature, Recipient and AdvertSerial { expected, found } as distinct failures.
+  - name: "Control::encode"
+    module: daemonseed_core::dm::channel
+    description: Encodes as lp(opening) || BE64(collected_cursor) || closed.
+    signature: "pub fn encode(&self) -> Vec<u8>"
+    parameters: []
+    returns:
+      type: "Vec<u8>"
+      description: The plaintext seal_control seals.
+  - name: "Control::decode"
+    module: daemonseed_core::dm::channel
+    description: Reads a control record from the plaintext open_control recovered.
+    signature: "pub fn decode(bytes: &[u8]) -> Result<Self, ChannelError>"
+    parameters:
+      - name: bytes
+        type: "&[u8]"
+        direction: in
+        description: The opened control plaintext.
+    returns:
+      type: "Result<Control, ChannelError>"
+      description: The control record, or Malformed / Length.
+
 # ─────────────────────────────────────────────────────────────────────
 # Error types — every error/result enum, with recoverability + action.
 # ─────────────────────────────────────────────────────────────────────
@@ -8983,6 +10294,140 @@ constants:
       Mandatory warning surfaced before a user opts into autostart (ISC-C20).
       Names the presence side-channel: the primary identity appears online
       whenever the machine is on, a pattern an observer or relay can correlate.
+
+
+  - name: ADVERT_SUBKEYS
+    module: daemonseed_core::dm::advert
+    type: u16
+    value: "64"
+    description: The advert record's o_cnt, part of its deterministic address; a writer builds its RecordShape from this rather than a literal.
+  - name: ADVERT_SUBKEY
+    module: daemonseed_core::dm::advert
+    type: u32
+    value: "0"
+    description: The subkey holding the advert; subkeys 1 to 63 are reserved for per-device keys and unwritten.
+  - name: ADVERT_OWNER_SEED_LEN
+    module: daemonseed_core::dm::advert
+    type: usize
+    value: "32"
+    description: Byte length of the advert record's Veilid owner seed, which under VLD0 is the owner's Ed25519 secret key.
+  - name: ROTATION_PERIOD_SECS
+    module: daemonseed_core::dm::advert
+    type: u64
+    value: "604800"
+    description: How long an advert key stays current, and how long the key before it is retained after it was due to retire.
+  - name: CLOCK_SKEW_SECS
+    module: daemonseed_core::dm::advert
+    type: u64
+    value: "3600"
+    description: How far before not_before a sender may encapsulate to an advert key.
+  - name: POLL_INTERVAL_MIN
+    module: daemonseed_core::dm::advert
+    type: Duration
+    value: "40min"
+    description: Lower bound of the advert poll interval next_poll_interval draws from.
+  - name: POLL_INTERVAL_MAX
+    module: daemonseed_core::dm::advert
+    type: Duration
+    value: "60min"
+    description: Upper bound of the advert poll interval next_poll_interval draws from.
+  - name: ADVERT_LEN
+    module: daemonseed_core::dm::advert
+    type: usize
+    value: "6211"
+    description: Byte length of an encoded advert, serial(8) || not_before(8) || kem_pk(1568) || signature(4627).
+
+  - name: DROP_SUBKEYS
+    module: daemonseed_core::dm::drop
+    type: u16
+    value: "256"
+    description: The drop record's o_cnt, part of its deterministic address; one hello per slot, and the count the slot derivation reduces modulo.
+  - name: DROP_SLOT_LEN
+    module: daemonseed_core::dm::drop
+    type: usize
+    value: "4096"
+    description: Bytes one drop slot holds, min(32 KiB, 1 MiB / DROP_SUBKEYS).
+  - name: DROP_OWNER_SEED_LEN
+    module: daemonseed_core::dm::drop
+    type: usize
+    value: "32"
+    description: Byte length of the drop record's Veilid owner seed.
+  - name: DROP_POW_BITS
+    module: daemonseed_core::dm::drop
+    type: u32
+    value: "0"
+    description: Leading zero bits a hello's pow_tag must show; raising it is the whole of raising the difficulty.
+  - name: DROP_POW_TAG_LEN
+    module: daemonseed_core::dm::drop
+    type: usize
+    value: "8"
+    description: Byte length of a hello's pow_tag.
+  - name: HELLO_LOOKUP_KEY_LEN
+    module: daemonseed_core::dm::drop
+    type: usize
+    value: "32"
+    description: Byte length of the channel lookup key a hello discloses.
+  - name: HELLO_R_LEN
+    module: daemonseed_core::dm::drop
+    type: usize
+    value: "32"
+    description: Byte length of r, the sealed value that picks the slot.
+  - name: HELLO_LEN
+    module: daemonseed_core::dm::drop
+    type: usize
+    value: "1668"
+    description: Byte length of an encoded hello, kem_ct(1568) || nonce(12) || ciphertext(64) || tag(16) || pow_tag(8).
+
+  - name: CHANNEL_SUBKEYS
+    module: daemonseed_core::dm::channel
+    type: u16
+    value: "64"
+    description: The channel record's o_cnt, part of its deterministic address; one control subkey plus RING_SLOTS message slots.
+  - name: CONTROL_SUBKEY
+    module: daemonseed_core::dm::channel
+    type: u16
+    value: "0"
+    description: The subkey holding the channel opening and the writer's collection cursor.
+  - name: RING_SLOTS
+    module: daemonseed_core::dm::channel
+    type: u64
+    value: "63"
+    description: Message slots in the ring, and the backpressure bound Ring::reserve refuses at.
+  - name: CHANNEL_OWNER_SEED_LEN
+    module: daemonseed_core::dm::channel
+    type: usize
+    value: "32"
+    description: Byte length of the channel record's Veilid owner seed, which under VLD0 is the owner's Ed25519 secret key.
+  - name: DEVICE_ID_SINGLE_DEVICE
+    module: daemonseed_core::dm::channel
+    type: u32
+    value: "0"
+    description: The device identifier a single-device installation writes into a message header; the field is reserved and nothing reads it.
+  - name: CHANNEL_SUBKEY_LEN
+    module: daemonseed_core::dm::channel
+    type: usize
+    value: "16384"
+    description: Bytes one channel subkey holds, min(32 KiB, 1 MiB / CHANNEL_SUBKEYS).
+  - name: MESSAGE_HEADER_MAX_LEN
+    module: daemonseed_core::dm::channel
+    type: usize
+    value: "3188"
+    description: Bytes an encoded MessageHeader takes at its largest, a turn's first message carrying both turn fields.
+  - name: MESSAGE_BODY_MAX_LEN
+    module: daemonseed_core::dm::channel
+    type: usize
+    value: "13168"
+    description: Bytes a message body may occupy, CHANNEL_SUBKEY_LEN less the largest header and the AEAD envelope overhead.
+  - name: OPENING_LEN
+    module: daemonseed_core::dm::channel
+    type: usize
+    value: "11387"
+    description: Byte length of an encoded ChannelOpening.
+  - name: SEALED_CONTROL_MAX_LEN
+    module: daemonseed_core::dm::channel
+    type: usize
+    value: "11432"
+    description: Bytes a sealed control record takes at its largest, with the opening present.
 
 # ─────────────────────────────────────────────────────────────────────
 # Common gotchas across modules (non-spec extra section, retained from the
