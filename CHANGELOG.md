@@ -26,6 +26,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-veilid-net`: `tests/two_node_dm_async.rs`, two `#[ignore]` two-node oracles — a
+  direct-message conversation completed by six processes that are never alive together, and the
+  same conversation with a kill at every step boundary resumed from the state on disk — each step
+  re-executed as its own process from the test binary, with the harness's one-process rule, its
+  end-state check and its result file covered by tests that need no network (#467).
 - `daemonseed-proto`: `DmAdvert`, `DmHello`, `DmChannelOpening`, `DmChannelControl`,
   `DmMessageHeader` and `DmChannelSlot` in `dm.proto` — the conversation records as wire-visible
   messages, with the header's turn fields optional, alongside `KeySelector`, `DmKeyRecord`,
