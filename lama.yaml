@@ -120,7 +120,7 @@ crates:
     manifest: null
 
   - name: xtask
-    purpose: "Workspace task runner. Subcommands: check-manifests, gen-proto, check-proto, check-ui-strings (refuses placeholder text in any string a user can read), isc-coverage, install-hooks, gate (runs the Definition-of-Done gate — one step table in the groups preflight, dev-suite and release-suite; --group runs one group, --list prints the table — and exits non-zero naming any red step), release-gate (runs every group of that gate)."
+    purpose: "Workspace task runner. Subcommands: check-manifests, gen-proto, check-proto, check-ui-strings (refuses placeholder text in any string a user can read), dm-size (counts the direct-messaging layer's lines, tests included, and refuses above the ceiling read from DM_SIZE_CEILING or on a module under dm/ that names no founding claim and is not on the outside-layer list, whose modules are counted as a separate total so the ceiling applies to the modules that name a founding claim), isc-coverage, install-hooks, gate (runs the Definition-of-Done gate — one step table in the groups preflight, dev-suite and release-suite; --group runs one group, --list prints the table — and exits non-zero naming any red step), release-gate (runs every group of that gate)."
     license: AGPL-3.0-or-later
     status: active
     manifest: null

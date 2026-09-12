@@ -26,6 +26,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `xtask`: `cargo xtask dm-size`, a `preflight` gate step counting the direct-messaging layer's
+  lines, tests included, refusing above the ceiling read from `DM_SIZE_CEILING` and on any module
+  under `dm/` that names no founding claim and is not on the subcommand's outside list, whose
+  modules are counted as a separate total so the ceiling applies to the modules that name a
+  founding claim (#468).
 - `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `peer_ack_fetches_failed`, one per fetch of a
   correspondent's acknowledgement record that came back with no answer (#429).
 - `daemonseed-tui`: a direct-message thread, opened with `Enter` on a correspondence row and left

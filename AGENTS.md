@@ -75,7 +75,7 @@ The gate is defined once — one table of steps in three groups, `RELEASE_GATE_S
 
 | Group | Steps |
 |-------|-------|
-| `preflight` | `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo check --workspace --release` · `cargo doc --workspace --no-deps` under `RUSTDOCFLAGS=-D warnings` · `cargo xtask check-proto` · `cargo xtask isc-coverage` · `cargo xtask check-manifests` · `cargo xtask check-ui-strings` |
+| `preflight` | `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo check --workspace --release` · `cargo doc --workspace --no-deps` under `RUSTDOCFLAGS=-D warnings` · `cargo xtask check-proto` · `cargo xtask isc-coverage` · `cargo xtask check-manifests` · `cargo xtask check-ui-strings` · `cargo xtask dm-size` |
 | `dev-suite` | `cargo clippy -p daemonseed-gui --features desktop --all-targets -- -D warnings` · `cargo test --workspace` |
 | `release-suite` | `cargo test --workspace --release` |
 

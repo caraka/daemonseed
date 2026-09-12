@@ -11,6 +11,8 @@
 //!   registry's live total; `--min N` fails the run below N percent.
 //! - `check-ui-strings` — refuse placeholder text in any string a user can
 //!   read.
+//! - `dm-size` — count the direct-messaging layer's lines, tests included, and
+//!   refuse above its ceiling or on a module that names no founding claim.
 //! - `install-hooks` — install the workspace's git pre-push hook into the
 //!   active checkout's `.git/hooks/` (or into a `--target` directory).
 //!   Idempotent; overwrites a previously-installed hook in-place.
@@ -30,6 +32,7 @@
 //! - `release-gate` — run every group of the gate and exit non-zero if any step
 //!   is red, so a release tag is never cut on a red tree. Run before `git tag`.
 
+mod dm_size;
 mod manifests;
 mod ui_strings;
 
@@ -61,6 +64,11 @@ enum Cmd {
     /// Refuse placeholder text in any string a user can read (.slint, and the
     /// gui/tui Rust sources). A placeholder is not shippable by definition.
     CheckUiStrings,
+    /// Count the direct-messaging layer's lines, tests included, and print them
+    /// per module and in total. Exits non-zero above the ceiling read from
+    /// `DM_SIZE_CEILING`, and on any module that names no founding claim and is
+    /// not on the outside-layer list.
+    DmSize,
     /// Report ISC coverage from `daemonseed-integration-tests`. Exits non-zero
     /// if the covered percentage is below `--min` (when supplied).
     IscCoverage {
@@ -102,6 +110,12 @@ fn main() -> Result<()> {
         Cmd::GenProto => gen_proto(),
         Cmd::CheckProto => check_proto(),
         Cmd::CheckUiStrings => ui_strings::check_ui_strings(&workspace_root_from_xtask()?),
+        Cmd::DmSize => dm_size::check(
+            &workspace_root_from_xtask()?,
+            dm_size::LAYER_DIRS,
+            dm_size::OUTSIDE_LAYER,
+            dm_size::ceiling_from_env()?,
+        ),
         Cmd::IscCoverage { min } => isc_coverage(min),
         Cmd::InstallHooks { target } => install_hooks(target),
         Cmd::Gate { group, list } => {
@@ -587,6 +601,15 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
         args: &["xtask", "check-ui-strings"],
         env: &[],
     },
+    // The direct-messaging layer's ceiling and its founding-claim headers are
+    // properties of the tree as a whole: a module added to one crate crosses the
+    // total no per-crate step reads. Cheap: a line count of two directories.
+    GateStep {
+        name: "xtask dm-size",
+        group: GateGroup::Preflight,
+        args: &["xtask", "dm-size"],
+        env: &[],
+    },
     // `--all-targets` skips targets whose `required-features` are unsatisfied, so the
     // windowed GUI is linted only by an invocation that opts into `desktop`.
     GateStep {
@@ -907,6 +930,19 @@ mod tests {
         assert_eq!(step.args, ["doc", "--workspace", "--no-deps"]);
         assert_eq!(step.group, GateGroup::Preflight);
         assert!(step.env.contains(&("RUSTDOCFLAGS", "-D warnings")));
+    }
+
+    /// The direct-messaging layer's line ceiling is checked by the gate, in the group
+    /// the pre-push hook runs. Asserted on the step table so deleting the step is a
+    /// test failure rather than a ceiling that silently stops being enforced.
+    #[test]
+    fn the_gate_checks_the_direct_messaging_layers_size() {
+        let step = RELEASE_GATE_STEPS
+            .iter()
+            .find(|s| s.args == ["xtask", "dm-size"])
+            .expect("the dm-size step must be in the gate");
+        assert_eq!(step.name, "xtask dm-size");
+        assert_eq!(step.group, GateGroup::Preflight);
     }
 
     /// The `release-suite` group is exactly the release-profile test suite: it is the
