@@ -26,6 +26,17 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-core`: `dm::store`, the direct-messaging layer's on-disk state over
+  `storage::dm_store` — `Store::persist_advert_keys` for the advert KEM secrets and serial,
+  `persist_conv` for a correspondence's peer identity key, both channel lookup keys, generation,
+  key schedule, cursors and outstanding hello, `persist_outbox` / `delete_outbox_through` for the
+  ciphertext of every message a correspondent has not collected, and `Store::load` reporting an
+  outbox entry as outstanding only while `peer_collected <= seq < send_seq`, `update_conv` as the
+  only door that changes an established record, `update_advert_keys` as the door a rotation takes,
+  and `delete_conv` removing both of a correspondence's records together;
+  `OutstandingHello` carries the sealed hello as written to its drop slot, so a rewrite after an
+  abort or an eviction is byte-identical; three fixed-width record encodings under three new
+  `RecordKind` variants `AdvertKeys`, `Conversation` and `ConversationOutbox` (#465).
 - `daemonseed-veilid-net`: `tests/two_node_dm_async.rs`, two `#[ignore]` two-node oracles — a
   direct-message conversation completed by six processes that are never alive together, and the
   same conversation with a kill at every step boundary resumed from the state on disk — each step

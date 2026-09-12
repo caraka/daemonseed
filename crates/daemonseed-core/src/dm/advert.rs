@@ -148,6 +148,18 @@ redacted_secret_newtype! {
     boxed pub struct AdvertDecapKey([u8; ml_kem::DK_LEN]);
 }
 
+impl AdvertDecapKey {
+    /// A key over bytes read back from the profile's at-rest store.
+    ///
+    /// The counterpart of [`Self::as_bytes`], for the one caller that writes
+    /// an [`AdvertSnapshot`] down and reads it again
+    /// ([`crate::dm::store`]). Nothing derives a decapsulation key, so a
+    /// restored one has to come from the bytes a snapshot was written from.
+    pub(crate) fn from_bytes(bytes: &[u8; ml_kem::DK_LEN]) -> Self {
+        Self(Box::new(*bytes))
+    }
+}
+
 redacted_secret_newtype! {
     /// The secret an encapsulation to an advert key yields on both sides.
     boxed pub struct AdvertSharedSecret([u8; ml_kem::SHARED_SECRET_LEN]);

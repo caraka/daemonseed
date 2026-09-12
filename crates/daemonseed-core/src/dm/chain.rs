@@ -130,6 +130,37 @@ redacted_secret_newtype! {
     boxed pub struct RatchetDecapKey([u8; ml_kem::DK_LEN]);
 }
 
+/// Rebuild a key-schedule secret from bytes read back out of the profile's
+/// at-rest store.
+///
+/// Every secret here is derived, and a restart cannot redo the derivation:
+/// the inputs are the previous turn's material, which the restart destroyed.
+/// So a [`ConversationSnapshot`] written to disk has to come back as the same
+/// values, and `from_bytes` is the only way in. `pub(crate)` — the store
+/// ([`crate::dm::store`]) is the single caller, and nothing outside this crate
+/// has any business minting a chain position.
+macro_rules! restore_from_bytes {
+    ($name:ident, $len:expr, inline) => {
+        impl $name {
+            pub(crate) fn from_bytes(bytes: &[u8; $len]) -> Self {
+                Self(*bytes)
+            }
+        }
+    };
+    ($name:ident, $len:expr, boxed) => {
+        impl $name {
+            pub(crate) fn from_bytes(bytes: &[u8; $len]) -> Self {
+                Self(Box::new(*bytes))
+            }
+        }
+    };
+}
+
+restore_from_bytes!(Root, ROOT_LEN, inline);
+restore_from_bytes!(ChainKey, CHAIN_KEY_LEN, inline);
+restore_from_bytes!(TurnSecret, ml_kem::SHARED_SECRET_LEN, inline);
+restore_from_bytes!(RatchetDecapKey, ml_kem::DK_LEN, boxed);
+
 /// One turn's ratchet keypair. The decapsulation key is zeroized on drop.
 pub struct RatchetKeypair {
     /// The public half, written into the turn's first header.

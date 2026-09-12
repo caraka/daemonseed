@@ -230,8 +230,9 @@ modules:
     description: >-
       The DM at-rest store: one directory per correspondence, one fixed-size
       file per correspondence-scoped RecordKind (Resume, Provisional, Outbox,
-      ReceiveCursor, ContactCache) inside it, and one fixed-size file per
-      profile-scoped kind (BlockList) at the store
+      ReceiveCursor, ContactCache, Conversation, ConversationOutbox) inside it,
+      and one fixed-size file per profile-scoped kind (BlockList, AdvertKeys) at
+      the store
       root. DmStore::open derives the seal key from the profile at-rest key
       (HKDF-SHA384 under DM_STORE_SALT/DM_STORE_SEAL) and sweeps orphaned temp
       siblings. critical_section holds an flock across the whole closure and
@@ -2389,6 +2390,57 @@ modules:
       RatchetDecapKey are zeroize-on-drop redacting newtypes, including inside a
       snapshot. The module holds no clock,
       performs no I/O, and takes entropy as a fill function.
+      Sub-module dm::store is the layer's on-disk state, over
+      storage::dm_store. Store::open(root, at_rest_key) -> Result<Store, StoreError>
+      opens it and records() borrows the record store beneath.
+      persist_advert_keys(&AdvertSnapshot) and load_advert_keys() ->
+      Result<Option<AdvertSnapshot>, StoreError> carry the advert KEM secrets and
+      serial as RecordKind::AdvertKeys, one record per profile; an empty payload is
+      absent state. update_advert_keys(FnOnce(&mut advert::AdvertKeys) -> R) ->
+      Result<R, StoreError> is the door a rotation takes, read and write in one
+      profile_critical_section, and refuses StoreError::MissingAdvertKeys where no
+      state has been written. create_conv(&CorrespondenceLabel, &ConvState)
+      establishes a correspondence's first record and refuses
+      StoreError::ConversationExists where one is already there;
+      load_conv(&CorrespondenceLabel) -> Result<Option<ConvState>, StoreError> carry
+      ConvState { peer_identity_pk, outgoing_lookup_key, incoming_lookup_key,
+      generation, conversation: chain::ConversationSnapshot, send_seq,
+      peer_collected, my_collected, outstanding_hello: Option<OutstandingHello {
+      slot, r, kem_ct, sealed, advert_serial }> } as RecordKind::Conversation;
+      OutstandingHello holds the sealed hello as written to the drop slot, so a
+      rewrite after an abort or an eviction is byte-identical rather than a fresh
+      encapsulation under a different ss0. update_conv(peer, FnOnce(&mut ConvState)
+      -> R) -> Result<R, StoreError> is the only door that changes an established
+      record, one critical_section for the whole of it, and refuses
+      StoreError::MissingConversation where there is no record; no whole-record
+      write is reachable from outside the crate, so a caller cannot blank a field
+      it does not track;
+      delete_conv(peer) removes the conversation and outbox records together.
+      Every read here takes the lock. persist_outbox(peer, seq,
+      ciphertext) records the exact bytes a slot will hold as
+      RecordKind::ConversationOutbox, one record holding one entry per ring slot
+      indexed by seq mod RING_SLOTS, and refuses StoreError::OutboxSlotOccupied
+      { offered, holding } when that entry holds a different sequence and
+      StoreError::CiphertextTooLong { len } above CHANNEL_SUBKEY_LEN;
+      delete_outbox_through(peer, cursor) drops every entry below cursor.
+      load() -> Result<Loaded { advert_keys, convs: Vec<LoadedConv { peer, state,
+      outstanding_outbox: Vec<OutboxEntry { seq, ciphertext }> }> }, StoreError>
+      is what a launch reads; an outbox entry is outstanding only while
+      peer_collected <= seq < send_seq, so an entry at or above send_seq is a seal
+      whose conversation record did not commit and is not reported. The caller
+      rewrites every outstanding entry whose slot differs, byte for byte.
+      The record encodings are crate-private: a magic, a version byte, then
+      fixed-width fields, an absent value written as a zero flag byte and its own
+      width in zeros. A decoder refuses an unknown version, an outbox entry whose
+      sequence is not its ring position, a hello slot at or above DROP_SUBKEYS,
+      and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6398),
+      CONV_RECORD_LEN (23722) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
+      widths and are the RecordKind buckets. StoreError is Store(DmStoreError),
+      Corrupt { kind, reason }, OutboxSlotOccupied, CiphertextTooLong,
+      MissingConversation, ConversationExists and MissingAdvertKeys.
+      The module holds no clock, mutates no key-schedule state, writes no
+      message body, and stores no channel opening — an evicted opening is
+      re-signed from the identity key and the generation.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
       per purpose.

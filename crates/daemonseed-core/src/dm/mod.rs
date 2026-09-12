@@ -90,6 +90,7 @@ pub mod ratchet;
 pub mod reest;
 pub mod resume;
 pub mod spent_store;
+pub mod store;
 pub mod token;
 
 /// A stand-in ephemeral decapsulation key for the resume-record fixtures.

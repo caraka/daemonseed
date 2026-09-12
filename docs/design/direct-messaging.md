@@ -97,7 +97,7 @@ What the end state guarantees, by compromise event:
 
 1. A computes ADVERT(B)'s lookup key from B's identity public key, reads subkey 0 and verifies the signature.
 2. A derives its owner keypair for CHAN(A→B), generates a ratchet keypair `pk_A^0`, encapsulates to B's advert key to get `ss0`, and persists CONV(B) before any DHT write.
-3. A writes CHAN(A→B).0 (the opening) and CHAN(A→B).1 (message `seq` 0), and persists OUTBOX(B, 0).
+3. A persists OUTBOX(B, 0), then writes CHAN(A→B).0 (the opening) and CHAN(A→B).1 (message `seq` 0); the seal is randomized, so the slot's bytes exist only once they are on disk.
 4. A writes the hello to DROP(B) at `H(r) mod 256` and reads it back once; if another value is there, A picks a new `r` and rewrites.
 5. A polls the hello slot and its own drop on its normal schedule and rewrites anything found evicted. If B's advert key changes before the hello is collected, A re-encapsulates to the new key and rewrites the hello and the first-turn slots.
 

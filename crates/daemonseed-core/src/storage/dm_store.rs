@@ -242,6 +242,7 @@ use crate::dm::block_list::BLOCK_LIST_CAPACITY;
 use crate::dm::contact_cache::CONTACT_RECORD_LEN;
 use crate::dm::provisional::PROVISIONAL_RECORD_LEN;
 use crate::dm::resume::MAX_ENCODED_LEN;
+use crate::dm::store::{ADVERT_KEYS_RECORD_LEN, CONV_OUTBOX_RECORD_LEN, CONV_RECORD_LEN};
 use crate::dm::{LEN_PREFIX, domain, push_lp, unpad};
 use crate::storage::atomic_file::{
     AtomicReplaceError, Durability, FileLock, LockError, RealDurability, TMP_INFIX,
@@ -471,6 +472,26 @@ pub enum RecordKind {
     /// 512-identity ceiling in full — so the file is one size whether it holds
     /// nobody or all 512.
     BlockList,
+    /// The profile's advert KEM state: the current advert secret, the retained
+    /// one, and the serial. [`crate::dm::store`] owns the encoding.
+    ///
+    /// Profile-scoped, for [`RecordKind::BlockList`]'s reason: one advert
+    /// serves every correspondence, so it belongs to no directory. Created
+    /// empty by every [`DmStore::open`], and an empty payload is what
+    /// [`crate::dm::store::Store::load`] reads as "no advert state yet".
+    AdvertKeys,
+    /// One correspondence's conversation state: the peer's identity key, both
+    /// channel lookup keys, the generation, the key schedule, the two cursors
+    /// and any outstanding hello. [`crate::dm::store`] owns the encoding.
+    Conversation,
+    /// The ciphertext of every message of [`RecordKind::Conversation`]'s
+    /// direction the correspondent has not collected.
+    ///
+    /// One record holding the whole ring rather than one file per sequence:
+    /// the file count would otherwise be the queue depth, readable with no
+    /// key, which is the leak [`OUTBOX_CAPACITY`]'s fixed size is bought to
+    /// close.
+    ConversationOutbox,
 }
 
 /// Whether a [`RecordKind`] belongs to one correspondence or to the profile.
@@ -495,13 +516,16 @@ impl RecordKind {
     /// records filters on [`RecordKind::scope`] rather than walking this
     /// directly — [`DmStore::present_unlocked`] is that filter and is the only
     /// enumeration a caller needs.
-    pub const ALL: [RecordKind; 6] = [
+    pub const ALL: [RecordKind; 9] = [
         RecordKind::Resume,
         RecordKind::Provisional,
         RecordKind::Outbox,
         RecordKind::ReceiveCursor,
         RecordKind::ContactCache,
         RecordKind::BlockList,
+        RecordKind::AdvertKeys,
+        RecordKind::Conversation,
+        RecordKind::ConversationOutbox,
     ];
 
     /// The stable string form, for local persistence.
@@ -521,6 +545,9 @@ impl RecordKind {
             RecordKind::ReceiveCursor => "receive-cursor",
             RecordKind::ContactCache => "contact-cache",
             RecordKind::BlockList => "block-list",
+            RecordKind::AdvertKeys => "advert-keys",
+            RecordKind::Conversation => "conversation",
+            RecordKind::ConversationOutbox => "conversation-outbox",
         }
     }
 
@@ -551,6 +578,9 @@ impl RecordKind {
             RecordKind::ReceiveCursor => "cursor.bin",
             RecordKind::ContactCache => "contact-cache.bin",
             RecordKind::BlockList => "block-list.bin",
+            RecordKind::AdvertKeys => "advert-keys.bin",
+            RecordKind::Conversation => "conversation.bin",
+            RecordKind::ConversationOutbox => "conversation-outbox.bin",
         }
     }
 
@@ -569,6 +599,11 @@ impl RecordKind {
             // The ratified 512-identity ceiling in full, so the record's size
             // never reports how many of those slots are used.
             RecordKind::BlockList => BLOCK_LIST_CAPACITY,
+            // Each of the three is one fixed width by construction, so the
+            // store's bucket is exactly it and there is nothing to choose.
+            RecordKind::AdvertKeys => ADVERT_KEYS_RECORD_LEN,
+            RecordKind::Conversation => CONV_RECORD_LEN,
+            RecordKind::ConversationOutbox => CONV_OUTBOX_RECORD_LEN,
         }
     }
 
@@ -604,6 +639,9 @@ impl RecordKind {
             RecordKind::ReceiveCursor => 4,
             RecordKind::ContactCache => 5,
             RecordKind::BlockList => 6,
+            RecordKind::AdvertKeys => 7,
+            RecordKind::Conversation => 8,
+            RecordKind::ConversationOutbox => 9,
         }
     }
 
@@ -633,8 +671,10 @@ impl RecordKind {
             | RecordKind::Provisional
             | RecordKind::Outbox
             | RecordKind::ReceiveCursor
-            | RecordKind::ContactCache => RecordScope::Correspondence,
-            RecordKind::BlockList => RecordScope::Profile,
+            | RecordKind::ContactCache
+            | RecordKind::Conversation
+            | RecordKind::ConversationOutbox => RecordScope::Correspondence,
+            RecordKind::BlockList | RecordKind::AdvertKeys => RecordScope::Profile,
         }
     }
 }
@@ -2723,7 +2763,10 @@ mod tests {
                 | RecordKind::Outbox
                 | RecordKind::ReceiveCursor
                 | RecordKind::ContactCache
-                | RecordKind::BlockList => {}
+                | RecordKind::BlockList
+                | RecordKind::AdvertKeys
+                | RecordKind::Conversation
+                | RecordKind::ConversationOutbox => {}
             }
         }
         let mut names: Vec<_> = RecordKind::ALL.iter().map(|k| k.file_name()).collect();
@@ -2779,11 +2822,22 @@ mod tests {
         // written out so a change to either factor has to be deliberate.
         assert_eq!(RecordKind::BlockList.capacity(), BLOCK_LIST_CAPACITY);
         assert_eq!(BLOCK_LIST_CAPACITY, 512 * 2592);
+        // The three direct-messaging records' sizes are their module's, not a
+        // copy of them.
+        assert_eq!(RecordKind::AdvertKeys.capacity(), ADVERT_KEYS_RECORD_LEN);
+        assert_eq!(ADVERT_KEYS_RECORD_LEN, 6_398);
+        assert_eq!(RecordKind::Conversation.capacity(), CONV_RECORD_LEN);
+        assert_eq!(CONV_RECORD_LEN, 23_722);
+        assert_eq!(
+            RecordKind::ConversationOutbox.capacity(),
+            CONV_OUTBOX_RECORD_LEN
+        );
+        assert_eq!(CONV_OUTBOX_RECORD_LEN, 1_033_040);
 
         // Every kind, with no exemption: the cursor's exemption is what #389
         // removed, so a loop that filtered any kind out would be the shape of
         // the defect rather than a test of the fix.
-        assert_eq!(RecordKind::ALL.len(), 6, "the loop must cover every kind");
+        assert_eq!(RecordKind::ALL.len(), 9, "the loop must cover every kind");
         for kind in RecordKind::ALL {
             assert_eq!(
                 kind.on_disk_len(),
@@ -2808,6 +2862,9 @@ mod tests {
         assert_eq!(RecordKind::ReceiveCursor.aad_tag(), 4);
         assert_eq!(RecordKind::ContactCache.aad_tag(), 5);
         assert_eq!(RecordKind::BlockList.aad_tag(), 6);
+        assert_eq!(RecordKind::AdvertKeys.aad_tag(), 7);
+        assert_eq!(RecordKind::Conversation.aad_tag(), 8);
+        assert_eq!(RecordKind::ConversationOutbox.aad_tag(), 9);
         let mut tags: Vec<_> = RecordKind::ALL.iter().map(|k| k.aad_tag()).collect();
         tags.sort_unstable();
         tags.dedup();
@@ -2826,6 +2883,11 @@ mod tests {
             g.replace(RecordKind::Provisional, &payload(PROVISIONAL_RECORD_LEN))?;
             g.replace(RecordKind::Outbox, &payload(9))?;
             g.replace(RecordKind::ContactCache, &payload(CONTACT_RECORD_LEN))?;
+            g.replace(RecordKind::Conversation, &payload(17))?;
+            g.replace(
+                RecordKind::ConversationOutbox,
+                &payload(CONV_OUTBOX_RECORD_LEN),
+            )?;
             g.replace(RecordKind::ReceiveCursor, &7u64.to_be_bytes())
         })
         .unwrap();
@@ -3689,7 +3751,7 @@ mod tests {
         // tautology that holds for any set of kinds — it would keep passing if a
         // member were silently replaced by another. The literal is the only part
         // of this test that notices the enum changing shape.
-        assert_eq!(seen.len(), 6, "six kinds, six distinct stable strings");
+        assert_eq!(seen.len(), 9, "nine kinds, nine distinct stable strings");
         assert_eq!(RecordKind::from_stable_str("resume.bin"), None);
         assert_eq!(RecordKind::from_stable_str("nope"), None);
     }
@@ -3724,7 +3786,7 @@ mod tests {
                 .iter()
                 .filter(|k| k.scope() == RecordScope::Correspondence)
                 .count(),
-            5,
+            7,
             "one erasure per correspondence kind"
         );
 
@@ -3786,7 +3848,7 @@ mod tests {
     /// is reachable, and this test says plainly that it is only that half.
     #[test]
     fn every_kind_survives_the_hop_from_error_to_trust_event() {
-        assert_eq!(RecordKind::ALL.len(), 6, "one case per kind");
+        assert_eq!(RecordKind::ALL.len(), 9, "one case per kind");
         for kind in RecordKind::ALL {
             for scrubbed in [false, true] {
                 let err = DmStoreError::ErasureBlocked {
@@ -4962,7 +5024,7 @@ mod tests {
         // about the bound vacuous.
         assert_eq!(
             RecordKind::ALL.len(),
-            6,
+            9,
             "the sweep below must not be empty"
         );
         assert!(
