@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex};
 use futures_util::stream::StreamExt;
 use tokio::sync::mpsc;
 use veilid_core::{
-    DHTSchema, KeyPair, PublicKey, RecordKey, RoutingContext, SetDHTValueOptions, VeilidAPI,
-    CRYPTO_KIND_VLD0,
+    DHTReportScope, DHTSchema, KeyPair, PublicKey, RecordKey, RoutingContext, SetDHTValueOptions,
+    VeilidAPI, CRYPTO_KIND_VLD0,
 };
 
 use crate::dht_gate::DhtGate;
@@ -1372,6 +1372,109 @@ pub async fn publish_at_subkey(
     .await
     .map(|_| ())
     .map_err(|e| VeilidNetError::Send(e.to_string()))
+}
+
+/// Each subkey's NETWORK sequence number for `handle`, in ascending subkey
+/// order — the live arm of eviction detection.
+///
+/// `inspect_dht_record` under [`DHTReportScope::SyncSet`] reports each subkey's
+/// sequence number **as if this node's local copy did not exist**
+/// (`veilid-core-0.5.7 src/veilid_api/types/dht/dht_record_report.rs:85-88`),
+/// which is the one question a plain read cannot answer: `get_dht_value`
+/// returns the same absent result for a never-written subkey and an evicted
+/// one, and serves a writer its own local copy without asking the network at
+/// all. `docs/design/direct-messaging.md` § Eviction detection names this as
+/// what a poller compares against the local sequence number to find a slot the
+/// network has lost.
+///
+/// Read the other way round it is also how a reader finds the few subkeys of a
+/// large record worth reading: a subkey with no network sequence number has
+/// nothing to fetch, so a whole-record scan can skip it without a round trip.
+///
+/// One network operation, under one read permit, bounded like any other read.
+pub async fn inspect_sync_set(
+    gate: &Arc<DhtGate>,
+    rc: &RoutingContext,
+    handle: &RendezvousHandle,
+) -> Result<Vec<veilid_core::ValueSeqNum>> {
+    Ok(inspect_sync_seqs(gate, rc, handle).await?.network)
+}
+
+/// Both halves of one `SyncSet` report: each subkey's sequence number in this
+/// node's local copy, and on the network as if that copy did not exist.
+///
+/// Side by side they answer the question a writer that is about to stop has to
+/// ask: is what I hold the same as what the network holds? Veilid's `set_value`
+/// says `Ok` for a value it could only keep locally — the node offline, or the
+/// fanout finished short of consensus — and flushes it in the background
+/// (`veilid-core-0.5.7 src/storage_manager/set_value.rs:108-119, 596-624`;
+/// the `AllowOffline(false)` option does not change that on the second path,
+/// `set_value.rs:170-172` turns its refusal back into `Ok`). A local sequence
+/// number the network has not reached is that value still on this machine.
+///
+/// One network operation, under one read permit, bounded like any other read.
+pub async fn inspect_sync_seqs(
+    gate: &Arc<DhtGate>,
+    rc: &RoutingContext,
+    handle: &RendezvousHandle,
+) -> Result<SyncSeqs> {
+    let report = crate::actor::gated_bounded_get(
+        gate,
+        "inspect_sync_set",
+        rc.inspect_dht_record(handle.key().clone(), None, DHTReportScope::SyncSet),
+    )
+    .await?;
+    Ok(SyncSeqs {
+        local: report.local_seqs().to_vec(),
+        network: report.network_seqs().to_vec(),
+    })
+}
+
+/// What [`inspect_sync_seqs`] reports, in ascending subkey order. Either list
+/// may be shorter than the record: Veilid reports on the range it covered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncSeqs {
+    /// This node's local copy.
+    pub local: Vec<veilid_core::ValueSeqNum>,
+    /// The network's, as if the local copy did not exist.
+    pub network: Vec<veilid_core::ValueSeqNum>,
+}
+
+/// Close and delete a record from this node's local store.
+///
+/// **Local only, and the wording matters.** `delete_dht_record` removes the
+/// record from this node's storage and stops this node refreshing it on the
+/// network; it sends nothing, and storage nodes holding a copy keep serving it
+/// until they evict it as the least recently touched thing they hold
+/// (`veilid-core-0.5.7 src/veilid_api/routing_context.rs:574-577`). So this is
+/// the owner *stopping*, which is what the owner of a record it alone writes
+/// has to offer: the record goes away because nobody rewrites it.
+///
+/// The close comes first because Veilid requires it — an open record refuses
+/// deletion — and a record this node never opened is not an error to close, so
+/// a close that refuses is carried past rather than returned.
+///
+/// The caller is responsible for the open-record cache: a handle cached under
+/// this record's id names a record that no longer exists locally, and the next
+/// caller to reach it would write through it.
+pub async fn delete_record(rc: &RoutingContext, handle: &RendezvousHandle) -> Result<()> {
+    let key = handle.key().clone();
+    if let Err(e) = rc.close_dht_record(key.clone()).await {
+        crate::vtrace!("delete_record: close refused ({e}); deleting anyway");
+    }
+    rc.delete_dht_record(key)
+        .await
+        .map_err(|e| VeilidNetError::Send(e.to_string()))
+}
+
+/// Forget the cached open handle for `id`, if there is one.
+///
+/// The one case [`open_cached`]'s never-evict rule does not cover: a record
+/// that has been deleted from this node's local store is not a transient
+/// failure to retry, it is gone, and a cached handle to it would have the next
+/// caller address a record this node no longer holds.
+pub fn forget_cached<I: Eq + std::hash::Hash, K>(cache: &Mutex<HashMap<I, K>>, id: &I) {
+    cache.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
 }
 
 /// How long one subkey GET inside a sweep may run before it is abandoned (#397).

@@ -322,6 +322,7 @@ capabilities:
       - daemonseed_core::dm::domain
       - daemonseed_core::dm::doorbell
       - daemonseed_core::dm::firstcontact
+      - daemonseed_core::dm::flows
       - daemonseed_core::dm::frame
       - daemonseed_core::dm::keyrec
       - daemonseed_core::dm::outbox
@@ -347,10 +348,14 @@ capabilities:
       events. At most one sweep of any record is in flight. `types` holds the
       crossing vocabulary: `DmCommand` in, `DmEvent` out, `DmIdentity`,
       `PkLt`, `RequestId`, `RefusalReason`, `AcceptFailure` and the
-      `WallClock` seam.
+      `WallClock` seam. `records` is a second, narrower transport surface
+      beside the driver: `VeilidRecords` implements
+      `daemonseed_core::dm::flows::Records` over real records, reading through
+      the DHT gate and writing through the write scheduler.
     crate: daemonseed-veilid-net
     modules:
       - daemonseed_veilid_net::dm::driver
+      - daemonseed_veilid_net::dm::records
       - daemonseed_veilid_net::dm::seam
       - daemonseed_veilid_net::dm::types
     iscs: [C39, C40, C41, C42, C43, C45, A-C21, A-C24]

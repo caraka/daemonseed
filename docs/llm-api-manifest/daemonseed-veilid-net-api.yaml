@@ -146,9 +146,11 @@ modules:
     description: >-
       Direct-messaging helpers and the DM driver. Holds the one spawn helper both
       frontend net actors share (spawn_dm_key_record_publish),
-      the DmDht seam over the handle's seven DM DHT operations, and DmDriver — a
+      the DmDht seam over the handle's seven DM DHT operations, DmDriver — a
       command/event task owning a DmPersist, an injected WallClock and the identity
-      halves, driving a step machine whose DHT operations run off its loop.
+      halves, driving a step machine whose DHT operations run off its loop — and
+      VeilidRecords, which implements daemonseed_core::dm::flows::Records over real
+      DHT records.
     no_std: false
     depends_on:
       - daemonseed_veilid_net::actor
@@ -298,6 +300,65 @@ types:
       VeilidNetHandle's; the address types are taken by value. Bounds are
       Send + Sync + 'static. VeilidNetHandle implements it. publish_dm_key_record is
       not a member.
+  - name: VeilidRecords
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: >-
+      daemonseed_core::dm::flows::Records over the Veilid DHT. Reads run through
+      the DHT gate's read pool under a bounded GET; writes enter the write
+      scheduler as WriteRequest::direct_message with a DirectMessageWrite kind and
+      the method waits for the reply. An advert and a drop are addressed by owner
+      seed under the subkey count the caller supplies; a channel is addressed by
+      the lookup key open_channel returns, which is the owner's 32-byte public key.
+      open_channel creates the record if absent and retains the owner keypair, so
+      write_channel addresses only channels opened in this process. erase_drop_slot
+      writes an empty value to the slot, and a subkey holding no bytes reads back
+      as None. read_drop_slot at slot 0 takes one inspect_sync_set report of the
+      drop and answers every slot the network reports no sequence number for
+      without a read; a hello written to that drop discards the report and an
+      erasure keeps it. Three inherent
+      methods sit outside the trait: publish_advert writes subkey 0 of an advert
+      record, erase_channel closes and deletes a channel record this side owns
+      from this node's local store without creating an absent one, and
+      write_counts reports writes so far per kind. Every method bridges the
+      synchronous trait onto the asynchronous transport with
+      tokio::task::block_in_place, so every call must be on a multi-thread runtime
+      worker; the flavor is checked at construction and at every bridged call.
+      Every network call is retried while Veilid refuses transiently (TryAgain,
+      offline, routing table not ready): eight attempts, 2 s doubling to a 30 s
+      cap, with a write retried inside its dispatch so one submission is one
+      entry on the funnel. Any other refusal returns on the first attempt.
+      Every subkey write is confirmed after its reply: the record is inspected
+      through inspect_sync_seqs, which reports the subkey's local and network
+      sequence numbers side by side, polled from 2 s doubling to 10 s for up to
+      300 s until the network's has reached the local one, because Veilid reports a write it
+      could only keep locally as done and flushes it in the background. The poll
+      is a read, so the write budget is unchanged; a write the network still
+      lacks at the end of the budget is an error naming the write.
+      Built by VeilidRecords::new from VeilidRecordsParts.
+  - name: VeilidRecordsParts
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: >-
+      The transport state a VeilidRecords is built over: the DHT gate, the
+      VeilidAPI, the RoutingContext, the open-record cache, the per-record locks
+      and the write scheduler handle. Obtained from
+      VeilidNetHandle::dm_records_parts. Fields are private.
+  - name: WriteCountsSnapshot
+    module: daemonseed_veilid_net::dm
+    kind: struct
+    description: >-
+      One VeilidRecords instance's writes so far, per record kind: hello, erase,
+      control, ring, advert. flow_writes() is every field but advert, which is
+      the set docs/design/direct-messaging.md § Write budget's per-flow ceilings
+      are measured in.
+  - name: RecordsError
+    module: daemonseed_veilid_net::dm
+    kind: enum
+    description: >-
+      Why VeilidRecords::new refused: NoRuntime (no tokio runtime on this thread),
+      NotMultiThread (the runtime is not multi-threaded, so the synchronous bridge
+      would panic).
   - name: DmDhtFuture
     module: daemonseed_veilid_net::dm
     kind: type_alias
@@ -1072,6 +1133,17 @@ functions:
       description: >-
         The record's deterministic key. Both owner variants resolve to the same key: the
         address is a function of the owner's public half alone.
+  - name: VeilidNetHandle::dm_records_parts
+    module: daemonseed_veilid_net::actor
+    description: >-
+      Hand out the transport state a VeilidRecords is built over. Every value in
+      it is a clone of one the actor holds, so a record store built from it shares
+      the node's open-record cache, its per-record locks, its DHT gate and its
+      write scheduler.
+    signature: "pub async fn dm_records_parts(&self) -> Result<VeilidRecordsParts>"
+    returns:
+      type: "Result<VeilidRecordsParts>"
+      description: The parts, or an actor error where the actor task is gone.
   - name: VeilidNetHandle::publish_dm_key_record
     module: daemonseed_veilid_net::actor
     description: Publish an identity's signed DM key record to subkey 0 of its dflt(1) record (ISC-C40). Bytes are opaque here — the caller signs with daemonseed_core::dm::keyrec::build and derives owner_seed with derive_owner_seed. Enqueued on the WB-3 funnel as a Keepalive-class coalescible current-state write, so slow anti-eviction re-seeds collapse to at most one queued write per record. The record is world-writable (a world-derivable address implies a world-derivable owner), so anyone can overwrite or erase it; forgery is impossible because the signature inside is verified against the address's own identity key, leaving erasure and rollback as denial-of-service only.

@@ -12,7 +12,7 @@
 //! ## A step is a process, and that is the whole of the claim
 //!
 //! FC1's probe says that at no moment do both processes exist. A test holding
-//! two drivers in one process cannot make that statement, however carefully it
+//! both sides in one process cannot make that statement, however carefully it
 //! stops one before starting the other: both are in the same address space, both
 //! their nodes are attached, and anything either kept in memory is still
 //! reachable. So each step of the conversation runs in a **separate operating
@@ -34,33 +34,32 @@
 //!
 //! ## The conversation
 //!
-//! 1. **B publishes its key record.** A conversation starts from a published
-//!    identity, so B has to have been online once before A can knock. This is
-//!    that occasion, and it is a step like any other: one process, alone.
+//! 1. **B publishes its advert.** A conversation starts from an advert a
+//!    knocker encapsulates to, so B has to have been online once before A can
+//!    knock. This is that occasion, and it is a step like any other: one
+//!    process, alone.
 //! 2. **A knocks, carrying message 0.** A first contact carries the first
 //!    message body, so the knock is message 0 rather than a separate write.
-//! 3. **B collects, accepts and replies.** B opens message 0 from its doorbell,
-//!    answers the request, and sends its reply on the channel the acceptance
-//!    establishes.
+//! 3. **B collects, accepts and replies.** B reads its drop, opens message 0
+//!    from the hello it finds, and accepts — and its reply is turn 0 of B's own
+//!    direction, carried by the acceptance rather than written after it.
 //! 4. **A collects, and replies in the same run.** A comes back holding only
-//!    what its knock left on disk, opens B's acceptance and B's reply, and then
-//!    sends one of its own. It may speak only because collecting the acceptance
-//!    established the correspondence *in this process*: a run that found the
-//!    correspondence on disk and nothing else is refused with
-//!    `RefusalReason::NotEstablishedThisSession`, which is why the reply is not
-//!    a step of its own.
+//!    what its knock left on disk, opens B's acceptance and the reply it
+//!    carried, and then sends one of its own. It may speak only once the
+//!    acceptance is in hand: a side still awaiting one is refused an ordinary
+//!    message, which is why the reply is not a step of its own.
 //! 5. **B collects A's reply**, and in doing so publishes the cursor that
 //!    settles B's own messages.
-//! 6. **A confirms.** A runs once more and reads B's acknowledgement, so its
+//! 6. **A confirms.** A runs once more and reads the cursor B published, so its
 //!    own reply shows as collected.
 //!
 //! Steps 5 and 6 are what make the containment below falsifiable rather than
 //! vacuous: without them neither side ever reads the other's cursor over its
 //! last message, and a `settled` set that is empty satisfies any containment.
 //!
-//! Every step publishes its own role's key record first. The write is the same
+//! Every step publishes its own role's advert first. The write is the same
 //! bytes every time, and a correspondent that finds the record missing has
-//! nothing to verify a frame against.
+//! nothing to encapsulate a hello to.
 //!
 //! ## What each side writes down, and what is read back
 //!
@@ -83,21 +82,19 @@
 //!
 //! ## The key schedule and the state
 //!
-//! `docs/design/direct-messaging.md` names the per-message key schedule and the
-//! conversation's at-rest records without naming the modules that hold them.
-//! They are `daemonseed_core::dm::ratchet` and
-//! `daemonseed_core::storage::dm_store`, reached through [`DmPersist`], and the
-//! steps compose those: a body opens under the key the conversation's own
-//! ratchet derived, never one this file makes up.
+//! `docs/design/direct-messaging.md` § Flows names the steps and § Records the
+//! shapes they read and write. The steps below call
+//! `daemonseed_core::dm::flows` for every one of them, over
+//! `daemonseed_veilid_net::VeilidRecords`, so a body opens under the key the
+//! conversation's own chain derived and never one this file makes up, and the
+//! records it opens are on the network rather than in a map.
 //!
 //! **A resumed step recovers its `settled` set from those records and its
-//! `opened` set from the snapshot.** The outbox on disk says which of a side's
-//! own messages a correspondent's cursor has passed, so that half survives a
+//! `opened` set from the snapshot.** The conversation record on disk says how
+//! far a correspondent's cursor has passed, so that half survives a
 //! kill outright. Opened bodies do not: the layer keeps no message store — a
 //! collected body lives in memory for as long as the process does — so the
-//! snapshot a step writes at its boundary is the only record of them. That is
-//! why the snapshot is taken after the driver has gone quiet rather than at the
-//! last assertion.
+//! snapshot a step writes at its boundary is the only record of them.
 //!
 //! ## What this needs to run
 //!
@@ -136,25 +133,20 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use daemonseed_core::dm::admission::AdmissionPolicy;
-use daemonseed_core::dm::keyrec;
-use daemonseed_core::dm::outbox::DeliveryState;
-use daemonseed_core::dm::persist::DmPersist;
-use daemonseed_core::dm::pow::PowDifficulty;
+use daemonseed_core::dm::advert::{self, AdvertKeys};
+use daemonseed_core::dm::channel;
+use daemonseed_core::dm::flows::{self, FlowError, Me, Records, Resumed, Surfaced};
+use daemonseed_core::dm::store::Store;
 use daemonseed_core::identity::keys::{
-    derive_identity_keys, Identity, IdentityKeys, IDENTITY_PK_LEN,
+    derive_identity_keys, Identity, SignKeypair, IDENTITY_PK_LEN, ML_DSA_SEED_LEN,
 };
 use daemonseed_core::identity::mnemonic::Mnemonic;
+use daemonseed_core::storage::dm_store::CorrespondenceLabel;
 use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
-use daemonseed_veilid_net::{
-    DmCommand, DmDriver, DmDriverConfig, DmDriverHandle, DmDriverParts, DmEvent, DmIdentity, PkLt,
-    RequestId, VeilidNet, VeilidNetConfig, VeilidNetHandle, WallClock,
-};
-use tokio::sync::mpsc::Receiver;
+use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidRecords, WriteCountsSnapshot};
 
 // ── what a run is configured with ────────────────────────────────────────────
 
@@ -162,41 +154,19 @@ use tokio::sync::mpsc::Receiver;
 /// directories, so this is a fixture rather than a secret.
 const AT_REST: [u8; AEAD_KEY_LEN] = [0x2b; AEAD_KEY_LEN];
 
-/// The driver's wake cadence. Every sweep, publish and fetch is planned on a
-/// tick, so this is what moves the conversation: fast enough that a hop is not
-/// dominated by waiting for the next wakeup, slow enough not to re-read the
-/// distributed hash table faster than a write can spread through it.
-const IDLE_TICK: Duration = Duration::from_secs(15);
-
 /// The budget for one hop: a write, its spread, and a correspondent's next sweep
 /// of it. A doorbell sweep reads every subkey of the record and a page sweep
 /// every subkey of its own, each a separate network round trip, so a hop is one
 /// tick plus an open plus a whole sweep.
 const HOP: Duration = Duration::from_secs(600);
 
-/// How long a step keeps its driver running after its last assertion, so the
-/// cadence that publishes what it composed gets to run before the process goes
-/// away.
-///
-/// **A composed frame is not a published one.** The driver plans the write on a
-/// tick, and a step that exited on the `Composed` event would leave the bytes in
-/// its outbox and nothing on the network for the correspondent to find.
-const PUBLISH_WINDOW: Duration = Duration::from_secs(300);
-
-/// How long a resumed step keeps its driver running before stopping.
-///
-/// A process that comes back after a kill re-seeds anything its outbox still
-/// holds. That is the whole of what the resumption has to show, and it happens
-/// on the driver's own cadence, so the window has to cover one.
-const RESUME_WINDOW: Duration = Duration::from_secs(300);
-
 /// How long the attach is given before a step gives up on the network.
 const ATTACH_SECS: u64 = 180;
 
-/// How long a driver is given to stop once it is asked.
+/// How long a step killed at its boundary is given to die.
 const STOP: Duration = Duration::from_secs(120);
 
-/// What is left of the node's graceful close once its driver has stopped.
+/// What the node's graceful close is given once a step's work is done.
 const NODE_CLOSE: Duration = Duration::from_secs(30);
 
 /// How long one step of the conversation may take before the driver gives up on
@@ -204,16 +174,20 @@ const NODE_CLOSE: Duration = Duration::from_secs(30);
 /// waits out several hops.
 const STEP_BUDGET: Duration = Duration::from_secs(5400);
 
+/// The budget for a hop whose reading half is a whole drop scan.
+///
+/// Longer than [`HOP`] by construction, and by roughly the ratio of the work.
+/// A drop is 256 slots and the record store reads one subkey per call, so a
+/// scan is 256 separate reads on one open record — where a hop's reading half
+/// is otherwise a single subkey. The budget covers several scans, because a
+/// hello that has not spread yet is found by scanning again.
+const DROP_SCAN_HOP: Duration = Duration::from_secs(2700);
+
 /// The budget for a hop that waits on an acknowledgement. Longer than [`HOP`] by
 /// construction: the correspondent has first to collect the message, which is an
 /// ordinary hop, its acknowledgement is floored before the write is permitted,
 /// and the sender then reads the record back on its own cadence.
 const ACK_HOP: Duration = Duration::from_secs(900);
-
-/// How long the driver's event stream must be silent before a step calls it
-/// quiet and takes its snapshot. One idle cadence plus room for a sweep the
-/// cadence planned.
-const QUIESCE_IDLE: Duration = Duration::from_secs(60);
 
 /// How many lines of a failed step's output the driver quotes back.
 const STDERR_TAIL_LINES: usize = 40;
@@ -288,8 +262,11 @@ impl Role {
         state.join(self.name())
     }
 
-    fn mnemonic_path(self, state: &Path) -> PathBuf {
-        self.dir(state).join("mnemonic")
+    /// Where this role's ML-DSA identity seed lives. The seed is the whole of
+    /// what persists between a role's steps: the signing keypair and every
+    /// channel owner seed come back out of it.
+    fn identity_seed_path(self, state: &Path) -> PathBuf {
+        self.dir(state).join("identity-seed")
     }
 
     fn result_path(self, state: &Path) -> PathBuf {
@@ -300,7 +277,7 @@ impl Role {
 /// One step of the conversation. Each runs as its own process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Step {
-    /// B publishes the identity A knocks at, and stops.
+    /// B publishes the advert A knocks at, and stops.
     BPublishes,
     /// A knocks, carrying message 0, and stops.
     AKnocks,
@@ -347,7 +324,7 @@ impl Step {
     /// The test function that is this step, as `--exact` names it.
     fn test_name(self) -> &'static str {
         match self {
-            Step::BPublishes => "steps::b_publishes_its_key_record",
+            Step::BPublishes => "steps::b_publishes_its_advert",
             Step::AKnocks => "steps::a_knocks_carrying_message_zero",
             Step::BCollectsAndReplies => "steps::b_collects_accepts_and_replies",
             Step::ACollectsAndReplies => "steps::a_collects_the_acceptance_and_replies",
@@ -360,7 +337,7 @@ impl Step {
 /// What a step does when its work is finished.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Boundary {
-    /// Stop the driver, close the node, exit.
+    /// Close the node, exit.
     Exit,
     /// Write the boundary marker and hold, to be killed where it stands.
     Hold,
@@ -404,6 +381,15 @@ struct StepResult {
     /// The steps this role has resumed after a kill, by label, with the number
     /// of correspondences its store held when it came back.
     resumed: Vec<String>,
+    /// What each completed step wrote, by label.
+    ///
+    /// **The write budget as a number rather than a claim.**
+    /// `docs/design/direct-messaging.md` § Write budget gives a ceiling per
+    /// flow, and the flows count writes by counting calls — so a step that
+    /// wrote twice where the design allows one would put the layer over a
+    /// ceiling the substrate enforces, with every assertion about the
+    /// conversation still passing.
+    wrote: Vec<(String, WriteCountsSnapshot)>,
 }
 
 impl StepResult {
@@ -420,6 +406,12 @@ impl StepResult {
         }
         for note in &self.resumed {
             out.push_str(&format!("resumed {note}\n"));
+        }
+        for (label, w) in &self.wrote {
+            out.push_str(&format!(
+                "wrote {label} {} {} {} {} {}\n",
+                w.hello, w.erase, w.control, w.ring, w.advert
+            ));
         }
         out
     }
@@ -468,6 +460,31 @@ impl StepResult {
                         format!("{label} {rest}")
                     });
                 }
+                "wrote" => {
+                    let label = fields
+                        .next()
+                        .ok_or_else(|| format!("line {}: no label", n + 1))?
+                        .to_owned();
+                    let counts: Vec<u64> = fields
+                        .next()
+                        .unwrap_or_default()
+                        .split(' ')
+                        .map(|f| f.parse::<u64>().map_err(|_| format!("line {}", n + 1)))
+                        .collect::<core::result::Result<_, _>>()?;
+                    let [hello, erase, control, ring, advert] = counts.as_slice() else {
+                        return Err(format!("line {}: a write record has five counts", n + 1));
+                    };
+                    out.wrote.push((
+                        label,
+                        WriteCountsSnapshot {
+                            hello: *hello,
+                            erase: *erase,
+                            control: *control,
+                            ring: *ring,
+                            advert: *advert,
+                        },
+                    ));
+                }
                 other => return Err(format!("line {}: unknown record {other:?}", n + 1)),
             }
         }
@@ -497,6 +514,14 @@ impl StepResult {
         if !self.has_done(step) {
             self.done.push(step.label().to_owned());
         }
+    }
+
+    /// What the step labelled `label` wrote, or `None` where it left no record.
+    fn writes_of(&self, step: Step) -> Option<WriteCountsSnapshot> {
+        self.wrote
+            .iter()
+            .find(|(label, _)| label == step.label())
+            .map(|(_, counts)| *counts)
     }
 
     fn opened_seqs(&self) -> Vec<u64> {
@@ -791,17 +816,19 @@ impl Drop for Supervisor {
 
 // ── the two oracles ──────────────────────────────────────────────────────────
 
-/// Lay out a fresh state directory: one mnemonic per role, and nothing else.
+/// Lay out a fresh state directory: one identity seed per role, and nothing
+/// else.
 ///
-/// The identities are generated here and derived in the step processes, so no
-/// step holds the other role's secret. A knocks at the identity B *published*,
-/// which B writes out in its first step.
+/// The seeds are drawn here and the identities derived from them in the step
+/// processes, so no step holds the other role's secret. A knocks at the
+/// identity B *published*, which B writes out in its first step.
 fn lay_out_state(state: &Path) -> [PathBuf; 2] {
     for role in [Role::A, Role::B] {
         std::fs::create_dir_all(role.dir(state)).expect("the role's directory is created");
-        let mnemonic = Mnemonic::generate().expect("a mnemonic");
-        std::fs::write(role.mnemonic_path(state), mnemonic.to_phrase())
-            .expect("the mnemonic writes");
+        let mut seed = [0u8; ML_DSA_SEED_LEN];
+        getrandom::fill(&mut seed).expect("the operating system's generator");
+        std::fs::write(role.identity_seed_path(state), hex_encode_bytes(&seed))
+            .expect("the identity seed writes");
     }
     [Role::A.result_path(state), Role::B.result_path(state)]
 }
@@ -823,7 +850,7 @@ fn conversation_completed(a: &StepResult, b: &StepResult) -> Result<(), String> 
     if !a
         .opened
         .iter()
-        .any(|(seq, body)| *seq == 1 && body.as_str() == REPLY)
+        .any(|(seq, body)| *seq == 0 && body.as_str() == REPLY)
     {
         return Err(format!("A never opened B's reply; A opened {:?}", a.opened));
     }
@@ -866,6 +893,95 @@ fn conversation_completed(a: &StepResult, b: &StepResult) -> Result<(), String> 
     Ok(())
 }
 
+/// The steps the kill variant kills at, in order.
+///
+/// Hoisted out of the test so the schedule is a value: a variant that quietly
+/// skipped a step would still complete the conversation and still pass every
+/// end-state assertion, because the step it skipped killing simply ran once
+/// like any other. [`the_kill_schedule_covers_every_step_once`] is what refuses
+/// that.
+fn boundary_schedule() -> Vec<Step> {
+    CONVERSATION.to_vec()
+}
+
+/// What `docs/design/direct-messaging.md` § Write budget allows each step, and
+/// what each step must have written to have done its part.
+///
+/// A value rather than a set of assertions so the check can be run here over
+/// hand-built results: a ceiling nothing ever reaches is satisfied by a layer
+/// that writes nothing at all, which is why each step's floor is checked too.
+/// Adverts are excluded — one per step, published by the harness on the layer's
+/// own schedule rather than by any flow.
+fn within_the_write_budget(a: &StepResult, b: &StepResult) -> Result<(), String> {
+    // First contact: at most four writes — the channel opening, message 0, the
+    // hello and one re-pick of the hello.
+    check_step(
+        a,
+        Step::AKnocks,
+        &[("control", 1, 1), ("ring", 1, 1), ("hello", 1, 2)],
+    )?;
+    // Acceptance: this side's opening, the reply it carries, the hello back with
+    // at most one re-pick, and the erase of the hello it collected.
+    check_step(
+        b,
+        Step::BCollectsAndReplies,
+        &[
+            ("control", 1, 1),
+            ("ring", 1, 1),
+            ("hello", 1, 2),
+            ("erase", 1, 1),
+        ],
+    )?;
+    // An ordinary message is one ring write, and A's acceptance-collection step
+    // sends one. The erase is of the acceptance hello A collected.
+    check_step(
+        a,
+        Step::ACollectsAndReplies,
+        &[("ring", 1, 1), ("erase", 1, 1), ("hello", 0, 0)],
+    )?;
+    // A collection batch publishes at most one cursor and writes nothing else.
+    check_step(
+        b,
+        Step::BCollectsTheReply,
+        &[("control", 0, 1), ("ring", 0, 0), ("hello", 0, 0)],
+    )?;
+    check_step(
+        a,
+        Step::AConfirms,
+        &[("control", 0, 1), ("ring", 0, 0), ("hello", 0, 0)],
+    )?;
+    Ok(())
+}
+
+/// Assert one step's counts against `(kind, floor, ceiling)` bounds.
+fn check_step(result: &StepResult, step: Step, bounds: &[(&str, u64, u64)]) -> Result<(), String> {
+    let counts = result
+        .writes_of(step)
+        .ok_or_else(|| format!("{} recorded no write counts", step.label()))?;
+    for (kind, floor, ceiling) in bounds {
+        let wrote = match *kind {
+            "hello" => counts.hello,
+            "erase" => counts.erase,
+            "control" => counts.control,
+            "ring" => counts.ring,
+            other => return Err(format!("no such write kind: {other}")),
+        };
+        if wrote < *floor {
+            return Err(format!(
+                "{} wrote {wrote} {kind} write(s), fewer than the {floor} its part needs: {counts:?}",
+                step.label()
+            ));
+        }
+        if wrote > *ceiling {
+            return Err(format!(
+                "{} wrote {wrote} {kind} write(s), over the {ceiling} the write budget allows: {counts:?}",
+                step.label()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// FC1's probe: the conversation completes with the two processes never alive
 /// together.
 #[test]
@@ -880,8 +996,11 @@ fn a_conversation_completes_with_the_two_processes_never_alive_together() {
         supervisor.run_to_exit(step);
     }
 
-    conversation_completed(&StepResult::load(&a_result), &StepResult::load(&b_result))
+    let a = StepResult::load(&a_result);
+    let b = StepResult::load(&b_result);
+    conversation_completed(&a, &b)
         .expect("the conversation completes across processes that are never alive together");
+    within_the_write_budget(&a, &b).expect("no step exceeds the design's write budget");
 }
 
 /// FC2's probe: the same conversation, with a kill at every step boundary and
@@ -894,7 +1013,7 @@ fn a_conversation_survives_a_kill_at_every_step_boundary() {
     let [a_result, b_result] = lay_out_state(state.path());
     let mut supervisor = Supervisor::new(state.path().to_path_buf());
 
-    for step in CONVERSATION {
+    for step in boundary_schedule() {
         // The step does its work, writes down what it opened, and is killed
         // where it stands rather than stopping.
         supervisor.run_and_kill_at_boundary(step);
@@ -907,267 +1026,182 @@ fn a_conversation_survives_a_kill_at_every_step_boundary() {
 
     let a = StepResult::load(&a_result);
     let b = StepResult::load(&b_result);
-    assert_eq!(
-        a.resumed.len() + b.resumed.len(),
-        CONVERSATION.len(),
-        "every step must have been resumed exactly once; A {:?}, B {:?}",
-        a.resumed,
-        b.resumed
-    );
+    // **Per side, not summed.** A total says the right number of resumptions
+    // happened somewhere; it does not say one side resumed at all, and a run
+    // where one side's steps all resumed twice and the other's never would
+    // satisfy it while leaving half the resume path unexercised.
+    for (role, result) in [(Role::A, &a), (Role::B, &b)] {
+        let steps = boundary_schedule()
+            .iter()
+            .filter(|step| step.role() == role)
+            .count();
+        assert_eq!(
+            result.resumed.len(),
+            steps,
+            "{}: every one of its {steps} step(s) must have been resumed exactly once; {:?}",
+            role.name(),
+            result.resumed
+        );
+    }
     conversation_completed(&a, &b)
         .expect("the conversation survives a kill at every step boundary");
+    within_the_write_budget(&a, &b)
+        .expect("no step exceeds the design's write budget across a kill and a resumption");
 }
 
 // ── one step, as a process ───────────────────────────────────────────────────
 
-/// One driver's event stream plus every event it has produced so far.
+/// How long a step waits between attempts at a read whose answer is still
+/// spreading through the distributed hash table.
 ///
-/// Retaining them is what makes the waits composable: a hop that arrives while
-/// an earlier one is still being waited for is buffered rather than dropped, so
-/// the order the assertions are written in does not have to be the order the
-/// network delivers in.
-struct Side {
-    who: String,
-    rx: Receiver<DmEvent>,
-    seen: Vec<DmEvent>,
-    started: Instant,
+/// A flow reports an absent record as an ordinary outcome — no advert yet, no
+/// hello in any slot — because that is what a plain read of an unwritten subkey
+/// returns. So a step that has to wait for a correspondent's write to arrive
+/// waits by reading again, and this is how often.
+const POLL: Duration = Duration::from_secs(20);
+
+/// Entropy for the flows that draw it.
+///
+/// Every key a conversation rests on comes through here, so it is the operating
+/// system's generator and not a seeded one: a run against the live network
+/// publishes records under these keys.
+fn fill(buf: &mut [u8]) -> Result<(), ()> {
+    getrandom::fill(buf).map_err(|_| ())
 }
 
-impl Side {
-    fn new(who: &str, rx: Receiver<DmEvent>) -> Self {
-        Self {
-            who: who.to_owned(),
-            rx,
-            seen: Vec::new(),
-            started: Instant::now(),
-        }
-    }
-
-    /// Seconds since this step began, for the timeline a `--nocapture` run
-    /// prints.
-    fn at(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
-    }
-
-    /// Wait until `pick` matches an event this side has produced, or fail naming
-    /// the hop. Already-buffered events are scanned first.
-    async fn wait_for<T>(
-        &mut self,
-        hop: &str,
-        budget: Duration,
-        mut pick: impl FnMut(&DmEvent) -> Option<T>,
-    ) -> T {
-        let hop_started = Instant::now();
-        if let Some(found) = self.seen.iter().find_map(&mut pick) {
-            eprintln!("[{:>7.1}s] {}: {hop} — already seen", self.at(), self.who);
-            return found;
-        }
-        loop {
-            let left = budget.saturating_sub(hop_started.elapsed());
-            assert!(
-                !left.is_zero(),
-                "{}: timed out after {}s waiting for {hop}; events so far: {:?}",
-                self.who,
-                budget.as_secs(),
-                self.seen
-            );
-            match tokio::time::timeout(left, self.rx.recv()).await {
-                Ok(Some(event)) => {
-                    let matched = pick(&event);
-                    eprintln!("[{:>7.1}s] {}: {event:?}", self.at(), self.who);
-                    self.seen.push(event);
-                    if let Some(found) = matched {
-                        eprintln!(
-                            "[{:>7.1}s] {}: {hop} in {:.1}s",
-                            self.at(),
-                            self.who,
-                            hop_started.elapsed().as_secs_f64()
-                        );
-                        return found;
-                    }
-                }
-                Ok(None) => panic!("{}: the driver stopped before {hop}", self.who),
-                Err(_) => panic!(
-                    "{}: timed out after {}s waiting for {hop}; events so far: {:?}",
-                    self.who,
-                    budget.as_secs(),
-                    self.seen
-                ),
-            }
-        }
-    }
-
-    /// Keep buffering events until none has arrived for `idle`, or `cap` runs
-    /// out. Asserts nothing.
-    ///
-    /// **This is what a step waits on before it writes its snapshot.** A driver
-    /// publishes what a step composed on its own cadence and reports what it
-    /// collected as the sweeps land, so a snapshot taken at the last assertion
-    /// is taken while the driver is still working — and in the kill test the
-    /// difference between that moment and a quiet one is evidence the kill takes
-    /// with it.
-    async fn drain_until_idle(&mut self, idle: Duration, cap: Duration) {
-        let until = Instant::now() + cap;
-        loop {
-            let left = until.saturating_duration_since(Instant::now()).min(idle);
-            if left.is_zero() {
-                return;
-            }
-            match tokio::time::timeout(left, self.rx.recv()).await {
-                Ok(Some(event)) => {
-                    eprintln!("[{:>7.1}s] {}: {event:?}", self.at(), self.who);
-                    self.seen.push(event);
-                }
-                Ok(None) | Err(_) => return,
-            }
-        }
-    }
-
-    /// Every sequence number of this side's own a correspondent's
-    /// acknowledgement confirmed collected.
-    fn settled(&self) -> Vec<u64> {
-        self.seen
-            .iter()
-            .filter_map(|e| match e {
-                DmEvent::Delivery {
-                    seq,
-                    state: DeliveryState::ConfirmedCollected,
-                    ..
-                } => Some(*seq),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Fail naming any refusal this side was given. A send that was refused
-    /// leaves no frame on the network, and the correspondent's step would then
-    /// time out with nothing saying why.
-    fn assert_nothing_was_refused(&self) {
-        let refusals: Vec<&DmEvent> = self
-            .seen
-            .iter()
-            .filter(|e| matches!(e, DmEvent::Refused { .. } | DmEvent::AcceptFailed { .. }))
-            .collect();
-        assert!(refusals.is_empty(), "{}: refused: {refusals:?}", self.who);
-    }
-}
-
-/// A node config with a fresh node identity, this role's listen port, and its
-/// own storage dir.
-///
-/// The node identity is per-node and unrelated to the conversation: nothing
-/// about a doorbell slot, a page address or a message key derives from a node
-/// key, which is why it is generated per step rather than carried with the user
-/// identity across one.
-fn node_config(role: Role, dir: &Path) -> VeilidNetConfig {
-    let id = derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
-    let mut cfg = VeilidNetConfig::new(id.veilid_node_seed, dir.to_string_lossy().into_owned());
-    cfg.namespace = format!("two_node_dm_async_{}", role.name());
-    cfg.listen_address = Some(role.port().to_owned());
-    cfg
-}
-
-/// This role's user identity, derived from the mnemonic its state directory
-/// holds.
-///
-/// **The mnemonic is what persists, not the keys.** A step takes its identity by
-/// value, so deriving it the way a front end does at start-up is the faithful
-/// version: a step that inherited keys from an earlier one would not be a
-/// separate process at all.
-fn identity_of(role: Role, state: &Path) -> IdentityKeys {
-    let path = role.mnemonic_path(state);
-    let phrase =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let mnemonic = Mnemonic::from_phrase(phrase.trim()).expect("the mnemonic parses");
-    derive_identity_keys(&mnemonic, Identity::Primary).expect("identity")
-}
-
-/// The parts this step's driver is built from.
-fn parts(
-    keys: IdentityKeys,
-    node: Arc<VeilidNetHandle>,
-    root: &Path,
-) -> DmDriverParts<VeilidNetHandle> {
-    DmDriverParts {
-        dht: node,
-        clock: WallClock::system(),
-        identity: DmIdentity {
-            signing: Arc::new(keys.signing),
-            kem: keys.kem,
-            doorbell_slot_secret: keys.dm_doorbell_slot_secret,
-        },
-        persist: DmPersist::open(root.join("dm"), &AT_REST).expect("persist opens"),
-        cfg: DmDriverConfig {
-            idle_tick: IDLE_TICK,
-            policy: AdmissionPolicy::Open,
-            // The shipped difficulty on both sides. A recipient always verifies
-            // at production, so a reduced mint would be dropped by the admission
-            // path this oracle exists to run.
-            pow_difficulty: PowDifficulty::PRODUCTION,
-        },
-        spent_tokens: None,
-    }
-}
-
-/// Publish this role's DM key record, awaited.
-///
-/// The front end's job rather than the driver's, and awaited rather than spawned
-/// so a knock cannot race a record that has not been written: a refusal caused
-/// by the step's own ordering would be indistinguishable from the transport
-/// losing the write.
-async fn publish_key_record(node: &VeilidNetHandle, keys: &IdentityKeys) {
-    let record = keyrec::build_encoded(
-        &keys.signing,
-        keys.kem.encapsulation_key(),
-        keyrec::DM_KEY_RECORD_VERSION,
-        keyrec::DM_KEY_RECORD_INVITE_ONLY,
-    )
-    .expect("key record builds");
-    let owner_seed = *keyrec::derive_owner_seed(keys.signing.public_key())
-        .expect("key-record owner seed")
-        .as_bytes();
-    node.publish_dm_key_record(owner_seed, record)
-        .await
-        .expect("key record publishes");
-}
-
-/// Every sequence number the outbox records on disk show as collected.
-///
-/// **The half of a side's evidence that survives a kill outright.** A running
-/// driver reports a settlement as an event and a killed process takes every
-/// event it held with it; the outbox record does not go anywhere. Opened bodies
-/// have no equivalent — the layer keeps no message store — so they come from the
-/// snapshot instead.
-///
-/// Opened read-only, beside the driver's own handle: this draws the outbox, it
-/// never drives it.
-fn settled_on_disk(root: &Path) -> Vec<u64> {
-    let persist = DmPersist::open(root.join("dm"), &AT_REST).expect("the store on disk reopens");
-    let now_ms = std::time::SystemTime::now()
+/// Seconds since the epoch, which is what an advert's window is measured in.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("a clock after the epoch")
-        .as_millis() as i64;
-    let mut seqs = Vec::new();
-    for label in persist
-        .store()
-        .correspondences()
-        .expect("the store lists its correspondences")
-    {
-        let Some(outbox) = persist
-            .read_outbox(&label, now_ms)
-            .expect("the outbox reads")
-        else {
-            continue;
-        };
-        for entry in outbox.iter() {
-            if matches!(entry.delivery_state(), DeliveryState::ConfirmedCollected) {
-                seqs.push(entry.seq());
-            }
+        .as_secs()
+}
+
+/// This role's identity seed, from the file its state directory holds.
+///
+/// **The seed is what persists, and both halves of an identity come out of
+/// it.** The signing keypair signs adverts and openings, and the same seed
+/// derives every channel owner seed this side writes under, so a step that
+/// inherited either from an earlier one would not be a separate process at all.
+fn identity_seed_of(role: Role, state: &Path) -> [u8; ML_DSA_SEED_LEN] {
+    let path = role.identity_seed_path(state);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let bytes = hex_decode_bytes(text.trim()).expect("the identity seed decodes");
+    <[u8; ML_DSA_SEED_LEN]>::try_from(bytes.as_slice()).expect("an ML-DSA seed's length")
+}
+
+/// This role's conversation store, under its own state directory.
+fn store_of(role: Role, state: &Path) -> Store {
+    Store::open(role.dir(state).join("dm-flows"), &AT_REST).expect("the store opens")
+}
+
+/// Load this role's advert keys, minting them on the first step, and publish
+/// the advert they name.
+///
+/// Published on every step rather than once: an advert record is world-writable
+/// and has no time to live, so a correspondent that finds it missing has
+/// nothing to verify a hello's encapsulation against, and the design's answer
+/// to both is that the owner rewrites it. One write.
+fn publish_advert(store: &Store, records: &mut VeilidRecords, signer: &SignKeypair) -> AdvertKeys {
+    let keys = advert_keys_of(store);
+    let bytes = keys.advert_bytes(signer).expect("the advert signs");
+    let owner = advert::derive_owner_seed(signer.public_key()).expect("the advert owner seed");
+    records
+        .publish_advert(&owner, advert::ADVERT_SUBKEYS, &bytes)
+        .expect("the advert publishes");
+    keys
+}
+
+/// This role's advert keys: the ones its store holds, or a fresh pair persisted
+/// before it is used.
+///
+/// **The keys have to be the same in every step, and nothing in memory carries
+/// between steps.** A correspondent encapsulates a hello to the advert key it
+/// read, so a step that minted a second pair would publish an advert nobody's
+/// outstanding hello can be opened under, and the conversation would stop with
+/// every record in place. The persist precedes the publish for the same reason
+/// § Flows orders every persist before the write it enables: an advert whose
+/// secret never reached disk is one nobody can open a hello against.
+fn advert_keys_of(store: &Store) -> AdvertKeys {
+    match store.load_advert_keys().expect("the advert keys read") {
+        Some(snapshot) => AdvertKeys::restore(snapshot),
+        None => {
+            let keys = AdvertKeys::new(now_secs(), fill).expect("advert keys mint");
+            store
+                .persist_advert_keys(&keys.snapshot())
+                .expect("the advert keys persist");
+            keys
         }
+    }
+}
+
+/// Open every channel this side owns, and return how many were opened.
+///
+/// **A write to a channel needs the owner keypair, and a lookup key is not
+/// one.** The lookup key a hello discloses is a public key, so the record store
+/// holds the keypair only for channels opened in this process — which is what a
+/// relaunch has to redo before it can write. The owner seed comes back from the
+/// identity seed, the correspondent and the generation the store holds, so
+/// nothing about it survives a kill except the inputs it is derived from.
+///
+/// The lookup key that comes back is asserted equal to the one the store
+/// recorded. That is the positive control on the derivation: a seed derived
+/// under the wrong inputs would open a perfectly valid record that the
+/// correspondent never reads, and every write to it would succeed.
+fn reopen_own_channels(store: &Store, records: &mut VeilidRecords, me: &Me<'_>) -> usize {
+    let loaded = store.load().expect("the store reloads");
+    for conv in &loaded.convs {
+        let owner = channel::derive_owner_seed(
+            me.identity_seed,
+            &conv.state.peer_identity_pk,
+            conv.state.generation,
+        )
+        .expect("the channel owner seed");
+        let lookup_key = records
+            .open_channel(&owner, channel::CHANNEL_SUBKEYS)
+            .expect("the channel opens");
+        assert_eq!(
+            lookup_key, conv.state.outgoing_lookup_key,
+            "the re-derived channel owner must address the record the store recorded"
+        );
+    }
+    loaded.convs.len()
+}
+
+/// Every sequence number of this side's own that a correspondent's cursor has
+/// passed.
+///
+/// **The half of a side's evidence that survives a kill outright.** A cursor
+/// the flows read is written into the conversation record, and that record does
+/// not go anywhere; opened bodies have no equivalent, because the layer keeps
+/// no message store, so they come from the snapshot a step writes instead.
+fn settled_on_disk(store: &Store) -> Vec<u64> {
+    let loaded = store.load().expect("the store reloads");
+    let mut seqs = Vec::new();
+    for conv in &loaded.convs {
+        seqs.extend(0..conv.state.peer_collected);
     }
     seqs.sort_unstable();
     seqs.dedup();
     seqs
+}
+
+/// The one correspondence this side holds, which every step after the first has
+/// exactly one of.
+fn only_correspondence(store: &Store) -> CorrespondenceLabel {
+    let loaded = store.load().expect("the store reloads");
+    assert_eq!(
+        loaded.convs.len(),
+        1,
+        "this conversation has one correspondent; the store holds {}",
+        loaded.convs.len()
+    );
+    loaded
+        .convs
+        .into_iter()
+        .next()
+        .expect("one conversation")
+        .peer
 }
 
 /// Where B writes the identity it has published, and A reads it.
@@ -1175,35 +1209,32 @@ fn published_identity_path(state: &Path) -> PathBuf {
     state.join("b-identity")
 }
 
-/// Stop one driver and wait until its event stream closes.
+/// Retry `attempt` until it answers, or fail naming the hop.
 ///
-/// The closed stream is the only signal that the driver is gone, and waiting for
-/// it is what makes the next step's process the only one holding this state.
-async fn stop(handle: &DmDriverHandle, side: &mut Side) {
-    handle
-        .send(DmCommand::Shutdown)
-        .await
-        .expect("the driver takes the shutdown");
-    let asked = Instant::now();
+/// What a step waits on is a correspondent's write spreading far enough through
+/// the distributed hash table for this node's read to find it, and the only
+/// thing that reports it has is the read itself. So the wait is a read repeated
+/// on a cadence, and the budget is what makes a correspondent that never wrote
+/// a failure rather than a hang.
+async fn until<T>(hop: &str, budget: Duration, mut attempt: impl FnMut() -> Option<T>) -> T {
+    let started = Instant::now();
+    let mut tries = 0u32;
     loop {
-        let left = STOP.saturating_sub(asked.elapsed());
-        assert!(
-            !left.is_zero(),
-            "{}: the driver did not stop within {}s",
-            side.who,
-            STOP.as_secs()
-        );
-        match tokio::time::timeout(left, side.rx.recv()).await {
-            Ok(Some(event)) => side.seen.push(event),
-            Ok(None) => break,
-            Err(_) => panic!(
-                "{}: the driver did not stop within {}s",
-                side.who,
-                STOP.as_secs()
-            ),
+        tries += 1;
+        if let Some(found) = attempt() {
+            eprintln!(
+                "[{:>7.1}s] {hop} — after {tries} attempt(s)",
+                started.elapsed().as_secs_f64()
+            );
+            return found;
         }
+        assert!(
+            started.elapsed() < budget,
+            "timed out after {}s over {tries} attempt(s) waiting for {hop}",
+            budget.as_secs()
+        );
+        tokio::time::sleep(POLL).await;
     }
-    eprintln!("[{:>7.1}s] {}: stopped", side.at(), side.who);
 }
 
 /// Run one step of the conversation, in this process, and leave.
@@ -1238,278 +1269,289 @@ async fn run_step(step: Step) {
     let mut result = StepResult::load(&role.result_path(&state));
     let resuming = result.has_done(step);
 
-    let keys = identity_of(role, &state);
-    let own_pk: PkLt = Box::new(*keys.signing.public_key());
+    let seed = identity_seed_of(role, &state);
+    let signer = SignKeypair::from_ml_dsa_seed(&seed).expect("the identity derives from its seed");
+    let me = Me {
+        signer: &signer,
+        identity_seed: &seed,
+    };
+
     let (node, _events) = VeilidNet::start(node_config(role, &role.dir(&state).join("node")))
         .await
         .expect("the node starts");
     node.attach_and_wait(ATTACH_SECS)
         .await
         .expect("the node reaches the public network");
-    publish_key_record(&node, &keys).await;
+    let mut records = VeilidRecords::new(
+        node.dm_records_parts()
+            .await
+            .expect("the node hands out its transport"),
+    )
+    .expect("a step runs on a multi-thread runtime");
+
+    let store = store_of(role, &state);
+    let advert_keys = publish_advert(&store, &mut records, &signer);
+    let reopened = reopen_own_channels(&store, &mut records, &me);
+    eprintln!(
+        "{}: {reopened} channel(s) of its own reopened",
+        step.label()
+    );
     if role == Role::B {
         std::fs::write(
             published_identity_path(&state),
-            hex_encode_bytes(own_pk.as_slice()),
+            hex_encode_bytes(signer.public_key().as_slice()),
         )
         .expect("the published identity writes");
     }
 
-    let node = Arc::new(node);
-    let (handle, events) = DmDriver::spawn(parts(keys, Arc::clone(&node), &role.dir(&state)));
-    let mut side = Side::new(role.name(), events);
-
     if resuming {
-        resume(step, &mut side, &mut result, &state).await;
+        resume(step, &store, &mut records, &mut result);
     } else {
         match step {
-            // B's record is already written, above. Nothing else is owed: the
-            // quiesce below is what makes this a real occasion of B being online
-            // rather than a bare write.
+            // B's advert is already written, above. Nothing else is owed: this
+            // is the occasion of B having been online once, which is what a
+            // first contact needs of it.
             Step::BPublishes => {}
-            Step::AKnocks => a_knocks(&handle, &mut side, &state).await,
+            Step::AKnocks => a_knocks(&store, &mut records, &me, &state).await,
             Step::BCollectsAndReplies => {
-                b_collects_accepts_and_replies(&handle, &mut side, &mut result).await
+                b_collects_accepts_and_replies(&store, &mut records, &me, &advert_keys, &mut result)
+                    .await
             }
             Step::ACollectsAndReplies => {
-                a_collects_and_replies(&handle, &mut side, &mut result).await
+                a_collects_and_replies(&store, &mut records, &me, &advert_keys, &mut result).await
             }
-            Step::BCollectsTheReply => b_collects_the_reply(&mut side, &mut result).await,
-            Step::AConfirms => a_confirms_its_reply_was_collected(&mut side).await,
+            Step::BCollectsTheReply => {
+                b_collects_the_reply(&store, &mut records, &mut result).await
+            }
+            Step::AConfirms => {
+                a_confirms_its_reply_was_collected(&store, &mut records, &mut result).await
+            }
         }
         result.mark_done(step);
+        // Taken after the step's work and before the boundary, so a kill cannot
+        // take the record of what was written with it. The advert publish above
+        // is counted apart from the flows' writes, which is what lets the
+        // budgets below be asserted against § Write budget's own numbers.
+        let counts = records.write_counts();
+        eprintln!("{}: wrote {counts:?}", step.label());
+        result.wrote.push((step.label().to_owned(), counts));
     }
 
-    // **Quiesce, then snapshot.** The driver is still publishing and still
-    // sweeping when the last assertion returns, so the snapshot waits for its
-    // event stream to go quiet — otherwise the kill test's kill lands between a
-    // settlement and the record of it.
-    side.drain_until_idle(QUIESCE_IDLE, PUBLISH_WINDOW).await;
-    side.assert_nothing_was_refused();
-    result.settled.extend(side.settled());
-    result.settled.extend(settled_on_disk(&role.dir(&state)));
+    result.settled.extend(settled_on_disk(&store));
     result.settled.sort_unstable();
     result.settled.dedup();
     result.save(&role.result_path(&state));
 
     match boundary {
         Boundary::Hold => hold_at_boundary(&state, step).await,
-        Boundary::Exit => {
-            stop(&handle, &mut side).await;
-            node.shutdown(NODE_CLOSE).await;
-        }
+        Boundary::Exit => node.shutdown(NODE_CLOSE).await,
     }
 }
 
 /// A knocks at the identity B published, carrying message 0.
-async fn a_knocks(handle: &DmDriverHandle, side: &mut Side, state: &Path) {
+///
+/// The knock is retried only while B's advert has not arrived. That is the one
+/// outcome a re-run repeats safely: the advert is read before anything is
+/// persisted or written, so a run that stops there has left nothing behind, and
+/// every later stop resumes from the conversation record instead.
+async fn a_knocks(store: &Store, records: &mut VeilidRecords, me: &Me<'_>, state: &Path) {
     let path = published_identity_path(state);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let bytes = hex_decode_bytes(text.trim()).expect("the published identity decodes");
-    let recipient: PkLt = Box::new(
-        <[u8; IDENTITY_PK_LEN]>::try_from(bytes.as_slice())
-            .expect("the published identity is an identity key"),
-    );
+    let recipient = <[u8; IDENTITY_PK_LEN]>::try_from(bytes.as_slice())
+        .expect("the published identity is an identity key");
 
-    handle
-        .send(DmCommand::FirstContact {
-            recipient,
-            body: MESSAGE_0.into(),
-        })
-        .await
-        .expect("the first contact queues");
-    side.wait_for("A's knock is composed", HOP, |e| {
-        matches!(
-            e,
-            DmEvent::Delivery {
-                seq: 0,
-                state: DeliveryState::Composed,
-                ..
-            }
-        )
-        .then_some(())
-    })
+    let opened = until(
+        "B's advert, and A's knock into B's drop",
+        HOP,
+        || match flows::first_contact(
+            store,
+            records,
+            me,
+            &recipient,
+            MESSAGE_0.as_bytes(),
+            fill,
+            now_secs(),
+        ) {
+            Ok(outcome) => Some(outcome),
+            Err(FlowError::NoAdvert) => None,
+            Err(e) => panic!("A's knock failed: {e}"),
+        },
+    )
     .await;
+    eprintln!("A: knocked — {opened:?}");
 }
 
-/// B opens message 0 from its doorbell, accepts, and replies on the channel the
-/// acceptance establishes.
+/// B reads its drop, opens message 0 from the hello it finds, accepts, and
+/// replies on the channel the acceptance establishes.
 async fn b_collects_accepts_and_replies(
-    handle: &DmDriverHandle,
-    side: &mut Side,
+    store: &Store,
+    records: &mut VeilidRecords,
+    me: &Me<'_>,
+    advert_keys: &AdvertKeys,
     result: &mut StepResult,
 ) {
-    let (request, from, body): (RequestId, PkLt, String) = side
-        .wait_for("the knock arrives at B's doorbell", HOP, |e| match e {
-            DmEvent::ContactRequest {
-                request,
-                from,
-                body,
-                ..
-            } => Some((request.clone(), from.clone(), body.clone())),
+    let request = until("A's knock arrives in B's drop", DROP_SCAN_HOP, || {
+        let surfaced = flows::collect(store, records, me, advert_keys, |_| false)
+            .expect("B's own store answers");
+        surfaced.into_iter().find_map(|one| match one {
+            Surfaced::ContactRequest(request) => Some(request),
+            Surfaced::Failed { error, .. } => panic!("B could not settle a hello: {error}"),
             _ => None,
         })
-        .await;
+    })
+    .await;
+
+    let accepted = flows::accept(
+        store,
+        records,
+        me,
+        &request,
+        REPLY.as_bytes(),
+        fill,
+        now_secs(),
+    )
+    .expect("B accepts the contact request");
     // The knock is message 0 of A's direction, and opening it is what B has to
     // show for FC1.
-    result.opened.push((0, body));
-
-    handle
-        .send(DmCommand::Accept { request })
-        .await
-        .expect("the accept queues");
-    side.wait_for("B's acceptance is composed", HOP, |e| {
-        matches!(
-            e,
-            DmEvent::Delivery {
-                seq: 0,
-                state: DeliveryState::Composed,
-                ..
-            }
-        )
-        .then_some(())
-    })
-    .await;
-
-    handle
-        .send(DmCommand::Send {
-            to: from,
-            body: REPLY.into(),
-        })
-        .await
-        .expect("the reply queues");
-    side.wait_for("B's reply is composed", HOP, |e| {
-        matches!(
-            e,
-            DmEvent::Delivery {
-                seq: 1,
-                state: DeliveryState::Composed,
-                ..
-            }
-        )
-        .then_some(())
-    })
-    .await;
+    for (seq, body) in accepted.bodies.iter().enumerate() {
+        result.opened.push((seq as u64, body_text(body)));
+    }
+    assert!(
+        result
+            .opened
+            .iter()
+            .any(|(seq, body)| *seq == 0 && body == MESSAGE_0),
+        "B must recover the exact body A knocked with; it opened {:?}",
+        result.opened
+    );
 }
 
 /// A comes back holding only what its knock left on disk, opens what B wrote
-/// while A was gone, and sends one of its own.
-async fn a_collects_and_replies(handle: &DmDriverHandle, side: &mut Side, result: &mut StepResult) {
-    // Nothing here is sent by a command. B's acceptance and reply were written
-    // while this process did not exist, and what A opens is what the records on
-    // the network hold, under keys A's own store re-derived.
-    let accepted = side
-        .wait_for("A collects B's acceptance", HOP, |e| match e {
-            DmEvent::Message { seq: 0, body, .. } => Some(body.clone()),
+/// while A did not exist, and sends one of its own.
+///
+/// Nothing here is sent until the acceptance is in hand. A run that found the
+/// correspondence on disk and nothing else is still awaiting acceptance, and
+/// the flow refuses an ordinary message while it is — which is why the reply
+/// belongs in this step rather than in one of its own.
+async fn a_collects_and_replies(
+    store: &Store,
+    records: &mut VeilidRecords,
+    me: &Me<'_>,
+    advert_keys: &AdvertKeys,
+    result: &mut StepResult,
+) {
+    let acceptance = until("B's acceptance arrives in A's drop", DROP_SCAN_HOP, || {
+        let surfaced = flows::collect(store, records, me, advert_keys, |_| false)
+            .expect("A's own store answers");
+        surfaced.into_iter().find_map(|one| match one {
+            Surfaced::Accepted(acceptance) => Some(acceptance),
+            Surfaced::Failed { error, .. } => panic!("A could not settle a hello: {error}"),
             _ => None,
         })
-        .await;
-    assert_eq!(
-        accepted, "",
-        "the acceptance carries no body; a non-empty one is a different frame"
-    );
-    result.opened.push((0, accepted));
-
-    let (peer, reply): (PkLt, String) = side
-        .wait_for("A collects B's reply", HOP, |e| match e {
-            DmEvent::Message {
-                from, seq: 1, body, ..
-            } => Some((from.clone(), body.clone())),
-            _ => None,
-        })
-        .await;
-    assert_eq!(reply, REPLY, "A must recover the exact body B sent");
-    result.opened.push((1, reply));
-
-    // **A may speak only because it has just collected the acceptance.** A run
-    // that found this correspondence on disk and nothing else is refused with
-    // `RefusalReason::NotEstablishedThisSession`, which is why the reply belongs
-    // in this step rather than in one of its own.
-    handle
-        .send(DmCommand::Send {
-            to: peer,
-            body: A_REPLY.into(),
-        })
-        .await
-        .expect("A's reply queues");
-    side.wait_for("A's reply is composed", HOP, |e| {
-        matches!(
-            e,
-            DmEvent::Delivery {
-                seq: 1,
-                state: DeliveryState::Composed,
-                ..
-            }
-        )
-        .then_some(())
     })
     .await;
+
+    for (seq, body) in acceptance.bodies.iter().enumerate() {
+        result.opened.push((seq as u64, body_text(body)));
+    }
+    assert!(
+        result
+            .opened
+            .iter()
+            .any(|(seq, body)| *seq == 0 && body == REPLY),
+        "A must recover the exact body B replied with; it opened {:?}",
+        result.opened
+    );
+
+    let seq = flows::send_message(store, records, &acceptance.peer, A_REPLY.as_bytes(), fill)
+        .expect("A's reply sends");
+    assert_eq!(seq, 1, "A's reply follows the message its knock carried");
 }
 
 /// B opens A's reply. Collecting it is what publishes the cursor that settles
-/// B's own messages, which is the only way B's side of the containment below
-/// becomes something a run can refute.
-async fn b_collects_the_reply(side: &mut Side, result: &mut StepResult) {
-    let body = side
-        .wait_for("B collects A's reply", HOP, |e| match e {
-            DmEvent::Message { seq: 1, body, .. } => Some(body.clone()),
-            _ => None,
-        })
-        .await;
-    assert_eq!(body, A_REPLY, "B must recover the exact body A sent");
-    result.opened.push((1, body));
-}
-
-/// A reads B's acknowledgement, so A's own reply shows as collected.
-///
-/// A fetch rather than a send, so it needs no re-establishment: what this run
-/// does is read the record B wrote and settle the outbox entry already on disk.
-async fn a_confirms_its_reply_was_collected(side: &mut Side) {
-    side.wait_for("A's reply is confirmed collected", ACK_HOP, |e| {
-        matches!(
-            e,
-            DmEvent::Delivery {
-                seq: 1,
-                state: DeliveryState::ConfirmedCollected,
-                ..
-            }
-        )
-        .then_some(())
+/// B's own messages, which is the only way B's side of the containment becomes
+/// something a run can refute.
+async fn b_collects_the_reply(store: &Store, records: &mut VeilidRecords, result: &mut StepResult) {
+    let peer = only_correspondence(store);
+    let batch = until("A's reply arrives in its channel", HOP, || {
+        let batch = flows::collect_batch(store, records, &peer).expect("B's own store answers");
+        (!batch.bodies.is_empty()).then_some(batch)
     })
     .await;
+    assert_eq!(
+        batch.bodies.len(),
+        1,
+        "A wrote one message since B's cursor"
+    );
+    assert_eq!(
+        body_text(&batch.bodies[0]),
+        A_REPLY,
+        "B must recover the exact body A sent"
+    );
+    result
+        .opened
+        .push((batch.my_collected - 1, body_text(&batch.bodies[0])));
+}
+
+/// A reads B's published cursor, so A's own reply shows as collected.
+///
+/// A collection first, because B's cursor rides inside a message where B has
+/// written one and in its control subkey where it has not, and only the batch
+/// reads the first of those. The cursor read that follows is what settles a
+/// reply B answered with nothing.
+async fn a_confirms_its_reply_was_collected(
+    store: &Store,
+    records: &mut VeilidRecords,
+    result: &mut StepResult,
+) {
+    let peer = only_correspondence(store);
+    let collected = until("B's cursor passes A's reply", ACK_HOP, || {
+        flows::collect_batch(store, records, &peer).expect("A's own store answers");
+        let cursor = flows::peer_cursor(store, records, &peer).expect("A's own store answers")?;
+        (cursor > 1).then_some(cursor)
+    })
+    .await;
+    result.settled.extend(0..collected);
 }
 
 /// Come back after a kill, over the state directory the killed process left.
 ///
-/// The store on disk is the whole of what this process has: everything the
-/// killed one held in memory is gone. The roster is the first thing the driver
-/// says and is read from those records, so waiting for it is how this run knows
-/// the store reopened; the window that follows lets the outbox re-seed anything
-/// the kill left unpublished.
+/// The store on disk is the whole of what this process has. Its own channels
+/// are opened again above, which is what a relaunch owes the record store, and
+/// any hello the kill left outstanding is rewritten from the bytes the store
+/// holds rather than minted again — the encapsulation is fixed, so a rewrite is
+/// the same hello and not a second one.
 ///
-/// **The evidence comes back from the records, not from that roster.** A count
+/// **The evidence comes back from the records, not from the count.** The number
 /// of correspondences says the store is readable and nothing about what the
-/// killed process had achieved, so the settled set is re-derived from the outbox
-/// records themselves — anything that landed between the snapshot and the kill
-/// is recovered here rather than lost.
-async fn resume(step: Step, side: &mut Side, result: &mut StepResult, state: &Path) {
-    side.wait_for("the roster the store on disk holds", HOP, |e| {
-        matches!(e, DmEvent::Roster { .. }).then_some(())
-    })
-    .await;
-    side.drain_until_idle(QUIESCE_IDLE, RESUME_WINDOW).await;
-    let recovered = settled_on_disk(&step.role().dir(state));
-    result
-        .resumed
-        .push(format!("{} {}", step.label(), recovered.len()));
+/// killed process had achieved, so the settled set is re-derived from the
+/// conversation records themselves.
+fn resume(step: Step, store: &Store, records: &mut VeilidRecords, result: &mut StepResult) {
+    let loaded = store.load().expect("the store reloads");
+    let mut rewritten = 0usize;
+    for conv in &loaded.convs {
+        match flows::resume_first_contact(store, records, &conv.peer)
+            .expect("a rewrite of an outstanding hello")
+        {
+            Resumed::Rewrote(_) => rewritten += 1,
+            Resumed::Nothing => {}
+        }
+    }
+    let recovered = settled_on_disk(store);
+    result.resumed.push(format!(
+        "{} {} {rewritten}",
+        step.label(),
+        loaded.convs.len()
+    ));
     result.settled.extend(recovered);
 }
 
 /// Write the boundary marker and hold, to be killed where this process stands.
 ///
-/// The driver test waits for the marker before it kills, so the kill lands after
-/// the step's work is on disk and before the process has stopped anything — which
-/// is what a step boundary is.
+/// The driver test waits for the marker before it kills, so the kill lands
+/// after the step's work is on disk and before the process has stopped
+/// anything — which is what a step boundary is.
 async fn hold_at_boundary(state: &Path, step: Step) {
     let marker = state.join(format!("{}.boundary", step.label()));
     std::fs::write(&marker, step.label()).expect("the boundary marker writes");
@@ -1520,6 +1562,11 @@ async fn hold_at_boundary(state: &Path, step: Step) {
         step.label(),
         HOLD_CAP.as_secs()
     );
+}
+
+/// One opened body as the text it was sent as.
+fn body_text(body: &[u8]) -> String {
+    String::from_utf8(body.to_vec()).expect("a body this file sent is text")
 }
 
 /// Bytes as lowercase hex.
@@ -1546,16 +1593,21 @@ fn hex_decode_bytes(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The four steps, as the test functions the driver tests re-execute.
+/// The six steps, as the test functions the driver tests re-execute.
 ///
 /// Each is `#[ignore]`d: it is spawned with its role and state directory in the
 /// environment, and run on its own with neither it prints a line and returns.
+///
+/// Each is a **multi-thread** runtime, and that is a requirement rather than a
+/// default. The record store bridges the flows' synchronous calls onto the
+/// asynchronous transport by blocking the worker they run on, which is sound
+/// only where there are other workers to carry the node meanwhile.
 mod steps {
     use super::{run_step, Step};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "one step of this file's driver tests; it is spawned by them, with its state directory in the environment"]
-    async fn b_publishes_its_key_record() {
+    async fn b_publishes_its_advert() {
         run_step(Step::BPublishes).await;
     }
 
@@ -1588,6 +1640,21 @@ mod steps {
     async fn a_confirms_its_reply_was_collected() {
         run_step(Step::AConfirms).await;
     }
+}
+
+/// A node config with a fresh node identity, this role's listen port, and its
+/// own storage dir.
+///
+/// The node identity is per-node and unrelated to the conversation: nothing
+/// about a drop slot, a channel address or a message key derives from a node
+/// key, which is why it is generated per step rather than carried with the user
+/// identity across one.
+fn node_config(role: Role, dir: &Path) -> VeilidNetConfig {
+    let id = derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap();
+    let mut cfg = VeilidNetConfig::new(id.veilid_node_seed, dir.to_string_lossy().into_owned());
+    cfg.namespace = format!("two_node_dm_async_{}", role.name());
+    cfg.listen_address = Some(role.port().to_owned());
+    cfg
 }
 
 // ── the harness's own tests, which need no network ───────────────────────────
@@ -1729,6 +1796,16 @@ fn a_result_file_round_trips() {
         settled: vec![0, 1],
         done: vec!["a-knocks".to_owned()],
         resumed: vec!["a-knocks 1".to_owned()],
+        wrote: vec![(
+            "a-knocks".to_owned(),
+            WriteCountsSnapshot {
+                hello: 2,
+                erase: 0,
+                control: 1,
+                ring: 1,
+                advert: 1,
+            },
+        )],
     };
 
     let read_back = StepResult::parse(&written.encode()).expect("the result file parses");
@@ -1798,17 +1875,25 @@ fn a_result_file_it_did_not_write_is_an_error() {
 /// what is wrong, on each way one can be incomplete.
 #[test]
 fn the_end_state_check_catches_each_way_a_conversation_is_incomplete() {
+    // A opened one body: B's reply, which is sequence 0 of B's direction
+    // because the acceptance carries it. B opened two: A's knock at sequence 0
+    // and A's reply at sequence 1. Each side's settled set is what the other's
+    // cursor has actually passed, so B's holds only sequence 0 — A's reply
+    // carried a cursor over B's first message and nothing has carried one over
+    // A's own last message except the cursor A reads in its final step.
     let complete_a = || StepResult {
-        opened: vec![(0, String::new()), (1, REPLY.to_owned())],
+        opened: vec![(0, REPLY.to_owned())],
         settled: vec![0, 1],
         done: Vec::new(),
         resumed: Vec::new(),
+        wrote: Vec::new(),
     };
     let complete_b = || StepResult {
         opened: vec![(0, MESSAGE_0.to_owned()), (1, A_REPLY.to_owned())],
-        settled: vec![0, 1],
+        settled: vec![0],
         done: Vec::new(),
         resumed: Vec::new(),
+        wrote: Vec::new(),
     };
     conversation_completed(&complete_a(), &complete_b()).expect("a completed conversation passes");
 
@@ -1836,11 +1921,194 @@ fn the_end_state_check_catches_each_way_a_conversation_is_incomplete() {
     b.opened.retain(|(seq, _)| *seq != 0);
     conversation_completed(&complete_a(), &b).expect_err("B not opening message 0 must fail");
     let mut a = complete_a();
-    a.opened.retain(|(seq, _)| *seq != 1);
+    a.opened.retain(|(seq, _)| *seq != 0);
     conversation_completed(&a, &complete_b()).expect_err("A not opening B's reply must fail");
     let mut b = complete_b();
     b.opened.retain(|(seq, _)| *seq != 1);
     conversation_completed(&complete_a(), &b).expect_err("B not opening A's reply must fail");
+}
+
+/// The kill variant kills at every step of the conversation, once each.
+///
+/// The control on [`boundary_schedule`]: a schedule that dropped a step would
+/// leave that step killed at no boundary, and the conversation would still
+/// complete.
+#[test]
+fn the_kill_schedule_covers_every_step_once() {
+    let schedule = boundary_schedule();
+    assert_eq!(
+        schedule.len(),
+        CONVERSATION.len(),
+        "the kill variant kills at every step: {schedule:?}"
+    );
+    for step in CONVERSATION {
+        assert_eq!(
+            schedule.iter().filter(|s| **s == step).count(),
+            1,
+            "{} must be killed at exactly once",
+            step.label()
+        );
+    }
+}
+
+/// A role's advert keys are the same in a second step as in the first.
+///
+/// **Nothing in memory crosses a step, so this is what makes a conversation
+/// possible at all.** A correspondent encapsulates its hello to the advert key
+/// it read; a second call that minted a fresh pair would publish an advert that
+/// no outstanding hello can be opened under, and the conversation would stop
+/// with every record in place and no error anywhere.
+#[test]
+fn a_roles_advert_keys_survive_between_steps() {
+    // The store seals its records, so the module has to be up before it opens.
+    // Tolerated rather than asserted: another test in this binary may have
+    // initialized it already, and a second call is not a failure of this one.
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let root = tempfile::tempdir().expect("a store directory");
+    let first = {
+        let store = Store::open(root.path().join("dm-flows"), &AT_REST).expect("the store opens");
+        advert_keys_of(&store)
+    };
+    // A separate `Store` over the same directory, as a separate step process
+    // would open it.
+    let second = {
+        let store = Store::open(root.path().join("dm-flows"), &AT_REST).expect("the store reopens");
+        advert_keys_of(&store)
+    };
+    assert_eq!(
+        first.serial(),
+        second.serial(),
+        "the serial is the same key"
+    );
+    assert_eq!(first.not_before(), second.not_before());
+    assert_eq!(
+        first.encapsulation_key(),
+        second.encapsulation_key(),
+        "a correspondent's hello is encapsulated to this key; it must not change"
+    );
+}
+
+/// A step's write counts survive the result file, and a step with none is
+/// distinguishable from one that wrote nothing.
+#[test]
+fn a_steps_write_counts_round_trip_through_the_result_file() {
+    let mut result = StepResult::default();
+    result.wrote.push((
+        Step::AKnocks.label().to_owned(),
+        WriteCountsSnapshot {
+            hello: 2,
+            erase: 0,
+            control: 1,
+            ring: 1,
+            advert: 1,
+        },
+    ));
+    let parsed = StepResult::parse(&result.encode()).expect("the record parses");
+    assert_eq!(parsed.writes_of(Step::AKnocks).map(|c| c.hello), Some(2));
+    assert_eq!(parsed.writes_of(Step::AKnocks).map(|c| c.control), Some(1));
+    assert_eq!(
+        parsed.writes_of(Step::AConfirms),
+        None,
+        "a step that recorded nothing is absent, not zero"
+    );
+}
+
+/// The budget check passes on a run inside it and fails, naming the step, on a
+/// run over it or short of it.
+///
+/// A value rather than a set of assertions for the reason
+/// [`conversation_completed`] is one: four of its clauses are what stop the
+/// ceiling being satisfied by a layer that wrote nothing.
+#[test]
+fn the_write_budget_check_catches_a_step_over_and_under_its_allowance() {
+    let within = || {
+        let a = StepResult {
+            wrote: vec![
+                (
+                    Step::AKnocks.label().to_owned(),
+                    WriteCountsSnapshot {
+                        hello: 1,
+                        control: 1,
+                        ring: 1,
+                        advert: 1,
+                        erase: 0,
+                    },
+                ),
+                (
+                    Step::ACollectsAndReplies.label().to_owned(),
+                    WriteCountsSnapshot {
+                        ring: 1,
+                        erase: 1,
+                        advert: 1,
+                        hello: 0,
+                        control: 0,
+                    },
+                ),
+                (
+                    Step::AConfirms.label().to_owned(),
+                    WriteCountsSnapshot {
+                        control: 1,
+                        advert: 1,
+                        hello: 0,
+                        erase: 0,
+                        ring: 0,
+                    },
+                ),
+            ],
+            ..StepResult::default()
+        };
+        let b = StepResult {
+            wrote: vec![
+                (
+                    Step::BCollectsAndReplies.label().to_owned(),
+                    WriteCountsSnapshot {
+                        hello: 2,
+                        control: 1,
+                        ring: 1,
+                        erase: 1,
+                        advert: 1,
+                    },
+                ),
+                (
+                    Step::BCollectsTheReply.label().to_owned(),
+                    WriteCountsSnapshot {
+                        control: 1,
+                        advert: 1,
+                        hello: 0,
+                        erase: 0,
+                        ring: 0,
+                    },
+                ),
+            ],
+            ..StepResult::default()
+        };
+        (a, b)
+    };
+    let (a, b) = within();
+    within_the_write_budget(&a, &b).expect("a run inside the budget passes");
+
+    // A hello re-picked twice is one more write than § Write budget allows.
+    let (mut a, b) = within();
+    a.wrote[0].1.hello = 3;
+    let over = within_the_write_budget(&a, &b).expect_err("a third hello must fail");
+    assert!(
+        over.contains(Step::AKnocks.label()),
+        "the failure must name the step: {over}"
+    );
+
+    // A first contact that wrote no message slot did not carry message 0.
+    let (mut a, b) = within();
+    a.wrote[0].1.ring = 0;
+    within_the_write_budget(&a, &b).expect_err("a first contact with no message must fail");
+
+    // A step that recorded nothing at all is not a step inside the budget.
+    let (a, mut b) = within();
+    b.wrote.clear();
+    let missing = within_the_write_budget(&a, &b).expect_err("a step with no record must fail");
+    assert!(
+        missing.contains(Step::BCollectsAndReplies.label()),
+        "the failure must name the step: {missing}"
+    );
 }
 
 /// A step that fails is reported by the driver with the tail of its own output,

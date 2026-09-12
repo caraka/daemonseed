@@ -16,6 +16,7 @@ pub mod driver;
 pub(crate) mod machine;
 #[cfg(test)]
 pub(crate) mod mock;
+pub mod records;
 pub mod seam;
 pub mod types;
 
@@ -24,6 +25,7 @@ pub use driver::{
     SpentTokenStore,
 };
 pub use machine::PENDING_REQUEST_CAP;
+pub use records::{RecordsError, VeilidRecords, VeilidRecordsParts, WriteCountsSnapshot};
 pub use seam::{DmDht, DmDhtFuture};
 pub use types::{
     AcceptFailure, Correspondent, CorrespondentState, DmCommand, DmEvent, DmIdentity, PkLt,

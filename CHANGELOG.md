@@ -26,6 +26,42 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
+- `daemonseed-veilid-net`: `dm::records::VeilidRecords`, `daemonseed_core::dm::flows::Records` over real
+  distributed-hash-table records. Reads go through the DHT gate's read pool under a bounded GET; writes
+  enter the write scheduler as `WriteRequest::direct_message` with a `DirectMessageWrite` kind and the
+  method waits for the reply. An advert and a drop are addressed by owner seed under the subkey count the
+  caller supplies; a channel is addressed by the lookup key `open_channel` returns, which is the owner's
+  32-byte public key, and `open_channel` retains the owner keypair so `write_channel` addresses only
+  channels opened in this process. `erase_drop_slot` writes an empty value to the slot. Inherent
+  `publish_advert` writes subkey 0 of an advert record and `erase_channel` closes and deletes a channel
+  record this side owns from this node's local store. Every method bridges the synchronous trait onto the asynchronous transport with
+  `tokio::task::block_in_place`, and `RecordsError` is returned on any runtime flavor but multi-thread,
+  checked at construction and at every bridged call. `read_drop_slot` at slot 0 takes one
+  `rendezvous::inspect_sync_set` report of the drop and answers every slot the network reports no
+  sequence number for without a read; a hello written to that drop discards the report and an erasure keeps
+  it. A subkey holding no bytes
+  reads back as `None`. Every network call is retried on a bounded backoff while Veilid refuses transiently — `TryAgain`, an
+  `offline` qualifier, a routing table not ready — eight attempts from 2 s doubling to a 30 s cap, so a
+  node that has just attached never surfaces its own unreadiness to the flows as an error; a write is
+  retried inside its dispatch, so one submission stays one entry on the funnel. Any other refusal is
+  returned on the first attempt. Every subkey write is confirmed after its reply: the record is inspected
+  through the new `rendezvous::inspect_sync_seqs`, which reports the subkey's local and network sequence
+  numbers side by side, polled from 2 s doubling to 10 s for up to 300 s until the network's has reached the
+  local one.
+  Veilid reports a write it could only keep locally as done and flushes it in the background; a sender
+  that stops when its write returns would otherwise leave with the value still on its machine. The poll
+  is a read, so the write budget is unchanged, and a write the network still lacks at the end of the
+  budget is an error naming the write. `write_counts` reports writes so far per kind as a
+  `WriteCountsSnapshot`. Built
+  from `VeilidNetHandle::dm_records_parts`. `rendezvous::inspect_sync_set`, `rendezvous::delete_record`,
+  `rendezvous::forget_cached` and the `ProdWrite::DmRecord` dispatch arm are the new transport primitives
+  beneath it (#476).
+- `daemonseed-veilid-net`: the `two_node_dm_async` oracle's six step bodies drive `dm::flows`
+  — `first_contact`, `collect`, `accept`, `send_message`, `collect_batch`, `peer_cursor`,
+  `resume_first_contact` — through `VeilidRecords` over a `dm::store::Store` in each step's state
+  directory, each role's identity derived from an ML-DSA seed its state directory holds and its advert
+  republished at every step. Each step records its per-kind write counts in its result file and both
+  drivers assert them against § Write budget; the kill variant asserts a resumption per side (#476).
 - `daemonseed-core`: `dm::flows`, the direct-messaging first-contact flow over `dm::advert`, `dm::drop`,
   `dm::channel`, `dm::chain` and `dm::store` — the `Records` trait carrying every record-store read and
   write, `first_contact(store, records, me, peer_identity_pk, body, fill, now)` creating the conversation

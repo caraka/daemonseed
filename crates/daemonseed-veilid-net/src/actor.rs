@@ -891,6 +891,19 @@ enum Command {
     /// `RouteChange.dead_routes`). Bounded by a minutes-scale interval well above the
     /// coalesce window so it cannot recreate the refresh storm. Fire-and-forget.
     AdvertWatchdog,
+    /// Hand out the transport state a [`crate::dm::records::VeilidRecords`] is built
+    /// over: the routing context and API this loop holds, the caches and locks
+    /// its own read and write paths use, and the write funnel.
+    ///
+    /// A read of this loop's state rather than an operation on it, which is why
+    /// it is one command and not seven. The alternative — a command per record
+    /// read and write — would put every one of them behind this single FIFO,
+    /// where a drop sweep is 256 reads and a slow one would park the whole node.
+    /// The values handed out are clones the sink already holds off this loop, so
+    /// the concurrency bound stays the shared gate rather than the queue.
+    DmRecordsParts {
+        reply: oneshot::Sender<crate::dm::records::VeilidRecordsParts>,
+    },
     Shutdown {
         /// Budget for the WB-3.I7 scheduler flush before the node is torn down.
         flush_budget: Duration,
@@ -1121,6 +1134,15 @@ impl VeilidNetHandle {
     }
 
     // ── Direct messaging (#232) ──
+
+    /// The transport state a [`crate::dm::records::VeilidRecords`] is built over.
+    ///
+    /// Every value in it is a clone of one the actor holds, so a record store
+    /// built here shares the node's open-record cache, its per-record locks and
+    /// its write funnel rather than keeping a second set beside them.
+    pub async fn dm_records_parts(&self) -> Result<crate::dm::records::VeilidRecordsParts> {
+        self.send(|reply| Command::DmRecordsParts { reply }).await
+    }
 
     /// Publish this identity's signed DM key record (ISC-C40). `record` is the
     /// prost-encoded `DmKeyRecord`; the caller signs it with
@@ -2799,6 +2821,18 @@ async fn actor_loop(
                     crate::vtrace!("advert_watchdog: refreshing {} idle advert(s)", idle.len());
                 }
             }
+            Command::DmRecordsParts { reply } => {
+                let _ = reply.send(crate::dm::records::VeilidRecordsParts {
+                    transport: crate::dm::records::Transport {
+                        gate: dht_gate.clone(),
+                        api: api.clone(),
+                        rc: rc.clone(),
+                        opened: opened.clone(),
+                        record_locks: record_locks.clone(),
+                    },
+                    sched: sched.clone(),
+                });
+            }
             Command::Shutdown {
                 flush_budget,
                 reply,
@@ -3062,7 +3096,7 @@ async fn publish_current_state(
 /// [`ProductionSink`] onto the existing per-record write function. The scheduler
 /// treats it opaquely; only the sink interprets it, so #131 / ring-seq-inside-
 /// `record_lock` stay where they are (inside these two functions, at dispatch time).
-enum ProdWrite {
+pub(crate) enum ProdWrite {
     /// An append-ring (chat / room / circle) write → [`publish_rendezvous`].
     Rendezvous {
         owner_seed: [u8; 32],
@@ -3144,6 +3178,18 @@ enum ProdWrite {
         address: DmAckAddress,
         record: Vec<u8>,
     },
+    /// A direct-messaging record write — an advert, a drop slot, a channel
+    /// subkey, or the deletion of a channel record — dispatched by
+    /// [`crate::dm::records::RecordWrite`].
+    ///
+    /// One variant for four record kinds, where every other direct-messaging
+    /// surface has one variant each, and the difference is where the shape comes
+    /// from. Each of those carries a shape this file names as a constant, so the
+    /// variant is what pins it. A record here is addressed under a subkey count
+    /// the flows supply — it is part of the address, and the flows are what hold
+    /// the three counts — so the shape travels in the token and the dispatch end
+    /// has nothing left to choose.
+    DmRecord(crate::dm::records::RecordWrite),
 }
 
 /// The production [`WriteSink`] (WB-3.I1): the funnel's dispatch end. Holds the same
@@ -3247,6 +3293,11 @@ impl WriteSink for ProductionSink {
                         record,
                     )
                     .await
+                }
+                ProdWrite::DmRecord(write) => {
+                    write
+                        .dispatch(&gate, &api, &rc, &opened, &record_locks)
+                        .await
                 }
                 ProdWrite::DmPage { address, frame } => {
                     // Borrowed, not moved: the binding is dropped — and therefore
@@ -3361,7 +3412,7 @@ async fn publish_dm_key_record(
 /// transport failure an erroring GET produces. Both say the same thing to a caller —
 /// the read did not deliver an answer and the record's state is unknown — and both
 /// stay distinct from `Ok(None)`, which is the authoritative *empty slot*.
-async fn gated_bounded_get<T, E: std::fmt::Display>(
+pub(crate) async fn gated_bounded_get<T, E: std::fmt::Display>(
     gate: &Arc<DhtGate>,
     what: &str,
     get: impl std::future::Future<Output = std::result::Result<T, E>>,
@@ -3656,7 +3707,7 @@ fn dm_page_place_swept(
 /// seed while its neighbour keys on the public key would **split one record's
 /// FIFO into two queues** — per-record single-flight and write ordering both
 /// lost, with `Ok(())` on every surface.
-fn funnel_record_key(owner_seed: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn funnel_record_key(owner_seed: &[u8; 32]) -> [u8; 32] {
     identity::rendezvous_owner_public_bytes(owner_seed)
 }
 

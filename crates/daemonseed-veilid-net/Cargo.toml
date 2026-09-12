@@ -28,7 +28,7 @@ daemonseed-core = { path = "../daemonseed-core" }
 ed25519-dalek = { version = "2.1", features = ["zeroize"] }
 base64 = "0.22"
 
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 thiserror = "1"
 
 # Fragment-pipelining the share fetch (#109): `StreamExt::buffered` keeps N

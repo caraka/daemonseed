@@ -156,8 +156,9 @@ pub use discovery::{
 };
 pub use dm::{
     spawn_dm_key_record_publish, AcceptFailure, DmCommand, DmDht, DmDhtFuture, DmDriver,
-    DmDriverConfig, DmDriverHandle, DmDriverParts, DmEvent, DmIdentity, PkLt, RefusalReason,
-    RequestId, SpentTokenStore, WallClock,
+    DmDriverConfig, DmDriverHandle, DmDriverParts, DmEvent, DmIdentity, PkLt, RecordsError,
+    RefusalReason, RequestId, SpentTokenStore, VeilidRecords, VeilidRecordsParts, WallClock,
+    WriteCountsSnapshot,
 };
 pub use error::{FetchErrorClass, Result, VeilidNetError};
 pub use event::VeilidNetEvent;
