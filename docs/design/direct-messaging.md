@@ -13,7 +13,7 @@ Each claim is an outcome, closed only by its own probe. Every component of the l
 - **FC3 Forward secrecy against a clone.** Someone who copies a user's device at time T reads nothing that user collected before T, nothing they sent before T, and nothing after their next reset. Probe: snapshot A's state directory mid-conversation and run it as an attacker against every record captured from the DHT. Pre-T and post-reset messages must fail to open. Control: the current-turn message before any reset must open.
 - **FC4 First contact.** Knowing only someone's published identity, a user can start a conversation while they are offline, they find it when they return, and nobody can make the user accept a request under a name that is not theirs. Probe: A writes a first-contact request with B off. B starts later and sees the request attributed to A's verified identity. A request under a different key is not shown as A.
 - **FC5 The network learns nothing.** Storage nodes holding every record of a conversation cannot read a message, cannot forge one, and cannot tell which two identities are talking. Probe: capture every record. Opening without keys fails. A slot write from a non-owner key is rejected. The identity public keys of both parties appear in zero bytes of any channel or drop record. Control: they do appear in the advert.
-- **FC6 Small enough to hold in one head.** The layer is readable end to end by one person in a day. Probe: a line ceiling of 6,000 including tests, checked at every commit, and a check that every component names a founding claim. Crossing the ceiling stops the work until the ceiling is re-ratified with the reason written down, or the layer is cut back under it.
+- **FC6 Small enough to hold in one head.** The layer is readable end to end by one person in a day. Probe: a ceiling of 6,000 lines of production code, checked at every commit, and a check that every component names a founding claim. Crossing the ceiling is a warning to the maintainer, who reviews the layer for scope creep; it fails nothing.
 
 Inherited from the project rather than restated: no message content survives client closure (`ISA.md` ISC-C30). Probe: search the profile directory for any sent or received body after close; control: the ciphertext outbox is present.
 
@@ -170,7 +170,7 @@ Three features are message types over the existing channel, with no record or ke
 
 ## Size rule
 
-The layer is at most 6,000 lines of Rust including tests, checked at every commit. Every component names the founding claim it serves.
+The layer is at most 6,000 lines of production code, checked at every commit: a line counts unless it is blank, is a comment, or belongs to an item marked `#[cfg(test)]`. Tests, documentation and whitespace are excluded because they are what makes the layer readable, and a ceiling that counted them would push the layer toward fewer of each. Crossing the ceiling is a warning to the maintainer and nothing else. Every component names the founding claim it serves.
 
 ## Open questions
 

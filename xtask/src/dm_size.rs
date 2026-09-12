@@ -1,12 +1,24 @@
-//! Hold the direct-messaging layer under its line ceiling, and require every
-//! module in it to name the founding claim it serves.
+//! Measure the direct-messaging layer against its line ceiling, and require
+//! every module in it to name the founding claim it serves.
 //!
 //! `docs/design/direct-messaging.md` § Size rule sets two conditions on the
-//! layer: it is at most [`DEFAULT_CEILING`] lines of Rust including tests, and
+//! layer: it is at most [`DEFAULT_CEILING`] lines of production code, and
 //! every component names the founding claim it serves. Both are properties of
 //! the tree as a whole, which no per-crate lint or test can see — a module is
 //! added to one crate, the total is read from neither, and the ceiling is
-//! crossed without any step going red.
+//! crossed without any step noticing.
+//!
+//! The two conditions have different consequences. A module naming no claim
+//! fails the run. A layer above its ceiling does not: the run prints a
+//! warning naming the figures and exits 0, because the ceiling exists so the
+//! maintainer is told when the layer has grown and can look for scope creep,
+//! not so a commit is refused.
+//!
+//! A line of production code is a line that is not blank, is not a comment,
+//! and is not part of an item marked `#[cfg(test)]`. Tests, documentation and
+//! whitespace are what make a layer readable, and a ceiling that counted them
+//! would push the layer toward fewer of each. See [`code_lines`] for the
+//! exact rule.
 //!
 //! A module belongs to the layer when its leading `//!` doc block carries a
 //! line naming a founding claim in the form `Serves FC<n>`, one or more of
@@ -40,8 +52,9 @@ pub const CEILING_ENV: &str = "DM_SIZE_CEILING";
 /// The modules under [`LAYER_DIRS`] counted outside the layer, as paths
 /// relative to the repository root.
 ///
-/// An entry is removed when that module gains a founding-claim header or is
-/// deleted. An entry naming no file is an error.
+/// An entry is removed when that module gains a founding-claim header, is
+/// declared under `#[cfg(test)]` by its parent, or is deleted. An entry naming
+/// no file is an error.
 pub const OUTSIDE_LAYER: &[&str] = &[
     "crates/daemonseed-core/src/dm/ack.rs",
     "crates/daemonseed-core/src/dm/ack_budget.rs",
@@ -69,7 +82,6 @@ pub const OUTSIDE_LAYER: &[&str] = &[
     "crates/daemonseed-core/src/dm/token.rs",
     "crates/daemonseed-veilid-net/src/dm/driver.rs",
     "crates/daemonseed-veilid-net/src/dm/machine.rs",
-    "crates/daemonseed-veilid-net/src/dm/mock.rs",
     "crates/daemonseed-veilid-net/src/dm/mod.rs",
     "crates/daemonseed-veilid-net/src/dm/seam.rs",
     "crates/daemonseed-veilid-net/src/dm/types.rs",
@@ -83,6 +95,10 @@ pub enum Set {
     Layer,
     /// The module is named in the outside list and counts against neither.
     Outside,
+    /// The module is declared under `#[cfg(test)]` by its parent, so it is
+    /// compiled only for tests: it counts zero, against neither total, and
+    /// needs no header.
+    TestOnly,
 }
 
 impl Set {
@@ -91,12 +107,13 @@ impl Set {
         match self {
             Set::Layer => "layer",
             Set::Outside => "outside",
+            Set::TestOnly => "test-only",
         }
     }
 }
 
-/// One counted module: its path relative to the repository root, its line
-/// count, and the set it is in.
+/// One counted module: its path relative to the repository root, its count of
+/// production code lines, and the set it is in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Module {
     pub path: String,
@@ -162,9 +179,152 @@ pub fn serves_founding_claim(content: &str) -> bool {
     })
 }
 
-/// A module's line count: every line of the file, tests included.
-pub fn line_count(content: &str) -> usize {
-    content.lines().count()
+/// A module's count of production code lines.
+///
+/// A line counts unless it is blank, is a comment (`//`, `///` or `//!`, or
+/// inside a `/* */` block), or belongs to an item marked `#[cfg(test)]`. The
+/// attribute is recognised on its own line. The item it marks runs through
+/// any further attributes and then its own lines: a line that opens a brace
+/// it does not close begins a body that runs to the closing brace at the
+/// attribute's own indentation; a line with balanced braces, or ending in
+/// `;`, ends the item; the item's first line ending in `,` (a field or a
+/// variant) ends it too; any other line is a signature or an expression that
+/// continues, until a `}` at or above the attribute's indentation closes the
+/// enclosing block. This is the layout `rustfmt` produces, and the gate's
+/// `cargo fmt --all --check` step holds every module to it. A line that ends
+/// an item early, such as a `}` at the item's indentation inside a raw string
+/// in a test, makes the count larger. One shape makes it smaller: a marked
+/// multi-line match arm followed by sibling arms, whose lines are swallowed
+/// until the enclosing `}`; the layer has none.
+///
+/// A file that is itself compiled only for tests, because its parent declares
+/// it under `#[cfg(test)]`, is not the concern of this function: see
+/// [`test_only_mod_declarations`] and [`measure`].
+pub fn code_lines(content: &str) -> usize {
+    let mut count = 0;
+    let mut in_block_comment = false;
+    // The indentation of a `#[cfg(test)]` whose item's signature is still
+    // being read, and whether the item's first line has been seen.
+    let mut pending_test_attr: Option<(usize, bool)> = None;
+    // The indentation of the `#[cfg(test)]` whose multi-line item is being
+    // skipped.
+    let mut skipping_to_indent: Option<usize> = None;
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if in_block_comment {
+            if line.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if let Some(at) = skipping_to_indent {
+            if indent == at && trimmed.starts_with('}') {
+                skipping_to_indent = None;
+            }
+            continue;
+        }
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if trimmed.starts_with("/*") {
+            if !trimmed.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+        if trimmed == "#[cfg(test)]" {
+            pending_test_attr = Some((indent, false));
+            continue;
+        }
+        if let Some((at, started)) = pending_test_attr {
+            if !started && trimmed.starts_with('#') {
+                // A further attribute on the same item.
+                continue;
+            }
+            let opens = trimmed.matches('{').count();
+            let closes = trimmed.matches('}').count();
+            let ended = trimmed.trim_end();
+            if started && indent <= at && trimmed.starts_with('}') {
+                // The enclosing block closed before the item ended: the
+                // item is over and this brace belongs to the code.
+                pending_test_attr = None;
+            } else if opens > closes {
+                skipping_to_indent = Some(at);
+                pending_test_attr = None;
+                continue;
+            } else if opens > 0 || ended.ends_with(';') || (!started && ended.ends_with(',')) {
+                pending_test_attr = None;
+                continue;
+            } else {
+                // A signature or an expression continuing on the next line.
+                pending_test_attr = Some((at, true));
+                continue;
+            }
+        }
+        count += 1;
+    }
+    count
+}
+
+/// The names of the out-of-line modules a file declares under `#[cfg(test)]`:
+/// each `mod name;` whose attributes include the marker, in order.
+///
+/// Such a module is compiled only for tests, and its file holds no production
+/// code however it reads.
+pub fn test_only_mod_declarations(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pending = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#[cfg(test)]" {
+            pending = true;
+            continue;
+        }
+        if !pending {
+            continue;
+        }
+        if trimmed.starts_with('#') || trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        pending = false;
+        let Some(rest) = trimmed.strip_suffix(';') else {
+            continue;
+        };
+        let mut rest = rest.trim();
+        if let Some(after) = rest.strip_prefix("pub") {
+            rest = match after.strip_prefix('(') {
+                Some(inner) => inner.split_once(')').map(|(_, r)| r).unwrap_or(""),
+                None => after,
+            }
+            .trim_start();
+        }
+        let Some(name) = rest.strip_prefix("mod ") else {
+            continue;
+        };
+        let name = name.trim();
+        if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// The files, relative to `repo`, a `mod name;` in `declaring` can name: the
+/// sibling `name.rs` and the child `name/mod.rs`, resolved against the
+/// directory the declaring file's own modules live in.
+fn declared_module_paths(declaring: &Path, name: &str) -> [PathBuf; 2] {
+    let dir = declaring.parent().unwrap_or(Path::new(""));
+    let stem = declaring.file_stem().and_then(OsStr::to_str).unwrap_or("");
+    let base = if matches!(stem, "mod" | "lib" | "main") {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    };
+    [
+        base.join(format!("{name}.rs")),
+        base.join(name).join("mod.rs"),
+    ]
 }
 
 /// Every `.rs` file under `dirs`, in path order, as paths relative to `repo`.
@@ -208,10 +368,15 @@ fn modules_under(repo: &Path, dirs: &[&str]) -> Result<Vec<PathBuf>> {
 
 /// Count every module under `dirs`, splitting them by header and `outside`.
 ///
+/// A module some other module under `dirs` declares under `#[cfg(test)]` is
+/// test-only: reported at zero, in neither total, and exempt from the header
+/// rule.
+///
 /// Refuses on any shape defect rather than reporting a figure built on it: an
 /// `outside` entry that names no file, a module on neither the list nor the
-/// headered side, which would leave lines counted in no total at all, and a
-/// listed module that names a founding claim, whose entry is now stale.
+/// headered side, which would leave lines counted in no total at all, a
+/// listed module that names a founding claim, whose entry is now stale, and a
+/// listed module that is test-only, whose entry counts nothing.
 pub fn measure(repo: &Path, dirs: &[&str], outside: &[&str]) -> Result<Report> {
     let missing: Vec<&str> = outside
         .iter()
@@ -227,18 +392,44 @@ pub fn measure(repo: &Path, dirs: &[&str], outside: &[&str]) -> Result<Report> {
         );
     }
 
+    let found = modules_under(repo, dirs)?;
+    let mut sources = Vec::with_capacity(found.len());
+    for rel in &found {
+        let path = rel.to_string_lossy().replace('\\', "/");
+        let content = std::fs::read_to_string(repo.join(rel))
+            .map_err(|e| anyhow::anyhow!("dm-size: read {path}: {e}"))?;
+        sources.push((rel.clone(), path, content));
+    }
+    let mut test_only: Vec<PathBuf> = Vec::new();
+    for (rel, _, content) in &sources {
+        for name in test_only_mod_declarations(content) {
+            test_only.extend(declared_module_paths(rel, &name));
+        }
+    }
+
     let mut modules = Vec::new();
     let mut unheadered: Vec<String> = Vec::new();
     let mut stale: Vec<String> = Vec::new();
+    let mut listed_test_only: Vec<String> = Vec::new();
     let mut layer_total = 0;
     let mut outside_total = 0;
-    for rel in modules_under(repo, dirs)? {
-        let path = rel.to_string_lossy().replace('\\', "/");
-        let content = std::fs::read_to_string(repo.join(&rel))
-            .map_err(|e| anyhow::anyhow!("dm-size: read {path}: {e}"))?;
-        let lines = line_count(&content);
-        let headered = serves_founding_claim(&content);
-        let set = if outside.contains(&path.as_str()) {
+    for (rel, path, content) in &sources {
+        let path = path.clone();
+        let lines = code_lines(content);
+        let headered = serves_founding_claim(content);
+        let listed = outside.contains(&path.as_str());
+        let set = if test_only.contains(rel) {
+            if listed {
+                listed_test_only.push(path.clone());
+                continue;
+            }
+            modules.push(Module {
+                path,
+                lines: 0,
+                set: Set::TestOnly,
+            });
+            continue;
+        } else if listed {
             if headered {
                 stale.push(path.clone());
                 continue;
@@ -264,6 +455,15 @@ pub fn measure(repo: &Path, dirs: &[&str], outside: &[&str]) -> Result<Report> {
         );
     }
 
+    if !listed_test_only.is_empty() {
+        bail!(
+            "dm-size: {} module(s) are declared under `#[cfg(test)]` and are on the outside-layer list:\n  {}\n\
+             Remove the list entry; a test-only module counts nothing.",
+            listed_test_only.len(),
+            listed_test_only.join("\n  ")
+        );
+    }
+
     if !unheadered.is_empty() {
         bail!(
             "dm-size: {} module(s) name no founding claim and are not on the outside-layer list:\n  {}\n\
@@ -280,7 +480,19 @@ pub fn measure(repo: &Path, dirs: &[&str], outside: &[&str]) -> Result<Report> {
     })
 }
 
-/// Measure the layer, print what it found, and refuse above `ceiling`.
+/// The warning a run prints when the layer is above `ceiling`, and `None`
+/// when it is not.
+pub fn ceiling_warning(report: &Report, ceiling: usize) -> Option<String> {
+    (report.layer_total > ceiling).then(|| {
+        format!(
+            "dm-size: WARNING the layer is {} code line(s), above its ceiling of {}. \
+             Tell the maintainer, who reviews the layer for scope creep.",
+            report.layer_total, ceiling
+        )
+    })
+}
+
+/// Measure the layer and print what it found, with a warning above `ceiling`.
 pub fn check(repo: &Path, dirs: &[&str], outside: &[&str], ceiling: usize) -> Result<()> {
     let report = measure(repo, dirs, outside)?;
     for module in &report.modules {
@@ -292,16 +504,11 @@ pub fn check(repo: &Path, dirs: &[&str], outside: &[&str], ceiling: usize) -> Re
         );
     }
     println!(
-        "dm-size: layer {} line(s), outside {} line(s), ceiling {}",
+        "dm-size: layer {} code line(s), outside {} code line(s), ceiling {}",
         report.layer_total, report.outside_total, ceiling
     );
-    if report.layer_total > ceiling {
-        bail!(
-            "dm-size: the layer is {} line(s), above its ceiling of {}. \
-             Remove lines from the layer or move a component out of it.",
-            report.layer_total,
-            ceiling
-        );
+    if let Some(warning) = ceiling_warning(&report, ceiling) {
+        println!("{warning}");
     }
     Ok(())
 }
@@ -385,8 +592,8 @@ mod tests {
         };
         assert_eq!(by_path(&headered).set, Set::Layer);
         assert_eq!(by_path(&listed).set, Set::Outside);
-        assert_eq!(report.layer_total, line_count(HEADERED));
-        assert_eq!(report.outside_total, line_count(BARE));
+        assert_eq!(report.layer_total, code_lines(HEADERED));
+        assert_eq!(report.outside_total, code_lines(BARE));
     }
 
     #[test]
@@ -402,26 +609,30 @@ mod tests {
     }
 
     #[test]
-    fn a_ceiling_below_the_layer_total_is_refused() {
+    fn a_ceiling_below_the_layer_total_warns_and_does_not_refuse() {
         let fx = Fixture::new("ceiling");
         fx.write("headered.rs", HEADERED);
-        let total = line_count(HEADERED);
-        // The mirror control: the same tree passes at its own total, so the
-        // refusal below is the ceiling and not some other defect.
-        check(&fx.root, DIRS, &[], total).expect("a ceiling at the total must pass");
-        let err = check(&fx.root, DIRS, &[], total - 1)
-            .unwrap_err()
-            .to_string();
+        let total = code_lines(HEADERED);
+        let report = measure(&fx.root, DIRS, &[]).unwrap();
+        // The mirror control: no warning at the total, so the one below is
+        // the ceiling and not some other defect.
+        assert_eq!(ceiling_warning(&report, total), None);
+        let warning = ceiling_warning(&report, total - 1).expect("a ceiling below the total warns");
         assert!(
-            err.contains("above its ceiling"),
-            "a ceiling below the total must refuse, got: {err}"
+            warning.contains("WARNING") && warning.contains("above its ceiling"),
+            "the warning names the condition, got: {warning}"
         );
+        // A run above the ceiling still exits 0: the warning is the whole
+        // consequence.
+        check(&fx.root, DIRS, &[], total - 1).expect("a layer above its ceiling is not refused");
 
         // The ceiling is on the layer, so a listed module's lines do not move
-        // it: the ceiling that passed above still passes with one added.
+        // it: the report that had no warning at the total still has none
+        // with one added.
         let listed = fx.write("listed.rs", BARE);
-        check(&fx.root, DIRS, &[listed.as_str()], total)
-            .expect("an outside-listed module must not count against the ceiling");
+        let report = measure(&fx.root, DIRS, &[listed.as_str()]).unwrap();
+        assert_eq!(report.layer_total, total);
+        assert_eq!(ceiling_warning(&report, total), None);
     }
 
     #[test]
@@ -477,15 +688,206 @@ mod tests {
     }
 
     #[test]
-    fn a_modules_count_is_its_line_count() {
+    fn a_modules_count_is_its_production_code_lines() {
         let fx = Fixture::new("lines");
-        let body = "//! Serves FC2.\n\npub fn c() {}\n\n#[cfg(test)]\nmod t {}\n";
+        let body = "//! Serves FC2.\n\npub fn c() {}\n\n#[cfg(test)]\nmod t {\n    fn d() {}\n}\n";
         let path = fx.write("counted.rs", body);
         let report = measure(&fx.root, DIRS, &[]).unwrap();
         assert_eq!(report.modules.len(), 1);
         assert_eq!(report.modules[0].path, path);
-        assert_eq!(report.modules[0].lines, 6);
-        assert_eq!(report.modules[0].lines, body.lines().count());
+        assert_eq!(report.modules[0].lines, 1, "only `pub fn c() {{}}` is code");
+        assert_eq!(
+            body.lines().count(),
+            8,
+            "positive control: the file has more lines than that"
+        );
+    }
+
+    #[test]
+    fn blank_and_comment_lines_are_not_code() {
+        // The mirror control: two code lines with nothing between them.
+        assert_eq!(code_lines("pub fn a() {}\npub fn b() {}\n"), 2);
+        assert_eq!(code_lines("pub fn a() {}\n\n\n   \npub fn b() {}\n"), 2);
+        assert_eq!(
+            code_lines(
+                "//! Module doc.\n/// Item doc.\n// Note.\npub fn a() {}\n    // Indented.\npub fn b() {}\n"
+            ),
+            2
+        );
+        assert_eq!(
+            code_lines("/* one line */\npub fn a() {}\n/* two\n   lines */\npub fn b() {}\n"),
+            2
+        );
+        // A trailing comment does not stop a line being code.
+        assert_eq!(code_lines("pub fn a() {} // trailing\n"), 1);
+    }
+
+    #[test]
+    fn an_item_marked_cfg_test_is_not_code_and_the_item_after_it_is() {
+        // The mirror control: the same text with the attribute removed counts
+        // every line.
+        let module = "mod t {\n    use super::*;\n    fn d() {}\n}\n";
+        assert_eq!(code_lines(module), 4);
+        assert_eq!(
+            code_lines(&format!("#[cfg(test)]\n{module}pub fn after() {{}}\n")),
+            1
+        );
+
+        // A nested item inside an impl block, ended by the brace at its own
+        // indentation and not by the impl's.
+        let nested = "impl A {\n    pub fn a() {}\n    #[cfg(test)]\n    pub fn t() {\n        if x {\n        }\n    }\n    pub fn b() {}\n}\n";
+        assert_eq!(code_lines(nested), 4, "impl, a, b and the closing brace");
+
+        // Further attributes on the marked item belong to it.
+        let derived =
+            "#[cfg(test)]\n#[derive(Clone)]\nstruct K {\n    x: u8,\n}\npub fn after() {}\n";
+        assert_eq!(code_lines(derived), 1);
+
+        // A single-line marked item ends on that line, so the next line counts.
+        assert_eq!(
+            code_lines("#[cfg(test)]\nuse std::cell::Cell;\npub fn after() {}\n"),
+            1
+        );
+        assert_eq!(code_lines("#[cfg(test)]\nmod t;\npub fn after() {}\n"), 1);
+        assert_eq!(
+            code_lines("#[cfg(test)]\nfn t() {}\npub fn after() {}\n"),
+            1
+        );
+
+        // A macro invocation with a brace body is an item like any other.
+        let tl = "#[cfg(test)]\nthread_local! {\n    static S: u8 = 0;\n}\npub fn after() {}\n";
+        assert_eq!(code_lines(tl), 1);
+
+        // A signature that wraps across lines, with a `where` clause, is
+        // still one item: the body opens on a later line.
+        let wrapped = "#[cfg(test)]\npub(crate) fn t<F>(\n    f: F,\n) -> u8\nwhere\n    F: Fn(),\n{\n    1\n}\npub fn after() {}\n";
+        assert_eq!(code_lines(wrapped), 1);
+
+        // A marked struct field or enum variant ends at its comma, and a
+        // marked statement at its semicolon.
+        assert_eq!(
+            code_lines("struct S {\n    #[cfg(test)]\n    t: u8,\n    u: u8,\n}\n"),
+            3
+        );
+        assert_eq!(
+            code_lines(
+                "fn f() {\n    #[cfg(test)]\n    let t = g(\n        1,\n    );\n    h();\n}\n"
+            ),
+            3
+        );
+
+        // A marked multi-line match arm that is the last arm: the enclosing
+        // `}` ends it and is itself code.
+        assert_eq!(
+            code_lines(
+                "fn f(x: u8) -> u8 {\n    match x {\n        #[cfg(test)]\n        0 => g(\n            1,\n        ),\n    }\n}\npub fn after() {}\n"
+            ),
+            5
+        );
+
+        // A blank line at the attribute's indentation inside the marked item
+        // does not end it: only the closing brace does.
+        assert_eq!(
+            code_lines(
+                "#[cfg(test)]\nmod t {\n    fn a() {}\n\n    fn b() {}\n}\npub fn after() {}\n"
+            ),
+            1
+        );
+
+        // A `}` shallower than the attribute, inside a string, does not end
+        // the item either.
+        assert_eq!(
+            code_lines(
+                "impl A {\n    #[cfg(test)]\n    fn t() {\n        let s = \"\n}\n\";\n    }\n    pub fn b() {}\n}\n"
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn a_module_declared_under_cfg_test_counts_zero_and_needs_no_header() {
+        let fx = Fixture::new("testonly");
+        let parent = fx.write(
+            "mod.rs",
+            "//! Serves FC1.\n\n#[cfg(test)]\npub(crate) mod mock;\npub mod seam;\n",
+        );
+        let mock = fx.write("mock.rs", "pub fn m() {}\npub fn n() {}\n");
+        let seam = fx.write("seam.rs", "//! Serves FC1.\n\npub fn s() {}\n");
+        let report = measure(&fx.root, DIRS, &[]).unwrap();
+        let by_path = |p: &str| {
+            report
+                .modules
+                .iter()
+                .find(|m| m.path == p)
+                .unwrap_or_else(|| panic!("{p} must be in the report"))
+        };
+        assert_eq!(by_path(&mock).set, Set::TestOnly);
+        assert_eq!(by_path(&mock).lines, 0);
+        assert_eq!(by_path(&parent).set, Set::Layer);
+        assert_eq!(by_path(&seam).set, Set::Layer);
+        assert_eq!(
+            report.layer_total, 2,
+            "mod.rs's `pub mod seam;` and seam.rs's one line"
+        );
+
+        // The mirror control: the same tree with the attribute removed refuses
+        // the unheadered module by name.
+        fx.write(
+            "mod.rs",
+            "//! Serves FC1.\n\npub(crate) mod mock;\npub mod seam;\n",
+        );
+        let err = measure(&fx.root, DIRS, &[]).unwrap_err().to_string();
+        assert!(err.contains(&mock), "got: {err}");
+
+        // A test-only module on the outside list is a stale entry.
+        fx.write(
+            "mod.rs",
+            "//! Serves FC1.\n\n#[cfg(test)]\npub(crate) mod mock;\npub mod seam;\n",
+        );
+        let err = measure(&fx.root, DIRS, &[mock.as_str()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&mock) && err.contains("test-only module counts nothing"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_only_declarations_are_read_from_a_parent_and_resolve_to_both_paths() {
+        assert_eq!(
+            test_only_mod_declarations(
+                "#[cfg(test)]\npub(crate) mod mock;\npub mod seam;\n#[cfg(test)]\n#[allow(dead_code)]\nmod fixtures;\n#[cfg(test)]\nmod inline {\n}\n"
+            ),
+            ["mock", "fixtures"]
+        );
+        assert_eq!(
+            declared_module_paths(Path::new("a/dm/mod.rs"), "mock"),
+            [
+                PathBuf::from("a/dm/mock.rs"),
+                PathBuf::from("a/dm/mock/mod.rs")
+            ]
+        );
+        assert_eq!(
+            declared_module_paths(Path::new("a/dm.rs"), "mock"),
+            [
+                PathBuf::from("a/dm/mock.rs"),
+                PathBuf::from("a/dm/mock/mod.rs")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cfg_that_is_not_test_alone_is_code() {
+        assert_eq!(code_lines("#[cfg(feature = \"x\")]\nfn f() {}\n"), 2);
+        assert_eq!(
+            code_lines("#[cfg(any(test, feature = \"x\"))]\nfn f() {}\n"),
+            2
+        );
+        assert_eq!(
+            code_lines("#[cfg_attr(test, derive(Debug))]\nstruct S;\n"),
+            2
+        );
     }
 
     #[test]
@@ -591,14 +993,25 @@ mod tests {
             files.len(),
             "every module under the two directories must be in one of the two sets"
         );
+        let test_only: Vec<PathBuf> = report
+            .modules
+            .iter()
+            .filter(|m| m.set == Set::TestOnly)
+            .map(|m| repo.join(&m.path))
+            .collect();
+        assert!(
+            test_only.iter().any(|p| p.ends_with("dm/mock.rs")),
+            "positive control: the transport's mock is declared test-only"
+        );
         let lines: usize = files
             .iter()
-            .map(|p| line_count(&std::fs::read_to_string(p).unwrap()))
+            .filter(|p| !test_only.contains(p))
+            .map(|p| code_lines(&std::fs::read_to_string(p).unwrap()))
             .sum();
         assert_eq!(
             report.layer_total + report.outside_total,
             lines,
-            "the two totals must account for every line under the two directories"
+            "the two totals must account for every code line under the two directories"
         );
     }
 

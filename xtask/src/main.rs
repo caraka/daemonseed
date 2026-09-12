@@ -11,8 +11,8 @@
 //!   registry's live total; `--min N` fails the run below N percent.
 //! - `check-ui-strings` — refuse placeholder text in any string a user can
 //!   read.
-//! - `dm-size` — count the direct-messaging layer's lines, tests included, and
-//!   refuse above its ceiling or on a module that names no founding claim.
+//! - `dm-size` — count the direct-messaging layer's production code lines, warn
+//!   above its ceiling, and refuse on a module that names no founding claim.
 //! - `install-hooks` — install the workspace's git pre-push hook into the
 //!   active checkout's `.git/hooks/` (or into a `--target` directory).
 //!   Idempotent; overwrites a previously-installed hook in-place.
@@ -64,10 +64,11 @@ enum Cmd {
     /// Refuse placeholder text in any string a user can read (.slint, and the
     /// gui/tui Rust sources). A placeholder is not shippable by definition.
     CheckUiStrings,
-    /// Count the direct-messaging layer's lines, tests included, and print them
-    /// per module and in total. Exits non-zero above the ceiling read from
-    /// `DM_SIZE_CEILING`, and on any module that names no founding claim and is
-    /// not on the outside-layer list.
+    /// Count the direct-messaging layer's production code lines (not blank, not a
+    /// comment, not under `#[cfg(test)]`) and print them per module and in total.
+    /// Prints a warning above the ceiling read from `DM_SIZE_CEILING`, and exits
+    /// non-zero on any module that names no founding claim and is not on the
+    /// outside-layer list.
     DmSize,
     /// Report ISC coverage from `daemonseed-integration-tests`. Exits non-zero
     /// if the covered percentage is below `--min` (when supplied).

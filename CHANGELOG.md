@@ -59,7 +59,8 @@ work lives in the maintainer's own planning notes, not here.
   makes, with `ALL`, `class()` and `kind()`, and `WriteRequest::direct_message`, which fixes every
   one of them to `WriteClass::Chat` and `WriteKind::Ring` (#461).
 - `xtask`: `cargo xtask dm-size`, a `preflight` gate step counting the direct-messaging layer's
-  lines, tests included, refusing above the ceiling read from `DM_SIZE_CEILING` and on any module
+  production code lines (not blank, not a comment, not under `#[cfg(test)]`), warning above the
+  ceiling read from `DM_SIZE_CEILING` and refusing on any module
   under `dm/` that names no founding claim and is not on the subcommand's outside list, whose
   modules are counted as a separate total so the ceiling applies to the modules that name a
   founding claim (#468).
