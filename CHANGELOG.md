@@ -44,14 +44,14 @@ work lives in the maintainer's own planning notes, not here.
   `offline` qualifier, a routing table not ready — eight attempts from 2 s doubling to a 30 s cap, so a
   node that has just attached never surfaces its own unreadiness to the flows as an error; a write is
   retried inside its dispatch, so one submission stays one entry on the funnel. Any other refusal is
-  returned on the first attempt. Every subkey write is confirmed after its reply: the record is inspected
-  through the new `rendezvous::inspect_sync_seqs`, which reports the subkey's local and network sequence
-  numbers side by side, polled from 2 s doubling to 10 s for up to 300 s until the network's has reached the
-  local one.
-  Veilid reports a write it could only keep locally as done and flushes it in the background; a sender
-  that stops when its write returns would otherwise leave with the value still on its machine. The poll
-  is a read, so the write budget is unchanged, and a write the network still lacks at the end of the
-  budget is an error naming the write. `write_counts` reports writes so far per kind as a
+  returned on the first attempt. Every subkey write is confirmed after its reply: a `Local` inspect of
+  the record, through the new `rendezvous::inspect_local_pending`, reports the subkey's local sequence
+  number and whether Veilid still has it queued for its background flush, and the write is done when it
+  has a number and is not queued. Veilid reports a write it could only keep locally as done and flushes
+  it in the background; a sender that stops when its write returns would otherwise leave with the value
+  still on its machine. A write found queued is polled from 2 s doubling to 10 s for up to 300 s. The
+  inspect asks no other node and is a read, so the write budget is unchanged, and a write still queued at
+  the end of the budget is an error naming the write. `write_counts` reports writes so far per kind as a
   `WriteCountsSnapshot`. Built
   from `VeilidNetHandle::dm_records_parts`. `rendezvous::inspect_sync_set`, `rendezvous::delete_record`,
   `rendezvous::forget_cached` and the `ProdWrite::DmRecord` dispatch arm are the new transport primitives

@@ -1364,14 +1364,30 @@ pub async fn publish_at_subkey(
         handle.key().clone(),
         subkey,
         sealed,
-        Some(SetDHTValueOptions {
-            writer: Some(owner.clone()),
-            allow_offline: None,
-        }),
+        Some(write_options(owner)),
     )
     .await
     .map(|_| ())
     .map_err(|e| VeilidNetError::Send(e.to_string()))
+}
+
+/// The options every write here passes: the caller's own writer, and Veilid's
+/// default for offline handling, which is to keep a value the node could not
+/// put out and flush it later.
+///
+/// That default is relied on, not merely tolerated. A direct-message write is
+/// confirmed by asking whether the subkey is still queued for that flush
+/// ([`inspect_local_pending`]), which is an answer only because every exit
+/// from `set_value` short of consensus queues the subkey under the default
+/// (`veilid-core-0.5.7 src/storage_manager/set_value.rs:110, 144, 618`). With
+/// `AllowOffline(false)` the same exits write nothing and queue nothing, and
+/// `set_value.rs:170-172` reports them as `Ok`, so a subkey written once
+/// before would confirm at once with the new value nowhere.
+fn write_options(owner: &KeyPair) -> SetDHTValueOptions {
+    SetDHTValueOptions {
+        writer: Some(owner.clone()),
+        allow_offline: None,
+    }
 }
 
 /// Each subkey's NETWORK sequence number for `handle`, in ascending subkey
@@ -1397,47 +1413,86 @@ pub async fn inspect_sync_set(
     rc: &RoutingContext,
     handle: &RendezvousHandle,
 ) -> Result<Vec<veilid_core::ValueSeqNum>> {
-    Ok(inspect_sync_seqs(gate, rc, handle).await?.network)
-}
-
-/// Both halves of one `SyncSet` report: each subkey's sequence number in this
-/// node's local copy, and on the network as if that copy did not exist.
-///
-/// Side by side they answer the question a writer that is about to stop has to
-/// ask: is what I hold the same as what the network holds? Veilid's `set_value`
-/// says `Ok` for a value it could only keep locally — the node offline, or the
-/// fanout finished short of consensus — and flushes it in the background
-/// (`veilid-core-0.5.7 src/storage_manager/set_value.rs:108-119, 596-624`;
-/// the `AllowOffline(false)` option does not change that on the second path,
-/// `set_value.rs:170-172` turns its refusal back into `Ok`). A local sequence
-/// number the network has not reached is that value still on this machine.
-///
-/// One network operation, under one read permit, bounded like any other read.
-pub async fn inspect_sync_seqs(
-    gate: &Arc<DhtGate>,
-    rc: &RoutingContext,
-    handle: &RendezvousHandle,
-) -> Result<SyncSeqs> {
     let report = crate::actor::gated_bounded_get(
         gate,
         "inspect_sync_set",
         rc.inspect_dht_record(handle.key().clone(), None, DHTReportScope::SyncSet),
     )
     .await?;
-    Ok(SyncSeqs {
-        local: report.local_seqs().to_vec(),
-        network: report.network_seqs().to_vec(),
-    })
+    Ok(report.network_seqs().to_vec())
 }
 
-/// What [`inspect_sync_seqs`] reports, in ascending subkey order. Either list
-/// may be shorter than the record: Veilid reports on the range it covered.
+/// What this node holds of a record and which of its subkeys Veilid still has
+/// to put on the network — from a `Local` inspect, which asks no other node.
+///
+/// This is the question a writer that is about to stop has to ask. Veilid's
+/// `set_value` says `Ok` for a value it could only keep locally — the node
+/// offline, or the fanout finished short of consensus — and queues it for a
+/// background flush (`veilid-core-0.5.7 src/storage_manager/set_value.rs:108-119,
+/// 596-624`). A `Local` inspect reports that queue: `offline_subkeys` is the
+/// union of the subkeys queued for the flush, in flight, and under an active
+/// set (`src/storage_manager/inspect_record.rs:125-183`), and the flush task
+/// removes a subkey from it when a later attempt reaches consensus
+/// (`src/storage_manager/tasks/offline_subkey_writes.rs`). A written subkey
+/// absent from it went out inside `set_value`; one present is still here.
+///
+/// No network operation: the `Local` scope returns as soon as the local values
+/// are read (`inspect_record.rs:192-202`). It is still taken under a read
+/// permit and the read bound, so the crate's accounting of DHT calls stays one
+/// shape.
+pub async fn inspect_local_pending(
+    gate: &Arc<DhtGate>,
+    rc: &RoutingContext,
+    handle: &RendezvousHandle,
+) -> Result<LocalPending> {
+    let report = crate::actor::gated_bounded_get(
+        gate,
+        "inspect_local_pending",
+        rc.inspect_dht_record(handle.key().clone(), None, DHTReportScope::Local),
+    )
+    .await?;
+    local_pending_of(
+        report.subkeys(),
+        report.local_seqs(),
+        report.offline_subkeys(),
+    )
+}
+
+/// The three parts of a `Local` report as [`LocalPending`], or a refusal if
+/// the report does not start at subkey 0.
+///
+/// `seqs` is positional over the range the report covered while `pending`
+/// is keyed by subkey, so a reader indexing `seqs` by subkey is right only
+/// when the covered range starts at 0. A request with no range does start
+/// there (`veilid-core-0.5.7 src/storage_manager/inspect_record.rs:80-84`, a
+/// request with no range is the full range),
+/// and this check is what turns that assumption into something a report
+/// can refuse rather than silently shift.
+fn local_pending_of(
+    subkeys: &veilid_core::ValueSubkeyRangeSet,
+    local_seqs: &[veilid_core::ValueSeqNum],
+    offline: &veilid_core::ValueSubkeyRangeSet,
+) -> Result<LocalPending> {
+    match subkeys.first() {
+        Some(0) | None => Ok(LocalPending {
+            seqs: local_seqs.to_vec(),
+            pending: offline.clone(),
+        }),
+        Some(first) => Err(VeilidNetError::Routing(format!(
+            "inspect_local_pending: report starts at subkey {first}, not 0; \
+             its sequence numbers cannot be read by subkey"
+        ))),
+    }
+}
+
+/// What [`inspect_local_pending`] reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncSeqs {
-    /// This node's local copy.
-    pub local: Vec<veilid_core::ValueSeqNum>,
-    /// The network's, as if the local copy did not exist.
-    pub network: Vec<veilid_core::ValueSeqNum>,
+pub struct LocalPending {
+    /// This node's sequence number per subkey, in ascending subkey order. May
+    /// be shorter than the record: Veilid reports on the range it covered.
+    pub seqs: Vec<veilid_core::ValueSeqNum>,
+    /// The subkeys Veilid still has to put on the network.
+    pub pending: veilid_core::ValueSubkeyRangeSet,
 }
 
 /// Close and delete a record from this node's local store.
@@ -1827,6 +1882,72 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// A write leaves Veilid's offline handling at its default, and that
+    /// default is to keep and queue.
+    ///
+    /// Both halves are pinned because the confirmation rests on both: the
+    /// options this crate builds must not set the flag, and the crate's
+    /// veilid-core must still default it to `true`. A bump that flipped the
+    /// default would otherwise turn every short-fanout write into a silent
+    /// no-write that confirms.
+    #[test]
+    fn a_write_keeps_veilid_queueing_what_it_cannot_put_out() {
+        use veilid_core::AllowOffline;
+        let owner = crate::identity::rendezvous_owner_keypair(&[7u8; 32])
+            .expect("a keypair derives from any seed");
+        let options = write_options(&owner);
+        assert!(
+            options.allow_offline.is_none(),
+            "the flag is left to Veilid"
+        );
+        assert_eq!(
+            AllowOffline::default(),
+            AllowOffline(true),
+            "and Veilid's default is to keep and queue"
+        );
+        assert!(
+            options.writer.is_some(),
+            "the caller's writer is always passed"
+        );
+    }
+
+    /// A `Local` report is read as this node's sequence numbers and the
+    /// subkeys still queued, and only when it starts at subkey 0.
+    ///
+    /// The queued set is what distinguishes it from a network report: the
+    /// same three inputs with the sequence numbers taken from the wrong list
+    /// or the queue dropped would confirm every write at once, and nothing
+    /// above this function can tell.
+    #[test]
+    fn a_local_report_is_read_from_subkey_zero_with_its_queue() {
+        use veilid_core::{ValueSeqNum, ValueSubkeyRangeSet};
+        let one = ValueSeqNum::ZERO.next().expect("below the max");
+        let read = local_pending_of(
+            &ValueSubkeyRangeSet::single_range(0, 1),
+            &[ValueSeqNum::ZERO, one],
+            &ValueSubkeyRangeSet::single(1),
+        )
+        .expect("a report from subkey 0 is read");
+        assert_eq!(read.seqs, vec![ValueSeqNum::ZERO, one]);
+        assert!(!read.pending.contains(0) && read.pending.contains(1));
+
+        let refused = local_pending_of(
+            &ValueSubkeyRangeSet::single_range(4, 5),
+            &[ValueSeqNum::ZERO, one],
+            &ValueSubkeyRangeSet::new(),
+        )
+        .expect_err("a report from subkey 4 cannot be indexed by subkey");
+        assert!(refused.to_string().contains("starts at subkey 4"));
+
+        let empty = local_pending_of(
+            &ValueSubkeyRangeSet::new(),
+            &[],
+            &ValueSubkeyRangeSet::new(),
+        )
+        .expect("an empty report is an empty answer");
+        assert!(empty.seqs.is_empty() && empty.pending.is_empty());
+    }
 
     /// Counting stand-in for [`open_or_create`]'s network round-trip: increments on
     /// every actual open, so a test can assert the cache collapsed N calls to one.

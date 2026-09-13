@@ -84,20 +84,22 @@
 //! case's refusal back into `Ok` with the value written nowhere). A sender that
 //! stops the moment its write returns, which is what § Flows lets a sender do,
 //! would leave with the value still on its machine and no report of it. So every
-//! subkey write here is followed by a confirmation: an `inspect` of the record
-//! that reports the local and the network sequence number of the subkey side by
-//! side, polled until the network's is at least the local one, for at most
-//! `CONFIRM_BUDGET`. The flush Veilid queued is what closes the gap; the poll
-//! only watches for it, and an `inspect` is a read, so the write budget is
-//! unchanged. A write the network still does not hold at the end of the budget
-//! is an error to the flows, which is the truth of it.
+//! subkey write here is followed by a confirmation: a `Local` inspect of the
+//! record, which asks no other node, reporting the subkey's local sequence
+//! number and whether Veilid still has that subkey queued for its background
+//! flush. A write went out when the subkey has a number and is not queued. One
+//! that is queued is polled, from `CONFIRM_POLL_FIRST` doubling to
+//! `CONFIRM_POLL_MAX`, for at most `CONFIRM_BUDGET`: the flush is what moves
+//! the value, and the poll only watches for it to leave the queue. An `inspect`
+//! is a read, so the write budget is unchanged, and a write still queued at the
+//! end of the budget is an error to the flows, which is the truth of it.
 //!
-//! What the confirmation proves is that the value left this machine: some node
-//! other than this one reports a sequence number at least this node's. It does
-//! not prove every holder has it, and on a slot anyone may write it does not
-//! prove the bytes there are this node's rather than a later writer's — the
-//! flows read a slot back after writing it and re-pick on a clobber, and that
-//! stays their job.
+//! What the confirmation proves is that the value left this machine, as
+//! `set_value` judges it — enough nodes answered its fanout to call the write
+//! done rather than queue it. It does not prove every holder has it, and
+//! on a slot anyone may write it does not prove the bytes there are this
+//! node's rather than a later writer's — the flows read a slot back after
+//! writing it and re-pick on a clobber, and that stays their job.
 //!
 //! ## The synchronous seam
 //!
@@ -509,10 +511,10 @@ impl VeilidRecords {
                             target.subkey
                         )));
                     };
-                    let seqs =
-                        rendezvous::inspect_sync_seqs(&transport.gate, &transport.rc, &handle)
+                    let report =
+                        rendezvous::inspect_local_pending(&transport.gate, &transport.rc, &handle)
                             .await?;
-                    Ok(seqs_at(&seqs, target.subkey))
+                    Ok(pending_at(&report, target.subkey))
                 }
             },
         ))
@@ -1148,20 +1150,20 @@ where
     unreachable!("the loop returns on its last attempt")
 }
 
-/// How soon a confirmation asks the network again after its first miss.
+/// How soon a confirmation looks again after finding the write still queued.
 ///
-/// Two seconds, doubling to [`CONFIRM_POLL_MAX`]. A probe issued the moment
-/// `set_value` returns misses on a network that took the write — the nodes an
-/// inspect reaches have not all seen it yet — and the value is there a second
-/// or two later, so the second probe is what confirms most writes and the
-/// wait before it is most of what a write costs the person sending it.
+/// Two seconds, doubling to [`CONFIRM_POLL_MAX`]. A write that went out inside
+/// `set_value` is never queued and its first probe confirms it, so this is
+/// only ever waited by a write the node could not put out at once; Veilid's
+/// flush ticks every second, so a short first wait catches a gap that opens
+/// soon after the write.
 const CONFIRM_POLL_FIRST: Duration = Duration::from_secs(2);
 
-/// The longest a confirmation waits between probes, however many have missed.
+/// The longest a confirmation waits between probes, however many have found
+/// the write still queued.
 ///
-/// Ten seconds: Veilid's background flush of a value it kept locally ticks
-/// every second and runs whenever the node is online, so a value is on the
-/// network within seconds of the node being able to put it there, and a poll
+/// Ten seconds: the flush runs whenever the node is online, so a value leaves
+/// the queue within seconds of the node being able to put it out, and a poll
 /// much faster than this for the rest of the budget would spend read permits
 /// watching for nothing.
 const CONFIRM_POLL_MAX: Duration = Duration::from_secs(10);
@@ -1175,38 +1177,32 @@ const CONFIRM_POLL_MAX: Duration = Duration::from_secs(10);
 /// failure here still names the write rather than the hop.
 const CONFIRM_BUDGET: Duration = Duration::from_secs(300);
 
-/// One subkey's sequence numbers out of a report: `(local, network)`, in that
-/// order, which is the order [`on_network`] takes them.
+/// One subkey out of a `Local` report: `(its local sequence number, whether it
+/// is still queued for the flush)`, in the order [`on_network`] takes them.
 ///
-/// A subkey past the end of either list reads as no number. Veilid reports on
-/// the range it covered, and a request with no range names the whole record
-/// up to its 1024-subkey limit, above every record this layer shapes, so a
-/// short list here is a subkey the report has no answer for — a miss, to be
-/// asked again, never a hit.
-fn seqs_at(seqs: &rendezvous::SyncSeqs, subkey: u32) -> (ValueSeqNum, ValueSeqNum) {
-    let at = |list: &[ValueSeqNum]| {
-        list.get(subkey as usize)
-            .copied()
-            .unwrap_or(ValueSeqNum::NONE)
-    };
-    (at(&seqs.local), at(&seqs.network))
+/// A subkey past the end of the sequence list reads as no number. Veilid
+/// reports on the range it covered, and a request with no range names the
+/// whole record up to its 1024-subkey limit, above every record this layer
+/// shapes, so a short list here is a subkey the report has no answer for — a
+/// miss, to be asked again, never a hit.
+fn pending_at(report: &rendezvous::LocalPending, subkey: u32) -> (ValueSeqNum, bool) {
+    let local = report
+        .seqs
+        .get(subkey as usize)
+        .copied()
+        .unwrap_or(ValueSeqNum::NONE);
+    (local, report.pending.contains(subkey))
 }
 
-/// Whether the network holds a write: its sequence number for the subkey has
-/// reached this node's.
+/// Whether a write left this machine: the subkey has a local sequence number
+/// and is not queued for the flush.
 ///
-/// Both are needed. A network sequence number with no local one is a subkey
-/// this node never wrote, and a local one the network has not reached — or has
-/// no number for at all — is a value still on this machine. A network number
-/// past the local one is a later writer: this node's write is no longer what
-/// the slot holds, but it is not what the confirmation asks, which is whether
-/// the write left this machine. Whether it was clobbered is read back by the
-/// flow that wrote it.
-fn on_network(local: ValueSeqNum, network: ValueSeqNum) -> bool {
-    match (local.to_option(), network.to_option()) {
-        (Some(local), Some(network)) => network >= local,
-        _ => false,
-    }
+/// Both are needed. No local number is a subkey this node never wrote, whatever
+/// the queue says; a number with the subkey queued is a value `set_value`
+/// could only keep here. Neither says anything about a later writer on a slot
+/// anyone may write — that is read back by the flow that wrote it.
+fn on_network(local: ValueSeqNum, pending: bool) -> bool {
+    local.is_some() && !pending
 }
 
 /// Whether a failure is a read that was cut off at its bound rather than
@@ -1220,8 +1216,8 @@ fn is_unanswered(error: &VeilidNetError) -> bool {
     error.to_string().contains("abandoned")
 }
 
-/// Poll `probe`, which reports the subkey's local and network sequence numbers,
-/// until [`on_network`] holds or `budget` is spent.
+/// Poll `probe`, which reports the subkey's local sequence number and whether
+/// it is still queued, until [`on_network`] holds or `budget` is spent.
 ///
 /// A probe that refuses transiently is a poll like any other — the node not
 /// being routable for a moment is the very condition the write is waiting out
@@ -1242,22 +1238,22 @@ async fn confirm_on_network<F, Fut>(
 ) -> Result<()>
 where
     F: FnMut() -> Fut,
-    Fut: core::future::Future<Output = Result<(ValueSeqNum, ValueSeqNum)>>,
+    Fut: core::future::Future<Output = Result<(ValueSeqNum, bool)>>,
 {
     let started = tokio::time::Instant::now();
     let (first, max) = poll;
     let mut wait = first;
     loop {
         match probe().await {
-            Ok((local, network)) if on_network(local, network) => {
+            Ok((local, pending)) if on_network(local, pending) => {
                 crate::vtrace!(
-                    "{what}: on the network (local {local:?}, network {network:?}) after {:.1}s",
+                    "{what}: on the network (local {local:?}) after {:.1}s",
                     started.elapsed().as_secs_f64()
                 );
                 return Ok(());
             }
-            Ok((local, network)) => crate::vtrace!(
-                "{what}: not on the network yet (local {local:?}, network {network:?}) at {:.1}s",
+            Ok((local, pending)) => crate::vtrace!(
+                "{what}: not on the network yet (local {local:?}, queued {pending}) at {:.1}s",
                 started.elapsed().as_secs_f64()
             ),
             Err(e) if is_transient(&e) || is_unanswered(&e) => {
@@ -1701,37 +1697,36 @@ mod tests {
         (0..=n).fold(ValueSeqNum::NONE, |s, _| s.next().expect("below the max"))
     }
 
-    /// The network holds a write once its sequence number for the subkey has
-    /// reached the local one, and not before.
+    /// A write left this machine once its subkey has a local sequence number
+    /// and is no longer queued for the flush, and not before.
     ///
-    /// Each miss below is a real state: a subkey nobody wrote, a value only
-    /// this node holds, a value the network holds an older copy of, and a
-    /// network copy of a subkey this node never wrote. Each hit is too: the
-    /// same number on both sides, and a later writer past this one.
+    /// Each miss below is a real state: a subkey nobody wrote, whether or not
+    /// something is queued under it, and a value this node wrote and could only
+    /// keep. The hit is the one shape that means the write went out.
     #[test]
-    fn a_write_is_on_the_network_once_the_network_sequence_reaches_the_local_one() {
-        for (local, network) in [
-            (ValueSeqNum::NONE, ValueSeqNum::NONE),
-            (seq(0), ValueSeqNum::NONE),
-            (seq(3), seq(2)),
-            (ValueSeqNum::NONE, seq(0)),
+    fn a_write_is_on_the_network_once_it_has_a_number_and_is_not_queued() {
+        for (local, pending) in [
+            (ValueSeqNum::NONE, false),
+            (ValueSeqNum::NONE, true),
+            (seq(0), true),
+            (seq(3), true),
         ] {
             assert!(
-                !on_network(local, network),
-                "local {local:?} network {network:?} is not on the network"
+                !on_network(local, pending),
+                "local {local:?} queued {pending} is not on the network"
             );
         }
-        for (local, network) in [(seq(0), seq(0)), (seq(3), seq(3)), (seq(3), seq(5))] {
+        for local in [seq(0), seq(3)] {
             assert!(
-                on_network(local, network),
-                "local {local:?} network {network:?} is on the network"
+                on_network(local, false),
+                "local {local:?} not queued is on the network"
             );
         }
     }
 
     /// A confirmation polls through a transient refusal, a read cut off at its
-    /// bound and a miss, and ends at the first probe that finds the write on
-    /// the network.
+    /// bound, a subkey with no number yet and a subkey still queued, and ends
+    /// at the first probe that finds the write on the network.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_confirmation_polls_until_the_network_holds_the_write() {
         let probes = AtomicU64::new(0);
@@ -1743,16 +1738,17 @@ mod tests {
                 match probes.fetch_add(1, Ordering::Relaxed) {
                     0 => Err(VeilidNetError::Routing("TryAgain: offline".to_owned())),
                     1 => Err(VeilidNetError::Routing(
-                        "inspect_sync_set: GET exceeded 15s, abandoned".to_owned(),
+                        "inspect_local_pending: GET exceeded 15s, abandoned".to_owned(),
                     )),
-                    2 => Ok((seq(0), ValueSeqNum::NONE)),
-                    _ => Ok((seq(0), seq(0))),
+                    2 => Ok((ValueSeqNum::NONE, false)),
+                    3 => Ok((seq(0), true)),
+                    _ => Ok((seq(0), false)),
                 }
             },
         )
         .await
-        .expect("the fourth probe finds it");
-        assert_eq!(probes.load(Ordering::Relaxed), 4, "and no probe after that");
+        .expect("the fifth probe finds it");
+        assert_eq!(probes.load(Ordering::Relaxed), 5, "and no probe after that");
     }
 
     /// A write the network never takes is an error naming the write and the
@@ -1767,7 +1763,7 @@ mod tests {
             (Duration::from_secs(2), Duration::from_secs(10)),
             || async {
                 probes.fetch_add(1, Ordering::Relaxed);
-                Ok((seq(0), ValueSeqNum::NONE))
+                Ok((seq(0), true))
             },
         )
         .await
@@ -1873,29 +1869,29 @@ mod tests {
         );
     }
 
-    /// A report is read at the written subkey, local first and network second,
-    /// and a subkey the report did not reach reads as no number on both sides.
+    /// A report is read at the written subkey — its own number, and whether it
+    /// is queued — and a subkey the report did not reach reads as no number.
     ///
-    /// The order is the whole test: read the other way round, a value the
-    /// network has not taken confirms on the first probe and the confirmation
-    /// checks nothing, with every other test here still green.
+    /// The subkey is the whole test: read at the wrong one, a queued value
+    /// confirms on the first probe because its neighbour went out, and the
+    /// confirmation checks nothing, with every other test here still green.
     #[test]
-    fn a_report_is_read_at_the_written_subkey_local_then_network() {
+    fn a_report_is_read_at_the_written_subkey() {
         assert_eq!(seq(3).to_option(), Some(3), "the helper counts from zero");
-        let seqs = rendezvous::SyncSeqs {
-            local: vec![seq(1), seq(4)],
-            network: vec![seq(1), seq(2)],
+        let report = rendezvous::LocalPending {
+            seqs: vec![seq(1), seq(4)],
+            pending: veilid_core::ValueSubkeyRangeSet::single(1),
         };
-        assert_eq!(seqs_at(&seqs, 0), (seq(1), seq(1)));
-        assert_eq!(seqs_at(&seqs, 1), (seq(4), seq(2)));
+        assert_eq!(pending_at(&report, 0), (seq(1), false));
+        assert_eq!(pending_at(&report, 1), (seq(4), true));
         assert!(
-            !on_network(seqs_at(&seqs, 1).0, seqs_at(&seqs, 1).1),
-            "subkey 1 is a value the network has not taken"
+            !on_network(pending_at(&report, 1).0, pending_at(&report, 1).1),
+            "subkey 1 is a value this node could only keep"
         );
         assert_eq!(
-            seqs_at(&seqs, 2),
-            (ValueSeqNum::NONE, ValueSeqNum::NONE),
-            "past the report is no answer, not an answer of zero"
+            pending_at(&report, 2),
+            (ValueSeqNum::NONE, false),
+            "past the report is no number, not a number of zero"
         );
     }
 
