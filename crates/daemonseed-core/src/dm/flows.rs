@@ -180,6 +180,18 @@ pub enum FlowError {
     /// This side's own first contact has not been accepted, so there is no
     /// established conversation to send an ordinary message on.
     AwaitingAcceptance,
+    /// The conversation record's `awaiting_acceptance` is clear: this side
+    /// has recognised the acceptance of its own first contact, or it is the
+    /// side that accepted. [`refresh_first_contact`] refreshes only a hello
+    /// that opens a first contact, so it refuses both; the accepting side's
+    /// hello back is not refreshed by it.
+    AlreadyAccepted,
+    /// The opening the correspondent's channel holds was signed by an
+    /// identity other than the one the conversation record names.
+    OpeningWriter,
+    /// The opening the correspondent's channel holds names a first ratchet key
+    /// other than the one this side's reading half was opened with.
+    OpeningRatchetKey,
     /// Every slot this hello picked was taken. The hello stays persisted and
     /// the poller retries.
     DropFull,
@@ -207,6 +219,15 @@ impl core::fmt::Display for FlowError {
             }
             Self::AwaitingAcceptance => {
                 f.write_str("this side's first contact has not been accepted")
+            }
+            Self::AlreadyAccepted => {
+                f.write_str("this side is not awaiting an acceptance of a first contact")
+            }
+            Self::OpeningWriter => {
+                f.write_str("the correspondent's opening is signed by another identity")
+            }
+            Self::OpeningRatchetKey => {
+                f.write_str("the correspondent's opening names another first ratchet key")
             }
             Self::DropFull => f.write_str("every slot the hello picked was taken"),
             Self::Incomplete(what) => write!(f, "the conversation record holds no {what}"),
@@ -346,14 +367,18 @@ pub fn first_contact<R: Records>(
         .ok_or(FlowError::NoAdvert)?;
     let advert = advert::verify(peer_identity_pk, &bytes)?;
 
-    // 2. The key schedule and the conversation record, before any write to the
-    //    record store. The channel's lookup key is not known yet, because
-    //    naming the record to the transport may create it.
+    // 2. The channel's lookup key, which the opening signs, then the key
+    //    schedule and the conversation record, before any write to the record
+    //    store. Naming the channel to the transport writes no value.
+    let channel_owner =
+        channel::derive_owner_seed(me.channel_root, peer_identity_pk, FIRST_GENERATION)?;
+    let outgoing_lookup_key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
     let encapsulation = advert::encapsulate_to(&advert, now, &mut fill)?;
     let opened = chain::initiate(&encapsulation.shared_secret, &mut fill)?;
     let opening = ChannelOpening::build(
         me.signer,
         peer_identity_pk,
+        &outgoing_lookup_key,
         &opened.ratchet_pk,
         encapsulation.serial,
     )?;
@@ -368,7 +393,7 @@ pub fn first_contact<R: Records>(
         &peer,
         &ConvState {
             peer_identity_pk: Box::new(*peer_identity_pk),
-            outgoing_lookup_key: [0u8; HELLO_LOOKUP_KEY_LEN],
+            outgoing_lookup_key,
             incoming_lookup_key: [0u8; HELLO_LOOKUP_KEY_LEN],
             generation: FIRST_GENERATION,
             conversation: opened.conversation.snapshot(),
@@ -385,13 +410,6 @@ pub fn first_contact<R: Records>(
             own_opening: Some(opening_bytes),
         },
     )?;
-
-    let channel_owner =
-        channel::derive_owner_seed(me.channel_root, peer_identity_pk, FIRST_GENERATION)?;
-    let outgoing_lookup_key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
-    store.update_conv(&peer, |state| {
-        state.outgoing_lookup_key = outgoing_lookup_key;
-    })?;
 
     let state = load(store, &peer)?;
     finish_first_contact(store, records, peer, state, body, &mut fill)
@@ -465,9 +483,13 @@ fn finish_first_contact<R: Records>(
         &peer,
         &peer_identity_pk,
         &outgoing_lookup_key,
-        own_secret,
-        own_kem_ct,
-        advert_serial,
+        &HelloSeal {
+            shared_secret: own_secret,
+            kem_ct: own_kem_ct,
+            advert_serial,
+            original: None,
+        },
+        HelloAttempt::new(drop_plane::repick(&mut *fill)?)?,
         fill,
     )?;
     Ok(FirstContact::Opened {
@@ -492,22 +514,13 @@ fn place_hello<R: Records>(
     peer: &CorrespondenceLabel,
     peer_identity_pk: &[u8; ml_dsa::PK_LEN],
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
-    shared_secret: &AdvertSharedSecret,
-    kem_ct: &[u8; ml_kem::CT_LEN],
-    advert_serial: u64,
+    seal: &HelloSeal<'_>,
+    mut attempt: HelloAttempt,
     fill: &mut impl FnMut(&mut [u8]) -> Result<(), ()>,
 ) -> Result<HelloAttempt, FlowError> {
     let drop_owner = drop_plane::derive_owner_seed(peer_identity_pk)?;
-    let mut attempt = HelloAttempt::new(drop_plane::repick(&mut *fill)?)?;
     loop {
-        let hello = seal_outstanding(
-            shared_secret,
-            kem_ct,
-            advert_serial,
-            lookup_key,
-            peer_identity_pk,
-            &attempt,
-        )?;
+        let hello = seal_outstanding(seal, lookup_key, peer_identity_pk, &attempt)?;
         let written = *hello.sealed;
         store.update_conv(peer, |state| {
             state.outstanding_hello = Some(hello);
@@ -529,21 +542,41 @@ fn place_hello<R: Records>(
     }
 }
 
+/// What a hello is sealed from, apart from the `r` that places it.
+struct HelloSeal<'a> {
+    /// The secret the hello's own encapsulation established.
+    shared_secret: &'a AdvertSharedSecret,
+    /// The encapsulation the hello publishes.
+    kem_ct: &'a [u8; ml_kem::CT_LEN],
+    /// The advert serial that encapsulation was made to.
+    advert_serial: u64,
+    /// For a rewritten hello, the secret of the first hello for this channel,
+    /// which the rewrite carries to the correspondent.
+    original: Option<&'a AdvertSharedSecret>,
+}
+
 /// The hello for one attempt, as the record the conversation persists.
 fn seal_outstanding(
-    shared_secret: &AdvertSharedSecret,
-    kem_ct: &[u8; ml_kem::CT_LEN],
-    advert_serial: u64,
+    seal: &HelloSeal<'_>,
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     peer_identity_pk: &[u8; ml_dsa::PK_LEN],
     attempt: &HelloAttempt,
 ) -> Result<OutstandingHello, FlowError> {
     let encapsulation = advert::HelloEncapsulation {
-        serial: advert_serial,
-        shared_secret: AdvertSharedSecret::from_bytes(shared_secret.as_bytes()),
-        ciphertext: Box::new(*kem_ct),
+        serial: seal.advert_serial,
+        shared_secret: AdvertSharedSecret::from_bytes(seal.shared_secret.as_bytes()),
+        ciphertext: Box::new(*seal.kem_ct),
     };
-    let sealed = drop_plane::seal_hello(&encapsulation, lookup_key, attempt.r(), peer_identity_pk)?;
+    let sealed = match seal.original {
+        None => drop_plane::seal_hello(&encapsulation, lookup_key, attempt.r(), peer_identity_pk)?,
+        Some(original) => drop_plane::seal_rewritten_hello(
+            &encapsulation,
+            lookup_key,
+            attempt.r(),
+            original,
+            peer_identity_pk,
+        )?,
+    };
     let sealed: [u8; HELLO_LEN] = sealed
         .as_slice()
         .try_into()
@@ -553,7 +586,7 @@ fn seal_outstanding(
         r: *attempt.r(),
         kem_ct: encapsulation.ciphertext,
         sealed: Box::new(sealed),
-        advert_serial,
+        advert_serial: seal.advert_serial,
     })
 }
 
@@ -604,13 +637,19 @@ pub enum Resumed {
     Rewrote(u16),
 }
 
-/// Rewrite an outstanding hello from the state a previous run left on disk.
+/// Write an outstanding hello from the state a previous run left on disk —
+/// § Flows, *Restart at any point*.
 ///
-/// The bytes written are the persisted `sealed` bytes, so a relaunch at any
-/// step boundary after the hello was persisted rewrites the same hello rather
-/// than minting a second one: the encapsulation is fixed, and `kem_ct` is
-/// unchanged across every rewrite. This is also the poller's rewrite of a slot
-/// the network has evicted.
+/// Every call writes the persisted `sealed` bytes; it reads nothing and never
+/// re-encapsulates. The caller decides when a write is owed, and this flow
+/// cannot decide it for the caller: a writer reading its own record is served
+/// its local copy (§ Substrate facts), so a read here never shows an evicted
+/// slot. A write is owed where the network reports the slot evicted or
+/// changed, and where a run stopped between persisting a hello and writing it,
+/// including a [`refresh_first_contact`] that persisted its rewrite and
+/// stopped. The bytes written are the persisted ones, so a relaunch at any step
+/// boundary writes the same hello rather than minting a second one: the
+/// encapsulation is fixed, and `kem_ct` is unchanged across every rewrite.
 pub fn resume_first_contact<R: Records>(
     store: &Store,
     records: &mut R,
@@ -630,132 +669,80 @@ pub fn resume_first_contact<R: Records>(
     Ok(Resumed::Rewrote(hello.slot))
 }
 
-/// Re-encapsulate an outstanding hello to a rotated advert key — § Flows,
+/// Rewrite an outstanding first-contact hello to a rotated advert key — § Flows,
 /// *First contact*, step 5.
 ///
-/// A hello encapsulated to a serial its owner has already retired can never be
-/// opened, so a poller that finds the correspondent's advert past that serial
-/// re-encapsulates, re-seals the opening, sequence 0 and the hello under the
-/// new secret, persists all three, and rewrites them. Nothing happens where
-/// the serial is unchanged or lower: an authentic older advert can be replayed
-/// over the record by anyone.
+/// A hello encapsulated to a serial its owner no longer holds cannot be opened.
+/// Where the correspondent's advert is past the serial the outstanding hello
+/// was encapsulated to, the hello is re-encapsulated to the current key and
+/// rewritten into the slot it already occupies, carrying the secret this side's
+/// first hello established ([`drop_plane::seal_rewritten_hello`]). The channel
+/// opening, sequence 0, the outbox and the key schedule stay as written: the
+/// correspondent recovers the first-turn root from the carried secret, and a
+/// correspondent that already collected an earlier hello keeps reading the
+/// same channel. Nothing happens where the serial is unchanged or lower,
+/// because an authentic older advert can be replayed over the record by anyone.
+///
+/// The rewritten hello is persisted before it is written, and a re-pick after a
+/// clobbered read-back keeps the same encapsulation. A stop at any point
+/// therefore leaves the bytes the slot must hold on disk: a later call finds
+/// the serial current and returns `false`, and [`resume_first_contact`] writes
+/// the persisted bytes.
+///
+/// **Call order.** Run [`collect`] over this side's own drop before this call,
+/// in the same poll. An acceptance waiting there is recognised by it, which
+/// ends the first contact, and this call then refuses with
+/// [`FlowError::AlreadyAccepted`] and writes nothing. A call made out of that
+/// order still changes no channel record and no key-schedule state, so a reply
+/// the correspondent has sealed stays readable. Its one hello write is erased
+/// by the correspondent as already collected.
+///
+/// One hello write, plus at most one re-pick, and no channel write.
 pub fn refresh_first_contact<R: Records>(
     store: &Store,
     records: &mut R,
-    me: &Me<'_>,
     peer: &CorrespondenceLabel,
     mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
     now: u64,
 ) -> Result<bool, FlowError> {
     let state = load(store, peer)?;
+    if !state.awaiting_acceptance {
+        return Err(FlowError::AlreadyAccepted);
+    }
     let hello = state
         .outstanding_hello
         .as_ref()
         .ok_or(FlowError::NotOutstanding)?;
-    let peer_identity_pk = state.peer_identity_pk.clone();
-    let advert_owner = advert::derive_owner_seed(&peer_identity_pk)?;
+    let original = state
+        .own_hello_secret
+        .as_ref()
+        .ok_or(FlowError::Incomplete("hello secret of its own"))?;
+    let advert_owner = advert::derive_owner_seed(&state.peer_identity_pk)?;
     let bytes = records
         .read_advert(&advert_owner, advert::ADVERT_SUBKEYS)?
         .ok_or(FlowError::NoAdvert)?;
-    let advert = advert::verify(&peer_identity_pk, &bytes)?;
+    let advert = advert::verify(&state.peer_identity_pk, &bytes)?;
     if !advert::hello_needs_rewrite(hello.advert_serial, &advert) {
         return Ok(false);
     }
 
-    let outgoing_lookup_key = state.outgoing_lookup_key;
-    let old_slot = hello.slot;
     let encapsulation = advert::encapsulate_to(&advert, now, &mut fill)?;
-    let opened = chain::initiate(&encapsulation.shared_secret, &mut fill)?;
-    let opening = ChannelOpening::build(
-        me.signer,
-        &peer_identity_pk,
-        &opened.ratchet_pk,
-        encapsulation.serial,
-    )?;
-    let opening_bytes: Box<[u8; OPENING_LEN]> = opening
-        .encode()
-        .as_slice()
-        .try_into()
-        .map(Box::new)
-        .expect("an opening encodes to OPENING_LEN bytes");
-    let serial = encapsulation.serial;
-
-    // Sequence 0 is re-sealed under the new schedule, because the old one was
-    // rooted in the secret the retired key established.
-    let mut conversation = opened.conversation;
-    let mut ring = Ring::new();
-    let previous_opening = ChannelOpening::decode(
-        state
-            .own_opening
-            .as_ref()
-            .ok_or(FlowError::Incomplete("channel opening of its own"))?
-            .as_slice(),
-    )?;
-    let body = first_message_body(store, peer, &state, &previous_opening)?;
-    let seq = ring.reserve()?;
-    let (header, sealed) = conversation.seal(&body, channel::DEVICE_ID_SINGLE_DEVICE, &mut fill)?;
-    let mut slot_bytes = header.encode();
-    slot_bytes.extend_from_slice(&sealed);
-    store.persist_outbox(peer, seq, &slot_bytes)?;
-
-    let secret_bytes = *encapsulation.shared_secret.as_bytes();
-    let kem_ct = encapsulation.ciphertext.clone();
-    store.update_conv(peer, |state| {
-        state.conversation = conversation.snapshot();
-        state.send_seq = ring.send_seq();
-        state.own_hello_secret = Some(AdvertSharedSecret::from_bytes(&secret_bytes));
-        state.own_hello_kem_ct = Some(kem_ct.clone());
-        state.own_opening = Some(opening_bytes.clone());
-    })?;
-
-    let control = channel::seal_control(
-        &encapsulation.shared_secret,
-        &Control {
-            opening: Some(opening),
-            collected_cursor: state.my_collected,
-            closed: false,
-        },
-    )?;
-    records.write_channel(&outgoing_lookup_key, channel::CONTROL_SUBKEY, &control)?;
-    records.write_channel(&outgoing_lookup_key, channel::slot_for(0), &slot_bytes)?;
-
-    let drop_owner = drop_plane::derive_owner_seed(&peer_identity_pk)?;
-    records.erase_drop_slot(&drop_owner, drop_plane::DROP_SUBKEYS, old_slot)?;
     place_hello(
         store,
         records,
         peer,
-        &peer_identity_pk,
-        &outgoing_lookup_key,
-        &encapsulation.shared_secret,
-        &kem_ct,
-        serial,
+        &state.peer_identity_pk,
+        &state.outgoing_lookup_key,
+        &HelloSeal {
+            shared_secret: &encapsulation.shared_secret,
+            kem_ct: &encapsulation.ciphertext,
+            advert_serial: encapsulation.serial,
+            original: Some(original),
+        },
+        HelloAttempt::new(hello.r)?,
         &mut fill,
     )?;
     Ok(true)
-}
-
-/// The body of sequence 0, opened from the outbox entry that still owes it.
-///
-/// A refresh re-seals under a new key schedule, and the plaintext exists only
-/// inside the ciphertext the outbox holds, so it is recovered the way the
-/// correspondent would have: the acceptor's reading half over the same hello
-/// secret and the same first ratchet key the published opening names.
-fn first_message_body(
-    store: &Store,
-    peer: &CorrespondenceLabel,
-    state: &ConvState,
-    opening: &ChannelOpening,
-) -> Result<Vec<u8>, FlowError> {
-    let bytes = outstanding_zero(store, peer)?
-        .ok_or(FlowError::Incomplete("outbox entry for sequence 0"))?;
-    let (header, sealed) = channel::MessageHeader::decode(&bytes)?;
-    let secret = state
-        .own_hello_secret
-        .as_ref()
-        .ok_or(FlowError::Incomplete("hello secret of its own"))?;
-    let mut mirror = chain::accept(secret, &opening.first_ratchet_pk)?;
-    Ok(mirror.open(&header, sealed)?)
 }
 
 /// A verified hello and everything an [`accept`] needs from it.
@@ -836,12 +823,16 @@ impl core::fmt::Debug for Surfaced {
 /// and 2, and *A hello from a known identity*.
 ///
 /// A slot the record store will not read, that does not decapsulate under
-/// either advert secret, or whose opening does not verify against this
-/// identity and the serial it was encapsulated to, is skipped silently and the
-/// scan continues: the drop is world-writable, a failure there carries no
-/// information about a correspondent, and one unreadable slot must not hide
+/// either advert secret, or whose opening does not verify is skipped silently
+/// and the scan continues: the drop is world-writable, a failure there carries
+/// no information about a correspondent, and one unreadable slot must not hide
 /// every hello after it. Only a failure of this side's own store stops the
 /// scan.
+///
+/// An opening verifies when it names this identity, the channel the hello
+/// named, and the advert serial the hello must bind. A rewritten hello is
+/// opened under the secret it carries, and its opening must name an earlier
+/// serial than the rewrite arrived under (§ Flows, *First contact*, step 5).
 pub fn collect<R: Records>(
     store: &Store,
     records: &mut R,
@@ -858,15 +849,22 @@ pub fn collect<R: Records>(
         else {
             continue;
         };
-        let Some((hello, shared_secret, serial)) =
+        let Some((mut hello, decapsulated, serial)) =
             open_against_either(advert_keys, &bytes, my_pk, slot)
         else {
             continue;
         };
+        // A rewritten hello's channel is sealed under the secret it carries,
+        // not under the one its own decapsulation yielded.
+        let rewritten = hello.original_secret.is_some();
+        let shared_secret = hello.original_secret.take().unwrap_or(decapsulated);
         let Some(opening) = read_opening(records, &shared_secret, &hello.lookup_key) else {
             continue;
         };
-        if opening.verify(my_pk, serial).is_err() {
+        let Some(bound) = opening_serial(rewritten, serial, &opening) else {
+            continue;
+        };
+        if opening.verify(my_pk, &hello.lookup_key, bound).is_err() {
             continue;
         }
         let identity = opening.writer_identity_pk.clone();
@@ -975,6 +973,31 @@ fn open_against_either(
         }
     }
     None
+}
+
+/// The advert serial a hello's channel opening must name, or `None` where the
+/// hello is refused.
+///
+/// An original hello was encapsulated to the serial its opening binds, so that
+/// is the serial it decapsulated under. A rewritten hello was re-encapsulated
+/// after this side's advert moved past the serial the opening binds, so the
+/// opening names an earlier serial than the rewrite arrived under, and exactly
+/// that serial is accepted. The carried secret it is paired with is
+/// authenticated by the channel: the control subkey holding the opening has
+/// already opened under it, and only the channel's owner writes that subkey.
+/// A redirected hello is still refused by [`ChannelOpening::verify`], because
+/// the opening names the identity it was addressed to. A rewrite whose opening
+/// names a serial at or past the one it arrived under was not made by a
+/// rotation and is refused here.
+fn opening_serial(
+    rewritten: bool,
+    decapsulated_under: u64,
+    opening: &ChannelOpening,
+) -> Option<u64> {
+    if !rewritten {
+        return Some(decapsulated_under);
+    }
+    (opening.advert_serial < decapsulated_under).then_some(opening.advert_serial)
 }
 
 /// The opening in a channel's control subkey, or `None` where the record store
@@ -1146,9 +1169,23 @@ fn finish_accept<R: Records>(
     let peer_serial = state
         .peer_advert_serial
         .ok_or(FlowError::Incomplete("advert serial of the correspondent"))?;
-    read_opening(records, peer_secret, &incoming)
-        .ok_or(FlowError::NoOpening)?
-        .verify(me.signer.public_key(), peer_serial)?;
+    let opening = read_opening(records, peer_secret, &incoming).ok_or(FlowError::NoOpening)?;
+    opening.verify(me.signer.public_key(), &incoming, peer_serial)?;
+    // The opening must be the one this record was created from: signed by the
+    // correspondent the record names, and naming the ratchet key the reading
+    // half was opened with.
+    if opening.writer_identity_pk.as_slice() != identity.as_slice() {
+        return Err(FlowError::OpeningWriter);
+    }
+    let opened_with = state
+        .conversation
+        .receiving
+        .peer_latest
+        .as_ref()
+        .map(|turn| turn.pk.as_slice());
+    if opened_with != Some(opening.first_ratchet_pk.as_slice()) {
+        return Err(FlowError::OpeningRatchetKey);
+    }
 
     let mut conversation = Conversation::restore(state.conversation);
     let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
@@ -1226,6 +1263,7 @@ fn finish_accept<R: Records>(
             let opening = ChannelOpening::build(
                 me.signer,
                 &identity,
+                &outgoing_lookup_key,
                 &first_ratchet_pk,
                 encapsulation.serial,
             )?;
@@ -1275,9 +1313,13 @@ fn finish_accept<R: Records>(
         &peer,
         &identity,
         &outgoing_lookup_key,
-        &own_secret,
-        &own_kem_ct,
-        advert_serial,
+        &HelloSeal {
+            shared_secret: &own_secret,
+            kem_ct: &own_kem_ct,
+            advert_serial,
+            original: None,
+        },
+        HelloAttempt::new(drop_plane::repick(&mut *fill)?)?,
         fill,
     )?;
 
@@ -1400,11 +1442,7 @@ fn read_ring<R: Records>(
 /// Exactly one write.
 ///
 /// Refused with [`FlowError::AwaitingAcceptance`] while this side's own first
-/// contact is unaccepted. First contact carries message 0 and nothing else,
-/// and until it is accepted the correspondent may still rotate the advert it
-/// was encapsulated to, which re-roots this direction's chain from sequence 0
-/// — so a message sent in between would be sealed under a root no longer in
-/// use.
+/// contact is unaccepted: first contact carries sequence 0 and nothing else.
 pub fn send_message<R: Records>(
     store: &Store,
     records: &mut R,
@@ -2386,9 +2424,11 @@ mod tests {
             |x| entropy.fill(x),
         )
         .expect("encapsulate");
+        let restart_key = [0x9fu8; HELLO_LOOKUP_KEY_LEN];
         let opening = ChannelOpening::build(
             &a.signer,
             b.pk(),
+            &restart_key,
             &[0x11u8; ml_kem::EK_LEN],
             hello_secret.serial,
         )
@@ -2402,7 +2442,6 @@ mod tests {
             },
         )
         .expect("seal the control");
-        let restart_key = [0x9fu8; HELLO_LOOKUP_KEY_LEN];
         net.write_channel(&restart_key, channel::CONTROL_SUBKEY, &control)
             .expect("write the control");
         let r = drop_plane::repick(|x| entropy.fill(x)).expect("r");
@@ -2552,74 +2591,756 @@ mod tests {
 
     // ── advert rotation ─────────────────────────────────────────────────────
 
+    /// Make a new advert key current for `b` at `at`, and publish it.
+    fn rotate(b: &mut Party, net: &mut Net, at: u64, seed: u64) {
+        let mut entropy = Seeded::at(seed);
+        b.advert_keys
+            .rotate_now(at, |x| entropy.fill(x))
+            .expect("B rotates");
+        b.publish(net);
+    }
+
+    /// A's refresh of its first contact at `at`.
+    fn a_refreshes(
+        a: &Party,
+        net: &mut Net,
+        peer: &CorrespondenceLabel,
+        at: u64,
+        seed: u64,
+    ) -> Result<bool, FlowError> {
+        let store = a.store();
+        let mut entropy = Seeded::at(seed);
+        refresh_first_contact(&store, net, peer, |x| entropy.fill(x), at)
+    }
+
+    /// The lookup key of the channel a fresh first contact opened.
+    fn opened_channel(outcome: &FirstContact) -> [u8; HELLO_LOOKUP_KEY_LEN] {
+        match outcome {
+            FirstContact::Opened {
+                outgoing_lookup_key,
+                ..
+            } => *outgoing_lookup_key,
+            other => panic!("expected a fresh first contact, got {other:?}"),
+        }
+    }
+
+    /// A channel as the network holds it: the control subkey and sequence 0's
+    /// slot.
+    fn channel_bytes(net: &Net, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> (Vec<u8>, Vec<u8>) {
+        let at = |subkey| {
+            net.channels
+                .get(&(*lookup_key, subkey))
+                .cloned()
+                .expect("a written subkey")
+        };
+        (at(channel::CONTROL_SUBKEY), at(channel::slot_for(0)))
+    }
+
+    /// A conversation record's encoding without its outstanding hello, which
+    /// is everything in the record a refresh must leave unchanged.
+    fn record_without_hello(party: &Party, peer: &CorrespondenceLabel) -> Vec<u8> {
+        let mut state = party
+            .store()
+            .load_conv(peer)
+            .expect("load")
+            .expect("a record");
+        state.outstanding_hello = None;
+        encode_conv(&state).to_vec()
+    }
+
+    /// The bytes one slot of a recipient's drop holds.
+    fn hello_in_drop(net: &Net, recipient: &Party, slot: u16) -> Vec<u8> {
+        let owner = drop_plane::derive_owner_seed(recipient.pk()).expect("the drop owner");
+        net.drops
+            .get(&(*owner.as_bytes(), slot))
+            .cloned()
+            .expect("a hello in the slot")
+    }
+
+    /// The outstanding hello a party's record holds for a correspondence.
+    fn outstanding(party: &Party, peer: &CorrespondenceLabel) -> OutstandingHello {
+        party
+            .store()
+            .load_conv(peer)
+            .expect("load")
+            .expect("a record")
+            .outstanding_hello
+            .expect("an outstanding hello")
+    }
+
     /// A hello outstanding across a rotation of the correspondent's advert is
-    /// re-encapsulated to the new key.
+    /// re-encapsulated to the new key and rewritten into the slot it occupies,
+    /// carrying the secret A's channel is sealed under.
     #[test]
     fn a_refresh_re_encapsulates_to_a_rotated_advert() {
         let (a, mut b, mut net) = scene();
         let outcome = a_opens(&a, &b, &mut net, b"the first message");
         let peer_a = opened_peer(&outcome);
-        let old_sealed = net
-            .hellos_written
-            .last()
-            .cloned()
-            .expect("the first hello was written");
+        let before = outstanding(&a, &peer_a);
+        let at = NOW + advert::ROTATION_PERIOD_SECS;
 
-        let mut entropy = Seeded::at(2_020);
-        b.advert_keys
-            .rotate_now(NOW + advert::ROTATION_PERIOD_SECS, |x| entropy.fill(x))
-            .expect("B rotates");
-        b.publish(&mut net);
-
-        let store_a = a.store();
-        let mut entropy = Seeded::at(3_030);
-        let refreshed = refresh_first_contact(
-            &store_a,
-            &mut net,
-            &a.me(),
-            &peer_a,
-            |x| entropy.fill(x),
-            NOW + advert::ROTATION_PERIOD_SECS,
-        )
-        .expect("the refresh runs");
+        rotate(&mut b, &mut net, at, 2_020);
+        let refreshed = a_refreshes(&a, &mut net, &peer_a, at, 3_030).expect("the refresh runs");
         assert!(refreshed, "the rotation was past the outstanding serial");
 
-        // The new hello opens under the new key; the old one does not.
-        let new_sealed = net
-            .hellos_written
-            .last()
-            .cloned()
-            .expect("the refreshed hello was written");
-        assert_ne!(new_sealed, old_sealed, "the hello was re-sealed");
-        let slot = store_a
+        let after = outstanding(&a, &peer_a);
+        assert_eq!(
+            after.slot, before.slot,
+            "the rewrite takes the hello's slot"
+        );
+        assert_eq!(after.advert_serial, b.advert_keys.serial());
+        assert_ne!(after.sealed, before.sealed, "the hello was re-sealed");
+        let found = hello_in_drop(&net, &b, after.slot);
+        assert_eq!(
+            found.as_slice(),
+            after.sealed.as_slice(),
+            "the drop holds the rewrite in place of the original"
+        );
+
+        let (hello, _, serial) = open_against_either(&b.advert_keys, &found, b.pk(), after.slot)
+            .expect("the rewrite opens");
+        assert_eq!(serial, b.advert_keys.serial(), "under the current key");
+        let own_secret = a
+            .store()
             .load_conv(&peer_a)
             .expect("load")
             .expect("a record")
-            .outstanding_hello
-            .expect("an outstanding hello")
-            .slot;
-        assert!(
-            open_against_either(&b.advert_keys, &new_sealed, b.pk(), slot).is_some(),
-            "the refreshed hello does not open under the rotated key"
+            .own_hello_secret
+            .expect("A's hello secret");
+        assert_eq!(
+            hello
+                .original_secret
+                .expect("a rewrite carries a secret")
+                .as_bytes(),
+            own_secret.as_bytes(),
+            "the rewrite carries the secret A's channel is sealed under"
         );
+        // The control: the original encapsulation does not open under the
+        // current key, so the re-encapsulation is what makes the hello
+        // readable under it.
+        let stale = b
+            .advert_keys
+            .decapsulate(b.advert_keys.serial(), &before.kem_ct)
+            .expect("decapsulate")
+            .expect("the serial is current");
         assert!(
-            open_against_either(&b.advert_keys, &old_sealed, b.pk(), slot).is_none(),
-            "the hello for the retired key still opens, so the refresh proved nothing"
+            drop_plane::open_hello(&stale, before.sealed.as_slice(), b.pk(), before.slot).is_err()
         );
 
         // A second refresh against the same advert does nothing.
-        let mut entropy = Seeded::at(4_040);
+        net.reset_writes();
         assert!(
-            !refresh_first_contact(
-                &store_a,
-                &mut net,
-                &a.me(),
-                &peer_a,
-                |x| entropy.fill(x),
-                NOW + advert::ROTATION_PERIOD_SECS,
-            )
-            .expect("the second refresh runs"),
+            !a_refreshes(&a, &mut net, &peer_a, at, 4_040).expect("the second refresh runs"),
             "an unchanged serial must not re-encapsulate"
+        );
+        assert_eq!(net.writes.total(), 0);
+    }
+
+    /// The correspondent's advert rotates twice before it
+    /// collects, so it no longer holds the key A first encapsulated to. A's
+    /// refreshes rewrite only the hello. The correspondent recovers the
+    /// first-turn root from the secret the rewrite carries and opens A's
+    /// sequence 0 as A first wrote it.
+    #[test]
+    fn a_hello_rewritten_across_two_rotations_opens_the_first_message_as_written() {
+        let (a, mut b, mut net) = scene();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let channel = opened_channel(&outcome);
+        let channel_before = channel_bytes(&net, &channel);
+        let record_before = record_without_hello(&a, &peer_a);
+        let outbox_before = outstanding_zero(&a.store(), &peer_a).expect("load");
+        let first_serial = b.advert_keys.serial();
+        let original_ct = outstanding(&a, &peer_a).kem_ct;
+
+        net.reset_writes();
+        for (turn, seed) in [(1u64, 2_020u64), (2, 2_121)] {
+            let at = NOW + turn * advert::ROTATION_PERIOD_SECS;
+            rotate(&mut b, &mut net, at, seed);
+            assert!(
+                a_refreshes(&a, &mut net, &peer_a, at, seed + 1).expect("the refresh runs"),
+                "rotation {turn} was past the outstanding serial"
+            );
+        }
+        assert_eq!(net.writes.hello, 2, "one hello write per rotation");
+        assert_eq!(
+            net.writes.control + net.writes.ring,
+            0,
+            "no channel subkey was written"
+        );
+        assert_eq!(
+            channel_bytes(&net, &channel),
+            channel_before,
+            "A's channel changed"
+        );
+        assert_eq!(
+            record_without_hello(&a, &peer_a),
+            record_before,
+            "A's conversation record changed beyond its outstanding hello"
+        );
+        assert_eq!(
+            outstanding_zero(&a.store(), &peer_a).expect("load"),
+            outbox_before,
+            "A's outbox entry for sequence 0 changed"
+        );
+        assert!(
+            b.advert_keys
+                .decapsulate(first_serial, &original_ct)
+                .expect("decapsulate")
+                .is_none(),
+            "B still holds the first key, so the two rotations prove nothing"
+        );
+
+        // The control: B's advert secrets alone do not open sequence 0. Every
+        // encapsulation B can reach, under every key B still holds, seeds a
+        // root under which A's first message does not open.
+        let first_ratchet_pk = ChannelOpening::decode(
+            a.store()
+                .load_conv(&peer_a)
+                .expect("load")
+                .expect("a record")
+                .own_opening
+                .expect("A's opening")
+                .as_slice(),
+        )
+        .expect("decode A's opening")
+        .first_ratchet_pk;
+        let (header, sealed) =
+            channel::MessageHeader::decode(&channel_before.1).expect("decode sequence 0");
+        let slot = outstanding(&a, &peer_a).slot;
+        let rewrite = hello_in_drop(&net, &b, slot);
+        let rewrite_ct: [u8; ml_kem::CT_LEN] = rewrite[..ml_kem::CT_LEN]
+            .try_into()
+            .expect("a ciphertext prefix");
+        let mut tried = 0;
+        for serial in [
+            Some(b.advert_keys.serial()),
+            b.advert_keys.previous_serial(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for ct in [&rewrite_ct, &*original_ct] {
+                let secret = b
+                    .advert_keys
+                    .decapsulate(serial, ct)
+                    .expect("decapsulate")
+                    .expect("a held serial");
+                let mut guess = chain::accept(&secret, &first_ratchet_pk).expect("a conversation");
+                assert!(
+                    guess.open(&header, sealed).is_err(),
+                    "sequence 0 opened without the carried secret"
+                );
+                tried += 1;
+            }
+        }
+        assert_eq!(tried, 4, "two held keys over two encapsulations");
+        // The mirror: the secret the rewrite carries opens it.
+        let (hello, _, _) =
+            open_against_either(&b.advert_keys, &rewrite, b.pk(), slot).expect("the rewrite opens");
+        let carried = hello.original_secret.expect("a rewrite carries a secret");
+        let mut reader = chain::accept(&carried, &first_ratchet_pk).expect("a conversation");
+        assert_eq!(
+            reader
+                .open(&header, sealed)
+                .expect("the carried secret opens sequence 0"),
+            b"the first message"
+        );
+
+        let request = only_request(b_collects(&b, &mut net));
+        assert_eq!(
+            request.advert_serial, first_serial,
+            "the opening binds the serial A first encapsulated to"
+        );
+        let store_b = b.store();
+        let mut entropy = Seeded::at(909);
+        let accepted = accept(
+            &store_b,
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B accepts");
+        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
+
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        match surfaced.as_slice() {
+            [Surfaced::Accepted(acceptance)] => {
+                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+            }
+            other => panic!("expected one acceptance, got {other:?}"),
+        }
+    }
+
+    /// A refresh run after the correspondent collected and accepted the
+    /// original hello, but before this side has recognised the acceptance,
+    /// changes no channel subkey and no key-schedule state. The reply opens,
+    /// and once the acceptance is recognised a refresh is refused.
+    #[test]
+    fn a_refresh_after_the_acceptance_leaves_the_conversation_readable() {
+        let (a, mut b, mut net) = scene();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let channel = opened_channel(&outcome);
+        let at = NOW + advert::ROTATION_PERIOD_SECS;
+
+        // B rotates, collects the original hello under the key it retained,
+        // and replies to A's first ratchet key.
+        rotate(&mut b, &mut net, at, 2_020);
+        let accepted = b_accepts(&b, &mut net, b"the reply");
+        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
+        let channel_before = channel_bytes(&net, &channel);
+        let record_before = record_without_hello(&a, &peer_a);
+
+        // Out of order: A refreshes before collecting its own drop.
+        net.reset_writes();
+        assert!(
+            a_refreshes(&a, &mut net, &peer_a, at, 3_030).expect("the refresh runs"),
+            "the advert moved past the outstanding serial"
+        );
+        assert_eq!(net.writes.hello, 1, "one hello write");
+        assert_eq!(net.writes.total(), 1, "and nothing else");
+        assert_eq!(
+            channel_bytes(&net, &channel),
+            channel_before,
+            "the refresh rewrote A's channel"
+        );
+        assert_eq!(
+            record_without_hello(&a, &peer_a),
+            record_before,
+            "the refresh changed A's conversation record beyond its hello"
+        );
+
+        // A collects its drop, recognises the acceptance and opens B's reply.
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        match surfaced.as_slice() {
+            [Surfaced::Accepted(acceptance)] => {
+                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+            }
+            other => panic!("expected one acceptance, got {other:?}"),
+        }
+
+        // In order: the refresh is refused and writes nothing.
+        net.reset_writes();
+        assert!(matches!(
+            a_refreshes(&a, &mut net, &peer_a, at, 4_040),
+            Err(FlowError::AlreadyAccepted)
+        ));
+        assert_eq!(net.writes.total(), 0);
+
+        // B erases the rewrite as already collected, and reads A's next
+        // message.
+        let surfaced = b_collects(&b, &mut net);
+        assert!(
+            matches!(surfaced.as_slice(), [Surfaced::AlreadyCollected { .. }]),
+            "got {surfaced:?}"
+        );
+        let mut entropy = Seeded::at(77);
+        send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"after the acceptance",
+            |x| entropy.fill(x),
+        )
+        .expect("A sends");
+        let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
+        assert_eq!(batch.bodies, vec![b"after the acceptance".to_vec()]);
+    }
+
+    /// A rewritten hello is refused anywhere but the drop it was written for.
+    /// Copied into another identity's drop it does not open. A rewrite built
+    /// by an identity A contacted, carrying the secret of A's hello to that
+    /// identity, opens at B but its opening names that identity.
+    #[test]
+    fn a_rewritten_hello_relayed_to_another_identity_is_refused() {
+        let (a, mut b, mut net) = scene();
+        let c = Party::new(0xc3);
+        c.publish(&mut net);
+        let to_b = a_opens(&a, &b, &mut net, b"to B");
+        let peer_b = opened_peer(&to_b);
+        // A seed of its own, so the hello to C does not share the slot the
+        // hello to B takes.
+        let store_a = a.store();
+        let mut entropy = Seeded::at(8_484);
+        let to_c = first_contact(
+            &store_a,
+            &mut net,
+            &a.me(),
+            c.pk(),
+            b"to C",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A's first contact to C");
+        drop(store_a);
+        let c_slot = match &to_c {
+            FirstContact::Opened { hello_slot, .. } => *hello_slot,
+            other => panic!("expected a fresh first contact, got {other:?}"),
+        };
+        let at = NOW + advert::ROTATION_PERIOD_SECS;
+        rotate(&mut b, &mut net, at, 2_020);
+        assert!(a_refreshes(&a, &mut net, &peer_b, at, 3_030).expect("the refresh runs"));
+        let slot = outstanding(&a, &peer_b).slot;
+        let rewrite = hello_in_drop(&net, &b, slot);
+
+        // C opens A's hello to C, as its recipient may.
+        let to_c_bytes = hello_in_drop(&net, &c, c_slot);
+        let (to_c_hello, to_c_secret, _) =
+            open_against_either(&c.advert_keys, &to_c_bytes, c.pk(), c_slot)
+                .expect("C opens A's hello");
+
+        // Copied into an empty slot of C's drop, B's rewrite does not open.
+        // The control: A's genuine hello to C, in the same drop, is surfaced.
+        assert_ne!(slot, c_slot, "the rewrite would overwrite A's hello to C");
+        let c_drop = drop_plane::derive_owner_seed(c.pk()).expect("C's drop");
+        net.drops.insert((*c_drop.as_bytes(), slot), rewrite);
+        let surfaced =
+            collect(&c.store(), &mut net, &c.me(), &c.advert_keys, |_| false).expect("C collects");
+        assert_eq!(
+            only_request(surfaced).lookup_key,
+            opened_channel(&to_c),
+            "C surfaced something other than A's hello to C"
+        );
+
+        // C relays A's channel to C into B's drop as a rewrite.
+        assert!(
+            c.advert_keys.serial() < b.advert_keys.serial(),
+            "C's serial is below B's, so the refusal below is the identity binding"
+        );
+        let mut entropy = Seeded::at(6_161);
+        let advert_b = advert::verify(
+            b.pk(),
+            &b.advert_keys.advert_bytes(&b.signer).expect("B's advert"),
+        )
+        .expect("verify B's advert");
+        let encap =
+            advert::encapsulate_to(&advert_b, at, |x| entropy.fill(x)).expect("encapsulate");
+        let r = drop_plane::repick(|x| entropy.fill(x)).expect("r");
+        let relay = drop_plane::seal_rewritten_hello(
+            &encap,
+            &to_c_hello.lookup_key,
+            &r,
+            &to_c_secret,
+            b.pk(),
+        )
+        .expect("seal the relay");
+        let relay_slot = drop_plane::slot_for(&r).expect("slot");
+        assert_ne!(relay_slot, slot, "the relay would overwrite A's rewrite");
+        let b_drop = drop_plane::derive_owner_seed(b.pk()).expect("B's drop");
+        net.drops.insert((*b_drop.as_bytes(), relay_slot), relay);
+
+        // The control: A's genuine rewrite in the same drop is surfaced.
+        let request = only_request(b_collects(&b, &mut net));
+        assert_eq!(
+            request.lookup_key,
+            opened_channel(&to_b),
+            "B surfaced a channel A opened to someone else"
+        );
+    }
+
+    /// Write a copy of `opening` into the channel at `channel` under a secret
+    /// the copier holds, with a message 0 of the copier's under that secret,
+    /// and a hello to `recipient` naming the channel. The hello is an original
+    /// when `chosen` is `None`, and a rewrite carrying `chosen` otherwise.
+    /// Returns the drop slot the hello occupies.
+    fn plant_copied_opening(
+        net: &mut Net,
+        recipient: &Party,
+        opening: &ChannelOpening,
+        channel: [u8; HELLO_LOOKUP_KEY_LEN],
+        chosen: Option<&AdvertSharedSecret>,
+        at: u64,
+        seed: u64,
+    ) -> u16 {
+        let mut entropy = Seeded::at(seed);
+        let advert = advert::verify(
+            recipient.pk(),
+            &recipient
+                .advert_keys
+                .advert_bytes(&recipient.signer)
+                .expect("the recipient's advert"),
+        )
+        .expect("verify the advert");
+        let encap = advert::encapsulate_to(&advert, at, |x| entropy.fill(x)).expect("encapsulate");
+        let channel_secret = chosen.unwrap_or(&encap.shared_secret);
+        let control = channel::seal_control(
+            channel_secret,
+            &Control {
+                opening: Some(opening.clone()),
+                collected_cursor: 0,
+                closed: false,
+            },
+        )
+        .expect("seal the control");
+        net.write_channel(&channel, channel::CONTROL_SUBKEY, &control)
+            .expect("write the control");
+        let mut conversation = chain::initiate(channel_secret, |x| entropy.fill(x))
+            .expect("initiate")
+            .conversation;
+        let (header, sealed) = conversation
+            .seal(b"not from A", channel::DEVICE_ID_SINGLE_DEVICE, |x| {
+                entropy.fill(x)
+            })
+            .expect("seal message 0");
+        let mut slot_bytes = header.encode();
+        slot_bytes.extend_from_slice(&sealed);
+        net.write_channel(&channel, channel::slot_for(0), &slot_bytes)
+            .expect("write message 0");
+        let r = drop_plane::repick(|x| entropy.fill(x)).expect("r");
+        let hello = match chosen {
+            None => drop_plane::seal_hello(&encap, &channel, &r, recipient.pk()),
+            Some(secret) => {
+                drop_plane::seal_rewritten_hello(&encap, &channel, &r, secret, recipient.pk())
+            }
+        }
+        .expect("seal the hello");
+        let slot = drop_plane::slot_for(&r).expect("slot");
+        let owner = drop_plane::derive_owner_seed(recipient.pk()).expect("the drop");
+        net.write_drop_slot(&owner, drop_plane::DROP_SUBKEYS, slot, &hello)
+            .expect("write the hello");
+        slot
+    }
+
+    /// A's genuine opening copied into a channel somebody else writes is
+    /// refused, whether the copier's hello is an original or a rewrite
+    /// carrying a secret the copier chose: the opening signs the lookup key of
+    /// the channel A wrote it into, and the copier's hello names another.
+    #[test]
+    fn a_genuine_opening_copied_into_another_channel_is_refused() {
+        let (a, mut b, mut net) = scene();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let genuine = opened_channel(&outcome);
+        let genuine_slot = outstanding(&a, &peer_a).slot;
+        // A's genuine opening, as anyone holding a snapshot of either side has
+        // it.
+        let opening = ChannelOpening::decode(
+            a.store()
+                .load_conv(&peer_a)
+                .expect("load")
+                .expect("a record")
+                .own_opening
+                .expect("A's opening")
+                .as_slice(),
+        )
+        .expect("decode A's opening");
+
+        // An original-shape copy, encapsulated to the key A encapsulated to.
+        let first = plant_copied_opening(
+            &mut net,
+            &b,
+            &opening,
+            [0x7eu8; HELLO_LOOKUP_KEY_LEN],
+            None,
+            NOW,
+            7_171,
+        );
+        assert_ne!(first, genuine_slot, "the copy would overwrite A's hello");
+        assert_eq!(
+            only_request(b_collects(&b, &mut net)).lookup_key,
+            genuine,
+            "B surfaced a copied opening as A's request"
+        );
+
+        // A rewrite-shape copy after B rotates, carrying a secret the copier
+        // chose.
+        let at = NOW + advert::ROTATION_PERIOD_SECS;
+        rotate(&mut b, &mut net, at, 2_020);
+        let chosen = AdvertSharedSecret::from_bytes(&[0x5cu8; ml_kem::SHARED_SECRET_LEN]);
+        let second = plant_copied_opening(
+            &mut net,
+            &b,
+            &opening,
+            [0x7du8; HELLO_LOOKUP_KEY_LEN],
+            Some(&chosen),
+            at,
+            7_272,
+        );
+        assert!(
+            second != genuine_slot && second != first,
+            "the second copy would overwrite another hello"
+        );
+        // The control: A's genuine hello, in the same drop, is surfaced.
+        assert_eq!(
+            only_request(b_collects(&b, &mut net)).lookup_key,
+            genuine,
+            "B surfaced a rewritten copy as A's request"
+        );
+    }
+
+    /// A rewrite whose opening names the serial the rewrite arrived under was
+    /// not made by a rotation, and is refused.
+    #[test]
+    fn a_rewrite_not_made_by_a_rotation_is_refused() {
+        let (a, b, mut net) = scene();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let slot = outstanding(&a, &peer_a).slot;
+        let original = hello_in_drop(&net, &b, slot);
+        let (opened, ss0, serial) =
+            open_against_either(&b.advert_keys, &original, b.pk(), slot).expect("A's hello opens");
+        assert_eq!(serial, b.advert_keys.serial(), "B has not rotated");
+
+        // A rewrite of A's hello, re-encapsulated to the key A first used.
+        let mut entropy = Seeded::at(9_191);
+        let advert_b = advert::verify(
+            b.pk(),
+            &b.advert_keys.advert_bytes(&b.signer).expect("B's advert"),
+        )
+        .expect("verify B's advert");
+        let encap =
+            advert::encapsulate_to(&advert_b, NOW, |x| entropy.fill(x)).expect("encapsulate");
+        let rewrite =
+            drop_plane::seal_rewritten_hello(&encap, &opened.lookup_key, &opened.r, &ss0, b.pk())
+                .expect("seal the rewrite");
+        let drop_owner = drop_plane::derive_owner_seed(b.pk()).expect("B's drop");
+        net.drops.insert((*drop_owner.as_bytes(), slot), rewrite);
+        let surfaced = b_collects(&b, &mut net);
+        assert!(
+            surfaced.is_empty(),
+            "a rewrite at its own serial was surfaced: {surfaced:?}"
+        );
+
+        // The control: the original hello in the same slot is surfaced.
+        net.drops.insert((*drop_owner.as_bytes(), slot), original);
+        assert_eq!(
+            only_request(b_collects(&b, &mut net)).lookup_key,
+            opened.lookup_key
+        );
+    }
+
+    /// A refresh stopped at each of its write boundaries is carried to
+    /// completion by the relaunch: the persisted rewrite is written byte for
+    /// byte, no second encapsulation is minted, and B opens A's first message.
+    #[test]
+    fn a_refresh_stopped_at_each_boundary_converges_on_one_rewrite() {
+        for boundary in 0..3usize {
+            let (a, mut b, mut net) = scene();
+            let outcome = a_opens(&a, &b, &mut net, b"the first message");
+            let peer_a = opened_peer(&outcome);
+            let channel = opened_channel(&outcome);
+            let at = NOW + advert::ROTATION_PERIOD_SECS;
+            rotate(&mut b, &mut net, at, 2_020);
+            let channel_before = channel_bytes(&net, &channel);
+
+            // Boundary 0 stops before the first write, over a slot still
+            // holding the original hello. Boundary 1 stops after a clobbered
+            // write and its re-pick. Boundary 2 is a drop kept full, which
+            // stops the refresh at DropFull over a slot holding another value.
+            net.clobber_hellos = net.clobbered + [0, 1, 2][boundary];
+            net.reset_writes();
+            net.minted.clear();
+            net.fail_after = [Some(0), Some(1), None][boundary];
+            assert!(
+                a_refreshes(&a, &mut net, &peer_a, at, 3_030).is_err(),
+                "boundary {boundary} must stop the refresh short"
+            );
+            let persisted = outstanding(&a, &peer_a);
+            assert_eq!(
+                persisted.advert_serial,
+                b.advert_keys.serial(),
+                "boundary {boundary} wrote a rewrite it had not persisted"
+            );
+
+            // The relaunch.
+            net.fail_after = None;
+            assert!(
+                !a_refreshes(&a, &mut net, &peer_a, at, 4_040).expect("the relaunch refresh runs"),
+                "boundary {boundary}: the persisted rewrite is current, so nothing re-encapsulates"
+            );
+            assert_eq!(
+                resume_first_contact(&a.store(), &mut net, &peer_a).expect("the relaunch rewrites"),
+                Resumed::Rewrote(persisted.slot)
+            );
+            assert_eq!(
+                net.hellos_written
+                    .last()
+                    .expect("a hello was written")
+                    .as_slice(),
+                persisted.sealed.as_slice(),
+                "boundary {boundary} wrote bytes other than the persisted rewrite"
+            );
+            assert_eq!(
+                outstanding(&a, &peer_a).sealed,
+                persisted.sealed,
+                "boundary {boundary}: the relaunch changed the persisted rewrite"
+            );
+            assert_eq!(
+                hello_in_drop(&net, &b, persisted.slot).as_slice(),
+                persisted.sealed.as_slice(),
+                "boundary {boundary}: the slot does not hold the persisted rewrite"
+            );
+            let distinct: HashSet<[u8; ml_kem::CT_LEN]> = net.minted.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                1,
+                "boundary {boundary} minted {} encapsulations",
+                distinct.len()
+            );
+            assert_eq!(
+                channel_bytes(&net, &channel),
+                channel_before,
+                "boundary {boundary} changed A's channel"
+            );
+
+            let accepted = b_accepts(&b, &mut net, b"the reply");
+            assert_eq!(
+                accepted.bodies,
+                vec![b"the first message".to_vec()],
+                "boundary {boundary}"
+            );
+        }
+    }
+
+    /// A refresh is one hello write and nothing else, two with one re-pick,
+    /// and none where the advert has not moved.
+    #[test]
+    fn a_refresh_is_one_hello_write_and_no_channel_write() {
+        let (a, mut b, mut net) = scene();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let period = advert::ROTATION_PERIOD_SECS;
+
+        rotate(&mut b, &mut net, NOW + period, 2_020);
+        net.reset_writes();
+        assert!(a_refreshes(&a, &mut net, &peer_a, NOW + period, 3_030).expect("the refresh runs"));
+        assert!(net.writes.bytes > 0, "the write carried bytes");
+        assert_eq!(net.writes.hello, 1, "the rewritten hello");
+        assert_eq!(net.writes.total(), 1, "no erase and no channel write");
+
+        rotate(&mut b, &mut net, NOW + 2 * period, 2_121);
+        net.clobber_hellos = net.clobbered + 1;
+        net.reset_writes();
+        assert!(
+            a_refreshes(&a, &mut net, &peer_a, NOW + 2 * period, 3_131).expect("the refresh runs")
+        );
+        assert_eq!(net.writes.hello, 2, "the rewritten hello and its re-pick");
+        assert_eq!(net.writes.total(), 2);
+
+        net.reset_writes();
+        assert!(
+            !a_refreshes(&a, &mut net, &peer_a, NOW + 2 * period, 3_232).expect("the refresh runs")
+        );
+        assert_eq!(net.writes.total(), 0, "an unmoved advert costs no write");
+
+        // The control: a record store that counts each write twice puts the
+        // same refresh over its budget.
+        rotate(&mut b, &mut net, NOW + 3 * period, 2_222);
+        net.double = true;
+        net.reset_writes();
+        assert!(
+            a_refreshes(&a, &mut net, &peer_a, NOW + 3 * period, 3_333).expect("the refresh runs")
+        );
+        assert!(
+            net.writes.total() > 1,
+            "a doubled write must exceed the one-write budget, was {}",
+            net.writes.total()
         );
     }
 
@@ -2677,9 +3398,14 @@ mod tests {
         let (hello, secret, serial) =
             open_against_either(&b.advert_keys, &bytes, b.pk(), slot).expect("the hello opens");
         let original = read_opening(&mut net, &secret, &hello.lookup_key).expect("the opening");
-        let forged =
-            ChannelOpening::build(&a.signer, b.pk(), &original.first_ratchet_pk, serial + 1)
-                .expect("re-sign the opening");
+        let forged = ChannelOpening::build(
+            &a.signer,
+            b.pk(),
+            &hello.lookup_key,
+            &original.first_ratchet_pk,
+            serial + 1,
+        )
+        .expect("re-sign the opening");
         let control = channel::seal_control(
             &secret,
             &Control {
@@ -2873,12 +3599,88 @@ mod tests {
         assert!(matches!(again, Err(FlowError::AlreadyEstablished)));
     }
 
+    /// An acceptance refuses a contact request whose fields do not all come
+    /// from the opening its channel holds: an identity paired with another
+    /// correspondent's channel, or a first ratchet key paired with a channel
+    /// whose opening names another. Nothing is written for either.
+    #[test]
+    fn an_acceptance_refuses_a_request_its_opening_does_not_match() {
+        let (a, b, mut net) = scene();
+        let c = Party::new(0xc3);
+        c.publish(&mut net);
+        a_opens(&a, &b, &mut net, b"from A");
+        let store_c = c.store();
+        let mut entropy = Seeded::at(8_484);
+        first_contact(
+            &store_c,
+            &mut net,
+            &c.me(),
+            b.pk(),
+            b"from C",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("C's first contact");
+        drop(store_c);
+
+        let requests: Vec<ContactRequest> = b_collects(&b, &mut net)
+            .into_iter()
+            .map(|surfaced| match surfaced {
+                Surfaced::ContactRequest(request) => request,
+                other => panic!("expected contact requests, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(requests.len(), 2, "A's and C's hellos are both surfaced");
+        let from = |party: &Party| {
+            requests
+                .iter()
+                .find(|r| r.identity.as_slice() == party.pk().as_slice())
+                .expect("a request from that party")
+        };
+        let (from_a, from_c) = (from(&a), from(&c));
+        let request = |identity: &ContactRequest, ratchet: &ContactRequest| ContactRequest {
+            identity: identity.identity.clone(),
+            lookup_key: from_c.lookup_key,
+            first_ratchet_pk: ratchet.first_ratchet_pk.clone(),
+            slot: from_c.slot,
+            advert_serial: from_c.advert_serial,
+            shared_secret: AdvertSharedSecret::from_bytes(from_c.shared_secret.as_bytes()),
+        };
+
+        let store_b = b.store();
+        net.reset_writes();
+        let mut entropy = Seeded::at(909);
+        let as_a = accept(
+            &store_b,
+            &mut net,
+            &b.me(),
+            &request(from_a, from_c),
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(
+            matches!(as_a, Err(FlowError::OpeningWriter)),
+            "A's identity over C's opening was not refused as another writer: {as_a:?}"
+        );
+        let other_key = accept(
+            &store_b,
+            &mut net,
+            &b.me(),
+            &request(from_c, from_a),
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(
+            matches!(other_key, Err(FlowError::OpeningRatchetKey)),
+            "A's ratchet key over C's opening was not refused: {other_key:?}"
+        );
+        assert_eq!(net.writes.total(), 0, "a refused acceptance writes nothing");
+    }
+
     /// An ordinary message is refused until this side's first contact has been
     /// accepted, and succeeds once it has.
-    ///
-    /// A message sent in between would be sealed under a root a refresh
-    /// re-derives, because an unaccepted first contact may still be
-    /// re-encapsulated to a rotated advert key.
     #[test]
     fn an_ordinary_message_is_refused_until_the_first_contact_is_accepted() {
         let (a, b, mut net) = scene();

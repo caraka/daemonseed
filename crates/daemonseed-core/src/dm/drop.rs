@@ -6,13 +6,24 @@
 //! hello per slot, and a hello is
 //!
 //! ```text
-//!   kem_ct ‖ AEAD_{k_hello}(lookup_key ‖ r) ‖ pow_tag
+//!   kem_ct ‖ AEAD_{k_hello}(lookup_key ‖ r ‖ carried_tag ‖ carried) ‖ pow_tag
 //! ```
 //!
 //! where `ss0` is the secret a sender gets from encapsulating to the
 //! recipient's advert key, `k_hello = HKDF(ss0, DM_DROP_HELLO)`, `lookup_key`
 //! addresses the sender's own channel record and `r` is 32 fresh bytes that
 //! pick the slot.
+//!
+//! `carried_tag` and `carried` tell an original hello from a rewritten one. An
+//! original hello, [`seal_hello`], has tag 0 and 32 zero bytes. A rewritten
+//! hello, [`seal_rewritten_hello`], is re-encapsulated to a recipient whose
+//! advert key has rotated since the original was written. It has tag 1 and
+//! carries the secret the original encapsulation established, because the
+//! sender's channel is sealed under that secret and stays as written. Both
+//! shapes are [`HELLO_LEN`] bytes, and their bytes do not tell a party who
+//! cannot open them which shape they are. A rewrite reuses the original's `r`
+//! and slot and follows a public advert rotation, so a storage node can still
+//! link it to the hello it replaces.
 //!
 //! Four rules govern it:
 //!
@@ -121,10 +132,20 @@ pub const HELLO_LOOKUP_KEY_LEN: usize = 32;
 /// Byte length of `r`, the value that picks the slot.
 pub const HELLO_R_LEN: usize = 32;
 
-/// Byte length of a hello's sealed plaintext: `lookup_key ‖ r`.
-const HELLO_PLAINTEXT_LEN: usize = HELLO_LOOKUP_KEY_LEN + HELLO_R_LEN;
+/// Byte length of the secret a rewritten hello carries.
+const CARRIED_LEN: usize = ml_kem::SHARED_SECRET_LEN;
 
-/// Byte length of an encoded hello:
+/// The tag of an original hello, whose carried field is all zero.
+const CARRIES_NOTHING: u8 = 0;
+
+/// The tag of a rewritten hello, whose carried field is the original secret.
+const CARRIES_ORIGINAL: u8 = 1;
+
+/// Byte length of a hello's sealed plaintext:
+/// `lookup_key ‖ r ‖ carried_tag ‖ carried`.
+const HELLO_PLAINTEXT_LEN: usize = HELLO_LOOKUP_KEY_LEN + HELLO_R_LEN + 1 + CARRIED_LEN;
+
+/// Byte length of an encoded hello, original or rewritten:
 /// `kem_ct ‖ nonce ‖ ciphertext ‖ tag ‖ pow_tag`.
 pub const HELLO_LEN: usize =
     ml_kem::CT_LEN + NONCE_LEN + HELLO_PLAINTEXT_LEN + TAG_LEN + DROP_POW_TAG_LEN;
@@ -390,11 +411,11 @@ pub fn repick(
 }
 
 /// What a hello discloses once it opens: the lookup key of the sender's own
-/// channel record, and the `r` that placed the hello.
+/// channel record, the `r` that placed the hello, and, for a rewritten hello,
+/// the secret the original encapsulation established.
 ///
 /// Only constructible via [`open_hello`], so holding one is the proof the seal
 /// opened and the tag verified.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
     /// The lookup key of `CHAN(sender → recipient)`, which the recipient now
     /// reads.
@@ -402,10 +423,25 @@ pub struct Hello {
     /// The value that picked this hello's slot. The recipient needs it to
     /// erase the slot the hello actually occupies.
     pub r: [u8; HELLO_R_LEN],
+    /// The secret a rewritten hello carries, `None` for an original hello.
+    ///
+    /// The sender's channel control subkey and first-turn root derive from
+    /// this secret rather than from the one the rewrite's own decapsulation
+    /// yields.
+    pub original_secret: Option<advert::AdvertSharedSecret>,
 }
 
-/// Seal a hello for publication:
-/// `kem_ct ‖ AEAD_{k_hello}(lookup_key ‖ r) ‖ pow_tag`.
+impl core::fmt::Debug for Hello {
+    /// Renders whether a secret is carried, never the secret.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Hello")
+            .field("rewritten", &self.original_secret.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Seal an original hello for publication:
+/// `kem_ct ‖ AEAD_{k_hello}(lookup_key ‖ r ‖ 0 ‖ 0^32) ‖ pow_tag`.
 ///
 /// `encap` is what [`advert::encapsulate_to`] produced against the
 /// recipient's verified advert, so it carries both the ciphertext the hello
@@ -416,12 +452,58 @@ pub fn seal_hello(
     r: &[u8; HELLO_R_LEN],
     recipient_pubkey: &[u8; ml_dsa::PK_LEN],
 ) -> Result<Vec<u8>, DropError> {
+    seal_with(
+        encap,
+        lookup_key,
+        r,
+        CARRIES_NOTHING,
+        &[0u8; CARRIED_LEN],
+        recipient_pubkey,
+    )
+}
+
+/// Seal a rewritten hello for publication:
+/// `kem_ct ‖ AEAD_{k_hello}(lookup_key ‖ r ‖ 1 ‖ original) ‖ pow_tag`.
+///
+/// `encap` is a fresh encapsulation to the recipient's current advert key and
+/// `original` is the secret the first hello for this channel established. The
+/// recipient opens the rewrite under its own decapsulation and takes
+/// `original` from inside it, so a channel sealed under `original` stays
+/// readable after the key it was encapsulated to is gone.
+pub fn seal_rewritten_hello(
+    encap: &advert::HelloEncapsulation,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    r: &[u8; HELLO_R_LEN],
+    original: &advert::AdvertSharedSecret,
+    recipient_pubkey: &[u8; ml_dsa::PK_LEN],
+) -> Result<Vec<u8>, DropError> {
+    seal_with(
+        encap,
+        lookup_key,
+        r,
+        CARRIES_ORIGINAL,
+        original.as_bytes(),
+        recipient_pubkey,
+    )
+}
+
+/// Seal a hello with an explicit carried tag and field.
+fn seal_with(
+    encap: &advert::HelloEncapsulation,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    r: &[u8; HELLO_R_LEN],
+    carried_tag: u8,
+    carried: &[u8; CARRIED_LEN],
+    recipient_pubkey: &[u8; ml_dsa::PK_LEN],
+) -> Result<Vec<u8>, DropError> {
     let key = hello_key(&encap.shared_secret)?;
     let aes = Aes256Key::new(key.as_bytes()).map_err(DropError::Module)?;
 
     let mut plaintext = Vec::with_capacity(HELLO_PLAINTEXT_LEN);
     plaintext.extend_from_slice(lookup_key);
     plaintext.extend_from_slice(r);
+    plaintext.push(carried_tag);
+    plaintext.extend_from_slice(carried);
     let sealed = seal_envelope(
         &aes,
         &hello_aad(&encap.ciphertext, recipient_pubkey),
@@ -450,9 +532,16 @@ pub fn seal_hello(
 /// junk from a hello meant for someone else: the length must be exactly
 /// [`HELLO_LEN`] ([`DropError::Length`]), the `pow_tag` must clear
 /// [`DROP_POW_BITS`] ([`DropError::BadTag`]), the seal must open
-/// ([`DropError::Aead`]), the tag must be the tag over the `r` the seal
-/// carried ([`DropError::BadTag`]), and `r` must pick `slot`
+/// ([`DropError::Aead`]), the carried tag must be 0 over an all-zero field or
+/// 1 over a field that is not all zero ([`DropError::Aead`]), because an
+/// all-zero carried secret would seal a channel under a key anyone can
+/// compute, the proof-of-work tag must be the tag over the `r`
+/// the seal carried ([`DropError::BadTag`]), and `r` must pick `slot`
 /// ([`DropError::SlotMismatch`]).
+///
+/// A rewritten hello opens to a [`Hello`] whose `original_secret` is the
+/// secret it carries. That secret is not authenticated by the hello alone:
+/// the caller authenticates it against whatever it was established for.
 ///
 /// **At [`DROP_POW_BITS`] zero the tag's value check binds nothing the AEAD
 /// does not already bind.** Anything that opens the seal was produced by a
@@ -488,15 +577,30 @@ pub fn open_hello(
         plaintext.zeroize();
         return Err(DropError::Aead);
     }
+    let tag_at = HELLO_LOOKUP_KEY_LEN + HELLO_R_LEN;
+    let mut carried = [0u8; CARRIED_LEN];
+    carried.copy_from_slice(&plaintext[tag_at + 1..]);
+    let original_secret = match plaintext[tag_at] {
+        CARRIES_NOTHING if carried == [0u8; CARRIED_LEN] => Ok(None),
+        CARRIES_ORIGINAL if carried != [0u8; CARRIED_LEN] => {
+            Ok(Some(advert::AdvertSharedSecret::from_bytes(&carried)))
+        }
+        _ => Err(DropError::Aead),
+    };
+    carried.zeroize();
     let mut hello = Hello {
         lookup_key: [0u8; HELLO_LOOKUP_KEY_LEN],
         r: [0u8; HELLO_R_LEN],
+        original_secret: None,
     };
     hello
         .lookup_key
         .copy_from_slice(&plaintext[..HELLO_LOOKUP_KEY_LEN]);
-    hello.r.copy_from_slice(&plaintext[HELLO_LOOKUP_KEY_LEN..]);
+    hello
+        .r
+        .copy_from_slice(&plaintext[HELLO_LOOKUP_KEY_LEN..tag_at]);
     plaintext.zeroize();
+    hello.original_secret = original_secret?;
 
     if pow_tag(kem_ct, &hello.r, recipient_pubkey)? != tag {
         return Err(DropError::BadTag);
@@ -685,6 +789,105 @@ mod tests {
         let opened = open_hello(&ss0, &bytes, &pk, fixture_slot()).expect("open the hello");
         assert_eq!(opened.lookup_key, [0x33u8; HELLO_LOOKUP_KEY_LEN]);
         assert_eq!(opened.r, r);
+        assert!(
+            opened.original_secret.is_none(),
+            "an original hello carries no secret"
+        );
+    }
+
+    /// A rewritten hello opens under the rewrite's own secret, carries the
+    /// original secret out, and measures what an original hello measures.
+    #[test]
+    fn a_rewritten_hello_round_trips_carrying_the_original_secret() {
+        let (keys, encap) = encapsulation(0x11);
+        let pk = recipient_pk(0x11);
+        let original = advert::AdvertSharedSecret::from_bytes(&[0x9au8; ml_kem::SHARED_SECRET_LEN]);
+        let bytes = seal_rewritten_hello(
+            &encap,
+            &[0x33u8; HELLO_LOOKUP_KEY_LEN],
+            &FIXTURE_R,
+            &original,
+            &pk,
+        )
+        .expect("seal the rewrite");
+        assert_eq!(
+            bytes.len(),
+            HELLO_LEN,
+            "a rewrite is as long as an original hello"
+        );
+        let ss = keys
+            .decapsulate(encap.serial, &encap.ciphertext)
+            .expect("decapsulate")
+            .expect("the serial is current");
+        let opened = open_hello(&ss, &bytes, &pk, fixture_slot()).expect("open the rewrite");
+        assert_eq!(opened.lookup_key, [0x33u8; HELLO_LOOKUP_KEY_LEN]);
+        assert_eq!(opened.r, FIXTURE_R);
+        let carried = opened
+            .original_secret
+            .expect("a rewrite carries the original secret");
+        assert_eq!(carried.as_bytes(), original.as_bytes());
+    }
+
+    /// A seal whose carried tag is neither shape does not open, and neither
+    /// does an original-shape tag over a field that is not zero, so one hello
+    /// has one reading.
+    #[test]
+    fn a_hello_with_a_malformed_carried_field_does_not_open() {
+        let (keys, encap) = encapsulation(0x11);
+        let pk = recipient_pk(0x11);
+        let ss = keys
+            .decapsulate(encap.serial, &encap.ciphertext)
+            .expect("decapsulate")
+            .expect("the serial is current");
+        let lookup_key = [0x33u8; HELLO_LOOKUP_KEY_LEN];
+        let seal = |tag: u8, field: [u8; CARRIED_LEN]| {
+            seal_with(&encap, &lookup_key, &FIXTURE_R, tag, &field, &pk).expect("seal")
+        };
+        // The control: the same helper opens with each well-formed pair.
+        assert!(
+            open_hello(
+                &ss,
+                &seal(CARRIES_NOTHING, [0u8; CARRIED_LEN]),
+                &pk,
+                fixture_slot()
+            )
+            .is_ok()
+        );
+        assert!(
+            open_hello(
+                &ss,
+                &seal(CARRIES_ORIGINAL, [0x01u8; CARRIED_LEN]),
+                &pk,
+                fixture_slot()
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            open_hello(&ss, &seal(2, [0u8; CARRIED_LEN]), &pk, fixture_slot()).unwrap_err(),
+            DropError::Aead
+        );
+        // A rewrite carrying the all-zero secret would name a channel sealed
+        // under a key anyone can compute.
+        assert_eq!(
+            open_hello(
+                &ss,
+                &seal(CARRIES_ORIGINAL, [0u8; CARRIED_LEN]),
+                &pk,
+                fixture_slot()
+            )
+            .unwrap_err(),
+            DropError::Aead
+        );
+        assert_eq!(
+            open_hello(
+                &ss,
+                &seal(CARRIES_NOTHING, [0x01u8; CARRIED_LEN]),
+                &pk,
+                fixture_slot()
+            )
+            .unwrap_err(),
+            DropError::Aead
+        );
     }
 
     /// **Control for every length figure in the module header.** A hello must

@@ -67,15 +67,25 @@ work lives in the maintainer's own planning notes, not here.
   write, `first_contact(store, records, me, peer_identity_pk, body, fill, now)` creating the conversation
   record before any record write, persisting the outbox entry before the channel writes, persisting the
   outstanding hello whole before the drop write and reading that write back once, `resume_first_contact`
-  rewriting a persisted hello unchanged, `refresh_first_contact` re-encapsulating an outstanding hello to
-  a rotated advert key, `collect` returning `Surfaced::Dropped` / `StartedOver` / `Accepted` /
+  rewriting a persisted hello unchanged, `refresh_first_contact(store, records, peer, fill, now)`
+  re-encapsulating an outstanding hello to a rotated advert key into the slot it occupies, carrying the
+  original hello secret and leaving the channel and key schedule unchanged, refused with
+  `FlowError::AlreadyAccepted` once the first contact is no longer awaiting acceptance, `collect` returning
+  `Surfaced::Dropped` / `StartedOver` / `Accepted` /
   `ContactRequest` per verified hello and skipping a slot it cannot read, open or verify, `accept` writing
   this side's channel opening and a hello back into the correspondent's drop, `recognise_acceptance`
   recording the correspondent's channel lookup key and hello secret, and `send_message` / `collect_batch`
   as the ordinary-message and cursor paths (#474).
 - `daemonseed-core`: `dm::store` conversation records carry `cursor_published`, `awaiting_acceptance`,
   `own_hello_secret`, `own_hello_kem_ct`, `peer_hello_secret`, `peer_advert_serial` and `own_opening`;
-  `CONV_RECORD_LEN` is 36763 (#474).
+  `CONV_RECORD_LEN` is 36828 (#474).
+- `daemonseed-core`: `dm::drop` hellos seal `lookup_key ‖ r ‖ carried_tag ‖ carried`, `HELLO_LEN` 1701;
+  `seal_rewritten_hello` carries the original hello secret and `Hello::original_secret` returns it (#474).
+- `daemonseed-core`: `dm::channel` openings carry and sign `channel_lookup_key`, `OPENING_LEN` 11419;
+  `ChannelOpening::verify(expected_recipient_pk, expected_lookup_key, expected_advert_serial)` refuses
+  `ChannelError::LookupKey`, and `flows::collect` requires the hello's lookup key; `flows::accept` refuses
+  an opening whose writer or first ratchet key is not the request's with `FlowError::OpeningWriter` /
+  `FlowError::OpeningRatchetKey` (#474).
 - `daemonseed-core`: `dm::delivery`, the direct-messaging delivery rules — `channel::collected(seq, peer_cursor)`,
   re-exported here, true exactly when the correspondent's published cursor is above the sequence and
   now also the predicate `Store::delete_outbox_through` frees a slot on;

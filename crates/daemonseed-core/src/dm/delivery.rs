@@ -254,6 +254,7 @@ mod tests {
         let opening = ChannelOpening::build(
             &writer,
             recipient.public_key(),
+            &OUTGOING,
             &conversation.ratchet_pk,
             OPENING_SERIAL,
         )

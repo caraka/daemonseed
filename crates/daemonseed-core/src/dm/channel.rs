@@ -70,6 +70,7 @@ use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
+use crate::dm::drop::HELLO_LOOKUP_KEY_LEN;
 use crate::dm::{advert, domain, push_lp};
 use crate::identity::keys::{DmChannelRootSecret, SignKeypair, SignatureError, verify_signature};
 use crate::secret_seed::{derive_boxed_seed, redacted_secret_newtype};
@@ -150,15 +151,19 @@ const _: () = assert!(
 );
 
 /// Byte length of an encoded [`ChannelOpening`]: `writer_identity_pk ‖
-/// recipient_identity_pk ‖ first_ratchet_pk ‖ advert_serial ‖ signature`.
+/// recipient_identity_pk ‖ channel_lookup_key ‖ first_ratchet_pk ‖
+/// advert_serial ‖ signature`.
 pub const OPENING_LEN: usize =
-    ml_dsa::PK_LEN + ml_dsa::PK_LEN + ml_kem::EK_LEN + 8 + ml_dsa::SIG_LEN;
+    ml_dsa::PK_LEN + ml_dsa::PK_LEN + HELLO_LOOKUP_KEY_LEN + ml_kem::EK_LEN + 8 + ml_dsa::SIG_LEN;
 
 /// Byte offset of `recipient_identity_pk` within an encoded opening.
 const RECIPIENT_PK_AT: usize = ml_dsa::PK_LEN;
 
+/// Byte offset of `channel_lookup_key` within an encoded opening.
+const LOOKUP_KEY_AT: usize = RECIPIENT_PK_AT + ml_dsa::PK_LEN;
+
 /// Byte offset of `first_ratchet_pk` within an encoded opening.
-const RATCHET_PK_AT: usize = RECIPIENT_PK_AT + ml_dsa::PK_LEN;
+const RATCHET_PK_AT: usize = LOOKUP_KEY_AT + HELLO_LOOKUP_KEY_LEN;
 
 /// Byte offset of `advert_serial` within an encoded opening.
 const SERIAL_AT: usize = RATCHET_PK_AT + ml_kem::EK_LEN;
@@ -245,6 +250,9 @@ pub enum ChannelError {
     /// An authentic opening naming a recipient other than the reader — a
     /// hello relayed to somebody the writer never addressed.
     Recipient,
+    /// An authentic opening naming a channel other than the one the reader
+    /// read it from — an opening copied into a record the writer does not own.
+    LookupKey,
     /// The opening's signature did not verify under the identity public key
     /// the opening itself carries.
     ///
@@ -321,6 +329,7 @@ impl PartialEq for ChannelError {
             ) => sa == sb && ca == cb,
             (Self::Signature, Self::Signature) => true,
             (Self::Recipient, Self::Recipient) => true,
+            (Self::LookupKey, Self::LookupKey) => true,
             (
                 Self::AdvertSerial {
                     expected: ea,
@@ -382,6 +391,7 @@ impl std::fmt::Display for ChannelError {
             ),
             Self::Signature => write!(f, "channel opening signature did not verify"),
             Self::Recipient => write!(f, "channel opening names another recipient"),
+            Self::LookupKey => write!(f, "channel opening names another channel"),
             Self::AdvertSerial { expected, found } => write!(
                 f,
                 "channel opening names advert serial {found}, not {expected}"
@@ -802,6 +812,8 @@ pub struct ChannelOpening {
     pub writer_identity_pk: Box<[u8; ml_dsa::PK_LEN]>,
     /// The identity the writer addressed this channel to.
     pub recipient_identity_pk: Box<[u8; ml_dsa::PK_LEN]>,
+    /// The lookup key of the channel record this opening belongs to.
+    pub channel_lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
     /// The writer's first ratchet ML-KEM-1024 public key.
     pub first_ratchet_pk: Box<[u8; ml_kem::EK_LEN]>,
     /// The serial of the advert the writer encapsulated to.
@@ -817,6 +829,7 @@ impl std::fmt::Debug for ChannelOpening {
         f.debug_struct("ChannelOpening")
             .field("writer_identity_pk", &"<ML-DSA-87 pubkey>")
             .field("recipient_identity_pk", &"<ML-DSA-87 pubkey>")
+            .field("channel_lookup_key", &"<lookup key>")
             .field("first_ratchet_pk", &"<ML-KEM-1024 pubkey>")
             .field("advert_serial", &self.advert_serial)
             .field("signature", &"<ML-DSA-87 signature>")
@@ -825,45 +838,59 @@ impl std::fmt::Debug for ChannelOpening {
 }
 
 /// Build the domain-separated signing preimage for an opening:
-/// `DM_CHANNEL_OPENING_SIG ‖ lp(writer pk) ‖ lp(recipient pk) ‖ lp(first
-/// ratchet pk) ‖ lp(BE64(advert_serial))`.
+/// `DM_CHANNEL_OPENING_SIG ‖ lp(writer pk) ‖ lp(recipient pk) ‖ lp(channel
+/// lookup key) ‖ lp(first ratchet pk) ‖ lp(BE64(advert_serial))`.
 ///
 /// Every field is length-prefixed, the repository's one preimage convention,
 /// so no pair of adjacent fields can be re-split into a different tuple.
 ///
-/// Two of the four fields are what stop a relayed hello, and they stop
-/// different relays: `advert_serial` names the advert the writer encapsulated
-/// to, which a reader who never published that serial refuses, and the
-/// recipient key names the identity the writer addressed, which a reader who
-/// is not that identity refuses even when the serial happens to match.
+/// Three of the five fields are what stop a relayed opening, and they stop
+/// different relays. `advert_serial` names the advert the writer
+/// encapsulated to, which a reader who never published that serial refuses.
+/// The recipient key names the identity the writer addressed, which a reader
+/// who is not that identity refuses even when the serial happens to match.
+/// The channel lookup key names the record the writer wrote the opening into,
+/// so a copy of the opening placed in a record somebody else owns, and named
+/// by a hello somebody else wrote, is refused by a reader who compares the
+/// signed key with the record it read.
 pub fn opening_signing_input(
     writer_identity_pk: &[u8; ml_dsa::PK_LEN],
     recipient_identity_pk: &[u8; ml_dsa::PK_LEN],
+    channel_lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     first_ratchet_pk: &[u8; ml_kem::EK_LEN],
     advert_serial: u64,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(
-        domain::DM_CHANNEL_OPENING_SIG.len() + 32 + 2 * ml_dsa::PK_LEN + ml_kem::EK_LEN + 8,
+        domain::DM_CHANNEL_OPENING_SIG.len()
+            + 40
+            + 2 * ml_dsa::PK_LEN
+            + HELLO_LOOKUP_KEY_LEN
+            + ml_kem::EK_LEN
+            + 8,
     );
     buf.extend_from_slice(domain::DM_CHANNEL_OPENING_SIG);
     push_lp(&mut buf, writer_identity_pk);
     push_lp(&mut buf, recipient_identity_pk);
+    push_lp(&mut buf, channel_lookup_key);
     push_lp(&mut buf, first_ratchet_pk);
     push_lp(&mut buf, &advert_serial.to_be_bytes());
     buf
 }
 
 impl ChannelOpening {
-    /// Sign and assemble an opening for the control subkey.
+    /// Sign and assemble an opening for the control subkey of the channel at
+    /// `channel_lookup_key`.
     pub fn build(
         signer: &SignKeypair,
         recipient_identity_pk: &[u8; ml_dsa::PK_LEN],
+        channel_lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
         first_ratchet_pk: &[u8; ml_kem::EK_LEN],
         advert_serial: u64,
     ) -> Result<Self, ChannelError> {
         let preimage = opening_signing_input(
             signer.public_key(),
             recipient_identity_pk,
+            channel_lookup_key,
             first_ratchet_pk,
             advert_serial,
         );
@@ -871,6 +898,7 @@ impl ChannelOpening {
         Ok(Self {
             writer_identity_pk: Box::new(*signer.public_key()),
             recipient_identity_pk: Box::new(*recipient_identity_pk),
+            channel_lookup_key: *channel_lookup_key,
             first_ratchet_pk: Box::new(*first_ratchet_pk),
             advert_serial,
             signature: Box::new(signature),
@@ -878,12 +906,13 @@ impl ChannelOpening {
     }
 
     /// Encode the opening: `writer_identity_pk ‖ recipient_identity_pk ‖
-    /// first_ratchet_pk ‖ BE64(advert_serial) ‖ signature`, exactly
-    /// [`OPENING_LEN`] bytes.
+    /// channel_lookup_key ‖ first_ratchet_pk ‖ BE64(advert_serial) ‖
+    /// signature`, exactly [`OPENING_LEN`] bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(OPENING_LEN);
         out.extend_from_slice(self.writer_identity_pk.as_slice());
         out.extend_from_slice(self.recipient_identity_pk.as_slice());
+        out.extend_from_slice(&self.channel_lookup_key);
         out.extend_from_slice(self.first_ratchet_pk.as_slice());
         out.extend_from_slice(&self.advert_serial.to_be_bytes());
         out.extend_from_slice(self.signature.as_slice());
@@ -905,9 +934,12 @@ impl ChannelOpening {
             *<&[u8; ml_dsa::PK_LEN]>::try_from(&bytes[..RECIPIENT_PK_AT]).expect("checked length"),
         );
         let recipient_identity_pk: Box<[u8; ml_dsa::PK_LEN]> = Box::new(
-            *<&[u8; ml_dsa::PK_LEN]>::try_from(&bytes[RECIPIENT_PK_AT..RATCHET_PK_AT])
+            *<&[u8; ml_dsa::PK_LEN]>::try_from(&bytes[RECIPIENT_PK_AT..LOOKUP_KEY_AT])
                 .expect("checked length"),
         );
+        let channel_lookup_key =
+            *<&[u8; HELLO_LOOKUP_KEY_LEN]>::try_from(&bytes[LOOKUP_KEY_AT..RATCHET_PK_AT])
+                .expect("checked length");
         let first_ratchet_pk: Box<[u8; ml_kem::EK_LEN]> = Box::new(
             *<&[u8; ml_kem::EK_LEN]>::try_from(&bytes[RATCHET_PK_AT..SERIAL_AT])
                 .expect("checked length"),
@@ -921,6 +953,7 @@ impl ChannelOpening {
         Ok(Self {
             writer_identity_pk,
             recipient_identity_pk,
+            channel_lookup_key,
             first_ratchet_pk,
             advert_serial,
             signature,
@@ -929,19 +962,23 @@ impl ChannelOpening {
 
     /// Verify the opening: the signature under the identity public key the
     /// opening carries, then that it names the reader as its recipient, then
-    /// that it names the advert serial the reader expects.
+    /// that it names the channel the reader read it from, then that it names
+    /// the advert serial the reader expects.
     ///
-    /// The signature is checked first, so [`ChannelError::Recipient`] and
-    /// [`ChannelError::AdvertSerial`] are only ever reported for an opening
-    /// that is genuinely someone's — a relayed hello, not a random subkey.
+    /// The signature is checked first, so [`ChannelError::Recipient`],
+    /// [`ChannelError::LookupKey`] and [`ChannelError::AdvertSerial`] are only
+    /// ever reported for an opening that is genuinely someone's — a relayed
+    /// hello, not a random subkey.
     pub fn verify(
         &self,
         expected_recipient_pk: &[u8; ml_dsa::PK_LEN],
+        expected_lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
         expected_advert_serial: u64,
     ) -> Result<(), ChannelError> {
         let preimage = opening_signing_input(
             &self.writer_identity_pk,
             &self.recipient_identity_pk,
+            &self.channel_lookup_key,
             &self.first_ratchet_pk,
             self.advert_serial,
         );
@@ -949,6 +986,9 @@ impl ChannelOpening {
             .map_err(|_| ChannelError::Signature)?;
         if self.recipient_identity_pk.as_slice() != expected_recipient_pk.as_slice() {
             return Err(ChannelError::Recipient);
+        }
+        if &self.channel_lookup_key != expected_lookup_key {
+            return Err(ChannelError::LookupKey);
         }
         if self.advert_serial != expected_advert_serial {
             return Err(ChannelError::AdvertSerial {
@@ -1095,10 +1135,20 @@ mod tests {
         *signer(0x77).public_key()
     }
 
-    /// An opening from the writer at seed `0x11` to [`recipient_pk`].
+    /// The channel every fixture opening names.
+    const LOOKUP_KEY: [u8; HELLO_LOOKUP_KEY_LEN] = [0x44u8; HELLO_LOOKUP_KEY_LEN];
+
+    /// An opening from the writer at seed `0x11` to [`recipient_pk`], naming
+    /// [`LOOKUP_KEY`].
     fn opening(serial: u64) -> ChannelOpening {
-        ChannelOpening::build(&signer(0x11), &recipient_pk(), &ratchet_pk(0x22), serial)
-            .expect("build the opening")
+        ChannelOpening::build(
+            &signer(0x11),
+            &recipient_pk(),
+            &LOOKUP_KEY,
+            &ratchet_pk(0x22),
+            serial,
+        )
+        .expect("build the opening")
     }
 
     // ── slot_for ────────────────────────────────────────────────────────────
@@ -1431,8 +1481,9 @@ mod tests {
             signer(0x11).public_key()
         );
         assert_eq!(decoded.recipient_identity_pk.as_slice(), recipient_pk());
+        assert_eq!(decoded.channel_lookup_key, LOOKUP_KEY);
         decoded
-            .verify(&recipient_pk(), 7)
+            .verify(&recipient_pk(), &LOOKUP_KEY, 7)
             .expect("the opening verifies");
     }
 
@@ -1443,7 +1494,7 @@ mod tests {
         bytes[SIGNATURE_AT] ^= 0x01;
         let decoded = ChannelOpening::decode(&bytes).unwrap();
         assert_eq!(
-            decoded.verify(&recipient_pk(), 7).unwrap_err(),
+            decoded.verify(&recipient_pk(), &LOOKUP_KEY, 7).unwrap_err(),
             ChannelError::Signature
         );
     }
@@ -1455,7 +1506,7 @@ mod tests {
     fn an_opening_naming_another_advert_serial_is_its_own_failure() {
         let built = opening(7);
         assert_eq!(
-            built.verify(&recipient_pk(), 8).unwrap_err(),
+            built.verify(&recipient_pk(), &LOOKUP_KEY, 8).unwrap_err(),
             ChannelError::AdvertSerial {
                 expected: 8,
                 found: 7,
@@ -1471,11 +1522,36 @@ mod tests {
         let built = opening(7);
         let elsewhere = *signer(0x78).public_key();
         assert_eq!(
-            built.verify(&elsewhere, 7).unwrap_err(),
+            built.verify(&elsewhere, &LOOKUP_KEY, 7).unwrap_err(),
             ChannelError::Recipient
         );
         // The control: the identity it IS addressed to accepts it.
-        built.verify(&recipient_pk(), 7).expect("its recipient");
+        built
+            .verify(&recipient_pk(), &LOOKUP_KEY, 7)
+            .expect("its recipient");
+    }
+
+    /// An opening read out of a channel other than the one it names is
+    /// refused, and the lookup key is inside the signature: rewriting it to
+    /// match the record it was copied into breaks the signature instead.
+    #[test]
+    fn an_opening_read_from_another_channel_is_refused() {
+        let built = opening(7);
+        let elsewhere = [0x45u8; HELLO_LOOKUP_KEY_LEN];
+        assert_eq!(
+            built.verify(&recipient_pk(), &elsewhere, 7).unwrap_err(),
+            ChannelError::LookupKey
+        );
+        let mut moved = built.clone();
+        moved.channel_lookup_key = elsewhere;
+        assert_eq!(
+            moved.verify(&recipient_pk(), &elsewhere, 7).unwrap_err(),
+            ChannelError::Signature
+        );
+        // The control: the channel it names accepts it.
+        built
+            .verify(&recipient_pk(), &LOOKUP_KEY, 7)
+            .expect("its own channel");
     }
 
     #[test]
@@ -1506,7 +1582,7 @@ mod tests {
         opened
             .opening
             .unwrap()
-            .verify(&recipient_pk(), 7)
+            .verify(&recipient_pk(), &LOOKUP_KEY, 7)
             .expect("it verifies");
     }
 
@@ -1638,6 +1714,7 @@ mod tests {
         let preimage = opening_signing_input(
             &[0x66u8; ml_dsa::PK_LEN],
             &peer,
+            &[0x44u8; HELLO_LOOKUP_KEY_LEN],
             &[0x22u8; ml_kem::EK_LEN],
             7,
         );
@@ -1659,13 +1736,14 @@ mod tests {
     /// Bytes `opening_signing_input` produces for the vector below. Pinned
     /// alongside the digest because a preimage of the wrong length is the one
     /// corruption a digest comparison cannot describe.
-    const KAT_OPENING_PREIMAGE_LEN: usize = 6828;
+    const KAT_OPENING_PREIMAGE_LEN: usize = 6868;
 
     /// SHA-384 of `opening_signing_input` over a writer key of 2592 `0x66`
-    /// bytes, a recipient key of 2592 `0x67` bytes, a ratchet key of 1568
-    /// `0x22` bytes and advert serial 7 — the digest rather than the preimage,
-    /// which is 6828 bytes of mostly repeated input.
-    const KAT_OPENING_PREIMAGE_SHA384: &str = "052afcb47cee443eb7952cbf8e27d6256b321fcda52846e2a608928d0aeee41d11e68590e19e434fd53176adb6e35ef2";
+    /// bytes, a recipient key of 2592 `0x67` bytes, a channel lookup key of 32
+    /// `0x44` bytes, a ratchet key of 1568 `0x22` bytes and advert serial 7 —
+    /// the digest rather than the preimage, which is 6868 bytes of mostly
+    /// repeated input.
+    const KAT_OPENING_PREIMAGE_SHA384: &str = "acaa4efa32f5e6064c30be4ab9eb75cc7267c2155c7c34106bd276bd01924789116529180bdf413f5dd0441ba24da5fd";
 
     /// The crypto module has to be operational before any SHA or ML-DSA call.
     fn module() {

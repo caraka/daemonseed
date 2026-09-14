@@ -2262,13 +2262,17 @@ modules:
       DROP_SUBKEYS (256) is the record's o_cnt and a writer builds its RecordShape
       from it, DROP_SLOT_LEN (4096) is one slot and holds one hello.
       seal_hello(encap, lookup_key, r, recipient_pubkey) -> Result<Vec<u8>, DropError>
-      emits HELLO_LEN (1668) bytes, kem_ct(1568) || nonce(12) || ciphertext(64) ||
-      tag(16) || pow_tag(8), sealed under k_hello = HKDF(ss0,
+      emits HELLO_LEN (1701) bytes, kem_ct(1568) || nonce(12) || ciphertext(97) ||
+      tag(16) || pow_tag(8), the plaintext lookup_key || r || carried_tag(1) ||
+      carried(32) with carried_tag 0 and carried zero, sealed under k_hello = HKDF(ss0,
       daemonseed/dm/drop/hello/v1) with associated data daemonseed/dm/drop/aad/v1 ||
       lp(kem_ct) || lp(recipient pubkey); hello_key(ss0) derives that key.
+      seal_rewritten_hello(encap, lookup_key, r, original, recipient_pubkey) emits
+      the same layout with carried_tag 1 and carried the original hello secret.
       open_hello(ss0, bytes, recipient_pubkey, slot) -> Result<Hello { lookup_key,
-      r }, DropError> length-gates to HELLO_LEN, shape-checks the tag against
-      DROP_POW_BITS (0), opens the seal, recomputes the tag over the recovered r, and
+      r, original_secret }, DropError> length-gates to HELLO_LEN, shape-checks the tag against
+      DROP_POW_BITS (0), opens the seal, refuses Aead for a carried_tag other than
+      0 over a zero field or 1, recomputes the tag over the recovered r, and
       refuses SlotMismatch { expected, found } when slot_for(r) is not the slot the
       bytes were read from, so a hello copied into another slot does not open there.
       At DROP_POW_BITS zero the tag's value check binds nothing the AEAD does not
@@ -2292,7 +2296,7 @@ modules:
       control subkey and RING_SLOTS (63) the message ring; slot_for(seq) is 1 + (seq
       mod RING_SLOTS). CHANNEL_SUBKEY_LEN (16384) is one subkey,
       MESSAGE_HEADER_MAX_LEN (3188) a header carrying both turn fields,
-      SEALED_CONTROL_MAX_LEN (11432) a sealed control record, and MESSAGE_BODY_MAX_LEN
+      SEALED_CONTROL_MAX_LEN (11464) a sealed control record, and MESSAGE_BODY_MAX_LEN
       (13168) is derived as CHANNEL_SUBKEY_LEN less the header maximum and the AEAD
       envelope overhead. derive_owner_seed(channel_root, peer_identity_pk, generation)
       -> Result<ChannelOwnerSeed, ChannelError> is HKDF-SHA384(salt=
@@ -2323,16 +2327,19 @@ modules:
       FieldLength { expected, actual } on a turn field of the wrong width and
       TurnFieldsIncomplete on one turn field without the other. device_id is reserved:
       DEVICE_ID_SINGLE_DEVICE (0) is what a single-device installation writes.
-      ChannelOpening { writer_identity_pk, recipient_identity_pk, first_ratchet_pk,
-      advert_serial, signature } is built by build(signer, recipient_identity_pk,
-      first_ratchet_pk, advert_serial), encodes to OPENING_LEN (11387) bytes and signs
+      ChannelOpening { writer_identity_pk, recipient_identity_pk, channel_lookup_key,
+      first_ratchet_pk, advert_serial, signature } is built by build(signer,
+      recipient_identity_pk, channel_lookup_key, first_ratchet_pk, advert_serial),
+      encodes to OPENING_LEN (11419) bytes and signs
       opening_signing_input = daemonseed/dm/channel/opening-sig/v1 || lp(writer
-      pubkey) || lp(recipient pubkey) || lp(first ratchet pubkey) ||
-      lp(BE64(advert_serial)). decode(bytes) reads the fields and does NOT verify
-      them; verify(expected_recipient_pk, expected_advert_serial) checks the signature
-      under the identity public key the opening carries, then the recipient, then the
-      serial, returning ChannelError::Signature, ChannelError::Recipient and
-      ChannelError::AdvertSerial { expected, found } as distinct failures. Control { opening: Option<ChannelOpening>, collected_cursor,
+      pubkey) || lp(recipient pubkey) || lp(channel lookup key) || lp(first ratchet
+      pubkey) || lp(BE64(advert_serial)). decode(bytes) reads the fields and does NOT
+      verify them; verify(expected_recipient_pk, expected_lookup_key,
+      expected_advert_serial) checks the signature under the identity public key the
+      opening carries, then the recipient, then the lookup key, then the serial,
+      returning ChannelError::Signature, ChannelError::Recipient,
+      ChannelError::LookupKey and ChannelError::AdvertSerial { expected, found } as
+      distinct failures. Control { opening: Option<ChannelOpening>, collected_cursor,
       closed } encodes as lp(opening) || BE64(collected_cursor) || closed(1);
       seal_control(ss_hello, control) and open_control(ss_hello, bytes) seal it under
       k_control = HKDF(ss_hello, daemonseed/dm/channel/control/v1) with associated
@@ -2446,7 +2453,7 @@ modules:
       width in zeros. A decoder refuses an unknown version, an outbox entry whose
       sequence is not its ring position, a hello slot at or above DROP_SUBKEYS,
       and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6398),
-      CONV_RECORD_LEN (36763) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
+      CONV_RECORD_LEN (36828) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
       widths and are the RecordKind buckets. StoreError is Store(DmStoreError),
       Corrupt { kind, reason }, OutboxSlotOccupied, CiphertextTooLong,
       MissingConversation, ConversationExists and MissingAdvertKeys.
@@ -2495,7 +2502,8 @@ modules:
       record's identity and so of its address. RecordError wraps a transport's
       own error; FlowError is Advert, Drop, Channel, Chain, Store, Records,
       NoAdvert, NoOpening, NotOutstanding, AlreadyEstablished,
-      AwaitingAcceptance, DropFull, Incomplete and HelloLength. Me { signer, channel_root } is this side's
+      AwaitingAcceptance, AlreadyAccepted, OpeningWriter, OpeningRatchetKey, DropFull,
+      Incomplete and HelloLength. Me { signer, channel_root } is this side's
       identity, FIRST_GENERATION is 0 and MAX_REPICKS is 1.
       first_contact(store, records, me, peer_identity_pk, body, fill, now) ->
       Result<FirstContact, FlowError> holds one conversation per correspondent
@@ -2504,24 +2512,33 @@ modules:
       FirstContact::Opened { peer, outgoing_lookup_key, hello_slot, repicks }
       where the previous run stopped earlier, FlowError::AlreadyEstablished
       where the conversation is established. A fresh contact reads and verifies
-      the correspondent's advert, creates the conversation record before any
-      record write, names the channel to the transport and records its lookup
-      key, persists the outbox entry before the channel writes, writes the
+      the correspondent's advert, names the channel to the transport, signs an
+      opening over its lookup key, creates the conversation record before any
+      record write, persists the outbox entry before the channel writes, writes the
       opening at channel::CONTROL_SUBKEY and message sequence 0 at its ring
       slot, persists the outstanding hello whole and writes it at
       drop::slot_for(r), reads it back once and re-picks at most MAX_REPICKS
       times; a further clobber is FlowError::DropFull with the hello left
       persisted. At most four writes. resume_first_contact(store, records,
-      peer) -> Result<Resumed, FlowError> rewrites a persisted hello unchanged
-      and reports Nothing or Rewrote(slot). refresh_first_contact(store,
-      records, me, peer, fill, now) -> Result<bool, FlowError> re-encapsulates
-      an outstanding hello to a rotated advert key, re-seals the opening,
-      sequence 0 and the hello, persists all three and rewrites them; false
-      where the correspondent's serial is unchanged or lower. collect(store,
+      peer) -> Result<Resumed, FlowError> writes a persisted hello unchanged on
+      every call and reports Nothing or Rewrote(slot); it reads nothing, so the
+      caller decides when a write is owed: a slot the network reports evicted or
+      changed, or a stop between persisting a hello and writing it.
+      refresh_first_contact(store,
+      records, peer, fill, now) -> Result<bool, FlowError> re-encapsulates an
+      outstanding first-contact hello to a rotated advert key and rewrites it
+      into the slot it occupies as a rewritten hello carrying own_hello_secret,
+      persisting it before the write; the channel opening, sequence 0, the outbox
+      and the key schedule are unchanged. One hello write plus at most one
+      re-pick, no channel write; false where the correspondent's serial is
+      unchanged or lower; FlowError::AlreadyAccepted where awaiting_acceptance is
+      clear. A caller runs collect over its own drop before it. collect(store,
       records, me, advert_keys, is_blocked) -> Result<Vec<Surfaced>, FlowError>
       scans the drop, tries the current and the previous advert secret, and
-      verifies each channel opening against this identity and the serial it was
-      encapsulated to; an unreadable slot, one that opens under neither secret
+      verifies each channel opening against this identity and an advert serial:
+      the serial an original hello decapsulated under, or for a rewritten hello,
+      opened under the secret it carries, the opening's own serial where that is
+      below the serial the rewrite decapsulated under; an unreadable slot, one that opens under neither secret
       and one whose opening does not verify are skipped and the scan continues.
       A verified hello is Surfaced::Dropped for a blocked identity,
       Accepted(Acceptance) where this side's own first contact is awaiting one,
@@ -5363,6 +5380,9 @@ types:
       - name: r
         type: "[u8; HELLO_R_LEN]"
         description: The value that picks the slot.
+      - name: original_secret
+        type: "Option<advert::AdvertSharedSecret>"
+        description: The secret a rewritten hello carries; None for an original hello.
   - name: ReadBack
     module: daemonseed_core::dm::drop
     kind: enum
@@ -5449,6 +5469,9 @@ types:
       - name: recipient_identity_pk
         type: "Box<[u8; ml_dsa::PK_LEN]>"
         description: The identity this direction is written to.
+      - name: channel_lookup_key
+        type: "[u8; HELLO_LOOKUP_KEY_LEN]"
+        description: The lookup key of the channel record the opening belongs to.
       - name: first_ratchet_pk
         type: "Box<[u8; ml_kem::EK_LEN]>"
         description: The writer's first ratchet public key.
@@ -9381,8 +9404,9 @@ functions:
   - name: "drop::seal_hello"
     module: daemonseed_core::dm::drop
     description: >-
-      Emits HELLO_LEN bytes, kem_ct || nonce || ciphertext || tag || pow_tag,
-      sealing the channel lookup key and r under the hello key.
+      Emits an original hello of HELLO_LEN bytes, kem_ct || nonce || ciphertext ||
+      tag || pow_tag, sealing lookup_key || r || carried_tag 0 || 32 zero bytes
+      under the hello key.
     signature: "pub fn seal_hello(encap: &advert::HelloEncapsulation, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], r: &[u8; HELLO_R_LEN], recipient_pubkey: &[u8; ml_dsa::PK_LEN]) -> Result<Vec<u8>, DropError>"
     parameters:
       - name: encap
@@ -9404,11 +9428,44 @@ functions:
     returns:
       type: "Result<Vec<u8>, DropError>"
       description: The hello bytes, or Kdf / Entropy / Module.
+  - name: "drop::seal_rewritten_hello"
+    module: daemonseed_core::dm::drop
+    description: >-
+      Emits a rewritten hello of HELLO_LEN bytes, the seal_hello layout with
+      carried_tag 1 and the carried field the original hello secret, sealed under
+      the hello key of a fresh encapsulation.
+    signature: "pub fn seal_rewritten_hello(encap: &advert::HelloEncapsulation, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], r: &[u8; HELLO_R_LEN], original: &advert::AdvertSharedSecret, recipient_pubkey: &[u8; ml_dsa::PK_LEN]) -> Result<Vec<u8>, DropError>"
+    parameters:
+      - name: encap
+        type: "&advert::HelloEncapsulation"
+        direction: in
+        description: A fresh encapsulation to the recipient's current advert key.
+      - name: lookup_key
+        type: "&[u8; HELLO_LOOKUP_KEY_LEN]"
+        direction: in
+        description: The sender's own channel record lookup key.
+      - name: r
+        type: "&[u8; HELLO_R_LEN]"
+        direction: in
+        description: The value that picks the slot.
+      - name: original
+        type: "&advert::AdvertSharedSecret"
+        direction: in
+        description: The secret the first hello for this channel established.
+      - name: recipient_pubkey
+        type: "&[u8; ml_dsa::PK_LEN]"
+        direction: in
+        description: The recipient's identity public key, bound by the associated data and the tag.
+    returns:
+      type: "Result<Vec<u8>, DropError>"
+      description: The hello bytes, or Kdf / Entropy / Module.
   - name: "drop::open_hello"
     module: daemonseed_core::dm::drop
     description: >-
       Length-gates to HELLO_LEN, shape-checks the tag against DROP_POW_BITS, opens
-      the seal, recomputes the tag over the recovered r, and refuses SlotMismatch
+      the seal, refuses Aead for a carried_tag other than 0 over a zero field or 1,
+      returns the carried secret of a rewritten hello as original_secret,
+      recomputes the tag over the recovered r, and refuses SlotMismatch
       when slot_for(r) is not the slot the bytes were read from, so a hello copied
       into another slot does not open there.
     signature: "pub fn open_hello(ss0: &advert::AdvertSharedSecret, bytes: &[u8], recipient_pubkey: &[u8; ml_dsa::PK_LEN], slot: u16) -> Result<Hello, DropError>"
@@ -9585,9 +9642,10 @@ functions:
     module: daemonseed_core::dm::channel
     description: >-
       Builds the opening's signature preimage, daemonseed/dm/channel/opening-sig/v1
-      followed by the writer public key, the recipient public key, the first ratchet
-      public key and the advert serial, each length-prefixed.
-    signature: "pub fn opening_signing_input(writer_identity_pk: &[u8; ml_dsa::PK_LEN], recipient_identity_pk: &[u8; ml_dsa::PK_LEN], first_ratchet_pk: &[u8; ml_kem::EK_LEN], advert_serial: u64) -> Vec<u8>"
+      followed by the writer public key, the recipient public key, the channel
+      lookup key, the first ratchet public key and the advert serial, each
+      length-prefixed.
+    signature: "pub fn opening_signing_input(writer_identity_pk: &[u8; ml_dsa::PK_LEN], recipient_identity_pk: &[u8; ml_dsa::PK_LEN], channel_lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], first_ratchet_pk: &[u8; ml_kem::EK_LEN], advert_serial: u64) -> Vec<u8>"
     parameters:
       - name: writer_identity_pk
         type: "&[u8; ml_dsa::PK_LEN]"
@@ -9597,6 +9655,10 @@ functions:
         type: "&[u8; ml_dsa::PK_LEN]"
         direction: in
         description: The identity this direction is written to.
+      - name: channel_lookup_key
+        type: "&[u8; HELLO_LOOKUP_KEY_LEN]"
+        direction: in
+        description: The lookup key of the channel record the opening is written into.
       - name: first_ratchet_pk
         type: "&[u8; ml_kem::EK_LEN]"
         direction: in
@@ -9773,7 +9835,7 @@ functions:
   - name: "ChannelOpening::build"
     module: daemonseed_core::dm::channel
     description: Builds and signs the opening under the writer's long-term key.
-    signature: "pub fn build(signer: &SignKeypair, recipient_identity_pk: &[u8; ml_dsa::PK_LEN], first_ratchet_pk: &[u8; ml_kem::EK_LEN], advert_serial: u64) -> Result<Self, ChannelError>"
+    signature: "pub fn build(signer: &SignKeypair, recipient_identity_pk: &[u8; ml_dsa::PK_LEN], channel_lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], first_ratchet_pk: &[u8; ml_kem::EK_LEN], advert_serial: u64) -> Result<Self, ChannelError>"
     parameters:
       - name: signer
         type: "&SignKeypair"
@@ -9783,6 +9845,10 @@ functions:
         type: "&[u8; ml_dsa::PK_LEN]"
         direction: in
         description: The identity this direction is written to.
+      - name: channel_lookup_key
+        type: "&[u8; HELLO_LOOKUP_KEY_LEN]"
+        direction: in
+        description: The lookup key of the channel record the opening is written into.
       - name: first_ratchet_pk
         type: "&[u8; ml_kem::EK_LEN]"
         direction: in
@@ -9818,20 +9884,24 @@ functions:
     module: daemonseed_core::dm::channel
     description: >-
       Checks the signature under the identity public key the opening carries, then
-      the recipient, then the serial.
-    signature: "pub fn verify(&self, expected_recipient_pk: &[u8; ml_dsa::PK_LEN], expected_advert_serial: u64) -> Result<(), ChannelError>"
+      the recipient, then the channel lookup key, then the serial.
+    signature: "pub fn verify(&self, expected_recipient_pk: &[u8; ml_dsa::PK_LEN], expected_lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], expected_advert_serial: u64) -> Result<(), ChannelError>"
     parameters:
       - name: expected_recipient_pk
         type: "&[u8; ml_dsa::PK_LEN]"
         direction: in
         description: The identity the reader expects the opening to name.
+      - name: expected_lookup_key
+        type: "&[u8; HELLO_LOOKUP_KEY_LEN]"
+        direction: in
+        description: The lookup key of the channel record the reader read the opening from.
       - name: expected_advert_serial
         type: u64
         direction: in
         description: The advert serial the reader expects.
     returns:
       type: "Result<(), ChannelError>"
-      description: Ok, or Signature, Recipient and AdvertSerial { expected, found } as distinct failures.
+      description: Ok, or Signature, Recipient, LookupKey and AdvertSerial { expected, found } as distinct failures.
   - name: "Control::encode"
     module: daemonseed_core::dm::channel
     description: Encodes as lp(opening) || BE64(collected_cursor) || closed.
@@ -10627,8 +10697,8 @@ constants:
   - name: HELLO_LEN
     module: daemonseed_core::dm::drop
     type: usize
-    value: "1668"
-    description: Byte length of an encoded hello, kem_ct(1568) || nonce(12) || ciphertext(64) || tag(16) || pow_tag(8).
+    value: "1701"
+    description: Byte length of an encoded hello, original or rewritten, kem_ct(1568) || nonce(12) || ciphertext(97) || tag(16) || pow_tag(8).
 
   - name: CHANNEL_SUBKEYS
     module: daemonseed_core::dm::channel
@@ -10673,12 +10743,12 @@ constants:
   - name: OPENING_LEN
     module: daemonseed_core::dm::channel
     type: usize
-    value: "11387"
+    value: "11419"
     description: Byte length of an encoded ChannelOpening.
   - name: SEALED_CONTROL_MAX_LEN
     module: daemonseed_core::dm::channel
     type: usize
-    value: "11432"
+    value: "11464"
     description: Bytes a sealed control record takes at its largest, with the opening present.
 
 # ─────────────────────────────────────────────────────────────────────
