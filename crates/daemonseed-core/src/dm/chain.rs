@@ -474,11 +474,14 @@ fn record_key_use(use_: KeyUse) {
     LAST_KEY_USE.with(|slot| slot.set(Some(use_)));
 }
 
-/// The most recent [`KeyUse`] on this thread, or `None` before any seal or
-/// open has run on it.
+/// Take the most recent [`KeyUse`] on this thread, leaving the slot empty, or
+/// `None` when no seal or open has run on it since it was last taken.
+///
+/// Taking rather than reading is what lets a test tell the record a call wrote
+/// from one an earlier call left behind.
 #[cfg(test)]
 pub(crate) fn last_key_use() -> Option<KeyUse> {
-    LAST_KEY_USE.with(|slot| slot.get())
+    LAST_KEY_USE.with(|slot| slot.take())
 }
 
 /// One turn this party minted: the number a peer header names as its `m`, the
@@ -1316,6 +1319,75 @@ mod tests {
         a.open(&reply, &sealed).unwrap();
     }
 
+    /// A header carries the device, the two turn numbers and the sequence it
+    /// was sealed under, and a turn's first message carries a public key
+    /// minted for that turn: the one the sealing side's reading half now
+    /// retains, and not the one its previous turn published.
+    ///
+    /// Control: the next message of the same turn carries neither turn field,
+    /// and a header with its device identifier rewritten does not open, so the
+    /// identifier is the one the body was sealed under.
+    #[test]
+    fn a_header_carries_its_numbers_and_a_turn_carries_a_fresh_key() {
+        let (mut a, mut b, mut ea, mut eb) = pair();
+        let (h, s) = a.seal(b"a1", 7, |x| ea.fill(x)).unwrap();
+        assert_eq!((h.device_id, h.n, h.m, h.seq), (7, 0, 0, 0));
+        b.open(&h, &s).unwrap();
+
+        let (b1, s) = b.seal(b"b1", 9, |x| eb.fill(x)).unwrap();
+        assert_eq!((b1.device_id, b1.n, b1.m, b1.seq), (9, 0, 0, 0));
+        a.open(&b1, &s).unwrap();
+
+        let (first, sealed_first) = a.seal(b"a2", 7, |x| ea.fill(x)).unwrap();
+        assert_eq!(
+            (first.device_id, first.n, first.m, first.seq),
+            (7, 1, b1.n, 1)
+        );
+        {
+            let published = first
+                .kem_pk
+                .as_ref()
+                .expect("a turn's first message carries a key");
+            let [newest, older] = &a.receiving.own_turns;
+            let newest = newest.as_ref().expect("the minted turn is retained");
+            let older = older.as_ref().expect("the previous turn is retained");
+            assert_eq!(newest.m, first.n);
+            assert!(
+                published == &newest.keypair.pk,
+                "the key published is the one retained"
+            );
+            assert!(
+                published != &older.keypair.pk,
+                "and not the previous turn's"
+            );
+        }
+
+        let (second, sealed_second) = a.seal(b"a3", 7, |x| ea.fill(x)).unwrap();
+        assert!(!second.starts_turn(), "the control");
+        assert_eq!(
+            (second.device_id, second.n, second.m, second.seq),
+            (7, first.n, first.m, 2)
+        );
+
+        b.open(&first, &sealed_first).unwrap();
+        let mut moved = second.clone();
+        moved.device_id = 8;
+        assert_eq!(
+            b.open(&moved, &sealed_second),
+            Err(ChainError::Aead),
+            "the control"
+        );
+        assert_eq!(b.open(&second, &sealed_second).unwrap(), b"a3");
+
+        let (b2, _) = b.seal(b"b2", 9, |x| eb.fill(x)).unwrap();
+        assert_eq!((b2.n, b2.m, b2.seq), (1, first.n, 1));
+        assert!(b1.kem_pk.is_some() && b2.kem_pk.is_some());
+        assert!(
+            b1.kem_pk != b2.kem_pk,
+            "each of b's turns publishes a key of its own"
+        );
+    }
+
     // ── crossing turns ──────────────────────────────────────────────────────
 
     /// Both sides start a turn without having read the other's, each
@@ -1456,7 +1528,8 @@ mod tests {
     ///
     /// Control: the copy taken from the same buffer immediately before the
     /// zeroization is non-zero, so the assertion is about a buffer that held a
-    /// key rather than one that was never written.
+    /// key rather than one that was never written. The seal's record is taken
+    /// before the open, so the record read after the open is the open's own.
     #[test]
     fn the_message_key_buffer_is_zeroized_on_both_sides() {
         let (mut a, mut b, mut ea, _) = pair();
@@ -1465,6 +1538,10 @@ mod tests {
         assert_ne!(after_seal.before, [0u8; MESSAGE_KEY_LEN], "the control");
         assert_eq!(after_seal.after, [0u8; MESSAGE_KEY_LEN]);
 
+        assert!(
+            last_key_use().is_none(),
+            "no record is left before the open"
+        );
         b.open(&header, &sealed).unwrap();
         let after_open = last_key_use().expect("an open records its key use");
         assert_ne!(after_open.before, [0u8; MESSAGE_KEY_LEN], "the control");
@@ -1681,6 +1758,83 @@ mod tests {
         assert_eq!(b.open(&h, &s).unwrap(), b"kept");
     }
 
+    /// Everything a message's write depends on is committed by the time
+    /// `seal` returns, so a snapshot taken then, before the ciphertext is
+    /// written anywhere, is the state a restart resumes from.
+    ///
+    /// The seal starts a turn, which is the case carrying state beyond the
+    /// chain. The restored conversation first seals the next message of the
+    /// same turn, under a key no earlier message of its used, and the peer
+    /// opens it, so the chain position the write advanced is the one saved.
+    /// It then opens the peer's reply, encapsulated to the key the write
+    /// published, so the minted secret is saved too. The snapshot holding no
+    /// pending turn pins the chosen design, in which [`Conversation::seal`]
+    /// retains a minted turn before it returns.
+    ///
+    /// Control: a snapshot taken before the seal cannot open the reply, so the
+    /// reply's open depends on the retained own turns.
+    #[test]
+    fn the_state_a_write_needs_is_committed_when_seal_returns() {
+        let (mut a, mut b, mut ea, mut eb) = pair();
+        let (h, s) = a.seal(b"a1", 0, |x| ea.fill(x)).unwrap();
+        let first_key = last_key_use().expect("a seal records its key use").before;
+        b.open(&h, &s).unwrap();
+        let (h, s) = b.seal(b"b1", 0, |x| eb.fill(x)).unwrap();
+        a.open(&h, &s).unwrap();
+
+        let before = a.snapshot();
+        let (header, sealed) = a.seal(b"a2", 0, |x| ea.fill(x)).unwrap();
+        let written_key = last_key_use().expect("a seal records its key use").before;
+        assert!(header.starts_turn());
+        let persisted = a.snapshot();
+        drop(a);
+
+        assert!(
+            persisted.sending.pending_turn.is_none(),
+            "a minted turn is retained before seal returns"
+        );
+        assert_eq!(
+            persisted.sending.seq,
+            header.seq + 1,
+            "the sequence moved past the write"
+        );
+        assert_eq!(
+            persisted.receiving.own_turns[0].as_ref().map(|t| t.m),
+            Some(header.n),
+            "the minted turn is retained"
+        );
+
+        // The write, and the peer's reply to the key it published.
+        assert_eq!(b.open(&header, &sealed).unwrap(), b"a2");
+        let (reply, reply_sealed) = b.seal(b"b2", 0, |x| eb.fill(x)).unwrap();
+        assert_eq!(reply.m, header.n, "b encapsulated to the published turn");
+
+        let mut resumed = Conversation::restore(persisted);
+        let (same_turn, same_turn_sealed) = resumed.seal(b"a3", 0, |x| ea.fill(x)).unwrap();
+        let same_turn_key = last_key_use().expect("a seal records its key use").before;
+        assert!(
+            !same_turn.starts_turn(),
+            "nothing new is read, so the turn holds"
+        );
+        assert_eq!((same_turn.n, same_turn.seq), (header.n, header.seq + 1));
+        assert!(
+            same_turn_key != written_key && same_turn_key != first_key,
+            "no key sealed under before the snapshot is issued again"
+        );
+        assert_eq!(b.open(&same_turn, &same_turn_sealed).unwrap(), b"a3");
+
+        assert_eq!(resumed.open(&reply, &reply_sealed).unwrap(), b"b2");
+        let (next, next_sealed) = resumed.seal(b"a4", 0, |x| ea.fill(x)).unwrap();
+        assert!(next.starts_turn(), "the reply made a turn due");
+        assert_eq!(b.open(&next, &next_sealed).unwrap(), b"a4");
+
+        assert_eq!(
+            Conversation::restore(before).open(&reply, &reply_sealed),
+            Err(ChainError::SecretGone { named: reply.m }),
+            "the control"
+        );
+    }
+
     /// A forced turn before any peer ratchet key has been read has nothing to
     /// encapsulate to.
     ///
@@ -1816,6 +1970,176 @@ mod tests {
         assert_eq!(format!("{:?}", Root([1u8; ROOT_LEN])), "Root(<redacted>)");
         let rendered = format!("{a:?}");
         assert!(rendered.contains("Conversation"), "got: {rendered}");
+    }
+
+    // ── the KEM step through seal and open ──────────────────────────────────
+
+    /// The secret a turn's reader decapsulates is an input to the key its
+    /// message opens under: a reader holding the named own turn with another
+    /// keypair's decapsulation key derives a different root, and the body does
+    /// not open.
+    ///
+    /// Every round trip would still pass if both sides replaced the
+    /// encapsulated and decapsulated secrets with one constant, so this is the
+    /// probe that reaches the KEM step through `seal` and `open`.
+    ///
+    /// Control: the unaltered reader opens the same message.
+    #[test]
+    fn a_reader_with_another_decapsulation_key_does_not_open_a_turn() {
+        let (mut a, mut b, mut ea, mut eb) = pair();
+        let (h, s) = a.seal(b"a1", 0, |x| ea.fill(x)).unwrap();
+        b.open(&h, &s).unwrap();
+        let (turn, sealed) = b.seal(b"b1", 0, |x| eb.fill(x)).unwrap();
+        assert!(turn.starts_turn());
+
+        let mut other = Seeded::at(999);
+        let stranger = mint(|x| other.fill(x)).unwrap();
+        let mut swapped = a.clone_state();
+        let own = swapped
+            .receiving
+            .own_turns
+            .iter_mut()
+            .flatten()
+            .find(|t| t.m == turn.m)
+            .expect("the named own turn is retained");
+        assert!(own.keypair.dk.as_bytes() != stranger.dk.as_bytes());
+        own.keypair.dk = stranger.dk;
+
+        assert_eq!(swapped.open(&turn, &sealed), Err(ChainError::Aead));
+        assert_eq!(a.open(&turn, &sealed).unwrap(), b"b1", "the control");
+    }
+
+    /// Known-answer test over the message keys a conversation derives through
+    /// `initiate`, `accept` and `seal`, from seeded fills.
+    ///
+    /// It pins the first message key of each side's turn 1, the first turn on
+    /// each side that mixes a peer secret and an own secret. The derivation
+    /// pin above calls the derivation directly, and every round trip derives
+    /// through the same code on both sides, so a call site passing the wrong
+    /// secret, or none, on both sides passes both. This pins what the call
+    /// sites produce.
+    #[test]
+    fn the_message_keys_of_a_seeded_conversation_are_pinned() {
+        let (mut a, mut b, mut ea, mut eb) = pair();
+        let (h, s) = a.seal(b"a1", 0, |x| ea.fill(x)).unwrap();
+        b.open(&h, &s).unwrap();
+        let (h, s) = b.seal(b"b1", 0, |x| eb.fill(x)).unwrap();
+        a.open(&h, &s).unwrap();
+
+        let (h, s) = a.seal(b"a2", 0, |x| ea.fill(x)).unwrap();
+        let a_turn = last_key_use().expect("a seal records its key use").before;
+        assert_eq!((h.n, h.m), (1, 0));
+        assert_eq!(b.open(&h, &s).unwrap(), b"a2");
+        let (h, s) = b.seal(b"b2", 0, |x| eb.fill(x)).unwrap();
+        let b_turn = last_key_use().expect("a seal records its key use").before;
+        assert_eq!((h.n, h.m), (1, 1));
+        assert_eq!(a.open(&h, &s).unwrap(), b"b2");
+
+        assert_eq!(
+            hex(&a_turn),
+            "d9d032deb34079c11f9de2417fc51812a15cca60cfd907ec8c6d07405d3451a7",
+            "a's turn 1, first message key"
+        );
+        assert_eq!(
+            hex(&b_turn),
+            "00b05a23edd8c23465b5b59bf9357357f89e767d3326bb06381248df67321770",
+            "b's turn 1, first message key"
+        );
+    }
+
+    // ── restored peer state ─────────────────────────────────────────────────
+
+    /// A restored conversation forced into a turn with nothing new read
+    /// encapsulates to, and mixes, the peer turn its snapshot saved, and the
+    /// peer opens the message.
+    ///
+    /// The seal's input names a peer turn the direction has already consumed,
+    /// so the peer key, the peer secret and the consumed turn number all come
+    /// from the restored state and not from the input.
+    ///
+    /// Control: before the flag is set the restored state seals inside its
+    /// turn, which it would not do had the consumed turn number been lost.
+    #[test]
+    fn a_restored_forced_turn_uses_the_peer_state_it_was_saved_with() {
+        let (mut a, mut b, mut ea, mut eb) = pair();
+        let (h, s) = a.seal(b"a1", 0, |x| ea.fill(x)).unwrap();
+        b.open(&h, &s).unwrap();
+        let (h, s) = b.seal(b"b1", 0, |x| eb.fill(x)).unwrap();
+        a.open(&h, &s).unwrap();
+        let (h, s) = a.seal(b"a2", 0, |x| ea.fill(x)).unwrap();
+        assert!(h.starts_turn());
+        b.open(&h, &s).unwrap();
+
+        let mut resumed = Conversation::restore(a.snapshot());
+        drop(a);
+        let (h, s) = resumed.seal(b"a3", 0, |x| ea.fill(x)).unwrap();
+        assert!(!h.starts_turn(), "the control");
+        assert_eq!(b.open(&h, &s).unwrap(), b"a3");
+
+        resumed.sending.force_next_turn();
+        let (h, s) = resumed.seal(b"a4", 0, |x| ea.fill(x)).unwrap();
+        assert!(h.starts_turn());
+        assert_eq!(h.m, 0, "the peer turn the snapshot consumed");
+        assert_eq!(b.open(&h, &s).unwrap(), b"a4");
+    }
+
+    // ── the older own turn ──────────────────────────────────────────────────
+
+    /// Opening a turn encapsulated to the older retained own turn keeps that
+    /// turn, so a second turn the peer forces with nothing read between, still
+    /// encapsulated to the older key, opens too.
+    ///
+    /// § Keys keeps the older secret until a message encapsulated to the newer
+    /// one arrives, and none does here. The peer's own window moves instead:
+    /// its two forced turns push out the turn this side's crossing message was
+    /// encapsulated to, which is the loss § Keys names for two forced turns
+    /// with no read between them.
+    ///
+    /// Control: this side retains both own turns before either open.
+    #[test]
+    fn an_open_under_the_older_own_turn_keeps_it() {
+        let (mut a, mut b, mut ea, mut eb) = pair();
+        let (h, s) = a.seal(b"a1", 0, |x| ea.fill(x)).unwrap();
+        b.open(&h, &s).unwrap();
+        let (h, s) = b.seal(b"b1", 0, |x| eb.fill(x)).unwrap();
+        a.open(&h, &s).unwrap();
+
+        // a mints its turn 1, which b does not read yet.
+        let (crossing, crossing_sealed) = a.seal(b"a2", 0, |x| ea.fill(x)).unwrap();
+        assert!(crossing.starts_turn());
+        assert_eq!(
+            a.receiving().retained_own_turns(),
+            OWN_TURNS_RETAINED,
+            "the control"
+        );
+
+        b.sending.force_next_turn();
+        let (first, sealed_first) = b.seal(b"b2", 0, |x| eb.fill(x)).unwrap();
+        b.sending.force_next_turn();
+        let (second, sealed_second) = b.seal(b"b3", 0, |x| eb.fill(x)).unwrap();
+        assert!(first.starts_turn() && second.starts_turn());
+        assert_eq!((first.m, second.m), (0, 0), "both name a's older turn");
+
+        assert_eq!(a.open(&first, &sealed_first).unwrap(), b"b2");
+        assert_eq!(a.open(&second, &sealed_second).unwrap(), b"b3");
+
+        assert_eq!(
+            b.open(&crossing, &crossing_sealed),
+            Err(ChainError::SecretGone { named: crossing.m })
+        );
+    }
+
+    /// Every key class is zeroized when dropped, so a key leaving scope by a
+    /// path other than the working-buffer zeroize is still cleared. Checked
+    /// at compile time; a value that is never dropped is outside it.
+    #[test]
+    fn key_classes_zeroize_on_drop() {
+        fn assert_zod<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zod::<MessageKey>();
+        assert_zod::<ChainKey>();
+        assert_zod::<Root>();
+        assert_zod::<TurnSecret>();
+        assert_zod::<RatchetDecapKey>();
     }
 
     fn hex(bytes: &[u8]) -> String {

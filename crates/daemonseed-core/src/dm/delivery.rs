@@ -26,7 +26,7 @@ use core::time::Duration;
 
 use crate::dm::channel::{ChannelOpening, Control};
 use crate::dm::drop::HELLO_LOOKUP_KEY_LEN;
-use crate::dm::store::{Store, StoreError};
+use crate::dm::store::{LoadedConv, Store, StoreError};
 use crate::storage::dm_store::CorrespondenceLabel;
 
 pub use crate::dm::advert::{POLL_INTERVAL_MAX, POLL_INTERVAL_MIN};
@@ -87,6 +87,33 @@ pub fn next_poll_interval_os(outstanding_since_secs: u64, now_secs: u64) -> Dura
     )
 }
 
+/// The send time of a conversation's oldest message still owed to the
+/// correspondent, in Unix seconds, or `None` where nothing is owed.
+///
+/// Read from the entries [`Store::load`] reports as outstanding, so a message
+/// the correspondent has collected, or any message of a conversation marked for
+/// delete, does not count. `now` minus this is how long the oldest owed message
+/// has been uncollected, which a caller can measure a poll's backoff or a nudge
+/// against.
+pub fn oldest_uncollected_at(conv: &LoadedConv) -> Option<u64> {
+    conv.outstanding_outbox
+        .iter()
+        .map(|entry| entry.sent_at)
+        .min()
+}
+
+/// Whether a conversation's oldest uncollected message has been waiting for
+/// `threshold_secs` or longer at `now_secs`.
+///
+/// `oldest_uncollected_at` is [`oldest_uncollected_at`]'s answer, and nothing
+/// owed is never due. The threshold is the caller's: the design leaves its
+/// value open, so there is no default here. A clock that reads earlier than the
+/// send time reads as age zero. This reports and does nothing else: nothing in
+/// this crate deletes a conversation because a message has waited.
+pub fn nudge_due(oldest_uncollected_at: Option<u64>, now_secs: u64, threshold_secs: u64) -> bool {
+    oldest_uncollected_at.is_some_and(|at| now_secs.saturating_sub(at) >= threshold_secs)
+}
+
 /// The "closed" marker a deleting client may leave in its channel's control
 /// subkey.
 ///
@@ -130,14 +157,50 @@ pub struct ChannelErase {
     pub marker: Option<ClosedMarker>,
 }
 
-/// Name the channel erase a teardown performs, changing nothing.
+/// Mark the conversation delete-pending and name the channel erase a teardown
+/// performs.
 ///
-/// Reads the conversation in one of [`Store`]'s critical sections and builds
-/// the transport's value from it. The local records are still there when this
-/// returns, and [`finish_delete`] is what removes them, because the design
-/// erases the channel record before dropping local state: an erase performed
-/// against a conversation already deleted is one whose lookup key has been
-/// thrown away.
+/// Sets [`crate::dm::store::ConvState::delete_pending`] in the critical section that reads the
+/// conversation, through [`Store::mark_delete_pending`], and builds the
+/// transport's value from that read. The mark reaches disk before the caller
+/// erases anything, so a stop anywhere after this is visible to the next
+/// launch in [`Store::pending_deletes`], [`Store::load`] offers none of the
+/// conversation's outbox for rewriting, and every flow that writes for a
+/// conversation refuses it with
+/// [`crate::dm::flows::FlowError::DeletePending`]:
+/// [`crate::dm::flows::send_message`], [`crate::dm::flows::collect_batch`],
+/// [`crate::dm::flows::recognise_acceptance`], [`crate::dm::flows::accept`] on
+/// an existing record, [`crate::dm::flows::continue_acceptance`],
+/// [`crate::dm::flows::continue_first_contact`], and through it
+/// [`crate::dm::flows::first_contact`] to a marked identity,
+/// [`crate::dm::flows::resume_first_contact`] and
+/// [`crate::dm::flows::refresh_first_contact`].
+///
+/// `send_message`, `collect_batch` and `recognise_acceptance` re-check the mark
+/// in the critical section that commits their state, which comes before any
+/// network write they make, and a refused commit writes nothing, so a flow that
+/// loaded the conversation before the mark is refused at its commit. What that
+/// leaves for those three is the gap between a commit and the network write
+/// that follows it: one message slot, one cursor write, or the erase of a
+/// collected hello slot, and `collect_batch`'s local record of the cursor it
+/// published, which follows that write. The other flows check the mark once, at
+/// their load: `resume_first_contact` leaves the gap between that check and its
+/// hello write, and `accept`, `continue_acceptance`, `first_contact`,
+/// `continue_first_contact` and `refresh_first_contact` leave the whole of the
+/// work they do after it. A teardown and a flow on the same conversation are
+/// therefore not run at once; that is the caller's to keep.
+///
+/// [`crate::dm::flows::collect`] still makes one network write for a marked,
+/// established conversation: a rewritten hello from the correspondent is
+/// surfaced as already collected, and its slot in this side's own drop is
+/// erased. That is this side's drop, never the channel being erased.
+///
+/// The local records are
+/// still there when this returns, and [`finish_delete`] is what removes them,
+/// because the design erases the channel record before dropping local state:
+/// an erase performed against a conversation already deleted is one whose
+/// lookup key has been thrown away. Calling this again on a marked
+/// conversation marks it again and names the same erase.
 ///
 /// The marker's cursor is this side's `my_collected` as read here. A
 /// collection landing between this and the erase is not in the marker, which
@@ -151,9 +214,7 @@ pub fn prepare_delete(
     peer: &CorrespondenceLabel,
     closed_marker: bool,
 ) -> Result<ChannelErase, StoreError> {
-    let state = store
-        .load_conv(peer)?
-        .ok_or(StoreError::MissingConversation)?;
+    let state = store.mark_delete_pending(peer)?;
     Ok(ChannelErase {
         lookup_key: state.outgoing_lookup_key,
         marker: closed_marker.then_some(ClosedMarker {
@@ -165,12 +226,16 @@ pub fn prepare_delete(
 /// Drop the local records once the caller's transport has performed the erase.
 ///
 /// [`Store::delete_conv`] removes the conversation and outbox records
-/// together. The caller stops polling the correspondence once this returns.
+/// together, and the delete-pending mark goes with the conversation record.
+/// The caller stops polling the correspondence once this returns.
 ///
-/// A crash between [`prepare_delete`] and here leaves the conversation intact
-/// and the correspondence still polled, which is the recoverable side: the
-/// caller re-runs both, and the erase in between is idempotent — a record
-/// erased twice is erased.
+/// A stop between [`prepare_delete`] and here leaves the conversation record
+/// on disk carrying the delete-pending mark, whether or not the erase ran. The
+/// next launch finds it in [`Store::pending_deletes`]; [`Store::load`] offers
+/// none of its outbox, the flows [`prepare_delete`] names refuse it, and the
+/// caller re-runs the erase and this, the erase
+/// being idempotent — a record erased twice is erased. Resuming the teardown
+/// rather than polling the conversation is the caller's part.
 pub fn finish_delete(store: &Store, peer: &CorrespondenceLabel) -> Result<(), StoreError> {
     store.delete_conv(peer)
 }
@@ -254,6 +319,7 @@ mod tests {
         let opening = ChannelOpening::build(
             &writer,
             recipient.public_key(),
+            &OUTGOING,
             &conversation.ratchet_pk,
             OPENING_SERIAL,
         )
@@ -270,16 +336,19 @@ mod tests {
             my_collected: MY_COLLECTED,
             cursor_published: MY_COLLECTED,
             awaiting_acceptance: false,
+            acceptance_pending: false,
             outstanding_hello: None,
             own_hello_secret: None,
             own_hello_kem_ct: None,
-            peer_hello_secret: None,
+            own_control_key: None,
+            peer_control_key: None,
             peer_advert_serial: None,
             own_opening: None,
+            delete_pending: false,
         };
         store.create_conv(&peer, &state).expect("create");
         store
-            .persist_outbox(&peer, OWED_SEQ, &[0x5f; 64])
+            .persist_outbox(&peer, OWED_SEQ, &[0x5f; 64], NOW)
             .expect("persist an owed ciphertext");
         Fixture {
             _tmp: tmp,
@@ -348,6 +417,12 @@ mod tests {
             "day 6 fell outside the normal band: {day_6:?}"
         );
 
+        let just_before = at(7 * DAY - 1);
+        assert!(
+            (POLL_INTERVAL_MIN..=POLL_INTERVAL_MAX).contains(&just_before),
+            "a second before seven days fell outside the normal band: {just_before:?}"
+        );
+
         assert_eq!(
             at(7 * DAY),
             BACKOFF_POLL_INTERVAL,
@@ -414,6 +489,155 @@ mod tests {
         assert_eq!(
             degraded,
             POLL_INTERVAL_MIN + Duration::from_millis(span / 2)
+        );
+    }
+
+    /// The protocol never gives up: a message outstanding for any length of
+    /// time is still polled, daily, and stays owed until a cursor passes it,
+    /// with no age entering that decision.
+    #[test]
+    fn an_outstanding_message_is_polled_and_owed_however_old_it_is() {
+        for age in [7 * DAY, 60 * DAY, 365 * DAY, 10 * 365 * DAY] {
+            assert_eq!(
+                next_poll_interval(NOW, NOW + age, counting_fill(0x55)),
+                BACKOFF_POLL_INTERVAL,
+                "no daily poll at an age of {} days",
+                age / DAY
+            );
+        }
+        assert_eq!(
+            next_poll_interval(0, u64::MAX, counting_fill(0x55)),
+            BACKOFF_POLL_INTERVAL,
+            "no daily poll at the largest age a clock can report"
+        );
+
+        let f = fixture();
+        let owed = |store: &Store| -> Vec<u64> {
+            store.load().expect("load").convs[0]
+                .outstanding_outbox
+                .iter()
+                .map(|entry| entry.seq)
+                .collect()
+        };
+        assert_eq!(
+            owed(&f.store),
+            vec![OWED_SEQ],
+            "control: the message is owed"
+        );
+        f.store
+            .delete_outbox_through(&f.peer, OWED_SEQ)
+            .expect("a cursor at the sequence");
+        assert_eq!(
+            owed(&f.store),
+            vec![OWED_SEQ],
+            "a cursor equal to the sequence released the message"
+        );
+        f.store
+            .delete_outbox_through(&f.peer, OWED_SEQ + 1)
+            .expect("a cursor past the sequence");
+        assert!(
+            owed(&f.store).is_empty(),
+            "a cursor past the sequence did not release the message"
+        );
+    }
+
+    // ── the age of what is owed ─────────────────────────────────────────────
+
+    /// The oldest uncollected send time is the earliest of the entries still
+    /// owed, wherever it sits among them: a collected entry does not count, and
+    /// a conversation marked for delete reports none.
+    #[test]
+    fn the_oldest_uncollected_send_time_is_the_earliest_outstanding_entry() {
+        let f = fixture();
+        f.store
+            .update_conv(&f.peer, |state| state.send_seq = 4)
+            .expect("four sequences sent");
+        f.store
+            .persist_outbox(&f.peer, 1, &[0x51; 64], NOW + 50)
+            .expect("persist sequence 1");
+        f.store
+            .persist_outbox(&f.peer, 3, &[0x53; 64], NOW + 80)
+            .expect("persist sequence 3");
+        f.store
+            .persist_outbox(&f.peer, 0, &[0x50; 64], NOW - 100)
+            .expect("persist a sequence the correspondent collected");
+        let loaded = || {
+            f.store
+                .load()
+                .expect("load")
+                .convs
+                .into_iter()
+                .next()
+                .expect("the conversation")
+        };
+        let conv = loaded();
+        assert_eq!(
+            conv.outstanding_outbox
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![1, OWED_SEQ, 3],
+            "the control: sequences 1 to 3 are owed, and 0 was collected"
+        );
+        assert_eq!(
+            conv.outstanding_outbox
+                .iter()
+                .map(|entry| entry.sent_at)
+                .collect::<Vec<_>>(),
+            vec![NOW + 50, NOW, NOW + 80],
+            "the control: the oldest owed entry is neither the first nor the last"
+        );
+        assert_eq!(
+            oldest_uncollected_at(&conv),
+            Some(NOW),
+            "the oldest owed send time is not the earliest outstanding entry's"
+        );
+
+        prepare_delete(&f.store, &f.peer, false).expect("prepare");
+        assert_eq!(
+            oldest_uncollected_at(&loaded()),
+            None,
+            "a conversation being deleted reported an age"
+        );
+    }
+
+    /// The nudge check on explicit times: not due below the threshold, due at
+    /// it and above it, never due with nothing owed, and a clock earlier than
+    /// the send time reads as age zero.
+    #[test]
+    fn a_nudge_is_due_at_the_threshold_and_not_before() {
+        let threshold = 3 * DAY;
+        assert!(
+            !nudge_due(Some(NOW), NOW + threshold - 1, threshold),
+            "due below the threshold"
+        );
+        assert!(
+            nudge_due(Some(NOW), NOW + threshold, threshold),
+            "not due at the threshold"
+        );
+        assert!(
+            nudge_due(Some(NOW), NOW + threshold + 1, threshold),
+            "not due above the threshold"
+        );
+        assert!(
+            !nudge_due(None, NOW + 365 * DAY, threshold),
+            "due with nothing owed"
+        );
+        assert!(
+            !nudge_due(Some(NOW), NOW - DAY, threshold),
+            "a clock earlier than the send time read as an age"
+        );
+        assert!(
+            nudge_due(Some(NOW), NOW - DAY, 0),
+            "a threshold of zero was not due on a clock earlier than the send time"
+        );
+        assert!(
+            !nudge_due(Some(u64::MAX - 1), u64::MAX, 2),
+            "an age below the threshold at the top of the clock was due"
+        );
+        assert!(
+            nudge_due(Some(u64::MAX - 2), u64::MAX, 2),
+            "an age at the threshold at the top of the clock was not due"
         );
     }
 

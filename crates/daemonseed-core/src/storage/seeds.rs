@@ -589,8 +589,7 @@ fn decode_hex_secret(src: &str) -> Result<Zeroizing<String>, BlobError> {
 /// The precise limit, since it is easy to overstate: a field is wiped if its type
 /// has a `Zeroize` impl reachable by method resolution — `String`, `Vec<u8>`,
 /// `[u8; N]`, and `Box<[u8; N]>` (no impl of its own, but it derefs to one) all
-/// qualify. A field whose type has none does not compile. See the same note on
-/// [`crate::dm::firstcontact::VerifiedFirstContact`].
+/// qualify. A field whose type has none does not compile.
 #[derive(Clone, Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct PersistedCircle {
     /// Canonicalized circle entropy (NFKC + whitespace-folded, ISC-C9). This is
@@ -916,8 +915,7 @@ impl Seeds {
     ///
     /// The map is private (#358) and that harness must live outside this crate —
     /// it installs a `GlobalAlloc` hook and `daemonseed-core` is
-    /// `#![forbid(unsafe_code)]` — so the witness needs a way in, exactly as
-    /// `VerifiedFirstContact` does for the same reason (#265). Gated so no
+    /// `#![forbid(unsafe_code)]` — so the witness needs a way in. Gated so no
     /// consumer of the crate can reach it.
     ///
     /// A borrow of the key's own buffer, which is what makes it usable as a watch
@@ -1171,8 +1169,7 @@ impl Seeds {
     /// The observation needs the pass-through allocator in
     /// `tests/secret_zeroize_on_drop.rs`, which is its own binary, so a unit
     /// test cannot substitute. Gated behind `testing`, enabled only by this
-    /// crate's dev-dependency on itself, exactly as
-    /// [`crate::dm::firstcontact::VerifiedFirstContact`]'s accessors are.
+    /// crate's dev-dependency on itself.
     #[cfg(feature = "testing")]
     pub fn parse_plaintext_for_witness(s: &str) -> Result<Self, BlobError> {
         Self::from_plaintext(s)
@@ -1451,9 +1448,8 @@ impl SealingKey {
     }
 
     /// The raw at-rest key, for the record stores that take it by reference
-    /// rather than through this type — currently
-    /// [`DmPersist::open`](crate::dm::persist::DmPersist::open), which protects
-    /// the DM records under the same profile key as the at-rest blob.
+    /// rather than through this type, which keeps the DM records under the same
+    /// profile key as the at-rest blob.
     ///
     /// Returned inside [`Zeroizing`] rather than bare: a copy of the session's
     /// most sensitive secret must not depend on each caller remembering to wipe
@@ -2741,7 +2737,7 @@ mod tests {
     }
 
     /// `PersistedCircle`'s `Debug` is hand-written, so pin the exact rendering the
-    /// way `circle::key::CircleKey` and `dm::ack` pin theirs. `debug_redacts_seeds`
+    /// way `circle::key::CircleKey` pins its own. `debug_redacts_seeds`
     /// above does not reach here: `Debug for Seeds` prints only a circle COUNT, so
     /// it would stay green if this rendering leaked the phrase.
     #[test]

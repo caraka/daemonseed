@@ -11,6 +11,12 @@ license = "AGPL-3.0-or-later"
 publish = false
 description = "Veilid DHT transport layer for daemonseed."
 
+[features]
+# A constructor for `dm::runner::ContactRequestId`, so a front end's own tests
+# can build the events a runner sends. Off by default: a build without it cannot
+# make an id the runner did not issue. Enable it only from a dev-dependency.
+test-support = []
+
 [dependencies]
 # D4: join the PUBLIC Veilid network (no network_key_password). Private routes
 # (the proven path) need no footgun feature.
@@ -40,15 +46,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Per-contact pseudonym keygen: a fresh ML-DSA seed per introduction. Already
 # in this crate's lock via daemonseed-core.
 getrandom = { workspace = true }
-# The spent-invite-token file's profile-id, in its cleartext header
-# (daemonseed_core::dm::spent_store). Already a workspace dependency.
-uuid = { workspace = true }
-# Zeroizing<String> for the profile passphrase DmDriverParts carries.
+# Zeroize-on-drop for secret material held in memory.
 zeroize = { workspace = true }
-# The digest a refused page slot is remembered by, so the same bytes at the same
-# position are refused once per key-schedule state rather than once per probe.
-# Already in this crate's lock via daemonseed-core.
-oxicrypt-sha = { workspace = true }
 
 [dev-dependencies]
 # Named again here purely to switch daemonseed-core's `testing` feature on while
@@ -59,18 +58,12 @@ oxicrypt-sha = { workspace = true }
 # `--all-targets` cargo does enable the feature for this crate's bin target too,
 # so "off in every build" would be false — it is off in the build that ships.
 daemonseed-core = { path = "../daemonseed-core", features = ["testing"] }
-# Test targets only: `ResumeRecord::new` takes key arrays sized by this crate's
-# `SK_LEN` / `PK_LEN`, so a fixture that builds one names them. No production
-# code here references it, and a dev-dependency carries no edge into the shipped
-# artifact.
-oxicrypt-ml-dsa = { workspace = true }
 # Integration test (#97): the 2-node send_sealed-over-private-route oracle.
 # Runs on a host that can attach to the public network (`--ignored`).
 # `test-util` drives the WB-3 scheduler oracles in paused virtual time
 # (`#[tokio::test(start_paused = true)]`) — the WB-2 paused-time write-budget oracle.
 daemonseed-proto = { path = "../daemonseed-proto" }
-oxicrypt-module = { workspace = true }
-# Per-test scratch directories for the DM driver oracles (`DmPersist::open` takes a
-# root). Already a workspace dependency and a dev-dep of five sibling crates.
+# Per-test scratch directories for the direct-messaging runner's tests and oracles.
+# Already a workspace dependency and a dev-dep of five sibling crates.
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }

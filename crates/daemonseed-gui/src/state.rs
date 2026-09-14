@@ -14,20 +14,14 @@
 //! it stays Slint-free and network-free. Materialized circles are RAM-only and
 //! gone on relaunch — config persistence is a separate milestone.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
-use daemonseed_core::dm::admission::AdmissionCounters;
-use daemonseed_core::dm::keyrec::KemEncapsulationKey;
-use daemonseed_core::dm::outbox::{Acceptance, DeliveryState};
 use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
-use daemonseed_core::trust_events::{TrustEventLog, TrustEventScope};
-use daemonseed_veilid_net::SweepOutcome;
-use daemonseed_veilid_net::dm::{
-    CorrespondentState, DmEvent, PENDING_REQUEST_CAP, PkLt, RefusalReason, RequestId,
-};
+use daemonseed_core::trust_events::{TrustEventKey, TrustEventLog, TrustEventScope};
+use daemonseed_veilid_net::dm::runner::RunnerEvent;
 
 use crate::net::{DmSessionKeys, RosterEntry};
 use daemonseed_core::passphrase::strength::{self, DicewareError};
@@ -434,361 +428,6 @@ pub struct CircleState {
     pub roster: Vec<RosterEntry>,
 }
 
-/// (#339) One correspondence, as the driver has reported it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DmCorrespondence {
-    /// What the driver's startup DM roster said this correspondence is.
-    ///
-    /// `None` until a roster names it, which is every correspondence the driver
-    /// first heard of while running — an entry created by a delivery or a
-    /// teardown carries no state, because nothing has said what state it is in.
-    /// Absence is therefore "not stated", never a fourth state.
-    pub state: Option<CorrespondentState>,
-    /// The last state reported per sequence number, newest wins.
-    ///
-    /// A map rather than a list because `Delivery` is a *replacement*: a seq
-    /// climbs `Composed → OnDht → ConfirmedCollected` and the UI shows where it
-    /// is now, never the path it took.
-    pub deliveries: BTreeMap<u64, DeliveryState>,
-    /// Sequence numbers a loud teardown left undelivered, in arrival order.
-    pub undelivered: Vec<u64>,
-}
-
-/// (#339) The DM state one session has accumulated from [`DmEvent`]s.
-///
-/// Deliberately a *record of what was said*, not a model of the conversation:
-/// the driver owns every DM decision, and this holds only what a surface would
-/// need to draw. Nothing here is persisted — the driver's own store is the
-/// durable half, and a restart re-derives this from a fresh session's events.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct DmState {
-    /// Contact requests the driver has surfaced, keyed by [`RequestId`] — a
-    /// `Vec` because `RequestId` is neither `Hash` nor `Ord`.
-    ///
-    /// **Capped at [`PENDING_REQUEST_CAP`], the driver's own held-request
-    /// bound, and the oldest row is dropped to make room.** Nothing removes a
-    /// row otherwise: there is no accept or decline event, so a request answered
-    /// by the user stays here until an interface exists to retire it, and without
-    /// the cap the list would grow for the life of the session. The driver
-    /// cannot hold more than this many at once, so a longer list here would
-    /// hold requests the driver has already forgotten.
-    ///
-    /// A repeat of a request already held replaces it rather than adding a
-    /// second row: the driver re-surfaces an unanswered knock on every sweep.
-    pub requests: Vec<DmContactRequest>,
-    /// Correspondences this session has heard about, keyed by the
-    /// correspondent's long-term identity key.
-    pub correspondences: BTreeMap<PkLt, DmCorrespondence>,
-    /// The last refusal, whole: who it was for, how far it got, and why it
-    /// stopped. One slot, because a refusal is a thing the user is told once.
-    pub last_refusal: Option<DmRefusal>,
-    /// The last doorbell-health report — the sweep's GET accounting, admission's
-    /// cumulative counters, and the slots this sweep skipped.
-    pub last_doorbell_health: Option<DmDoorbellHealth>,
-    /// The last per-correspondence channel-health report.
-    pub last_channel_health: Option<DmChannelHealth>,
-    /// How many idle ticks could not read the profile's block-list record.
-    ///
-    /// **Counted rather than dropped, because it is an alarm and not a
-    /// counter the driver keeps.** Every other observability-only event has a
-    /// second symptom somewhere — a refusal, a health counter, a request that
-    /// does not arrive. This one's whole symptom is silence: the channel plane
-    /// fails closed while the record is unreadable, so every conversation stops
-    /// collecting and nothing else says why. Nothing renders it yet; a surface
-    /// that wants to warn has the number here rather than having to re-derive
-    /// it from an absence.
-    pub block_list_unreadable_ticks: u64,
-}
-
-/// A correspondent's identity key, as a trace line may show it: the marker only.
-/// The key itself is 2592 bytes and names a person. Mirrors the redaction
-/// `daemonseed_veilid_net::dm::DmEvent` applies to the same values.
-fn redacted_pk(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str("PkLt(..)")
-}
-
-impl std::fmt::Debug for DmState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Hand-written because the derive would print every `PkLt` map key in
-        // full — the same 2592 bytes naming a person that `DmEvent`'s own
-        // `Debug` redacts, arriving here by a different route.
-        f.debug_struct("DmState")
-            .field("requests", &self.requests)
-            .field("correspondences", &self.correspondences.len())
-            .field("last_refusal", &self.last_refusal)
-            .field("last_doorbell_health", &self.last_doorbell_health)
-            .field("last_channel_health", &self.last_channel_health)
-            .field(
-                "block_list_unreadable_ticks",
-                &self.block_list_unreadable_ticks,
-            )
-            .finish()
-    }
-}
-
-/// (#339) A pending contact request as the user would answer it.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DmContactRequest {
-    /// The request the accept / decline names.
-    pub request: RequestId,
-    /// The knocker's long-term identity key.
-    pub from: PkLt,
-    /// The first message body.
-    pub body: String,
-    /// When the knocker says it was sent, in unix milliseconds.
-    pub sent_unix_ms: i64,
-}
-
-impl std::fmt::Debug for DmContactRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The body is a stranger's plaintext message and `from` names a person:
-        // a trace line is the last place either belongs. Length and marker only,
-        // exactly as `DmEvent::ContactRequest` prints them.
-        write!(f, "DmContactRequest {{ request: {:?}, from: ", self.request)?;
-        redacted_pk(f)?;
-        write!(
-            f,
-            ", body_len: {}, sent_unix_ms: {} }}",
-            self.body.len(),
-            self.sent_unix_ms
-        )
-    }
-}
-
-/// (#339) The last refusal, held whole so a surface can say why.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DmRefusal {
-    /// The intended recipient.
-    pub to: PkLt,
-    /// How far the send got.
-    pub acceptance: Acceptance,
-    /// Where it stopped.
-    pub reason: RefusalReason,
-}
-
-impl std::fmt::Debug for DmRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DmRefusal { to: ")?;
-        redacted_pk(f)?;
-        write!(
-            f,
-            ", acceptance: {:?}, reason: {:?} }}",
-            self.acceptance, self.reason
-        )
-    }
-}
-
-/// (#339) The last [`DmEvent::DoorbellHealth`], flattened.
-///
-/// Derives `Debug`: every field is a counter about this side's own sweep, and
-/// none of them names a correspondent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DmDoorbellHealth {
-    /// The sweep's GET accounting.
-    pub outcome: SweepOutcome,
-    /// Admission's cumulative accounting.
-    pub admission: AdmissionCounters,
-    /// Slots this sweep skipped because the held-request list was full.
-    pub pending_full: u64,
-}
-
-/// (#339) The last [`DmEvent::ChannelHealth`], flattened.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DmChannelHealth {
-    /// The correspondent the counters belong to.
-    pub with: PkLt,
-    /// Sweeps refused because the transport did not read every slot.
-    pub partial_sweeps: u64,
-    /// Frames whose ratchet position was already consumed.
-    pub already_consumed: u64,
-    /// Frames that did not open or did not verify.
-    pub unopenable: u64,
-    /// Unsettled positions left alone for want of the peer's pseudonym key.
-    pub peer_pseudonym_unknown: u64,
-    /// Peer acknowledgements that would not merge.
-    pub peer_acks_deferred: u64,
-    /// Peer acknowledgements clipped to what this side has actually sent.
-    pub peer_acks_clipped: u64,
-    /// Standalone acknowledgement records that did not verify.
-    pub peer_acks_unverified: u64,
-    /// Acknowledgement fetches that errored or were abandoned at their bound.
-    pub peer_ack_fetches_failed: u64,
-    /// Receive-cursor records found unreadable and replaced.
-    pub cursor_records_repaired: u64,
-    /// Re-establishment legs that opened and whose fold could not finish.
-    pub leg_folds_deferred: u64,
-    /// Queued re-establishment legs whose record address would not derive.
-    pub leg_unaddressable: u64,
-}
-
-impl std::fmt::Debug for DmChannelHealth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The counters are harmless; `with` is a person's identity key.
-        f.write_str("DmChannelHealth { with: ")?;
-        redacted_pk(f)?;
-        write!(
-            f,
-            ", partial_sweeps: {}, already_consumed: {}, unopenable: {}, \
-             peer_pseudonym_unknown: {}, peer_acks_deferred: {}, peer_acks_clipped: {}, \
-             peer_acks_unverified: {}, peer_ack_fetches_failed: {}, \
-             cursor_records_repaired: {}, leg_folds_deferred: {}, \
-             leg_unaddressable: {} }}",
-            self.partial_sweeps,
-            self.already_consumed,
-            self.unopenable,
-            self.peer_pseudonym_unknown,
-            self.peer_acks_deferred,
-            self.peer_acks_clipped,
-            self.peer_acks_unverified,
-            self.peer_ack_fetches_failed,
-            self.cursor_records_repaired,
-            self.leg_folds_deferred,
-            self.leg_unaddressable
-        )
-    }
-}
-
-impl DmState {
-    /// Fold one driver event.
-    ///
-    /// Observability-only variants ([`DmEvent::ContactLookupFailed`],
-    /// [`DmEvent::BlockListFull`] and the rest) are accepted and dropped: no
-    /// interface renders them yet, and inventing state for them here would be
-    /// state no reader could check. [`DmEvent::BlockListUnreadable`] is the
-    /// exception and is counted: it is an alarm whose only other symptom is a
-    /// channel plane that has gone quiet, so dropping it leaves nothing to
-    /// check at all.
-    fn fold(&mut self, event: &DmEvent) {
-        match event {
-            DmEvent::ContactRequest {
-                request,
-                from,
-                body,
-                sent_unix_ms,
-            } => {
-                let row = DmContactRequest {
-                    request: request.clone(),
-                    from: from.clone(),
-                    body: body.clone(),
-                    sent_unix_ms: *sent_unix_ms,
-                };
-                match self.requests.iter_mut().find(|r| r.request == *request) {
-                    Some(existing) => *existing = row,
-                    None => {
-                        // The driver holds at most this many, so a longer list
-                        // here would show requests it has already forgotten.
-                        // Oldest out, because the newest knock is the one the
-                        // user has not seen.
-                        if self.requests.len() >= PENDING_REQUEST_CAP {
-                            self.requests.remove(0);
-                        }
-                        self.requests.push(row);
-                    }
-                }
-            }
-            DmEvent::Roster { correspondents } => {
-                for correspondent in correspondents {
-                    // Merged into the map rather than replacing it: a roster is
-                    // a statement about what is on disk, and an entry this
-                    // session made for a correspondence the store has not
-                    // recorded yet is not something the roster contradicts.
-                    self.correspondences
-                        .entry(correspondent.pk_lt.clone())
-                        .or_default()
-                        .state = Some(correspondent.state);
-                }
-            }
-            DmEvent::Delivery { to, seq, state } => {
-                self.correspondences
-                    .entry(to.clone())
-                    .or_default()
-                    .deliveries
-                    .insert(*seq, *state);
-            }
-            DmEvent::Refused {
-                to,
-                acceptance,
-                reason,
-                // Matched by name rather than by `..`: a field added to
-                // `Refused` must break this fold rather than be dropped
-                // silently. The key is folded by the caller, which is where
-                // the audit log lives.
-                event: _,
-            } => {
-                self.last_refusal = Some(DmRefusal {
-                    to: to.clone(),
-                    acceptance: *acceptance,
-                    reason: *reason,
-                });
-            }
-            DmEvent::ChannelLost { with, surfaced, .. } => {
-                let c = self.correspondences.entry(with.clone()).or_default();
-                c.undelivered.extend(surfaced.iter().copied());
-            }
-            DmEvent::DoorbellHealth {
-                outcome,
-                admission,
-                pending_full,
-            } => {
-                self.last_doorbell_health = Some(DmDoorbellHealth {
-                    outcome: *outcome,
-                    admission: *admission,
-                    pending_full: *pending_full,
-                });
-            }
-            DmEvent::ChannelHealth {
-                with,
-                partial_sweeps,
-                already_consumed,
-                unopenable,
-                peer_pseudonym_unknown,
-                peer_acks_deferred,
-                peer_acks_clipped,
-                peer_acks_unverified,
-                peer_ack_fetches_failed,
-                cursor_records_repaired,
-                leg_folds_deferred,
-                leg_unaddressable,
-            } => {
-                self.last_channel_health = Some(DmChannelHealth {
-                    with: with.clone(),
-                    partial_sweeps: *partial_sweeps,
-                    already_consumed: *already_consumed,
-                    unopenable: *unopenable,
-                    peer_pseudonym_unknown: *peer_pseudonym_unknown,
-                    peer_acks_deferred: *peer_acks_deferred,
-                    peer_acks_clipped: *peer_acks_clipped,
-                    peer_acks_unverified: *peer_acks_unverified,
-                    peer_ack_fetches_failed: *peer_ack_fetches_failed,
-                    cursor_records_repaired: *cursor_records_repaired,
-                    leg_folds_deferred: *leg_folds_deferred,
-                    leg_unaddressable: *leg_unaddressable,
-                });
-            }
-            DmEvent::BlockListUnreadable => {
-                self.block_list_unreadable_ticks =
-                    self.block_list_unreadable_ticks.saturating_add(1);
-            }
-            // Nothing a fold could add and no interface that renders them: an
-            // accepted request stays held by the driver, a message has no view,
-            // and the rest are counters the driver already keeps. The one event
-            // that is an alarm rather than a counter — `BlockListUnreadable`,
-            // whose only other symptom is silence — is folded above instead.
-            DmEvent::Message { .. }
-            | DmEvent::AcceptFailed { .. }
-            | DmEvent::ChannelDirectionUnknown { .. }
-            // Its audit entry is written above, where every classed key is. The
-            // fold adds nothing to `dm`: recovery is under way and bounded, and
-            // there is no per-correspondence state a reader could act on.
-            | DmEvent::ReestablishmentAnomaly { .. }
-            | DmEvent::ContactLookupFailed
-            | DmEvent::BlockListFull { .. }
-            | DmEvent::BlockListProvisioned
-            | DmEvent::SpentTokensNotPersisted => {}
-        }
-    }
-}
-
 /// First circle id handed out (0 is reserved/unused so a missing id is obvious).
 const FIRST_CIRCLE_ID: u64 = 1;
 
@@ -818,19 +457,14 @@ pub struct GuiState {
     /// subsequent event covers. Retaining it lets the tab-open handler mark exactly
     /// what is displayed as seen, independent of whether any event arrives.
     announcements_on_screen: AnnouncementsView,
-    /// (#339) What the DM driver has told this session. Folded by
-    /// [`GuiState::on_dm_event`] and rendered nowhere yet: no interface draws
-    /// it.
-    dm: DmState,
     /// The ISC-C28 trust-event audit log: bounded, in-memory, and the sink every
     /// classed event this session raises is written to.
     ///
-    /// **It exists here because ISC-A-C12 makes the entry non-optional**, not
-    /// because something draws it — no interface does yet, exactly as with `dm`
-    /// above. A teardown that arrived with nowhere to be recorded would be the
-    /// silent loss the loud-teardown design (`docs/design/direct-messaging.md`)
-    /// was written to end, so the log lands before the affordance rather than
-    /// after it.
+    /// **It exists here because the audit entry is non-optional**, not because
+    /// something draws it — no interface does yet. A teardown that arrived with
+    /// nowhere to be recorded would be the silent loss the loud-teardown design
+    /// (`docs/design/direct-messaging.md`) was written to end, so the log lands
+    /// before the affordance rather than after it.
     trust_log: TrustEventLog,
     /// The project-announce seed variable's value, if this process was launched
     /// with one: taken out of the environment at startup and held here so every
@@ -869,7 +503,6 @@ impl GuiState {
             profile: None,
             my_shares: Vec::new(),
             announcements_on_screen: AnnouncementsView::default(),
-            dm: DmState::default(),
             trust_log: TrustEventLog::default(),
             project_announce_seed: None,
         }
@@ -974,28 +607,11 @@ impl GuiState {
             .and_then(|p| p.stable_share_root_ikm().ok())
     }
 
-    /// (#232) The unlocked profile's STABLE ML-KEM-1024 encapsulation key — the
-    /// public half the DM key record publishes (ISC-C40). `None` on the ephemeral /
-    /// no-profile path: that session has no persistent identity, so it is not
-    /// DM-reachable and must not publish a key record.
-    pub fn stable_kem_encapsulation_key(&self) -> Option<KemEncapsulationKey> {
-        self.profile
-            .as_ref()
-            .and_then(|p| p.stable_kem_encapsulation_key().ok())
-    }
-
-    /// (#339) Derive the secret DM halves for the driver this connect will spawn.
-    /// `None` on the ephemeral / no-profile path, or if derivation fails — each of
-    /// which means this session is not DM-reachable and no driver is spawned.
+    /// Derive the secret halves for the direct-messaging runner this connect
+    /// starts. `None` on the ephemeral / no-profile path, or if derivation fails,
+    /// and then no runner is started.
     pub fn dm_session_keys(&self) -> Option<Box<DmSessionKeys>> {
         self.profile.as_ref().and_then(|p| p.dm_session_keys().ok())
-    }
-
-    /// (#339) What the DM driver has told this session. Read-only; the fold is
-    /// [`Self::on_dm_event`]'s.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn dm_state(&self) -> &DmState {
-        &self.dm
     }
 
     /// The ISC-C28 trust-event audit log. Read-only; the writes are
@@ -1005,26 +621,22 @@ impl GuiState {
         &self.trust_log
     }
 
-    /// (#339) Fold one DM driver event. Renders nothing: no interface draws it.
+    /// Take one direct-messaging runner event. No interface draws direct
+    /// messages, so nothing here is kept for display.
     ///
-    /// An event carrying a classed key is the one thing that leaves a record
-    /// beyond `dm`, and ISC-A-C12 forbids skipping the audit entry the taxonomy
-    /// owes it. Three arrive that way — a lost channel, the refusal an
-    /// introduction ends in, and A3.8's re-establishment anomalies, whose class
-    /// is `PersistentNonBlocking` exactly as a teardown's is. A refusal that
-    /// tore nothing down carries no key and folds nothing.
-    pub fn on_dm_event(&mut self, event: &DmEvent) {
-        match event {
-            DmEvent::ChannelLost { event: key, .. }
-            | DmEvent::ReestablishmentAnomaly { event: key, .. }
-            | DmEvent::Refused {
-                event: Some(key), ..
-            } => self
-                .trust_log
-                .append(TrustEventScope::bare(*key).observed_at(now_unix_ms(), None, None)),
-            _ => {}
+    /// A correspondent starting over is the one event that leaves a record: it
+    /// appends [`TrustEventKey::DmCorrespondentStateLost`] to the trust log.
+    pub fn on_dm_event(&mut self, event: &RunnerEvent) {
+        // No surface draws direct messages, so every other event is dropped.
+        if let RunnerEvent::StartedOver { .. } = event {
+            self.trust_log.append(
+                TrustEventScope::bare(TrustEventKey::DmCorrespondentStateLost).observed_at(
+                    now_unix_ms(),
+                    None,
+                    None,
+                ),
+            );
         }
-        self.dm.fold(event);
     }
 
     /// (#229) Record the announcements/MOTD view now rendered in the pane.
@@ -1679,7 +1291,6 @@ impl GuiState {
             profile: None,
             my_shares: Vec::new(),
             announcements_on_screen: AnnouncementsView::default(),
-            dm: DmState::default(),
             trust_log: TrustEventLog::default(),
             project_announce_seed: None,
         }
@@ -3506,288 +3117,46 @@ mod tests {
         assert!(st.active_roster().is_empty());
     }
 
-    // ── #339: DM driver events fold into DmState and drive no UI ──
+    // ── Direct-messaging runner events: only a correspondent starting over is kept ──
 
-    /// A distinct 2592-byte identity key, so two correspondents are separable.
-    fn dm_pk(tag: u8) -> PkLt {
+    /// A distinct identity key, so two correspondents are separable.
+    fn dm_pk(tag: u8) -> daemonseed_veilid_net::dm::runner::IdentityPk {
         Box::new([tag; daemonseed_core::identity::keys::IDENTITY_PK_LEN])
     }
 
-    fn dm_request(slot: u16, tag: u8) -> RequestId {
-        RequestId {
-            slot,
-            entry_hash: [tag; daemonseed_core::dm::pow::ENTRY_HASH_LEN],
-        }
+    fn dm_request(serial: u64) -> daemonseed_veilid_net::dm::runner::ContactRequestId {
+        daemonseed_veilid_net::dm::runner::ContactRequestId::for_test(1, serial)
     }
 
-    /// The startup roster reaches `DmState` per correspondent, each carrying
-    /// the state the driver put it in.
-    ///
-    /// The three states are asserted separately rather than by count: a fold
-    /// that recorded the right number of correspondents under one state would
-    /// pass a count and be useless to a surface, which needs to know which
-    /// correspondence it may write to.
+    /// A correspondent starting over appends `DmCorrespondentStateLost` to the
+    /// trust log, once, with nothing that names the correspondent. The control is
+    /// a contact request, which carries the same fields and appends nothing.
     #[test]
-    fn dm_roster_states_each_correspondent() {
-        use daemonseed_veilid_net::dm::Correspondent;
+    fn a_correspondent_starting_over_is_audit_logged() {
         let mut st = GuiState::lobby_only();
-        assert!(st.dm_state().correspondences.is_empty());
-
-        st.on_dm_event(&DmEvent::Roster {
-            correspondents: vec![
-                Correspondent {
-                    pk_lt: dm_pk(1),
-                    state: CorrespondentState::Established,
-                },
-                Correspondent {
-                    pk_lt: dm_pk(2),
-                    state: CorrespondentState::Pending,
-                },
-                Correspondent {
-                    pk_lt: dm_pk(3),
-                    state: CorrespondentState::Blocked,
-                },
-            ],
+        st.on_dm_event(&RunnerEvent::ContactRequest {
+            request: dm_request(1),
+            from: dm_pk(9),
         });
-
-        let state_of = |tag: u8| {
-            st.dm_state()
-                .correspondences
-                .get(&dm_pk(tag))
-                .expect("the roster left out a correspondent")
-                .state
-        };
-        assert_eq!(state_of(1), Some(CorrespondentState::Established));
-        assert_eq!(state_of(2), Some(CorrespondentState::Pending));
-        assert_eq!(state_of(3), Some(CorrespondentState::Blocked));
         assert_eq!(
-            st.dm_state().correspondences.len(),
-            3,
-            "the fold invented a correspondence the roster did not name"
+            st.trust_log().len(),
+            0,
+            "control: a contact request was audit-logged"
         );
-    }
 
-    /// A correspondence the driver reports on without a roster carries no
-    /// state: absence is "not stated", and a fold that guessed would say a
-    /// blocked correspondent is writable.
-    #[test]
-    fn a_delivery_alone_states_no_correspondent_state() {
-        let mut st = GuiState::lobby_only();
-
-        st.on_dm_event(&DmEvent::Delivery {
-            to: dm_pk(4),
-            seq: 0,
-            state: DeliveryState::Composed,
-        });
-
-        assert_eq!(
-            st.dm_state()
-                .correspondences
-                .get(&dm_pk(4))
-                .expect("the delivery folded")
-                .state,
-            None
-        );
-    }
-
-    /// #339: a `Refused` reaches `DmState` whole — recipient, acceptance and
-    /// reason. The refusal is the one DM outcome the user must be told about,
-    /// no interface draws it yet, so this field IS the delivery.
-    #[test]
-    fn dm_refused_event_lands_in_dm_state() {
-        let mut st = GuiState::lobby_only();
-        assert!(st.dm_state().last_refusal.is_none());
-
-        st.on_dm_event(&DmEvent::Refused {
-            to: dm_pk(7),
-            acceptance: Acceptance::Unconfirmed,
-            reason: RefusalReason::NoKeyRecord,
-            event: None,
-        });
-
-        let refusal = st.dm_state().last_refusal.as_ref().expect("refusal folded");
-        assert_eq!(refusal.to, dm_pk(7));
-        assert_eq!(refusal.acceptance, Acceptance::Unconfirmed);
-        assert_eq!(refusal.reason, RefusalReason::NoKeyRecord);
-    }
-
-    /// A torn-down channel reaches the trust-event audit log, carrying the key
-    /// the driver classed it under and nothing that names the correspondent.
-    ///
-    /// The front-end half of the loud teardown: ISC-A-C12 forbids the client
-    /// skipping the entry, and this fold is the only thing between the driver's
-    /// classed key and the log. The undelivered queue is asserted alongside it,
-    /// so a fold that logged the event and dropped the sequences would fail.
-    /// **A re-establishment anomaly reaches the audit log too**, and its class
-    /// is the same one a teardown's is.
-    ///
-    /// A3.8 gives every loud re-establishment state
-    /// `PersistentNonBlocking`, and ISC-A-C12 forbids the client dropping a
-    /// classed key on the way to the log. Nothing else about the event is folded
-    /// — recovery is under way and bounded — so the log entry is the whole of
-    /// what a front end owes it, and this is the only place that can be checked.
-    #[test]
-    fn dm_reestablishment_anomaly_is_audit_logged() {
-        use daemonseed_core::trust_events::{TrustEventClass, TrustEventKey, class_of};
-        let mut st = GuiState::lobby_only();
-        assert_eq!(st.trust_log().len(), 0, "the fixture starts empty");
-
-        st.on_dm_event(&DmEvent::ReestablishmentAnomaly {
-            with: dm_pk(9),
-            event: TrustEventKey::DmPeerStateRegressed,
+        st.on_dm_event(&RunnerEvent::StartedOver {
+            request: dm_request(2),
+            from: dm_pk(9),
         });
 
         let entries = st.trust_log().entries();
-        assert_eq!(entries.len(), 1, "the anomaly was not logged");
-        assert_eq!(entries[0].key, TrustEventKey::DmPeerStateRegressed);
-        assert_eq!(
-            class_of(TrustEventKey::DmPeerStateRegressed),
-            TrustEventClass::PersistentNonBlocking,
-            "the class the log entry is written at moved"
-        );
-        // ISC-C28 keeps the correspondence out of the log, exactly as it does
-        // for a teardown: the key is the whole statement.
+        assert_eq!(entries.len(), 1, "the start-over was not logged once");
+        assert_eq!(entries[0].key, TrustEventKey::DmCorrespondentStateLost);
+        // The key is the whole statement: no scope field names the correspondent.
         assert!(entries[0].server_id.is_none());
         assert!(entries[0].suite_id.is_none());
         assert!(entries[0].record_kind.is_none());
         assert!(entries[0].timestamp_unix_ms > 0, "the entry has no clock");
-        // And nothing else moved: the fold adds no per-correspondence state.
-        assert!(
-            !st.dm_state().correspondences.contains_key(&dm_pk(9)),
-            "the anomaly invented correspondence state a reader cannot act on"
-        );
-    }
-
-    #[test]
-    fn dm_channel_lost_is_audit_logged() {
-        let mut st = GuiState::lobby_only();
-        assert_eq!(st.trust_log().len(), 0, "the fixture starts empty");
-
-        st.on_dm_event(&DmEvent::ChannelLost {
-            with: dm_pk(9),
-            cause: daemonseed_core::dm::provisional::TeardownCause::CorrespondentStateLost,
-            event: daemonseed_core::trust_events::TrustEventKey::DmCorrespondentStateLost,
-            surfaced: vec![4, 5],
-        });
-
-        let entries = st.trust_log().entries();
-        assert_eq!(entries.len(), 1, "the teardown was not logged");
-        assert_eq!(
-            entries[0].key,
-            daemonseed_core::trust_events::TrustEventKey::DmCorrespondentStateLost
-        );
-        // ISC-C28 keeps the correspondence out of the log: the key is the whole
-        // statement, and every scope field stays empty rather than being filled
-        // with something that would join into a recently-contacted set.
-        assert!(entries[0].server_id.is_none());
-        assert!(entries[0].suite_id.is_none());
-        assert!(entries[0].record_kind.is_none());
-        assert!(entries[0].timestamp_unix_ms > 0, "the entry has no clock");
-
-        assert_eq!(
-            st.dm_state()
-                .correspondences
-                .get(&dm_pk(9))
-                .expect("correspondence folded")
-                .undelivered,
-            vec![4, 5]
-        );
-    }
-
-    /// A refusal that carries a classed key is audit-logged exactly once, and a
-    /// refusal that carries none writes nothing.
-    ///
-    /// An introduction whose channel is torn down is stated as a refusal, so
-    /// this fold is the only thing between the driver's classed key and the log
-    /// — the standing ISC-A-C12 puts on a lost channel, on the event the
-    /// introduce-probe path actually emits. The second half is what keeps the
-    /// fold conditional: a client that logged every refusal would pass the
-    /// first assertion and write an audit entry for a full outbox.
-    #[test]
-    fn dm_refused_carrying_a_trust_event_is_audit_logged_once() {
-        let mut st = GuiState::lobby_only();
-        assert_eq!(st.trust_log().len(), 0, "the fixture starts empty");
-
-        st.on_dm_event(&DmEvent::Refused {
-            to: dm_pk(9),
-            acceptance: Acceptance::Unconfirmed,
-            reason: RefusalReason::StoreFailure,
-            event: Some(
-                daemonseed_core::trust_events::TrustEventKey::DmProvisionalRecordUnreadable,
-            ),
-        });
-
-        let entries = st.trust_log().entries();
-        assert_eq!(
-            entries.len(),
-            1,
-            "the refusal's key reached the log {} times",
-            entries.len()
-        );
-        assert_eq!(
-            entries[0].key,
-            daemonseed_core::trust_events::TrustEventKey::DmProvisionalRecordUnreadable
-        );
-        // ISC-C28 again: the key is the whole statement, and no scope field is
-        // filled with anything that would name the correspondent.
-        assert!(entries[0].server_id.is_none());
-        assert!(entries[0].suite_id.is_none());
-        assert!(entries[0].record_kind.is_none());
-        assert!(entries[0].timestamp_unix_ms > 0, "the entry has no clock");
-
-        // The refusal is still a refusal to the rest of the fold.
-        assert_eq!(
-            st.dm_state()
-                .last_refusal
-                .as_ref()
-                .expect("refusal folded")
-                .reason,
-            RefusalReason::StoreFailure
-        );
-
-        st.on_dm_event(&DmEvent::Refused {
-            to: dm_pk(9),
-            acceptance: Acceptance::Unconfirmed,
-            reason: RefusalReason::OutboxFull { needed: 12 },
-            event: None,
-        });
-        assert_eq!(
-            st.trust_log().entries().len(),
-            1,
-            "a refusal that tore nothing down was audit-logged"
-        );
-    }
-
-    /// #339: a `ContactRequest` adds exactly ONE row, a re-surfaced request
-    /// replaces it, and a different request is its own row.
-    #[test]
-    fn dm_contact_request_adds_exactly_one_request() {
-        let mut st = GuiState::lobby_only();
-        assert_eq!(st.dm_state().requests.len(), 0);
-
-        let event = |body: &str| DmEvent::ContactRequest {
-            request: dm_request(3, 9),
-            from: dm_pk(1),
-            body: body.to_owned(),
-            sent_unix_ms: 1_700_000_000_000,
-        };
-        st.on_dm_event(&event("hello"));
-        assert_eq!(st.dm_state().requests.len(), 1);
-
-        st.on_dm_event(&event("hello again"));
-        assert_eq!(st.dm_state().requests.len(), 1);
-        let held = &st.dm_state().requests[0];
-        assert_eq!(held.request, dm_request(3, 9));
-        assert_eq!(held.from, dm_pk(1));
-        assert_eq!(held.body, "hello again");
-
-        st.on_dm_event(&DmEvent::ContactRequest {
-            request: dm_request(4, 9),
-            from: dm_pk(2),
-            body: "someone else".to_owned(),
-            sent_unix_ms: 1_700_000_001_000,
-        });
-        assert_eq!(st.dm_state().requests.len(), 2);
     }
 
     /// Everything `GuiState` exposes to the view layer, in one comparable value.
@@ -3815,9 +3184,8 @@ mod tests {
         }
     }
 
-    /// #339: NO UI. Folding DM events changes nothing the view layer reads — no
-    /// interface renders them, and this is what catches a fold reaching into the
-    /// visible layer early.
+    /// No UI: runner events change nothing the view layer reads. The trust log is
+    /// the control that proves the events were taken.
     #[test]
     fn dm_events_change_no_visible_state() {
         let mut st = GuiState::demo();
@@ -3827,103 +3195,24 @@ mod tests {
             "the fixture must have circles for the snapshot to mean anything"
         );
 
-        st.on_dm_event(&DmEvent::ContactRequest {
-            request: dm_request(1, 2),
+        st.on_dm_event(&RunnerEvent::ContactRequest {
+            request: dm_request(1),
             from: dm_pk(3),
-            body: "knock".to_owned(),
-            sent_unix_ms: 1_700_000_000_000,
         });
-        st.on_dm_event(&DmEvent::Refused {
-            to: dm_pk(3),
-            acceptance: Acceptance::Unconfirmed,
-            reason: RefusalReason::PublishFailed,
-            event: None,
+        st.on_dm_event(&RunnerEvent::Refused {
+            token: None,
+            reason: daemonseed_veilid_net::dm::runner::Refusal::ShuttingDown,
         });
-        st.on_dm_event(&DmEvent::DoorbellHealth {
-            outcome: SweepOutcome::default(),
-            admission: AdmissionCounters::default(),
-            pending_full: 3,
+        st.on_dm_event(&RunnerEvent::StartedOver {
+            request: dm_request(2),
+            from: dm_pk(3),
         });
 
-        // The fold really happened — otherwise this proves only that three
-        // no-ops leave the view alone.
-        assert_eq!(st.dm_state().requests.len(), 1);
-        assert!(st.dm_state().last_refusal.is_some());
-        assert!(st.dm_state().last_doorbell_health.is_some());
-
+        assert_eq!(st.trust_log().len(), 1, "the events were not taken");
         assert_eq!(
             visible_state(&st),
             before,
-            "a DM fold changed visible state"
-        );
-    }
-
-    /// #339: the held-request list is bounded by the driver's own cap. Without it
-    /// the fold has no removal path at all — there is no accept or decline event —
-    /// so a long session accumulates every knock it was ever told about,
-    /// including ones the driver has already dropped.
-    #[test]
-    fn dm_requests_are_capped_at_the_drivers_own_bound() {
-        let mut st = GuiState::lobby_only();
-        for i in 0..(PENDING_REQUEST_CAP as u16 + 10) {
-            st.on_dm_event(&DmEvent::ContactRequest {
-                request: dm_request(i, (i % 251) as u8),
-                from: dm_pk(1),
-                body: format!("knock {i}"),
-                sent_unix_ms: 1_700_000_000_000 + i as i64,
-            });
-        }
-        assert_eq!(st.dm_state().requests.len(), PENDING_REQUEST_CAP);
-        assert_eq!(
-            st.dm_state().requests.last().expect("non-empty").body,
-            format!("knock {}", PENDING_REQUEST_CAP + 9)
-        );
-    }
-
-    /// #339: `Debug` on the DM state redacts what core's own `DmEvent::Debug`
-    /// redacts. A trace line is the last place a stranger's plaintext message or
-    /// a 2592-byte key naming a person belongs, and these types reach `Debug` by
-    /// a different route than the event they were folded from.
-    #[test]
-    fn dm_state_debug_redacts_bodies_and_keys() {
-        let mut st = GuiState::lobby_only();
-        st.on_dm_event(&DmEvent::ContactRequest {
-            request: dm_request(1, 2),
-            from: dm_pk(0xAB),
-            body: "meet me at the docks".to_owned(),
-            sent_unix_ms: 1,
-        });
-        st.on_dm_event(&DmEvent::ChannelHealth {
-            with: dm_pk(0xAB),
-            partial_sweeps: 1,
-            already_consumed: 0,
-            unopenable: 0,
-            peer_pseudonym_unknown: 0,
-            peer_acks_deferred: 0,
-            peer_acks_clipped: 0,
-            peer_acks_unverified: 0,
-            peer_ack_fetches_failed: 0,
-            cursor_records_repaired: 0,
-            leg_folds_deferred: 0,
-            leg_unaddressable: 0,
-        });
-        let rendered = format!("{:?}", st.dm_state());
-
-        assert!(
-            !rendered.contains("meet me at the docks"),
-            "the body reached a Debug line: {rendered}"
-        );
-        assert!(
-            rendered.contains("body_len: 20"),
-            "the length should still be there: {rendered}"
-        );
-        assert!(
-            !rendered.contains("171, 171"),
-            "the identity key reached a Debug line: {rendered}"
-        );
-        assert!(
-            rendered.contains("PkLt(..)"),
-            "expected the marker: {rendered}"
+            "a direct-messaging event changed visible state"
         );
     }
 }

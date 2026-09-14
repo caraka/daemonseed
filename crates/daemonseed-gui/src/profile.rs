@@ -22,7 +22,6 @@
 use std::path::PathBuf;
 
 use crate::net::DmSessionKeys;
-use daemonseed_core::dm::keyrec::KemEncapsulationKey;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::identity::keys::{
     Identity, KeyDerivationError, ShareRootIkm, SignKeypair, derive_identity_keys,
@@ -107,35 +106,18 @@ impl Profile {
         derive_identity_keys(&self.seeds.mnemonic, Identity::Primary).map(|k| k.share_root_ikm)
     }
 
-    /// (#232) Derive the STABLE ML-KEM-1024 **encapsulation** key from the unlocked
-    /// profile's mnemonic — the public half of the identity KEM keypair, the fifth
-    /// consumer of the same identity PRK behind [`Self::stable_signing_key`]. The
-    /// net actor holds it so it can publish the DM key record (ISC-C40) that makes
-    /// this identity reachable for direct messages.
+    /// Derive the secret halves the direct-messaging runner a connect starts
+    /// needs: the signing keypair, the identity's channel root, and this
+    /// profile's at-rest key.
     ///
-    /// Only the PUBLIC half leaves this method. The decapsulation key stays inside
-    /// `IdentityKeys` and is dropped here — nothing in the publish path needs it,
-    /// and handing it to the net actor would widen that actor's authority for no
-    /// reason (the least-authority posture `stable_signing_key` already documents).
-    pub fn stable_kem_encapsulation_key(&self) -> Result<KemEncapsulationKey, KeyDerivationError> {
-        derive_identity_keys(&self.seeds.mnemonic, Identity::Primary)
-            .map(|k| Box::new(*k.kem.encapsulation_key()))
-    }
-
-    /// (#339) Derive the secret DM halves for the driver a connect will spawn:
-    /// the signing keypair, the FULL identity KEM keypair, the doorbell slot
-    /// secret, and this profile's at-rest key.
-    ///
-    /// One `derive_identity_keys` call rather than three, because the KEM keypair
-    /// is `!Clone` and has to be moved out whole. The decapsulation key leaves
-    /// this method — the one caller is the connect path, which hands it to the
-    /// driver task and to nothing else; the net actor still never sees it.
+    /// One `derive_identity_keys` call, because the channel root is `!Clone` and
+    /// has to be moved out whole. The one caller is the connect path, which
+    /// moves it into the runner's parts.
     pub fn dm_session_keys(&self) -> Result<Box<DmSessionKeys>, KeyDerivationError> {
         let keys = derive_identity_keys(&self.seeds.mnemonic, Identity::Primary)?;
         Ok(Box::new(DmSessionKeys {
             signing: std::sync::Arc::new(keys.signing),
-            kem: keys.kem,
-            doorbell_slot_secret: keys.dm_doorbell_slot_secret,
+            dm_channel_root: keys.dm_channel_root,
             at_rest_key: self.seal_key.to_bytes(),
         }))
     }
@@ -333,16 +315,16 @@ mod tests {
     use daemonseed_core::first_start::FirstStart;
     use daemonseed_core::profile::config::ArgonParams;
 
-    /// #339: the material handed to the driver is THIS profile's — the same
-    /// identity behind the signing key, the doorbell secret from the same
-    /// derivation, and the profile's own at-rest key.
+    /// The material handed to the runner is THIS profile's — the same identity
+    /// behind the signing key, the channel root from the same derivation, and
+    /// the profile's own at-rest key.
     ///
-    /// The doorbell secret and the at-rest key are the two halves nothing else
-    /// checks: the first decides which slot a knock is written to, so a wrong one
+    /// The channel root and the at-rest key are the two halves nothing else
+    /// checks: the first decides which channels the runner opens, so a wrong one
     /// is silently unreachable rather than broken, and the second decides whether
-    /// the DM records open at all.
+    /// the runner's store opens at all.
     #[test]
-    fn dm_session_keys_bind_the_identity_and_the_profile_key() {
+    fn dm_session_keys_bind_the_identity_the_channel_root_and_the_profile_key() {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
         let fast = ArgonParams {
             memory_kib: 8,
@@ -382,22 +364,17 @@ mod tests {
         assert_eq!(
             keys.signing.public_key(),
             expected.signing.public_key(),
-            "the driver signs as this profile"
+            "the runner signs as this profile"
         );
         assert_eq!(
-            keys.kem.encapsulation_key(),
-            expected.kem.encapsulation_key(),
-            "and opens knocks with this profile's KEM keypair"
-        );
-        assert_eq!(
-            keys.doorbell_slot_secret.as_bytes(),
-            expected.dm_doorbell_slot_secret.as_bytes(),
-            "a wrong doorbell secret is silently unreachable, never loudly broken"
+            keys.dm_channel_root.with_bytes(|bytes| *bytes),
+            expected.dm_channel_root.with_bytes(|bytes| *bytes),
+            "a wrong channel root is silently unreachable, never loudly broken"
         );
         assert_eq!(
             *keys.at_rest_key,
             *seal_key.to_bytes(),
-            "the DM store opens under the profile's own at-rest key"
+            "the runner's store opens under the profile's own at-rest key"
         );
     }
 }

@@ -118,6 +118,7 @@
 //! taking one later changes this module and no caller of it.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -126,12 +127,16 @@ use daemonseed_core::dm::advert::{AdvertOwnerSeed, ADVERT_SUBKEY};
 use daemonseed_core::dm::channel::{ChannelOwnerSeed, CHANNEL_SUBKEYS, CONTROL_SUBKEY};
 use daemonseed_core::dm::drop::{DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
 use daemonseed_core::dm::flows::{RecordError, Records};
+use daemonseed_core::identity::keys::{DmChannelRootSecret, SignKeypair};
+use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::oneshot;
 use veilid_core::{KeyPair, RoutingContext, ValueSeqNum, VeilidAPI};
+use zeroize::Zeroizing;
 
 use crate::actor::{funnel_record_key, gated_bounded_get, ProdWrite};
 use crate::dht_gate::DhtGate;
+use crate::dm::runner::{RecordFailure, RunnerConfig, RunnerParts, RunnerRecords, SubkeyReport};
 use crate::error::{Result, VeilidNetError};
 use crate::identity;
 use crate::rendezvous::{self, RecordShape, RendezvousHandle};
@@ -178,6 +183,13 @@ pub enum RecordsError {
     /// The runtime on this thread is not multi-threaded, so the synchronous
     /// bridge every method uses would panic.
     NotMultiThread,
+    /// A write or an erasure named a channel this process has not opened, so
+    /// its owner keypair is not held.
+    ChannelNotOpened,
+    /// A subkey count outside the range a record can be addressed with.
+    SubkeyCount(u16),
+    /// A record's owner keypair would not derive from its seed.
+    OwnerKey,
 }
 
 impl core::fmt::Display for RecordsError {
@@ -191,6 +203,19 @@ impl core::fmt::Display for RecordsError {
                 "the tokio runtime on this thread is not multi-thread: the record \
                  store's synchronous bridge needs a multi-thread worker",
             ),
+            Self::ChannelNotOpened => f.write_str(
+                "this channel has not been opened in this process, so its owner \
+                 keypair is not held: open it before writing it",
+            ),
+            Self::SubkeyCount(subkeys) => write!(
+                f,
+                "subkey count {subkeys} is outside 1..={} — it is part of the record \
+                 address, so no record can be named with it",
+                rendezvous::MAX_SUBKEY_COUNT
+            ),
+            Self::OwnerKey => {
+                f.write_str("the record's owner keypair would not derive from its seed")
+            }
         }
     }
 }
@@ -298,6 +323,17 @@ impl Writer {
         kind: DirectMessageWrite,
         write: RecordWrite,
     ) -> core::result::Result<(), RecordError> {
+        wait_for_reply(self.send(record, kind, write))
+    }
+
+    /// Charge one write and hand it to the funnel, returning where its reply
+    /// will arrive.
+    fn send(
+        &self,
+        record: [u8; 32],
+        kind: DirectMessageWrite,
+        write: RecordWrite,
+    ) -> oneshot::Receiver<Result<()>> {
         self.counts.charge(kind);
         let (reply, replied) = oneshot::channel();
         self.sched.enqueue(WriteRequest::direct_message(
@@ -306,13 +342,22 @@ impl Writer {
             ProdWrite::DmRecord(write),
             Some(reply),
         ));
-        block(async move {
-            replied.await.map_err(|_| {
-                VeilidNetError::Actor("the write scheduler dropped the reply".into())
-            })?
-        })
-        .map_err(RecordError::new)
+        replied
     }
+}
+
+/// Wait for a submitted write's reply.
+///
+/// A reply the scheduler dropped without sending is a refusal, not a local
+/// one: the scheduler may have dispatched the write before it went, so the
+/// write may have been sent.
+fn wait_for_reply(replied: oneshot::Receiver<Result<()>>) -> core::result::Result<(), RecordError> {
+    block(async move {
+        replied
+            .await
+            .map_err(|_| VeilidNetError::Actor("the write scheduler dropped the reply".into()))?
+    })
+    .map_err(RecordError::new)
 }
 
 /// A channel record this side owns, as [`Records::open_channel`] left it.
@@ -381,6 +426,9 @@ pub struct VeilidRecords {
     own_channels: HashMap<[u8; HELLO_LOOKUP_KEY_LEN], OwnChannel>,
     /// What the current scan of a drop found, where one is in progress.
     drop_scan: Option<DropScan>,
+    /// The failure of the last scan a slot read took, until the runner takes
+    /// it through [`RunnerRecords::take_scan_failure`].
+    scan_failure: Option<RecordError>,
 }
 
 impl core::fmt::Debug for VeilidRecords {
@@ -405,6 +453,7 @@ impl VeilidRecords {
             writer: Writer::new(parts.sched),
             own_channels: HashMap::new(),
             drop_scan: None,
+            scan_failure: None,
         })
     }
 
@@ -432,16 +481,17 @@ impl VeilidRecords {
     /// record ends because nobody rewrites it. A caller that wants the
     /// correspondent to see the conversation closed writes the marker first,
     /// through [`Records::write_channel`].
+    ///
+    /// **A failed erase keeps the channel open.** The owner keypair stays held,
+    /// so the delete can be retried in the same process. An erase that went
+    /// through ends the channel, and this side does not write it again.
     pub fn erase_channel(
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> core::result::Result<(), RecordError> {
         let (kind, write) = channel_erase_write(self.own(lookup_key)?);
         let erased = self.write(*lookup_key, kind, write);
-        // Dropped whatever the write did. A channel this side has stopped
-        // writing is one it must not write again, and a delete that failed has
-        // still closed the record this node held open.
-        self.own_channels.remove(lookup_key);
+        release_erased(&mut self.own_channels, lookup_key, &erased);
         erased
     }
 
@@ -485,9 +535,9 @@ impl VeilidRecords {
             || {
                 let target = &target;
                 async move {
-                    let record_lock =
-                        rendezvous::record_lock(&transport.record_locks, &target.owner.key());
-                    let handle = {
+                    let open = async {
+                        let record_lock =
+                            rendezvous::record_lock(&transport.record_locks, &target.owner.key());
                         let _open_guard = record_lock.lock().await;
                         rendezvous::open_cached_optional(
                             &transport.opened,
@@ -500,21 +550,13 @@ impl VeilidRecords {
                                 target.shape,
                             ),
                         )
-                        .await?
+                        .await
                     };
-                    // The funnel opened this record to write it, so a record this
-                    // node does not hold is not a state a confirmation can wait
-                    // out: something removed it, and that is the answer.
-                    let Some(handle) = handle else {
-                        return Err(VeilidNetError::Send(format!(
-                            "{}: the record this node just wrote is not held locally",
-                            target.subkey
-                        )));
-                    };
-                    let report =
+                    confirm_probe(target.subkey, open, |handle| async move {
                         rendezvous::inspect_local_pending(&transport.gate, &transport.rc, &handle)
-                            .await?;
-                    Ok(pending_at(&report, target.subkey))
+                            .await
+                    })
+                    .await
                 }
             },
         ))
@@ -537,19 +579,141 @@ impl VeilidRecords {
         self.write(record, DirectMessageWrite::Advert, write)
     }
 
+    /// Every subkey of the channel at `lookup_key`, as this node's sequence
+    /// number beside the network's — the report
+    /// `docs/design/direct-messaging.md` § Eviction detection reads an eviction
+    /// from.
+    ///
+    /// Two reads: a `Local` inspect for this node's numbers and for which
+    /// subkeys Veilid still has queued for its background flush, and a
+    /// `SyncSet` inspect for the network's numbers, which reports as if the
+    /// local copy did not exist. Both reports must start at subkey 0. A channel
+    /// this process opened is opened under the owner keypair and the shape it
+    /// was opened with; any other is opened read-only under [`CHANNEL_SUBKEYS`].
+    /// A record this node does not hold reports no number on either side, and so
+    /// does a subkey past the end of a report that did not reach it.
+    ///
+    /// A report that comes back with no network numbers is the network holding
+    /// no copy: Veilid builds it that way whenever its fanout gathered no copy of
+    /// the record (`veilid-core-0.5.7 src/storage_manager/inspect_record.rs:257-262`),
+    /// and the report carries no count of the nodes reached
+    /// (`src/veilid_api/types/dht/dht_record_report.rs:13-23`). A node that could
+    /// not ask gets an error instead: an inspect issued while it is not online is
+    /// refused with `TryAgain` (`src/storage_manager/inspect_record.rs:205-206`),
+    /// retried here and returned as an error once the retries are spent, and a
+    /// read that runs past its bound is an error too.
+    pub fn inspect_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        let own = self
+            .own_channels
+            .get(lookup_key)
+            .map(|own| (own.owner.clone(), own.shape));
+        let shape = match &own {
+            Some((_, shape)) => *shape,
+            None => shape_of(CHANNEL_SUBKEYS)?,
+        };
+        let transport = &self.transport;
+        let lookup_key = *lookup_key;
+        block(retry_transient("dm records channel inspect", || {
+            let own = own.clone();
+            async move {
+                let owner = identity::owner_public_key(&lookup_key);
+                let handle = {
+                    let record_lock = rendezvous::record_lock(&transport.record_locks, &owner);
+                    let _open_guard = record_lock.lock().await;
+                    let id = rendezvous::cached_record_id(&owner, shape);
+                    match own {
+                        Some((keypair, _)) => {
+                            rendezvous::open_cached_optional(
+                                &transport.opened,
+                                &id,
+                                rendezvous::open_only(
+                                    &transport.gate,
+                                    &transport.api,
+                                    &transport.rc,
+                                    &keypair,
+                                    shape,
+                                ),
+                            )
+                            .await?
+                        }
+                        None => {
+                            rendezvous::open_cached_optional(
+                                &transport.opened,
+                                &id,
+                                rendezvous::open_read_only(
+                                    &transport.gate,
+                                    &transport.api,
+                                    &transport.rc,
+                                    &lookup_key,
+                                    shape,
+                                ),
+                            )
+                            .await?
+                        }
+                    }
+                };
+                inspect_both(transport, handle, shape.o_cnt()).await
+            }
+        }))
+        .map_err(RecordError::new)
+    }
+
+    /// Every subkey of the advert record the seed owns, as this node's sequence
+    /// number beside the network's — what an advert repair decides from.
+    ///
+    /// The same two reads as [`Self::inspect_channel`], over a record opened
+    /// without creating it.
+    pub fn inspect_advert(
+        &mut self,
+        owner: &AdvertOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        self.inspect_record(owner.as_bytes(), subkeys)
+    }
+
+    /// Every slot of the drop the seed owns, as this node's sequence number
+    /// beside the network's — how a sender learns that the hello it placed
+    /// there is no longer what the network holds.
+    ///
+    /// The same two reads as [`Self::inspect_channel`], over a record opened
+    /// without creating it. The scan [`Records::read_drop_slot`] keeps is left
+    /// as it is: an inspect writes nothing.
+    pub fn inspect_drop(
+        &mut self,
+        owner: &DropOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        self.inspect_record(owner.as_bytes(), subkeys)
+    }
+
+    /// Every subkey of the record `owner_seed` owns, inspected on both sides.
+    fn inspect_record(
+        &self,
+        owner_seed: &[u8; 32],
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        let shape = shape_of(subkeys)?;
+        let owner = &owner_keypair(owner_seed)?;
+        let transport = &self.transport;
+        block(retry_transient("dm records inspect", || async move {
+            let handle = open_for_read(transport, owner, shape).await?;
+            inspect_both(transport, handle, subkeys).await
+        }))
+        .map_err(RecordError::new)
+    }
+
     /// The channel this side owns under `lookup_key`, or a refusal naming what
     /// the caller has to do first.
     fn own(
         &self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> core::result::Result<&OwnChannel, RecordError> {
-        self.own_channels.get(lookup_key).ok_or_else(|| {
-            RecordError::new(VeilidNetError::Send(
-                "this channel has not been opened in this process, so its owner \
-                 keypair is not held: open it before writing it"
-                    .to_owned(),
-            ))
-        })
+        self.own_channels
+            .get(lookup_key)
+            .ok_or_else(|| RecordError::new(RecordsError::ChannelNotOpened))
     }
 
     /// Read one subkey of the record `owner_seed` owns, under `subkeys`.
@@ -566,9 +730,10 @@ impl VeilidRecords {
         subkey: u32,
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
         let shape = shape_of(subkeys)?;
+        let owner = &owner_keypair(owner_seed)?;
         let transport = &self.transport;
         block(retry_transient("dm records read", || async move {
-            let Some(handle) = open_for_read(transport, owner_seed, shape).await? else {
+            let Some(handle) = open_for_read(transport, owner, shape).await? else {
                 return Ok(None);
             };
             get_subkey(&transport.gate, &transport.rc, &handle, subkey).await
@@ -596,16 +761,21 @@ impl VeilidRecords {
 
     /// Take a scan of the drop `owner_seed` owns, for the pass beginning now.
     ///
-    /// `None` means the scan could not be taken and every slot is to be read —
+    /// An error means the scan could not be taken and every slot is to be read —
     /// a transport that will not answer an inspect must never be read as a drop
     /// that holds nothing, because that would silently discard every hello in
     /// it. An absent record is the opposite case and is an answer: it has no
     /// slots at all, so the scan says so and the pass costs nothing.
-    fn scan_drop(&self, owner_seed: &[u8; 32], subkeys: u16) -> Option<DropScan> {
-        let shape = shape_of(subkeys).ok()?;
+    fn scan_drop(
+        &self,
+        owner_seed: &[u8; 32],
+        subkeys: u16,
+    ) -> core::result::Result<DropScan, RecordError> {
+        let shape = shape_of(subkeys)?;
+        let owner = &owner_keypair(owner_seed)?;
         let transport = &self.transport;
         let scanned = block(retry_transient("dm records drop inspect", || async move {
-            let Some(handle) = open_for_read(transport, owner_seed, shape).await? else {
+            let Some(handle) = open_for_read(transport, owner, shape).await? else {
                 return Ok(None);
             };
             rendezvous::inspect_sync_set(&transport.gate, &transport.rc, &handle)
@@ -613,17 +783,17 @@ impl VeilidRecords {
                 .map(Some)
         }));
         match scanned {
-            Ok(Some(seqs)) => Some(DropScan {
+            Ok(Some(seqs)) => Ok(DropScan {
                 owner: *owner_seed,
                 populated: populated_subkeys(&seqs, subkeys),
             }),
-            Ok(None) => Some(DropScan {
+            Ok(None) => Ok(DropScan {
                 owner: *owner_seed,
                 populated: vec![false; usize::from(subkeys)],
             }),
             Err(e) => {
                 crate::vtrace!("dm records: drop inspect failed ({e}); reading every slot");
-                None
+                Err(RecordError::new(e))
             }
         }
     }
@@ -645,7 +815,9 @@ impl Records for VeilidRecords {
     /// scan is taken; every later slot of that pass is answered from it. A
     /// caller reading a single slot rather than scanning — a hello's read-back
     /// — reads through whatever scan is current, which either says the slot
-    /// holds something and it is fetched, or is of another drop and ignored.
+    /// holds something and it is fetched, or is of another drop and ignored. A
+    /// scan that fails leaves every slot to be read, and its failure is kept for
+    /// [`RunnerRecords::take_scan_failure`], since the read itself goes on.
     fn read_drop_slot(
         &mut self,
         owner: &DropOwnerSeed,
@@ -654,7 +826,13 @@ impl Records for VeilidRecords {
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
         let owner_seed = *owner.as_bytes();
         if slot == 0 {
-            self.drop_scan = self.scan_drop(&owner_seed, subkeys);
+            self.drop_scan = match self.scan_drop(&owner_seed, subkeys) {
+                Ok(scan) => Some(scan),
+                Err(failure) => {
+                    self.scan_failure = Some(failure);
+                    None
+                }
+            };
         }
         if let Some(scan) = &self.drop_scan {
             if scan.covers(&owner_seed) && !scan.needs_get(slot) {
@@ -819,6 +997,213 @@ impl Records for VeilidRecords {
     }
 }
 
+impl RunnerRecords for VeilidRecords {
+    /// A [`VeilidNetError::TimedOut`] ran out of time. That variant is built where
+    /// the timeout is first seen, from the typed error: an open or a read cut
+    /// off at its bound, a call Veilid answered with `Timeout`, and a write the
+    /// network had not taken when its confirmation budget ran out. Local, never
+    /// having reached the network: a [`RecordsError`] (an unopened channel, an
+    /// unusable subkey count, an owner key that would not derive) and a
+    /// [`VeilidNetError::Local`] (a runtime the bridge cannot use, a record this
+    /// node just wrote and no longer holds, a write the scheduler never took
+    /// because it is gone, or a call Veilid refused before sending it). Every
+    /// other failure is a refusal: transient refusals whose retries were spent,
+    /// and a [`VeilidNetError::Actor`], a reply the scheduler dropped or a
+    /// dispatch task that panicked, which may come after the write was sent.
+    fn classify(error: &RecordError) -> RecordFailure {
+        let inner = error.inner();
+        if inner.downcast_ref::<RecordsError>().is_some() {
+            return RecordFailure::Local;
+        }
+        match inner.downcast_ref::<VeilidNetError>() {
+            Some(VeilidNetError::TimedOut(_)) => RecordFailure::TimedOut,
+            Some(VeilidNetError::Local(_)) => RecordFailure::Local,
+            _ => RecordFailure::Refused,
+        }
+    }
+
+    fn take_scan_failure(&mut self) -> Option<RecordError> {
+        self.scan_failure.take()
+    }
+
+    /// The same [`RecordsError`], or a [`VeilidNetError::Local`] naming the same
+    /// refusal.
+    fn same_local_refusal(scan: &RecordError, read: &RecordError) -> bool {
+        let (scan, read) = (scan.inner(), read.inner());
+        match (
+            scan.downcast_ref::<RecordsError>(),
+            read.downcast_ref::<RecordsError>(),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => matches!(
+                (
+                    scan.downcast_ref::<VeilidNetError>(),
+                    read.downcast_ref::<VeilidNetError>(),
+                ),
+                (Some(VeilidNetError::Local(a)), Some(VeilidNetError::Local(b))) if a == b
+            ),
+        }
+    }
+
+    fn inspect_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        VeilidRecords::inspect_channel(self, lookup_key)
+    }
+
+    fn inspect_advert(
+        &mut self,
+        owner: &AdvertOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        VeilidRecords::inspect_advert(self, owner, subkeys)
+    }
+
+    fn inspect_drop(
+        &mut self,
+        owner: &DropOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        VeilidRecords::inspect_drop(self, owner, subkeys)
+    }
+
+    fn publish_advert(
+        &mut self,
+        owner: &AdvertOwnerSeed,
+        subkeys: u16,
+        bytes: &[u8],
+    ) -> core::result::Result<(), RecordError> {
+        VeilidRecords::publish_advert(self, owner, subkeys, bytes)
+    }
+
+    fn erase_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> core::result::Result<(), RecordError> {
+        VeilidRecords::erase_channel(self, lookup_key)
+    }
+
+    /// Open the channel record the seed owns without creating it. `None` is
+    /// Veilid finding no such record, which is not evidence that no node holds
+    /// one; a record this node does not hold has no local copy to erase.
+    fn open_existing_channel(
+        &mut self,
+        owner: &ChannelOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Option<[u8; HELLO_LOOKUP_KEY_LEN]>, RecordError> {
+        let (shape, keypair, lookup_key) = channel_open_plan(owner.as_bytes(), subkeys)?;
+        let transport = &self.transport;
+        let opening = keypair.clone();
+        let opened = block(retry_transient(
+            "dm records channel open without create",
+            || {
+                let opening = opening.clone();
+                async move {
+                    let record_lock =
+                        rendezvous::record_lock(&transport.record_locks, &opening.key());
+                    let _open_guard = record_lock.lock().await;
+                    rendezvous::open_cached_optional(
+                        &transport.opened,
+                        &rendezvous::cached_record_id(&opening.key(), shape),
+                        rendezvous::open_only(
+                            &transport.gate,
+                            &transport.api,
+                            &transport.rc,
+                            &opening,
+                            shape,
+                        ),
+                    )
+                    .await
+                    .map(|handle| handle.is_some())
+                }
+            },
+        ))
+        .map_err(RecordError::new)?;
+        if !opened {
+            return Ok(None);
+        }
+        self.own_channels.insert(
+            lookup_key,
+            OwnChannel {
+                owner: keypair,
+                shape,
+            },
+        );
+        Ok(Some(lookup_key))
+    }
+
+    fn write_counts(&self) -> WriteCountsSnapshot {
+        VeilidRecords::write_counts(self)
+    }
+}
+
+impl RunnerParts<VeilidRecords> {
+    /// The parts of a runner over the Veilid distributed hash table: a
+    /// [`VeilidRecords`] built from `parts`, and the identity, key and profile
+    /// directory the runner needs beside it.
+    ///
+    /// Fails where [`VeilidRecords::new`] does, which is on any thread that is
+    /// not a multi-thread tokio runtime worker.
+    pub fn over_veilid(
+        parts: VeilidRecordsParts,
+        signer: Arc<SignKeypair>,
+        channel_root: DmChannelRootSecret,
+        at_rest_key: Zeroizing<[u8; AEAD_KEY_LEN]>,
+        profile_root: PathBuf,
+        config: RunnerConfig,
+    ) -> core::result::Result<Self, RecordsError> {
+        Ok(Self {
+            records: VeilidRecords::new(parts)?,
+            signer,
+            channel_root,
+            at_rest_key,
+            profile_root,
+            config,
+        })
+    }
+}
+
+/// Both inspects of one open record, as one [`SubkeyReport`] per subkey.
+///
+/// `None` is a record this node does not hold, which reports no number on
+/// either side for every subkey.
+async fn inspect_both(
+    transport: &Transport,
+    handle: Option<RendezvousHandle>,
+    subkeys: u16,
+) -> Result<Vec<SubkeyReport>> {
+    let Some(handle) = handle else {
+        return Ok(vec![SubkeyReport::default(); usize::from(subkeys)]);
+    };
+    let local = rendezvous::inspect_local_pending(&transport.gate, &transport.rc, &handle).await?;
+    let network = rendezvous::inspect_sync_set(&transport.gate, &transport.rc, &handle).await?;
+    Ok(seq_reports(&local, &network, subkeys))
+}
+
+/// One report per subkey of an `o_cnt`-subkey record, from a `Local` report and
+/// a positional list of network numbers.
+///
+/// A subkey past the end of either list has no number on that side: a report
+/// that did not reach a subkey says nothing about it. A subkey Veilid still
+/// has queued for its flush is marked pending, whatever its numbers say.
+fn seq_reports(
+    local: &rendezvous::LocalPending,
+    network: &[ValueSeqNum],
+    o_cnt: u16,
+) -> Vec<SubkeyReport> {
+    (0..o_cnt)
+        .map(|subkey| {
+            let i = usize::from(subkey);
+            SubkeyReport {
+                local_seq: local.seqs.get(i).and_then(|s| s.to_option()).map(u64::from),
+                network_seq: network.get(i).and_then(|s| s.to_option()).map(u64::from),
+                pending: local.pending.contains(u32::from(subkey)),
+            }
+        })
+        .collect()
+}
+
 /// The record and subkey a submitted write is confirmed at.
 ///
 /// Taken from the write before the funnel consumes it, because the confirmation
@@ -931,27 +1316,37 @@ impl RecordWrite {
     }
 }
 
-/// Open the record `owner_seed` owns for reading, without creating it.
+/// Open the record `owner` owns for reading, without creating it.
 async fn open_for_read(
     transport: &Transport,
-    owner_seed: &[u8; 32],
+    owner: &KeyPair,
     shape: RecordShape,
 ) -> Result<Option<RendezvousHandle>> {
-    let owner = identity::rendezvous_owner_keypair(owner_seed)?;
     let record_lock = rendezvous::record_lock(&transport.record_locks, &owner.key());
     let _open_guard = record_lock.lock().await;
     rendezvous::open_cached_optional(
         &transport.opened,
         &rendezvous::cached_record_id(&owner.key(), shape),
-        rendezvous::open_only(
-            &transport.gate,
-            &transport.api,
-            &transport.rc,
-            &owner,
-            shape,
-        ),
+        rendezvous::open_only(&transport.gate, &transport.api, &transport.rc, owner, shape),
     )
     .await
+}
+
+/// The owner keypair of the record `owner_seed` names, or
+/// [`RecordsError::OwnerKey`] where it will not derive. Derived before any call
+/// is bridged, so a read, a write and an open all refuse the same way.
+fn owner_keypair(owner_seed: &[u8; 32]) -> core::result::Result<KeyPair, RecordError> {
+    identity::rendezvous_owner_keypair(owner_seed)
+        .map_err(|_| RecordError::new(RecordsError::OwnerKey))
+}
+
+/// The refusal a write's confirmation reaches when the record it just wrote is
+/// not held here any more: something on this node removed it, so no probe of
+/// the network can answer for it.
+fn not_held_locally(subkey: u32) -> VeilidNetError {
+    VeilidNetError::Local(format!(
+        "{subkey}: the record this node just wrote is not held locally"
+    ))
 }
 
 /// One bounded, permitted GET of `subkey`, as bytes or as an empty slot.
@@ -1008,7 +1403,7 @@ fn subkey_write(
     value: &[u8],
 ) -> core::result::Result<([u8; 32], RecordWrite), RecordError> {
     let shape = shape_of(subkeys)?;
-    let owner = identity::rendezvous_owner_keypair(owner_seed).map_err(RecordError::new)?;
+    let owner = owner_keypair(owner_seed)?;
     Ok((
         funnel_record_key(owner_seed),
         RecordWrite {
@@ -1020,6 +1415,17 @@ fn subkey_write(
             },
         },
     ))
+}
+
+/// Stop holding a channel whose erase went through, and keep one whose erase failed.
+fn release_erased(
+    own_channels: &mut HashMap<[u8; HELLO_LOOKUP_KEY_LEN], OwnChannel>,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    erased: &core::result::Result<(), RecordError>,
+) {
+    if erased.is_ok() {
+        own_channels.remove(lookup_key);
+    }
 }
 
 /// The kind and dispatch token for erasing a channel record this side owns.
@@ -1089,7 +1495,7 @@ fn channel_open_plan(
     subkeys: u16,
 ) -> core::result::Result<(RecordShape, KeyPair, [u8; HELLO_LOOKUP_KEY_LEN]), RecordError> {
     let shape = shape_of(subkeys)?;
-    let keypair = identity::rendezvous_owner_keypair(owner_seed).map_err(RecordError::new)?;
+    let keypair = owner_keypair(owner_seed)?;
     Ok((shape, keypair, funnel_record_key(owner_seed)))
 }
 
@@ -1205,15 +1611,35 @@ fn on_network(local: ValueSeqNum, pending: bool) -> bool {
     local.is_some() && !pending
 }
 
-/// Whether a failure is a read that was cut off at its bound rather than
-/// answered.
+/// Whether a failure is a call that ran out of time rather than an answer.
 ///
-/// `gated_bounded_get` abandons a read that has not answered within its bound
-/// and reports it as `… GET exceeded Ns, abandoned`; to a retry that is a real
-/// refusal, because the hop was spent, but to a confirmation it is a poll with
-/// no answer, and the next poll is the answer.
+/// `gated_bounded_get` and `gated_bounded_open` abandon a call that has not
+/// answered within its bound, and Veilid answers some calls with `Timeout`;
+/// each is [`VeilidNetError::TimedOut`]. To a retry that is a real refusal,
+/// because the hop was spent, but to a confirmation it is a poll with no answer,
+/// and the next poll is the answer.
 fn is_unanswered(error: &VeilidNetError) -> bool {
-    error.to_string().contains("abandoned")
+    matches!(error, VeilidNetError::TimedOut(_))
+}
+
+/// One confirmation probe: `open` opens the written record without creating
+/// it, then `inspect` reads this node's numbers from it, and the result is
+/// taken at `subkey`.
+///
+/// The funnel opened this record to write it, so a record this node does not
+/// hold is not a state a confirmation can wait out: something removed it, and
+/// [`not_held_locally`] is the answer.
+async fn confirm_probe<H, O, I, F>(subkey: u32, open: O, inspect: I) -> Result<(ValueSeqNum, bool)>
+where
+    O: core::future::Future<Output = Result<Option<H>>>,
+    I: FnOnce(H) -> F,
+    F: core::future::Future<Output = Result<rendezvous::LocalPending>>,
+{
+    let Some(handle) = open.await? else {
+        return Err(not_held_locally(subkey));
+    };
+    let report = inspect(handle).await?;
+    Ok(pending_at(&report, subkey))
 }
 
 /// Poll `probe`, which reports the subkey's local sequence number and whether
@@ -1229,7 +1655,9 @@ fn is_unanswered(error: &VeilidNetError) -> bool {
 /// which of its writes the network never took. The wait between probes starts
 /// at `poll.0` and doubles to `poll.1`: short at first, when the write is most
 /// likely to have just landed, and no faster than the flush it may be waiting
-/// on after that.
+/// on after that. Each probe runs under what is left of the budget, its waits
+/// for the record's lock and for a read permit included, so a probe that cannot
+/// start does not hold the confirmation past its budget.
 async fn confirm_on_network<F, Fut>(
     what: &str,
     budget: Duration,
@@ -1243,29 +1671,47 @@ where
     let started = tokio::time::Instant::now();
     let (first, max) = poll;
     let mut wait = first;
+    let mut answered = false;
+    let mut last_unanswered = String::new();
     loop {
-        match probe().await {
-            Ok((local, pending)) if on_network(local, pending) => {
+        let remaining = budget.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, probe()).await {
+            Err(_elapsed) => {
+                crate::vtrace!("{what}: a probe was still waiting when the budget ran out");
+                last_unanswered = "a probe still waiting when the budget ran out".to_owned();
+            }
+            Ok(Ok((local, pending))) if on_network(local, pending) => {
                 crate::vtrace!(
                     "{what}: on the network (local {local:?}) after {:.1}s",
                     started.elapsed().as_secs_f64()
                 );
                 return Ok(());
             }
-            Ok((local, pending)) => crate::vtrace!(
-                "{what}: not on the network yet (local {local:?}, queued {pending}) at {:.1}s",
-                started.elapsed().as_secs_f64()
-            ),
-            Err(e) if is_transient(&e) || is_unanswered(&e) => {
-                crate::vtrace!("{what}: confirmation got no answer ({e}); polling on")
+            Ok(Ok((local, pending))) => {
+                answered = true;
+                crate::vtrace!(
+                    "{what}: not on the network yet (local {local:?}, queued {pending}) at {:.1}s",
+                    started.elapsed().as_secs_f64()
+                )
             }
-            Err(e) => return Err(e),
+            Ok(Err(e)) if is_transient(&e) || is_unanswered(&e) => {
+                crate::vtrace!("{what}: confirmation got no answer ({e}); polling on");
+                last_unanswered = e.to_string();
+            }
+            Ok(Err(e)) => return Err(e),
         }
         if started.elapsed() >= budget {
-            return Err(VeilidNetError::Routing(format!(
-                "{what}: not on the network after {}s",
-                budget.as_secs()
-            )));
+            // Only a probe that answered said anything about the network; one
+            // that never did leaves the write unchecked, not absent.
+            return Err(VeilidNetError::TimedOut(if answered {
+                format!("{what}: not on the network after {}s", budget.as_secs())
+            } else {
+                format!(
+                    "{what}: could not be checked within {}s, no probe was answered \
+                     (the last: {last_unanswered})",
+                    budget.as_secs()
+                )
+            }));
         }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(max);
@@ -1278,7 +1724,7 @@ where
 /// is [`Send`], so the thread that built it need not be the thread using it,
 /// and `block_in_place` panics rather than erroring on the wrong one.
 fn block<T>(fut: impl core::future::Future<Output = Result<T>>) -> Result<T> {
-    require_multi_thread().map_err(|e| VeilidNetError::Actor(e.to_string()))?;
+    require_multi_thread().map_err(|e| VeilidNetError::Local(e.to_string()))?;
     tokio::task::block_in_place(|| Handle::current().block_on(fut))
 }
 
@@ -1300,11 +1746,7 @@ fn require_multi_thread() -> core::result::Result<(), RecordsError> {
 /// an abort.
 fn shape_of(subkeys: u16) -> core::result::Result<RecordShape, RecordError> {
     if !(1..=rendezvous::MAX_SUBKEY_COUNT).contains(&subkeys) {
-        return Err(RecordError::new(VeilidNetError::Send(format!(
-            "subkey count {subkeys} is outside 1..={} — it is part of the record \
-             address, so no record can be named with it",
-            rendezvous::MAX_SUBKEY_COUNT
-        ))));
+        return Err(RecordError::new(RecordsError::SubkeyCount(subkeys)));
     }
     Ok(RecordShape::new(subkeys))
 }
@@ -1312,6 +1754,102 @@ fn shape_of(subkeys: u16) -> core::result::Result<RecordShape, RecordError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How a failure is classified, from the code that produces it rather than
+    /// from its text: an open Veilid answers with `Timeout` (which is also what
+    /// an open cut off at its bound returns), a write or a deletion Veilid
+    /// answers with `Timeout`, a read cut off at its bound or answered with
+    /// `Timeout`, and a write the network had not taken when its confirmation
+    /// budget ran out are timeouts. Any other refusal from the same code is a
+    /// refusal, and a call refused before it reached the network is local.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failure_is_classified_from_the_code_that_produced_it() {
+        use veilid_core::VeilidAPIError;
+        let classify = |error: VeilidNetError| {
+            <VeilidRecords as RunnerRecords>::classify(&RecordError::new(error))
+        };
+        let try_again = || VeilidAPIError::TryAgain {
+            message: "offline".to_owned(),
+        };
+
+        assert_eq!(
+            classify(rendezvous::open_failure(
+                "open_only",
+                VeilidAPIError::Timeout
+            )),
+            RecordFailure::TimedOut
+        );
+        assert_eq!(
+            classify(rendezvous::open_failure("open_only", try_again())),
+            RecordFailure::Refused
+        );
+        assert_eq!(
+            classify(rendezvous::write_failure(
+                "set_dht_value",
+                VeilidAPIError::Timeout
+            )),
+            RecordFailure::TimedOut
+        );
+        assert_eq!(
+            classify(rendezvous::write_failure("set_dht_value", try_again())),
+            RecordFailure::Refused
+        );
+        for local in [
+            rendezvous::open_failure("open_only", VeilidAPIError::Shutdown),
+            rendezvous::write_failure("delete_dht_record", VeilidAPIError::NotInitialized),
+            not_held_locally(3),
+        ] {
+            let shown = local.to_string();
+            assert_eq!(
+                classify(local),
+                RecordFailure::Local,
+                "{shown} never reached the network"
+            );
+        }
+        let unbridged =
+            block(async { Ok(()) }).expect_err("a current-thread runtime cannot carry the bridge");
+        assert_eq!(classify(unbridged), RecordFailure::Local);
+
+        let gate = crate::dht_gate::DhtGate::with_pools(2, 1, 2, 1);
+        let never = std::future::pending::<std::result::Result<Option<Vec<u8>>, VeilidAPIError>>();
+        let abandoned = gated_bounded_get(&gate, "dm records", never)
+            .await
+            .expect_err("a read that never answers is abandoned");
+        assert_eq!(classify(abandoned), RecordFailure::TimedOut);
+        let answered_timeout = gated_bounded_get(&gate, "dm records", async {
+            Err::<Option<Vec<u8>>, _>(VeilidAPIError::Timeout)
+        })
+        .await
+        .expect_err("a read Veilid answers with Timeout fails");
+        assert_eq!(classify(answered_timeout), RecordFailure::TimedOut);
+        let refused_read = gated_bounded_get(&gate, "dm records", async {
+            Err::<Option<Vec<u8>>, _>(try_again())
+        })
+        .await
+        .expect_err("a read Veilid refuses fails");
+        assert_eq!(classify(refused_read), RecordFailure::Refused);
+
+        let unconfirmed = confirm_on_network(
+            "advert write to subkey 0",
+            Duration::from_secs(30),
+            (Duration::from_secs(2), Duration::from_secs(10)),
+            || async { Ok((seq(0), true)) },
+        )
+        .await
+        .expect_err("the budget ends the wait");
+        assert_eq!(classify(unconfirmed), RecordFailure::TimedOut);
+
+        let unusable = shape_of(0).expect_err("no record has no subkeys");
+        assert_eq!(
+            <VeilidRecords as RunnerRecords>::classify(&unusable),
+            RecordFailure::Local
+        );
+        let unopened = RecordError::new(RecordsError::ChannelNotOpened);
+        assert_eq!(
+            <VeilidRecords as RunnerRecords>::classify(&unopened),
+            RecordFailure::Local
+        );
+    }
 
     use std::sync::Mutex;
 
@@ -1737,7 +2275,7 @@ mod tests {
             || async {
                 match probes.fetch_add(1, Ordering::Relaxed) {
                     0 => Err(VeilidNetError::Routing("TryAgain: offline".to_owned())),
-                    1 => Err(VeilidNetError::Routing(
+                    1 => Err(VeilidNetError::TimedOut(
                         "inspect_local_pending: GET exceeded 15s, abandoned".to_owned(),
                     )),
                     2 => Ok((ValueSeqNum::NONE, false)),
@@ -1779,6 +2317,236 @@ mod tests {
             6,
             "probes at 0, 2, 6, 14, 24 and 34 seconds, then the budget is spent"
         );
+    }
+
+    /// A confirmation whose probes all run out of time without an answer polls
+    /// through each of them, whatever the timeout's text, and once the budget is
+    /// spent reports the write as not checked rather than as not on the network.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_confirmation_no_probe_answered_says_it_could_not_check() {
+        let probes = AtomicU64::new(0);
+        let unchecked = confirm_on_network(
+            "advert write to subkey 0",
+            Duration::from_secs(30),
+            (Duration::from_secs(2), Duration::from_secs(10)),
+            || async {
+                probes.fetch_add(1, Ordering::Relaxed);
+                Err::<(ValueSeqNum, bool), _>(VeilidNetError::TimedOut(
+                    "open_only: Timeout".to_owned(),
+                ))
+            },
+        )
+        .await
+        .expect_err("the budget ends the wait");
+        let text = unchecked.to_string();
+        assert!(matches!(unchecked, VeilidNetError::TimedOut(_)), "{text}");
+        assert!(
+            text.contains("could not be checked") && !text.contains("not on the network"),
+            "the error says the write went unchecked: {text}"
+        );
+        assert!(
+            text.contains("open_only: Timeout"),
+            "the error carries the last unanswered probe's own text: {text}"
+        );
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            6,
+            "an open that runs out of time is polled through, at 0, 2, 6, 14, 24 and 34 seconds"
+        );
+    }
+
+    /// A confirmation's probe whose open runs out of time, as the open reports it,
+    /// is polled through until the budget is spent, for both opens a probe of
+    /// this layer's records goes through.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_confirmation_whose_open_times_out_polls_on() {
+        use veilid_core::VeilidAPIError;
+        for what in ["open_only", "open_read_only"] {
+            let probes = AtomicU64::new(0);
+            let unchecked = confirm_on_network(
+                "hello write to subkey 5",
+                Duration::from_secs(30),
+                (Duration::from_secs(2), Duration::from_secs(10)),
+                || {
+                    probes.fetch_add(1, Ordering::Relaxed);
+                    confirm_probe(
+                        5,
+                        async {
+                            rendezvous::open_outcome(
+                                what,
+                                Err::<(), _>(VeilidAPIError::Timeout),
+                                (),
+                            )
+                        },
+                        |()| async { Err(VeilidNetError::Routing("never inspected".to_owned())) },
+                    )
+                },
+            )
+            .await
+            .expect_err("the budget ends the wait");
+            let text = unchecked.to_string();
+            assert!(
+                text.contains("could not be checked") && text.contains(what),
+                "{what}: an open that timed out leaves the write unchecked: {text}"
+            );
+            assert_eq!(
+                probes.load(Ordering::Relaxed),
+                6,
+                "{what}: the timed-out open is polled through"
+            );
+        }
+    }
+
+    /// A confirmation's probe that finds the written record no longer held on
+    /// this node ends the confirmation at once, as a local refusal.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_confirmation_of_a_record_no_longer_held_ends_at_once() {
+        let probes = AtomicU64::new(0);
+        let ended = confirm_on_network(
+            "hello write to subkey 5",
+            Duration::from_secs(300),
+            (Duration::from_secs(2), Duration::from_secs(10)),
+            || {
+                probes.fetch_add(1, Ordering::Relaxed);
+                confirm_probe(
+                    5,
+                    async { Ok::<Option<()>, VeilidNetError>(None) },
+                    |()| async { Err(VeilidNetError::Routing("never inspected".to_owned())) },
+                )
+            },
+        )
+        .await
+        .expect_err("a record no longer held ends the wait");
+        assert_eq!(
+            probes.load(Ordering::Relaxed),
+            1,
+            "no probe after the first"
+        );
+        assert!(matches!(ended, VeilidNetError::Local(_)), "{ended}");
+        assert_eq!(
+            <VeilidRecords as RunnerRecords>::classify(&RecordError::new(ended)),
+            RecordFailure::Local
+        );
+    }
+
+    /// A probe waiting on a lock another holder never releases does not hold the
+    /// confirmation past its budget.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_probe_waiting_on_a_held_lock_does_not_outlast_the_budget() {
+        let lock = tokio::sync::Mutex::new(());
+        let _held = lock.lock().await;
+        let started = tokio::time::Instant::now();
+        let unchecked = tokio::time::timeout(
+            Duration::from_secs(600),
+            confirm_on_network(
+                "hello write to subkey 5",
+                Duration::from_secs(30),
+                (Duration::from_secs(2), Duration::from_secs(10)),
+                || async {
+                    let _guard = lock.lock().await;
+                    Ok((seq(0), false))
+                },
+            ),
+        )
+        .await
+        .expect("the confirmation returns once its budget is spent")
+        .expect_err("the probe never answered");
+        assert!(
+            started.elapsed() <= Duration::from_secs(31),
+            "it returned at its budget: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            unchecked.to_string().contains("could not be checked"),
+            "{unchecked}"
+        );
+    }
+
+    /// A sink whose dispatch panics.
+    struct Panicking;
+
+    impl WriteSink for Panicking {
+        type Item = ProdWrite;
+
+        fn dispatch(&self, _item: ProdWrite, _lane: DispatchLane) -> DispatchFuture {
+            Box::pin(async { panic!("the sink panics mid-dispatch") })
+        }
+    }
+
+    /// The write scheduler's failures reach the runner classed by when they can
+    /// happen: a scheduler already gone never took the write, which is local; a
+    /// reply it dropped unsent and a dispatch that panicked may follow the
+    /// write's send, which are refusals.
+    #[test]
+    fn a_scheduler_failure_is_local_only_before_the_write_was_taken() {
+        let recording = || {
+            Arc::new(Recording {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                kind: DirectMessageWrite::Hello,
+            })
+        };
+        let hello =
+            || drop_slot_write(&SEED, DROP_SUBKEYS, 5, Some(&[7, 7])).expect("the hello shapes");
+        let never_driven = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a current-thread runtime builds")
+        };
+
+        let idle = never_driven();
+        let gone =
+            Writer::new(idle.block_on(async {
+                WriteScheduler::spawn(recording(), SchedulerConfig::default())
+            }));
+        drop(idle);
+        let (kind, record, write) = hello();
+        let gone_reply = gone.send(record, kind, write);
+
+        let stalled = never_driven();
+        let dropping =
+            Writer::new(stalled.block_on(async {
+                WriteScheduler::spawn(recording(), SchedulerConfig::default())
+            }));
+        let (kind, record, write) = hello();
+        let dropped_reply = dropping.send(record, kind, write);
+        drop(stalled);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a multi-thread runtime builds");
+        runtime.block_on(async {
+            let classify =
+                |failure: RecordError| <VeilidRecords as RunnerRecords>::classify(&failure);
+            let failure = wait_for_reply(gone_reply).expect_err("a scheduler already gone");
+            assert_eq!(
+                classify(failure),
+                RecordFailure::Local,
+                "a scheduler already gone never took the write"
+            );
+            let failure = wait_for_reply(dropped_reply)
+                .expect_err("a scheduler that stopped with the write queued");
+            assert_eq!(
+                classify(failure),
+                RecordFailure::Refused,
+                "a reply dropped unsent may follow the write's send"
+            );
+            let panicking = Writer::new(WriteScheduler::spawn(
+                Arc::new(Panicking),
+                SchedulerConfig::default(),
+            ));
+            let (kind, record, write) = hello();
+            let failure = panicking
+                .submit(record, kind, write)
+                .expect_err("a dispatch that panics");
+            assert_eq!(
+                classify(failure),
+                RecordFailure::Refused,
+                "a dispatch that panicked may follow the write's send"
+            );
+        });
     }
 
     /// A refusal that is an answer about the record ends the wait at once.
@@ -1866,6 +2634,26 @@ mod tests {
         assert!(
             write.confirm_target().is_none(),
             "and has no network state to wait for"
+        );
+    }
+
+    /// A channel whose erase failed stays held, so the delete can be retried,
+    /// and one whose erase went through is released.
+    #[test]
+    fn a_failed_channel_erase_keeps_the_channel_and_a_successful_one_releases_it() {
+        let (shape, owner, lookup_key) =
+            channel_open_plan(&SEED, CHANNEL_SUBKEYS).expect("the plan shapes");
+        let mut own = HashMap::from([(lookup_key, OwnChannel { owner, shape })]);
+        let refused = Err(RecordError::new(RecordsError::ChannelNotOpened));
+        release_erased(&mut own, &lookup_key, &refused);
+        assert!(
+            own.contains_key(&lookup_key),
+            "a failed erase keeps the channel"
+        );
+        release_erased(&mut own, &lookup_key, &Ok(()));
+        assert!(
+            !own.contains_key(&lookup_key),
+            "an erase that went through releases it"
         );
     }
 

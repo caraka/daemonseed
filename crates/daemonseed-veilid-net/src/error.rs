@@ -15,6 +15,23 @@ pub enum VeilidNetError {
     #[error("send failed: {0}")]
     Send(String),
 
+    /// A network call that ran out of time: an open or a read cut off at its
+    /// bound, a call Veilid itself answered with `Timeout`, or a write the
+    /// network had not taken when its confirmation budget ran out. Told apart
+    /// from [`Self::Routing`] and [`Self::Send`] where the timeout is first seen,
+    /// so a caller counting failures can count it as one.
+    #[error("timed out: {0}")]
+    TimedOut(String),
+
+    /// A failure that never left this node: a runtime that cannot carry the
+    /// call, a record this node expected to hold and does not, a write the
+    /// scheduler never took because it is gone, or a call Veilid refused before
+    /// sending it (`NotInitialized`, `AlreadyInitialized`, `Shutdown`,
+    /// `Unimplemented`, `ParseError`, `InvalidArgument`, `MissingArgument` or
+    /// `TransactionNotFound`).
+    #[error("refused locally: {0}")]
+    Local(String),
+
     /// The peer ANSWERED, but does not serve the requested share/chunk — it was
     /// withdrawn (unpublished via `stop_serve`) or never offered. Distinct from a
     /// transport error (`Send` / offline / slow / dead route): this is an
@@ -40,85 +57,6 @@ pub enum VeilidNetError {
     #[error("actor channel error: {0}")]
     Actor(String),
 
-    /// A DM channel page's record was opened under a shape whose `o_cnt` is not
-    /// `daemonseed_core::dm::paging::PAGE_SLOTS`, so it is not a page and is not
-    /// swept (#254).
-    ///
-    /// **Checked in BOTH directions, and the low side is the one that hides.** A
-    /// shape *above* `PAGE_SLOTS` yields slot indices the page cannot hold and
-    /// surfaces as [`Self::DmPageSlotOutsideRecord`]. A shape *below* it yields no
-    /// unplaceable slot at all: the sweep is bounded by the record's own `o_cnt`, so
-    /// every position it produces places cleanly, and the caller gets `Ok` with a
-    /// **silently truncated page** — the messages in the missing slots simply do not
-    /// exist as far as the collector can tell. That is exactly the "lost message
-    /// under an `Ok`" the sibling variant's docs say cannot happen, reached from the
-    /// other side, so the shape is compared before any slot is read.
-    #[error(
-        "dm page {page}'s record has {o_cnt} slot(s), not the {} a page holds",
-        daemonseed_core::dm::paging::PAGE_SLOTS
-    )]
-    DmPageShapeMismatch {
-        /// The page whose record was opened.
-        page: u64,
-        /// The `o_cnt` the opened record actually carries.
-        o_cnt: u16,
-    },
-
-    /// A DM channel-page sweep returned a slot the addressed page cannot hold
-    /// (#254).
-    ///
-    /// A slot outside the page means the record was opened under a shape whose
-    /// `o_cnt` exceeds `daemonseed_core::dm::paging::PAGE_SLOTS`, so the position
-    /// belongs to some other page — the ISC-C100 failure mode. The page number
-    /// itself cannot be at fault: `DmPageAddress` refuses a page above `MAX_PAGE` at
-    /// construction.
-    ///
-    /// **This is now the second line, not the first.** The sweep compares the
-    /// record's `o_cnt` against `PAGE_SLOTS` before reading any slot and fails as
-    /// [`Self::DmPageShapeMismatch`], which is what makes the too-small direction
-    /// loud as well — so a shape disagreement is caught before it can produce an
-    /// unplaceable slot, and reaching this variant means the placement itself went
-    /// wrong. It is kept because the alternative to reporting is skipping the slot,
-    /// and a skipped slot is a lost message under an `Ok`.
-    #[error("dm page sweep returned slot {slot}, which page {page}'s record cannot hold")]
-    DmPageSlotOutsideRecord {
-        /// The page that was swept.
-        page: u64,
-        /// The subkey index that came back.
-        slot: u32,
-    },
-
-    /// A doorbell subkey outside the record's slot count — either supplied by a
-    /// caller that did not reduce mod `DOORBELL_SLOTS`, or returned by a sweep of
-    /// a record whose shape exceeds it.
-    ///
-    /// Reported rather than skipped, for the reason
-    /// [`Self::DmPageSlotOutsideRecord`] gives: a skipped slot is a knock the
-    /// recipient never sees, under an `Ok`.
-    #[error(
-        "dm doorbell slot {slot} is outside the {} the record holds",
-        daemonseed_core::dm::doorbell::DOORBELL_SLOTS
-    )]
-    DmDoorbellSlotOutsideRecord {
-        /// The offending slot index.
-        slot: u32,
-    },
-
-    /// A first-contact entry larger than a doorbell subkey can hold.
-    ///
-    /// Refused locally, before any network call, naming the true cap — the same
-    /// bound veilid enforces for `dflt(32)`. `daemonseed_core::dm::firstcontact`
-    /// pads every entry into a bucket that fits, so reaching this means the entry
-    /// was not built by that module, or the padding ladder and the schema have
-    /// drifted apart.
-    #[error("dm doorbell entry is {len} bytes, above the {max}-byte subkey cap")]
-    DmDoorbellEntryTooLarge {
-        /// The entry's length.
-        len: usize,
-        /// The cap it exceeded.
-        max: usize,
-    },
-
     /// A Phase 2+ surface (circles / shares / presence / announcements) that
     /// this crate does not implement yet.
     #[error("not yet implemented: {0}")]
@@ -126,6 +64,72 @@ pub enum VeilidNetError {
 }
 
 pub type Result<T> = std::result::Result<T, VeilidNetError>;
+
+/// How a Veilid API call failed, from the variant of its error alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VeilidFailure {
+    /// The call ran out of time.
+    TimedOut,
+    /// The call was refused before it left this node.
+    Local,
+    /// The network, or this node's view of it, refused the call.
+    Refused,
+}
+
+/// Every variant of `VeilidAPIError` (`veilid-core-0.5.7
+/// src/veilid_api/error.rs:128-216`), classed once, here.
+///
+/// Local: the API not attached or already attached, shutting down, a feature
+/// this build lacks, an argument that would not parse, was rejected or was
+/// missing, and a transaction handle already completed
+/// (`src/veilid_api/dht_transaction.rs:74`). None of these can have reached the
+/// network. Refused: retry later, an unreachable target, no connection, a record
+/// this node does not hold, Veilid's generic error, and an internal failure,
+/// which Veilid also raises after a fanout has run
+/// (`src/storage_manager/inspect_record.rs:249,649`,
+/// `src/storage_manager/open_record.rs:266`,
+/// `src/rpc_processor/fanout/fanout_call.rs:365`,
+/// `src/rpc_processor/fanout/fanout_queue.rs:274`). The match names every
+/// variant, so a variant a later Veilid adds does not compile until it is
+/// classed.
+pub(crate) fn veilid_failure(error: &veilid_core::VeilidAPIError) -> VeilidFailure {
+    use veilid_core::VeilidAPIError as E;
+    match error {
+        E::Timeout => VeilidFailure::TimedOut,
+        E::NotInitialized => VeilidFailure::Local,
+        E::AlreadyInitialized => VeilidFailure::Local,
+        E::Shutdown => VeilidFailure::Local,
+        E::Internal { .. } => VeilidFailure::Refused,
+        E::Unimplemented { .. } => VeilidFailure::Local,
+        E::ParseError { .. } => VeilidFailure::Local,
+        E::InvalidArgument { .. } => VeilidFailure::Local,
+        E::MissingArgument { .. } => VeilidFailure::Local,
+        E::TransactionNotFound { .. } => VeilidFailure::Local,
+        E::TryAgain { .. } => VeilidFailure::Refused,
+        E::InvalidTarget { .. } => VeilidFailure::Refused,
+        E::NoConnection { .. } => VeilidFailure::Refused,
+        E::KeyNotFound { .. } => VeilidFailure::Refused,
+        E::Generic { .. } => VeilidFailure::Refused,
+    }
+}
+
+impl VeilidNetError {
+    /// `error` from the call `what`, as [`veilid_failure`] classes it: a timeout
+    /// as [`Self::TimedOut`], a local refusal as [`Self::Local`], and anything
+    /// else as `refused` builds it.
+    pub(crate) fn from_veilid(
+        what: &str,
+        error: veilid_core::VeilidAPIError,
+        refused: fn(String) -> VeilidNetError,
+    ) -> Self {
+        let text = format!("{what}: {error}");
+        match veilid_failure(&error) {
+            VeilidFailure::TimedOut => Self::TimedOut(text),
+            VeilidFailure::Local => Self::Local(text),
+            VeilidFailure::Refused => refused(text),
+        }
+    }
+}
 
 /// Coarse class of a fetch-path failure. The download engine switches on this to
 /// decide resume vs abort vs surface, WITHOUT switching on error *message
@@ -167,21 +171,14 @@ impl VeilidNetError {
             // resumable transient at the fetch boundary. A local identity or
             // not-yet-implemented fault must NEVER poison-abort a share, so it
             // classifies transient (surfaced, route untouched), not integrity.
-            //
-            // The three DM-page faults are unreachable here — no share fetch touches
-            // a channel page — and classify transient for the same reason a local
-            // identity fault does: a local caller/shape fault is never grounds to
-            // declare a share's CONTENT hostile.
             VeilidNetError::Send(_)
             | VeilidNetError::Routing(_)
+            | VeilidNetError::TimedOut(_)
+            | VeilidNetError::Local(_)
             | VeilidNetError::Actor(_)
             | VeilidNetError::NotReady
             | VeilidNetError::Startup(_)
             | VeilidNetError::Identity(_)
-            | VeilidNetError::DmPageSlotOutsideRecord { .. }
-            | VeilidNetError::DmPageShapeMismatch { .. }
-            | VeilidNetError::DmDoorbellSlotOutsideRecord { .. }
-            | VeilidNetError::DmDoorbellEntryTooLarge { .. }
             | VeilidNetError::Unimplemented(_) => FetchErrorClass::Transient,
         }
     }
@@ -190,26 +187,6 @@ impl VeilidNetError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// **A page record whose shape is not the page shape is refused in BOTH
-    /// directions**, and the rendering says what it found against what a page holds —
-    /// the too-small case being the one that would otherwise truncate a page under an
-    /// `Ok`.
-    #[test]
-    fn the_shape_mismatch_error_renders_what_it_found_and_what_it_wanted() {
-        let slots = daemonseed_core::dm::paging::PAGE_SLOTS;
-        for o_cnt in [slots - 1, slots + 1, 1, 1024] {
-            let rendered = VeilidNetError::DmPageShapeMismatch { page: 3, o_cnt }.to_string();
-            assert!(
-                rendered.contains(&format!("{o_cnt} slot")),
-                "the shape it found must be in the line: {rendered}"
-            );
-            assert!(
-                rendered.contains(&slots.to_string()),
-                "the shape a page holds must be in the line: {rendered}"
-            );
-        }
-    }
 
     /// DL-ISC-10: the fetch boundary types transient-transport, integrity, and
     /// not-served failures apart; the SHA-384 mismatch (an `Integrity`) is the
@@ -226,18 +203,13 @@ mod tests {
         );
         for e in [
             VeilidNetError::Send("Timeout".into()),
+            VeilidNetError::TimedOut("open_only: Timeout".into()),
+            VeilidNetError::Local("open_only: Shutdown".into()),
             VeilidNetError::Routing("no route".into()),
             VeilidNetError::Actor("actor gone".into()),
             VeilidNetError::NotReady,
             VeilidNetError::Startup("boot".into()),
             VeilidNetError::Identity("bad identity".into()),
-            VeilidNetError::DmPageSlotOutsideRecord { page: 3, slot: 31 },
-            VeilidNetError::DmPageShapeMismatch { page: 3, o_cnt: 1 },
-            VeilidNetError::DmDoorbellSlotOutsideRecord { slot: 32 },
-            VeilidNetError::DmDoorbellEntryTooLarge {
-                len: 32769,
-                max: 32768,
-            },
             VeilidNetError::Unimplemented("phase-2"),
         ] {
             assert_eq!(e.fetch_class(), FetchErrorClass::Transient, "{e:?}");
@@ -251,22 +223,90 @@ mod tests {
             VeilidNetError::Integrity("x".into()),
             VeilidNetError::NotServed,
             VeilidNetError::Send("x".into()),
+            VeilidNetError::TimedOut("x".into()),
+            VeilidNetError::Local("x".into()),
             VeilidNetError::Routing("x".into()),
             VeilidNetError::Actor("x".into()),
             VeilidNetError::NotReady,
             VeilidNetError::Startup("x".into()),
             VeilidNetError::Identity("x".into()),
-            VeilidNetError::DmPageSlotOutsideRecord { page: 1, slot: 16 },
-            VeilidNetError::DmPageShapeMismatch { page: 1, o_cnt: 32 },
-            VeilidNetError::DmDoorbellSlotOutsideRecord { slot: 99 },
-            VeilidNetError::DmDoorbellEntryTooLarge {
-                len: 40000,
-                max: 32768,
-            },
             VeilidNetError::Unimplemented("x"),
         ];
         assert!(all
             .iter()
             .all(|e| e.fetch_class() != FetchErrorClass::Local));
+    }
+
+    /// Every variant of veilid-core 0.5.7's `VeilidAPIError` is classed as the
+    /// source says it can have failed: out of time, before it left this node, or
+    /// refused by the network. The class reaches the error the call reports.
+    #[test]
+    fn every_veilid_failure_is_classified_by_its_variant() {
+        use veilid_core::{BareOpaqueRecordKey, OpaqueRecordKey, VeilidAPIError as E};
+        let text = || "x".to_owned();
+        let table = [
+            (E::Timeout, VeilidFailure::TimedOut),
+            (E::NotInitialized, VeilidFailure::Local),
+            (E::AlreadyInitialized, VeilidFailure::Local),
+            (E::Shutdown, VeilidFailure::Local),
+            (E::Internal { message: text() }, VeilidFailure::Refused),
+            (E::Unimplemented { message: text() }, VeilidFailure::Local),
+            (
+                E::ParseError {
+                    message: text(),
+                    value: text(),
+                },
+                VeilidFailure::Local,
+            ),
+            (
+                E::InvalidArgument {
+                    context: text(),
+                    argument: text(),
+                    value: text(),
+                },
+                VeilidFailure::Local,
+            ),
+            (
+                E::MissingArgument {
+                    context: text(),
+                    argument: text(),
+                },
+                VeilidFailure::Local,
+            ),
+            (
+                E::TransactionNotFound { message: text() },
+                VeilidFailure::Local,
+            ),
+            (E::TryAgain { message: text() }, VeilidFailure::Refused),
+            (E::InvalidTarget { message: text() }, VeilidFailure::Refused),
+            (E::NoConnection { message: text() }, VeilidFailure::Refused),
+            (
+                E::KeyNotFound {
+                    key: OpaqueRecordKey::new(
+                        veilid_core::CRYPTO_KIND_VLD0,
+                        BareOpaqueRecordKey::new(&[0u8; 32]),
+                    ),
+                },
+                VeilidFailure::Refused,
+            ),
+            (E::Generic { message: text() }, VeilidFailure::Refused),
+        ];
+        assert_eq!(
+            table.len(),
+            15,
+            "one row per variant of veilid-core 0.5.7's VeilidAPIError"
+        );
+        for (error, expected) in table {
+            let shown = error.to_string();
+            assert_eq!(veilid_failure(&error), expected, "{shown}");
+            let reported = match VeilidNetError::from_veilid("call", error, VeilidNetError::Routing)
+            {
+                VeilidNetError::TimedOut(_) => VeilidFailure::TimedOut,
+                VeilidNetError::Local(_) => VeilidFailure::Local,
+                VeilidNetError::Routing(_) => VeilidFailure::Refused,
+                other => panic!("{shown} is reported as an unexpected variant: {other:?}"),
+            };
+            assert_eq!(reported, expected, "{shown} is reported as its class");
+        }
     }
 }

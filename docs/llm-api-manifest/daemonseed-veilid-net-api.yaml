@@ -144,18 +144,24 @@ modules:
       - daemonseed_veilid_net::route_budget
   - name: daemonseed_veilid_net::dm
     description: >-
-      Direct-messaging helpers and the DM driver. Holds the one spawn helper both
-      frontend net actors share (spawn_dm_key_record_publish),
-      the DmDht seam over the handle's seven DM DHT operations, DmDriver — a
-      command/event task owning a DmPersist, an injected WallClock and the identity
-      halves, driving a step machine whose DHT operations run off its loop — and
-      VeilidRecords, which implements daemonseed_core::dm::flows::Records over real
-      DHT records.
+      Direct messaging over the Veilid DHT: VeilidRecords, which implements
+      daemonseed_core::dm::flows::Records over real DHT records, and the runner
+      task a front end spawns over it.
     no_std: false
     depends_on:
       - daemonseed_veilid_net::actor
       - daemonseed_veilid_net::error
       - daemonseed_veilid_net::rendezvous
+  - name: daemonseed_veilid_net::dm::runner
+    description: >-
+      The direct-message runner: one tokio task per identity that owns a record
+      store and a daemonseed_core::dm::store::Store at <profile_root>/dm-store,
+      calls daemonseed_core::dm::flows one call at a time, serves RunnerCommands
+      between flow calls and emits RunnerEvents, on a collection tick, a repair
+      poll and an advert poll.
+    no_std: false
+    depends_on:
+      - daemonseed_veilid_net::dm
   - name: daemonseed_veilid_net::schedule
     description: >-
       The WB-3 write scheduler — the single funnel every DHT write enters, ordering
@@ -301,18 +307,6 @@ types:
     module: daemonseed_veilid_net::aimd
     kind: struct
     description: A bounded additive-increase/multiplicative-decrease concurrency window (floor..ceiling).
-  - name: DmDht
-    module: daemonseed_veilid_net::dm
-    kind: trait
-    description: >-
-      The seam over the ten DM DHT operations the driver performs —
-      fetch_dm_key_record, publish_doorbell_entry, sweep_doorbell, publish_dm_page,
-      sweep_dm_page, watch_dm_page, close_dm_page, pin_dm_pages, publish_dm_ack,
-      fetch_dm_ack.
-      Signatures are
-      VeilidNetHandle's; the address types are taken by value. Bounds are
-      Send + Sync + 'static. VeilidNetHandle implements it. publish_dm_key_record is
-      not a member.
   - name: VeilidRecords
     module: daemonseed_veilid_net::dm
     kind: struct
@@ -329,12 +323,17 @@ types:
       as None. read_drop_slot at slot 0 takes one inspect_sync_set report of the
       drop and answers every slot the network reports no sequence number for
       without a read; a hello written to that drop discards the report and an
-      erasure keeps it. Three inherent
-      methods sit outside the trait: publish_advert writes subkey 0 of an advert
-      record, erase_channel closes and deletes a channel record this side owns
-      from this node's local store without creating an absent one, and
-      write_counts reports writes so far per kind. Every method bridges the
-      synchronous trait onto the asynchronous transport with
+      erasure keeps it. Inherent methods outside the trait: publish_advert writes
+      subkey 0 of an advert record, erase_channel closes and deletes a channel
+      record this side owns from this node's local store without creating an
+      absent one and keeps the channel open for a retry when the erase fails,
+      write_counts reports writes so far per kind, and
+      inspect_channel, inspect_advert and inspect_drop report a SubkeyReport per
+      subkey (local and network sequence numbers, and whether Veilid still has
+      the subkey queued for its flush). It implements
+      daemonseed_veilid_net::dm::runner::RunnerRecords through them, with
+      open_existing_channel opening a channel record without creating it. Every
+      method bridges the synchronous trait onto the asynchronous transport with
       tokio::task::block_in_place, so every call must be on a multi-thread runtime
       worker; the flavor is checked at construction and at every bridged call.
       Every network call is retried while Veilid refuses transiently (TryAgain,
@@ -373,413 +372,185 @@ types:
     description: >-
       Why VeilidRecords::new refused: NoRuntime (no tokio runtime on this thread),
       NotMultiThread (the runtime is not multi-threaded, so the synchronous bridge
-      would panic).
-  - name: DmDhtFuture
-    module: daemonseed_veilid_net::dm
-    kind: type_alias
-    description: "Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>> — what one DmDht call returns."
-  - name: DmDriver
-    module: daemonseed_veilid_net::dm
-    kind: struct
+      would panic). Also the error inside a RecordError for a call refused before
+      it reached the network: ChannelNotOpened (a write or erasure of a channel
+      this process has not opened), SubkeyCount(u16) (a subkey count no record can
+      be addressed with) and OwnerKey (an owner keypair that would not derive).
+  - name: RunnerRecords
+    module: daemonseed_veilid_net::dm::runner
+    kind: trait
     description: >-
-      The DM driver's entry point; `spawn` starts the task and returns its handle
-      plus the event stream. On each `cfg.idle_tick` it sweeps its own doorbell and
-      runs every populated slot through daemonseed_core::dm::admission::Admitter,
-      surfacing an admitted stranger's knock as DmEvent::ContactRequest, dropping a
-      blocked one, and routing a known correspondent's to
-      DmPersist::correspondent_state_lost, surfacing DmEvent::ChannelLost. A slot
-      arriving at a full held-request list is skipped BEFORE admission and counted
-      on DoorbellHealth's pending_full, and a slot whose contact lookup failed is
-      left unverified and unrecorded — both are read normally on a later sweep
-      rather than being burnt into the seen set. The same cadence drives the
-      channel plane per correspondence: due outbox entries are emitted and
-      published at DmPageAddress::sending, a landed write is confirmed, entries
-      past the seven-day window are surfaced as Delivery{state: Undelivered} and
-      recorded surfaced in the same write, and the pages Collection::probe_plan
-      names are swept at DmPageAddress::receiving. No page is swept for a
-      correspondent BlockList::suppresses_channel names and no acknowledgement
-      record is fetched for one; a page outcome or an acknowledgement record for a
-      correspondent blocked after its operation was asked for folds nothing and
-      settles nothing; and an unreadable block list sweeps, fetches and folds
-      nothing on the channel plane, emitting DmEvent::BlockListUnreadable once for
-      the tick. A sweep counts as complete
-      only when nothing failed AND the transport attempted either no subkey (an
-      absent record) or every subkey the record holds; anything else folds
-      nothing and advances nothing. A give-up is offered without clearing the
-      outbox's surfacing flag — only DmCommand::Surfaced clears it, and a session
-      does not repeat an offer it has already made — so a restart before the
-      front end answers re-offers. The outbox is driven for a correspondence
-      recovered from disk too, taking its direction from the stored record, so a
-      queued doorbell entry keeps re-seeding without a key schedule while a
-      channel entry, having no address without a ratchet, is left alone. A collected
-      frame emits DmEvent::Message and advances the persisted receive cursor when
-      the contiguous prefix moved, bounded by the pages this session has swept. A
-      correspondence found on disk at startup is listed with no ratchet — a
-      ratchet has no at-rest record — and a Send to it is refused with
-      NotEstablishedThisSession. Its own S_pc/PK_pc pair IS read back: from the
-      resume record at load, and from the provisional record when an unanswered
-      first-contact entry's handshake is re-armed, so a re-armed initiator that
-      collects its acceptance composes ordinary frames under the pseudonym that
-      entry published. A completed re-establishment lifts the refusal on the
-      side that asked for it: that party owns the one chain under the re-rooted
-      root and composes ordinary frames at the agreed generation, which the two
-      sides settle inside the RE-ACK and RE-CONFIRM payloads rather than derive
-      from their own counters. The party that answered opens a receiving chain
-      only, so a Send to it is refused with AwaitingCorrespondentsFirstFrame —
-      before the outbox is asked and before the ratchet steps, so no sequence is
-      spent — until the correspondent's first frame under that root arrives with
-      the ephemeral its own chain steps off. Such a correspondence DOES sweep its receiving pages,
-      addressed by DmPageAddress::receiving_on off the stored address root and
-      the opposite of the outbox's stored direction, because that plane is where
-      a re-establishment leg arrives. On the first tick after a load, an
-      established correspondence runs one re-establishment pass: the dead-chain
-      sweep against its resume record's reroot_ratchet_gen, ending every entry
-      sealed below it and leaving each owing the surfacing the same tick then
-      offers; and, where the outbox still holds a pending entry and the
-      re-initiation window has attempts left, a RE-EST sealed under the committed
-      re-establishment root at the outbox's next sequence, committed to the resume
-      record and only then queued on this side's direction record as an
-      OutboxTarget::ReEstablishmentLeg with its first dispatch drawn from A5.5's
-      reconnect-cadence band. A queued leg is published to this side's direction
-      record at DmPageAddress::sending_on(AR, direction, position_of(seq)) — the
-      stored bytes, never resealed — on the ordinary ladder. Pending mail means an UNSEALED entry
-      (Lifecycle::AwaitingKey): a sealed one re-seeds on its own ladder and needs
-      no handshake. A resume record already carrying an attempt is re-emitted as
-      its stored bytes at the sequence its own slot records, queued only if the
-      outbox does not already hold that sequence, and never resealed; a sequence
-      the outbox has moved past cannot be re-emitted at all and is surfaced. The
-      pass runs once per load and is re-owed on a store fault, bounded at eight
-      consecutive faults. An outbox standing behind the resume record's durable
-      send floor stops it, sweeping nothing and opening nothing. Three states
-      reach one classed event — DmEvent::ChannelLost carrying
-      TrustEventKey::DmChannelTornDownOnRestart and the sequences the
-      correspondence still owes: a resume record absent on an established
-      correspondence, a stored attempt whose sequence has been spent, and a
-      re-initiation window with no attempts left. A resume record that will not
-      read is DmProvisionalRecordUnreadable, emitted once per session while the
-      pass keeps retrying. A swept slot that is not an openable channel frame,
-      and every slot of a correspondence holding no key schedule, is
-      trial-decrypted as the leg kinds the resume record says this side expects:
-      RE-ACK while an own slot stands, RE-CONFIRM while an unconfirmed acceptance
-      stands, RE-EST at one past the committed generation, and RE-EST under the
-      retained root at the generation an open exchange is at. An opened RE-EST is
-      recorded in the dedup memory, put to contest_outcome, admitted through
-      ReEstGate under a per-session response-emission cap, answered with a RE-ACK
-      sealed under the root it opened under, committed, and then queued; a repeat
-      changes nothing. An opened RE-ACK at or above the current attempt completes
-      the exchange, seals and queues the settling RE-CONFIRM, and opens the
-      resumed ratchet one position past it. An opened RE-CONFIRM settles the
-      exchange this side answered, advancing the generation and retiring the
-      superseded root. Either completion runs the dead-chain sweep and retires
-      every finished leg. An RE-EST opened under the retained root at an already
-      committed generation is deduped and reported once per session as
-      DmEvent::ReestablishmentAnomaly carrying
-      TrustEventKey::DmPeerStateRegressed. The same cadence carries the
-      acknowledgement plane. As a receiver the driver holds one
-      daemonseed_core::dm::ack_cadence::StandaloneAckCadence per correspondence,
-      keyed on the sent_unix_ms each collected frame asserted CLAMPED to the
-      moment it was collected — the field is peer-asserted and otherwise
-      unbounded, and a time in the future never ages out of the give-up window —
-      held as a sorted, deduplicated, capped set that drops its second-newest
-      entry on overflow so the oldest (the taper's key) and the newest (the
-      liveness witness) both survive, and one client-global StandaloneAckBudget; every correspondence that wants a write is
-      ordered by ack_cadence::pick_next, oldest pending first, and the budget grants
-      at most one per tick, a refusal's retry_after_ms becoming a wake time. A grant
-      builds the record with ack_record::build_encoded over Collection::ack and
-      publishes it at DmAckAddress::for_direction over the receiving direction; the
-      cadence advances on the write's outcome, never on the decision to write, and
-      stops wanting one once every message collected has passed the sender's
-      give-up. An acceptor settles the knock's own sequence zero at the accept,
-      because it arrives by doorbell and no page will ever hold it. As a sender the
-      driver holds one retained AckState per correspondence: a piggybacked
-      acknowledgement is folded where the frame is opened, and a correspondence with
-      unsettled entries and a known pseudonym fetches the peer's record on the tick
-      and folds it after ack_record::decode_and_verify. Either fold merges under the
-      highest sequence this side has sent, counting a clip on ChannelHealth, then
-      settles the outbox and reports each settled sequence as
-      Delivery{state: ConfirmedCollected} once per run. Cadence and budget state are
-      not persisted: after a restart the taper restarts from the floor. `spawn` does the one-off work
-      before the task starts — deriving this identity's own doorbell and
-      key-record owner seeds, provisioning the block list, and opening the
-      spent-token set — so neither their failure modes nor Argon2id's cost land on
-      the driver's loop. A panicked spawned job is attributed to what it was
-      doing: a mint or a transport task releases its introduction, a spent-token
-      write poisons the store. Panics if cfg.idle_tick is zero, if cfg.policy is
-      AdmissionPolicy::InviteOnly with no DmDriverParts::spent_tokens, if either
-      owner seed will not derive (a driver without them is permanently deaf), or
-      if the block list cannot be provisioned.
-  - name: DmDriverParts
-    module: daemonseed_veilid_net::dm
-    kind: struct
-    description: "Everything the driver owns, constructed by the frontend and moved in: dht (Arc<D: DmDht>), clock (WallClock), identity (DmIdentity), persist (DmPersist), cfg (DmDriverConfig), spent_tokens (Option<SpentTokenStore>)."
-  - name: DmDriverConfig
-    module: daemonseed_veilid_net::dm
-    kind: struct
-    description: >-
-      The driver's cadence and admission knobs: `idle_tick` is how long the driver
-      sleeps when nothing else wakes it and how often it sweeps its doorbell,
-      `policy` is the AdmissionPolicy it enforces, `pow_difficulty` is the
-      PowDifficulty it verifies and mints at.
-  - name: SpentTokenStore
-    module: daemonseed_veilid_net::dm
-    kind: struct
-    description: >-
-      Where a profile's consumed invite-token nonces are sealed: profile_root,
-      passphrase, profile_id, argon2. Absent means the set lives only in memory,
-      which is correct under AdmissionPolicy::Open and refused under
-      AdmissionPolicy::InviteOnly. A stored set that is present and will not open
-      POISONS the store for the life of the driver — never written over, because
-      that would erase every grant it held — and surfaces
-      DmEvent::SpentTokensNotPersisted. Writes run on a blocking thread and only
-      when a nonce was actually consumed or pruned. Its Debug prints no passphrase.
-  - name: DmDriverHandle
-    module: daemonseed_veilid_net::dm
-    kind: struct
-    description: Cloneable handle onto a running driver; `send` queues one DmCommand. Dropping the last one ends the driver and closes the event stream.
-  - name: DmCommand
-    module: daemonseed_veilid_net::dm
+      daemonseed_core::dm::flows::Records plus inspect_channel, inspect_advert and
+      inspect_drop (a SubkeyReport per subkey of a channel, advert or drop
+      record), publish_advert, erase_channel (a failed erase leaves the channel
+      open), open_existing_channel(&mut self, &ChannelOwnerSeed, u16) ->
+      Result<Option<lookup key>, RecordError> (opens without creating, None where
+      this node holds no such record; the default calls open_channel) and
+      write_counts, the associated fn
+      classify(&RecordError) -> RecordFailure (default Refused) that decides the
+      counter a failed call is counted in, and take_scan_failure(&mut self) ->
+      Option<RecordError> (default None), the failure of the drop inspect a scan
+      took before its first slot read, and same_local_refusal(&RecordError,
+      &RecordError) -> bool (default false), whether a scan's local refusal and
+      its slot read's are the same one and so counted once. VeilidRecords
+      implements it, classing VeilidNetError::TimedOut as TimedOut, a
+      RecordsError or VeilidNetError::Local as Local, and everything else,
+      VeilidNetError::Actor (a dropped scheduler reply or a panicked dispatch)
+      included, as Refused.
+  - name: RecordFailure
+    module: daemonseed_veilid_net::dm::runner
     kind: enum
     description: >-
-      What a frontend asks the driver to do — FirstContact{recipient,body},
-      Send{to,body}, Accept{request}, Decline{request}, Block{pk_lt},
-      Unblock{pk_lt}, Surfaced{to,seqs}, Shutdown. FirstContact fetches the
-      recipient's key record, mints the entry off the loop, writes the provisional
-      record and publishes the knock, keeping that record until a verified
-      acceptance; Accept establishes through
-      DmPersist::accept_first_contact and, in the same call, seals the acceptance
-      with frame::seal_accept and queues it at channel sequence zero, reported as
-      Delivery{seq: 0, state: Composed}; a full outbox refuses it with
-      RefusalReason::OutboxFull{needed} before the sequence is spent.
-      A refused acceptance emits Delivery{seq: 0, state: Undelivered} plus a
-      Refused naming the reason, emitted once per distinct reason, and is
-      retried on the idle cadence while the acceptor's sequence zero is unspent.
-      A provisional record the erase could not reach is retried on later ticks
-      rather than dropped. Accept also erases any provisional
-      record this side held for the same identity, and a mint is refused with
-      RefusalReason::AlreadyEstablished when the correspondence already carries
-      the correspondent's pseudonym — together these are what a mutual knock
-      needs so no provisional record is stranded.
-      Decline persists nothing; Block and Unblock
-      write the block list, and a refused 513th entry surfaces as
-      DmEvent::BlockListFull, which leaves both the stored list and any held
-      request from that identity as they were. A block that is stored drops a held
-      request from that identity and stops the next idle tick sweeping that
-      identity's channel and fetching its acknowledgement record, leaving the
-      correspondence, its channel and its outbox in place; Unblock resumes both at
-      the next tick. Sends to a blocked identity, and acknowledgements written for
-      one, are unchanged. Send seals on an established channel: the outbox is
-      priced against frame::WORST_CASE_SEALED_FRAME_LEN before the ratchet steps,
-      the frame carries the collection's acknowledgement piggybacked, and the
-      queued sequence is reported as Delivery{state: Composed}. Surfaced clears
-      the surfacing owed on the named sequence numbers. Send is refused with
-      RefusalReason::NotEstablishedThisSession when no ratchet is held for that
-      identity, AwaitingCorrespondentsFirstFrame on the answering side of a
-      completed re-establishment until the correspondent's first frame opens this
-      side's chain, OutboxFull{needed} when the record cannot take another
-      message, BodyTooLarge over DM_BODY_CAP, and SealFailed when the frame will
-      not seal; an OutboxFull or AwaitingCorrespondentsFirstFrame refusal spends
-      no sequence number. FirstContact is refused
-      with
-      RefusalReason::AlreadyEstablished when a correspondence with that identity
-      exists and AlreadyInFlight when an introduction to it is already between the
-      command and the doorbell write; a panicked mint refuses it with MintPanicked
-      and a panicked transport task with TaskPanicked. An Accept the store refuses
-      leaves the request held and surfaces AcceptFailed. Correspondents are keyed by
-      long-term identity key; requests by RequestId. Shutdown aborts in-flight DHT
-      operations. Debug prints variant names, body lengths, and a redacted PkLt.
-  - name: DmEvent
-    module: daemonseed_veilid_net::dm
-    kind: enum
-    description: >-
-      What the driver tells a frontend — Roster{correspondents},
-      ContactRequest{request,from,body,sent_unix_ms},
-      Message{from,seq,body,sent_unix_ms}, Delivery{to,seq,state},
-      Refused{to,acceptance,reason,event}, AcceptFailed{request,from,reason},
-      ChannelLost{with,cause,event,surfaced}, ReestablishmentAnomaly{with,event},
-      ChannelDirectionUnknown{with},
-      DoorbellHealth{outcome,admission,pending_full},
-      ChannelHealth{with,partial_sweeps,already_consumed,unopenable,peer_pseudonym_unknown,peer_acks_deferred,peer_acks_clipped,peer_acks_unverified,peer_ack_fetches_failed,cursor_records_repaired,leg_folds_deferred,leg_unaddressable},
-      ContactLookupFailed, BlockListFull{count}, BlockListProvisioned,
-      BlockListUnreadable, SpentTokensNotPersisted. Roster is emitted once, before
-      the driver's first tick, and names every correspondence on disk exactly once
-      as a Correspondent{pk_lt, state: CorrespondentState}; a label carrying no
-      contact record is not listed. BlockListUnreadable is emitted ahead of it
-      where the block-list record would not read, and every correspondence is then
-      stated from its own contact record; a record already unreadable at startup
-      fails DmDriver::try_spawn with DmSpawnError::BlockList instead, so that
-      pairing belongs to a read that stops working later. BlockListUnreadable says the
-      profile's block-list record would not read on an idle tick, so no
-      correspondent's channel was swept and no acknowledgement was fetched;
-      emitted at most once per tick, and only on a tick whose correspondence list
-      is non-empty — the gate is that list, not whether any correspondence holds a
-      live channel. ChannelHealth is one correspondence's channel-plane
-      accounting, cumulative for the session and emitted only when a counter
-      moves; already_consumed is reachable only through the TooManyRuns retry
-      path, since a settled position is filtered out before the ratchet sees it,
-      and peer_pseudonym_unknown counts unsettled positions an initiator left
-      alone because they sit at a sequence above the acceptance and no pseudonym
-      is installed yet — once per sweep that saw them, so a position stuck across
-      four sweeps counts four. peer_acks_deferred counts peer acknowledgements that
-      would not merge into the retained state, peer_acks_clipped counts claims above
-      the highest sequence this side has sent, peer_acks_unverified counts
-      fetched records that did not decode or did not verify, and
-      peer_ack_fetches_failed counts fetches of that record that came back with
-      no answer, an erroring read and one abandoned at its bound alike.
-      cursor_records_repaired counts receive-cursor records found unreadable and
-      replaced with this session's own page. leg_folds_deferred counts
-      re-establishment legs that opened and whose fold could not finish, whose
-      positions are left unsettled for the peer's own re-seed to bring back, and
-      leg_unaddressable counts queued legs whose record address would not derive
-      and which were therefore not emitted and did not spend a rung. Refused covers a channel send as well as
-
-      a first contact, and Refused
-      carries a RefusalReason plus event, an
-      Option<daemonseed_core::trust_events::TrustEventKey>: Some where the refusal
-      is a teardown, from Teardown::event, and None where it ends no channel.
-      AcceptFailed carries an AcceptFailure; ReestablishmentAnomaly is one
-      variant for A3.8's loud re-establishment states, named by its classed key —
-      DmPeerStateRegressed, DmReestablishmentFailed,
-      DmReestablishmentUnconfirmed or DmReestablishmentBackoffEngaged. Each fires
-      once per session per correspondence, nothing is asked of the user, and both
-      front ends route it to the audit log exactly as they route a teardown.
-      ChannelLost
-      carries the surfaced sequence numbers the user is owed and the
-      TrustEventKey the teardown is classed under
-      (Teardown::event, ISC-C28). A front end writes either key to its audit log; DoorbellHealth
-      carries admission's running AdmissionCounters plus pending_full, the slots
-      this sweep skipped because the held-request list was full. Every payload is a
-      daemonseed-core type or a String except DoorbellHealth, which carries this
-      crate's rendezvous::SweepOutcome and core's AdmissionCounters. Given-up
-      delivery is a DeliveryState on Delivery. Debug redacts as DmCommand's does.
-  - name: Correspondent
-    module: daemonseed_veilid_net::dm
+      How a failed record store call failed: Refused (the network or transport
+      refused), TimedOut (ran out of time) or Local (refused before it reached the
+      network, counted in HealthCounters::local_refusals).
+  - name: SubkeyReport
+    module: daemonseed_veilid_net::dm::runner
     kind: struct
     description: >-
-      One correspondence on DmEvent::Roster: pk_lt (PkLt — the correspondent's
-      long-term identity key) and state (CorrespondentState). Debug redacts
-      pk_lt and prints the state.
-  - name: CorrespondentState
-    module: daemonseed_veilid_net::dm
-    kind: enum
-    description: >-
-      What a stored correspondence is, as far as this side is concerned, and
-      every correspondence on disk is in exactly one of them. Established: the
-      contact record names the correspondent's pseudonym key. A send on one
-      established before this process began is still refused with
-      NotEstablishedThisSession until re-establishment mints a ratchet. Pending:
-      the contact record names no pseudonym key, so a first contact was sent and
-      no acceptance has verified; nothing but the acceptance can be opened.
-      Blocked: the correspondent is on the block list, reported ahead of the
-      other two whatever the contact record holds, because the block is what
-      decides whether either plane carries anything.
-    variants: [Established, Pending, Blocked]
-  - name: RefusalReason
-    module: daemonseed_veilid_net::dm
-    kind: enum
-    description: >-
-      Where a send stopped — NoKeyRecord, KeyRecordInvalid, KeyRecordRollback,
-      PublishFailed, StoreFailure, AlreadyEstablished, AlreadyInFlight,
-      MintPanicked, TaskPanicked, MintFailed, Module, OutboxFull{needed},
-      NotEstablishedThisSession, AwaitingCorrespondentsFirstFrame, BodyTooLarge,
-      SealFailed. The first eleven are first-contact refusals and the last five
-      channel-send ones. AwaitingCorrespondentsFirstFrame is the answering side
-      of a completed re-establishment, whose chain opens on the correspondent's
-      first frame under the re-rooted root; it spends no sequence number.
-      KeyRecordRollback is an authentic record naming a version below the highest
-      already verified for that identity this session; KeyRecordInvalid is one
-      that does not verify at all. Acceptance says how far the write got; this
-      says why it went no further, and folding them loses the second.
-  - name: AcceptFailure
-    module: daemonseed_veilid_net::dm
-    kind: enum
-    description: >-
-      Why an accepted request was not established — AlreadyEstablished or
-      StoreFailure. The request stays held for both, unless the refusal came from
-      inside DmPersist::accept_first_contact, which consumes the knock.
-  - name: RequestId
-    module: daemonseed_veilid_net::dm
-    kind: struct
-    description: A pending contact request — the doorbell slot it arrived in plus the entry hash, which pins the exact entry across an overwrite of that slot.
-  - name: PkLt
-    module: daemonseed_veilid_net::dm
-    kind: type_alias
-    description: "Box<[u8; IDENTITY_PK_LEN]> — a correspondent's long-term identity key."
-  - name: DmIdentity
-    module: daemonseed_veilid_net::dm
-    kind: struct
-    description: "The identity halves the driver needs: signing (Arc<SignKeypair>), kem (the full KemKeypair, decapsulation half included), doorbell_slot_secret. Its Debug prints no key material."
-  - name: daemonseed_veilid_net::dm::DmSpawnError
-    kind: enum
-    description: "(#339) Why a driver did not start: DoorbellOwnerSeed(DmDoorbellError), KeyRecordOwnerSeed(DmKeyRecordError), BlockList(DmPersistError). Every variant is a condition of this machine — its crypto module or its profile directory — and none is transient. DmDriver::try_spawn(parts) -> Result<(DmDriverHandle, mpsc::Receiver<DmEvent>), DmSpawnError> reports them; DmDriver::spawn stays the panicking wrapper, for tests and for callers whose whole purpose is the driver. The three fallible steps run on the CALLER's thread, so a front-end net actor — which also serves chat, shares and presence — uses try_spawn."
-  - name: daemonseed_veilid_net::dm::DmTrySendError
-    kind: enum
-    description: "(#339) Why DmDriverHandle::try_send did not queue a command: Full (the driver is running, its 64-slot queue is not draining) or Stopped (the handle reaches nothing). The command is dropped in both cases; they differ in what the caller should do about the handle. try_send exists for a shared actor loop, where awaiting DmDriverHandle::send on a full queue would stall every other command behind a DM one."
-  - name: daemonseed_veilid_net::dm::PENDING_REQUEST_CAP
-    kind: const
-    description: "(#339, was crate-private) How many contact requests the driver holds at once (64). Public so a front end's own held-request list can be bounded by the same number rather than a second one that could disagree."
-  - name: WallClock
-    module: daemonseed_veilid_net::dm
-    kind: struct
-    description: "Unix milliseconds, injected as Arc<dyn Fn() -> i64 + Send + Sync>. `system()` reads SystemTime; `from_fn(f)` reads whatever f returns; `now_ms()` samples it. Debug prints a fixed marker and does not call the closure."
-  - name: DmPageWatch
-    module: daemonseed_veilid_net::actor
-    kind: enum
-    description: >-
-      What one watch on a receiving page came back with: `Changed`, a subkey of the
-      watched record changed, and `Lost`, the watch is no longer in place. Both arms end
-      the watch that produced them, so a caller that wants to go on hearing about a page
-      arms another one. `Changed` names no subkey and carries no bytes — the page is read
-      by VeilidNetHandle::sweep_dm_page — and `Lost` carries no failure, because a page
-      with no watch on it is collected by the sweep cadence.
-  - name: DmPageSweep
-    module: daemonseed_veilid_net::actor
+      One inspected subkey: local_seq (this node's copy), network_seq (the
+      network's, as if the local copy did not exist) and pending (still queued
+      for Veilid's flush).
+  - name: RunnerParts
+    module: daemonseed_veilid_net::dm::runner
     kind: struct
     description: >-
-      One page sweep's full result: `conversation` (the AR fingerprint naming which
-      correspondence the frames came from), `slots`, and `outcome`. The tag means a
-      caller sweeping several correspondents concurrently matches results to
-      conversations by a value it was handed rather than by the order it dispatched
-      in; a misattribution forges nothing, because frames are individually
-      authenticated, but the ratchet fails to open them and that conversation stalls
-      while every layer reports success. Each populated slot arrives as a checked
-      `daemonseed_core::dm::paging::PagePosition` on the swept page, so the collector
-      compares the frame's declared sequence number against a position it did not
-      have to compute. The outcome is required, not decoration: an empty slot list
-      alone means both "nobody has written to this page" and "all sixteen GETs
-      errored", and `rendezvous.rs` names surfacing `failed` separately as the
-      enabling signal for consumer-side session-health tracking (CRSH-ISC-1).
-  - name: DmPageRecord
-    module: daemonseed_veilid_net::actor
-    kind: enum
-    description: >-
-      One channel page record, either direction: `Sending(DmPageAddress<Sending>)` or
-      `Receiving(DmPageAddress<Receiving>)`. The argument of
-      `VeilidNetHandle::close_dm_page`, which is the one page operation that does not
-      depend on direction — a close acts on the record, not on its contents. Exposes
-      `with_owner_seed`, `page`, `conversation` and `direction`, each delegating to the
-      address it wraps, so the owner seed stays boxed, redacted and zeroize-on-drop.
-  - name: DoorbellDispatch
-    module: daemonseed_veilid_net::actor
-    kind: enum
-    description: Which dispatch of a doorbell knock a write is, deciding its WB-3 funnel priority class.
-    variants:
-      - name: FirstSend
-        description: The first dispatch of a user's first-contact send; classifies WriteClass::Chat (rank 1).
-      - name: Reseed
-        description: A scheduler-driven re-dispatch, the doorbell keep-alive; classifies WriteClass::Keepalive (rank 4).
-  - name: DoorbellSweep
-    module: daemonseed_veilid_net::actor
+      What spawn_runner takes, all fields public: records (a RunnerRecords),
+      signer (Arc<SignKeypair>), channel_root (DmChannelRootSecret, moved),
+      at_rest_key (Zeroizing<[u8; 32]>), profile_root (PathBuf) and config
+      (RunnerConfig).
+  - name: RunnerConfig
+    module: daemonseed_veilid_net::dm::runner
     kind: struct
     description: >-
-      One doorbell sweep's result: `slots`, the populated `(slot, bytes)` pairs, and
-      `outcome`. The bytes are unverified and still sealed — only
-      `daemonseed_core::dm::firstcontact::open` may decide an entry is genuine, and it
-      needs the recipient's ML-KEM decapsulation key. The slot travels back with the
-      bytes because a sender's retry re-lands in that same slot and overwrites its own
-      previous entry. There is no conversation tag: a doorbell holds knocks from
-      distinct and as-yet-unknown senders, and the slot is derived from a secret only
-      the sender holds. The outcome is required, not decoration: an empty slot list
-      alone means both "nobody has knocked" and "all thirty-two GETs errored".
+      tick (collection interval before ±20 % jitter, default DEFAULT_TICK 60 s)
+      and grace (the longest RunnerHandle::shutdown waits, default DEFAULT_GRACE
+      10 s). Implements Default. clamped() holds tick within MIN_TICK (1 ms) and
+      MAX_TICK (24 h); spawn_runner applies it.
+  - name: RunnerHandle
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      A running runner: commands() clones the command sender, send queues a
+      command, next_event and try_next_event read events, shutdown stops it and
+      returns the unread events. Dropping it stops the runner after the flow
+      call in progress and discards unread events.
+  - name: RunnerCommand
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      FirstContact{token, peer_identity_pk, body}, Send{token, peer, body},
+      Accept{token, request, reply}, Block{peer}, Unblock{peer},
+      DeleteConversation{token, peer}, Shutdown. peer is a CorrespondenceLabel
+      except on Block and Unblock, where it is an identity public key. Debug omits
+      bodies and keys.
+  - name: RunnerEvent
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      Roster(Vec<ConversationSummary>), ContactRequest{request, from},
+      StartedOver{request, from}, Message{from, seq, body, received_at (Unix ms,
+      stamped by the runner)}, Sent{token, peer, seq}, Deleted{token, peer},
+      Delivered{peer, through_seq}, Accepted{peer}, Refused{token:
+      Option<CommandToken>, reason: Refusal}, Health(HealthCounters),
+      BlockList(Vec<IdentityPk>), BlockListUnreadable. Every command with a token
+      is answered by Sent, Deleted or Refused. Health is emitted once at startup
+      and then when a counter changes, at most once per scheduled wake. BlockList
+      lists every blocked identity in ascending byte order: once at startup
+      straight after the first Roster, after each Block and Unblock the store
+      accepted (changed or not), and when an unreadable list reads again; a
+      refused Block or Unblock emits none. BlockListUnreadable replaces it at
+      startup, and follows a later failed read of a known list, when the list
+      cannot be read or decoded or its record is gone: blocked state is unknown,
+      and the runner scans no drop and collects no conversation until a read
+      succeeds. An absent record is created empty only at startup, never while
+      running. Debug omits bodies and keys.
+  - name: ConversationSummary
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      One roster row: peer, peer_identity_pk, state (ConversationState Pending or
+      Established), peer_collected (the correspondent's cursor) and uncollected
+      (send_seq minus that cursor).
+  - name: ConversationState
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      Pending (this side's first contact awaits acceptance, or this side's
+      acceptance of the correspondent's has not finished) or Established.
+  - name: CommandToken
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: A caller-chosen u64 echoed on the Sent or Refused event answering a command.
+  - name: ContactRequestId
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      The runner's id for a surfaced hello: a value drawn once per run and a
+      serial within the run, so an id from an earlier run is refused. It stays
+      the same while the same identity's hello keeps surfacing. No public
+      constructor, except ContactRequestId::for_test(epoch: u64, serial: u64) ->
+      Self under the crate's `test-support` cargo feature (off by default), for a
+      front end's tests to build ContactRequest and StartedOver events.
+  - name: Refusal
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      UnknownConversation (also a conversation whose delete is under way),
+      UnknownRequest, StartedOverNotAcceptable, RingFull (63
+      messages uncollected), AwaitingAcceptance, AcceptanceUnfinished (this side's acceptance has not
+      finished; the repair poll carries it on), AlreadyEstablished, NoAdvert,
+      DropFull, BlockListFull (a Block past the maximum), Store (also a stored
+      block list that is absent or does not decode, and an Accept while it will
+      not read), Network, Flow, ShuttingDown (the runner stopped with the command
+      still queued). An Accept of a request whose identity the block list holds
+      is UnknownRequest.
+  - name: HealthCounters
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      Counters since the runner started: reads, inspects and writes per record
+      kind (advert, drop, channel, plus channel opens and erasures), each as a
+      _failures counter (refused) and a _timeouts counter (ran out of time, as
+      RunnerRecords::classify classes it; the drop inspect counters include the
+      scan's inspect before its first slot read), local_refusals (calls refused
+      before they reached the network),
+      advert_failures, network_not_answering (a record with no network number on
+      any subkey in a pass where this node's own advert showed none either, or
+      the inspect of that advert failed, left alone), hellos_dropped (blocked
+      sender),
+      hellos_already_collected, hellos_unsettled, conversation_failures,
+      store_failures (a block list that will not read adds one at startup and one
+      for each later drop scan that meets it) and
+      requests_evicted (held requests dropped, oldest-seen first, above one per
+      drop slot).
+  - name: ShutdownOutcome
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      Finished(Result<(), RunnerError>), Panicked, or TimedOut(TaskEnd): the
+      grace period ended with a flow call in progress, which was not
+      interrupted.
+  - name: TaskEnd
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      A runner task still inside a flow call when its shutdown's grace period
+      ended. is_finished() reports whether it has ended; finish() waits for it
+      and returns a RunnerStop with every event emitted meanwhile. The call may
+      still save a collection cursor or an acceptance, and the bodies it read
+      are lost if the TaskEnd is dropped unfinished. The profile must not be
+      opened again until the task has ended.
+  - name: RunnerStop
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      What RunnerHandle::shutdown returns: outcome (ShutdownOutcome) and
+      undelivered (every event emitted and not read, in order).
+  - name: RunnerError
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: Store(StoreError) or Advert(AdvertError), a startup failure that stopped the runner.
   - name: OwnerSeed
     module: daemonseed_veilid_net::identity
     kind: struct
@@ -1256,364 +1027,69 @@ functions:
     returns:
       type: "Result<VeilidRecordsParts>"
       description: The parts, or an actor error where the actor task is gone.
-  - name: VeilidNetHandle::publish_dm_key_record
-    module: daemonseed_veilid_net::actor
-    description: Publish an identity's signed DM key record to subkey 0 of its dflt(1) record (ISC-C40). Bytes are opaque here — the caller signs with daemonseed_core::dm::keyrec::build and derives owner_seed with derive_owner_seed. Enqueued on the WB-3 funnel as a Keepalive-class coalescible current-state write, so slow anti-eviction re-seeds collapse to at most one queued write per record. The record is world-writable (a world-derivable address implies a world-derivable owner), so anyone can overwrite or erase it; forgery is impossible because the signature inside is verified against the address's own identity key, leaving erasure and rollback as denial-of-service only.
-    signature: "pub async fn publish_dm_key_record(&self, owner_seed: [u8; 32], record: Vec<u8>) -> Result<()>"
-    parameters:
-      - name: owner_seed
-        type: "[u8; 32]"
-        direction: in
-        description: The key record's owner seed, from daemonseed_core::dm::keyrec::derive_owner_seed over the identity's ML-DSA-87 public key.
-      - name: record
-        type: "Vec<u8>"
-        direction: in
-        description: The prost-encoded, already-signed DmKeyRecord.
-    returns:
-      type: "Result<()>"
-      description: >-
-        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
-        answers Ok when the write is coalesced away by a later same-record, same-logical-id
-        write, and when a tombstone dominates it.
-  - name: VeilidNetHandle::fetch_dm_key_record
-    module: daemonseed_veilid_net::actor
-    description: Fetch a correspondent's DM key record from subkey 0 of its dflt(1) record. Ok(None) is an empty slot — evicted, wiped, or never published — and is the caller's awaiting-key state, deliberately distinct from Err (a transport failure); conflating them would make an attacker's wipe indistinguishable from a network problem. The bytes are UNVERIFIED — only daemonseed_core::dm::keyrec::verify may decide a record is genuine, and it needs the identity public key this layer does not hold. One gated GET on the read lane; no write funnel involvement (WB-3 I9).
-    signature: "pub async fn fetch_dm_key_record(&self, owner_seed: [u8; 32]) -> Result<Option<Vec<u8>>>"
-    parameters:
-      - name: owner_seed
-        type: "[u8; 32]"
-        direction: in
-        description: The correspondent's key-record owner seed, derived from their ML-DSA-87 public key.
-    returns:
-      type: "Result<Option<Vec<u8>>>"
-      description: The unverified prost-encoded DmKeyRecord bytes, or None for an empty slot.
-  - name: VeilidNetHandle::publish_dm_ack
-    module: daemonseed_veilid_net::actor
-    description: Publish one direction's sealed acknowledgement to subkey 0 of its dflt(1) record (ISC-C39). Bytes are opaque here — the caller builds them with daemonseed_core::dm::ack_record::build_encoded and the address with DmAckAddress::for_direction over the same address root and direction. Enqueued on the WB-3 funnel as a Keepalive-class coalescible current-state write under the logical id dm-ack; the statement is monotonic, so a coalesced write carries nothing the surviving one lacks. The record is owner-write-gated — the owner seed derives from the conversation's secret address root — so a third party can neither forge nor erase it, and that seed rides inside the zeroizing DmAckAddress rather than as a copyable array.
-    signature: "pub async fn publish_dm_ack(&self, address: DmAckAddress, record: Vec<u8>) -> Result<()>"
-    parameters:
-      - name: address
-        type: "DmAckAddress"
-        direction: in
-        description: The acknowledgement record's address, from daemonseed_core::dm::ack_record::DmAckAddress::for_direction over the conversation's address root and the direction of the messages being acknowledged. Taken by value; derive one per call.
-      - name: record
-        type: "Vec<u8>"
-        direction: in
-        description: The prost-encoded, already-sealed and already-signed DmAck.
-    returns:
-      type: "Result<()>"
-      description: >-
-        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
-        answers Ok when the write is coalesced away by a later same-record, same-logical-id
-        write, and when a tombstone dominates it.
-  - name: VeilidNetHandle::fetch_dm_ack
-    module: daemonseed_veilid_net::actor
-    description: Fetch a correspondent's acknowledgement record from subkey 0 of its dflt(1) record. Ok(None) is an empty slot — evicted, or never written because the peer has settled nothing — and is the caller's no-confirmation-yet state, deliberately distinct from Err (a transport failure); under a fail-safe delivery posture, conflating them would let a network fault read as an absence of confirmation. The bytes are UNVERIFIED — only daemonseed_core::dm::ack_record::decode_and_verify may open them, and its PeerAck answers nothing until merged under the caller's own ceiling. One gated GET on the read lane; no write funnel involvement (WB-3 I9).
-    signature: "pub async fn fetch_dm_ack(&self, address: DmAckAddress) -> Result<Option<Vec<u8>>>"
-    parameters:
-      - name: address
-        type: "DmAckAddress"
-        direction: in
-        description: The correspondent's acknowledgement-record address, from DmAckAddress::for_direction over the conversation's address root and the direction of the messages being acknowledged — Ratchet::send_direction for a sender reading its peer's acknowledgement. Taken by value; derive one per call.
-    returns:
-      type: "Result<Option<Vec<u8>>>"
-      description: The unverified prost-encoded DmAck bytes, or None for an empty slot.
-  - name: VeilidNetHandle::publish_dm_page
-    module: daemonseed_veilid_net::actor
+  # ── dm: the runner ───────────────────────────────────────────────────
+  - name: spawn_runner
+    module: daemonseed_veilid_net::dm::runner
     description: >-
-      Publish one sealed DM channel frame into the slot its address names
-      (ISC-C42). Bytes are opaque here — this layer neither parses nor verifies the
-      frame, and a successful write proves nothing about authorship, since both parties
-      can derive the owner seed for both directions. The address carries the position
-      it writes, so page and slot cannot disagree and there is nothing to reject.
-      Enqueued on the WB-3 funnel as a Chat-class, Ring-kind write —
-      non-coalescible, because two queued writes to one page are two different messages
-      in two different slots. Write-once is a CALLER OBLIGATION: this is an
-      unconditional last-writer-wins set_dht_value with no read-before-write, so a
-      reissued sequence number overwrites an already-delivered message and returns Ok
-      (see #243). The page record is not world-writable: its owner seed derives from the
-      first-contact secret, so a third party cannot compute the address at all.
-    signature: "pub async fn publish_dm_page(&self, address: DmPageAddress<Sending>, frame: Vec<u8>) -> Result<()>"
-    parameters:
-      - name: address
-        type: "DmPageAddress<Sending>"
-        direction: in
-        description: The placed slot to write, from daemonseed_core::dm::paging::DmPageAddress::sending(address_root, ratchet, paging::position_of(seq)). The address IS the position, so page and slot come from one sequence number by construction. Typed to Sending, so an address for the stream this end receives on is a compile error. Taken by value — it holds a boxed, redacted, zeroize-on-drop owner seed that is neither Clone nor constructible outside daemonseed_core::dm::paging, so it is moved into the command rather than copied. Derive one per call; derivation is pure. The funnel's record id is the owner's PUBLIC key derived from the seed, never the seed.
-      - name: frame
-        type: "Vec<u8>"
-        direction: in
-        description: The already-sealed, already-signed channel frame.
+      Start a runner on the current tokio runtime with a command queue of
+      COMMAND_QUEUE (64) and an event queue of EVENT_QUEUE (256). Over
+      VeilidRecords the runtime must be multi-thread.
+    signature: "pub fn spawn_runner<R>(parts: RunnerParts<R>) -> RunnerHandle where R: RunnerRecords + Send + 'static"
     returns:
-      type: "Result<()>"
-      description: >-
-        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
-        answers Ok when the write is coalesced away by a later same-record, same-logical-id
-        write, and when a tombstone dominates it.
-  - name: VeilidNetHandle::sweep_dm_page
-    module: daemonseed_veilid_net::actor
+      type: RunnerHandle
+      description: The handle; a startup failure ends the task and closes the event stream.
+  - name: RunnerHandle::shutdown
+    module: daemonseed_veilid_net::dm::runner
     description: >-
-      Sweep every slot of one DM channel page, returning a DmPageSweep: the
-      conversation the swept address named, the populated (PagePosition, bytes)
-      slots, and the sweep's SweepOutcome. The conversation tag means a caller
-      sweeping several correspondents concurrently attributes frames by a value it
-      was handed rather than by dispatch order. Each subkey is placed on
-      the addressed page through PagePosition::new at the boundary, so the collector
-      checks the frame's declared sequence number against a position rather than
-      recomputing one; a slot the record cannot hold returns
-      VeilidNetError::DmPageSlotOutsideRecord rather than being skipped. Refuses a
-      record whose o_cnt is not paging::PAGE_SLOTS as
-      VeilidNetError::DmPageShapeMismatch before any slot is read, so a shape
-      disagreement is loud in both directions rather than truncating the page. The outcome
-      travels back because an empty Vec alone cannot distinguish an unwritten page from
-      one whose every GET errored, and those demand opposite responses. A partial sweep
-      returns what it read, which makes recovery a CALLER OBLIGATION: the collector must
-      hold probe frontier and contiguous cursor as separate pointers and treat failed >
-      0 as a record-health signal. No such collector exists yet (#236). Bounded by the
-      handle's own shape; PAGE_SLOTS gated GETs on the read lane, no write funnel
-      involvement (WB-3 I9). Spawned off the command loop (D-0b / #128, CRSH-ISC-22).
-      Opens via open_only, so probing a page nobody has written does NOT create it: an
-      absent page returns an empty Vec with SweepOutcome attempted 0, distinct from a
-      present page whose slots were all read and empty (attempted PAGE_SLOTS, found 0).
-      attempted 0 means the record was not found by this node on this pass, NOT that it
-      does not exist: veilid raises KeyNotFound on an inspect that returns no
-      descriptor, and a fanout reaching nobody is a non-error outcome. A caller must
-      not treat it as authoritative absence or clear a health / repair latch on it.
-      An absence is never cached, so each probe of a still-unwritten page pays a fresh
-      open (~6-10s) rather than the one-off cost of creating and caching a record.
-    signature: "pub async fn sweep_dm_page(&self, address: DmPageAddress<Receiving>) -> Result<DmPageSweep>"
-    parameters:
-      - name: address
-        type: "DmPageAddress<Receiving>"
-        direction: in
-        description: The page's address, from daemonseed_core::dm::paging::DmPageAddress::receiving(address_root, ratchet, page). Typed to Receiving, so sweeping the stream this end sends on is a compile error — that address is valid and would read this end's own writes back forever. Taken by value for the reason publish_dm_page gives; derive one per call.
+      Ask the task to stop, read its events while it finishes the flow call in
+      progress, and wait at most RunnerConfig::grace. After the call the task
+      starts no flow call that writes, and every command still queued is
+      answered Refused ShuttingDown. A call still running at the end of the grace
+      period is not interrupted; the outcome is TimedOut with a TaskEnd.
+    signature: "pub async fn shutdown(self) -> RunnerStop"
     returns:
-      type: "Result<DmPageSweep>"
-      description: DmPageSweep { conversation, slots, outcome } — the AR fingerprint naming the correspondence, the populated slots as (PagePosition, unverified bytes) pairs, and the sweep outcome (attempted / found / failed).
-  - name: VeilidNetHandle::watch_dm_page
-    module: daemonseed_veilid_net::actor
+      type: RunnerStop
+      description: How the task ended, and every event not yet read.
+  - name: TaskEnd::finish
+    module: daemonseed_veilid_net::dm::runner
     description: >-
-      Watch one DM channel page's DHT record and answer once the watch has something to
-      say (#234). Resolves DmPageWatch::Changed on a value change and DmPageWatch::Lost
-      on expiry, on a refused or unanswered arming, on a page the correspondent has not
-      written, and when the record is closed or evicted under the watch. The future is
-      pending for as long as the watch stands, up to a 600-second lease. The DHT watch is
-      cancelled on the Changed path and on lease expiry, bounded by
-      rendezvous::SWEEP_GET_TIMEOUT under one un-gated-op permit. A value change names no
-      subkey and carries no bytes: the page is read by sweep_dm_page, so a watch decides
-      only when that read happens. Nothing may depend on this for correctness — a page
-      swept on a cadence is collected whether or not a watch was armed, and Lost and Err
-      are equivalent to the caller. The record is opened through the same opener
-      sweep_dm_page uses and is never created, so a page with no writes answers Lost. The
-      watch itself does not pin the record open: the pin is the separate pin_dm_pages
-      statement, which names the watched pair of every conversation on cadence, and a
-      record outside that set may be reclaimed by the open cache's capacity bound while
-      the watch stands, which ends the watch and resolves it Lost. A value change on any
-      record this node has armed a page watch on is routed to that watch and never to
-      VeilidNetEvent; every other record's value changes reach VeilidNetEvent unchanged.
-      Spawned off the command loop; the arming runs under one un-gated-op permit bounded
-      by rendezvous::SWEEP_GET_TIMEOUT, and no permit or page lease is held across the
-      wait.
-    signature: "pub async fn watch_dm_page(&self, address: DmPageAddress<Receiving>) -> Result<DmPageWatch>"
-    parameters:
-      - name: address
-        type: "DmPageAddress<Receiving>"
-        direction: in
-        description: The page's address, from daemonseed_core::dm::paging::DmPageAddress::receiving(address_root, ratchet, page). Typed to Receiving, so watching the stream this end sends on is a compile error — that watch would fire on this end's own writes. Taken by value for the reason publish_dm_page gives; derive one per call.
+      Wait for a timed-out runner task to end, reading its events meanwhile.
+    signature: "pub async fn finish(self) -> RunnerStop"
     returns:
-      type: "Result<DmPageWatch>"
-      description: Changed when a subkey of the watched record changed, Lost when the watch is no longer in place. Neither says anything about the page's contents.
-  - name: VeilidNetHandle::close_dm_page
-    module: daemonseed_veilid_net::actor
+      type: RunnerStop
+      description: Finished or Panicked, and every event the task emitted after the shutdown returned.
+  - name: RunnerParts::over_veilid
+    module: daemonseed_veilid_net::dm::records
+    description: Build RunnerParts over a VeilidRecords made from VeilidRecordsParts.
+    signature: "pub fn over_veilid(parts: VeilidRecordsParts, signer: Arc<SignKeypair>, channel_root: DmChannelRootSecret, at_rest_key: Zeroizing<[u8; AEAD_KEY_LEN]>, profile_root: PathBuf, config: RunnerConfig) -> Result<Self, RecordsError>"
+    returns:
+      type: "Result<RunnerParts<VeilidRecords>, RecordsError>"
+      description: The parts, or the error VeilidRecords::new returns off a multi-thread runtime worker.
+  - name: VeilidRecords::inspect_channel
+    module: daemonseed_veilid_net::dm::records
     description: >-
-      Give one DM channel page's DHT record back: drop it from the session open cache
-      and close the record. DM channel pages are the one record family whose count
-      grows with message volume rather than with peers — a new page owner seed every
-      paging::PAGE_SLOTS messages, per direction, per conversation — so a page is
-      released when its holder will not address it again. Answers whether a record was
-      actually closed. Ok(false) is a page nobody opened, one the open cache's own
-      capacity bound (rendezvous::DM_PAGE_CACHE_CAPACITY) already reclaimed, and one an
-      operation is still holding: a leased record is refused rather than closed, because
-      closing mid-sweep turns the remaining GETs into SweepOutcome failed. The record's
-      contents are untouched — a closed page named again is opened again by the ordinary
-      open path and sweeps back what it held. Direction-erased, unlike publish_dm_page
-      and sweep_dm_page: a close acts on the record, not on its contents. Spawned off
-      the command loop; issues no gated DHT operation and takes no permit.
-    signature: "pub async fn close_dm_page(&self, address: DmPageRecord) -> Result<bool>"
-    parameters:
-      - name: address
-        type: DmPageRecord
-        direction: in
-        description: The page record, as DmPageRecord::Sending(DmPageAddress<Sending>) or DmPageRecord::Receiving(DmPageAddress<Receiving>). Taken by value for the reason publish_dm_page gives — it holds a boxed, redacted, zeroize-on-drop owner seed that is neither Clone nor constructible outside daemonseed_core::dm::paging. Any slot of the page derives the same record; the owner seed is a function of the address root, the direction and the page.
+      A local inspect and a SyncSet inspect of a channel record, as one
+      SubkeyReport per subkey, pending taken from the local report's flush queue.
+      Both reports must start at subkey 0. An own channel opens under its
+      keypair, any other read-only; an absent record reports no numbers.
+    signature: "pub fn inspect_channel(&mut self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> Result<Vec<SubkeyReport>, RecordError>"
     returns:
-      type: "Result<bool>"
-      description: true when a record was released, false when the cache held none or an in-flight operation still holds it.
-  - name: VeilidNetHandle::pin_dm_pages
-    module: daemonseed_veilid_net::actor
-    description: >-
-      State which DM page records the open cache's capacity bound
-      (rendezvous::DM_PAGE_CACHE_CAPACITY, 128) may not reclaim, replacing any previous
-      statement. The pages a caller is still working through, not the ones it is using
-      right now: an operation in flight already holds a lease that refuses eviction for
-      its whole length, and what no lease covers is the page a caller will address again
-      shortly but holds nothing on at this instant. Under capacity pressure that page is
-      among the oldest unheld records and is what a least-recently-swept choice picks, so
-      without a pin the bound reclaims exactly the records about to be re-opened. The
-      whole set every time, so a page absent from pages is unpinned by the same call and
-      there is no release to forget; an empty list pins nothing. statement is strictly
-      increasing per caller and a statement no newer than the last applied is dropped, so a
-      reordered delivery cannot reinstate a stale set over the current one. Keep the set
-      proportional to conversations rather than to traffic: a pinned record is not counted
-      against the capacity, so a set at or past it stalls reclamation — the cache then holds
-      the pinned records plus the entries in flight, one per concurrent open, and does not
-      grow with traffic. The DM driver states the watched pair of every conversation on
-      cadence. A pin does not stop close_dm_page.
-      Not spawned: it reaches no DHT and takes no record lock.
-    signature: "pub async fn pin_dm_pages(&self, statement: u64, pages: Vec<DmPageRecord>) -> Result<()>"
-    parameters:
-      - name: statement
-        type: u64
-        direction: in
-        description: This statement's number, strictly increasing per caller. Zero is never valid, so the first call always applies.
-      - name: pages
-        type: "Vec<DmPageRecord>"
-        direction: in
-        description: The complete set of page records to protect from capacity eviction. Taken by value for the reason close_dm_page gives — each holds a boxed, redacted, zeroize-on-drop owner seed. A record whose cache id will not derive is dropped from the statement rather than failing it.
+      type: "Result<Vec<SubkeyReport>, RecordError>"
+      description: One report per subkey, indexed by subkey.
+  - name: VeilidRecords::inspect_advert
+    module: daemonseed_veilid_net::dm::records
+    description: The same two inspects over the advert record the seed owns.
+    signature: "pub fn inspect_advert(&mut self, owner: &AdvertOwnerSeed, subkeys: u16) -> Result<Vec<SubkeyReport>, RecordError>"
     returns:
-      type: "Result<()>"
-      description: Ok once the statement has replaced the previous one.
-  - name: VeilidNetHandle::publish_doorbell_entry
-    module: daemonseed_veilid_net::actor
-    description: >-
-      Write one sealed first-contact entry into one slot of a recipient's dflt(32)
-      doorbell record (ISC-C41). Bytes are opaque here — this layer neither parses,
-      seals, nor verifies the entry, and a successful write proves nothing about the
-      sender, because the record is world-writable. This is the one record a party
-      writes that it does not own: a world-derivable address implies a world-derivable
-      owner under Veilid's DFLT schema, so the sender derives the recipient's owner
-      keypair from the recipient's public identity key and signs the set with it. Any
-      third party holds that same authority and can overwrite or erase any slot, which
-      is a denial-of-service residual only — forgery is impossible, since an entry that
-      does not verify under the recipient's own decapsulation key does not open. Opens
-      with create, so the first sender brings a recipient's doorbell into being. A slot
-      outside the record and an entry above the per-subkey cap are refused before the
-      command crosses the channel, so neither reaches a network call. Enqueued on the
-      WB-3 funnel as a Keepalive-class CurrentState write coalescing on the slot: a
-      retry re-lands in the sender's own slot and is defined to overwrite its previous
-      entry, while two slots of one doorbell never coalesce. The class comes from
-      `dispatch`. Coalescing is keyed on the kind, not the class, so a FirstSend still
-      queued when its own Reseed is enqueued is superseded, and the survivor inherits the
-      strongest class of the set it subsumed, so a knock already answered Ok is not shed
-      at shutdown. Carries no deadline.
-    signature: "pub async fn publish_doorbell_entry(&self, owner_seed: [u8; 32], slot: u16, entry: Vec<u8>, dispatch: DoorbellDispatch) -> Result<()>"
-    parameters:
-      - name: owner_seed
-        type: "[u8; 32]"
-        direction: in
-        description: The recipient's doorbell owner seed, from daemonseed_core::dm::doorbell::derive_owner_seed over the recipient's ML-DSA-87 public key.
-      - name: slot
-        type: u16
-        direction: in
-        description: The sender's slot in that doorbell, from daemonseed_core::dm::doorbell::slot_for over this sender's own doorbell slot secret and the same recipient key. Must be below daemonseed_core::dm::doorbell::DOORBELL_SLOTS; a slot outside the record returns VeilidNetError::DmDoorbellSlotOutsideRecord.
-      - name: entry
-        type: "Vec<u8>"
-        direction: in
-        description: The already-sealed, already-signed first-contact entry, from daemonseed_core::dm::firstcontact::build. At most daemonseed_core::dm::firstcontact::MAX_ENTRY_LEN bytes; larger returns VeilidNetError::DmDoorbellEntryTooLarge.
-      - name: dispatch
-        type: DoorbellDispatch
-        direction: in
-        description: Whether this is the first dispatch of a user send (WriteClass::Chat) or a scheduler-driven re-seed (WriteClass::Keepalive). The transport cannot tell them apart, so the caller states it; there is no default.
+      type: "Result<Vec<SubkeyReport>, RecordError>"
+      description: One report per subkey, indexed by subkey.
+  - name: VeilidRecords::inspect_drop
+    module: daemonseed_veilid_net::dm::records
+    description: The same two inspects over the drop record the seed owns.
+    signature: "pub fn inspect_drop(&mut self, owner: &DropOwnerSeed, subkeys: u16) -> Result<Vec<SubkeyReport>, RecordError>"
     returns:
-      type: "Result<()>"
-      description: >-
-        Ok means the write left this layer, NOT that it reached the DHT. The funnel also
-        answers Ok when the write is coalesced away by a newer one for the same slot, and
-        when a tombstone dominates it. A caller needing delivery re-seeds on its own
-        schedule; the #236 outbox owns that decision.
-  - name: VeilidNetHandle::sweep_doorbell
-    module: daemonseed_veilid_net::actor
-    description: >-
-      Sweep every slot of a doorbell, returning a DoorbellSweep: the populated
-      (slot, bytes) pairs and the sweep's SweepOutcome (ISC-C41). The bytes are
-      unverified and still sealed — pass each to daemonseed_core::dm::firstcontact::open,
-      which fails closed and uniformly, because a world-writable record makes garbage an
-      ordinary input. Whether the doorbell is this node's own is the caller's to know:
-      the owner seed is a world-derivable [u8; 32], so sweeping another identity's
-      doorbell is well-formed and returns entries no local key opens. A
-      partial sweep returns what it read, so outcome.failed > 0 is a record-health
-      signal and not an empty doorbell. Bounded by the handle's own shape;
-      DOORBELL_SLOTS gated GETs on the read lane, no write funnel involvement (WB-3 I9).
-      Spawned off the command loop (D-0b / #128, CRSH-ISC-22). Opens via open_only, so
-      sweeping a doorbell nobody has knocked on does not create it: an absent record
-      returns an empty Vec with SweepOutcome attempted 0, distinct from a present record
-      whose slots were all read and empty. attempted 0 means the record was not found by
-      this node on this pass, not that it does not exist.
-    signature: "pub async fn sweep_doorbell(&self, owner_seed: [u8; 32]) -> Result<DoorbellSweep>"
-    parameters:
-      - name: owner_seed
-        type: "[u8; 32]"
-        direction: in
-        description: The doorbell's owner seed, from daemonseed_core::dm::doorbell::derive_owner_seed over the owning identity's ML-DSA-87 public key.
-    returns:
-      type: "Result<DoorbellSweep>"
-      description: DoorbellSweep { slots, outcome } — the populated slots as (slot, unverified sealed bytes) pairs, and the sweep outcome (attempted / found / failed).
-  # ── dm: the DM driver ────────────────────────────────────────────────
-  - name: DmDriver::spawn
-    module: daemonseed_veilid_net::dm
-    description: Spawn the DM driver over the parts the frontend constructed and return its handle plus the event stream. The driver wakes on cfg.idle_tick and ends when the last handle drops or a Shutdown command arrives, aborting in-flight DHT operations. Panics if cfg.idle_tick is zero.
-    signature: "pub fn spawn<D: DmDht>(parts: DmDriverParts<D>) -> (DmDriverHandle, mpsc::Receiver<DmEvent>)"
-    parameters:
-      - name: parts
-        type: "DmDriverParts<D>"
-        direction: in
-        description: The seam, clock, identity, store and cadence knobs, moved into the driver.
-    returns:
-      type: "(DmDriverHandle, mpsc::Receiver<DmEvent>)"
-      description: The command handle and the event stream. The stream yields None once the driver has stopped.
-
-  - name: DmDriverHandle::send
-    module: daemonseed_veilid_net::dm
-    description: Queue one command for the driver. A full queue applies backpressure to the caller; the call fails only once the driver has stopped.
-    signature: "pub async fn send(&self, cmd: DmCommand) -> Result<()>"
-    parameters:
-      - name: cmd
-        type: DmCommand
-        direction: in
-        description: The command to queue.
-    returns:
-      type: "Result<()>"
-      description: Ok once queued; VeilidNetError::Actor once the driver has stopped.
-
-  - name: WallClock::system
-    module: daemonseed_veilid_net::dm
-    description: The production clock — SystemTime::now() since the unix epoch, in milliseconds. A pre-epoch system clock reads as 0.
-    signature: "pub fn system() -> Self"
-    parameters: []
-    returns:
-      type: WallClock
-      description: A clock reading the system time.
-
-  - name: WallClock::from_fn
-    module: daemonseed_veilid_net::dm
-    description: A clock reading whatever the closure returns, in unix milliseconds.
-    signature: "pub fn from_fn(f: impl Fn() -> i64 + Send + Sync + 'static) -> Self"
-    parameters:
-      - name: f
-        type: "impl Fn() -> i64 + Send + Sync + 'static"
-        direction: in
-        description: The source of unix milliseconds.
-    returns:
-      type: WallClock
-      description: A clock reading f.
-
-  - name: WallClock::now_ms
-    module: daemonseed_veilid_net::dm
-    description: The current time, in unix milliseconds.
-    signature: "pub fn now_ms(&self) -> i64"
-    parameters: []
-    returns:
-      type: i64
-      description: Unix milliseconds.
-
+      type: "Result<Vec<SubkeyReport>, RecordError>"
+      description: One report per slot, indexed by slot.
   - name: VeilidNetHandle::publish_presence
     module: daemonseed_veilid_net::actor
     description: Publish a sealed member-presence beacon to a per-member current-state slot on the presence sibling rendezvous record; a re-beacon overwrites the same slot (last-writer-wins). The presence record is distinct from the chat rendezvous, so a beacon never evicts chat backlog. member_pubkey owns the stable-slot-id encoding (member_slot_id, hex) so all callers agree. The slot count is bounded (SUBKEY_COUNT), so at unbounded membership two members can slot-share (a bounded, self-healing degradation). The app net actor holds the keys and runs the emit/ingest/reap loop; a receiver subscribes via subscribe_room on the same presence owner seed.
@@ -2135,7 +1611,7 @@ functions:
         binding, NOT the secret: passing the keypair to open_dht_record /
         create_dht_record makes veilid retain a clone in OpenedRecord.writer for as long
         as the record stays open. daemonseed opens a record once per session and holds it
-        open, except a DM channel page, which a bounded LRU closes on eviction (#252). Use
+        open. Use
         rendezvous_owner_public_bytes where only a record identity is needed.
   - name: identity::OperatorCredential::load
     module: daemonseed_veilid_net::identity
@@ -2355,6 +1831,10 @@ error_types:
         condition: A routing / private-route error.
       - name: Send
         condition: A send / transport failure (offline / slow / dead route).
+      - name: TimedOut
+        condition: A network call that ran out of time — an open or read cut off at its bound, a call Veilid answered with Timeout, or a write the network had not taken (or could not be checked) within its confirmation budget. Classified where the typed error is first seen, never from message text.
+      - name: Local
+        condition: A failure that never left this node — a runtime the synchronous record bridge cannot use, a record this node just wrote and no longer holds, a write the scheduler never took because it is gone, or a call Veilid refused before sending it (NotInitialized, AlreadyInitialized, Shutdown, Unimplemented, ParseError, InvalidArgument, MissingArgument, TransactionNotFound). Veilid's Internal is a refusal, since Veilid also raises it after a fanout.
       - name: NotServed
         condition: The peer answered but does not serve the requested share/chunk (withdrawn or never offered) — an authoritative negative distinct from a transport error.
       - name: Integrity
@@ -2363,10 +1843,6 @@ error_types:
         condition: Invalid node identity.
       - name: Actor
         condition: The actor task is gone or dropped a reply.
-      - name: DmPageShapeMismatch
-        condition: A DM page's record carries an o_cnt other than paging::PAGE_SLOTS, checked before any slot is read (ISC-C100). Carries the page and the o_cnt found. An o_cnt below PAGE_SLOTS yields no unplaceable slot, so without this check the sweep returns Ok with a silently truncated page.
-      - name: DmPageSlotOutsideRecord
-        condition: A DM page sweep returned a slot the addressed page cannot hold — an o_cnt above paging::PAGE_SLOTS (ISC-C100). Carries the page and the subkey. Backstop behind DmPageShapeMismatch, which rejects the shape first.
       - name: Unimplemented
         condition: A Phase 4 surface (presence / announcements) not yet implemented.
   - name: FetchErrorClass

@@ -69,7 +69,7 @@ use crate::dm::chain::{
     CHAIN_KEY_LEN, ChainKey, ConversationSnapshot, DirectionState, OWN_TURNS_RETAINED, OwnTurn,
     PeerTurn, ROOT_LEN, RatchetDecapKey, RatchetKeypair, ReceivingState, Root, TurnSecret,
 };
-use crate::dm::channel::{CHANNEL_SUBKEY_LEN, OPENING_LEN, RING_SLOTS};
+use crate::dm::channel::{CHANNEL_SUBKEY_LEN, ControlKey, OPENING_LEN, RING_SLOTS};
 use crate::dm::drop::{DROP_SUBKEYS, HELLO_LEN, HELLO_LOOKUP_KEY_LEN, HELLO_R_LEN};
 use crate::storage::dm_store::{
     CorrespondenceLabel, DmStore, DmStoreError, Locked, LockedProfile, RecordKind,
@@ -85,13 +85,37 @@ const CONV_MAGIC: &[u8] = b"daemonseed/dm/store/conv/v1\0";
 /// The magic heading a conversation's outbox record.
 const CONV_OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/store/obox/v1\0";
 
-/// The version byte every record carries after its magic.
+/// The version byte an outbox record carries after its magic.
 ///
-/// The magic already names a version and the two move together; the byte is
-/// what a format change that keeps the same record identity turns over, so a
-/// reader's refusal names a version rather than failing to recognise the record
-/// at all.
-const RECORD_VERSION: u8 = 1;
+/// The magic names the record kind and does not change when its format does;
+/// the byte is what a format change turns over, so a reader's refusal names a
+/// version rather than failing to recognise the record at all. Each record kind
+/// carries its own, so one kind's format turns over without the others being
+/// refused.
+const CONV_OUTBOX_RECORD_VERSION: u8 = 2;
+
+/// The version byte a conversation record carries after its magic.
+///
+/// Carried apart from the other record kinds' versions, so the conversation
+/// record's format turns over without the others being refused. A reader
+/// refuses any other value as an unknown version rather than reading the record
+/// at the wrong length.
+const CONV_RECORD_VERSION: u8 = 3;
+
+/// The order [`Store::delete_conv`] removes a correspondence's records in.
+const DELETE_ORDER: [RecordKind; 2] = [RecordKind::Conversation, RecordKind::ConversationOutbox];
+
+#[cfg(test)]
+thread_local! {
+    /// Every record kind [`Store::delete_conv`] has removed on this thread, in
+    /// the order it removed them.
+    static DELETED: core::cell::RefCell<Vec<RecordKind>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// The version byte the advert-keys record carries after its magic, carried
+/// apart for [`CONV_RECORD_VERSION`]'s reason.
+const ADVERT_KEYS_RECORD_VERSION: u8 = 2;
 
 /// A flag byte's two accepted values. Any other byte is a corrupt record rather
 /// than a truthy value, because nothing this module writes produces one.
@@ -135,10 +159,14 @@ const SNAPSHOT_LEN: usize = SENDING_LEN + RECEIVING_LEN;
 /// advert serial it was encapsulated to.
 const HELLO_FIELD_LEN: usize = 1 + 2 + HELLO_R_LEN + ml_kem::CT_LEN + HELLO_LEN + 8;
 
+/// Bytes a control key takes: the width of a [`ControlKey`].
+const CONTROL_KEY_LEN: usize = 32;
+
 /// Bytes the advert-keys record occupies, and so
-/// [`RecordKind::AdvertKeys`]'s bucket.
+/// [`RecordKind::AdvertKeys`]'s bucket: the current key, the retained key as
+/// an optional field, and the published serial as an optional field.
 pub const ADVERT_KEYS_RECORD_LEN: usize =
-    ADVERT_KEYS_MAGIC.len() + 1 + 8 + 8 + ml_kem::DK_LEN + (1 + 8 + 8 + ml_kem::DK_LEN);
+    ADVERT_KEYS_MAGIC.len() + 1 + 8 + 8 + ml_kem::DK_LEN + (1 + 8 + 8 + ml_kem::DK_LEN) + (1 + 8);
 
 /// Bytes a conversation record occupies, and so
 /// [`RecordKind::Conversation`]'s bucket.
@@ -156,14 +184,18 @@ pub const CONV_RECORD_LEN: usize = CONV_MAGIC.len()
     + HELLO_FIELD_LEN
     + (1 + ml_kem::SHARED_SECRET_LEN)
     + (1 + ml_kem::CT_LEN)
-    + (1 + ml_kem::SHARED_SECRET_LEN)
+    + (1 + CONTROL_KEY_LEN)
+    + (1 + CONTROL_KEY_LEN)
     + (1 + 8)
     + (1 + OPENING_LEN)
-    + SNAPSHOT_LEN;
+    + SNAPSHOT_LEN
+    + 1
+    + 1;
 
 /// Bytes one outbox entry takes: an occupancy flag, the sequence it holds, the
-/// ciphertext length, and a whole subkey of space for the ciphertext.
-const CONV_OUTBOX_ENTRY_LEN: usize = 1 + 8 + 4 + CHANNEL_SUBKEY_LEN;
+/// time it was sent, the ciphertext length, and a whole subkey of space for the
+/// ciphertext.
+const CONV_OUTBOX_ENTRY_LEN: usize = 1 + 8 + 8 + 4 + CHANNEL_SUBKEY_LEN;
 
 /// Bytes the outbox record occupies, and so
 /// [`RecordKind::ConversationOutbox`]'s bucket: one entry per ring slot,
@@ -207,6 +239,14 @@ pub enum StoreError {
     /// [`Store::update_advert_keys`] was asked to change advert state the
     /// profile has never written.
     MissingAdvertKeys,
+    /// [`Store::mark_advert_published`] was handed a serial above the current
+    /// advert key's, which names no advert this profile has built.
+    UnbuiltAdvertSerial {
+        /// The serial offered.
+        serial: u64,
+        /// The current key's serial.
+        current: u64,
+    },
 }
 
 impl From<DmStoreError> for StoreError {
@@ -242,6 +282,10 @@ impl core::fmt::Display for StoreError {
                 write!(f, "the correspondence already holds a conversation record")
             }
             Self::MissingAdvertKeys => write!(f, "the profile holds no advert key state"),
+            Self::UnbuiltAdvertSerial { serial, current } => write!(
+                f,
+                "advert serial {serial} is above the current key's serial {current}"
+            ),
         }
     }
 }
@@ -323,12 +367,24 @@ pub struct ConvState {
     /// of a first contact: a hello of this side's own is outstanding whether
     /// it opened the conversation or accepted one.
     pub awaiting_acceptance: bool,
+    /// Whether this side accepted the correspondent's first contact and has
+    /// not yet finished that acceptance.
+    ///
+    /// Set when the acceptance's record is created and cleared by the step
+    /// that finishes it, which is also the step that records the collection.
+    /// A record with an outstanding hello back and this flag set was stopped
+    /// part way, and [`crate::dm::flows::continue_acceptance`] finishes it.
+    pub acceptance_pending: bool,
     /// The hello awaiting collection, while there is one.
     pub outstanding_hello: Option<OutstandingHello>,
-    /// The secret this side's own hello established.
+    /// The secret this side's own hello established, held only while a hello
+    /// may still have to be sealed from it.
     ///
-    /// Seals this side's control subkey and nothing else. Absent until this
-    /// side has encapsulated a hello of its own.
+    /// The initiator keeps it while awaiting acceptance, because a rewritten
+    /// hello carries it. The acceptor keeps it until its hello back is
+    /// persisted. It is deleted after that: the initiator's hello secret roots
+    /// its first turn, and the control subkey needs only
+    /// [`Self::own_control_key`].
     pub own_hello_secret: Option<AdvertSharedSecret>,
     /// The encapsulation this side's own hello carries.
     ///
@@ -336,11 +392,17 @@ pub struct ConvState {
     /// decapsulates to reach it: a rewritten hello that carried a fresh
     /// ciphertext would establish a secret this record does not hold.
     pub own_hello_kem_ct: Option<Box<[u8; ml_kem::CT_LEN]>>,
-    /// The secret the correspondent's hello established.
+    /// The key this side's control subkey is sealed under, derived from this
+    /// side's hello secret.
     ///
-    /// Opens the correspondent's control subkey and nothing else. Absent until
-    /// the correspondent's hello has been opened.
-    pub peer_hello_secret: Option<AdvertSharedSecret>,
+    /// Absent until this side has encapsulated a hello of its own.
+    pub own_control_key: Option<ControlKey>,
+    /// The key the correspondent's control subkey opens under, derived from
+    /// the secret the correspondent's hello established.
+    ///
+    /// The secret itself is never stored. Absent until the correspondent's
+    /// hello has been opened.
+    pub peer_control_key: Option<ControlKey>,
     /// The advert serial the correspondent's channel opening binds.
     ///
     /// The serial of this side's own advert that the correspondent
@@ -355,6 +417,10 @@ pub struct ConvState {
     /// rewritten control record would otherwise carry an opening whose bytes
     /// differ from the one already published.
     pub own_opening: Option<Box<[u8; OPENING_LEN]>>,
+    /// Whether a delete of this conversation is under way: set by
+    /// [`crate::dm::delivery::prepare_delete`] before the channel record is
+    /// erased, and gone with the record when the delete finishes.
+    pub delete_pending: bool,
 }
 
 impl core::fmt::Debug for ConvState {
@@ -368,6 +434,8 @@ impl core::fmt::Debug for ConvState {
             .field("my_collected", &self.my_collected)
             .field("cursor_published", &self.cursor_published)
             .field("awaiting_acceptance", &self.awaiting_acceptance)
+            .field("acceptance_pending", &self.acceptance_pending)
+            .field("delete_pending", &self.delete_pending)
             .field("outstanding_hello", &self.outstanding_hello.is_some())
             .finish_non_exhaustive()
     }
@@ -379,6 +447,9 @@ impl core::fmt::Debug for ConvState {
 pub struct OutboxEntry {
     /// The message's sequence within this side's direction.
     pub seq: u64,
+    /// When the message was sent, in Unix seconds on the caller's clock: the
+    /// `now` the flow that sealed it was given.
+    pub sent_at: u64,
     /// The bytes the slot holds, as written.
     pub ciphertext: Vec<u8>,
 }
@@ -393,6 +464,10 @@ pub struct LoadedConv {
     /// The messages committed but not yet collected, ascending by sequence.
     /// Every one of them has a slot to be rewritten if the network no longer
     /// holds it.
+    ///
+    /// Empty for a conversation whose [`ConvState::delete_pending`] is set,
+    /// whatever its outbox record holds: its channel is being erased, and a
+    /// rewrite would put the slots back.
     pub outstanding_outbox: Vec<OutboxEntry>,
 }
 
@@ -439,8 +514,12 @@ impl Store {
     /// Ordered before the advert record's own DHT write: an advert published
     /// under a key whose secret did not reach disk is one nobody can open a
     /// hello to, including its owner.
+    ///
+    /// A record written whole names no published advert: the keys it carries
+    /// have not been confirmed published through
+    /// [`Store::mark_advert_published`].
     pub fn persist_advert_keys(&self, snapshot: &AdvertSnapshot) -> Result<(), StoreError> {
-        let bytes = encode_advert_keys(snapshot);
+        let bytes = encode_advert_keys(snapshot, None);
         self.inner.profile_critical_section::<_, StoreError>(|g| {
             g.replace(RecordKind::AdvertKeys, &bytes)?;
             Ok(())
@@ -449,8 +528,9 @@ impl Store {
 
     /// Read the advert KEM state back, or `None` where none has been written.
     pub fn load_advert_keys(&self) -> Result<Option<AdvertSnapshot>, StoreError> {
-        self.inner
-            .profile_critical_section::<_, StoreError>(|g| read_advert_keys(g))
+        self.inner.profile_critical_section::<_, StoreError>(|g| {
+            Ok(read_advert_keys(g)?.map(|(snapshot, _)| snapshot))
+        })
     }
 
     /// Rotate, prune or otherwise change the advert state inside a single
@@ -469,15 +549,56 @@ impl Store {
         &self,
         f: impl FnOnce(&mut AdvertKeys) -> R,
     ) -> Result<R, StoreError> {
+        self.update_advert_state(|keys, _| f(keys))
+    }
+
+    /// [`Store::update_advert_keys`], with the serial of the last advert
+    /// confirmed published handed to `f` beside the keys, so a decision that
+    /// depends on whether the current key has been published is made in the
+    /// critical section that writes. The published serial is carried over
+    /// unchanged.
+    pub fn update_advert_state<R>(
+        &self,
+        f: impl FnOnce(&mut AdvertKeys, Option<u64>) -> R,
+    ) -> Result<R, StoreError> {
         self.inner.profile_critical_section::<_, StoreError>(|g| {
-            let snapshot = read_advert_keys(g)?.ok_or(StoreError::MissingAdvertKeys)?;
+            let (snapshot, published) =
+                read_advert_keys(g)?.ok_or(StoreError::MissingAdvertKeys)?;
             let mut keys = AdvertKeys::restore(snapshot);
-            let out = f(&mut keys);
+            let out = f(&mut keys, published);
             g.replace(
                 RecordKind::AdvertKeys,
-                &encode_advert_keys(&keys.snapshot()),
+                &encode_advert_keys(&keys.snapshot(), published),
             )?;
             Ok(out)
+        })
+    }
+
+    /// Record that the advert at `serial` has been confirmed published.
+    ///
+    /// The recorded serial only moves forward, so a late confirmation of an
+    /// older advert changes nothing. Refuses [`StoreError::MissingAdvertKeys`]
+    /// where no state has been written, and
+    /// [`StoreError::UnbuiltAdvertSerial`], recording nothing, for a serial
+    /// above the current key's: a mark only moves forward, so one past the
+    /// current key would stand for ever and let every later reset rotate
+    /// away the key hellos in flight were encapsulated to.
+    pub fn mark_advert_published(&self, serial: u64) -> Result<(), StoreError> {
+        self.inner.profile_critical_section::<_, StoreError>(|g| {
+            let (snapshot, published) =
+                read_advert_keys(g)?.ok_or(StoreError::MissingAdvertKeys)?;
+            if serial > snapshot.serial {
+                return Err(StoreError::UnbuiltAdvertSerial {
+                    serial,
+                    current: snapshot.serial,
+                });
+            }
+            let published = Some(published.map_or(serial, |p| p.max(serial)));
+            g.replace(
+                RecordKind::AdvertKeys,
+                &encode_advert_keys(&snapshot, published),
+            )?;
+            Ok(())
         })
     }
 
@@ -548,19 +669,76 @@ impl Store {
         })
     }
 
+    /// [`Store::update_conv`] for a change that can be refused: the record is
+    /// written only where `f` returns `Ok`, so a refusal leaves the record's
+    /// bytes as they were.
+    pub fn try_update_conv<T, E>(
+        &self,
+        peer: &CorrespondenceLabel,
+        f: impl FnOnce(&mut ConvState) -> Result<T, E>,
+    ) -> Result<Result<T, E>, StoreError> {
+        self.inner.critical_section::<_, StoreError>(peer, |g| {
+            let mut state = read_conv(g)?.ok_or(StoreError::MissingConversation)?;
+            let out = f(&mut state);
+            if out.is_ok() {
+                g.replace(RecordKind::Conversation, &encode_conv(&state))?;
+            }
+            Ok(out)
+        })
+    }
+
     /// Remove one correspondence's conversation and outbox records.
     ///
     /// Both in one section, so no reader sees a conversation without the
     /// ciphertext it still owes or an outbox with no conversation to place it
-    /// in. The correspondence's directory stays: it is what
-    /// [`DmStore::critical_section`] establishes by being entered, and removing
-    /// it is the record store's business rather than this module's.
+    /// in. The removals run in `DELETE_ORDER`, conversation record first: a
+    /// stop between the two leaves an outbox with no conversation record, which
+    /// nothing lists or polls and [`Store::load`] deletes, rather than a
+    /// conversation the user deleted still being listed. The correspondence's
+    /// directory stays: it is what [`DmStore::critical_section`] establishes by
+    /// being entered, and removing it is the record store's business rather
+    /// than this module's.
     pub fn delete_conv(&self, peer: &CorrespondenceLabel) -> Result<(), StoreError> {
         self.inner.critical_section::<_, StoreError>(peer, |g| {
-            g.delete(RecordKind::ConversationOutbox)?;
-            g.delete(RecordKind::Conversation)?;
+            for kind in DELETE_ORDER {
+                g.delete(kind)?;
+                #[cfg(test)]
+                DELETED.with(|deleted| deleted.borrow_mut().push(kind));
+            }
             Ok(())
         })
+    }
+
+    /// Record that a delete of `peer`'s conversation is under way, returning
+    /// the state as it stood.
+    ///
+    /// Written in the section that reads the state, so the mark and the values
+    /// a teardown is built from are one read. Refuses
+    /// [`StoreError::MissingConversation`] where there is no record.
+    pub fn mark_delete_pending(&self, peer: &CorrespondenceLabel) -> Result<ConvState, StoreError> {
+        self.inner.critical_section::<_, StoreError>(peer, |g| {
+            let mut state = read_conv(g)?.ok_or(StoreError::MissingConversation)?;
+            state.delete_pending = true;
+            g.replace(RecordKind::Conversation, &encode_conv(&state))?;
+            Ok(state)
+        })
+    }
+
+    /// Every correspondence whose conversation record carries a delete-pending
+    /// mark: a teardown that marked it and had not dropped its records when
+    /// the process stopped. A launch resumes each one rather than polling or
+    /// rewriting it.
+    pub fn pending_deletes(&self) -> Result<Vec<CorrespondenceLabel>, StoreError> {
+        let mut pending = Vec::new();
+        for peer in self.inner.correspondences()? {
+            let marked = self.inner.critical_section::<_, StoreError>(&peer, |g| {
+                Ok(read_conv(g)?.is_some_and(|state| state.delete_pending))
+            })?;
+            if marked {
+                pending.push(peer);
+            }
+        }
+        Ok(pending)
     }
 
     /// Record the exact ciphertext written to `seq`'s slot, before it is
@@ -571,11 +749,15 @@ impl Store {
     /// sequence maps onto the slot of one 63 messages older — surfacing here
     /// rather than as a silently dropped entry, and a caller reaching it has
     /// skipped [`Store::delete_outbox_through`].
+    ///
+    /// `sent_at` is when the message was sent, in Unix seconds on the caller's
+    /// clock, and is kept with the entry for as long as it is owed.
     pub fn persist_outbox(
         &self,
         peer: &CorrespondenceLabel,
         seq: u64,
         ciphertext: &[u8],
+        sent_at: u64,
     ) -> Result<(), StoreError> {
         if ciphertext.len() > CHANNEL_SUBKEY_LEN {
             return Err(StoreError::CiphertextTooLong {
@@ -595,6 +777,7 @@ impl Store {
             }
             table[at] = Some(OutboxEntry {
                 seq,
+                sent_at,
                 ciphertext: ciphertext.to_vec(),
             });
             g.replace(RecordKind::ConversationOutbox, &encode_conv_outbox(&table))?;
@@ -641,6 +824,10 @@ impl Store {
     /// reporting it would rewrite a slot for a message the correspondent is not
     /// expecting. An entry below `peer_collected` has been collected and is
     /// waiting for the next [`Store::delete_outbox_through`].
+    ///
+    /// An outbox record with no conversation record beside it is deleted,
+    /// scrubbed first. A run that stopped between persisting its first message
+    /// and creating the record leaves one, and nothing else reads it.
     pub fn load(&self) -> Result<Loaded, StoreError> {
         let advert_keys = self.load_advert_keys()?;
         let mut convs = Vec::new();
@@ -652,6 +839,13 @@ impl Store {
             // or leave one it has not.
             let read = self.inner.critical_section::<_, StoreError>(&peer, |g| {
                 let Some(state) = read_conv(g)? else {
+                    // An outbox with no conversation record beside it is what a
+                    // run leaves that stopped between persisting its first
+                    // message and creating the record. Nothing reads it, so it
+                    // is deleted here, scrubbed first.
+                    if g.read(RecordKind::ConversationOutbox)?.is_some() {
+                        g.delete(RecordKind::ConversationOutbox)?;
+                    }
                     return Ok(None);
                 };
                 let table = read_outbox(g.read(RecordKind::ConversationOutbox)?.as_deref())?;
@@ -663,7 +857,9 @@ impl Store {
             let mut outstanding: Vec<OutboxEntry> = table
                 .into_iter()
                 .flatten()
-                .filter(|e| e.seq >= state.peer_collected && e.seq < state.send_seq)
+                .filter(|e| {
+                    !state.delete_pending && e.seq >= state.peer_collected && e.seq < state.send_seq
+                })
                 .collect();
             outstanding.sort_unstable_by_key(|e| e.seq);
             convs.push(LoadedConv {
@@ -676,10 +872,13 @@ impl Store {
     }
 }
 
-/// The advert-keys record under an open profile guard, or `None` where the
-/// profile has none. An empty payload is the record every [`DmStore::open`]
-/// creates and nothing has written to yet.
-fn read_advert_keys(g: &LockedProfile<'_>) -> Result<Option<AdvertSnapshot>, StoreError> {
+/// The advert-keys record under an open profile guard, with the serial of the
+/// last advert confirmed published, or `None` where the profile has none. An
+/// empty payload is the record every [`DmStore::open`] creates and nothing has
+/// written to yet.
+fn read_advert_keys(
+    g: &LockedProfile<'_>,
+) -> Result<Option<(AdvertSnapshot, Option<u64>)>, StoreError> {
     let Some(bytes) = g.read(RecordKind::AdvertKeys)? else {
         return Ok(None);
     };
@@ -922,12 +1121,12 @@ impl<'a> Reader<'a> {
         }))
     }
 
-    /// The magic and version at the head of a record.
-    fn header(&mut self, magic: &[u8]) -> Result<(), StoreError> {
+    /// The magic and a record's own version at the head of a record.
+    fn header_version(&mut self, magic: &[u8], version: u8) -> Result<(), StoreError> {
         if self.take(magic.len())? != magic {
             return Err(self.corrupt("the record does not begin with its magic"));
         }
-        if self.u8()? != RECORD_VERSION {
+        if self.u8()? != version {
             return Err(self.corrupt("the record carries an unknown version"));
         }
         Ok(())
@@ -943,11 +1142,15 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Encode the advert KEM state.
-pub(crate) fn encode_advert_keys(snapshot: &AdvertSnapshot) -> Zeroizing<Vec<u8>> {
+/// Encode the advert KEM state, and the serial of the last advert confirmed
+/// published.
+pub(crate) fn encode_advert_keys(
+    snapshot: &AdvertSnapshot,
+    published: Option<u64>,
+) -> Zeroizing<Vec<u8>> {
     let mut w = Writer::with_capacity(ADVERT_KEYS_RECORD_LEN);
     w.bytes(ADVERT_KEYS_MAGIC);
-    w.u8(RECORD_VERSION);
+    w.u8(ADVERT_KEYS_RECORD_VERSION);
     w.u64(snapshot.serial);
     w.u64(snapshot.not_before);
     w.bytes(snapshot.decapsulation_key.as_bytes());
@@ -963,13 +1166,26 @@ pub(crate) fn encode_advert_keys(snapshot: &AdvertSnapshot) -> Zeroizing<Vec<u8>
             w.padded(&[], 8 + 8 + ml_kem::DK_LEN);
         }
     }
+    match published {
+        Some(serial) => {
+            w.u8(PRESENT);
+            w.u64(serial);
+        }
+        None => {
+            w.u8(ABSENT);
+            w.padded(&[], 8);
+        }
+    }
     w.0
 }
 
-/// Decode the advert KEM state.
-pub(crate) fn decode_advert_keys(bytes: &[u8]) -> Result<AdvertSnapshot, StoreError> {
+/// Decode the advert KEM state, and the serial of the last advert confirmed
+/// published.
+pub(crate) fn decode_advert_keys(
+    bytes: &[u8],
+) -> Result<(AdvertSnapshot, Option<u64>), StoreError> {
     let mut r = Reader::new(bytes, RecordKind::AdvertKeys);
-    r.header(ADVERT_KEYS_MAGIC)?;
+    r.header_version(ADVERT_KEYS_MAGIC, ADVERT_KEYS_RECORD_VERSION)?;
     let serial = r.u64()?;
     let not_before = r.u64()?;
     let dk = r.array::<{ ml_kem::DK_LEN }>()?;
@@ -977,8 +1193,9 @@ pub(crate) fn decode_advert_keys(bytes: &[u8]) -> Result<AdvertSnapshot, StoreEr
     let prev_serial = r.u64()?;
     let retired_at = r.u64()?;
     let prev_dk = r.array::<{ ml_kem::DK_LEN }>()?;
+    let published = r.opt_u64()?;
     r.finish()?;
-    Ok(AdvertSnapshot {
+    let snapshot = AdvertSnapshot {
         serial,
         not_before,
         decapsulation_key: AdvertDecapKey::from_bytes(&dk),
@@ -987,14 +1204,15 @@ pub(crate) fn decode_advert_keys(bytes: &[u8]) -> Result<AdvertSnapshot, StoreEr
             retired_at,
             decapsulation_key: AdvertDecapKey::from_bytes(&prev_dk),
         }),
-    })
+    };
+    Ok((snapshot, published))
 }
 
 /// Encode one correspondence's state.
 pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
     let mut w = Writer::with_capacity(CONV_RECORD_LEN);
     w.bytes(CONV_MAGIC);
-    w.u8(RECORD_VERSION);
+    w.u8(CONV_RECORD_VERSION);
     w.bytes(state.peer_identity_pk.as_slice());
     w.bytes(&state.outgoing_lookup_key);
     w.bytes(&state.incoming_lookup_key);
@@ -1027,8 +1245,12 @@ pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
         ml_kem::CT_LEN,
     );
     w.opt(
-        state.peer_hello_secret.as_ref().map(|s| &s.as_bytes()[..]),
-        ml_kem::SHARED_SECRET_LEN,
+        state.own_control_key.as_ref().map(|k| &k.as_bytes()[..]),
+        CONTROL_KEY_LEN,
+    );
+    w.opt(
+        state.peer_control_key.as_ref().map(|k| &k.as_bytes()[..]),
+        CONTROL_KEY_LEN,
     );
     w.opt_u64(state.peer_advert_serial);
     w.opt(
@@ -1069,13 +1291,15 @@ pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
         w.own_turn(turn.as_ref());
     }
     w.peer_turn(receiving.peer_latest.as_ref());
+    w.u8(u8::from(state.acceptance_pending));
+    w.u8(u8::from(state.delete_pending));
     w.0
 }
 
 /// Decode one correspondence's state.
 pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
     let mut r = Reader::new(bytes, RecordKind::Conversation);
-    r.header(CONV_MAGIC)?;
+    r.header_version(CONV_MAGIC, CONV_RECORD_VERSION)?;
     let peer_identity_pk = r.boxed::<{ ml_dsa::PK_LEN }>()?;
     let outgoing_lookup_key = *r.array::<HELLO_LOOKUP_KEY_LEN>()?;
     let incoming_lookup_key = *r.array::<HELLO_LOOKUP_KEY_LEN>()?;
@@ -1113,10 +1337,14 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         .as_deref()
         .map(AdvertSharedSecret::from_bytes);
     let own_hello_kem_ct = r.opt_array::<{ ml_kem::CT_LEN }>()?.map(|b| Box::new(*b));
-    let peer_hello_secret = r
-        .opt_array::<{ ml_kem::SHARED_SECRET_LEN }>()?
+    let own_control_key = r
+        .opt_array::<CONTROL_KEY_LEN>()?
         .as_deref()
-        .map(AdvertSharedSecret::from_bytes);
+        .map(ControlKey::from_bytes);
+    let peer_control_key = r
+        .opt_array::<CONTROL_KEY_LEN>()?
+        .as_deref()
+        .map(ControlKey::from_bytes);
     let peer_advert_serial = r.opt_u64()?;
     let own_opening = r.opt_array::<OPENING_LEN>()?.map(|b| Box::new(*b));
 
@@ -1150,6 +1378,8 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         own_turns: [r.own_turn()?, r.own_turn()?],
         peer_latest: r.peer_turn()?,
     };
+    let acceptance_pending = r.flag()?;
+    let delete_pending = r.flag()?;
     r.finish()?;
 
     Ok(ConvState {
@@ -1163,6 +1393,7 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         my_collected,
         cursor_published,
         awaiting_acceptance,
+        acceptance_pending,
         outstanding_hello: has_hello.then_some(OutstandingHello {
             slot: hello_slot,
             r: *hello_r,
@@ -1172,9 +1403,11 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         }),
         own_hello_secret,
         own_hello_kem_ct,
-        peer_hello_secret,
+        own_control_key,
+        peer_control_key,
         peer_advert_serial,
         own_opening,
+        delete_pending,
     })
 }
 
@@ -1185,12 +1418,13 @@ type OutboxTable = Vec<Option<OutboxEntry>>;
 pub(crate) fn encode_conv_outbox(table: &[Option<OutboxEntry>]) -> Zeroizing<Vec<u8>> {
     let mut w = Writer::with_capacity(CONV_OUTBOX_RECORD_LEN);
     w.bytes(CONV_OUTBOX_MAGIC);
-    w.u8(RECORD_VERSION);
+    w.u8(CONV_OUTBOX_RECORD_VERSION);
     for slot in table {
         match slot {
             Some(e) => {
                 w.u8(PRESENT);
                 w.u64(e.seq);
+                w.u64(e.sent_at);
                 w.u32(e.ciphertext.len() as u32);
                 w.padded(&e.ciphertext, CHANNEL_SUBKEY_LEN);
             }
@@ -1206,11 +1440,12 @@ pub(crate) fn encode_conv_outbox(table: &[Option<OutboxEntry>]) -> Zeroizing<Vec
 /// Decode the outbox table.
 pub(crate) fn decode_conv_outbox(bytes: &[u8]) -> Result<OutboxTable, StoreError> {
     let mut r = Reader::new(bytes, RecordKind::ConversationOutbox);
-    r.header(CONV_OUTBOX_MAGIC)?;
+    r.header_version(CONV_OUTBOX_MAGIC, CONV_OUTBOX_RECORD_VERSION)?;
     let mut table = Vec::with_capacity(RING_SLOTS as usize);
     for index in 0..RING_SLOTS {
         let present = r.flag()?;
         let seq = r.u64()?;
+        let sent_at = r.u64()?;
         let len = r.u32()? as usize;
         let body = r.take(CHANNEL_SUBKEY_LEN)?;
         if !present {
@@ -1229,7 +1464,11 @@ pub(crate) fn decode_conv_outbox(bytes: &[u8]) -> Result<OutboxTable, StoreError
             .get(..len)
             .ok_or_else(|| r.corrupt("an entry's length runs past its slot"))?
             .to_vec();
-        table.push(Some(OutboxEntry { seq, ciphertext }));
+        table.push(Some(OutboxEntry {
+            seq,
+            sent_at,
+            ciphertext,
+        }));
     }
     r.finish()?;
     Ok(table)
@@ -1380,12 +1619,15 @@ mod tests {
             my_collected,
             cursor_published: my_collected,
             awaiting_acceptance: false,
+            acceptance_pending: false,
             outstanding_hello: hello,
             own_hello_secret: Some(shared_secret(0x44)),
             own_hello_kem_ct: Some(Box::new([0x77u8; ml_kem::CT_LEN])),
-            peer_hello_secret: Some(shared_secret(0x55)),
+            own_control_key: Some(ControlKey::from_bytes(&[0x45u8; 32])),
+            peer_control_key: Some(ControlKey::from_bytes(&[0x55u8; 32])),
             peer_advert_serial: Some(9),
             own_opening: Some(Box::new([0x66u8; OPENING_LEN])),
+            delete_pending: false,
         }
     }
 
@@ -1431,7 +1673,9 @@ mod tests {
         let store = Store::open(tmp.path(), &at_rest_key(1)).unwrap();
         store.persist_advert_keys(&advert).unwrap();
         store.create_conv(&label(1), &state).unwrap();
-        store.persist_outbox(&label(1), 0, &ciphertext).unwrap();
+        store
+            .persist_outbox(&label(1), 0, &ciphertext, NOW)
+            .unwrap();
         drop(store);
 
         let store = Store::open(tmp.path(), &at_rest_key(1)).unwrap();
@@ -1439,8 +1683,8 @@ mod tests {
 
         let read_advert = loaded.advert_keys.expect("the advert record is there");
         assert_eq!(
-            encode_advert_keys(&read_advert).to_vec(),
-            encode_advert_keys(&advert).to_vec(),
+            encode_advert_keys(&read_advert, None).to_vec(),
+            encode_advert_keys(&advert, None).to_vec(),
             "the advert record did not round trip"
         );
         assert_eq!(read_advert.previous.expect("retained key").serial, 0);
@@ -1485,11 +1729,19 @@ mod tests {
         );
         assert_eq!(
             conv.state
-                .peer_hello_secret
+                .own_control_key
                 .as_ref()
-                .expect("the peer hello secret round trips")
+                .expect("the own control key round trips")
                 .as_bytes(),
-            shared_secret(0x55).as_bytes()
+            &[0x45u8; 32]
+        );
+        assert_eq!(
+            conv.state
+                .peer_control_key
+                .as_ref()
+                .expect("the peer control key round trips")
+                .as_bytes(),
+            &[0x55u8; 32]
         );
         assert_eq!(
             conv.state
@@ -1514,7 +1766,8 @@ mod tests {
         let bare = ConvState {
             own_hello_secret: None,
             own_hello_kem_ct: None,
-            peer_hello_secret: None,
+            own_control_key: None,
+            peer_control_key: None,
             peer_advert_serial: None,
             own_opening: None,
             ..bare
@@ -1522,13 +1775,15 @@ mod tests {
         let decoded = decode_conv(&encode_conv(&bare)).expect("a bare record decodes");
         assert!(decoded.own_hello_secret.is_none());
         assert!(decoded.own_hello_kem_ct.is_none());
-        assert!(decoded.peer_hello_secret.is_none());
+        assert!(decoded.own_control_key.is_none());
+        assert!(decoded.peer_control_key.is_none());
         assert!(decoded.peer_advert_serial.is_none());
         assert!(decoded.own_opening.is_none());
         assert_eq!(
             conv.outstanding_outbox,
             vec![OutboxEntry {
                 seq: 0,
+                sent_at: NOW,
                 ciphertext: ciphertext.clone()
             }],
             "the outbox record did not round trip"
@@ -1566,12 +1821,14 @@ mod tests {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(3)).unwrap();
-        store.persist_outbox(&label(4), 0, b"first").unwrap();
+        store.persist_outbox(&label(4), 0, b"first", NOW).unwrap();
         // The control: the same sequence again is a re-seal, and is allowed.
-        store.persist_outbox(&label(4), 0, b"first again").unwrap();
+        store
+            .persist_outbox(&label(4), 0, b"first again", NOW)
+            .unwrap();
 
         let err = store
-            .persist_outbox(&label(4), RING_SLOTS, b"a full ring later")
+            .persist_outbox(&label(4), RING_SLOTS, b"a full ring later", NOW)
             .expect_err("the slot is occupied");
         assert!(matches!(
             err,
@@ -1583,7 +1840,7 @@ mod tests {
 
         store.delete_outbox_through(&label(4), 1).unwrap();
         store
-            .persist_outbox(&label(4), RING_SLOTS, b"a full ring later")
+            .persist_outbox(&label(4), RING_SLOTS, b"a full ring later", NOW)
             .expect("the slot is free once the cursor passes it");
     }
 
@@ -1775,7 +2032,7 @@ mod tests {
 
             budget.act()?;
             self.store
-                .persist_outbox(&self.label, seq, &ciphertext)
+                .persist_outbox(&self.label, seq, &ciphertext, NOW)
                 .expect("persist the outbox");
             budget.act()?;
             self.persist();
@@ -1926,12 +2183,15 @@ mod tests {
                         my_collected: 0,
                         cursor_published: 0,
                         awaiting_acceptance: false,
+                        acceptance_pending: false,
                         outstanding_hello: None,
                         own_hello_secret: None,
                         own_hello_kem_ct: None,
-                        peer_hello_secret: None,
+                        own_control_key: None,
+                        peer_control_key: None,
                         peer_advert_serial: None,
                         own_opening: None,
+                        delete_pending: false,
                     },
                 )
                 .unwrap();
@@ -1950,12 +2210,15 @@ mod tests {
                         my_collected: 0,
                         cursor_published: 0,
                         awaiting_acceptance: false,
+                        acceptance_pending: false,
                         outstanding_hello: None,
                         own_hello_secret: None,
                         own_hello_kem_ct: None,
-                        peer_hello_secret: None,
+                        own_control_key: None,
+                        peer_control_key: None,
                         peer_advert_serial: None,
                         own_opening: None,
+                        delete_pending: false,
                     },
                 )
                 .unwrap();
@@ -2445,6 +2708,324 @@ mod tests {
         );
     }
 
+    /// A delete stopped after its first removal leaves no conversation record,
+    /// so nothing a launch would list or poll; the outbox it had not yet
+    /// removed is an orphan the next load deletes.
+    #[test]
+    fn a_delete_stopped_after_its_first_removal_leaves_no_conversation() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x30)).unwrap();
+        let peer = label(0x33);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store.persist_outbox(&peer, 0, &[0x7c; 64], NOW).unwrap();
+        let file = |kind: RecordKind| {
+            store
+                .records()
+                .root()
+                .join(hex::encode(peer.as_bytes()))
+                .join(kind.file_name())
+        };
+        assert!(
+            file(RecordKind::Conversation).exists()
+                && file(RecordKind::ConversationOutbox).exists(),
+            "the control: both records are on disk"
+        );
+
+        // The delete's first removal, and a stop.
+        store
+            .records()
+            .critical_section::<_, DmStoreError>(&peer, |g| g.delete(DELETE_ORDER[0]))
+            .unwrap();
+        assert!(
+            !file(RecordKind::Conversation).exists(),
+            "the first removal left the conversation record, which a launch would list"
+        );
+        assert!(
+            file(RecordKind::ConversationOutbox).exists(),
+            "the control: the stop landed between the two removals"
+        );
+    }
+
+    /// A change refused inside `try_update_conv` leaves the conversation
+    /// record's bytes on disk exactly as they were, and an accepted one
+    /// rewrites them.
+    #[test]
+    fn a_refused_change_leaves_the_record_bytes_unchanged() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x3a)).unwrap();
+        let peer = label(0x3b);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        let file = store
+            .records()
+            .root()
+            .join(hex::encode(peer.as_bytes()))
+            .join(RecordKind::Conversation.file_name());
+        let before = std::fs::read(&file).unwrap();
+
+        let refused = store
+            .try_update_conv(&peer, |state| {
+                state.send_seq += 1;
+                Err::<(), _>("refused")
+            })
+            .unwrap();
+        assert_eq!(refused, Err("refused"));
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "a refused change rewrote the record"
+        );
+
+        store
+            .try_update_conv(&peer, |state| {
+                state.send_seq += 1;
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "the control: an accepted change rewrote the record"
+        );
+    }
+
+    /// An owed entry keeps its send time when another entry is persisted after
+    /// it, and when a cursor drops an entry before it and the record is
+    /// rewritten.
+    #[test]
+    fn an_owed_entry_keeps_its_send_time_across_later_writes() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x3c)).unwrap();
+        let peer = label(0x3d);
+        let sent_at = |store: &Store| -> Vec<(u64, u64)> {
+            let raw = store
+                .records()
+                .critical_section::<_, DmStoreError>(&peer, |g| {
+                    g.read(RecordKind::ConversationOutbox)
+                })
+                .unwrap()
+                .expect("an outbox record");
+            decode_conv_outbox(&raw)
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .map(|entry| (entry.seq, entry.sent_at))
+                .collect()
+        };
+
+        store.persist_outbox(&peer, 0, &[0x70; 64], NOW).unwrap();
+        store
+            .persist_outbox(&peer, 1, &[0x71; 64], NOW + 10)
+            .unwrap();
+        assert_eq!(
+            sent_at(&store),
+            vec![(0, NOW), (1, NOW + 10)],
+            "a later persist changed an earlier entry's send time"
+        );
+
+        store.delete_outbox_through(&peer, 1).unwrap();
+        assert_eq!(
+            sent_at(&store),
+            vec![(1, NOW + 10)],
+            "dropping an earlier entry changed a later entry's send time"
+        );
+
+        store
+            .persist_outbox(&peer, 2, &[0x72; 64], NOW + 20)
+            .unwrap();
+        assert_eq!(sent_at(&store), vec![(1, NOW + 10), (2, NOW + 20)]);
+    }
+
+    /// `delete_conv` removes the conversation record and then the outbox, in
+    /// that order.
+    #[test]
+    fn a_delete_removes_the_conversation_record_before_the_outbox() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x38)).unwrap();
+        let peer = label(0x39);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store.persist_outbox(&peer, 0, &[0x7e; 64], NOW).unwrap();
+        DELETED.with(|deleted| deleted.borrow_mut().clear());
+
+        store.delete_conv(&peer).unwrap();
+        assert_eq!(
+            DELETED.with(|deleted| deleted.borrow().clone()),
+            vec![RecordKind::Conversation, RecordKind::ConversationOutbox],
+            "delete_conv did not remove the conversation record first"
+        );
+        assert!(
+            store.load().unwrap().convs.is_empty(),
+            "the control: the delete removed the conversation"
+        );
+    }
+
+    /// A conversation marked for delete is loaded carrying its mark and with no
+    /// outstanding outbox, so a launch rewrites none of its slots.
+    #[test]
+    fn a_conversation_marked_for_delete_offers_no_outbox_to_rewrite() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x36)).unwrap();
+        let peer = label(0x37);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store.persist_outbox(&peer, 0, &[0x7d; 64], NOW).unwrap();
+        let loaded = |store: &Store| {
+            store
+                .load()
+                .unwrap()
+                .convs
+                .into_iter()
+                .next()
+                .expect("the conversation")
+        };
+
+        let unmarked = loaded(&store);
+        assert!(!unmarked.state.delete_pending);
+        assert_eq!(
+            unmarked.outstanding_outbox.len(),
+            1,
+            "the control: the message is outstanding"
+        );
+
+        store.mark_delete_pending(&peer).unwrap();
+        let marked = loaded(&store);
+        assert!(
+            marked.state.delete_pending,
+            "the loaded conversation does not carry its mark"
+        );
+        assert!(
+            marked.outstanding_outbox.is_empty(),
+            "a conversation being deleted offered its outbox for rewriting"
+        );
+    }
+
+    /// A delete-pending byte other than 0 or 1 is refused as corrupt rather
+    /// than read as a mark.
+    #[test]
+    fn a_delete_pending_byte_other_than_zero_or_one_is_refused() {
+        let (a, _b) = pair();
+        let mut bytes = encode_conv(&conv_state(&a, 1, 0, 0, None)).to_vec();
+        let at = bytes.len() - 1;
+        bytes[at] = 1;
+        assert!(
+            decode_conv(&bytes)
+                .expect("the control: a set mark decodes")
+                .delete_pending
+        );
+        bytes[at] = 2;
+        match decode_conv(&bytes) {
+            Err(StoreError::Corrupt { .. }) => {}
+            other => panic!("a delete-pending byte of 2 was not refused: {other:?}"),
+        }
+    }
+
+    /// The delete-pending mark survives a reopen, names the correspondence in
+    /// `pending_deletes` and nothing else, and goes with the conversation
+    /// record.
+    #[test]
+    fn a_delete_pending_mark_survives_a_reopen_and_goes_with_the_record() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let marked = label(0x34);
+        let other = label(0x35);
+        {
+            let store = Store::open(tmp.path(), &at_rest_key(0x31)).unwrap();
+            store
+                .create_conv(&marked, &conv_state(&a, 1, 0, 0, None))
+                .unwrap();
+            store
+                .create_conv(&other, &conv_state(&a, 1, 0, 0, None))
+                .unwrap();
+            assert!(
+                store.pending_deletes().unwrap().is_empty(),
+                "the control: nothing is pending before the mark"
+            );
+            assert!(store.mark_delete_pending(&marked).unwrap().delete_pending);
+        }
+
+        let store = Store::open(tmp.path(), &at_rest_key(0x31)).unwrap();
+        assert!(
+            store
+                .load_conv(&marked)
+                .unwrap()
+                .expect("the marked record")
+                .delete_pending,
+            "the mark did not survive a reopen"
+        );
+        assert!(
+            !store
+                .load_conv(&other)
+                .unwrap()
+                .expect("the other record")
+                .delete_pending,
+            "an unmarked record reads as marked"
+        );
+        assert_eq!(store.pending_deletes().unwrap(), vec![marked]);
+
+        store.delete_conv(&marked).unwrap();
+        assert!(
+            store.pending_deletes().unwrap().is_empty(),
+            "the mark outlived its record"
+        );
+        assert!(matches!(
+            store.mark_delete_pending(&marked),
+            Err(StoreError::MissingConversation)
+        ));
+    }
+
+    /// An outbox record whose correspondence holds no conversation record is
+    /// deleted by the next load, and an outbox beside a conversation record is
+    /// kept.
+    #[test]
+    fn a_load_deletes_an_outbox_with_no_conversation_record() {
+        // First: the pair brings the crypto module up, which opening the store
+        // needs.
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(1)).unwrap();
+        let orphan = label(0x31);
+        let genuine = label(0x32);
+        store.persist_outbox(&orphan, 0, &[0x5a; 64], NOW).unwrap();
+        store
+            .create_conv(&genuine, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store.persist_outbox(&genuine, 0, &[0x6b; 64], NOW).unwrap();
+        let outbox_of = |peer: &CorrespondenceLabel| {
+            store
+                .records()
+                .critical_section::<_, DmStoreError>(peer, |g| {
+                    g.read(RecordKind::ConversationOutbox)
+                })
+                .unwrap()
+        };
+        // The control: both outboxes are on disk before the load.
+        assert!(outbox_of(&orphan).is_some(), "the orphan was not written");
+        assert!(outbox_of(&genuine).is_some(), "the outbox was not written");
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.convs.len(), 1, "one correspondence has a record");
+        assert!(
+            outbox_of(&orphan).is_none(),
+            "an outbox with no conversation record survived the load"
+        );
+        assert!(
+            outbox_of(&genuine).is_some(),
+            "the load deleted an outbox beside its conversation record"
+        );
+    }
+
     // ── what a decoder refuses ──────────────────────────────────────────────
 
     /// Byte offset of the conversation record's `send_seq`.
@@ -2464,24 +3045,66 @@ mod tests {
 
     #[test]
     fn a_record_carrying_an_unknown_version_is_refused() {
+        // The version every record kind carried before its format first turned
+        // over.
+        const FIRST_RECORD_VERSION: u8 = 1;
         let (a, _b) = pair();
-        let cases: Vec<(&str, Vec<u8>, usize)> = vec![
+        let cases: Vec<(&str, Vec<u8>, usize, u8)> = vec![
             (
                 "advert keys",
-                encode_advert_keys(&rotated_advert()).to_vec(),
+                encode_advert_keys(&rotated_advert(), Some(1)).to_vec(),
                 ADVERT_KEYS_MAGIC.len(),
+                ADVERT_KEYS_RECORD_VERSION,
             ),
-            ("conversation", conv_bytes_with_hello(), CONV_MAGIC.len()),
+            (
+                "conversation",
+                conv_bytes_with_hello(),
+                CONV_MAGIC.len(),
+                CONV_RECORD_VERSION,
+            ),
             (
                 "outbox",
                 encode_conv_outbox(&vec![None; RING_SLOTS as usize]).to_vec(),
                 CONV_OUTBOX_MAGIC.len(),
+                CONV_OUTBOX_RECORD_VERSION,
             ),
         ];
         let _ = &a;
-        for (name, good, version_at) in cases {
+
+        // A record of any kind carrying the first version is refused as an
+        // unknown version, not read at a wrong length.
+        let mut old = conv_bytes_with_hello();
+        old[CONV_MAGIC.len()] = FIRST_RECORD_VERSION;
+        match decode_conv(&old) {
+            Err(StoreError::Corrupt { reason, .. }) => assert!(
+                reason.contains("version"),
+                "refused for the wrong reason: {reason}"
+            ),
+            other => panic!("a conversation record at the first version decoded: {other:?}"),
+        }
+        let mut old = encode_advert_keys(&rotated_advert(), Some(1)).to_vec();
+        old[ADVERT_KEYS_MAGIC.len()] = FIRST_RECORD_VERSION;
+        match decode_advert_keys(&old).map(|_| ()) {
+            Err(StoreError::Corrupt { reason, .. }) => assert!(
+                reason.contains("version"),
+                "refused for the wrong reason: {reason}"
+            ),
+            other => panic!("an advert-keys record at the first version decoded: {other:?}"),
+        }
+        // An outbox record written before entries carried a send time.
+        let mut old = encode_conv_outbox(&vec![None; RING_SLOTS as usize]).to_vec();
+        old[CONV_OUTBOX_MAGIC.len()] = FIRST_RECORD_VERSION;
+        match decode_conv_outbox(&old) {
+            Err(StoreError::Corrupt { reason, .. }) => assert!(
+                reason.contains("version"),
+                "refused for the wrong reason: {reason}"
+            ),
+            other => panic!("an outbox record at the first version decoded: {other:?}"),
+        }
+
+        for (name, good, version_at, version) in cases {
             // The control: the byte this test moves really is the version.
-            assert_eq!(good[version_at], RECORD_VERSION, "{name}");
+            assert_eq!(good[version_at], version, "{name}");
             let decode = |bytes: &[u8]| -> Result<(), StoreError> {
                 match name {
                     "advert keys" => decode_advert_keys(bytes).map(|_| ()),
@@ -2493,7 +3116,7 @@ mod tests {
             decode(&good).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
 
             let mut bumped = good.clone();
-            bumped[version_at] = RECORD_VERSION + 1;
+            bumped[version_at] = version + 1;
             match decode(&bumped) {
                 Err(StoreError::Corrupt { reason, .. }) => assert!(
                     reason.contains("version"),
@@ -2509,6 +3132,7 @@ mod tests {
         let mut table: OutboxTable = vec![None; RING_SLOTS as usize];
         table[0] = Some(OutboxEntry {
             seq: 0,
+            sent_at: NOW,
             ciphertext: b"a message".to_vec(),
         });
         let good = encode_conv_outbox(&table).to_vec();
@@ -2656,6 +3280,99 @@ mod tests {
         assert_ne!(read.serial, first_serial, "the current key moved on");
         let retained = read.previous.expect("the retired key was persisted");
         assert_eq!(retained.serial, first_serial);
+    }
+
+    /// A change to a correspondence whose conversation record has been deleted
+    /// is refused as a missing conversation, which is the refusal a reset
+    /// skips.
+    #[test]
+    fn a_change_to_a_deleted_conversation_is_a_missing_conversation() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x2f)).unwrap();
+        store
+            .create_conv(&label(1), &conv_state(&a, 4, 2, 0, None))
+            .unwrap();
+        // The control: the record takes a change.
+        store.update_conv(&label(1), |_| ()).unwrap();
+        store.delete_conv(&label(1)).unwrap();
+        assert!(matches!(
+            store.update_conv(&label(1), |_| ()),
+            Err(StoreError::MissingConversation)
+        ));
+    }
+
+    /// The serial of the last advert confirmed published survives a reopen and
+    /// a rotation through the store, only moves forward, is never above the
+    /// current key's, and is absent from a record written whole.
+    #[test]
+    fn the_published_advert_serial_survives_a_reopen_and_a_rotation() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let published =
+            |store: &Store| store.update_advert_state(|_, published| published).unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x2e)).unwrap();
+        assert!(matches!(
+            store.mark_advert_published(0),
+            Err(StoreError::MissingAdvertKeys)
+        ));
+
+        let keys = advert::AdvertKeys::new(NOW, counting_fill(0x63)).expect("advert keys");
+        let first = keys.serial();
+        store.persist_advert_keys(&keys.snapshot()).unwrap();
+        assert_eq!(
+            published(&store),
+            None,
+            "the control: a fresh record names no published advert"
+        );
+
+        store.mark_advert_published(first).unwrap();
+        drop(store);
+        let store = Store::open(tmp.path(), &at_rest_key(0x2e)).unwrap();
+        assert_eq!(
+            published(&store),
+            Some(first),
+            "the published serial did not survive a reopen"
+        );
+
+        store
+            .update_advert_keys(|k| k.rotate_now(NOW + 1, counting_fill(0x64)).expect("rotate"))
+            .unwrap();
+        assert_eq!(
+            published(&store),
+            Some(first),
+            "a rotation dropped the published serial"
+        );
+
+        // A serial above the current key's is refused and records nothing.
+        assert!(
+            matches!(
+                store.mark_advert_published(first + 2),
+                Err(StoreError::UnbuiltAdvertSerial { serial, current })
+                    if serial == first + 2 && current == first + 1
+            ),
+            "a serial above the current key's was accepted"
+        );
+        assert_eq!(
+            published(&store),
+            Some(first),
+            "a refused mark changed the published serial"
+        );
+
+        store.mark_advert_published(first + 1).unwrap();
+        store.mark_advert_published(first).unwrap();
+        assert_eq!(
+            published(&store),
+            Some(first + 1),
+            "a late confirmation of an older advert moved the serial back"
+        );
+
+        store.persist_advert_keys(&keys.snapshot()).unwrap();
+        assert_eq!(
+            published(&store),
+            None,
+            "a record written whole kept a published serial"
+        );
     }
 
     #[test]

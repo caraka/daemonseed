@@ -18,9 +18,8 @@ pub const DEFAULT_JITTER_FRAC: f64 = 0.25;
 /// the band; result = `delay * (1 + frac * unit)`, clamped to ≥ 0.
 ///
 /// **The one definition of jitter in the workspace**, free of any policy so a
-/// caller with its own ladder can reach it — [`crate::dm::outbox`] draws against
-/// an explicit rung ladder, and a second copy of this arithmetic beside it would
-/// be free to drift from this one.
+/// caller with its own ladder can reach it, and a second copy of this arithmetic
+/// beside it would be free to drift from this one.
 pub fn apply_jitter(delay: Duration, frac: f64, unit: f64) -> Duration {
     let unit = unit.clamp(-1.0, 1.0);
     let factor = (1.0 + frac * unit).max(0.0);
@@ -73,12 +72,9 @@ mod tests {
 
     /// **The `unit` clamp is a bound on the caller, and nothing tested it.**
     ///
-    /// `apply_jitter` is the workspace's one definition of jitter and is reached
-    /// by `crate::dm::outbox::ReseedSchedule::schedule_next_with_unit`. Removing
+    /// `apply_jitter` is the workspace's one definition of jitter. Removing
     /// `unit.clamp(-1.0, 1.0)` lets a caller passing an out-of-band unit push the
-    /// resulting delay arbitrarily far out — for the outbox that is a
-    /// `next_due_ms` a caller can place past its own give-up, i.e. a message that
-    /// stops being re-seeded on nothing but a bad argument.
+    /// resulting delay arbitrarily far out.
     #[test]
     fn jitter_clamps_a_unit_outside_the_band() {
         let frac = DEFAULT_JITTER_FRAC;
@@ -124,8 +120,7 @@ mod tests {
     /// [`apply_jitter`]'s `.max(0.0)` is a panic guard, and this is what says so.
     ///
     /// [`Duration::mul_f64`] panics on a negative or NaN factor. No in-tree caller
-    /// can reach either — every `frac` in the tree is `0.25` and `jitter::unit`
-    /// returns `[-1, 1]` by construction — so deleting the `.max(0.0)` leaves the
+    /// can reach either — so deleting the `.max(0.0)` leaves the
     /// whole workspace green while removing the only thing standing between a
     /// future caller's out-of-range argument and a panicking retry path.
     ///

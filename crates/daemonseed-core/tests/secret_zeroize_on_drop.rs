@@ -23,38 +23,25 @@
 //! second benefit: the allocator hook applies only here, never to the crate's
 //! ~970 unit tests.
 //!
-//! The witness also covers the two secret-bearing structs the macro does not
-//! generate: `PersistedCircle` and `VerifiedFirstContact`. Both are now on
-//! `#[derive(Zeroize, ZeroizeOnDrop)]` rather than a hand-written `Drop` (#267),
-//! so the cases below watch every field either struct stores on the heap, not the
-//! one field a hand-written `Drop` happened to name — `PersistedCircle`'s
-//! `entropy` AND `label`, and `VerifiedFirstContact`'s `ss0` AND `body`.
+//! The witness also covers the secret-bearing struct the macro does not
+//! generate: `PersistedCircle`. It is on `#[derive(Zeroize, ZeroizeOnDrop)]`
+//! rather than a hand-written `Drop`, so the cases below watch every field it
+//! stores on the heap, not the one field a hand-written `Drop` happened to name —
+//! `entropy` AND `label`.
 //!
 //! That widening is the point of the change, and it is why `label` is watched at
 //! all despite not being a secret. Under a hand-written `Drop` the test enumerated
 //! the same field names the code did, so the two shared one assumption and a field
-//! added to either struct was uncovered in both places at once. Under the derive
+//! added to the struct was uncovered in both places at once. Under the derive
 //! the default is a wipe, and `label` is the case that holds the default: it is
 //! the field no author would think to add a `zeroize()` call for, and it is wiped.
 //!
-//! Neither struct carries a single `#[zeroize(skip)]`, so every field is wiped and
-//! there is no opt-out to review. Four of the six heap-resident ones are watched
-//! here (`entropy`, `label`, `ss0`, `body`) plus `pk_lt` as the `Box<[u8; N]>`
-//! shape; `pk_pc` and `eph_ek` are the same shape as `pk_lt` and are held by the
-//! same derive, and `seq`/`sent_unix_ms` are scalars this allocator hook cannot
-//! see. The compile-time bound in `secret_seed.rs` now names both structs; before
-//! this change it could not reach them at all.
+//! The struct carries no `#[zeroize(skip)]`, so every field is wiped and there is
+//! no opt-out to review. The compile-time bound in `secret_seed.rs` names it.
 //!
-//! `VerifiedFirstContact`'s fields are private, because holding one is meant to be
-//! the proof that its seal opened and its signatures verified (#265). This file
-//! reaches them through the `testing`-gated constructor and accessors described
-//! there, which this crate's own dev-dependency on itself switches on and nothing
-//! else does.
-//!
-//! `ss0` is what made the watch a *range inside* a block rather than a whole block:
-//! it sits at a non-zero offset in a larger struct, so the witness fires on any
-//! freed block that wholly contains the watched range and snapshots from the
-//! watched address rather than from the block start. Because containment matching
+//! The witness fires on any freed block that wholly contains the watched range and
+//! snapshots from the watched address rather than from the block start, so a watch
+//! can be a range inside a block. Because containment matching
 //! asserts nothing about *which* block fired, every case additionally states the
 //! `(offset, block_size)` it expects and the harness pins both — that pair is what
 //! replaced the structural guarantee exact-block-start matching used to give for
@@ -71,8 +58,7 @@
 //! that block is handed back. A `Copy` secret sitting on a stack frame — a
 //! `[u8; 32]` shared secret or a `[u8; DK_LEN]` decapsulation key inside a
 //! `Result` a function has not yet returned from — is never allocated and never
-//! freed, so nothing here observes it. That class is held by the in-place wipes
-//! in `dm::reest` and `dm::ratchet`; no case in this file can go red on it.
+//! freed, so nothing here observes it; no case in this file can go red on it.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -82,42 +68,21 @@ use daemonseed_core::circle::key::{
     derive_circle_presence_veilid_owner_seed, derive_circle_veilid_owner_seed,
 };
 use daemonseed_core::crypto::suite::CNSA_2_0;
-use daemonseed_core::dm::firstcontact::{ChannelRoots, ROOT_LEN, SS0_LEN, VerifiedFirstContact};
-use daemonseed_core::dm::provisional::SigningKeyPc;
-use daemonseed_core::dm::ratchet::EphemeralDecapKey;
-use daemonseed_core::dm::ratchet::ROOT_KEY_LEN;
-use daemonseed_core::dm::resume::{
-    CommittedRoot, DedupMemory, FreshAttempt, OwnSlot, ReEstState, ResumeRecord, RetainedRoot,
-    Retention, SealedReEst, SendFloor, reroot,
-};
 use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_room::derive_room_veilid_owner_seed;
 use daemonseed_core::storage::seeds::{
     DecodedSecretBuffer, PersistedCircle, Seeds, observe_decoded_secret_buffers,
 };
-use oxicrypt_ml_dsa::{PK_LEN, SK_LEN as ML_DSA_SK_LEN};
-use oxicrypt_ml_kem::{DK_LEN, EK_LEN};
 use zeroize::Zeroizing;
 
-/// Large enough for the biggest secret watched here, which since #314 is the
-/// ML-DSA-87 signing key behind `ResumeRecord::s_pc` at 4 896 bytes — larger than
-/// the ML-KEM decapsulation key that previously set this bound.
-///
-/// Derived from the constant rather than written as a literal, so a suite change
-/// that grows the ML-DSA key cannot silently outrun the buffer. It tracks that key
-/// only: a decapsulation key grown past it is caught by the length refusal below
-/// instead — loudly, and at the case that needs it, but not by this derivation.
+/// Large enough for the biggest secret watched here, the decode buffer case's
+/// `DECODE_SECRET_LEN`.
 ///
 /// `assert_zeroed_when_freed` refuses a secret longer than this rather than
-/// truncating it, which is what caught the 4 096 figure when the first #314 case
-/// was added — a truncating snapshot would have compared only the first 4 096 bytes
-/// and passed while the tail went unexamined.
-const SNAPSHOT_CAP: usize = if ML_DSA_SK_LEN > 4096 {
-    ML_DSA_SK_LEN
-} else {
-    4096
-};
+/// truncating it — a truncating snapshot would compare only the first bytes and
+/// pass while the tail went unexamined.
+const SNAPSHOT_CAP: usize = DECODE_SECRET_LEN;
 
 /// The size every 32-byte secret newtype watched here occupies — the block size
 /// each such case expects the allocator to hand back.
@@ -152,14 +117,6 @@ const CIRCLE_SEEN_PHRASE: &str = "a different phrase for the read high-water key
 const CIRCLE_SEEN_PHRASE_LEN: usize = 46;
 const CIRCLE_SEEN_KEY_CAP: usize = 80;
 
-/// The decrypted message the `VerifiedFirstContact::body` case builds, and the
-/// length and capacity of its buffer. They differ for the same reason the circle
-/// phrase's do: the production body is decoded out of a padded plaintext and can
-/// carry slack, so the watched buffer carries slack too.
-const DM_BODY_TEXT: &str = "meet me at the usual place, half past eight";
-const DM_BODY_LEN: usize = DM_BODY_TEXT.len();
-const DM_BODY_CAP: usize = 128;
-
 /// Address of the watched bytes, or 0 when disarmed. A live allocation is never
 /// at address 0, so 0 is an unambiguous "off". This is the start of the secret,
 /// which may be a block start or an offset inside a larger block.
@@ -191,9 +148,6 @@ static CAPTURED: AtomicBool = AtomicBool::new(false);
 /// there, so nothing is ever captured afterwards; this records *why*, so the
 /// missing capture is not misread as a leak or a wrong accessor.
 static REALLOCATED: AtomicBool = AtomicBool::new(false);
-/// The `Box<[u8; PK_LEN]>` block behind `VerifiedFirstContact::pk_lt` — the
-/// public key's own heap allocation, exactly the array's size.
-const ML_DSA_PK_BLOCK: usize = PK_LEN;
 /// The bytes the watched block held at the moment it was freed.
 static SNAPSHOT: [AtomicU8; SNAPSHOT_CAP] = [const { AtomicU8::new(0) }; SNAPSHOT_CAP];
 /// The watch is one global slot, so the tests take turns.
@@ -1077,10 +1031,9 @@ fn assert_decoded_entropy_was_wiped(freed: &FreedBuffer, needle: &str) {
 /// The boxed arm, across three modules that use it, clears its heap buffer
 /// before releasing it.
 ///
-/// Four of the eleven boxed types, chosen for being cheap to construct from
-/// outside the crate and for spanning both secret sizes the arm is used at. The
-/// property under test is the macro arm's, not each type's — every one of the
-/// eleven is the same expansion — and the remaining seven are held to it by the
+/// Three of the boxed types, chosen for being cheap to construct from outside the
+/// crate. The property under test is the macro arm's, not each type's — every
+/// boxed type is the same expansion — and the rest are held to it by the
 /// compile-time bound in `secret_seed.rs`.
 #[test]
 fn boxed_arm_secrets_are_zeroed_before_their_memory_is_released() {
@@ -1111,42 +1064,6 @@ fn boxed_arm_secrets_are_zeroed_before_their_memory_is_released() {
         || derive_room_veilid_owner_seed("general", &CNSA_2_0).unwrap(),
         |s| at(s.as_bytes()),
     );
-
-    // The DM ratchet's own boxed secret, and the only watched block that is not
-    // 32 bytes — a `[u8; DK_LEN]` at 3168. It takes its bytes directly rather
-    // than deriving them, which is the point: the wipe is the newtype's, not the
-    // derivation's.
-    assert_zeroed_when_freed(
-        "EphemeralDecapKey",
-        (0, DK_LEN),
-        || EphemeralDecapKey::new(Box::new([0xA5u8; DK_LEN])),
-        |s| at(s.as_bytes()),
-    );
-}
-
-/// **`SigningKeyPc` is wiped before its memory is released.**
-///
-/// A case of its own rather than a fifth entry beside the four above, because the
-/// claim it answers is this type's rather than the arm's. `ProvisionalRecord`
-/// documents the field as wiping on drop and relies on that instead of a
-/// container `Drop` — the type has none, deliberately — so the wipe is the whole
-/// of the record's promise about the one long-lived signing key that has no
-/// re-derivation path. An arm-level case built on a different type is evidence
-/// about the macro and says nothing about which arm this field was written on.
-///
-/// Watched at offset 0 of a block exactly the signing key's size, which is what a
-/// `boxed` secret owning its whole allocation must present; a field that moved to
-/// an inline or borrowed shape fails on the offset rather than on the bytes.
-#[test]
-fn the_provisional_records_signing_key_is_zeroed_before_its_memory_is_released() {
-    init();
-
-    assert_zeroed_when_freed(
-        "SigningKeyPc",
-        (0, ML_DSA_SK_LEN),
-        || SigningKeyPc::new(Box::new([0xC3u8; ML_DSA_SK_LEN])),
-        |s| at(s.as_bytes()),
-    );
 }
 
 /// The inline arm keeps its secret in the value itself, so it is observed by
@@ -1154,16 +1071,14 @@ fn the_provisional_records_signing_key_is_zeroed_before_its_memory_is_released()
 /// `[u8; 32]` inside a heap block the witness can watch. The wrapper's `Drop`
 /// wipes the array in place, and only then is the block released.
 ///
-/// All three identity-rooted secrets come from one derivation, so this covers
+/// All four identity-rooted secrets come from one derivation, so this covers
 /// every inline-family secret that has a public constructor — with one caveat
-/// since #271: `VeilidNodeSeed` is on the `inline_scoped` arm rather than
-/// `inline`, so its case here proves the *scoped* arm's expansion, not this one's.
+/// since #271: `VeilidNodeSeed` and `DmChannelRootSecret` are on the
+/// `inline_scoped` arm rather than `inline`, so their cases here prove the
+/// *scoped* arm's expansion, not this one's.
 /// The two arms share their storage, `Zeroize` and `ZeroizeOnDrop` derives, which
 /// is why they are witnessed together, but a change to one does not move the
-/// other. The inline ratchet keys (`RootKey`, `ChainKey`, `MessageKey`) are built
-/// only inside their own module and are reachable here only by the compile-time
-/// bound in `secret_seed.rs`; they share the `inline` arm, so the arm-level
-/// property proved by the two remaining cases is the one they rely on.
+/// other.
 #[test]
 fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
     init();
@@ -1196,14 +1111,20 @@ fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
         || Box::new(keys.dm_doorbell_slot_secret),
         |s| at(s.as_bytes()),
     );
+    assert_zeroed_when_freed(
+        "DmChannelRootSecret",
+        (0, SEED_LEN),
+        || Box::new(keys.dm_channel_root),
+        |s| s.with_bytes(|b| at(b)),
+    );
 }
 
-/// Every heap-resident field of the two multi-field secret structs is zeroed
-/// before its storage is released.
+/// Every heap-resident field of the multi-field secret struct is zeroed before its
+/// storage is released.
 ///
-/// The sites the macro does not generate. Both structs now carry
-/// `#[derive(Zeroize, ZeroizeOnDrop)]` (#267), so the case list is driven by what
-/// the structs actually store rather than by which fields a hand-written `Drop`
+/// The site the macro does not generate. The struct carries
+/// `#[derive(Zeroize, ZeroizeOnDrop)]`, so the case list is driven by what it
+/// actually stores rather than by which fields a hand-written `Drop`
 /// remembered:
 ///
 /// - `PersistedCircle::entropy` is a private [`Zeroizing`] `String`. It has two
@@ -1215,23 +1136,6 @@ fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
 ///   as the load-bearing case for the derive: nothing but the derive wipes it, so
 ///   removing `Zeroize, ZeroizeOnDrop` from the struct leaves the whole suite green
 ///   but for this case. It stands in for the secret field somebody adds next.
-/// - `ChannelRoots::rs0` is the retained re-establishment root — the one root of
-///   the four that outlives establishment, and therefore the one a copy left in
-///   freed memory would hand an attacker. It is the struct's last field, so the
-///   watched range runs from its offset to the end of the struct and covers no
-///   neighbour; what stands behind the case is the offset, not a filler contrast.
-/// - `VerifiedFirstContact::ss0` is a bare `[u8; SS0_LEN]`, wiped only by the
-///   derive. Removing the derive, or marking the field `#[zeroize(skip)]`, leaves
-///   the whole suite green but for this case.
-/// - `VerifiedFirstContact::body` is the decrypted message, wiped by the same
-///   derive. It is a `String`, so it is watched as its own heap block rather than
-///   as a range inside the struct — the two secrets on one struct take two
-///   different routes through this witness (#266).
-/// - `VerifiedFirstContact::pk_lt` is a public key, not a secret, and is the
-///   `Box<[u8; N]>` shape. It is `label`'s counterpart for boxed fields, and it
-///   pins the non-obvious half of the derive's reach: `Box<[u8; N]>` has no
-///   `Zeroize` impl of its own, and is covered anyway because the call derefs.
-///   Marking it `#[zeroize(skip)]` leaves the whole suite green but for this case.
 #[test]
 fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
     init();
@@ -1274,118 +1178,6 @@ fn secrets_outside_the_macro_zero_themselves_before_their_memory_is_released() {
             PersistedCircle::new(phrase, circle_label())
         },
         |c| at(c.label.as_bytes()),
-    );
-
-    // `ChannelRoots::rs0` is the retained re-establishment root, and it is the
-    // one root of the four that survives establishment — `ss0` is deleted, and
-    // with it the ratchet root, so `rs0` is what a copy of this struct left in
-    // freed memory would hand an attacker: channel-resume authority for the rest
-    // of the correspondence.
-    //
-    // Watched as a range inside the boxed struct's own block, the way `ss0` is,
-    // with the offset taken structurally rather than assumed. `rs0` is the last
-    // field, so the range from its offset to the end of the struct is the field
-    // itself plus any tail padding — no neighbour falls inside it, and the
-    // distinct fillers on `ar` and `chan_id` are not doing work here. The
-    // structural offset is what holds the case: an accessor that drifted to
-    // another field would report an address outside the watched range.
-    //
-    // Two wipes stand behind this case — `CommittedRoot`'s own `ZeroizeOnDrop`
-    // and the struct's derive — so it is a weaker mutation signal than a
-    // single-wipe case. It goes red on the shape that actually threatens it:
-    // storing the root as a bare `[u8; ROOT_KEY_LEN]`, which has no wipe of its
-    // own and which the struct's derive is then the only thing covering.
-    assert_zeroed_when_freed(
-        "ChannelRoots::rs0",
-        (
-            ChannelRoots::rs0_offset_for_test(),
-            size_of::<ChannelRoots>(),
-        ),
-        || {
-            Box::new(ChannelRoots::new_for_test(
-                [0x44u8; ROOT_LEN],
-                [0x55u8; ROOT_LEN],
-                CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
-            ))
-        },
-        |r| at(r.rs0().as_bytes()),
-    );
-
-    // `ss0` is an inline `[u8; SS0_LEN]` field, so it is watched as a range at a
-    // non-zero offset inside the boxed struct's own block — the case the witness was
-    // generalised for. `ss0_offset_for_test` / `size_of` state that structurally:
-    // offset 64 of 160 on the current layout, and an accessor that drifted to any
-    // other field fails on the offset. The offset comes from a `testing`-gated
-    // accessor rather than `offset_of!` because the field is private (#265) and
-    // `offset_of!` cannot see a private field from out here.
-    //
-    // The distinct filler bytes are a WEAKER control than they look, which is why
-    // the offset assertion above carries the load. They catch only a HIGH-side slip
-    // into `roots.ar()` (0x44). A slip 1–7 bytes LOW lands in `body`'s length word —
-    // `18 00 00 00 00 00 00 00` for a 24-byte body — so the snapshot would read as
-    // zeros plus a zeroized `ss0` and pass vacuously. What the fillers guarantee is
-    // narrow: no neighbouring field is all-zero *above* `ss0`.
-    assert_zeroed_when_freed(
-        "VerifiedFirstContact::ss0",
-        (
-            VerifiedFirstContact::ss0_offset_for_test(),
-            size_of::<VerifiedFirstContact>(),
-        ),
-        || {
-            Box::new(verified_first_contact(
-                "the body is not a secret".to_owned(),
-            ))
-        },
-        |v| at(v.ss0_for_test()),
-    );
-
-    // The decrypted message on the same struct. Unlike `ss0` it is a `String`, so
-    // it is watched exactly as `PersistedCircle::entropy` is — its own heap block,
-    // offset 0, block size the CAPACITY — and the struct it hangs off is left on
-    // the stack, since the watched block is the string buffer rather than the
-    // struct. Built with slack for the same reason as the circle phrase: the
-    // production body is decoded out of a padded plaintext and carries slack, so an
-    // exact-fit buffer would not be the production shape.
-    //
-    // What this case holds: `body` is wiped by the same hand-written `Drop` that
-    // wipes `ss0`. Deleting `self.body.zeroize()` leaves the whole suite green but
-    // for this case (#266).
-    assert_zeroed_when_freed(
-        "VerifiedFirstContact::body",
-        (0, DM_BODY_CAP),
-        || {
-            let mut body = String::with_capacity(DM_BODY_CAP);
-            body.push_str(DM_BODY_TEXT);
-            assert_eq!(body.len(), DM_BODY_LEN);
-            verified_first_contact(body)
-        },
-        |v| at(v.body().as_bytes()),
-    );
-
-    // The sender's long-term public key, which is not a secret and is the one
-    // case here whose subject is a `Box<[u8; N]>`. It earns its place twice over.
-    //
-    // First, it is the boxed counterpart of the `label` case: nothing but the
-    // struct's derive wipes it, so it holds the derive against a field shape a
-    // secret is very likely to arrive in — an ML-KEM decapsulation key or a
-    // sealed-frame buffer added to this struct later would be exactly this shape.
-    //
-    // Second, it pins a claim in the struct's own doc comment that is easy to get
-    // backwards, and that this file's author did get backwards once: zeroize 1.8
-    // has no `Zeroize for Box<[u8; N]>`, only `Box<[Z]>` and `Box<str>`, so the
-    // derive appears not to cover it — but `field.zeroize()` auto-derefs to the
-    // `[u8; N]` inside, which is covered, and the heap block is cleared in place.
-    // "Appears not to be covered, is covered" is exactly the kind of claim that
-    // wants a test rather than a comment.
-    //
-    // The `Box` owns its whole block, so this is offset 0 of a `PK_LEN` block,
-    // and the struct is left on the stack — the watched allocation is the box's,
-    // not the struct's.
-    assert_zeroed_when_freed(
-        "VerifiedFirstContact::pk_lt",
-        (0, ML_DSA_PK_BLOCK),
-        || verified_first_contact("the body is not a secret".to_owned()),
-        |v| at(v.pk_lt()),
     );
 }
 
@@ -1469,143 +1261,6 @@ fn circle_label() -> String {
     label
 }
 
-/// One fully-populated witness, with the filler bytes the `ss0` case's structural
-/// control depends on.
-///
-/// Built through the `testing`-gated constructor: the fields are private so that
-/// holding a `VerifiedFirstContact` really is the proof of verification its doc
-/// comment claims (#265), and `open` is no substitute here — it controls neither
-/// the neighbouring byte patterns nor `body`'s capacity, which are exactly the two
-/// structural controls these cases pin.
-fn verified_first_contact(body: String) -> VerifiedFirstContact {
-    VerifiedFirstContact::new_for_test(
-        Box::new([0x11u8; PK_LEN]),
-        Box::new([0x22u8; PK_LEN]),
-        Box::new([0x33u8; EK_LEN]),
-        7,
-        1_700_000_000_000,
-        body,
-        [0xA5u8; SS0_LEN],
-        ChannelRoots::new_for_test(
-            [0x44u8; ROOT_LEN],
-            [0x55u8; ROOT_LEN],
-            CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
-        ),
-    )
-}
-
-/// **`Rerooted`'s two publicly reachable secret halves wipe before their storage
-/// is released, and its `Debug` renders none of them.**
-///
-/// A re-establishment's outputs are the successor retained root and the resumed
-/// channel's identifier; the third, the re-rooted ratchet root, has no accessor
-/// outside the crate and so cannot be located from here — it is a
-/// `dm::ratchet::RootKey`, held by that type's own inline-arm wipe and by the
-/// compile-time bound in `secret_seed.rs`.
-///
-/// **The structural control here is weaker than the `ss0` case's, deliberately
-/// and unavoidably.** `Rerooted`'s fields are private, so `offset_of!` cannot
-/// reach them from an integration test; the offsets below are measured off the
-/// accessors on a probe instance. That means a mislocated accessor would agree
-/// with its own measurement. What the case still holds is that the two fields
-/// occupy *different, non-overlapping* ranges inside one struct and that each is
-/// zero when the struct's block is freed — so a build that dropped either wipe,
-/// or aliased the two fields onto one value, fails here.
-#[test]
-fn a_rerooted_pairs_secret_halves_are_zeroed_before_their_memory_is_released() {
-    init();
-
-    let make = || {
-        Box::new(
-            reroot(
-                &CommittedRoot::from_bytes(&[0x5cu8; ROOT_KEY_LEN]),
-                &[0x09u8; 32],
-            )
-            .expect("the crypto module is operational"),
-        )
-    };
-
-    // Offsets measured on a probe, then asserted to be distinct and inside the
-    // struct — see the note above on why they are not taken from `offset_of!`.
-    //
-    // The probe needs no gate: it allocates and frees blocks of its own, and
-    // every watch in this file names one live address that no other thread's
-    // allocation can be.
-    let probe = make();
-    let base = std::ptr::from_ref::<daemonseed_core::dm::resume::Rerooted>(&*probe) as usize;
-    let next_at = probe.next().as_bytes().as_ptr() as usize - base;
-    let chan_at = probe.chan_id().as_ptr() as usize - base;
-    let width = size_of::<daemonseed_core::dm::resume::Rerooted>();
-    assert_ne!(next_at, chan_at, "the two outputs alias one range");
-    assert!(
-        next_at + ROOT_KEY_LEN <= width && chan_at + ROOT_KEY_LEN <= width,
-        "an output falls outside the struct: next at {next_at}, chan_id at {chan_at}, \
-         struct {width} bytes"
-    );
-    assert_ne!(
-        probe.next().as_bytes().as_slice(),
-        probe.chan_id().as_slice(),
-        "the successor root and the channel identifier are one value"
-    );
-    drop(probe);
-
-    assert_zeroed_when_freed("Rerooted::next", (next_at, width), make, |r| {
-        at(r.next().as_bytes())
-    });
-    assert_zeroed_when_freed("Rerooted::chan_id", (chan_at, width), make, |r| {
-        at(r.chan_id())
-    });
-}
-
-/// **Neither multi-secret re-establishment type renders its contents.**
-///
-/// A `Debug` that printed a root would put it in every log line and every panic
-/// message that carried the value, which is a disclosure path no wipe reaches.
-/// Both types hand-write `Debug` rather than deriving it, so this is the test
-/// that a derive re-added later fails.
-#[test]
-fn the_re_establishment_types_render_redacted() {
-    init();
-    let rerooted = reroot(
-        &CommittedRoot::from_bytes(&[0x5cu8; ROOT_KEY_LEN]),
-        &[0x09u8; 32],
-    )
-    .expect("the crypto module is operational");
-    let rendered = format!("{rerooted:?}");
-    assert_eq!(rendered, "Rerooted(<redacted>)");
-    for (name, bytes) in [
-        ("next", rerooted.next().as_bytes().as_slice()),
-        ("chan_id", rerooted.chan_id().as_slice()),
-    ] {
-        assert!(
-            !rendered.contains(&hex_of(bytes)),
-            "Rerooted's Debug rendered {name}"
-        );
-    }
-
-    let roots = ChannelRoots::new_for_test(
-        [0x44u8; ROOT_LEN],
-        [0x55u8; ROOT_LEN],
-        CommittedRoot::from_bytes(&[0x66u8; ROOT_KEY_LEN]),
-    );
-    let rendered = format!("{roots:?}");
-    assert_eq!(rendered, "ChannelRoots(<redacted>)");
-    for (name, bytes) in [
-        ("ar", roots.ar().as_slice()),
-        ("chan_id", roots.chan_id().as_slice()),
-        ("rs0", roots.rs0().as_bytes().as_slice()),
-    ] {
-        assert!(
-            !rendered.contains(&hex_of(bytes)),
-            "ChannelRoots's Debug rendered {name}"
-        );
-    }
-
-    // Positive control: `hex_of` really does produce the needle these assertions
-    // look for, so a rendering that DID leak would be caught rather than missed.
-    assert!(hex_of(&[0x44u8; ROOT_LEN]).contains("4444"));
-}
-
 /// The `realloc` disarm is itself a control, so hold it to being live.
 ///
 /// A watched buffer that is reallocated may be released inside `realloc` without
@@ -1679,197 +1334,4 @@ fn a_watched_buffer_that_is_reallocated_disarms_the_watch() {
 
     WATCH_ADDR.store(0, Ordering::SeqCst);
     REALLOCATED.store(false, Ordering::SeqCst);
-}
-
-/// One record, filled with distinct non-zero patterns so a slip into a
-/// neighbouring field is visible rather than reading as an incidental zero.
-///
-/// Every input is reachable from out here without a `testing` gate: `ResumeRecord`
-/// already exposes `new`, `s_pc` and `committed_root` publicly. Only the *offset*
-/// of the inline field needed gating (#314), because `offset_of!` cannot see a
-/// private field from outside the crate.
-fn resume_record() -> ResumeRecord {
-    ResumeRecord::new(
-        Box::new([0xA7; ML_DSA_SK_LEN]),
-        Box::new([0x8E; PK_LEN]),
-        Box::new([0xB3; PK_LEN]),
-        CommittedRoot::from_bytes(&[0xC5; ROOT_KEY_LEN]),
-        ReEstState {
-            reconnect_gen: 9,
-            attempt: 1,
-            last_seen_re_est: 0,
-            own: Some(OwnSlot::new(
-                10,
-                77,
-                SealedReEst::seal(FreshAttempt::first(), vec![0xD1; 64].into_boxed_slice())
-                    .expect("a 64-byte frame is inside MAX_FRAME_LEN"),
-                EphemeralDecapKey::new(Box::new([0x3d; DK_LEN])),
-            )),
-            acceptance: None,
-            confirm: None,
-            attempt_at_window_start: 2,
-            reroot_ratchet_gen: 0,
-        },
-        Retention {
-            retained: Some(RetainedRoot::new(
-                CommittedRoot::from_bytes(&[0xE9; ROOT_KEY_LEN]),
-                1_700_000_000_000,
-            )),
-            dedup: DedupMemory::new(),
-            stopped: false,
-        },
-        SendFloor::new(7, 11),
-    )
-    .expect("the fixture's pairings are coherent")
-}
-
-/// Where the retained root's bytes sit inside the record.
-///
-/// `Retention` holds it behind an `Option`, so the offset cannot be computed
-/// from `ResumeRecord`'s layout alone the way `committed_root`'s can. The
-/// accessor gives the address of the bytes themselves, and the watch is set over
-/// the record's whole allocation — containment is what matches, and the accessor
-/// is what pins which bytes are being read.
-fn retained_root_bytes(r: &ResumeRecord) -> &[u8] {
-    r.retained()
-        .expect("the fixture retains a superseded root")
-        .root()
-        .as_bytes()
-}
-
-/// **The two secret halves of `ResumeRecord` are wiped before their memory is
-/// released (#314).**
-///
-/// `s_pc` is a per-correspondent ML-DSA-87 signing key that is at-rest only and
-/// **not mnemonic-derivable**: there is no re-derivation path, which is why the key
-/// is in the record rather than fetched on resume. A `#[zeroize(skip)]` added to it
-/// by mistake compiles, passes the whole suite, and silently stops wiping it. That
-/// is the hole this closes.
-///
-/// The two fields exercise the two arms for different reasons. `s_pc` is `Box`ed,
-/// so it owns its allocation and is watched at offset 0 of its own block.
-/// `committed_root` is inline, so it is watched as a range inside the record's own
-/// block at a declared offset — the case where the offset assertion carries the
-/// load, because containment matching alone would accept any enclosing block.
-///
-/// **The distinct fillers are a weaker control than they look**, exactly as the
-/// `ss0` case above says of its own: a slip off `committed_root` inside the record
-/// lands in `window_anchor_ms` (`1_700_000_000_000`, five zero high bytes) or
-/// `toward_c` (`3`), and both snapshot as zeros. What refuses a mispointed accessor
-/// is the offset assertion, not the fillers.
-///
-/// **They are not equally exposed, and #314's premise was half right.** Measured by
-/// mutation while writing this:
-///
-/// - Adding `#[zeroize(skip)]` to `s_pc` **is** a silent leak, and this test catches
-///   it — the freed block came back full of the filler byte. `Box<[u8; SK_LEN]>`
-///   is a plain array with no `Drop` of its own, so the record's derive is the only
-///   thing wiping it.
-/// - Adding `#[zeroize(skip)]` to `committed_root` changes **nothing**, and the same
-///   mutation passes. `CommittedRoot` comes from `redacted_secret_newtype`'s inline
-///   arm, which derives `ZeroizeOnDrop` on the newtype itself, so it wipes on its own
-///   drop whatever the outer derive says.
-///
-/// That second measurement is why `CommittedRoot` was added to `secret_seed.rs`'s
-/// compile-time bound sweep in this same change: it was the ONE macro-generated
-/// newtype of twenty missing from it, and this case cannot stand in for it. A
-/// hand-rolled `CommittedRoot` deriving only `Zeroize` passes everything here,
-/// because this witness only ever sees the root inside a `ResumeRecord` whose own
-/// derive wipes it in place — while `CommittedRoot::from_bytes` is `pub` and the
-/// type is dropped standalone on `decode`'s error paths. The behavioural case and
-/// the compile-time bound cover different halves and neither substitutes.
-///
-/// So the `committed_root` case here is a behavioural confirmation rather than a
-/// guard against a reachable defect: the surviving mutation is the correct answer,
-/// not a gap. Recorded because a future reader who mutates it and sees it pass
-/// should reach that conclusion in one step instead of hunting a hole that is not
-/// there.
-#[test]
-fn resume_record_secret_halves_are_zeroed_before_their_memory_is_released() {
-    init();
-
-    assert_zeroed_when_freed(
-        "ResumeRecord::s_pc",
-        (0, ML_DSA_SK_LEN),
-        resume_record,
-        |r| at(r.s_pc()),
-    );
-
-    assert_zeroed_when_freed(
-        "ResumeRecord::committed_root",
-        (
-            ResumeRecord::committed_root_offset_for_test(),
-            size_of::<ResumeRecord>(),
-        ),
-        || Box::new(resume_record()),
-        |r| at(r.committed_root().as_bytes()),
-    );
-
-    // **The retained `RS_n` is deliberately NOT a case here.** It sits inside an
-    // `Option<RetainedRoot>` inside `Retention`, and this harness matches a freed
-    // block against a fixed offset in the record's own allocation — a shape an
-    // `Option` payload does not reliably present, so a case written here cannot
-    // be shown to be watching the bytes it names rather than the neighbouring
-    // `Vec` and flag. `dm::resume`'s
-    // `zeroizing_a_retained_root_wipes_its_root_and_its_stamp` calls that impl
-    // directly instead, which is a probe whose subject is not in doubt.
-    //
-    // The fixture still carries a retained root, because it strengthens the two
-    // cases above: it puts a second root in the record, so a watch that drifted
-    // onto it would read a different filler rather than an incidental zero.
-}
-
-/// **The controls: the `#[zeroize(skip)]` neighbours must still be readable right
-/// up to the drop.**
-///
-/// Without this the test above proves less than it appears to. If `ResumeRecord`
-/// wiped *everything* — or if the record were somehow never populated — the zero
-/// assertions would pass while telling us nothing about which fields the derive
-/// actually covers. `pk_pc` is the peer's PUBLIC verifying key and is deliberately
-/// skipped; its bytes must survive, and reading them back distinguishes "the
-/// secret was wiped" from "the whole record was blank".
-///
-/// **Both verifying keys are read, and against different fillers.** They are the
-/// same width and adjacent, so a control that read only one of them would pass
-/// on a record that had written that one twice — and this party's own verifying
-/// key is skipped for the same reason the peer's is, while being the one the
-/// record cannot re-derive if it is lost.
-#[test]
-fn the_record_is_populated_before_any_drop_so_the_wipe_cases_have_a_control() {
-    init();
-    let r = resume_record();
-    assert!(
-        r.pk_pc().iter().all(|&b| b == 0xB3),
-        "the skipped public field did not survive construction, so the zeroize \
-         cases above have no control"
-    );
-    assert!(
-        r.own_pk_pc().iter().all(|&b| b == 0x8E),
-        "our own skipped verifying key did not survive construction, so the \
-         zeroize cases above have no control over it"
-    );
-    assert_ne!(
-        r.own_pk_pc().as_slice(),
-        r.pk_pc().as_slice(),
-        "the two verifying keys share a filler, so a read of one could pass on \
-         the other"
-    );
-    assert!(
-        r.s_pc().iter().any(|&b| b != 0),
-        "the signing key is all-zero before any drop, so wiping it proves nothing"
-    );
-    assert!(
-        r.committed_root().as_bytes().iter().any(|&b| b != 0),
-        "the committed root is all-zero before any drop, so wiping it proves nothing"
-    );
-    assert!(
-        retained_root_bytes(&r).iter().all(|&b| b == 0xE9),
-        "the retained root is not the fixture's pattern before any drop, so wiping \
-         it proves nothing"
-    );
-    assert_ne!(
-        retained_root_bytes(&r),
-        r.committed_root().as_bytes(),
-        "the two roots share a filler, so a watch on one could pass on the other"
-    );
 }

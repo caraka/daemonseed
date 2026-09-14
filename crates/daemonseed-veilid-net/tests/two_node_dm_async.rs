@@ -141,7 +141,7 @@ use daemonseed_core::dm::channel;
 use daemonseed_core::dm::flows::{self, FlowError, Me, Records, Resumed, Surfaced};
 use daemonseed_core::dm::store::Store;
 use daemonseed_core::identity::keys::{
-    derive_identity_keys, Identity, SignKeypair, IDENTITY_PK_LEN, ML_DSA_SEED_LEN,
+    derive_identity_keys, Identity, IdentityKeys, SignKeypair, IDENTITY_PK_LEN,
 };
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::storage::dm_store::CorrespondenceLabel;
@@ -150,14 +150,13 @@ use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidRecords, WriteCoun
 
 // ── what a run is configured with ────────────────────────────────────────────
 
-/// The at-rest key each side's [`DmPersist`] seals under. Per-run scratch
+/// The at-rest key each side's `Store` seals under. Per-run scratch
 /// directories, so this is a fixture rather than a secret.
 const AT_REST: [u8; AEAD_KEY_LEN] = [0x2b; AEAD_KEY_LEN];
 
 /// The budget for one hop: a write, its spread, and a correspondent's next sweep
-/// of it. A doorbell sweep reads every subkey of the record and a page sweep
-/// every subkey of its own, each a separate network round trip, so a hop is one
-/// tick plus an open plus a whole sweep.
+/// of it. A sweep reads every subkey of its record, each a separate network round
+/// trip, so a hop is one tick plus an open plus a whole sweep.
 const HOP: Duration = Duration::from_secs(600);
 
 /// How long the attach is given before a step gives up on the network.
@@ -262,11 +261,11 @@ impl Role {
         state.join(self.name())
     }
 
-    /// Where this role's ML-DSA identity seed lives. The seed is the whole of
-    /// what persists between a role's steps: the signing keypair and every
-    /// channel owner seed come back out of it.
-    fn identity_seed_path(self, state: &Path) -> PathBuf {
-        self.dir(state).join("identity-seed")
+    /// Where this role's recovery phrase lives. The phrase is the whole of what
+    /// persists of the identity between a role's steps: the signing keypair and
+    /// the channel root, and so every channel owner seed, come back out of it.
+    fn recovery_phrase_path(self, state: &Path) -> PathBuf {
+        self.dir(state).join("recovery-phrase")
     }
 
     fn result_path(self, state: &Path) -> PathBuf {
@@ -816,19 +815,20 @@ impl Drop for Supervisor {
 
 // ── the two oracles ──────────────────────────────────────────────────────────
 
-/// Lay out a fresh state directory: one identity seed per role, and nothing
+/// Lay out a fresh state directory: one recovery phrase per role, and nothing
 /// else.
 ///
-/// The seeds are drawn here and the identities derived from them in the step
+/// The phrases are drawn here and the identities derived from them in the step
 /// processes, so no step holds the other role's secret. A knocks at the
 /// identity B *published*, which B writes out in its first step.
 fn lay_out_state(state: &Path) -> [PathBuf; 2] {
     for role in [Role::A, Role::B] {
         std::fs::create_dir_all(role.dir(state)).expect("the role's directory is created");
-        let mut seed = [0u8; ML_DSA_SEED_LEN];
-        getrandom::fill(&mut seed).expect("the operating system's generator");
-        std::fs::write(role.identity_seed_path(state), hex_encode_bytes(&seed))
-            .expect("the identity seed writes");
+        let phrase = Mnemonic::generate()
+            .expect("the operating system's generator")
+            .to_phrase();
+        std::fs::write(role.recovery_phrase_path(state), phrase)
+            .expect("the recovery phrase writes");
     }
     [Role::A.result_path(state), Role::B.result_path(state)]
 }
@@ -1077,17 +1077,19 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// This role's identity seed, from the file its state directory holds.
+/// This role's identity, derived from the recovery phrase its state directory
+/// holds exactly as production derives one.
 ///
-/// **The seed is what persists, and both halves of an identity come out of
-/// it.** The signing keypair signs adverts and openings, and the same seed
+/// **The phrase is what persists, and both halves of an identity come out of
+/// it.** The signing keypair signs adverts and openings, and the channel root
 /// derives every channel owner seed this side writes under, so a step that
 /// inherited either from an earlier one would not be a separate process at all.
-fn identity_seed_of(role: Role, state: &Path) -> [u8; ML_DSA_SEED_LEN] {
-    let path = role.identity_seed_path(state);
+fn identity_of(role: Role, state: &Path) -> IdentityKeys {
+    let path = role.recovery_phrase_path(state);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    let bytes = hex_decode_bytes(text.trim()).expect("the identity seed decodes");
-    <[u8; ML_DSA_SEED_LEN]>::try_from(bytes.as_slice()).expect("an ML-DSA seed's length")
+    let mnemonic = Mnemonic::from_phrase(text.trim()).expect("the recovery phrase parses");
+    derive_identity_keys(&mnemonic, Identity::Primary)
+        .expect("the identity derives from its phrase")
 }
 
 /// This role's conversation store, under its own state directory.
@@ -1141,7 +1143,7 @@ fn advert_keys_of(store: &Store) -> AdvertKeys {
 /// one.** The lookup key a hello discloses is a public key, so the record store
 /// holds the keypair only for channels opened in this process — which is what a
 /// relaunch has to redo before it can write. The owner seed comes back from the
-/// identity seed, the correspondent and the generation the store holds, so
+/// channel root, the correspondent and the generation the store holds, so
 /// nothing about it survives a kill except the inputs it is derived from.
 ///
 /// The lookup key that comes back is asserted equal to the one the store
@@ -1152,7 +1154,7 @@ fn reopen_own_channels(store: &Store, records: &mut VeilidRecords, me: &Me<'_>) 
     let loaded = store.load().expect("the store reloads");
     for conv in &loaded.convs {
         let owner = channel::derive_owner_seed(
-            me.identity_seed,
+            me.channel_root,
             &conv.state.peer_identity_pk,
             conv.state.generation,
         )
@@ -1269,11 +1271,11 @@ async fn run_step(step: Step) {
     let mut result = StepResult::load(&role.result_path(&state));
     let resuming = result.has_done(step);
 
-    let seed = identity_seed_of(role, &state);
-    let signer = SignKeypair::from_ml_dsa_seed(&seed).expect("the identity derives from its seed");
+    let keys = identity_of(role, &state);
+    let signer = &keys.signing;
     let me = Me {
-        signer: &signer,
-        identity_seed: &seed,
+        signer,
+        channel_root: &keys.dm_channel_root,
     };
 
     let (node, _events) = VeilidNet::start(node_config(role, &role.dir(&state).join("node")))
@@ -1290,7 +1292,7 @@ async fn run_step(step: Step) {
     .expect("a step runs on a multi-thread runtime");
 
     let store = store_of(role, &state);
-    let advert_keys = publish_advert(&store, &mut records, &signer);
+    let advert_keys = publish_advert(&store, &mut records, signer);
     let reopened = reopen_own_channels(&store, &mut records, &me);
     eprintln!(
         "{}: {reopened} channel(s) of its own reopened",
@@ -1464,8 +1466,15 @@ async fn a_collects_and_replies(
         result.opened
     );
 
-    let seq = flows::send_message(store, records, &acceptance.peer, A_REPLY.as_bytes(), fill)
-        .expect("A's reply sends");
+    let seq = flows::send_message(
+        store,
+        records,
+        &acceptance.peer,
+        A_REPLY.as_bytes(),
+        fill,
+        now_secs(),
+    )
+    .expect("A's reply sends");
     assert_eq!(seq, 1, "A's reply follows the message its knock carried");
 }
 

@@ -85,141 +85,15 @@ dm_labels! {
     /// ML-KEM-1024 public key follow it, each length-prefixed. FROZEN.
     DM_ADVERT_SIG = b"daemonseed/dm/advert/sig/v1";
 
-    /// HKDF-Extract salt for the KEY-RECORD derivation rooted in a published identity
-    /// key. Non-empty and normative — no implicit zero-salt. The doorbell derives from
-    /// the same kind of input under its own salt ([`DM_DOORBELL_SALT`]); the two must
-    /// not share one. FROZEN.
-    DM_KEYREC_SALT = b"daemonseed/dm/keyrec/salt/v1";
-
-    /// HKDF-Expand `info` for the key record's Veilid owner seed, derived from the
-    /// identity's full ML-DSA-87 public key. World-derivable by design: anyone
-    /// holding the pubkey computes the address. FROZEN.
-    DM_KEYREC_OWNER = b"daemonseed/dm/keyrec/owner/v1";
-
-    /// Signature domain for the [`crate::dm::keyrec`] record's inner ML-DSA-87
-    /// signature. FROZEN.
-    DM_KEYREC_SIG = b"daemonseed/dm/keyrec/sig/v1";
-
-    /// HKDF-Extract salt for the doorbell's owner-seed derivation, which is rooted in
-    /// the RECIPIENT's published identity key. Distinct from [`DM_KEYREC_SALT`] so the
-    /// two derivations over that same public input cannot collide. FROZEN.
-    DM_DOORBELL_SALT = b"daemonseed/dm/doorbell/salt/v1";
-
-    /// HKDF-Expand `info` for the doorbell's Veilid owner seed, derived from the
-    /// recipient's full ML-DSA-87 public key. World-derivable — and therefore
-    /// world-WRITABLE — by design: a stranger holding no shared secret must be able
-    /// to knock. That is what makes the doorbell the only unauthenticated write
-    /// surface in DM, and why it carries a sealed entry rather than trust. FROZEN.
-    DM_DOORBELL_OWNER = b"daemonseed/dm/doorbell/addr/v4";
-
-    /// HKDF-Extract salt for the sender's doorbell SLOT derivation. Rooted in the
-    /// sender's secret slot IKM, not in any public key. FROZEN.
-    DM_DOORBELL_SLOT_SALT = b"daemonseed/dm/doorbell/slot-salt/v1";
-
-    /// HKDF-Expand `info` for the sender's doorbell slot index. FROZEN.
-    DM_DOORBELL_SLOT = b"daemonseed/dm/doorbell/slot/v5";
-
-    /// HKDF-Extract salt for the first-contact seal key, rooted in the encapsulated
-    /// secret `ss0`. FROZEN.
-    DM_FC_SALT = b"daemonseed/dm/fc/salt/v1";
-
-    /// HKDF-Expand `info` for the first-contact entry's AES-256-GCM seal key. FROZEN.
-    DM_FC_SEAL = b"daemonseed/dm/fc/seal/v1";
-
-    /// AAD prefix for the first-contact seal. The recipient's key-record address and
-    /// the current first-contact epoch follow it, which is what makes an entry
-    /// un-openable at a different recipient or outside its epoch window. FROZEN.
-    DM_FC_AAD = b"daemonseed/dm/fc/aad/v1";
-
-    /// Domain prefix for the first-contact proof-of-work preimage
-    /// ([`crate::dm::pow::pow_input`]). The recipient's key-record address, the
-    /// first-contact epoch, the entry hash and the nonce follow it, each
-    /// length-prefixed.
-    ///
-    /// **The `/v1` is where the difficulty lives.** [`crate::dm::pow::FC_POW_BITS`]
-    /// is a fixed protocol constant rather than an advertised or adaptive one, so
-    /// there is nowhere on the wire that says what difficulty an entry was minted
-    /// at — which means changing it is a change to what this label *means*, and the
-    /// only way to make two clients disagree about that safely is to change the
-    /// label with it. A `/v2` here is what a difficulty change costs. FROZEN.
-    DM_FC_POW = b"daemonseed/dm/fc/pow/v1";
-
-    /// Signature domain for a grantee-bound one-time invite token
-    /// ([`crate::dm::token::TokenV1`]), signed under the ISSUER's long-term key.
-    /// The grantee's long-term public key, the token nonce and the expiry follow
-    /// it, each length-prefixed.
-    ///
-    /// **The grantee's key is inside the preimage and not inside the token.** The
-    /// verifier takes it from `body.pk_lt` and rebuilds these bytes, so a token is
-    /// only ever valid stapled to the identity it names — possession of the bytes
-    /// proves nothing, and an intercepted token is inert. FROZEN.
-    DM_TOKEN = b"daemonseed/dm/token/v1";
-
-    /// HKDF-Extract salt for the provisional handshake record's at-rest seal key,
-    /// rooted in the profile's at-rest key material — **never** in `ss0`, which is
-    /// what the record holds. Pairs with [`DM_PROVISIONAL_SEAL`] exactly as
-    /// [`DM_FC_SALT`] pairs with [`DM_FC_SEAL`]. FROZEN.
-    DM_PROVISIONAL_SALT = b"daemonseed/dm/provisional/salt/v1";
-
-    /// HKDF-Expand `info` for the provisional handshake record's AES-256-GCM seal
-    /// key ([`crate::dm::provisional`]).
-    ///
-    /// **Its own label rather than the first-contact seal's.** That one is keyed on
-    /// `ss0` and protects an entry on the wire; this one is keyed on local at-rest
-    /// material and protects a record on the medium. Deriving both from one label
-    /// would mean a first-contact entry and a provisional record could open as each
-    /// other wherever the two key inputs ever coincided. FROZEN.
-    DM_PROVISIONAL_SEAL = b"daemonseed/dm/provisional/seal/v1";
-
-    /// AAD prefix for the provisional handshake record's at-rest seal. The
-    /// correspondent's key-record address and the first-contact epoch follow it,
-    /// length-prefixed — the same two fields [`DM_FC_AAD`] binds, for the same
-    /// reason.
-    ///
-    /// **Per-record, where the key is only per-profile.** [`DM_PROVISIONAL_SEAL`]
-    /// derives ONE key for a whole profile, so without a per-record binding every
-    /// provisional record in a profile is an interchangeable ciphertext: copy one
-    /// channel's record over another's and it opens cleanly, the version matches and
-    /// the halves pair, so the channel silently resumes as the wrong correspondent.
-    /// Binding what the caller *expects* the record to be is what makes that splice
-    /// fail to authenticate. FROZEN.
-    DM_PROVISIONAL_AAD = b"daemonseed/dm/provisional/aad/v1";
-
-    /// HKDF-Extract salt for the provisional record's internal binding tag, rooted in
-    /// `ss0`. Distinct from [`DM_PROVISIONAL_SALT`], which is rooted in the profile's
-    /// at-rest material: the two extractions must not share a salt. FROZEN.
-    DM_PROVISIONAL_BIND_SALT = b"daemonseed/dm/provisional/bind-salt/v1";
-
-    /// HKDF-Expand `info` for the provisional record's binding tag. The opening
-    /// ephemeral's public half follows it, length-prefixed.
-    ///
-    /// **The edge nothing else carried.** The AEAD authenticates the record's bytes
-    /// and `EphemeralDecapKey::matches` binds the two ephemeral halves to each other,
-    /// but nothing bound either of them to `ss0` — so a record splicing one channel's
-    /// `ss0` onto another's ephemeral passed construction, the open and the ratchet
-    /// handover, then failed every reply forever with `UnknownEphemeral`: the silent
-    /// death #243 exists to abolish, reintroduced by the record meant to prevent it.
-    /// FROZEN.
-    DM_PROVISIONAL_BIND = b"daemonseed/dm/provisional/bind/v1";
-
     /// HKDF-Extract salt for the DM record store's at-rest seal key, rooted in the
-    /// profile's at-rest key material — the same root [`DM_PROVISIONAL_SALT`] uses,
-    /// under its own salt so the two extractions over that one input cannot collide.
-    /// That store holds five fixed records per correspondence — resume state,
-    /// provisional handshake state, the outbox, the receive cursor and the contact
-    /// cache — plus the profile's block list; never a message archive.
-    /// FROZEN.
+    /// profile's at-rest key material. That store holds fixed-size records, never a
+    /// message archive. FROZEN.
     DM_STORE_SALT = b"daemonseed/dm/store/salt/v1";
 
     /// HKDF-Expand `info` for the DM record store's AES-256-GCM seal key
     /// ([`crate::storage::dm_store`]).
     ///
-    /// **Its own label rather than [`DM_PROVISIONAL_SEAL`]'s.** That key protects one
-    /// record kind's contents; this one protects every record's slot in the store,
-    /// including a provisional record the other key already sealed. One label for
-    /// both would mean a store blob and a provisional record could open as each other
-    /// wherever the two key inputs coincided — which, both being derived from the
-    /// same profile at-rest material, is always. FROZEN.
+    /// FROZEN.
     DM_STORE_SEAL = b"daemonseed/dm/store/seal/v1";
 
     /// AAD prefix for a DM store record's at-rest seal. The correspondence label and
@@ -227,11 +101,10 @@ dm_labels! {
     ///
     /// **Per-slot, where the key is only per-profile.** [`DM_STORE_SEAL`] derives ONE
     /// key for a whole profile, so without this binding every file in the store is an
-    /// interchangeable ciphertext: copy one correspondence's resume record over
-    /// another's and it opens cleanly, or drop an outbox into a resume slot of the
-    /// same size and it opens as state. Binding what the store *expects* the file to
-    /// be is what makes both splices fail to authenticate. The same construction as
-    /// [`DM_PROVISIONAL_AAD`], for the same reason. FROZEN.
+    /// interchangeable ciphertext: copy one correspondence's record over
+    /// another's and it opens cleanly, or drop one kind into another kind's slot of
+    /// the same size and it opens as that kind. Binding what the store *expects* the
+    /// file to be is what makes both splices fail to authenticate. FROZEN.
     DM_STORE_AAD = b"daemonseed/dm/store/aad/v1";
 
     /// AAD prefix for a **profile-level** DM store record's at-rest seal — one that
@@ -247,214 +120,6 @@ dm_labels! {
     /// construction's field list fixed, so a profile record and a correspondence
     /// record can never be parsed into one another. FROZEN.
     DM_STORE_PROFILE_AAD = b"daemonseed/dm/store/profile/aad/v1";
-
-    /// Signature domain binding a per-contact pseudonym key to the long-term identity
-    /// that vouches for it, signed under the LONG-TERM key. FROZEN.
-    DM_BIND_LT = b"daemonseed/dm/bind/lt/v1";
-
-    /// Signature domain for a DM frame's authorship signature, signed under the
-    /// PSEUDONYM key. The sole proof-of-possession path (the separate `bind_pop` was
-    /// folded into it), so it binds both public keys as well as the message. FROZEN.
-    DM_MSG_SIG = b"daemonseed/dm/msg/sig/v6";
-
-    /// AAD prefix for an ongoing-channel frame's seal. Every clear field of the frame
-    /// follows it, length-prefixed, so a header edited in flight fails the AEAD open
-    /// rather than reaching the ratchet as an authenticated position. Distinct from
-    /// [`DM_FC_AAD`] so a first-contact entry and a channel frame can never open as
-    /// each other.
-    ///
-    /// **`/v4`, past the frozen text's three earlier spellings.** The design names
-    /// this AAD three times and means something different each time: `/v1` binds
-    /// `chan_id ‖ epoch`, `/v2` drops the epoch, `/v3` adds `dir`. What the build
-    /// binds is broader than all of them — the whole clear header and both pieces of
-    /// ephemeral material — so reusing any of those strings would let two
-    /// implementations disagree about what a signature of that name covers, which is
-    /// the exact failure the `msg/sig/v6` bump exists to prevent. FROZEN.
-    DM_MSG_AAD = b"daemonseed/dm/msg/aad/v4";
-
-    /// HKDF-Extract salt for the two roots derived from `ss0`. FROZEN.
-    DM_ROOT_SALT = b"daemonseed/dm/root/salt/v1";
-
-    /// HKDF-Expand `info` for the address root `AR`, from which every ongoing-channel
-    /// address derives. Retained for the life of the conversation — addressing is
-    /// deliberately NOT forward-secret, while content is. FROZEN.
-    DM_ADDR_ROOT = b"daemonseed/dm/addr/root/v3";
-
-    /// HKDF-Expand `info` for `chan_id`, the conversation identifier bound into every
-    /// signature and AAD. **Never serialized** — a receiver recomputes it from the
-    /// record it derived. Putting it on the wire would collapse the address scatter
-    /// it exists to protect. FROZEN.
-    DM_CHAN_ID = b"daemonseed/dm/chanid/v2";
-
-    /// HKDF-Extract salt for a channel page's owner-seed derivation, rooted in the
-    /// conversation's secret address root `AR`. FROZEN.
-    DM_PAGE_SALT = b"daemonseed/dm/page/salt/v1";
-
-    /// HKDF-Expand `info` prefix for a channel page's Veilid owner seed. The
-    /// direction and page number follow it, length-prefixed. Unlike every other DM
-    /// address this one is **not** world-derivable: it is rooted in a secret only the
-    /// two parties hold, which is what makes the page owner-write-gated and therefore
-    /// unforgeable and un-erasable by a third party. FROZEN.
-    DM_PAGE_ADDR = b"daemonseed/dm/page/addr/v4";
-
-    /// HKDF-Extract salt for a direction's delivery-acknowledgement seal key, rooted
-    /// in the conversation's retained address root `AR`. Distinct from
-    /// [`DM_PAGE_SALT`] so the two derivations over that same secret cannot collide.
-    /// FROZEN.
-    DM_ACK_SALT = b"daemonseed/dm/ack/salt/v1";
-
-    /// HKDF-Expand `info` prefix for a direction's delivery-acknowledgement seal key.
-    /// The direction follows it, length-prefixed.
-    ///
-    /// **Rooted in `AR`, not in the ratchet root**, which is what the `/v3` in the
-    /// frozen name records: a ratchet-rooted ack key desyncs the moment the two
-    /// parties sit at different generations (crypto F-3), and the acknowledgement
-    /// would go dark exactly when a conversation is busiest. Per-direction for F-6.
-    /// FROZEN.
-    DM_ACK_SEAL = b"daemonseed/dm/ack/seal/v3";
-
-    /// HKDF-Extract salt for a direction's ACKNOWLEDGEMENT-RECORD owner-seed
-    /// derivation, rooted in the conversation's retained address root `AR`.
-    ///
-    /// **Distinct from [`DM_ACK_SALT`], which extracts the seal KEY from the same
-    /// input.** One salt for both would mean the record's address and the key its
-    /// contents are sealed under descend from one extraction over one secret, so
-    /// anyone who learned the address would be one HKDF-Expand from the key. It is
-    /// distinct from [`DM_PAGE_SALT`] for the same reason those two are. FROZEN.
-    DM_ACK_ADDR_SALT = b"daemonseed/dm/ack/addr/salt/v1";
-
-    /// HKDF-Expand `info` prefix for a direction's acknowledgement-record Veilid
-    /// owner seed. The direction follows it, length-prefixed.
-    ///
-    /// **Not world-derivable**, like [`DM_PAGE_ADDR`] and unlike every other DM
-    /// address: it is rooted in `AR`, a secret only the two parties hold, which is
-    /// what makes the ack record owner-write-gated and therefore unforgeable and
-    /// un-erasable by a third party. There is no page number — one record per
-    /// direction, for the life of the conversation. FROZEN.
-    DM_ACK_ADDR = b"daemonseed/dm/ack/addr/v1";
-
-    /// AAD prefix for a delivery acknowledgement's seal. The conversation
-    /// identifier and the direction follow it, length-prefixed — the same two
-    /// fields [`DM_ACK_SIG`] binds first, so the AEAD refuses a cross-conversation
-    /// or cross-direction splice before any signature is checked.
-    ///
-    /// **`/v3`, past the frozen text's `…/ack/aad/v2`.** That name was pinned in
-    /// § DRAFT v2 beside a seal key rooted in `RK_current` and an AAD binding
-    /// `chan_id` alone; v3 re-rooted the key in `AR` and made the ack per-direction
-    /// (crypto F-3 / F-6), so what this domain covers is `chan_id ‖ dir`. Reusing
-    /// `/v2` for different content would let two implementations disagree about
-    /// what an AAD of that name binds, which is the failure the `ack/seal/v3` and
-    /// `ack/sig/v3` bumps exist to prevent. FROZEN.
-    DM_ACK_AAD = b"daemonseed/dm/ack/aad/v3";
-
-    /// Signature domain for a delivery acknowledgement, signed under the PSEUDONYM
-    /// key.
-    ///
-    /// **`/v3`, past the frozen text's `…/ack/sig/v2`.** That name was pinned in
-    /// § DRAFT v2 for a preimage covering `chan_id ‖ high_water` alone — written while
-    /// the gap bitmap was dropped. v6 restored the bitmap and made it decide
-    /// confirmation, so a preimage of that shape leaves the deciding half unsigned.
-    /// What this domain covers is `chan_id ‖ dir ‖ high_water ‖ the canonical run
-    /// encoding`; reusing `/v2` for materially broader content would let two
-    /// implementations disagree about what a signature of that name covers, which is
-    /// the same failure the `msg/sig/v6` and `msg/aad/v4` bumps exist to prevent.
-    /// FROZEN.
-    DM_ACK_SIG = b"daemonseed/dm/ack/sig/v3";
-
-    /// HKDF-Expand `info` for the ratchet root `RK0` — the third sibling of the same
-    /// extraction that yields [`DM_ADDR_ROOT`] and [`DM_CHAN_ID`]. Unlike those two,
-    /// this one is ratcheted forward and deleted, which is the whole of DM's forward
-    /// secrecy. FROZEN.
-    DM_RATCHET_ROOT = b"daemonseed/dm/ratchet/root/v2";
-
-    /// HKDF-Expand `info` for a ratchet generation step. The extraction that precedes
-    /// it takes the PREVIOUS root as its salt and the freshly encapsulated secret as
-    /// its IKM, so a generation depends on both its ancestor and new entropy — the
-    /// standard double-ratchet root step, and what makes a compromise heal. FROZEN.
-    DM_RATCHET_STEP = b"daemonseed/dm/ratchet/step/v2";
-
-    /// HKDF-Extract salt for deriving a direction's chain key from a ratchet root.
-    /// FROZEN.
-    DM_CHAIN_SALT = b"daemonseed/dm/chain/salt/v1";
-
-    /// HKDF-Expand `info` for the initiator-to-recipient chain key. FROZEN.
-    DM_CHAIN_A2B = b"daemonseed/dm/chain/a2b/v2";
-
-    /// HKDF-Expand `info` for the recipient-to-initiator chain key. Distinct from
-    /// [`DM_CHAIN_A2B`] so the two directions never share a message key — the defect
-    /// that made the single-chain draft reuse an AES-GCM nonce. FROZEN.
-    DM_CHAIN_B2A = b"daemonseed/dm/chain/b2a/v2";
-
-    /// HKDF-Extract salt for one symmetric step along a chain. FROZEN.
-    DM_CHAIN_STEP_SALT = b"daemonseed/dm/chain/step-salt/v1";
-
-    /// HKDF-Expand `info` for the message key at a chain position. FROZEN.
-    DM_MK = b"daemonseed/dm/mk/v2";
-
-    /// HKDF-Expand `info` for the successor chain key. Sibling of [`DM_MK`] under one
-    /// extraction, so learning a message key never yields the chain it came from.
-    /// FROZEN.
-    DM_CK = b"daemonseed/dm/ck/v2";
-
-    /// HKDF-Expand `info` for `RS_0`, the retained re-establishment root — the
-    /// FOURTH sibling of the extraction that yields [`DM_ADDR_ROOT`],
-    /// [`DM_CHAN_ID`] and [`DM_RATCHET_ROOT`]
-    /// (`docs/design/direct-messaging.md:714`).
-    ///
-    /// A sibling and not a chain, for the reason the other three are: `RS_0` is
-    /// retained at rest after establishment deletes `ss0`, so a chained
-    /// derivation would let the retained value regenerate the deleted ones and
-    /// cost the forward secrecy that deletion buys. FROZEN.
-    DM_REEST_ROOT = b"daemonseed/dm/reest/root/v1";
-
-    /// HKDF-Expand `info` for the successor retained root `RS_{n+1}`, expanded
-    /// from the extraction over `RS_n ‖ ss_new` under [`DM_REEST_SALT`]
-    /// (`docs/design/direct-messaging.md:724`).
-    ///
-    /// Distinct from [`DM_RATCHET_STEP`], which expands the ratchet root
-    /// `RK_0'` from a different extraction over the same two inputs: the two
-    /// outputs of one re-establishment must not be derivable from each other,
-    /// because one is retained at rest and the other is a live ratchet root
-    /// that is advanced and deleted. FROZEN.
-    DM_REEST_NEXT = b"daemonseed/dm/reest/next/v1";
-
-    /// HKDF-Expand `info` for the resumed channel's identifier
-    /// `chan_id_{n+1}`, expanded from the extraction over `RS_n ‖ ss_new` under
-    /// [`DM_REEST_SALT`] — **the one sibling of the successor root**
-    /// [`DM_REEST_NEXT`], which that extraction also yields. The ratchet root
-    /// the resumed channel opens under is not a sibling of either: it comes from
-    /// a separate extraction, salted with `RS_n` itself.
-    ///
-    /// Establishment deletes `chan_id` along with `ss0`
-    /// (`docs/design/direct-messaging.md:710`), so a resumed channel needs an
-    /// identifier that neither party retained. Deriving it beside the roots
-    /// rather than retaining the old one keeps the at-rest set unchanged: a
-    /// party that resumes holds `AR` and `RS_n` and nothing else about the
-    /// conversation's identity. FROZEN.
-    DM_REEST_CHAN_ID = b"daemonseed/dm/reest/chanid/v1";
-
-    /// HKDF-Extract salt for every derivation rooted in a committed
-    /// re-establishment root — the leg keys and the tiebreak coin alike. FROZEN.
-    DM_REEST_SALT = b"daemonseed/dm/reest/salt/v1";
-
-    /// HKDF-Expand `info` prefix for one re-establishment leg's seal key. The
-    /// leg kind, the direction, the generation and the attempt follow it, each
-    /// length-prefixed — A4.6's `K(RS_n, gen, attempt, leg, dir)`. Every one of
-    /// those is a KEY input rather than a wire field: a leg carries no clear
-    /// discriminator at all, so this derivation is what a receiver's trial
-    /// decryption is scanning over. FROZEN.
-    DM_REEST_LEG = b"daemonseed/dm/reest/leg/v1";
-
-    /// HKDF-Expand `info` prefix for A3.7's tiebreak coin, with the
-    /// re-establishment generation length-prefixed after it. Distinct from
-    /// [`DM_REEST_LEG`] so a seal key can never be read as a coin. FROZEN.
-    DM_REEST_TIEBREAK = b"daemonseed/dm/reest/tiebreak/v1";
-
-    /// Signature domain for a re-establishment leg's authorship signature
-    /// (A3.1), signed under the sender's per-correspondent pseudonym key. The
-    /// leg kind, the direction, the generation, the attempt and the leg's
-    /// payload follow it, each length-prefixed. FROZEN.
-    DM_REEST_SIG = b"daemonseed/dm/reest/sig/v1";
 
     /// HKDF-Extract salt for the DROP's owner-seed derivation, rooted in the
     /// RECIPIENT's published identity key. Distinct from every other salt over that
@@ -537,11 +202,7 @@ dm_labels! {
     /// ([`crate::dm::chain`]), both for the seed root and for every turn's
     /// successor.
     ///
-    /// **Its own label rather than [`DM_RATCHET_ROOT`]'s or
-    /// [`DM_RATCHET_STEP`]'s.** Those two belong to the ongoing-channel ratchet,
-    /// whose root is one per conversation and carries both directions; this one is
-    /// per direction and steps per turn, so a value of one kind must never be
-    /// derivable as a value of the other. FROZEN.
+    /// FROZEN.
     DM_CHANNEL_ROOT = b"daemonseed/dm/channel/root/v1";
 
     /// HKDF-Extract salt for a turn's chain key, rooted in that turn's root.
@@ -550,9 +211,7 @@ dm_labels! {
 
     /// HKDF-Expand `info` for a turn's chain key.
     ///
-    /// **One label for both directions, unlike [`DM_CHAIN_A2B`] and
-    /// [`DM_CHAIN_B2A`].** Those two separate directions that share a root for the
-    /// life of a conversation. Here the two directions share only the SEED root,
+    /// **One label for both directions.** The two directions share only the SEED root,
     /// derived from `ss0` and therefore one value on both sides, and diverge at
     /// each side's first own turn; from there each root is its own. A
     /// per-direction label would not separate the seed — both sides derive both
@@ -581,61 +240,13 @@ mod tests {
     /// change, and this test is the tripwire that makes it deliberate.
     #[test]
     fn labels_are_byte_pinned() {
-        assert_eq!(DM_KEYREC_SALT, b"daemonseed/dm/keyrec/salt/v1");
-        assert_eq!(DM_KEYREC_OWNER, b"daemonseed/dm/keyrec/owner/v1");
-        assert_eq!(DM_KEYREC_SIG, b"daemonseed/dm/keyrec/sig/v1");
-        assert_eq!(DM_DOORBELL_SALT, b"daemonseed/dm/doorbell/salt/v1");
-        assert_eq!(DM_DOORBELL_OWNER, b"daemonseed/dm/doorbell/addr/v4");
-        assert_eq!(
-            DM_DOORBELL_SLOT_SALT,
-            b"daemonseed/dm/doorbell/slot-salt/v1"
-        );
-        assert_eq!(DM_DOORBELL_SLOT, b"daemonseed/dm/doorbell/slot/v5");
-        assert_eq!(DM_FC_SALT, b"daemonseed/dm/fc/salt/v1");
-        assert_eq!(DM_FC_SEAL, b"daemonseed/dm/fc/seal/v1");
-        assert_eq!(DM_FC_AAD, b"daemonseed/dm/fc/aad/v1");
-        assert_eq!(DM_FC_POW, b"daemonseed/dm/fc/pow/v1");
-        assert_eq!(DM_TOKEN, b"daemonseed/dm/token/v1");
-        assert_eq!(DM_PROVISIONAL_SALT, b"daemonseed/dm/provisional/salt/v1");
-        assert_eq!(DM_PROVISIONAL_SEAL, b"daemonseed/dm/provisional/seal/v1");
-        assert_eq!(DM_PROVISIONAL_AAD, b"daemonseed/dm/provisional/aad/v1");
-        assert_eq!(
-            DM_PROVISIONAL_BIND_SALT,
-            b"daemonseed/dm/provisional/bind-salt/v1"
-        );
-        assert_eq!(DM_PROVISIONAL_BIND, b"daemonseed/dm/provisional/bind/v1");
         assert_eq!(DM_STORE_SALT, b"daemonseed/dm/store/salt/v1");
         assert_eq!(DM_STORE_SEAL, b"daemonseed/dm/store/seal/v1");
         assert_eq!(DM_STORE_AAD, b"daemonseed/dm/store/aad/v1");
         assert_eq!(DM_STORE_PROFILE_AAD, b"daemonseed/dm/store/profile/aad/v1");
-        assert_eq!(DM_BIND_LT, b"daemonseed/dm/bind/lt/v1");
-        assert_eq!(DM_MSG_SIG, b"daemonseed/dm/msg/sig/v6");
-        assert_eq!(DM_MSG_AAD, b"daemonseed/dm/msg/aad/v4");
-        assert_eq!(DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1");
-        assert_eq!(DM_ADDR_ROOT, b"daemonseed/dm/addr/root/v3");
         assert_eq!(DM_ADVERT_SALT, b"daemonseed/dm/advert/salt/v1");
         assert_eq!(DM_ADVERT_OWNER, b"daemonseed/dm/advert/owner/v1");
         assert_eq!(DM_ADVERT_SIG, b"daemonseed/dm/advert/sig/v1");
-        assert_eq!(DM_CHAN_ID, b"daemonseed/dm/chanid/v2");
-        assert_eq!(DM_PAGE_SALT, b"daemonseed/dm/page/salt/v1");
-        assert_eq!(DM_PAGE_ADDR, b"daemonseed/dm/page/addr/v4");
-        assert_eq!(DM_ACK_SALT, b"daemonseed/dm/ack/salt/v1");
-        assert_eq!(DM_ACK_SEAL, b"daemonseed/dm/ack/seal/v3");
-        assert_eq!(DM_ACK_ADDR_SALT, b"daemonseed/dm/ack/addr/salt/v1");
-        assert_eq!(DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1");
-        assert_eq!(DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3");
-        assert_eq!(DM_ACK_SIG, b"daemonseed/dm/ack/sig/v3");
-        assert_eq!(DM_RATCHET_ROOT, b"daemonseed/dm/ratchet/root/v2");
-        assert_eq!(DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2");
-        assert_eq!(DM_CHAIN_SALT, b"daemonseed/dm/chain/salt/v1");
-        assert_eq!(DM_CHAIN_A2B, b"daemonseed/dm/chain/a2b/v2");
-        assert_eq!(DM_CHAIN_B2A, b"daemonseed/dm/chain/b2a/v2");
-        assert_eq!(DM_CHAIN_STEP_SALT, b"daemonseed/dm/chain/step-salt/v1");
-        assert_eq!(DM_MK, b"daemonseed/dm/mk/v2");
-        assert_eq!(DM_CK, b"daemonseed/dm/ck/v2");
-        assert_eq!(DM_REEST_ROOT, b"daemonseed/dm/reest/root/v1");
-        assert_eq!(DM_REEST_CHAN_ID, b"daemonseed/dm/reest/chanid/v1");
-        assert_eq!(DM_REEST_NEXT, b"daemonseed/dm/reest/next/v1");
         assert_eq!(DM_DROP_SALT, b"daemonseed/dm/drop/salt/v1");
         assert_eq!(DM_DROP_OWNER, b"daemonseed/dm/drop/owner/v1");
         assert_eq!(DM_DROP_HELLO_SALT, b"daemonseed/dm/drop/hello-salt/v1");
@@ -746,28 +357,10 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 74] = [
-            (DM_ACK_AAD, b"daemonseed/dm/ack/aad/v3".as_slice()),
-            (DM_ACK_ADDR, b"daemonseed/dm/ack/addr/v1".as_slice()),
-            (
-                DM_ACK_ADDR_SALT,
-                b"daemonseed/dm/ack/addr/salt/v1".as_slice(),
-            ),
-            (DM_ACK_SALT, b"daemonseed/dm/ack/salt/v1".as_slice()),
-            (DM_ACK_SEAL, b"daemonseed/dm/ack/seal/v3".as_slice()),
-            (DM_ACK_SIG, b"daemonseed/dm/ack/sig/v3".as_slice()),
-            (DM_ADDR_ROOT, b"daemonseed/dm/addr/root/v3".as_slice()),
+        let pinned: [(&[u8], &[u8]); 28] = [
             (DM_ADVERT_OWNER, b"daemonseed/dm/advert/owner/v1".as_slice()),
             (DM_ADVERT_SALT, b"daemonseed/dm/advert/salt/v1".as_slice()),
             (DM_ADVERT_SIG, b"daemonseed/dm/advert/sig/v1".as_slice()),
-            (DM_BIND_LT, b"daemonseed/dm/bind/lt/v1".as_slice()),
-            (DM_CHAIN_A2B, b"daemonseed/dm/chain/a2b/v2".as_slice()),
-            (DM_CHAIN_B2A, b"daemonseed/dm/chain/b2a/v2".as_slice()),
-            (DM_CHAIN_SALT, b"daemonseed/dm/chain/salt/v1".as_slice()),
-            (
-                DM_CHAIN_STEP_SALT,
-                b"daemonseed/dm/chain/step-salt/v1".as_slice(),
-            ),
             (
                 DM_CHANNEL_CHAIN,
                 b"daemonseed/dm/channel/chain/v1".as_slice(),
@@ -812,24 +405,6 @@ mod tests {
                 DM_CHANNEL_STEP_SALT,
                 b"daemonseed/dm/channel/step-salt/v1".as_slice(),
             ),
-            (DM_CHAN_ID, b"daemonseed/dm/chanid/v2".as_slice()),
-            (DM_CK, b"daemonseed/dm/ck/v2".as_slice()),
-            (
-                DM_DOORBELL_OWNER,
-                b"daemonseed/dm/doorbell/addr/v4".as_slice(),
-            ),
-            (
-                DM_DOORBELL_SALT,
-                b"daemonseed/dm/doorbell/salt/v1".as_slice(),
-            ),
-            (
-                DM_DOORBELL_SLOT,
-                b"daemonseed/dm/doorbell/slot/v5".as_slice(),
-            ),
-            (
-                DM_DOORBELL_SLOT_SALT,
-                b"daemonseed/dm/doorbell/slot-salt/v1".as_slice(),
-            ),
             (DM_DROP_AAD, b"daemonseed/dm/drop/aad/v1".as_slice()),
             (DM_DROP_HELLO, b"daemonseed/dm/drop/hello/v1".as_slice()),
             (
@@ -840,54 +415,6 @@ mod tests {
             (DM_DROP_POW, b"daemonseed/dm/drop/pow/v1".as_slice()),
             (DM_DROP_SALT, b"daemonseed/dm/drop/salt/v1".as_slice()),
             (DM_DROP_SLOT, b"daemonseed/dm/drop/slot/v1".as_slice()),
-            (DM_FC_AAD, b"daemonseed/dm/fc/aad/v1".as_slice()),
-            (DM_FC_POW, b"daemonseed/dm/fc/pow/v1".as_slice()),
-            (DM_FC_SALT, b"daemonseed/dm/fc/salt/v1".as_slice()),
-            (DM_FC_SEAL, b"daemonseed/dm/fc/seal/v1".as_slice()),
-            (DM_KEYREC_OWNER, b"daemonseed/dm/keyrec/owner/v1".as_slice()),
-            (DM_KEYREC_SALT, b"daemonseed/dm/keyrec/salt/v1".as_slice()),
-            (DM_KEYREC_SIG, b"daemonseed/dm/keyrec/sig/v1".as_slice()),
-            (DM_MK, b"daemonseed/dm/mk/v2".as_slice()),
-            (DM_MSG_AAD, b"daemonseed/dm/msg/aad/v4".as_slice()),
-            (DM_MSG_SIG, b"daemonseed/dm/msg/sig/v6".as_slice()),
-            (DM_PAGE_ADDR, b"daemonseed/dm/page/addr/v4".as_slice()),
-            (DM_PAGE_SALT, b"daemonseed/dm/page/salt/v1".as_slice()),
-            (
-                DM_PROVISIONAL_AAD,
-                b"daemonseed/dm/provisional/aad/v1".as_slice(),
-            ),
-            (
-                DM_PROVISIONAL_BIND,
-                b"daemonseed/dm/provisional/bind/v1".as_slice(),
-            ),
-            (
-                DM_PROVISIONAL_BIND_SALT,
-                b"daemonseed/dm/provisional/bind-salt/v1".as_slice(),
-            ),
-            (
-                DM_PROVISIONAL_SALT,
-                b"daemonseed/dm/provisional/salt/v1".as_slice(),
-            ),
-            (
-                DM_PROVISIONAL_SEAL,
-                b"daemonseed/dm/provisional/seal/v1".as_slice(),
-            ),
-            (DM_RATCHET_ROOT, b"daemonseed/dm/ratchet/root/v2".as_slice()),
-            (DM_RATCHET_STEP, b"daemonseed/dm/ratchet/step/v2".as_slice()),
-            (DM_REEST_LEG, b"daemonseed/dm/reest/leg/v1".as_slice()),
-            (
-                DM_REEST_CHAN_ID,
-                b"daemonseed/dm/reest/chanid/v1".as_slice(),
-            ),
-            (DM_REEST_NEXT, b"daemonseed/dm/reest/next/v1".as_slice()),
-            (DM_REEST_ROOT, b"daemonseed/dm/reest/root/v1".as_slice()),
-            (DM_REEST_SALT, b"daemonseed/dm/reest/salt/v1".as_slice()),
-            (DM_REEST_SIG, b"daemonseed/dm/reest/sig/v1".as_slice()),
-            (
-                DM_REEST_TIEBREAK,
-                b"daemonseed/dm/reest/tiebreak/v1".as_slice(),
-            ),
-            (DM_ROOT_SALT, b"daemonseed/dm/root/salt/v1".as_slice()),
             (DM_STORE_AAD, b"daemonseed/dm/store/aad/v1".as_slice()),
             (
                 DM_STORE_PROFILE_AAD,
@@ -895,7 +422,6 @@ mod tests {
             ),
             (DM_STORE_SALT, b"daemonseed/dm/store/salt/v1".as_slice()),
             (DM_STORE_SEAL, b"daemonseed/dm/store/seal/v1".as_slice()),
-            (DM_TOKEN, b"daemonseed/dm/token/v1".as_slice()),
         ];
         assert_eq!(
             pinned.len(),

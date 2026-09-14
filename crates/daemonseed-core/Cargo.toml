@@ -47,14 +47,12 @@ notify = { workspace = true }
 
 [features]
 # Test-only escape hatches, off by default and never enabled by a consumer of
-# this crate. It gates `VerifiedFirstContact::new_for_test` and its two
-# companions: that type is a verification witness whose fields are private so
-# that holding one really is the proof its doc comment claims (#265), but the
-# behavioural zeroize witness in `tests/secret_zeroize_on_drop.rs` needs a
-# `GlobalAlloc` hook and this crate is `#![forbid(unsafe_code)]`, so that harness
-# must live outside the crate — where sealed fields would put the type out of its
-# reach. The dev-dependency below is what turns the feature on for this crate's
-# own test targets, and nothing else.
+# this crate. It gates test-only constructors and accessors. The behavioural
+# zeroize witness in `tests/secret_zeroize_on_drop.rs` needs a `GlobalAlloc` hook
+# and this crate is `#![forbid(unsafe_code)]`, so that harness must live outside
+# the crate, where private fields would be out of its reach. The dev-dependency
+# below is what turns the feature on for this crate's own test targets, and
+# nothing else.
 testing = []
 
 [dev-dependencies]

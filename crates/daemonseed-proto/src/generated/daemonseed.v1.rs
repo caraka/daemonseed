@@ -1060,8 +1060,9 @@ pub struct DmChannelOpening {
     pub advert_serial: u64,
     /// ML-DSA-87 signature, exactly 4627 bytes, over the preimage
     /// `daemonseed/dm/channel/opening-sig/v1` followed by the writer identity
-    /// key, the recipient identity key, the first ratchet key, and
-    /// `advert_serial` as a big-endian 64-bit integer — each of those four
+    /// key, the recipient identity key, the 32-byte lookup key of the channel
+    /// record the opening is written into, the first ratchet key, and
+    /// `advert_serial` as a big-endian 64-bit integer — each of those five
     /// prefixed with its own big-endian 64-bit length.
     #[prost(bytes = "vec", tag = "5")]
     pub signature: ::prost::alloc::vec::Vec<u8>,

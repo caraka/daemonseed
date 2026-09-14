@@ -9,9 +9,9 @@
 //! online. No handshake round-trip, no session, no new transport.
 //!
 //! `docs/design/direct-messaging.md` is implemented by [`advert`], [`mod@drop`],
-//! [`channel`], [`chain`], [`store`], [`delivery`] and [`flows`]. The other
-//! modules under `dm/` are the transport's current wiring and are counted
-//! outside the layer by `cargo xtask dm-size`.
+//! [`channel`], [`chain`], [`store`], [`delivery`] and [`flows`]. [`block_list`],
+//! [`contact_cache`] and [`domain`] are counted outside the layer by
+//! `cargo xtask dm-size`.
 
 /// Append a `u64` big-endian length prefix and the bytes.
 ///
@@ -30,22 +30,6 @@ pub(crate) fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
 /// recoverable from a buffer padded out with zeros.
 pub(crate) const LEN_PREFIX: usize = 4;
 
-/// Pad an encoded body to the smallest bucket that holds it:
-/// `len(4, LE) ‖ protobuf ‖ zero-pad`, matching [`crate::heartbeat`]'s scheme.
-///
-/// `None` means no bucket is large enough — the caller reports that with its own
-/// error, since only the caller knows which record shape the ladder was sized
-/// against. Shared by every DM frame kind so the two ladders cannot drift into
-/// two incompatible paddings of the same shape.
-pub(crate) fn pad_to_bucket(encoded: &[u8], buckets: &[usize]) -> Option<Vec<u8>> {
-    let needed = LEN_PREFIX.checked_add(encoded.len())?;
-    let bucket = buckets.iter().copied().find(|b| needed <= *b)?;
-    let mut buf = vec![0u8; bucket];
-    buf[..LEN_PREFIX].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
-    buf[LEN_PREFIX..needed].copy_from_slice(encoded);
-    Some(buf)
-}
-
 /// Recover the encoded body from a padded plaintext. `None` on a corrupt or
 /// oversized length rather than slicing past the buffer.
 pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
@@ -55,48 +39,13 @@ pub(crate) fn unpad(padded: &[u8]) -> Option<&[u8]> {
     padded.get(LEN_PREFIX..end)
 }
 
-pub mod ack;
-pub mod ack_budget;
-pub mod ack_cadence;
-pub mod ack_record;
-pub mod admission;
 pub mod advert;
 pub mod block_list;
 pub mod chain;
 pub mod channel;
-pub mod collect;
 pub mod contact_cache;
 pub mod delivery;
 pub mod domain;
-pub mod doorbell;
 pub mod drop;
-pub mod firstcontact;
 pub mod flows;
-pub mod frame;
-pub mod keyrec;
-pub mod outbox;
-pub mod paging;
-pub mod persist;
-pub mod pow;
-pub mod provisional;
-pub mod ratchet;
-pub mod reest;
-pub mod resume;
-pub mod spent_store;
 pub mod store;
-pub mod token;
-
-/// A stand-in ephemeral decapsulation key for the resume-record fixtures.
-///
-/// A fixed pattern rather than a real ML-KEM keypair: every test that uses it
-/// exercises the record's encoding and its guards, neither of which
-/// decapsulates anything. The tests that do complete a handshake mint a real
-/// keypair through [`reest::mint_ephemeral`].
-///
-/// One definition, read by `dm::resume`, `dm::reest` and `dm::persist`, so the
-/// bytes a record is written with and the bytes it is asserted against cannot
-/// drift apart.
-#[cfg(test)]
-pub(crate) fn eph_dk_fixture() -> ratchet::EphemeralDecapKey {
-    ratchet::EphemeralDecapKey::new(Box::new([0x3du8; oxicrypt_ml_kem::DK_LEN]))
-}
