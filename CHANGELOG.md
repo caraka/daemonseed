@@ -805,6 +805,22 @@ work lives in the maintainer's own planning notes, not here.
   or next page of a sweep — the pages nothing holds between operations, and therefore the oldest
   unheld records an LRU would pick. A close asked for by name is not refused by a pin.
   `DM_PAGE_CACHE_CAPACITY` is 128. (#252)
+- `daemonseed-veilid-net`: the `two_node_dm_offline` and `two_node_dm_evict` oracles, one process per step
+  over `dm::flows` and `VeilidRecords`, each driver `#[ignore]`d. `two_node_dm_offline`: A writes a first
+  contact while no B process exists, a third identity writes one whose channel opening names A as writer
+  under its own signature, and B collects afterwards, with that hello and the forged opening confirmed on
+  the network byte for byte before and after every collection pass; the driver asserts a contact request
+  whose identity public key equals A's on A's channel and slot, and nothing surfaced on the forged
+  channel, at its slot, or under either key otherwise. `two_node_dm_evict`: a channel holding an
+  outstanding message is left untouched for `DAEMONSEED_DM_EVICT_QUIET_SECS` (default 6 h, 60 s to 30 days)
+  per round, up to `DAEMONSEED_DM_EVICT_ROUNDS` (default 28, at most 1000), until a fresh observer node's
+  `SyncSet` inspect shows a subkey's network number absent or below the owner's. Every look is bracketed
+  by an inspect of the looking role's own freshly published advert, and a look whose advert shows no
+  network number is not counted. The driver asserts the owner's own controlled `inspect_channel` reports
+  the loss within `delivery::POLL_INTERVAL_MIN` of the look, that a fresh observer's look before the
+  owner's rewrite step still shows every lost subkey lost, that the owner rewrote each one, that a lost
+  control subkey comes back above its established network number and a lost message slot at or above it,
+  and that each slot reads back byte-identical to its outbox entry.
 
 ### Fixed
 
