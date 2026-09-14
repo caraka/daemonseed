@@ -1792,6 +1792,19 @@ mod tests {
         refuse_reads_after: Option<usize>,
         /// Refuse to read any advert.
         refuse_adverts: bool,
+        /// Every value ever written to a channel subkey, in order, overwritten
+        /// versions included.
+        channel_log: Vec<([u8; HELLO_LOOKUP_KEY_LEN], u16, Vec<u8>)>,
+        /// Every value ever written to a drop slot, in order.
+        drop_log: Vec<([u8; 32], u16, Vec<u8>)>,
+        /// Every advert ever published, in order, with the owner seed that
+        /// addresses it.
+        advert_log: Vec<([u8; 32], Vec<u8>)>,
+        /// The owner seed each channel record was opened under, by lookup
+        /// key. A channel value is stored only when its writer is that seed,
+        /// which is the check a substrate's schema makes of a value's writer
+        /// against the record's owner.
+        channel_owners: HashMap<[u8; HELLO_LOOKUP_KEY_LEN], [u8; channel::CHANNEL_OWNER_SEED_LEN]>,
     }
 
     impl Net {
@@ -1814,11 +1827,48 @@ mod tests {
         }
 
         fn publish_advert(&mut self, owner: &AdvertOwnerSeed, bytes: Vec<u8>) {
+            self.advert_log.push((*owner.as_bytes(), bytes.clone()));
             self.adverts.insert(*owner.as_bytes(), bytes);
         }
 
         fn reset_writes(&mut self) {
             self.writes = Writes::default();
+        }
+
+        /// Write one channel subkey as the holder of `owner`.
+        fn write_channel_as(
+            &mut self,
+            owner: &ChannelOwnerSeed,
+            lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+            subkey: u16,
+            bytes: &[u8],
+        ) -> Result<(), RecordError> {
+            self.write_owned(owner.as_bytes(), lookup_key, subkey, bytes)
+        }
+
+        /// One channel write by `writer`, refused before anything is charged
+        /// or stored where `writer` is not the seed the record was opened
+        /// under.
+        fn write_owned(
+            &mut self,
+            writer: &[u8; channel::CHANNEL_OWNER_SEED_LEN],
+            lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+            subkey: u16,
+            bytes: &[u8],
+        ) -> Result<(), RecordError> {
+            if self.channel_owners.get(lookup_key) != Some(writer) {
+                return Err(RecordError::new(Refused));
+            }
+            self.charge(bytes.len())?;
+            self.channel_log.push((*lookup_key, subkey, bytes.to_vec()));
+            let one = if self.double { 2 } else { 1 };
+            if subkey == channel::CONTROL_SUBKEY {
+                self.writes.control += one;
+            } else {
+                self.writes.ring += one;
+            }
+            self.channels.insert((*lookup_key, subkey), bytes.to_vec());
+            Ok(())
         }
     }
 
@@ -1861,6 +1911,8 @@ mod tests {
         ) -> Result<(), RecordError> {
             self.shapes.push(("drop", subkeys));
             self.charge(bytes.len())?;
+            self.drop_log
+                .push((*owner.as_bytes(), slot, bytes.to_vec()));
             self.writes.hello += if self.double { 2 } else { 1 };
             self.hellos_written.push(bytes.to_vec());
             if let Some(prefix) = bytes.get(..ml_kem::CT_LEN) {
@@ -1895,7 +1947,9 @@ mod tests {
             subkeys: u16,
         ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
             self.shapes.push(("channel", subkeys));
-            Ok(Self::lookup_key(owner))
+            let key = Self::lookup_key(owner);
+            self.channel_owners.insert(key, *owner.as_bytes());
+            Ok(key)
         }
 
         fn read_channel(
@@ -1918,15 +1972,14 @@ mod tests {
             subkey: u16,
             bytes: &[u8],
         ) -> Result<(), RecordError> {
-            self.charge(bytes.len())?;
-            let one = if self.double { 2 } else { 1 };
-            if subkey == channel::CONTROL_SUBKEY {
-                self.writes.control += one;
-            } else {
-                self.writes.ring += one;
-            }
-            self.channels.insert((*lookup_key, subkey), bytes.to_vec());
-            Ok(())
+            // Written as the owner the record was opened under, so a record no
+            // owner has opened takes no write.
+            let owner = self
+                .channel_owners
+                .get(lookup_key)
+                .copied()
+                .ok_or_else(|| RecordError::new(Refused))?;
+            self.write_owned(&owner, lookup_key, subkey, bytes)
         }
     }
 
@@ -2463,6 +2516,471 @@ mod tests {
         );
     }
 
+    /// Every 32-byte window of `bytes`.
+    fn windows_of(bytes: &[u8]) -> HashSet<[u8; 32]> {
+        bytes
+            .windows(32)
+            .map(|w| <[u8; 32]>::try_from(w).expect("a 32-byte window"))
+            .collect()
+    }
+
+    /// Whether any 32-byte window of `key` is among `windows`.
+    fn any_window_of(key: &[u8], windows: &HashSet<[u8; 32]>) -> bool {
+        key.windows(32)
+            .any(|w| windows.contains(&<[u8; 32]>::try_from(w).expect("a 32-byte window")))
+    }
+
+    /// Whether `reader` opens one captured message.
+    fn opens(reader: &mut Conversation, bytes: &[u8]) -> bool {
+        let (header, sealed) = channel::MessageHeader::decode(bytes).expect("a message header");
+        reader.open(&header, sealed).is_ok()
+    }
+
+    /// **FC5** (design § Founding claims). No record a whole conversation writes holds either identity
+    /// public key or any 32-byte window of one, and a third identity opens
+    /// none of them.
+    ///
+    /// The values scanned are every value written through `Records` by the
+    /// core flows in this conversation, overwritten versions included, with
+    /// the runner's writes out of scope: a first contact stopped before its
+    /// hello and carried on, its hello resumed and then refreshed across a
+    /// rotation, an acceptance stopped after its hello back and continued, and
+    /// messages and cursors each way. To those are added a closed marker sealed
+    /// the way the delete flow seals one, and each advert either party
+    /// publishes. An erase writes no bytes, so it adds nothing to scan. Record
+    /// addresses are hash-derived rather than written values; each advert is
+    /// checked to sit at its owner's derived seed and to verify under that
+    /// owner's identity key.
+    #[test]
+    fn no_record_a_conversation_writes_carries_an_identity_key() {
+        let (a, mut b, mut net) = scene();
+
+        // A first contact stopped before its hello, and carried on from the
+        // record.
+        net.fail_after = Some(2);
+        let mut entropy = Seeded::at(4_242);
+        assert!(
+            first_contact(
+                &a.store(),
+                &mut net,
+                &a.me(),
+                b.pk(),
+                b"the first message",
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .is_err(),
+            "the first contact must stop before its hello"
+        );
+        net.fail_after = None;
+        let peer_a = a.store().load().expect("load").convs[0].peer;
+        let mut entropy = Seeded::at(5_353);
+        continue_first_contact(&a.store(), &mut net, &peer_a, |x| entropy.fill(x))
+            .expect("the first contact is carried on");
+
+        // The hello resumed, then rewritten after the correspondent rotates
+        // its advert.
+        assert!(
+            matches!(
+                resume_first_contact(&a.store(), &mut net, &peer_a).expect("A resumes"),
+                Resumed::Rewrote(_)
+            ),
+            "the resume wrote no hello"
+        );
+        let at = NOW + advert::ROTATION_PERIOD_SECS;
+        rotate(&mut b, &mut net, at, 2_020);
+        assert!(a_refreshes(&a, &mut net, &peer_a, at, 3_030).expect("the refresh runs"));
+
+        // The acceptance with a reply, stopped after its hello back lands and
+        // continued from the record, which rewrites the persisted hello back.
+        let request = only_request(b_collects(&b, &mut net));
+        let store_b = b.store();
+        net.reset_writes();
+        net.refuse_reads_after = Some(4);
+        let mut entropy = Seeded::at(909);
+        assert!(
+            accept(
+                &store_b,
+                &mut net,
+                &b.me(),
+                &request,
+                b"the reply",
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .is_err(),
+            "the acceptance must stop after its hello back"
+        );
+        net.refuse_reads_after = None;
+        let b_peer = store_b.load().expect("load").convs[0].peer;
+        let mut entropy = Seeded::at(5_454);
+        let accepted = continue_acceptance(
+            &store_b,
+            &mut net,
+            &b.me(),
+            &b_peer,
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("the acceptance is continued");
+        assert_eq!(
+            net.writes.hello, 2,
+            "the continued acceptance did not rewrite its hello back"
+        );
+        let written = &net.hellos_written;
+        assert_eq!(
+            written[written.len() - 1],
+            written[written.len() - 2],
+            "the hello back was not rewritten byte for byte"
+        );
+        // B's reading half as the acceptance left it, before B reads any of
+        // A's later messages.
+        let b_after_accept = store_b
+            .load_conv(&b_peer)
+            .expect("load")
+            .expect("B's record");
+
+        // The acceptance recognised.
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        assert!(
+            matches!(surfaced.as_slice(), [Surfaced::Accepted(_)]),
+            "expected one acceptance, got {surfaced:?}"
+        );
+
+        // Several messages each way, each side's cursor published by a batch.
+        for round in 0..3u64 {
+            let mut entropy = Seeded::at(100 + round);
+            send_message(&a.store(), &mut net, &peer_a, b"from A", |x| {
+                entropy.fill(x)
+            })
+            .expect("A sends");
+            assert!(
+                collect_batch(&b.store(), &mut net, &accepted.peer)
+                    .expect("B collects")
+                    .cursor_published,
+                "round {round}: B published no cursor"
+            );
+            let mut entropy = Seeded::at(200 + round);
+            send_message(&b.store(), &mut net, &accepted.peer, b"from B", |x| {
+                entropy.fill(x)
+            })
+            .expect("B sends");
+            assert!(
+                collect_batch(&a.store(), &mut net, &peer_a)
+                    .expect("A collects")
+                    .cursor_published,
+                "round {round}: A published no cursor"
+            );
+        }
+
+        // A's teardown writes a closed marker into its control subkey.
+        let state = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        let opening =
+            ChannelOpening::decode(state.own_opening.as_ref().expect("A's opening").as_slice())
+                .expect("decode A's opening");
+        let erase = crate::dm::delivery::prepare_delete(&a.store(), &peer_a, true)
+            .expect("prepare the delete");
+        let marker = channel::seal_control_with_key(
+            state.own_control_key.as_ref().expect("A's control key"),
+            &erase
+                .marker
+                .expect("a closed marker")
+                .control(Some(opening.clone())),
+        )
+        .expect("seal the closed marker");
+        net.write_channel(&erase.lookup_key, channel::CONTROL_SUBKEY, &marker)
+            .expect("write the closed marker");
+
+        let captured: Vec<(&str, &[u8])> = net
+            .channel_log
+            .iter()
+            .map(|(_, _, v)| ("channel", v.as_slice()))
+            .chain(net.drop_log.iter().map(|(_, _, v)| ("drop", v.as_slice())))
+            .chain(net.advert_log.iter().map(|(_, v)| ("advert", v.as_slice())))
+            .collect();
+        // Non-vacuous: every kind is captured, and so are the earlier versions
+        // of the subkeys that were rewritten.
+        for kind in ["channel", "drop", "advert"] {
+            assert!(
+                captured.iter().any(|(k, _)| *k == kind),
+                "no {kind} record was captured"
+            );
+        }
+        assert!(
+            net.channel_log.len() > net.channels.len(),
+            "no channel subkey was rewritten, so no earlier version was captured"
+        );
+        assert!(
+            net.drop_log.len() >= 5,
+            "the hello, its resumed and refreshed rewrites, the hello back and its rewrite \
+             were not all captured"
+        );
+
+        for (kind, bytes) in &captured {
+            let windows = windows_of(bytes);
+            for (name, identity) in [("A", a.pk()), ("B", b.pk())] {
+                assert!(
+                    !contains(bytes, identity),
+                    "{name}'s identity key appears in a {kind} record"
+                );
+                assert!(
+                    !any_window_of(identity, &windows),
+                    "a 32-byte window of {name}'s identity key appears in a {kind} record"
+                );
+            }
+        }
+
+        // The control: the same two scans find A's key in A's control record
+        // before it is sealed.
+        let plaintext = Control {
+            opening: Some(opening),
+            collected_cursor: 0,
+            closed: false,
+        }
+        .encode();
+        assert!(
+            contains(&plaintext, a.pk()),
+            "the whole-key scan misses a key that is there"
+        );
+        assert!(
+            any_window_of(a.pk(), &windows_of(&plaintext)),
+            "the window scan misses a key that is there"
+        );
+
+        // Each advert sits at the owner seed derived from exactly one party's
+        // identity key, and verifies under that key and not the other's.
+        let mut published = [0usize; 2];
+        for (owner, bytes) in &net.advert_log {
+            let sits_at = |party: &Party| {
+                advert::derive_owner_seed(party.pk())
+                    .expect("an advert owner")
+                    .as_bytes()
+                    == owner
+            };
+            let (index, party, other) = match (sits_at(&a), sits_at(&b)) {
+                (true, false) => (0, &a, &b),
+                (false, true) => (1, &b, &a),
+                found => panic!("an advert sits at the owner seeds of (A, B) = {found:?}"),
+            };
+            advert::verify(party.pk(), bytes)
+                .expect("an advert does not verify under its owner's identity key");
+            assert!(
+                advert::verify(other.pk(), bytes).is_err(),
+                "an advert verifies under the other party's identity key"
+            );
+            published[index] += 1;
+        }
+        assert_eq!(
+            published,
+            [1, 2],
+            "A's advert and B's two were not all checked"
+        );
+
+        // A third identity with real keys of every kind: its own advert keys,
+        // and the control keys and key schedule of a conversation it holds
+        // with a fourth identity on a network of their own.
+        let c = Party::new(0xc3);
+        let d = Party::new(0xd4);
+        let mut elsewhere = Net::default();
+        c.publish(&mut elsewhere);
+        d.publish(&mut elsewhere);
+        let (peer_c, accepted_d) = round_trip(&c, &d, &mut elsewhere);
+        let mut entropy = Seeded::at(300);
+        send_message(
+            &d.store(),
+            &mut elsewhere,
+            &accepted_d.peer,
+            b"from D",
+            |x| entropy.fill(x),
+        )
+        .expect("D sends");
+        collect_batch(&c.store(), &mut elsewhere, &peer_c).expect("C collects");
+        let c_state = c
+            .store()
+            .load_conv(&peer_c)
+            .expect("load")
+            .expect("C's record");
+        // Every hello's encapsulation decapsulated under C's own advert key,
+        // which implicit rejection answers with a secret rather than an error.
+        let decapsulated: Vec<ControlKey> = net
+            .drop_log
+            .iter()
+            .filter_map(|(_, _, bytes)| {
+                let ciphertext =
+                    <&[u8; ml_kem::CT_LEN]>::try_from(bytes.get(..ml_kem::CT_LEN)?).ok()?;
+                let secret = c
+                    .advert_keys
+                    .decapsulate(c.advert_keys.serial(), ciphertext)
+                    .ok()??;
+                channel::control_key(&secret).ok()
+            })
+            .collect();
+        let c_keys: Vec<&ControlKey> = [&c_state.own_control_key, &c_state.peer_control_key]
+            .into_iter()
+            .flatten()
+            .chain(&decapsulated)
+            .collect();
+        assert_eq!(
+            c_keys.len(),
+            2 + net.drop_log.len(),
+            "the third identity holds fewer control keys than it should"
+        );
+        let b_state = b
+            .store()
+            .load_conv(&b_peer)
+            .expect("load")
+            .expect("B's record");
+        let party_keys: Vec<&ControlKey> = [
+            &state.own_control_key,
+            &state.peer_control_key,
+            &b_state.own_control_key,
+            &b_state.peer_control_key,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let (controls, messages): (Vec<_>, Vec<_>) = net
+            .channel_log
+            .iter()
+            .partition(|(_, subkey, _)| *subkey == channel::CONTROL_SUBKEY);
+        assert!(
+            !controls.is_empty() && !messages.is_empty(),
+            "no control or no message was captured"
+        );
+
+        // Channel controls.
+        for (_, _, control) in &controls {
+            for key in &c_keys {
+                assert!(
+                    channel::open_control_with_key(key, control).is_err(),
+                    "a control record opened with the third identity's keys"
+                );
+            }
+        }
+        assert!(
+            controls.iter().any(|(_, _, control)| party_keys
+                .iter()
+                .any(|key| channel::open_control_with_key(key, control).is_ok())),
+            "the control: no control record opened with the parties' own keys"
+        );
+
+        // Channel messages.
+        for (_, _, message) in &messages {
+            let (header, _) = channel::MessageHeader::decode(message).expect("a message header");
+            let mut snapshot = c
+                .store()
+                .load_conv(&peer_c)
+                .expect("load")
+                .expect("C's record")
+                .conversation;
+            snapshot.receiving.next_seq = header.seq;
+            assert!(
+                !opens(&mut Conversation::restore(snapshot), message),
+                "a message opened with the third identity's key schedule"
+            );
+        }
+        let mut a_to_b = std::collections::BTreeMap::new();
+        for (key, _, bytes) in &messages {
+            if *key == state.outgoing_lookup_key {
+                let (header, _) = channel::MessageHeader::decode(bytes).expect("a message header");
+                a_to_b.entry(header.seq).or_insert_with(|| bytes.clone());
+            }
+        }
+        let mut b_reader = Conversation::restore(b_after_accept.conversation);
+        let next = b_reader.receiving().next_seq();
+        let mut opened = 0;
+        for bytes in a_to_b.range(next..).map(|(_, bytes)| bytes) {
+            if opens(&mut b_reader, bytes) {
+                opened += 1;
+            }
+        }
+        assert!(
+            opened >= 1,
+            "the control: B's reading half opened none of A's messages"
+        );
+
+        // Drop hellos.
+        for (_, slot, bytes) in &net.drop_log {
+            for pk in [c.pk(), a.pk(), b.pk()] {
+                assert!(
+                    open_against_either(&c.advert_keys, bytes, pk, *slot).is_none(),
+                    "a hello opened with the third identity's advert keys"
+                );
+            }
+        }
+        let b_drop = *drop_plane::derive_owner_seed(b.pk())
+            .expect("B's drop")
+            .as_bytes();
+        assert!(
+            net.drop_log.iter().any(|(owner, slot, bytes)| {
+                let recipient = if *owner == b_drop { &b } else { &a };
+                open_against_either(&recipient.advert_keys, bytes, recipient.pk(), *slot).is_some()
+            }),
+            "the control: no hello opened with its recipient's advert keys"
+        );
+    }
+
+    /// A channel subkey is written only under the owner seed its record was
+    /// opened with, as a substrate's schema refuses a value whose writer is
+    /// not the record's owner. A write to A's channel under B's owner seed is
+    /// refused and changes nothing, and so is a write to a channel no owner
+    /// opened. A's own writes land.
+    #[test]
+    fn a_channel_write_under_another_owner_seed_is_refused() {
+        let (a, b, mut net) = scene();
+        let a_owner = channel::derive_owner_seed(&a.channel_root, b.pk(), FIRST_GENERATION)
+            .expect("A's channel owner");
+        let b_owner = channel::derive_owner_seed(&b.channel_root, a.pk(), FIRST_GENERATION)
+            .expect("B's channel owner");
+        let a_channel = net
+            .open_channel(&a_owner, channel::CHANNEL_SUBKEYS)
+            .expect("A opens its channel");
+        net.open_channel(&b_owner, channel::CHANNEL_SUBKEYS)
+            .expect("B opens its channel");
+
+        assert!(
+            net.write_channel_as(&b_owner, &a_channel, channel::slot_for(0), b"from B")
+                .is_err(),
+            "a write under B's owner seed landed in A's channel"
+        );
+        let unopened = [0x3cu8; HELLO_LOOKUP_KEY_LEN];
+        assert!(
+            net.write_channel(&unopened, channel::slot_for(0), b"from nobody")
+                .is_err(),
+            "a write to a channel no owner opened landed"
+        );
+        assert!(
+            net.channels.is_empty() && net.channel_log.is_empty(),
+            "a refused write changed the network"
+        );
+        assert_eq!(net.writes, Writes::default(), "a refused write was counted");
+
+        // The control: A's own writes land, under its seed and through the
+        // record store.
+        net.write_channel_as(&a_owner, &a_channel, channel::slot_for(0), b"from A")
+            .expect("A writes under its own seed");
+        net.write_channel(&a_channel, channel::slot_for(1), b"from A again")
+            .expect("A writes its own channel");
+        assert_eq!(
+            net.channels
+                .get(&(a_channel, channel::slot_for(0)))
+                .map(Vec::as_slice),
+            Some(&b"from A"[..]),
+            "A's own write did not land"
+        );
+        assert_eq!(
+            net.channel_log.len(),
+            2,
+            "A's two writes were not both recorded"
+        );
+    }
+
     /// Whether `needle` appears anywhere in `haystack`.
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
@@ -2665,7 +3183,12 @@ mod tests {
             |x| entropy.fill(x),
         )
         .expect("encapsulate");
-        let restart_key = [0x9fu8; HELLO_LOOKUP_KEY_LEN];
+        let generation = FIRST_GENERATION + 1;
+        let restart_owner = channel::derive_owner_seed(&a.channel_root, b.pk(), generation)
+            .expect("A's next channel owner");
+        let restart_key = net
+            .open_channel(&restart_owner, channel::CHANNEL_SUBKEYS)
+            .expect("A opens its next channel");
         let opening = ChannelOpening::build(
             &a.signer,
             b.pk(),
@@ -3352,6 +3875,19 @@ mod tests {
         slot
     }
 
+    /// A channel record opened under an owner seed no party here holds, as a
+    /// copier opens the record it writes.
+    fn copier_channel(net: &mut Net, root: u8, recipient: &Party) -> [u8; HELLO_LOOKUP_KEY_LEN] {
+        let owner = channel::derive_owner_seed(
+            &DmChannelRootSecret::from_bytes([root; 32]),
+            recipient.pk(),
+            FIRST_GENERATION,
+        )
+        .expect("the copier's channel owner");
+        net.open_channel(&owner, channel::CHANNEL_SUBKEYS)
+            .expect("the copier opens its channel")
+    }
+
     /// A's genuine opening copied into a channel somebody else writes is
     /// refused, whether the copier's hello is an original or a rewrite
     /// carrying a secret the copier chose: the opening signs the lookup key of
@@ -3377,15 +3913,8 @@ mod tests {
         .expect("decode A's opening");
 
         // An original-shape copy, encapsulated to the key A encapsulated to.
-        let first = plant_copied_opening(
-            &mut net,
-            &b,
-            &opening,
-            [0x7eu8; HELLO_LOOKUP_KEY_LEN],
-            None,
-            NOW,
-            7_171,
-        );
+        let first_channel = copier_channel(&mut net, 0x7e, &b);
+        let first = plant_copied_opening(&mut net, &b, &opening, first_channel, None, NOW, 7_171);
         assert_ne!(first, genuine_slot, "the copy would overwrite A's hello");
         assert_eq!(
             only_request(b_collects(&b, &mut net)).lookup_key,
@@ -3398,11 +3927,12 @@ mod tests {
         let at = NOW + advert::ROTATION_PERIOD_SECS;
         rotate(&mut b, &mut net, at, 2_020);
         let chosen = AdvertSharedSecret::from_bytes(&[0x5cu8; ml_kem::SHARED_SECRET_LEN]);
+        let second_channel = copier_channel(&mut net, 0x7d, &b);
         let second = plant_copied_opening(
             &mut net,
             &b,
             &opening,
-            [0x7du8; HELLO_LOOKUP_KEY_LEN],
+            second_channel,
             Some(&chosen),
             at,
             7_272,
