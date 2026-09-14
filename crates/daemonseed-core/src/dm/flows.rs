@@ -344,21 +344,8 @@ pub fn first_contact<R: Records>(
     now: u64,
 ) -> Result<FirstContact, FlowError> {
     if let Some(peer) = correspondence_for(store, peer_identity_pk)? {
-        let state = load(store, &peer)?;
-        if !state.awaiting_acceptance {
-            return Err(FlowError::AlreadyEstablished);
-        }
-        if state.outstanding_hello.is_some() {
-            let slot = match resume_first_contact(store, records, &peer)? {
-                Resumed::Rewrote(slot) => slot,
-                Resumed::Nothing => return Err(FlowError::NotOutstanding),
-            };
-            return Ok(FirstContact::Rewrote {
-                peer,
-                hello_slot: slot,
-            });
-        }
-        return finish_first_contact(store, records, peer, state, body, &mut fill);
+        // The record already holds sequence 0, so `body` is not sealed again.
+        return continue_first_contact(store, records, &peer, fill);
     }
 
     // 1. The advert, verified under the identity the caller named.
@@ -390,6 +377,18 @@ pub fn first_contact<R: Records>(
         .map(Box::new)
         .expect("an opening encodes to OPENING_LEN bytes");
     let peer = CorrespondenceLabel::mint().map_err(|e| FlowError::Store(StoreError::Store(e)))?;
+
+    // 3, committed ahead of the record. Sequence 0 is sealed and its outbox
+    // entry persisted before the record exists, so every record holds it and a
+    // relaunch never needs the body. An outbox with no record is not loaded.
+    let mut conversation = opened.conversation;
+    let mut ring = Ring::new();
+    let seq = ring.reserve()?;
+    let (header, sealed) = conversation.seal(body, channel::DEVICE_ID_SINGLE_DEVICE, &mut fill)?;
+    let mut slot_bytes = header.encode();
+    slot_bytes.extend_from_slice(&sealed);
+    store.persist_outbox(&peer, seq, &slot_bytes)?;
+
     store.create_conv(
         &peer,
         &ConvState {
@@ -397,12 +396,13 @@ pub fn first_contact<R: Records>(
             outgoing_lookup_key,
             incoming_lookup_key: [0u8; HELLO_LOOKUP_KEY_LEN],
             generation: FIRST_GENERATION,
-            conversation: opened.conversation.snapshot(),
-            send_seq: 0,
+            conversation: conversation.snapshot(),
+            send_seq: ring.send_seq(),
             peer_collected: 0,
             my_collected: 0,
             cursor_published: 0,
             awaiting_acceptance: true,
+            acceptance_pending: false,
             outstanding_hello: None,
             own_control_key: Some(channel::control_key(&encapsulation.shared_secret)?),
             own_hello_secret: Some(encapsulation.shared_secret),
@@ -414,18 +414,52 @@ pub fn first_contact<R: Records>(
     )?;
 
     let state = load(store, &peer)?;
-    finish_first_contact(store, records, peer, state, body, &mut fill)
+    finish_first_contact(store, records, peer, state, &mut fill)
 }
 
-/// Steps 3 to 5 over a conversation record that already exists: seal and
-/// commit message 0 where it is not committed yet, write the opening and the
-/// slot, then place the hello.
+/// Carry on a first contact from its conversation record alone — § Flows,
+/// *Restart at any point*.
+///
+/// For a relaunch that holds nothing of the first contact in memory. From the
+/// moment the record exists it holds sequence 0's ciphertext, the
+/// encapsulation, the signed opening and the channel's lookup key, so this
+/// redoes only writes. Where no hello is persisted yet it writes the opening,
+/// sequence 0's slot and the hello. Where one is, the opening and the slot
+/// were written before it was persisted, and it writes that hello's persisted
+/// bytes as [`resume_first_contact`] does. Nothing is minted or re-sealed.
+///
+/// [`FlowError::AlreadyEstablished`] where the first contact is no longer
+/// awaiting acceptance.
+pub fn continue_first_contact<R: Records>(
+    store: &Store,
+    records: &mut R,
+    peer: &CorrespondenceLabel,
+    mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+) -> Result<FirstContact, FlowError> {
+    let state = load(store, peer)?;
+    if !state.awaiting_acceptance {
+        return Err(FlowError::AlreadyEstablished);
+    }
+    if state.outstanding_hello.is_some() {
+        let slot = match resume_first_contact(store, records, peer)? {
+            Resumed::Rewrote(slot) => slot,
+            Resumed::Nothing => return Err(FlowError::NotOutstanding),
+        };
+        return Ok(FirstContact::Rewrote {
+            peer: *peer,
+            hello_slot: slot,
+        });
+    }
+    finish_first_contact(store, records, *peer, state, &mut fill)
+}
+
+/// Steps 3 to 5 over a conversation record that already exists: write the
+/// opening and the committed bytes of sequence 0, then place the hello.
 fn finish_first_contact<R: Records>(
     store: &Store,
     records: &mut R,
     peer: CorrespondenceLabel,
     state: ConvState,
-    body: &[u8],
     fill: &mut impl FnMut(&mut [u8]) -> Result<(), ()>,
 ) -> Result<FirstContact, FlowError> {
     let outgoing_lookup_key = state.outgoing_lookup_key;
@@ -445,28 +479,9 @@ fn finish_first_contact<R: Records>(
     let opening = ChannelOpening::decode(opening_bytes.as_slice())?;
     let advert_serial = opening.advert_serial;
 
-    // 3. The first message. A run that died before its conversation record
-    //    committed left no sequence 0 to rewrite, so it is sealed here from the
-    //    persisted key schedule; one that got past it rewrites the bytes on
-    //    disk.
-    let slot_bytes = match outstanding_zero(store, &peer)? {
-        Some(bytes) => bytes,
-        None => {
-            let mut conversation = Conversation::restore(state.conversation);
-            let mut ring = Ring::new();
-            let seq = ring.reserve()?;
-            let (header, sealed) =
-                conversation.seal(body, channel::DEVICE_ID_SINGLE_DEVICE, &mut *fill)?;
-            let mut bytes = header.encode();
-            bytes.extend_from_slice(&sealed);
-            store.persist_outbox(&peer, seq, &bytes)?;
-            store.update_conv(&peer, |state| {
-                state.conversation = conversation.snapshot();
-                state.send_seq = ring.send_seq();
-            })?;
-            bytes
-        }
-    };
+    // 3. The first message, committed before the record was created.
+    let slot_bytes = outstanding_zero(store, &peer)?
+        .ok_or(FlowError::Incomplete("outbox entry for sequence 0"))?;
     let own_control_key = state
         .own_control_key
         .as_ref()
@@ -1073,18 +1088,26 @@ pub struct Accepted {
 
 /// Accept a contact request — § Flows, *Collection*, steps 3 to 5.
 ///
-/// The conversation record is created before the ring is read, the hello slot
-/// is erased once it has been, and the acceptance is a hello back naming this
-/// side's channel, encapsulated to the correspondent's advert key. `reply` is
-/// turn 0 of this side's direction, and its ratchet public key is the one the
-/// opening publishes: the acceptor's first ratchet key comes into existence
-/// when its first message is sealed, so an opening written without one would
-/// name a key no message is encapsulated to.
+/// The channel this side writes is named to the transport, and the reply is
+/// sealed and its outbox entry persisted, before the conversation record is
+/// created. Every record therefore holds what a relaunch needs to finish the
+/// acceptance with neither the request nor the reply in memory
+/// ([`continue_acceptance`]). `reply` is turn 0 of this side's direction, and
+/// its ratchet public key is the one the opening publishes: the acceptor's
+/// first ratchet key comes into existence when its first message is sealed.
+///
+/// The acceptance is this side's opening and cursor, the reply's slot and a
+/// hello back naming this side's channel, encapsulated to the correspondent's
+/// advert key. The correspondent's ring is read before those writes, but the
+/// bodies and the collection cursor are recorded only by the step that
+/// finishes the acceptance, after the hello back is written. A run stopped
+/// before then records nothing it read, and the call that finishes the
+/// acceptance returns the bodies.
 ///
 /// One conversation per correspondent identity, as first contact holds: a
-/// correspondent whose record exists resumes from it — an acceptance the
-/// previous run left half-done is carried to completion, one whose hello back
-/// is already placed is [`FlowError::AlreadyEstablished`].
+/// correspondent whose record holds an unfinished acceptance is carried on
+/// from it, and one with any other record is
+/// [`FlowError::AlreadyEstablished`].
 ///
 /// One channel opening and one hello back, the hello read back once and
 /// re-picked at most [`MAX_REPICKS`] times, plus the reply's own slot and the
@@ -1101,13 +1124,8 @@ pub fn accept<R: Records>(
 ) -> Result<Accepted, FlowError> {
     if let Some(peer) = correspondence_for(store, &request.identity)? {
         let state = load(store, &peer)?;
-        if state.outstanding_hello.is_some() {
-            // A record that holds its hello back and still holds the secret
-            // that hello was sealed from has the secret deleted here.
-            if state.own_hello_secret.is_some() {
-                store.update_conv(&peer, |state| state.own_hello_secret = None)?;
-            }
-            return Err(FlowError::AlreadyEstablished);
+        if !state.acceptance_pending {
+            return already_established(store, &peer, &state);
         }
         return finish_accept(
             store,
@@ -1116,27 +1134,40 @@ pub fn accept<R: Records>(
             peer,
             state,
             Some(request.slot),
-            reply,
             &mut fill,
             now,
         );
     }
 
-    let conversation = chain::accept(&request.shared_secret, &request.first_ratchet_pk)?;
+    let channel_owner =
+        channel::derive_owner_seed(me.channel_root, &request.identity, FIRST_GENERATION)?;
+    let outgoing_lookup_key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
     let peer = CorrespondenceLabel::mint().map_err(|e| FlowError::Store(StoreError::Store(e)))?;
+
+    // The reply, committed ahead of the record so that a relaunch never needs
+    // it again. An outbox with no record is not loaded.
+    let mut conversation = chain::accept(&request.shared_secret, &request.first_ratchet_pk)?;
+    let mut ring = Ring::new();
+    let seq = ring.reserve()?;
+    let (header, sealed) = conversation.seal(reply, channel::DEVICE_ID_SINGLE_DEVICE, &mut fill)?;
+    let mut slot_bytes = header.encode();
+    slot_bytes.extend_from_slice(&sealed);
+    store.persist_outbox(&peer, seq, &slot_bytes)?;
+
     store.create_conv(
         &peer,
         &ConvState {
             peer_identity_pk: request.identity.clone(),
-            outgoing_lookup_key: [0u8; HELLO_LOOKUP_KEY_LEN],
+            outgoing_lookup_key,
             incoming_lookup_key: request.lookup_key,
             generation: FIRST_GENERATION,
             conversation: conversation.snapshot(),
-            send_seq: 0,
+            send_seq: ring.send_seq(),
             peer_collected: 0,
             my_collected: 0,
             cursor_published: 0,
             awaiting_acceptance: false,
+            acceptance_pending: true,
             outstanding_hello: None,
             own_hello_secret: None,
             own_hello_kem_ct: None,
@@ -1155,21 +1186,72 @@ pub fn accept<R: Records>(
         peer,
         state,
         Some(request.slot),
-        reply,
         &mut fill,
         now,
     )
+}
+
+/// Carry on an acceptance from its conversation record alone — § Flows,
+/// *Restart at any point*.
+///
+/// For a relaunch that holds neither the request nor the reply. The record
+/// holds the reply's ciphertext, both channels' lookup keys, the key the
+/// correspondent's control subkey opens under and the advert serial its
+/// opening binds. This redoes only what the record shows undone. It mints the
+/// encapsulation and the opening where the record holds none, and otherwise
+/// writes the persisted ones. The correspondent's collected hello slot is not
+/// erased here: the correspondent rewrites that hello until it sees the
+/// acceptance, and the next scan erases it as already collected.
+///
+/// The bodies of the correspondent's ring are returned, and recorded by the
+/// same step that finishes the acceptance. [`FlowError::AlreadyEstablished`]
+/// where the record holds no unfinished acceptance.
+pub fn continue_acceptance<R: Records>(
+    store: &Store,
+    records: &mut R,
+    me: &Me<'_>,
+    peer: &CorrespondenceLabel,
+    mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+    now: u64,
+) -> Result<Accepted, FlowError> {
+    let state = load(store, peer)?;
+    if !state.acceptance_pending {
+        return already_established(store, peer, &state);
+    }
+    finish_accept(store, records, me, *peer, state, None, &mut fill, now)
+}
+
+/// [`FlowError::AlreadyEstablished`] for a correspondence with no unfinished
+/// acceptance.
+///
+/// An accepting side's record that holds its hello back and still holds the
+/// secret that hello was sealed from has the secret deleted here. The
+/// initiator's hello secret is left alone while it awaits acceptance, because
+/// a rewrite still carries it.
+fn already_established(
+    store: &Store,
+    peer: &CorrespondenceLabel,
+    state: &ConvState,
+) -> Result<Accepted, FlowError> {
+    if !state.awaiting_acceptance
+        && state.outstanding_hello.is_some()
+        && state.own_hello_secret.is_some()
+    {
+        store.update_conv(peer, |state| state.own_hello_secret = None)?;
+    }
+    Err(FlowError::AlreadyEstablished)
 }
 
 /// Steps 3 to 5 over an acceptance's conversation record, performing only what
 /// the record shows is not done yet — the acceptor's counterpart of
 /// [`finish_first_contact`].
 ///
-/// Everything it needs is in the record: the correspondent's channel, the
-/// secret its hello established, and the serial its opening binds. That
-/// opening is re-read and re-verified here rather than taken on trust, so a
-/// resumed acceptance is bound to the same advert serial the first run
-/// verified.
+/// Everything it needs is in the record: the correspondent's channel, the key
+/// and serial its opening is verified under, and the committed reply. That
+/// opening is re-read and re-verified here rather than taken on trust. The
+/// ring is read on a copy of the key schedule, and the copy, the collection
+/// cursor and the end of the acceptance are persisted together, after the
+/// hello back is written.
 #[allow(clippy::too_many_arguments)]
 fn finish_accept<R: Records>(
     store: &Store,
@@ -1178,7 +1260,6 @@ fn finish_accept<R: Records>(
     peer: CorrespondenceLabel,
     state: ConvState,
     slot: Option<u16>,
-    reply: &[u8],
     fill: &mut impl FnMut(&mut [u8]) -> Result<(), ()>,
     now: u64,
 ) -> Result<Accepted, FlowError> {
@@ -1209,9 +1290,6 @@ fn finish_accept<R: Records>(
         return Err(FlowError::OpeningRatchetKey);
     }
 
-    let mut conversation = Conversation::restore(state.conversation);
-    let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
-
     let outgoing_lookup_key = if state.outgoing_lookup_key == [0u8; HELLO_LOOKUP_KEY_LEN] {
         let channel_owner =
             channel::derive_owner_seed(me.channel_root, &identity, FIRST_GENERATION)?;
@@ -1222,42 +1300,9 @@ fn finish_accept<R: Records>(
         state.outgoing_lookup_key
     };
 
-    // The correspondent's ring from where this side left off.
-    let read = read_ring(
-        records,
-        &mut conversation,
-        &mut ring,
-        &incoming,
-        state.my_collected,
-    )?;
-    store.update_conv(&peer, |state| {
-        state.conversation = conversation.snapshot();
-        state.my_collected = read.collected;
-        state.peer_collected = ring.peer_collected();
-    })?;
-    if let Some(slot) = slot {
-        let my_drop = drop_plane::derive_owner_seed(me.signer.public_key())?;
-        records.erase_drop_slot(&my_drop, drop_plane::DROP_SUBKEYS, slot)?;
-    }
-
-    // The reply, turn 0 of this side's direction, carrying the ratchet key the
-    // opening publishes. A run that committed it already rewrites those bytes.
-    let slot_bytes = match outstanding_zero(store, &peer)? {
-        Some(bytes) => bytes,
-        None => {
-            let seq = ring.reserve()?;
-            let (header, sealed) =
-                conversation.seal(reply, channel::DEVICE_ID_SINGLE_DEVICE, &mut *fill)?;
-            let mut bytes = header.encode();
-            bytes.extend_from_slice(&sealed);
-            store.persist_outbox(&peer, seq, &bytes)?;
-            store.update_conv(&peer, |state| {
-                state.conversation = conversation.snapshot();
-                state.send_seq = ring.send_seq();
-            })?;
-            bytes
-        }
-    };
+    // The reply, turn 0 of this side's direction, committed with the record.
+    let slot_bytes = outstanding_zero(store, &peer)?
+        .ok_or(FlowError::Incomplete("outbox entry for the reply"))?;
     let (reply_header, _) = channel::MessageHeader::decode(&slot_bytes)?;
     let first_ratchet_pk = reply_header
         .kem_pk
@@ -1265,63 +1310,81 @@ fn finish_accept<R: Records>(
         .ok_or(FlowError::Chain(ChainError::NoTurn))?;
     let reply_seq = reply_header.seq;
 
-    // The acceptance: this side's opening and cursor, then the hello back. The
-    // encapsulation is minted once and persisted, so a resumed run publishes
-    // the opening the correspondent has already been told to expect.
-    let state = load(store, &peer)?;
-    let (own_secret, own_kem_ct, opening_bytes) = match (
-        state.own_hello_secret,
-        state.own_hello_kem_ct,
-        state.own_opening,
-    ) {
-        (Some(secret), Some(kem_ct), Some(opening)) => (secret, kem_ct, opening),
-        _ => {
-            let advert_owner = advert::derive_owner_seed(&identity)?;
-            let bytes = records
-                .read_advert(&advert_owner, advert::ADVERT_SUBKEYS)?
-                .ok_or(FlowError::NoAdvert)?;
-            let advert = advert::verify(&identity, &bytes)?;
-            let encapsulation = advert::encapsulate_to(&advert, now, &mut *fill)?;
-            let opening = ChannelOpening::build(
-                me.signer,
-                &identity,
-                &outgoing_lookup_key,
-                &first_ratchet_pk,
-                encapsulation.serial,
-            )?;
-            let opening_bytes: Box<[u8; OPENING_LEN]> = opening
-                .encode()
-                .as_slice()
-                .try_into()
-                .map(Box::new)
-                .expect("an opening encodes to OPENING_LEN bytes");
-            let secret_bytes = Zeroizing::new(*encapsulation.shared_secret.as_bytes());
-            let control_bytes =
-                Zeroizing::new(*channel::control_key(&encapsulation.shared_secret)?.as_bytes());
-            let kem_ct = encapsulation.ciphertext.clone();
-            let carried = opening_bytes.clone();
-            store.update_conv(&peer, |state| {
-                state.cursor_published = read.collected;
-                state.own_control_key = Some(ControlKey::from_bytes(&control_bytes));
-                state.own_hello_secret = Some(AdvertSharedSecret::from_bytes(&secret_bytes));
-                state.own_hello_kem_ct = Some(kem_ct.clone());
-                state.own_opening = Some(carried.clone());
-            })?;
-            (encapsulation.shared_secret, kem_ct, opening_bytes)
-        }
-    };
+    // The acceptance's encapsulation and opening, minted once and persisted
+    // before anything they enable is written, so a resumed run publishes the
+    // opening the correspondent has already been told to expect.
+    if state.own_opening.is_none() {
+        let advert_owner = advert::derive_owner_seed(&identity)?;
+        let bytes = records
+            .read_advert(&advert_owner, advert::ADVERT_SUBKEYS)?
+            .ok_or(FlowError::NoAdvert)?;
+        let advert = advert::verify(&identity, &bytes)?;
+        let encapsulation = advert::encapsulate_to(&advert, now, &mut *fill)?;
+        let opening = ChannelOpening::build(
+            me.signer,
+            &identity,
+            &outgoing_lookup_key,
+            &first_ratchet_pk,
+            encapsulation.serial,
+        )?;
+        let opening_bytes: Box<[u8; OPENING_LEN]> = opening
+            .encode()
+            .as_slice()
+            .try_into()
+            .map(Box::new)
+            .expect("an opening encodes to OPENING_LEN bytes");
+        let secret_bytes = Zeroizing::new(*encapsulation.shared_secret.as_bytes());
+        let control_bytes =
+            Zeroizing::new(*channel::control_key(&encapsulation.shared_secret)?.as_bytes());
+        let kem_ct = encapsulation.ciphertext.clone();
+        store.update_conv(&peer, |state| {
+            state.own_control_key = Some(ControlKey::from_bytes(&control_bytes));
+            state.own_hello_secret = Some(AdvertSharedSecret::from_bytes(&secret_bytes));
+            state.own_hello_kem_ct = Some(kem_ct.clone());
+            state.own_opening = Some(opening_bytes.clone());
+        })?;
+    }
 
-    // Sealed under the secret *this* side's hello established, which is the
-    // one the correspondent recovers by decapsulating that hello. The
-    // correspondent's own secret belongs to its channel and opens nothing
-    // here.
+    // The correspondent's ring from where this side left off, read on a copy
+    // of the key schedule. Nothing of the read is persisted until the
+    // acceptance is finished.
+    let mut reader = Conversation::restore(state.conversation);
+    let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
+    let read = read_ring(
+        records,
+        &mut reader,
+        &mut ring,
+        &incoming,
+        state.my_collected,
+    )?;
+    if let Some(slot) = slot {
+        let my_drop = drop_plane::derive_owner_seed(me.signer.public_key())?;
+        records.erase_drop_slot(&my_drop, drop_plane::DROP_SUBKEYS, slot)?;
+    }
+
+    // This side's opening and cursor, sealed under the key derived from the
+    // secret this side's hello establishes, then the reply's slot.
+    let state = load(store, &peer)?;
+    let own_control_key = state
+        .own_control_key
+        .as_ref()
+        .ok_or(FlowError::Incomplete("control key of its own"))?;
+    let opening_bytes = state
+        .own_opening
+        .as_ref()
+        .ok_or(FlowError::Incomplete("channel opening of its own"))?;
     let opening = ChannelOpening::decode(opening_bytes.as_slice())?;
     let advert_serial = opening.advert_serial;
-    let control = channel::seal_control(
-        &own_secret,
+    let control = channel::seal_control_with_key(
+        own_control_key,
         &Control {
             opening: Some(opening),
-            collected_cursor: read.collected,
+            // The cursor already on disk, never the read above. That read is
+            // recorded only when the acceptance finishes, and a cursor published
+            // ahead of it would let the correspondent drop a message this side
+            // has not recorded. The next collection batch publishes the cursor
+            // the read reached.
+            collected_cursor: state.my_collected,
             closed: false,
         },
     )?;
@@ -1332,28 +1395,62 @@ fn finish_accept<R: Records>(
         &slot_bytes,
     )?;
 
-    let attempt = place_hello(
-        store,
-        records,
-        &peer,
-        &identity,
-        &outgoing_lookup_key,
-        &HelloSeal {
-            shared_secret: &own_secret,
-            kem_ct: &own_kem_ct,
-            advert_serial,
-            original: None,
-        },
-        HelloAttempt::new(drop_plane::repick(&mut *fill)?)?,
-        fill,
-    )?;
+    // The hello back: the persisted bytes where a previous run placed it, and
+    // a fresh placement otherwise.
+    let (hello_slot, repicks) = match &state.outstanding_hello {
+        Some(hello) => {
+            let drop_owner = drop_plane::derive_owner_seed(&identity)?;
+            records.write_drop_slot(
+                &drop_owner,
+                drop_plane::DROP_SUBKEYS,
+                hello.slot,
+                hello.sealed.as_slice(),
+            )?;
+            (hello.slot, 0)
+        }
+        None => {
+            let own_secret = state
+                .own_hello_secret
+                .as_ref()
+                .ok_or(FlowError::Incomplete("hello secret of its own"))?;
+            let own_kem_ct = state
+                .own_hello_kem_ct
+                .as_ref()
+                .ok_or(FlowError::Incomplete("hello encapsulation of its own"))?;
+            let attempt = place_hello(
+                store,
+                records,
+                &peer,
+                &identity,
+                &outgoing_lookup_key,
+                &HelloSeal {
+                    shared_secret: own_secret,
+                    kem_ct: own_kem_ct,
+                    advert_serial,
+                    original: None,
+                },
+                HelloAttempt::new(drop_plane::repick(&mut *fill)?)?,
+                fill,
+            )?;
+            (attempt.slot(), attempt.repicks())
+        }
+    };
+
+    // The end of the acceptance, recorded together with the collection it read.
+    let peer_collected = ring.peer_collected();
+    store.update_conv(&peer, |state| {
+        state.conversation = reader.snapshot();
+        state.my_collected = read.collected;
+        state.peer_collected = state.peer_collected.max(peer_collected);
+        state.acceptance_pending = false;
+    })?;
 
     Ok(Accepted {
         peer,
         outgoing_lookup_key,
         bodies: read.bodies,
-        hello_slot: attempt.slot(),
-        repicks: attempt.repicks(),
+        hello_slot,
+        repicks,
     })
 }
 
@@ -1471,7 +1568,9 @@ fn read_ring<R: Records>(
 /// Exactly one write.
 ///
 /// Refused with [`FlowError::AwaitingAcceptance`] while this side's own first
-/// contact is unaccepted: first contact carries sequence 0 and nothing else.
+/// contact is unaccepted, because first contact carries sequence 0 and nothing
+/// else, and while this side's acceptance of the correspondent's is not
+/// finished, because the step that finishes it records the key schedule.
 pub fn send_message<R: Records>(
     store: &Store,
     records: &mut R,
@@ -1480,7 +1579,7 @@ pub fn send_message<R: Records>(
     fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
 ) -> Result<u64, FlowError> {
     let state = load(store, peer)?;
-    if state.awaiting_acceptance {
+    if state.awaiting_acceptance || state.acceptance_pending {
         return Err(FlowError::AwaitingAcceptance);
     }
     let lookup_key = state.outgoing_lookup_key;
@@ -1523,12 +1622,21 @@ pub struct Batch {
 /// carries this side's own opening, both read from the conversation record: a
 /// control write without the opening erases it from the channel, and the
 /// signature is randomized, so it cannot be rebuilt to the same bytes.
+///
+/// Refused with [`FlowError::AwaitingAcceptance`] while this side's acceptance
+/// of the correspondent's first contact is not finished. The step that finishes
+/// it records the collection and the key schedule, so a batch run before it
+/// would record a read that step then overwrites, or record one it cannot
+/// publish.
 pub fn collect_batch<R: Records>(
     store: &Store,
     records: &mut R,
     peer: &CorrespondenceLabel,
 ) -> Result<Batch, FlowError> {
     let state = load(store, peer)?;
+    if state.acceptance_pending {
+        return Err(FlowError::AwaitingAcceptance);
+    }
     let incoming = state.incoming_lookup_key;
     let outgoing = state.outgoing_lookup_key;
     let mut conversation = Conversation::restore(state.conversation);
@@ -1678,6 +1786,12 @@ mod tests {
         fail_after: Option<usize>,
         /// Refuse to read this drop slot.
         unreadable_slot: Option<u16>,
+        /// Refuse every drop and channel read once this many writes have been
+        /// performed, so a run stops after a write that landed and before
+        /// whatever the flow persists next.
+        refuse_reads_after: Option<usize>,
+        /// Refuse to read any advert.
+        refuse_adverts: bool,
     }
 
     impl Net {
@@ -1715,6 +1829,9 @@ mod tests {
             subkeys: u16,
         ) -> Result<Option<Vec<u8>>, RecordError> {
             self.shapes.push(("advert", subkeys));
+            if self.refuse_adverts {
+                return Err(RecordError::new(Refused));
+            }
             Ok(self.adverts.get(owner.as_bytes()).cloned())
         }
 
@@ -1725,7 +1842,11 @@ mod tests {
             slot: u16,
         ) -> Result<Option<Vec<u8>>, RecordError> {
             self.shapes.push(("drop", subkeys));
-            if self.unreadable_slot == Some(slot) {
+            if self.unreadable_slot == Some(slot)
+                || self
+                    .refuse_reads_after
+                    .is_some_and(|n| self.writes.total() >= n)
+            {
                 return Err(RecordError::new(Refused));
             }
             Ok(self.drops.get(&(*owner.as_bytes(), slot)).cloned())
@@ -1782,6 +1903,12 @@ mod tests {
             lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
             subkey: u16,
         ) -> Result<Option<Vec<u8>>, RecordError> {
+            if self
+                .refuse_reads_after
+                .is_some_and(|n| self.writes.total() >= n)
+            {
+                return Err(RecordError::new(Refused));
+            }
             Ok(self.channels.get(&(*lookup_key, subkey)).cloned())
         }
 
@@ -2327,10 +2454,12 @@ mod tests {
             peer_cursor(&b.store(), &mut net, &accepted.peer).expect("B reads A's cursor"),
             Some(batch.my_collected)
         );
+        // B's first batch publishes the collection its acceptance recorded.
+        collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects a batch");
         assert_eq!(
             peer_cursor(&a.store(), &mut net, &peer_a).expect("A reads B's cursor"),
             Some(1),
-            "B's acceptance published its cursor over A's first message"
+            "B's first batch published its cursor over A's first message"
         );
     }
 
@@ -2684,7 +2813,11 @@ mod tests {
         assert_eq!(acceptance.peer, peer_a);
         assert_eq!(acceptance.lookup_key, accepted.outgoing_lookup_key);
         assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
-        assert_eq!(acceptance.peer_cursor, Some(1), "B collected A's message");
+        assert_eq!(
+            acceptance.peer_cursor,
+            Some(0),
+            "the acceptance publishes B's persisted cursor; its next batch publishes the collection"
+        );
         assert_eq!(net.writes.erase, 1, "the collected hello slot is erased");
 
         let state = store_a
@@ -3678,10 +3811,9 @@ mod tests {
         )
         .expect("the relaunch finishes the acceptance");
 
-        // The stopped run had already read the ring and recorded the
-        // collection, so the finish reports no new bodies and the message is
-        // collected exactly once.
-        assert!(accepted.bodies.is_empty());
+        // The stopped run recorded nothing it read, so the finish returns the
+        // correspondent's first message, and it is collected exactly once.
+        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
         assert_eq!(
             store
                 .load_conv(&accepted.peer)
@@ -3714,6 +3846,506 @@ mod tests {
             NOW,
         );
         assert!(matches!(again, Err(FlowError::AlreadyEstablished)));
+    }
+
+    /// An acceptance stopped after its hello back lands and before it records
+    /// what it read has published only the cursor already persisted. The
+    /// correspondent still owes sequence 0 until this side records the read and
+    /// publishes it, and sequence 0 surfaces once.
+    #[test]
+    fn an_acceptance_stopped_after_its_hello_back_lands_leaves_the_first_message_owed() {
+        let (a, b, mut net) = scene();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let request = only_request(b_collects(&b, &mut net));
+        let store_b = b.store();
+
+        // The erase, the opening, the reply and the hello back land. The
+        // read-back after the hello back is refused, so the run stops before
+        // the acceptance records what it read.
+        net.reset_writes();
+        net.refuse_reads_after = Some(4);
+        let mut entropy = Seeded::at(909);
+        let stopped = accept(
+            &store_b,
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(stopped.is_err(), "the run must stop after the hello back");
+        assert_eq!(net.writes.hello, 1, "the hello back landed");
+        net.refuse_reads_after = None;
+        let b_peer = store_b.load().expect("load").convs[0].peer;
+        assert!(
+            store_b
+                .load_conv(&b_peer)
+                .expect("load")
+                .expect("B's record")
+                .acceptance_pending,
+            "the stop landed after the acceptance finished"
+        );
+
+        // A recognises the acceptance and still owes sequence 0.
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        match surfaced.as_slice() {
+            [Surfaced::Accepted(acceptance)] => assert_eq!(
+                acceptance.peer_cursor,
+                Some(0),
+                "B published a collection it had not recorded"
+            ),
+            other => panic!("expected one acceptance, got {other:?}"),
+        }
+        collect_batch(&a.store(), &mut net, &peer_a).expect("A collects a batch");
+        let a_owes_zero = a
+            .store()
+            .load()
+            .expect("load")
+            .convs
+            .into_iter()
+            .find(|c| c.peer == peer_a)
+            .expect("A's record")
+            .outstanding_outbox
+            .iter()
+            .any(|e| e.seq == 0);
+        assert!(a_owes_zero, "A dropped sequence 0 before B recorded it");
+
+        // B finishes from the record and returns sequence 0 once, and its next
+        // batch publishes the collection.
+        let mut entropy = Seeded::at(5_353);
+        let finished = continue_acceptance(
+            &store_b,
+            &mut net,
+            &b.me(),
+            &b_peer,
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B finishes the acceptance");
+        assert_eq!(finished.bodies, vec![b"the first message".to_vec()]);
+        let batch = collect_batch(&store_b, &mut net, &b_peer).expect("B collects a batch");
+        assert!(batch.bodies.is_empty(), "sequence 0 surfaced twice");
+        assert!(batch.cursor_published, "B's batch published the collection");
+        assert_eq!(
+            peer_cursor(&a.store(), &mut net, &peer_a).expect("A reads B's cursor"),
+            Some(1)
+        );
+    }
+
+    /// A collection batch is refused while this side's acceptance is not
+    /// finished, whether the run stopped before or after minting the
+    /// acceptance's opening, and the acceptance that finishes returns
+    /// sequence 0 once.
+    #[test]
+    fn a_collection_batch_is_refused_while_an_acceptance_is_pending() {
+        for before_mint in [true, false] {
+            let (a, b, mut net) = scene();
+            a_opens(&a, &b, &mut net, b"the first message");
+            let request = only_request(b_collects(&b, &mut net));
+            let store = b.store();
+            net.reset_writes();
+            if before_mint {
+                net.refuse_adverts = true;
+            } else {
+                // The erase lands and the opening write is refused.
+                net.fail_after = Some(1);
+            }
+            let mut entropy = Seeded::at(909);
+            assert!(
+                accept(
+                    &store,
+                    &mut net,
+                    &b.me(),
+                    &request,
+                    b"the reply",
+                    |x| entropy.fill(x),
+                    NOW,
+                )
+                .is_err(),
+                "before_mint={before_mint}: the acceptance must stop short"
+            );
+            net.refuse_adverts = false;
+            net.fail_after = None;
+            let peer = store.load().expect("load").convs[0].peer;
+            let pending = store.load_conv(&peer).expect("load").expect("B's record");
+            assert!(pending.acceptance_pending, "before_mint={before_mint}");
+            assert_eq!(
+                pending.own_opening.is_none(),
+                before_mint,
+                "the stop landed on the wrong side of the mint"
+            );
+
+            let refused = collect_batch(&store, &mut net, &peer);
+            assert!(
+                matches!(refused, Err(FlowError::AwaitingAcceptance)),
+                "before_mint={before_mint}: a batch ran over a pending acceptance: {refused:?}"
+            );
+            assert_eq!(
+                store
+                    .load_conv(&peer)
+                    .expect("load")
+                    .expect("B's record")
+                    .my_collected,
+                0,
+                "before_mint={before_mint}: the refused batch recorded a read"
+            );
+
+            let mut entropy = Seeded::at(5_353);
+            let finished =
+                continue_acceptance(&store, &mut net, &b.me(), &peer, |x| entropy.fill(x), NOW)
+                    .expect("the acceptance finishes");
+            assert_eq!(
+                finished.bodies,
+                vec![b"the first message".to_vec()],
+                "before_mint={before_mint}"
+            );
+            let batch = collect_batch(&store, &mut net, &peer).expect("B collects a batch");
+            assert!(
+                batch.bodies.is_empty(),
+                "before_mint={before_mint}: sequence 0 surfaced twice"
+            );
+        }
+    }
+
+    /// An acceptance stopped before it mints its encapsulation and opening is
+    /// finished by [`continue_acceptance`], which mints them once.
+    #[test]
+    fn an_acceptance_stopped_before_its_mint_mints_once_when_continued() {
+        let (a, b, mut net) = scene();
+        a_opens(&a, &b, &mut net, b"the first message");
+        let request = only_request(b_collects(&b, &mut net));
+        let store = b.store();
+        net.refuse_adverts = true;
+        net.reset_writes();
+        let mut entropy = Seeded::at(909);
+        assert!(
+            accept(
+                &store,
+                &mut net,
+                &b.me(),
+                &request,
+                b"the reply",
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .is_err(),
+            "the acceptance must stop at the advert read"
+        );
+        assert_eq!(net.writes.total(), 0, "nothing is written before the mint");
+        net.refuse_adverts = false;
+        let peer = store.load().expect("load").convs[0].peer;
+        assert!(
+            store
+                .load_conv(&peer)
+                .expect("load")
+                .expect("B's record")
+                .own_opening
+                .is_none(),
+            "the stop landed after the mint"
+        );
+
+        let mut entropy = Seeded::at(5_353);
+        let finished =
+            continue_acceptance(&store, &mut net, &b.me(), &peer, |x| entropy.fill(x), NOW)
+                .expect("the acceptance finishes");
+        assert_eq!(finished.bodies, vec![b"the first message".to_vec()]);
+        let after = store.load_conv(&peer).expect("load").expect("B's record");
+        assert!(after.own_opening.is_some(), "no opening was minted");
+        let hello = after
+            .outstanding_hello
+            .as_ref()
+            .expect("the hello back is persisted");
+        assert_eq!(
+            after.own_hello_kem_ct.as_ref(),
+            Some(&hello.kem_ct),
+            "the hello back carries an encapsulation other than the one minted"
+        );
+        assert_eq!(net.writes.hello, 1, "one hello back");
+
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        match surfaced.as_slice() {
+            [Surfaced::Accepted(acceptance)] => {
+                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+            }
+            other => panic!("expected one acceptance, got {other:?}"),
+        }
+    }
+
+    /// An accept or a continued acceptance addressed to a correspondence this
+    /// side opened is refused as established, and leaves the hello secret a
+    /// rewrite of this side's hello still carries.
+    #[test]
+    fn an_initiators_record_keeps_its_hello_secret_through_accept_and_continue() {
+        let (a, b, mut net) = scene();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let store = a.store();
+        let secret = || {
+            store
+                .load_conv(&peer_a)
+                .expect("load")
+                .expect("A's record")
+                .own_hello_secret
+                .map(|s| *s.as_bytes())
+        };
+        let before = secret().expect("A holds its hello secret while awaiting acceptance");
+
+        // A request naming B, as a hello from B would.
+        let request = ContactRequest {
+            identity: Box::new(*b.pk()),
+            lookup_key: [0x21u8; HELLO_LOOKUP_KEY_LEN],
+            first_ratchet_pk: Box::new([0x22u8; ml_kem::EK_LEN]),
+            slot: 0,
+            advert_serial: 0,
+            shared_secret: AdvertSharedSecret::from_bytes(&[0x23u8; ml_kem::SHARED_SECRET_LEN]),
+        };
+        let mut entropy = Seeded::at(909);
+        assert!(matches!(
+            accept(
+                &store,
+                &mut net,
+                &a.me(),
+                &request,
+                b"a reply",
+                |x| entropy.fill(x),
+                NOW,
+            ),
+            Err(FlowError::AlreadyEstablished)
+        ));
+        let mut entropy = Seeded::at(910);
+        assert!(matches!(
+            continue_acceptance(&store, &mut net, &a.me(), &peer_a, |x| entropy.fill(x), NOW),
+            Err(FlowError::AlreadyEstablished)
+        ));
+        assert_eq!(
+            secret(),
+            Some(before),
+            "a refused acceptance deleted the initiator's hello secret"
+        );
+    }
+
+    /// An acceptance whose hello back write is refused has recorded nothing it
+    /// read, so the call that finishes it returns the correspondent's first
+    /// message and nothing returns that message again.
+    #[test]
+    fn a_refused_hello_back_surfaces_the_first_message_once() {
+        let (a, b, mut net) = scene();
+        a_opens(&a, &b, &mut net, b"the first message");
+        let request = only_request(b_collects(&b, &mut net));
+        let store = b.store();
+        let mut surfaced: Vec<Vec<u8>> = Vec::new();
+
+        // The erase, the opening and the reply land, and the hello back is
+        // refused.
+        net.reset_writes();
+        net.fail_after = Some(3);
+        let mut entropy = Seeded::at(909);
+        let refused = accept(
+            &store,
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(
+            matches!(refused, Err(FlowError::Records(_))),
+            "the hello back write was not the refusal: {refused:?}"
+        );
+        assert_eq!(net.writes.hello, 0, "no hello back reached the drop");
+
+        net.fail_after = None;
+        for seed in [7_070u64, 8_080] {
+            let mut entropy = Seeded::at(seed);
+            match accept(
+                &store,
+                &mut net,
+                &b.me(),
+                &request,
+                b"the reply",
+                |x| entropy.fill(x),
+                NOW,
+            ) {
+                Ok(accepted) => surfaced.extend(accepted.bodies),
+                Err(FlowError::AlreadyEstablished) => {}
+                Err(other) => panic!("a retry failed: {other:?}"),
+            }
+        }
+        let peer = store.load().expect("load").convs[0].peer;
+        surfaced.extend(
+            collect_batch(&store, &mut net, &peer)
+                .expect("B collects a batch")
+                .bodies,
+        );
+        assert_eq!(
+            surfaced,
+            vec![b"the first message".to_vec()],
+            "the first message surfaced other than exactly once"
+        );
+    }
+
+    /// An acceptance stopped at each of its writes is finished by
+    /// [`continue_acceptance`] from the store and the record store alone. The
+    /// opening, the reply and the hello back's encapsulation are the ones the
+    /// stopped run persisted, byte for byte, and the first message is returned
+    /// once.
+    #[test]
+    fn an_acceptance_stopped_at_each_write_is_finished_from_the_record() {
+        for boundary in 0..4usize {
+            let (a, b, mut net) = scene();
+            a_opens(&a, &b, &mut net, b"the first message");
+            let request = only_request(b_collects(&b, &mut net));
+            let store = b.store();
+            net.minted.clear();
+            net.reset_writes();
+            net.fail_after = Some(boundary);
+            let mut entropy = Seeded::at(909);
+            let stopped = accept(
+                &store,
+                &mut net,
+                &b.me(),
+                &request,
+                b"the reply",
+                |x| entropy.fill(x),
+                NOW,
+            );
+            assert!(
+                stopped.is_err(),
+                "boundary {boundary} must stop the acceptance short"
+            );
+            drop(request);
+
+            let peer = store.load().expect("load").convs[0].peer;
+            let before = store.load_conv(&peer).expect("load").expect("B's record");
+            let kem_ct_before = before
+                .own_hello_kem_ct
+                .clone()
+                .expect("the encapsulation is persisted before any write it enables");
+            let hello_before = before.outstanding_hello.as_ref().map(|h| h.sealed.clone());
+            let reply_before = outstanding_zero(&store, &peer)
+                .expect("load")
+                .expect("the reply is committed with the record");
+
+            // The relaunch: nothing but the store and the record store.
+            net.fail_after = None;
+            let mut entropy = Seeded::at(5_353);
+            let finished =
+                continue_acceptance(&store, &mut net, &b.me(), &peer, |x| entropy.fill(x), NOW)
+                    .expect("the relaunch finishes the acceptance");
+            assert_eq!(
+                finished.bodies,
+                vec![b"the first message".to_vec()],
+                "boundary {boundary}"
+            );
+
+            let after = store.load_conv(&peer).expect("load").expect("B's record");
+            assert_eq!(
+                after.outstanding_hello.as_ref().map(|h| h.kem_ct.clone()),
+                Some(kem_ct_before),
+                "boundary {boundary}: the hello back was encapsulated again"
+            );
+            assert!(
+                after.own_hello_secret.is_none(),
+                "boundary {boundary}: the hello secret survived the finished acceptance"
+            );
+            if let Some(sealed) = hello_before {
+                assert_eq!(
+                    after.outstanding_hello.as_ref().map(|h| h.sealed.clone()),
+                    Some(sealed),
+                    "boundary {boundary}: the persisted hello back was sealed again"
+                );
+            }
+            assert_eq!(
+                outstanding_zero(&store, &peer).expect("load"),
+                Some(reply_before),
+                "boundary {boundary}: the reply was sealed again"
+            );
+            assert!(!after.acceptance_pending, "boundary {boundary}");
+            let mut entropy = Seeded::at(6_464);
+            assert!(matches!(
+                continue_acceptance(&store, &mut net, &b.me(), &peer, |x| entropy.fill(x), NOW),
+                Err(FlowError::AlreadyEstablished)
+            ));
+
+            let surfaced = collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false)
+                .expect("A collects");
+            match surfaced.as_slice() {
+                [Surfaced::Accepted(acceptance)] => {
+                    assert_eq!(
+                        acceptance.bodies,
+                        vec![b"the reply".to_vec()],
+                        "boundary {boundary}"
+                    );
+                }
+                other => panic!("boundary {boundary}: expected one acceptance, got {other:?}"),
+            }
+        }
+    }
+
+    /// A first contact stopped at each of its writes is carried on by
+    /// [`continue_first_contact`] from the store and the record store alone,
+    /// writing the opening, sequence 0 and hello the record holds.
+    #[test]
+    fn a_first_contact_stopped_at_each_write_is_carried_on_from_the_record() {
+        for boundary in 0..4usize {
+            let (a, b, mut net) = scene();
+            // The fourth boundary is reachable only through a re-pick.
+            net.clobber_hellos = usize::from(boundary == 3);
+            net.fail_after = Some(boundary);
+            let store = a.store();
+            let mut entropy = Seeded::at(4_242);
+            let stopped = first_contact(
+                &store,
+                &mut net,
+                &a.me(),
+                b.pk(),
+                b"the first message",
+                |x| entropy.fill(x),
+                NOW,
+            );
+            assert!(
+                stopped.is_err(),
+                "boundary {boundary} must stop the first contact short"
+            );
+            let peer = store.load().expect("load").convs[0].peer;
+            let seq0 = outstanding_zero(&store, &peer)
+                .expect("load")
+                .expect("sequence 0 is committed with the record");
+
+            // The relaunch: nothing but the store and the record store.
+            net.fail_after = None;
+            let mut entropy = Seeded::at(5_353);
+            continue_first_contact(&store, &mut net, &peer, |x| entropy.fill(x))
+                .expect("the relaunch carries the first contact on");
+
+            let after = store.load_conv(&peer).expect("load").expect("A's record");
+            assert_eq!(
+                net.channels
+                    .get(&(after.outgoing_lookup_key, channel::slot_for(0))),
+                Some(&seq0),
+                "boundary {boundary}: sequence 0's slot does not hold the committed bytes"
+            );
+            let hello = after
+                .outstanding_hello
+                .as_ref()
+                .expect("a hello is persisted");
+            assert_eq!(
+                net.hellos_written.last().map(Vec::as_slice),
+                Some(hello.sealed.as_slice()),
+                "boundary {boundary}: the drop does not hold the persisted hello"
+            );
+            let accepted = b_accepts(&b, &mut net, b"the reply");
+            assert_eq!(
+                accepted.bodies,
+                vec![b"the first message".to_vec()],
+                "boundary {boundary}"
+            );
+        }
     }
 
     /// An acceptance stopped after its hello back is persisted and before that
@@ -3782,16 +4414,16 @@ mod tests {
             b"the reply",
             |x| entropy.fill(x),
             NOW,
-        );
-        assert!(matches!(again, Err(FlowError::AlreadyEstablished)));
+        )
+        .expect("the relaunch finishes the acceptance");
+        assert_eq!(again.bodies, vec![b"the first message".to_vec()]);
         let image = encode_conv(&store.load_conv(&peer).expect("load").expect("B's record"));
         assert!(
             !contains(&image, secret.as_bytes()),
             "the relaunch left the hello secret in the record"
         );
 
-        // The conversation still completes from what is on disk.
-        resume_first_contact(&store, &mut net, &peer).expect("the hello back is written");
+        // The finish wrote the persisted hello back, and A reads the reply.
         let surfaced =
             collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
         match surfaced.as_slice() {

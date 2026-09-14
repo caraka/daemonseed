@@ -93,6 +93,14 @@ const CONV_OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/store/obox/v1\0";
 /// at all.
 const RECORD_VERSION: u8 = 1;
 
+/// The version byte a conversation record carries after its magic.
+///
+/// Carried apart from [`RECORD_VERSION`], which the advert-keys and outbox
+/// records carry, so the conversation record's format turns over without the
+/// other two being refused. A reader refuses any other value as an unknown
+/// version rather than reading the record at the wrong length.
+const CONV_RECORD_VERSION: u8 = 2;
+
 /// A flag byte's two accepted values. Any other byte is a corrupt record rather
 /// than a truthy value, because nothing this module writes produces one.
 const ABSENT: u8 = 0;
@@ -163,7 +171,8 @@ pub const CONV_RECORD_LEN: usize = CONV_MAGIC.len()
     + (1 + CONTROL_KEY_LEN)
     + (1 + 8)
     + (1 + OPENING_LEN)
-    + SNAPSHOT_LEN;
+    + SNAPSHOT_LEN
+    + 1;
 
 /// Bytes one outbox entry takes: an occupancy flag, the sequence it holds, the
 /// ciphertext length, and a whole subkey of space for the ciphertext.
@@ -327,6 +336,14 @@ pub struct ConvState {
     /// of a first contact: a hello of this side's own is outstanding whether
     /// it opened the conversation or accepted one.
     pub awaiting_acceptance: bool,
+    /// Whether this side accepted the correspondent's first contact and has
+    /// not yet finished that acceptance.
+    ///
+    /// Set when the acceptance's record is created and cleared by the step
+    /// that finishes it, which is also the step that records the collection.
+    /// A record with an outstanding hello back and this flag set was stopped
+    /// part way, and [`crate::dm::flows::continue_acceptance`] finishes it.
+    pub acceptance_pending: bool,
     /// The hello awaiting collection, while there is one.
     pub outstanding_hello: Option<OutstandingHello>,
     /// The secret this side's own hello established, held only while a hello
@@ -382,6 +399,7 @@ impl core::fmt::Debug for ConvState {
             .field("my_collected", &self.my_collected)
             .field("cursor_published", &self.cursor_published)
             .field("awaiting_acceptance", &self.awaiting_acceptance)
+            .field("acceptance_pending", &self.acceptance_pending)
             .field("outstanding_hello", &self.outstanding_hello.is_some())
             .finish_non_exhaustive()
     }
@@ -655,6 +673,10 @@ impl Store {
     /// reporting it would rewrite a slot for a message the correspondent is not
     /// expecting. An entry below `peer_collected` has been collected and is
     /// waiting for the next [`Store::delete_outbox_through`].
+    ///
+    /// An outbox record with no conversation record beside it is deleted,
+    /// scrubbed first. A run that stopped between persisting its first message
+    /// and creating the record leaves one, and nothing else reads it.
     pub fn load(&self) -> Result<Loaded, StoreError> {
         let advert_keys = self.load_advert_keys()?;
         let mut convs = Vec::new();
@@ -666,6 +688,13 @@ impl Store {
             // or leave one it has not.
             let read = self.inner.critical_section::<_, StoreError>(&peer, |g| {
                 let Some(state) = read_conv(g)? else {
+                    // An outbox with no conversation record beside it is what a
+                    // run leaves that stopped between persisting its first
+                    // message and creating the record. Nothing reads it, so it
+                    // is deleted here, scrubbed first.
+                    if g.read(RecordKind::ConversationOutbox)?.is_some() {
+                        g.delete(RecordKind::ConversationOutbox)?;
+                    }
                     return Ok(None);
                 };
                 let table = read_outbox(g.read(RecordKind::ConversationOutbox)?.as_deref())?;
@@ -936,12 +965,17 @@ impl<'a> Reader<'a> {
         }))
     }
 
-    /// The magic and version at the head of a record.
+    /// The magic and [`RECORD_VERSION`] at the head of a record.
     fn header(&mut self, magic: &[u8]) -> Result<(), StoreError> {
+        self.header_version(magic, RECORD_VERSION)
+    }
+
+    /// The magic and a record's own version at the head of a record.
+    fn header_version(&mut self, magic: &[u8], version: u8) -> Result<(), StoreError> {
         if self.take(magic.len())? != magic {
             return Err(self.corrupt("the record does not begin with its magic"));
         }
-        if self.u8()? != RECORD_VERSION {
+        if self.u8()? != version {
             return Err(self.corrupt("the record carries an unknown version"));
         }
         Ok(())
@@ -1008,7 +1042,7 @@ pub(crate) fn decode_advert_keys(bytes: &[u8]) -> Result<AdvertSnapshot, StoreEr
 pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
     let mut w = Writer::with_capacity(CONV_RECORD_LEN);
     w.bytes(CONV_MAGIC);
-    w.u8(RECORD_VERSION);
+    w.u8(CONV_RECORD_VERSION);
     w.bytes(state.peer_identity_pk.as_slice());
     w.bytes(&state.outgoing_lookup_key);
     w.bytes(&state.incoming_lookup_key);
@@ -1087,13 +1121,14 @@ pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
         w.own_turn(turn.as_ref());
     }
     w.peer_turn(receiving.peer_latest.as_ref());
+    w.u8(u8::from(state.acceptance_pending));
     w.0
 }
 
 /// Decode one correspondence's state.
 pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
     let mut r = Reader::new(bytes, RecordKind::Conversation);
-    r.header(CONV_MAGIC)?;
+    r.header_version(CONV_MAGIC, CONV_RECORD_VERSION)?;
     let peer_identity_pk = r.boxed::<{ ml_dsa::PK_LEN }>()?;
     let outgoing_lookup_key = *r.array::<HELLO_LOOKUP_KEY_LEN>()?;
     let incoming_lookup_key = *r.array::<HELLO_LOOKUP_KEY_LEN>()?;
@@ -1172,6 +1207,7 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         own_turns: [r.own_turn()?, r.own_turn()?],
         peer_latest: r.peer_turn()?,
     };
+    let acceptance_pending = r.flag()?;
     r.finish()?;
 
     Ok(ConvState {
@@ -1185,6 +1221,7 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         my_collected,
         cursor_published,
         awaiting_acceptance,
+        acceptance_pending,
         outstanding_hello: has_hello.then_some(OutstandingHello {
             slot: hello_slot,
             r: *hello_r,
@@ -1403,6 +1440,7 @@ mod tests {
             my_collected,
             cursor_published: my_collected,
             awaiting_acceptance: false,
+            acceptance_pending: false,
             outstanding_hello: hello,
             own_hello_secret: Some(shared_secret(0x44)),
             own_hello_kem_ct: Some(Box::new([0x77u8; ml_kem::CT_LEN])),
@@ -1960,6 +1998,7 @@ mod tests {
                         my_collected: 0,
                         cursor_published: 0,
                         awaiting_acceptance: false,
+                        acceptance_pending: false,
                         outstanding_hello: None,
                         own_hello_secret: None,
                         own_hello_kem_ct: None,
@@ -1985,6 +2024,7 @@ mod tests {
                         my_collected: 0,
                         cursor_published: 0,
                         awaiting_acceptance: false,
+                        acceptance_pending: false,
                         outstanding_hello: None,
                         own_hello_secret: None,
                         own_hello_kem_ct: None,
@@ -2481,6 +2521,47 @@ mod tests {
         );
     }
 
+    /// An outbox record whose correspondence holds no conversation record is
+    /// deleted by the next load, and an outbox beside a conversation record is
+    /// kept.
+    #[test]
+    fn a_load_deletes_an_outbox_with_no_conversation_record() {
+        // First: the pair brings the crypto module up, which opening the store
+        // needs.
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(1)).unwrap();
+        let orphan = label(0x31);
+        let genuine = label(0x32);
+        store.persist_outbox(&orphan, 0, &[0x5a; 64]).unwrap();
+        store
+            .create_conv(&genuine, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store.persist_outbox(&genuine, 0, &[0x6b; 64]).unwrap();
+        let outbox_of = |peer: &CorrespondenceLabel| {
+            store
+                .records()
+                .critical_section::<_, DmStoreError>(peer, |g| {
+                    g.read(RecordKind::ConversationOutbox)
+                })
+                .unwrap()
+        };
+        // The control: both outboxes are on disk before the load.
+        assert!(outbox_of(&orphan).is_some(), "the orphan was not written");
+        assert!(outbox_of(&genuine).is_some(), "the outbox was not written");
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.convs.len(), 1, "one correspondence has a record");
+        assert!(
+            outbox_of(&orphan).is_none(),
+            "an outbox with no conversation record survived the load"
+        );
+        assert!(
+            outbox_of(&genuine).is_some(),
+            "the load deleted an outbox beside its conversation record"
+        );
+    }
+
     // ── what a decoder refuses ──────────────────────────────────────────────
 
     /// Byte offset of the conversation record's `send_seq`.
@@ -2501,23 +2582,43 @@ mod tests {
     #[test]
     fn a_record_carrying_an_unknown_version_is_refused() {
         let (a, _b) = pair();
-        let cases: Vec<(&str, Vec<u8>, usize)> = vec![
+        let cases: Vec<(&str, Vec<u8>, usize, u8)> = vec![
             (
                 "advert keys",
                 encode_advert_keys(&rotated_advert()).to_vec(),
                 ADVERT_KEYS_MAGIC.len(),
+                RECORD_VERSION,
             ),
-            ("conversation", conv_bytes_with_hello(), CONV_MAGIC.len()),
+            (
+                "conversation",
+                conv_bytes_with_hello(),
+                CONV_MAGIC.len(),
+                CONV_RECORD_VERSION,
+            ),
             (
                 "outbox",
                 encode_conv_outbox(&vec![None; RING_SLOTS as usize]).to_vec(),
                 CONV_OUTBOX_MAGIC.len(),
+                RECORD_VERSION,
             ),
         ];
         let _ = &a;
-        for (name, good, version_at) in cases {
+
+        // A conversation record carrying the version the other two records
+        // carry is refused as an unknown version, not read at a wrong length.
+        let mut shared = conv_bytes_with_hello();
+        shared[CONV_MAGIC.len()] = RECORD_VERSION;
+        match decode_conv(&shared) {
+            Err(StoreError::Corrupt { reason, .. }) => assert!(
+                reason.contains("version"),
+                "refused for the wrong reason: {reason}"
+            ),
+            other => panic!("a conversation record at RECORD_VERSION decoded: {other:?}"),
+        }
+
+        for (name, good, version_at, version) in cases {
             // The control: the byte this test moves really is the version.
-            assert_eq!(good[version_at], RECORD_VERSION, "{name}");
+            assert_eq!(good[version_at], version, "{name}");
             let decode = |bytes: &[u8]| -> Result<(), StoreError> {
                 match name {
                     "advert keys" => decode_advert_keys(bytes).map(|_| ()),
@@ -2529,7 +2630,7 @@ mod tests {
             decode(&good).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
 
             let mut bumped = good.clone();
-            bumped[version_at] = RECORD_VERSION + 1;
+            bumped[version_at] = version + 1;
             match decode(&bumped) {
                 Err(StoreError::Corrupt { reason, .. }) => assert!(
                     reason.contains("version"),

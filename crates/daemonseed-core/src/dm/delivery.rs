@@ -271,6 +271,7 @@ mod tests {
             my_collected: MY_COLLECTED,
             cursor_published: MY_COLLECTED,
             awaiting_acceptance: false,
+            acceptance_pending: false,
             outstanding_hello: None,
             own_hello_secret: None,
             own_hello_kem_ct: None,

@@ -77,9 +77,11 @@ work lives in the maintainer's own planning notes, not here.
   recording the correspondent's channel lookup key and hello secret, and `send_message` / `collect_batch`
   as the ordinary-message and cursor paths (#474).
 - `daemonseed-core`: `dm::store` conversation records carry `cursor_published`, `awaiting_acceptance`,
-  `own_hello_secret`, `own_hello_kem_ct`, `own_control_key`, `peer_control_key`, `peer_advert_serial` and
-  `own_opening`; `own_hello_secret` is deleted once a first contact's acceptance is recognised or a hello
-  back is persisted, and no correspondent's hello secret is stored; `CONV_RECORD_LEN` is 36861;
+  `acceptance_pending`, `own_hello_secret`, `own_hello_kem_ct`, `own_control_key`, `peer_control_key`,
+  `peer_advert_serial` and `own_opening`; `own_hello_secret` is deleted once a first contact's acceptance is
+  recognised or a hello back is persisted, and no correspondent's hello secret is stored; the conversation
+  record's format is version 2 (`CONV_RECORD_VERSION`) and `CONV_RECORD_LEN` is 36862; `Store::load` deletes
+  an outbox record that has no conversation record;
   `channel::seal_control_with_key` / `open_control_with_key` seal and open under a derived `ControlKey`
   (#474).
 - `daemonseed-core`: `dm::drop` hellos seal `lookup_key ‖ r ‖ carried_tag ‖ carried`, `HELLO_LEN` 1701;
@@ -89,6 +91,12 @@ work lives in the maintainer's own planning notes, not here.
   `ChannelError::LookupKey`, and `flows::collect` requires the hello's lookup key; `flows::accept` refuses
   an opening whose writer or first ratchet key is not the request's with `FlowError::OpeningWriter` /
   `FlowError::OpeningRatchetKey` (#474).
+- `daemonseed-core`: `flows::continue_first_contact(store, records, peer, fill)` and
+  `flows::continue_acceptance(store, records, me, peer, fill, now)` carry a first contact and an acceptance
+  on from the conversation record alone; `first_contact` and `accept` persist sequence 0 and the reply
+  before the record, and `accept` records the bodies it read and its cursor only when the acceptance
+  finishes, publishing in its control record the cursor already persisted; `send_message` and `collect_batch`
+  are `FlowError::AwaitingAcceptance` while `acceptance_pending` is set (#474).
 - `daemonseed-core`: `dm::delivery`, the direct-messaging delivery rules — `channel::collected(seq, peer_cursor)`,
   re-exported here, true exactly when the correspondent's published cursor is above the sequence and
   now also the predicate `Store::delete_outbox_through` frees a slot on;

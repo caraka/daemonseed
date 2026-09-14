@@ -2449,14 +2449,16 @@ modules:
       outstanding_outbox: Vec<OutboxEntry { seq, ciphertext }> }> }, StoreError>
       is what a launch reads; an outbox entry is outstanding only while
       peer_collected <= seq < send_seq, so an entry at or above send_seq is a seal
-      whose conversation record did not commit and is not reported. The caller
+      whose conversation record did not commit and is not reported. An outbox record
+      whose correspondence holds no conversation record is deleted, scrubbed first. The caller
       rewrites every outstanding entry whose slot differs, byte for byte.
       The record encodings are crate-private: a magic, a version byte, then
       fixed-width fields, an absent value written as a zero flag byte and its own
-      width in zeros. A decoder refuses an unknown version, an outbox entry whose
+      width in zeros. A decoder refuses an unknown version (the conversation record is at
+      CONV_RECORD_VERSION 2, the advert-keys and outbox records at version 1), an outbox entry whose
       sequence is not its ring position, a hello slot at or above DROP_SUBKEYS,
       and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6398),
-      CONV_RECORD_LEN (36861) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
+      CONV_RECORD_LEN (36862) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
       widths and are the RecordKind buckets. StoreError is Store(DmStoreError),
       Corrupt { kind, reason }, OutboxSlotOccupied, CiphertextTooLong,
       MissingConversation, ConversationExists and MissingAdvertKeys.
@@ -2522,7 +2524,14 @@ modules:
       slot, persists the outstanding hello whole and writes it at
       drop::slot_for(r), reads it back once and re-picks at most MAX_REPICKS
       times; a further clobber is FlowError::DropFull with the hello left
-      persisted. At most four writes. resume_first_contact(store, records,
+      persisted. At most four writes. Sequence 0 is sealed and its outbox entry
+      persisted before the conversation record is created, so every record holds
+      it. continue_first_contact(store, records, peer, fill) -> Result<FirstContact,
+      FlowError> carries a first contact on from its record alone: the opening,
+      the slot and the hello where no hello is persisted, the persisted hello's
+      bytes where one is; it mints and re-seals nothing, and is
+      FlowError::AlreadyEstablished once awaiting_acceptance is clear. first_contact
+      over an existing record delegates to it. resume_first_contact(store, records,
       peer) -> Result<Resumed, FlowError> writes a persisted hello unchanged on
       every call and reports Nothing or Rewrote(slot); it reads nothing, so the
       caller decides when a write is owed: a slot the network reports evicted or
@@ -2553,13 +2562,22 @@ modules:
       carries on past it, and only a failure of this side's own store returns.
       accept(store, records, me, request, reply, fill, now) -> Result<Accepted {
       peer, outgoing_lookup_key, bodies, hello_slot, repicks }, FlowError>
-      holds one conversation per correspondent identity: a half-done acceptance
-      is carried to completion from the record, one whose hello back is placed
-      is FlowError::AlreadyEstablished. It creates the conversation record,
-      reads the correspondent's ring, erases the hello slot, writes this side's
-      opening and cursor at CONTROL_SUBKEY with the reply in its ring slot, and
-      writes a hello naming this channel into the correspondent's drop, read
-      back like any other. recognise_acceptance(store, records, me, peer, lookup_key,
+      holds one conversation per correspondent identity: a record with
+      acceptance_pending set is carried on, and any other record is
+      FlowError::AlreadyEstablished. It names this side's channel, seals the reply
+      and persists its outbox entry before creating the record, mints the
+      encapsulation and opening once, reads the correspondent's ring on a copy of
+      the key schedule, erases the hello slot, writes this side's opening and its
+      persisted cursor at CONTROL_SUBKEY with the reply in its ring slot, and writes
+      a hello naming this channel into the correspondent's drop, read back like any
+      other; the read, my_collected and the clearing of acceptance_pending are
+      persisted together after that, and the next collect_batch publishes the new
+      cursor.
+      continue_acceptance(store, records, me, peer, fill, now) -> Result<Accepted,
+      FlowError> does the same from the record alone, leaving the collected hello
+      slot unerased and writing a persisted hello back's bytes rather than
+      re-sealing it; FlowError::AlreadyEstablished where acceptance_pending is
+      clear. recognise_acceptance(store, records, me, peer, lookup_key,
       peer_secret, slot) -> Result<Acceptance { peer, lookup_key, peer_cursor,
       bodies }, FlowError> records the correspondent's channel lookup key and
       the control key derived from peer_secret, reads its cursor and any reply,
@@ -2567,9 +2585,11 @@ modules:
       erases the slot. send_message(store, records,
       peer, body, fill) -> Result<u64, FlowError> persists the ciphertext and
       the advanced send_seq and writes one ring slot; it is
-      FlowError::AwaitingAcceptance while awaiting_acceptance is set. collect_batch(store,
+      FlowError::AwaitingAcceptance while awaiting_acceptance or acceptance_pending is
+      set. collect_batch(store,
       records, peer) -> Result<Batch { bodies, my_collected, cursor_published },
-      FlowError> reads the correspondent's ring from this side's cursor and
+      FlowError> is FlowError::AwaitingAcceptance while acceptance_pending is set, and
+      otherwise reads the correspondent's ring from this side's cursor and
       publishes the new cursor in one control write where my_collected is above
       the record's cursor_published, sealed under own_control_key and carrying
       own_opening. peer_cursor(store, records, peer) ->
