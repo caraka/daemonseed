@@ -118,6 +118,7 @@
 //! taking one later changes this module and no caller of it.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -126,12 +127,16 @@ use daemonseed_core::dm::advert::{AdvertOwnerSeed, ADVERT_SUBKEY};
 use daemonseed_core::dm::channel::{ChannelOwnerSeed, CHANNEL_SUBKEYS, CONTROL_SUBKEY};
 use daemonseed_core::dm::drop::{DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
 use daemonseed_core::dm::flows::{RecordError, Records};
+use daemonseed_core::identity::keys::{DmChannelRootSecret, SignKeypair};
+use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::oneshot;
 use veilid_core::{KeyPair, RoutingContext, ValueSeqNum, VeilidAPI};
+use zeroize::Zeroizing;
 
 use crate::actor::{funnel_record_key, gated_bounded_get, ProdWrite};
 use crate::dht_gate::DhtGate;
+use crate::dm::runner::{RunnerConfig, RunnerParts, RunnerRecords, SubkeyReport};
 use crate::error::{Result, VeilidNetError};
 use crate::identity;
 use crate::rendezvous::{self, RecordShape, RendezvousHandle};
@@ -537,6 +542,131 @@ impl VeilidRecords {
         self.write(record, DirectMessageWrite::Advert, write)
     }
 
+    /// Every subkey of the channel at `lookup_key`, as this node's sequence
+    /// number beside the network's — the report
+    /// `docs/design/direct-messaging.md` § Eviction detection reads an eviction
+    /// from.
+    ///
+    /// Two reads: a `Local` inspect for this node's numbers and for which
+    /// subkeys Veilid still has queued for its background flush, and a
+    /// `SyncSet` inspect for the network's numbers, which reports as if the
+    /// local copy did not exist. Both reports must start at subkey 0. A channel
+    /// this process opened is opened under the owner keypair and the shape it
+    /// was opened with; any other is opened read-only under [`CHANNEL_SUBKEYS`].
+    /// A record this node does not hold reports no number on either side, and so
+    /// does a subkey past the end of a report that did not reach it.
+    ///
+    /// A report that comes back with no network numbers is the network holding
+    /// no copy: Veilid builds it that way whenever its fanout gathered no copy of
+    /// the record (`veilid-core-0.5.7 src/storage_manager/inspect_record.rs:257-262`),
+    /// and the report carries no count of the nodes reached
+    /// (`src/veilid_api/types/dht/dht_record_report.rs:13-23`). A node that could
+    /// not ask gets an error instead: an inspect issued while it is not online is
+    /// refused with `TryAgain` (`src/storage_manager/inspect_record.rs:205-206`),
+    /// retried here and returned as an error once the retries are spent, and a
+    /// read that runs past its bound is an error too.
+    pub fn inspect_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        let own = self
+            .own_channels
+            .get(lookup_key)
+            .map(|own| (own.owner.clone(), own.shape));
+        let shape = match &own {
+            Some((_, shape)) => *shape,
+            None => shape_of(CHANNEL_SUBKEYS)?,
+        };
+        let transport = &self.transport;
+        let lookup_key = *lookup_key;
+        block(retry_transient("dm records channel inspect", || {
+            let own = own.clone();
+            async move {
+                let owner = identity::owner_public_key(&lookup_key);
+                let handle = {
+                    let record_lock = rendezvous::record_lock(&transport.record_locks, &owner);
+                    let _open_guard = record_lock.lock().await;
+                    let id = rendezvous::cached_record_id(&owner, shape);
+                    match own {
+                        Some((keypair, _)) => {
+                            rendezvous::open_cached_optional(
+                                &transport.opened,
+                                &id,
+                                rendezvous::open_only(
+                                    &transport.gate,
+                                    &transport.api,
+                                    &transport.rc,
+                                    &keypair,
+                                    shape,
+                                ),
+                            )
+                            .await?
+                        }
+                        None => {
+                            rendezvous::open_cached_optional(
+                                &transport.opened,
+                                &id,
+                                rendezvous::open_read_only(
+                                    &transport.gate,
+                                    &transport.api,
+                                    &transport.rc,
+                                    &lookup_key,
+                                    shape,
+                                ),
+                            )
+                            .await?
+                        }
+                    }
+                };
+                inspect_both(transport, handle, shape.o_cnt()).await
+            }
+        }))
+        .map_err(RecordError::new)
+    }
+
+    /// Every subkey of the advert record the seed owns, as this node's sequence
+    /// number beside the network's — what an advert repair decides from.
+    ///
+    /// The same two reads as [`Self::inspect_channel`], over a record opened
+    /// without creating it.
+    pub fn inspect_advert(
+        &mut self,
+        owner: &AdvertOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        self.inspect_record(owner.as_bytes(), subkeys)
+    }
+
+    /// Every slot of the drop the seed owns, as this node's sequence number
+    /// beside the network's — how a sender learns that the hello it placed
+    /// there is no longer what the network holds.
+    ///
+    /// The same two reads as [`Self::inspect_channel`], over a record opened
+    /// without creating it. The scan [`Records::read_drop_slot`] keeps is left
+    /// as it is: an inspect writes nothing.
+    pub fn inspect_drop(
+        &mut self,
+        owner: &DropOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        self.inspect_record(owner.as_bytes(), subkeys)
+    }
+
+    /// Every subkey of the record `owner_seed` owns, inspected on both sides.
+    fn inspect_record(
+        &self,
+        owner_seed: &[u8; 32],
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        let shape = shape_of(subkeys)?;
+        let transport = &self.transport;
+        block(retry_transient("dm records inspect", || async move {
+            let handle = open_for_read(transport, owner_seed, shape).await?;
+            inspect_both(transport, handle, subkeys).await
+        }))
+        .map_err(RecordError::new)
+    }
+
     /// The channel this side owns under `lookup_key`, or a refusal naming what
     /// the caller has to do first.
     fn own(
@@ -817,6 +947,117 @@ impl Records for VeilidRecords {
         };
         self.write(*lookup_key, channel_write_kind(subkey), write)
     }
+}
+
+impl RunnerRecords for VeilidRecords {
+    fn inspect_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        VeilidRecords::inspect_channel(self, lookup_key)
+    }
+
+    fn inspect_advert(
+        &mut self,
+        owner: &AdvertOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        VeilidRecords::inspect_advert(self, owner, subkeys)
+    }
+
+    fn inspect_drop(
+        &mut self,
+        owner: &DropOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
+        VeilidRecords::inspect_drop(self, owner, subkeys)
+    }
+
+    fn publish_advert(
+        &mut self,
+        owner: &AdvertOwnerSeed,
+        subkeys: u16,
+        bytes: &[u8],
+    ) -> core::result::Result<(), RecordError> {
+        VeilidRecords::publish_advert(self, owner, subkeys, bytes)
+    }
+
+    fn erase_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> core::result::Result<(), RecordError> {
+        VeilidRecords::erase_channel(self, lookup_key)
+    }
+
+    fn write_counts(&self) -> WriteCountsSnapshot {
+        VeilidRecords::write_counts(self)
+    }
+}
+
+impl RunnerParts<VeilidRecords> {
+    /// The parts of a runner over the Veilid distributed hash table: a
+    /// [`VeilidRecords`] built from `parts`, and the identity, key and profile
+    /// directory the runner needs beside it.
+    ///
+    /// Fails where [`VeilidRecords::new`] does, which is on any thread that is
+    /// not a multi-thread tokio runtime worker.
+    pub fn over_veilid(
+        parts: VeilidRecordsParts,
+        signer: Arc<SignKeypair>,
+        channel_root: DmChannelRootSecret,
+        at_rest_key: Zeroizing<[u8; AEAD_KEY_LEN]>,
+        profile_root: PathBuf,
+        config: RunnerConfig,
+    ) -> core::result::Result<Self, RecordsError> {
+        Ok(Self {
+            records: VeilidRecords::new(parts)?,
+            signer,
+            channel_root,
+            at_rest_key,
+            profile_root,
+            config,
+        })
+    }
+}
+
+/// Both inspects of one open record, as one [`SubkeyReport`] per subkey.
+///
+/// `None` is a record this node does not hold, which reports no number on
+/// either side for every subkey.
+async fn inspect_both(
+    transport: &Transport,
+    handle: Option<RendezvousHandle>,
+    subkeys: u16,
+) -> Result<Vec<SubkeyReport>> {
+    let Some(handle) = handle else {
+        return Ok(vec![SubkeyReport::default(); usize::from(subkeys)]);
+    };
+    let local = rendezvous::inspect_local_pending(&transport.gate, &transport.rc, &handle).await?;
+    let network = rendezvous::inspect_sync_set(&transport.gate, &transport.rc, &handle).await?;
+    Ok(seq_reports(&local, &network, subkeys))
+}
+
+/// One report per subkey of an `o_cnt`-subkey record, from a `Local` report and
+/// a positional list of network numbers.
+///
+/// A subkey past the end of either list has no number on that side: a report
+/// that did not reach a subkey says nothing about it. A subkey Veilid still
+/// has queued for its flush is marked pending, whatever its numbers say.
+fn seq_reports(
+    local: &rendezvous::LocalPending,
+    network: &[ValueSeqNum],
+    o_cnt: u16,
+) -> Vec<SubkeyReport> {
+    (0..o_cnt)
+        .map(|subkey| {
+            let i = usize::from(subkey);
+            SubkeyReport {
+                local_seq: local.seqs.get(i).and_then(|s| s.to_option()).map(u64::from),
+                network_seq: network.get(i).and_then(|s| s.to_option()).map(u64::from),
+                pending: local.pending.contains(u32::from(subkey)),
+            }
+        })
+        .collect()
 }
 
 /// The record and subkey a submitted write is confirmed at.

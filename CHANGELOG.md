@@ -56,6 +56,12 @@ work lives in the maintainer's own planning notes, not here.
   from `VeilidNetHandle::dm_records_parts`. `rendezvous::inspect_sync_set`, `rendezvous::delete_record`,
   `rendezvous::forget_cached` and the `ProdWrite::DmRecord` dispatch arm are the new transport primitives
   beneath it (#476).
+- `daemonseed-veilid-net`: `dm::runner` added: `spawn_runner`, `RunnerHandle`, `RunnerCommand`,
+  `RunnerEvent`, `RunnerConfig`, `ShutdownOutcome`, `RunnerStop`, `TaskEnd`.
+- `daemonseed-veilid-net`: `dm::runner::RunnerRecords` and `SubkeyReport` added; `VeilidRecords` implements
+  `RunnerRecords` (`inspect_channel`, `inspect_advert`, `inspect_drop`).
+- `daemonseed-veilid-net`: `RunnerParts::over_veilid` added.
+- `daemonseed-veilid-net`: `rendezvous::inspect_sync_set` refuses a report that does not start at subkey 0.
 - `daemonseed-veilid-net`: the `two_node_dm_async` oracle's six step bodies drive `dm::flows`
   — `first_contact`, `collect`, `accept`, `send_message`, `collect_batch`, `peer_cursor`,
   `resume_first_contact` — through `VeilidRecords` over a `dm::store::Store` in each step's state

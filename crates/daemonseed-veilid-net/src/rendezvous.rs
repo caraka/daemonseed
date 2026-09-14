@@ -1419,7 +1419,13 @@ pub async fn inspect_sync_set(
         rc.inspect_dht_record(handle.key().clone(), None, DHTReportScope::SyncSet),
     )
     .await?;
-    Ok(report.network_seqs().to_vec())
+    match report.subkeys().first() {
+        Some(0) | None => Ok(report.network_seqs().to_vec()),
+        Some(first) => Err(VeilidNetError::Routing(format!(
+            "inspect_sync_set: report starts at subkey {first}, not 0; \
+             its sequence numbers cannot be read by subkey"
+        ))),
+    }
 }
 
 /// What this node holds of a record and which of its subkeys Veilid still has

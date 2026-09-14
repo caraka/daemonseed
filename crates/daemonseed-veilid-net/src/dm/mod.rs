@@ -17,6 +17,7 @@ pub(crate) mod machine;
 #[cfg(test)]
 pub(crate) mod mock;
 pub mod records;
+pub mod runner;
 pub mod seam;
 pub mod types;
 

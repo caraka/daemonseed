@@ -156,6 +156,16 @@ modules:
       - daemonseed_veilid_net::actor
       - daemonseed_veilid_net::error
       - daemonseed_veilid_net::rendezvous
+  - name: daemonseed_veilid_net::dm::runner
+    description: >-
+      The direct-message runner: one tokio task per identity that owns a record
+      store and a daemonseed_core::dm::store::Store at <profile_root>/dm-store,
+      calls daemonseed_core::dm::flows one call at a time, serves RunnerCommands
+      between flow calls and emits RunnerEvents, on a collection tick, a repair
+      poll and an advert poll.
+    no_std: false
+    depends_on:
+      - daemonseed_veilid_net::dm
   - name: daemonseed_veilid_net::schedule
     description: >-
       The WB-3 write scheduler — the single funnel every DHT write enters, ordering
@@ -329,11 +339,14 @@ types:
       as None. read_drop_slot at slot 0 takes one inspect_sync_set report of the
       drop and answers every slot the network reports no sequence number for
       without a read; a hello written to that drop discards the report and an
-      erasure keeps it. Three inherent
-      methods sit outside the trait: publish_advert writes subkey 0 of an advert
-      record, erase_channel closes and deletes a channel record this side owns
-      from this node's local store without creating an absent one, and
-      write_counts reports writes so far per kind. Every method bridges the
+      erasure keeps it. Inherent methods outside the trait: publish_advert writes
+      subkey 0 of an advert record, erase_channel closes and deletes a channel
+      record this side owns from this node's local store without creating an
+      absent one, write_counts reports writes so far per kind, and
+      inspect_channel, inspect_advert and inspect_drop report a SubkeyReport per
+      subkey (local and network sequence numbers, and whether Veilid still has
+      the subkey queued for its flush). It implements
+      daemonseed_veilid_net::dm::runner::RunnerRecords through them. Every method bridges the
       synchronous trait onto the asynchronous transport with
       tokio::task::block_in_place, so every call must be on a multi-thread runtime
       worker; the flavor is checked at construction and at every bridged call.
@@ -374,6 +387,139 @@ types:
       Why VeilidRecords::new refused: NoRuntime (no tokio runtime on this thread),
       NotMultiThread (the runtime is not multi-threaded, so the synchronous bridge
       would panic).
+  - name: RunnerRecords
+    module: daemonseed_veilid_net::dm::runner
+    kind: trait
+    description: >-
+      daemonseed_core::dm::flows::Records plus inspect_channel, inspect_advert and
+      inspect_drop (a SubkeyReport per subkey of a channel, advert or drop
+      record), publish_advert, erase_channel and write_counts. VeilidRecords
+      implements it.
+  - name: SubkeyReport
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      One inspected subkey: local_seq (this node's copy), network_seq (the
+      network's, as if the local copy did not exist) and pending (still queued
+      for Veilid's flush).
+  - name: RunnerParts
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      What spawn_runner takes, all fields public: records (a RunnerRecords),
+      signer (Arc<SignKeypair>), channel_root (DmChannelRootSecret, moved),
+      at_rest_key (Zeroizing<[u8; 32]>), profile_root (PathBuf) and config
+      (RunnerConfig).
+  - name: RunnerConfig
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      tick (collection interval before ±20 % jitter, default DEFAULT_TICK 60 s)
+      and grace (the longest RunnerHandle::shutdown waits, default DEFAULT_GRACE
+      10 s). Implements Default. clamped() holds tick within MIN_TICK (1 ms) and
+      MAX_TICK (24 h); spawn_runner applies it.
+  - name: RunnerHandle
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      A running runner: commands() clones the command sender, send queues a
+      command, next_event and try_next_event read events, shutdown stops it and
+      returns the unread events. Dropping it stops the runner after the flow
+      call in progress and discards unread events.
+  - name: RunnerCommand
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      FirstContact{token, peer_identity_pk, body}, Send{token, peer, body},
+      Accept{token, request, reply}, Block{peer}, Unblock{peer},
+      DeleteConversation{token, peer}, Shutdown. peer is a CorrespondenceLabel
+      except on Block and Unblock, where it is an identity public key. Debug omits
+      bodies and keys.
+  - name: RunnerEvent
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      Roster(Vec<ConversationSummary>), ContactRequest{request, from},
+      StartedOver{request, from}, Message{from, seq, body, received_at (Unix ms,
+      stamped by the runner)}, Sent{token, peer, seq}, Deleted{token, peer},
+      Delivered{peer, through_seq}, Accepted{peer}, Refused{token:
+      Option<CommandToken>, reason: Refusal}, Health(HealthCounters). Every
+      command with a token is answered by Sent, Deleted or Refused. Health is
+      emitted once at startup and then when a counter changes, at most once per
+      scheduled wake. Debug omits bodies and keys.
+  - name: ConversationSummary
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      One roster row: peer, peer_identity_pk, state (ConversationState Pending or
+      Established), peer_collected (the correspondent's cursor) and uncollected
+      (send_seq minus that cursor).
+  - name: ConversationState
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      Pending (this side's first contact awaits acceptance, or this side's
+      acceptance of the correspondent's has not finished) or Established.
+  - name: CommandToken
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: A caller-chosen u64 echoed on the Sent or Refused event answering a command.
+  - name: ContactRequestId
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      The runner's id for a surfaced hello: a value drawn once per run and a
+      serial within the run, so an id from an earlier run is refused. It stays
+      the same while the same identity's hello keeps surfacing.
+  - name: Refusal
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      UnknownConversation, UnknownRequest, StartedOverNotAcceptable, RingFull (63
+      messages uncollected), AwaitingAcceptance, AcceptanceUnfinished (this side's acceptance has not
+      finished; the repair poll carries it on), AlreadyEstablished, NoAdvert,
+      DropFull, BlockListFull, Store, Network, Flow, ShuttingDown (the runner
+      stopped with the command still queued).
+  - name: HealthCounters
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      Counters since the runner started: failed reads, inspects and writes per
+      record kind (advert, drop, channel, plus channel opens and erasures),
+      advert_failures, network_not_answering (a record with no network number on
+      any subkey in a pass where this node's own advert showed none either, left
+      alone), hellos_dropped (blocked sender),
+      hellos_already_collected, hellos_unsettled, conversation_failures,
+      store_failures and
+      requests_evicted (held requests dropped, oldest-seen first, above one per
+      drop slot).
+  - name: ShutdownOutcome
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      Finished(Result<(), RunnerError>), Panicked, or TimedOut(TaskEnd): the
+      grace period ended with a flow call in progress, which was not
+      interrupted.
+  - name: TaskEnd
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      A runner task still inside a flow call when its shutdown's grace period
+      ended. is_finished() reports whether it has ended; finish() waits for it
+      and returns a RunnerStop with every event emitted meanwhile. The call may
+      still save a collection cursor or an acceptance, and the bodies it read
+      are lost if the TaskEnd is dropped unfinished. The profile must not be
+      opened again until the task has ended.
+  - name: RunnerStop
+    module: daemonseed_veilid_net::dm::runner
+    kind: struct
+    description: >-
+      What RunnerHandle::shutdown returns: outcome (ShutdownOutcome) and
+      undelivered (every event emitted and not read, in order).
+  - name: RunnerError
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: Store(StoreError) or Advert(AdvertError), a startup failure that stopped the runner.
   - name: DmDhtFuture
     module: daemonseed_veilid_net::dm
     kind: type_alias
@@ -1557,6 +1703,68 @@ functions:
       type: "Result<DoorbellSweep>"
       description: DoorbellSweep { slots, outcome } — the populated slots as (slot, unverified sealed bytes) pairs, and the sweep outcome (attempted / found / failed).
   # ── dm: the DM driver ────────────────────────────────────────────────
+  - name: spawn_runner
+    module: daemonseed_veilid_net::dm::runner
+    description: >-
+      Start a runner on the current tokio runtime with a command queue of
+      COMMAND_QUEUE (64) and an event queue of EVENT_QUEUE (256). Over
+      VeilidRecords the runtime must be multi-thread.
+    signature: "pub fn spawn_runner<R>(parts: RunnerParts<R>) -> RunnerHandle where R: RunnerRecords + Send + 'static"
+    returns:
+      type: RunnerHandle
+      description: The handle; a startup failure ends the task and closes the event stream.
+  - name: RunnerHandle::shutdown
+    module: daemonseed_veilid_net::dm::runner
+    description: >-
+      Ask the task to stop, read its events while it finishes the flow call in
+      progress, and wait at most RunnerConfig::grace. After the call the task
+      starts no flow call that writes, and every command still queued is
+      answered Refused ShuttingDown. A call still running at the end of the grace
+      period is not interrupted; the outcome is TimedOut with a TaskEnd.
+    signature: "pub async fn shutdown(self) -> RunnerStop"
+    returns:
+      type: RunnerStop
+      description: How the task ended, and every event not yet read.
+  - name: TaskEnd::finish
+    module: daemonseed_veilid_net::dm::runner
+    description: >-
+      Wait for a timed-out runner task to end, reading its events meanwhile.
+    signature: "pub async fn finish(self) -> RunnerStop"
+    returns:
+      type: RunnerStop
+      description: Finished or Panicked, and every event the task emitted after the shutdown returned.
+  - name: RunnerParts::over_veilid
+    module: daemonseed_veilid_net::dm::records
+    description: Build RunnerParts over a VeilidRecords made from VeilidRecordsParts.
+    signature: "pub fn over_veilid(parts: VeilidRecordsParts, signer: Arc<SignKeypair>, channel_root: DmChannelRootSecret, at_rest_key: Zeroizing<[u8; AEAD_KEY_LEN]>, profile_root: PathBuf, config: RunnerConfig) -> Result<Self, RecordsError>"
+    returns:
+      type: "Result<RunnerParts<VeilidRecords>, RecordsError>"
+      description: The parts, or the error VeilidRecords::new returns off a multi-thread runtime worker.
+  - name: VeilidRecords::inspect_channel
+    module: daemonseed_veilid_net::dm::records
+    description: >-
+      A local inspect and a SyncSet inspect of a channel record, as one
+      SubkeyReport per subkey, pending taken from the local report's flush queue.
+      Both reports must start at subkey 0. An own channel opens under its
+      keypair, any other read-only; an absent record reports no numbers.
+    signature: "pub fn inspect_channel(&mut self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> Result<Vec<SubkeyReport>, RecordError>"
+    returns:
+      type: "Result<Vec<SubkeyReport>, RecordError>"
+      description: One report per subkey, indexed by subkey.
+  - name: VeilidRecords::inspect_advert
+    module: daemonseed_veilid_net::dm::records
+    description: The same two inspects over the advert record the seed owns.
+    signature: "pub fn inspect_advert(&mut self, owner: &AdvertOwnerSeed, subkeys: u16) -> Result<Vec<SubkeyReport>, RecordError>"
+    returns:
+      type: "Result<Vec<SubkeyReport>, RecordError>"
+      description: One report per subkey, indexed by subkey.
+  - name: VeilidRecords::inspect_drop
+    module: daemonseed_veilid_net::dm::records
+    description: The same two inspects over the drop record the seed owns.
+    signature: "pub fn inspect_drop(&mut self, owner: &DropOwnerSeed, subkeys: u16) -> Result<Vec<SubkeyReport>, RecordError>"
+    returns:
+      type: "Result<Vec<SubkeyReport>, RecordError>"
+      description: One report per slot, indexed by slot.
   - name: DmDriver::spawn
     module: daemonseed_veilid_net::dm
     description: Spawn the DM driver over the parts the frontend constructed and return its handle plus the event stream. The driver wakes on cfg.idle_tick and ends when the last handle drops or a Shutdown command arrives, aborting in-flight DHT operations. Panics if cfg.idle_tick is zero.
