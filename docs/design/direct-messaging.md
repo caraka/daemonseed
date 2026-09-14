@@ -12,7 +12,7 @@ Each claim is an outcome, closed only by its own probe. Every component of the l
 - **FC2 Restart-safe.** A restart on either side, at any moment, loses no message and shows nothing false. Probe: FC1's run with a kill at every step boundary, resumed from the state left on disk. Refuted if a message fails to open, or a message shows as collected that was not.
 - **FC3 Forward secrecy against a clone.** Someone who copies a user's device at time T reads nothing that user collected before T, nothing they sent before T, and nothing after their next reset. Probe: snapshot A's state directory mid-conversation and run it as an attacker against every record captured from the DHT. Pre-T and post-reset messages must fail to open. Control: the current-turn message before any reset must open.
 - **FC4 First contact.** Knowing only someone's published identity, a user can start a conversation while they are offline, they find it when they return, and nobody can make the user accept a request under a name that is not theirs. Probe: A writes a first-contact request with B off. B starts later and sees the request attributed to A's verified identity. A request under a different key is not shown as A.
-- **FC5 The network learns nothing.** Storage nodes holding every record of a conversation cannot read a message, cannot forge one, and cannot tell which two identities are talking. Probe: capture every record. Opening without keys fails. A slot write from a non-owner key is rejected. The identity public keys of both parties appear in zero bytes of any channel or drop record. Control: they do appear in the advert.
+- **FC5 The network learns nothing.** Storage nodes holding every record of a conversation cannot read a message, cannot forge one, and cannot tell which two identities are talking. Probe: capture every record. Opening without keys fails. A slot write from a non-owner key is rejected. The identity public keys of both parties appear in zero bytes of any channel or drop record. Control: the identity public key determines the advert's address and verifies its signature, and appears in cleartext in no record.
 - **FC6 Small enough to hold in one head.** The layer is readable end to end by one person in a day. Probe: a ceiling of 6,000 lines of production code, checked at every commit, and a check that every component names a founding claim. Crossing the ceiling is a warning to the maintainer, who reviews the layer for scope creep; it fails nothing.
 
 Inherited from the project rather than restated: no message content survives client closure (`ISA.md` ISC-C30). Probe: search the profile directory for any sent or received body after close; control: the ciphertext outbox is present.
@@ -46,17 +46,17 @@ Facts about Veilid the design rests on. File references are to `veilid-core` 0.5
 
 A channel's lookup key is disclosed only inside a hello, so its readers are the two parties and the storage nodes holding it.
 
-- **ADVERT.0** — `serial ‖ not_before ‖ kem_pk (1568) ‖ ML-DSA-87 signature (4627)` over all of it with B's identity key, about 6.3 KB. The KEM keypair rotates weekly; B keeps the previous secret for one rotation period only.
+- **ADVERT.0** — `serial ‖ not_before ‖ kem_pk (1568) ‖ ML-DSA-87 signature (4627)` over all of it with B's identity key, about 6.3 KB. The KEM keypair rotates weekly; B keeps the previous secret for one rotation period only. An advert is usable for a new encapsulation from one hour before its `not_before` until two rotation periods after it. A reader keeps the highest advert serial it has verified and refuses a lower one.
 - **DROP.slot** — `kem_ct (1568) ‖ AEAD_{k_hello}(lookup_key(CHAN) ‖ r) ‖ pow_tag`, about 1.7 KB, where `ss0` is the shared secret from encapsulating to the recipient's advert key and `k_hello = HKDF(ss0, "hello")`. Slot index is `H(r) mod 256`. `pow_tag` is a proof-of-work tag over `kem_ct ‖ r ‖ recipient identity` at difficulty zero: present and checked, free to produce.
-- **CHAN.0 (control)** — from the writer, encrypted: the **channel opening** and the writer's `collected_cursor`. The opening is written once and holds the writer's identity public key (2592), its first ratchet KEM public key (1568), the advert serial it encapsulated to, and an ML-DSA-87 signature (4627) over the whole, about 9 KB.
-- **CHAN.k, k = 1..63** — message `seq` lives in slot `1 + (seq mod 63)`: `header(n, m, seq, device_id, optional kem_ct 1568, optional kem_pk 1568) ‖ AEAD_{mk}(body)`. `n` and `m` are turn numbers; `device_id` is a reserved device identifier. Header up to about 3.2 KB, body up to about 12 KB.
+- **CHAN.0 (control)** — from the writer, encrypted: the **channel opening** and the writer's `collected_cursor`. The opening is written once and holds the writer's identity public key (2592), the recipient's identity public key (2592), its first ratchet KEM public key (1568), the advert serial it encapsulated to, and an ML-DSA-87 signature (4627) over the whole, about 12 KB.
+- **CHAN.k, k = 1..63** — message `seq` lives in slot `1 + (seq mod 63)`: `header(n, m, seq, device_id, cursor, optional kem_ct 1568, optional kem_pk 1568) ‖ AEAD_{mk}(body)`. `n` and `m` are turn numbers; `device_id` is a `u32` device identifier, and a single-device installation writes `0`; `cursor` is the writer's collected cursor over the reader's messages, carried in every reply. Header up to about 3.2 KB, body up to about 12 KB.
 
 ### On-disk records
 
 All under the application's at-rest AEAD.
 
-- **SELF** — the current and previous advert KEM secret keys and the advert serial. Derived owner keypairs are recomputed from the identity, never stored.
-- **CONV(peer)** — the peer's identity public key, both channel lookup keys, the conversation generation, ratchet state (chain roots, the two most recent own ratchet KEM secrets, the peer's latest ratchet public key), `send_seq`, `peer_collected` (their cursor over my messages), `my_collected` (mine over theirs), and the hello slot and `r` while a hello is outstanding.
+- **SELF** — the current and previous advert KEM secret keys, the advert serial, the current key's `not_before`, and the moment the previous key stopped being current. Derived owner keypairs are recomputed from the identity, never stored.
+- **CONV(peer)** — the peer's identity public key, both channel lookup keys, the conversation generation, ratchet state (chain roots, the two most recent own ratchet KEM secrets, the peer's latest ratchet public key), `send_seq`, `peer_collected` (their cursor over my messages), `my_collected` (mine over theirs), and, while a hello is outstanding, its slot, `r` and its sealed bytes, so a rewrite is byte-identical.
 - **OUTBOX(peer, seq)** — the exact ciphertext written to the slot. Deleted once the peer's cursor passes `seq`.
 
 There is no message store. A received message is held in memory only while the application runs; a sent message persists only as the ciphertext in the outbox. On startup the user sees unread messages only.
@@ -86,9 +86,9 @@ Key deletion is strict: every per-message key is deleted after use, by the sende
 What the end state guarantees, by compromise event:
 
 - **Identity key, at any time.** No message content is revealed, past or future; the identity key never derives a decryption key. The attacker can sign and write a forged advert and so impersonate the victim for new first contacts until the identity is revoked, which is out of scope here. Established conversations are unaffected.
-- **At-rest state at time T, with a storage node retaining every ciphertext forever.** Messages the compromised party collected before T stay secret: their keys are gone. Messages it sent before T stay secret: only ciphertext is kept. Necessarily revealed: messages addressed to it and not yet collected at T, and the current advert KEM secret, hence any hello and first turn still on the DHT encapsulated to it, bounded by the weekly rotation.
+- **At-rest state at time T, with a storage node retaining every ciphertext forever.** Messages the compromised party collected before T stay secret: their keys are gone, with two limits. The initiator's turn 0 stays derivable for up to two rotation periods, from the retained advert secret and the stored hello bytes. The peer's turns written after the snapshot stay readable until the peer reads a turn written after it. Messages it sent before T stay secret: only ciphertext is kept. Necessarily revealed: messages addressed to it and not yet collected at T, and the current advert KEM secret, hence any hello and first turn still on the DHT encapsulated to it, bounded by the weekly rotation.
 - **After the compromise.** Once each party has completed one turn the other has read, later messages are secret again.
-- **Reset, user-triggered.** Forces a new turn on the next send in every conversation and rotates the advert immediately. It does not cover the identity key.
+- **Reset, user-triggered.** Forces a new turn on the next send in every conversation and rotates the advert immediately. It does not cover the identity key. Two forced turns on one side with no read between them drop the peer's in-flight crossing reply, because each side keeps only its two most recent KEM secrets.
 - **Not protected:** live compromise of a running process.
 
 ## Flows
@@ -99,7 +99,7 @@ What the end state guarantees, by compromise event:
 2. A derives its owner keypair for CHAN(A→B), generates a ratchet keypair `pk_A^0`, encapsulates to B's advert key to get `ss0`, and persists CONV(B) before any DHT write.
 3. A persists OUTBOX(B, 0), then writes CHAN(A→B).0 (the opening) and CHAN(A→B).1 (message `seq` 0); the seal is randomized, so the slot's bytes exist only once they are on disk.
 4. A writes the hello to DROP(B) at `H(r) mod 256` and reads it back once; if another value is there, A picks a new `r` and rewrites.
-5. A polls the hello slot and its own drop on its normal schedule and rewrites anything found evicted. If B's advert key changes before the hello is collected, A re-encapsulates to the new key and rewrites the hello and the first-turn slots.
+5. A polls the hello slot and its own drop on its normal schedule and rewrites anything found evicted. If B's advert key changes before the hello is collected, A re-encapsulates to the new key and rewrites the hello, whose sealed payload carries the original `ss0` so that B recovers the first-turn root from it; the first-turn slots stay as written.
 
 **Collection (B, whenever it next runs).**
 
@@ -134,7 +134,7 @@ Deleting a conversation is the sender-side teardown: erase the own channel recor
 
 ## Eviction detection
 
-A plain read cannot detect eviction: it returns the same absent result for a never-written and an evicted subkey, and a writer reading its own record is served the local copy without the network being asked, even on a forced refresh. The poller therefore uses `inspect_dht_record(key, subkeys, DHTReportScope::SyncSet)`, which reports the network's sequence number for each subkey as if the local copy did not exist. A network sequence number that is absent, or below the local one, is an eviction and triggers the rewrite from OUTBOX.
+A plain read cannot detect eviction: it returns the same absent result for a never-written and an evicted subkey, and a writer reading its own record is served the local copy without the network being asked, even on a forced refresh. The poller therefore uses `inspect_dht_record(key, subkeys, DHTReportScope::SyncSet)`, which reports the network's sequence number for each subkey as if the local copy did not exist. A network sequence number that is absent, or below the local one, is an eviction and triggers the rewrite from OUTBOX. For the advert record any difference between the two numbers is a repair.
 
 Because eviction is least-recently-touched per storage node and a read is a touch, the daily poll is itself the keep-alive; a write happens only on a day a node has dropped the record.
 
@@ -146,7 +146,7 @@ Because eviction is least-recently-touched per storage node and a read is a touc
 
 **Channel erasure by storage nodes.** The sender rewrites. Storage nodes cannot forge, lacking the owner key and the AEAD keys, and replay of an old slot is detected by `seq` in the associated data against the reader's cursor.
 
-**Redirect and impersonation.** The opening's signature binds the writer's identity, its first ratchet key and the recipient's advert serial; a relayed hello lands in a channel whose signature names the wrong advert.
+**Redirect and impersonation.** The opening's signature binds the writer's identity, the recipient's identity, its first ratchet key and the recipient's advert serial; a relayed hello lands in a channel whose signature names the wrong advert.
 
 **Linkability.** Storage nodes holding DROP(B) learn that someone sent B a hello, not who; those holding a channel learn nothing about either identity. Safety routing hides the originating node of every read and write. Hiding that B receives hellos at all is impossible without prior arrangement, because a sender must compute a location B reads, and that computation is public.
 
@@ -174,9 +174,9 @@ The layer is at most 6,000 lines of production code, checked at every commit: a 
 
 ## Open questions
 
-- Which key encrypts the channel control subkey, and does it change per turn?
+- Answered: the control subkey is sealed under `HKDF(ss_hello, DM_CHANNEL_CONTROL)`, `ss_hello` being the shared secret of the hello that named the channel; the key does not step per turn.
 - Does the root of B's direction also mix in the shared secret of B's hello written back, or only the encapsulation of B's first turn?
-- How wide is the device identifier, and what value does a single-device installation write?
+- Answered: the device identifier is a `u32`, and a single-device installation writes `0` (§ Records, CHAN.k).
 - What is the shape of the "closed" marker, and does a peer's client surface it?
 - What does a full drop poll cost on a mobile-class CPU? The mobile figure is an estimate until a native benchmark of 256 ML-KEM-1024 decapsulations plus 256 ML-DSA-87 verifications runs on a device.
 - Does `inspect_dht_record` with `SyncSet` report an eviction on the live network? The probe is to evict or zero a record from another node and confirm the report.
