@@ -961,6 +961,14 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-core`: DM channel owner seeds derive from `identity::keys::DmChannelRootSecret`, a seventh
+  identity-scoped expansion of the identity PRK under `kdf::info::DOMAIN_DM_CHANNEL_ROOT`
+  (`dm-channel-root/v1`), carried as `IdentityKeys::dm_channel_root`. `DmChannelRootSecret` is on the
+  `inline_scoped` arm with no public constructor. `dm::channel::derive_owner_seed` takes
+  `&DmChannelRootSecret` in place of an ML-DSA seed, and `dm::flows::Me`'s `identity_seed` field is
+  `channel_root`. No existing expansion's label or input changed.
+- `daemonseed-veilid-net`: the `two_node_dm_async` oracle persists a recovery phrase per role and derives
+  each step's identity from it with `derive_identity_keys`.
 - `docs/design/direct-messaging.md`: the direct-messaging design of record — founding claims with
   probes, substrate facts, records, keys and forward secrecy, flows, delivery, eviction detection,
   abuse bounds, write budget, wire change, multi-device foundations and open questions. The earlier

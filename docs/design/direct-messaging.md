@@ -65,8 +65,10 @@ There is no message store. A received message is held in memory only while the a
 
 ```
 identity ML-DSA-87 (long-term; signs adverts and channel openings)
- ├─ advert, drop and channel owner keypairs   (derived; DHT write authority only)
+ ├─ advert and drop owner keypairs   (derived from the public key; DHT write authority only)
  └─ [nothing that decrypts]
+identity channel secret (sibling of the signing key, from the same recovery phrase)
+ └─ channel owner keypairs           (derived; DHT write authority only)
 
 advert ML-KEM-1024 keypair (weekly, independent random)  ── hello ──▶ ss0
 ss0 ─▶ k_hello, R_A^0 (root of A's direction)

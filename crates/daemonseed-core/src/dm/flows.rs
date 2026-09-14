@@ -42,7 +42,7 @@ use crate::dm::drop::{
     DropError, DropOwnerSeed, HELLO_LEN, HELLO_LOOKUP_KEY_LEN, HelloAttempt, ReadBack,
 };
 use crate::dm::store::{ConvState, OutstandingHello, Store, StoreError};
-use crate::identity::keys::{ML_DSA_SEED_LEN, SignKeypair};
+use crate::identity::keys::{DmChannelRootSecret, SignKeypair};
 use crate::storage::dm_store::CorrespondenceLabel;
 
 /// The conversation generation a first contact opens at.
@@ -255,13 +255,14 @@ impl From<RecordError> for FlowError {
 
 /// This side's identity, as the two halves the flow needs of it.
 ///
-/// The seed derives channel owner keypairs and the keypair signs adverts and
-/// openings. Both are borrowed: neither is copied into this type.
+/// The channel root derives channel owner keypairs and the keypair signs
+/// adverts and openings. Both are borrowed: neither is copied into this type.
 pub struct Me<'a> {
     /// The identity signing keypair.
     pub signer: &'a SignKeypair,
-    /// The ML-DSA seed the identity was derived from.
-    pub identity_seed: &'a [u8; ML_DSA_SEED_LEN],
+    /// The identity's channel root secret,
+    /// [`crate::identity::keys::IdentityKeys::dm_channel_root`].
+    pub channel_root: &'a DmChannelRootSecret,
 }
 
 impl core::fmt::Debug for Me<'_> {
@@ -386,7 +387,7 @@ pub fn first_contact<R: Records>(
     )?;
 
     let channel_owner =
-        channel::derive_owner_seed(me.identity_seed, peer_identity_pk, FIRST_GENERATION)?;
+        channel::derive_owner_seed(me.channel_root, peer_identity_pk, FIRST_GENERATION)?;
     let outgoing_lookup_key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
     store.update_conv(&peer, |state| {
         state.outgoing_lookup_key = outgoing_lookup_key;
@@ -1154,7 +1155,7 @@ fn finish_accept<R: Records>(
 
     let outgoing_lookup_key = if state.outgoing_lookup_key == [0u8; HELLO_LOOKUP_KEY_LEN] {
         let channel_owner =
-            channel::derive_owner_seed(me.identity_seed, &identity, FIRST_GENERATION)?;
+            channel::derive_owner_seed(me.channel_root, &identity, FIRST_GENERATION)?;
         let key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
         store.update_conv(&peer, |state| state.outgoing_lookup_key = key)?;
         key
@@ -1521,6 +1522,7 @@ mod tests {
     use oxicrypt_sha::sha384;
 
     use crate::dm::store::encode_conv;
+    use crate::identity::keys::ML_DSA_SEED_LEN;
     use crate::storage::seeds::AEAD_KEY_LEN;
 
     /// A moment inside every advert's usability window.
@@ -1747,6 +1749,7 @@ mod tests {
     struct Party {
         signer: SignKeypair,
         seed: [u8; ML_DSA_SEED_LEN],
+        channel_root: DmChannelRootSecret,
         advert_keys: AdvertKeys,
         root: tempfile::TempDir,
         at_rest: [u8; AEAD_KEY_LEN],
@@ -1760,6 +1763,8 @@ mod tests {
             Self {
                 signer: SignKeypair::from_ml_dsa_seed(&seed).expect("derive a signer"),
                 seed,
+                // Distinct from the signing seed, as an identity's two secrets are.
+                channel_root: DmChannelRootSecret::from_bytes([!byte; 32]),
                 advert_keys: AdvertKeys::new(NOW, |b| entropy.fill(b)).expect("advert keys"),
                 root: tempfile::tempdir().expect("a profile directory"),
                 at_rest: [byte; AEAD_KEY_LEN],
@@ -1773,7 +1778,7 @@ mod tests {
         fn me(&self) -> Me<'_> {
             Me {
                 signer: &self.signer,
-                identity_seed: &self.seed,
+                channel_root: &self.channel_root,
             }
         }
 
@@ -2159,7 +2164,7 @@ mod tests {
             .to_vec();
         let image = encode_conv(&state);
 
-        let b_owner = channel::derive_owner_seed(&b.seed, a.pk(), FIRST_GENERATION)
+        let b_owner = channel::derive_owner_seed(&b.channel_root, a.pk(), FIRST_GENERATION)
             .expect("B's channel owner seed");
         assert!(
             !contains(&image, b_owner.as_bytes()),
@@ -2168,6 +2173,10 @@ mod tests {
         assert!(
             !contains(&image, &b.seed),
             "B's identity seed is in A's conversation record"
+        );
+        assert!(
+            !b.channel_root.with_bytes(|root| contains(&image, root)),
+            "B's channel root is in A's conversation record"
         );
         assert!(
             contains(&image, &own_dk),
@@ -2757,7 +2766,7 @@ mod tests {
 
         let store_a = a.store();
         let state = store_a.load_conv(&peer_a).expect("load").expect("a record");
-        let own_owner = channel::derive_owner_seed(&a.seed, b.pk(), FIRST_GENERATION)
+        let own_owner = channel::derive_owner_seed(&a.channel_root, b.pk(), FIRST_GENERATION)
             .expect("A's own channel owner seed");
         let drop_owner = drop_plane::derive_owner_seed(b.pk()).expect("B's drop owner seed");
         let advert_owner = advert::derive_owner_seed(b.pk()).expect("B's advert owner seed");

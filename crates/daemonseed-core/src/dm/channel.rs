@@ -10,8 +10,10 @@
 //! Four rules govern it:
 //!
 //! - **The owner keypair is derived, never random.** [`derive_owner_seed`]
-//!   is `HKDF-SHA-384` over the writer's identity secret, the peer's identity
-//!   public key and the conversation generation, each length-prefixed. The
+//!   is `HKDF-SHA-384` over the writer's channel root secret, the peer's
+//!   identity public key and the conversation generation, each length-prefixed.
+//!   The channel root is its own expansion of the identity PRK, never the
+//!   signing key ([`DmChannelRootSecret`]). The
 //!   seed is the VLD0 secret key, and Veilid's lookup key is a hash of the
 //!   owner PUBLIC key — itself a pure function of the seed — so any store that
 //!   derives this seed addresses the same record. That is what lets a second
@@ -55,8 +57,8 @@
 //!   changes no record.
 //!
 //! Everything here is pure: no I/O, no clock, no ambient randomness except
-//! the AEAD nonce the shared envelope primitive draws. The identity secret is
-//! a parameter, never read from a store.
+//! the AEAD nonce the shared envelope primitive draws. The channel root secret
+//! is a parameter, never read from a store.
 //!
 //! Serves FC1, FC5.
 
@@ -69,7 +71,7 @@ use zeroize::Zeroize;
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::dm::{advert, domain, push_lp};
-use crate::identity::keys::{ML_DSA_SEED_LEN, SignKeypair, SignatureError, verify_signature};
+use crate::identity::keys::{DmChannelRootSecret, SignKeypair, SignatureError, verify_signature};
 use crate::secret_seed::{derive_boxed_seed, redacted_secret_newtype};
 
 /// Subkeys in a channel record — the `o_cnt` of its `dflt(o_cnt)` schema, and
@@ -178,7 +180,7 @@ redacted_secret_newtype! {
     /// the VLD0 secret key of the record the holder writes.
     ///
     /// Unlike the advert's and the drop's owner seeds this one is NOT
-    /// world-derivable: it is rooted in the writer's identity secret, so only
+    /// world-derivable: it is rooted in the writer's channel root secret, so only
     /// the writer (or another device holding the same recovery phrase) can
     /// compute it, and only the writer can write the record.
     boxed pub struct ChannelOwnerSeed([u8; CHANNEL_OWNER_SEED_LEN]);
@@ -430,25 +432,27 @@ pub fn collected(seq: u64, peer_cursor: u64) -> bool {
 }
 
 /// Derive the owner seed for one direction of one conversation:
-/// `HKDF-SHA-384(salt = DM_CHANNEL_SALT, ikm = identity_seed, info =
+/// `HKDF-SHA-384(salt = DM_CHANNEL_SALT, ikm = channel_root, info =
 /// DM_CHANNEL_OWNER ‖ lp(peer identity pk) ‖ lp(BE64(generation)))`.
 ///
 /// Deterministic and pure in its three inputs, which is the whole point: any
-/// store holding the same recovery phrase re-derives the same seed, hence the
-/// same VLD0 keypair and the same record address, and the conversation
-/// generation is what makes a re-established conversation a different record
-/// rather than a reuse of the old one.
+/// store holding the same recovery phrase re-derives the same channel root and
+/// so the same seed, hence the same VLD0 keypair and the same record address,
+/// and the conversation generation is what makes a re-established conversation
+/// a different record rather than a reuse of the old one.
 ///
-/// `identity_seed` is a parameter and is never read from a store here. The
-/// public half — and so the record's lookup key — is computed from this seed
-/// by the transport layer, which is where VLD0's Ed25519 lives; it is a pure
-/// function of the seed, so equal seeds address equal records.
+/// `channel_root` is [`crate::identity::keys::IdentityKeys::dm_channel_root`],
+/// a parameter never read from a store here. The public half — and so the
+/// record's lookup key — is computed from this seed by the transport layer,
+/// which is where VLD0's Ed25519 lives; it is a pure function of the seed, so
+/// equal seeds address equal records.
 pub fn derive_owner_seed(
-    identity_seed: &[u8; ML_DSA_SEED_LEN],
+    channel_root: &DmChannelRootSecret,
     peer_identity_pk: &[u8; ml_dsa::PK_LEN],
     generation: u64,
 ) -> Result<ChannelOwnerSeed, ChannelError> {
-    let hkdf = HkdfSha384::extract(Some(domain::DM_CHANNEL_SALT), identity_seed)
+    let hkdf = channel_root
+        .with_bytes(|root| HkdfSha384::extract(Some(domain::DM_CHANNEL_SALT), root))
         .map_err(ChannelError::Kdf)?;
     let mut info = Vec::with_capacity(domain::DM_CHANNEL_OWNER.len() + 16 + ml_dsa::PK_LEN + 8);
     info.extend_from_slice(domain::DM_CHANNEL_OWNER);
@@ -1166,12 +1170,12 @@ mod tests {
 
     // ── owner seed ──────────────────────────────────────────────────────────
 
-    /// Two stores holding the same identity secret, peer and generation
-    /// derive byte-equal owner seeds, and so the same VLD0 keypair and the
-    /// same record. A different generation is a different record.
+    /// Two stores holding the same channel root, peer and generation derive
+    /// byte-equal owner seeds, and so the same VLD0 keypair and the same
+    /// record. A different generation is a different record.
     #[test]
     fn the_owner_seed_is_deterministic_and_generation_scoped() {
-        let secret = [0x31u8; ML_DSA_SEED_LEN];
+        let secret = DmChannelRootSecret::from_bytes([0x31u8; 32]);
         let peer = *signer(0x77).public_key();
         let first = derive_owner_seed(&secret, &peer, 0).unwrap();
         let again = derive_owner_seed(&secret, &peer, 0).unwrap();
@@ -1180,10 +1184,11 @@ mod tests {
         let next_generation = derive_owner_seed(&secret, &peer, 1).unwrap();
         assert_ne!(first.as_bytes(), next_generation.as_bytes());
 
-        // The controls: a different identity secret and a different peer each
+        // The controls: a different channel root and a different peer each
         // move the record too, so the equality above is not one the
         // derivation gives to everything.
-        let other_secret = derive_owner_seed(&[0x32u8; ML_DSA_SEED_LEN], &peer, 0).unwrap();
+        let other_secret =
+            derive_owner_seed(&DmChannelRootSecret::from_bytes([0x32u8; 32]), &peer, 0).unwrap();
         assert_ne!(first.as_bytes(), other_secret.as_bytes());
         let other_peer = derive_owner_seed(&secret, signer(0x78).public_key(), 0).unwrap();
         assert_ne!(first.as_bytes(), other_peer.as_bytes());
@@ -1623,7 +1628,7 @@ mod tests {
     #[test]
     fn known_answer_owner_seed_aad_and_opening_preimage() {
         module();
-        let seed = [0x31u8; ML_DSA_SEED_LEN];
+        let seed = DmChannelRootSecret::from_bytes([0x31u8; 32]);
         let peer = [0x67u8; ml_dsa::PK_LEN];
         assert_eq!(
             hex::encode(derive_owner_seed(&seed, &peer, 7).unwrap().as_bytes()),
@@ -1643,7 +1648,7 @@ mod tests {
         );
     }
 
-    /// `derive_owner_seed` over an identity seed of 32 `0x31` bytes, a peer
+    /// `derive_owner_seed` over a channel root of 32 `0x31` bytes, a peer
     /// public key of 2592 `0x67` bytes and generation 7.
     const KAT_OWNER_SEED: &str = "298b040277b2d86e07e952111f5cf70639cd9cc74a523c7eeb0da67c064017bf";
 

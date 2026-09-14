@@ -1154,10 +1154,11 @@ fn the_provisional_records_signing_key_is_zeroed_before_its_memory_is_released()
 /// `[u8; 32]` inside a heap block the witness can watch. The wrapper's `Drop`
 /// wipes the array in place, and only then is the block released.
 ///
-/// All three identity-rooted secrets come from one derivation, so this covers
+/// All four identity-rooted secrets come from one derivation, so this covers
 /// every inline-family secret that has a public constructor — with one caveat
-/// since #271: `VeilidNodeSeed` is on the `inline_scoped` arm rather than
-/// `inline`, so its case here proves the *scoped* arm's expansion, not this one's.
+/// since #271: `VeilidNodeSeed` and `DmChannelRootSecret` are on the
+/// `inline_scoped` arm rather than `inline`, so their cases here prove the
+/// *scoped* arm's expansion, not this one's.
 /// The two arms share their storage, `Zeroize` and `ZeroizeOnDrop` derives, which
 /// is why they are witnessed together, but a change to one does not move the
 /// other. The inline ratchet keys (`RootKey`, `ChainKey`, `MessageKey`) are built
@@ -1195,6 +1196,12 @@ fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
         (0, SEED_LEN),
         || Box::new(keys.dm_doorbell_slot_secret),
         |s| at(s.as_bytes()),
+    );
+    assert_zeroed_when_freed(
+        "DmChannelRootSecret",
+        (0, SEED_LEN),
+        || Box::new(keys.dm_channel_root),
+        |s| s.with_bytes(|b| at(b)),
     );
 }
 

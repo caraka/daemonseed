@@ -22,10 +22,12 @@
 //!   is NOT shared — each is a distinct expansion of the identity PRK — only the
 //!   newtype hygiene is.
 //! - **Identity-rooted capabilities** — [`crate::identity::keys::VeilidNodeSeed`]
-//!   alone, on the `inline_scoped` arm: same storage, but reached through
-//!   `with_bytes` and not `Clone` (#271). It is the node identity, so a copy of it
-//!   is a copy of the whole process's standing on the network — unlike its two
-//!   siblings above, which root content keys and a slot index.
+//!   and [`crate::identity::keys::DmChannelRootSecret`], on the `inline_scoped`
+//!   arm: same storage, but reached through `with_bytes` and not `Clone` (#271).
+//!   The first is the node identity, so a copy of it is a copy of the whole
+//!   process's standing on the network; the second is write authority over every
+//!   DM channel the identity owns — unlike the two siblings above, which root
+//!   content keys and a slot index.
 //! - **The operator's runtime-loaded seed** — [`crate::public_space::ProjectAnnounceSeed`]
 //!   on the `boxed` arm: not derived here at all but parsed from text the operator
 //!   supplies, then checked against the public keys baked into the build. It is the
@@ -378,8 +380,9 @@ mod tests {
         assert_zeroize_on_drop::<crate::identity::keys::ShareRootIkm>();
         assert_zeroize_on_drop::<crate::identity::keys::DmDoorbellSlotSecret>();
 
-        // inline_scoped arm — the one identity-rooted capability.
+        // inline_scoped arm — the identity-rooted capabilities.
         assert_zeroize_on_drop::<crate::identity::keys::VeilidNodeSeed>();
+        assert_zeroize_on_drop::<crate::identity::keys::DmChannelRootSecret>();
 
         // inline arm — the DM ratchet key schedule.
         assert_zeroize_on_drop::<crate::dm::ratchet::RootKey>();

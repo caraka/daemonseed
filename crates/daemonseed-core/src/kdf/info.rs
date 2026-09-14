@@ -44,7 +44,7 @@ pub const DOMAIN_KEM_Z: &str = "kem-z";
 /// from this — it binds only the node/transport identity.
 pub const DOMAIN_VEILID_NODE: &str = "veilid-node";
 
-/// Domain separator for the share-root identity IKM (#156). The FOURTH expansion
+/// Domain separator for the share-root identity IKM (#156). The FIFTH expansion
 /// of the identity PRK (sibling of `sign` / `kem-d` / `kem-z` / `veilid-node`),
 /// yielding the ONE normative 32-byte secret from which per-share hiding nonces
 /// derive (`share_announce::derive_share_root_nonce`). Passed through
@@ -55,7 +55,7 @@ pub const DOMAIN_VEILID_NODE: &str = "veilid-node";
 /// share-id commitment nonce.
 pub const DOMAIN_SHARE_ROOT_IKM: &str = "share-root-ikm/v2";
 
-/// Domain separator for the DM doorbell slot secret (#233). The FIFTH expansion
+/// Domain separator for the DM doorbell slot secret (#233). The SIXTH expansion
 /// of the identity PRK (sibling of `sign` / `kem-d` / `kem-z` / `veilid-node` /
 /// `share-root-ikm`), yielding the 32-byte secret that picks which of the
 /// recipient's 32 doorbell slots this sender knocks on
@@ -74,9 +74,25 @@ pub const DOMAIN_SHARE_ROOT_IKM: &str = "share-root-ikm/v2";
 /// them one shared slot would make them clobber each other's knocks.
 pub const DOMAIN_DM_DOORBELL_SLOT: &str = "dm-doorbell-slot/v1";
 
+/// Domain separator for the DM channel root secret. The SEVENTH expansion of
+/// the identity PRK (sibling of `sign` / `kem-d` / `kem-z` / `veilid-node` /
+/// `share-root-ikm` / `dm-doorbell-slot`), yielding the 32-byte secret that is
+/// the sole secret input to every DM channel owner seed
+/// (`dm::channel::derive_owner_seed`).
+///
+/// A channel owner seed is write authority over one direction of one
+/// conversation, so the secret it descends from is kept off the signing key:
+/// holding it confers no signature, and holding the signing key confers no
+/// channel.
+///
+/// Passed through [`primary`]/[`device`] like `dm-doorbell-slot`, so a Primary
+/// and a Device presentation of one mnemonic own different channels.
+pub const DOMAIN_DM_CHANNEL_ROOT: &str = "dm-channel-root/v1";
+
 /// Build the full HKDF info string for the primary identity's given domain.
 /// `domain` is one of `DOMAIN_SIGN`, `DOMAIN_KEM_D`, `DOMAIN_KEM_Z`,
-/// `DOMAIN_VEILID_NODE`, `DOMAIN_SHARE_ROOT_IKM`.
+/// `DOMAIN_VEILID_NODE`, `DOMAIN_SHARE_ROOT_IKM`, `DOMAIN_DM_DOORBELL_SLOT`,
+/// `DOMAIN_DM_CHANNEL_ROOT`.
 pub fn primary(domain: &str) -> String {
     format!("{PRIMARY_PREFIX}/{domain}")
 }
@@ -351,6 +367,47 @@ mod tests {
             device("123e4567-e89b-12d3-a456-426614174000", DOMAIN_SIGN),
             "daemonseed/identity/device-123e4567-e89b-12d3-a456-426614174000/sign"
         );
+        // The DM channel root label (frozen — a second implementation must
+        // reproduce it byte-for-byte or it addresses channels the correspondent
+        // never reads). Identity-scoped, so the device form is pinned too.
+        assert_eq!(
+            primary(DOMAIN_DM_CHANNEL_ROOT),
+            "daemonseed/identity/primary/dm-channel-root/v1"
+        );
+        assert_eq!(
+            device(
+                "123e4567-e89b-12d3-a456-426614174000",
+                DOMAIN_DM_CHANNEL_ROOT
+            ),
+            "daemonseed/identity/device-123e4567-e89b-12d3-a456-426614174000/dm-channel-root/v1"
+        );
+    }
+
+    /// No identity domain label is a prefix of another.
+    ///
+    /// As for the auxiliary labels below, a shared prefix is not itself an
+    /// attack: HKDF-Expand computes `HMAC(PRK, T(i-1) ‖ info ‖ i)` over the whole
+    /// info string, so distinct labels give unrelated outputs. This pins visible
+    /// distinctness, and stops a label added by copy-edit from silently sharing
+    /// a stem with an existing one.
+    #[test]
+    fn identity_domain_labels_are_mutually_distinct() {
+        let all = [
+            DOMAIN_SIGN,
+            DOMAIN_KEM_D,
+            DOMAIN_KEM_Z,
+            DOMAIN_VEILID_NODE,
+            DOMAIN_SHARE_ROOT_IKM,
+            DOMAIN_DM_DOORBELL_SLOT,
+            DOMAIN_DM_CHANNEL_ROOT,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i != j {
+                    assert!(!a.starts_with(b), "{a} starts with {b}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -374,10 +431,11 @@ mod tests {
 
     /// No auxiliary info string is a prefix of another.
     ///
-    /// HKDF's info is length-delimited, so a shared prefix is not itself an
-    /// attack — this pins the weaker property that the labels are visibly
-    /// distinct, which is what stops a future one being added by copy-edit and
-    /// silently colliding with an existing key.
+    /// A shared prefix is not itself an attack: HKDF-Expand computes
+    /// `HMAC(PRK, T(i-1) ‖ info ‖ i)` over the whole info string, so distinct
+    /// strings give unrelated outputs. This pins the weaker property that the
+    /// labels are visibly distinct, which is what stops a future one being added
+    /// by copy-edit and silently colliding with an existing key.
     #[test]
     fn auxiliary_info_strings_are_mutually_distinct() {
         let all = [

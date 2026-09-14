@@ -93,12 +93,13 @@ modules:
       a BIP-39 seed via HKDF-SHA-384 with domain-separated info strings.
       Distinguishes "primary" (cross-device root) from "per-device" (UUID-
       keyed) identity branches per ISC-C1 / C13. derive_identity_keys expands
-      the identity PRK six times under identity-scoped labels: sign, kem-d,
-      kem-z, veilid-node (VeilidNodeSeed), share-root-ikm (ShareRootIkm), and
+      the identity PRK seven times under identity-scoped labels: sign, kem-d,
+      kem-z, veilid-node (VeilidNodeSeed), share-root-ikm (ShareRootIkm),
       dm-doorbell-slot (DmDoorbellSlotSecret, the input to
-      dm::doorbell::slot_for). The three non-keypair secrets share no key
-      material with the signing or KEM keys; each zeroizes on drop and redacts
-      its Debug.
+      dm::doorbell::slot_for), and dm-channel-root (DmChannelRootSecret, the
+      secret input to dm::channel::derive_owner_seed). The four non-keypair
+      secrets share no key material with the signing or KEM keys; each
+      zeroizes on drop and redacts its Debug.
     no_std: false
     depends_on:
       - daemonseed_core::identity::mnemonic
@@ -2293,9 +2294,9 @@ modules:
       MESSAGE_HEADER_MAX_LEN (3188) a header carrying both turn fields,
       SEALED_CONTROL_MAX_LEN (11432) a sealed control record, and MESSAGE_BODY_MAX_LEN
       (13168) is derived as CHANNEL_SUBKEY_LEN less the header maximum and the AEAD
-      envelope overhead. derive_owner_seed(identity_seed, peer_identity_pk, generation)
+      envelope overhead. derive_owner_seed(channel_root, peer_identity_pk, generation)
       -> Result<ChannelOwnerSeed, ChannelError> is HKDF-SHA384(salt=
-      daemonseed/dm/channel/salt/v1, ikm=identity ML-DSA seed, info=
+      daemonseed/dm/channel/salt/v1, ikm=DmChannelRootSecret, info=
       daemonseed/dm/channel/owner/v1 || lp(peer pubkey) || lp(BE64(generation))); the
       seed is the VLD0 secret key and the record's lookup key derives from the public
       half, computed by the transport layer, so equal seeds address equal records.
@@ -2494,7 +2495,7 @@ modules:
       record's identity and so of its address. RecordError wraps a transport's
       own error; FlowError is Advert, Drop, Channel, Chain, Store, Records,
       NoAdvert, NoOpening, NotOutstanding, AlreadyEstablished,
-      AwaitingAcceptance, DropFull, Incomplete and HelloLength. Me { signer, identity_seed } is this side's
+      AwaitingAcceptance, DropFull, Incomplete and HelloLength. Me { signer, channel_root } is this side's
       identity, FIRST_GENERATION is 0 and MAX_REPICKS is 1.
       first_contact(store, records, me, peer_identity_pk, body, fill, now) ->
       Result<FirstContact, FlowError> holds one conversation per correspondent
@@ -3149,7 +3150,23 @@ types:
   - name: IdentityKeys
     module: daemonseed_core::identity::keys
     kind: struct
-    description: Bundle of SignKeypair + KemKeypair for one Identity branch.
+    description: >-
+      Bundle for one Identity branch: signing (SignKeypair), kem (KemKeypair),
+      veilid_node_seed, share_root_ikm, dm_doorbell_slot_secret and
+      dm_channel_root.
+    security:
+      contains_secret: true
+      zeroize_on_drop: true
+
+  - name: DmChannelRootSecret
+    module: daemonseed_core::identity::keys
+    kind: struct
+    description: >-
+      The 32-byte (DM_CHANNEL_ROOT_SECRET_LEN) sole secret input to
+      dm::channel::derive_owner_seed, expanded from the identity PRK under the
+      identity-scoped label dm-channel-root/v1. inline_scoped arm: bytes reached
+      through with_bytes, not Clone, Debug redacted, no public constructor.
+      Recomputable from the recovery phrase; never persisted, never on the wire.
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -5581,6 +5598,21 @@ functions:
           condition: HKDF, oxicrypt-module, or KEM keygen failed.
     preconditions:
       - description: The oxicrypt module must be operational.
+
+  - name: DmChannelRootSecret::with_bytes
+    module: daemonseed_core::identity::keys
+    description: >-
+      Run a closure over the raw 32-byte channel root secret and return its value.
+      The only accessor; there is no borrowing accessor and the type is not Clone.
+    signature: "pub fn with_bytes<T>(&self, f: impl FnOnce(&[u8; DM_CHANNEL_ROOT_SECRET_LEN]) -> T) -> T"
+    parameters:
+      - name: f
+        type: "impl FnOnce(&[u8; DM_CHANNEL_ROOT_SECRET_LEN]) -> T"
+        direction: in
+        description: Receives a borrow of the raw secret for the duration of the call.
+    returns:
+      type: "T"
+      description: Whatever the closure returns.
 
   - name: VeilidNodeSeed::with_bytes
     module: daemonseed_core::identity::keys
@@ -9491,16 +9523,16 @@ functions:
   - name: "channel::derive_owner_seed"
     module: daemonseed_core::dm::channel
     description: >-
-      Derives the channel's Veilid owner seed from the writer's identity seed, the
-      peer's identity public key and the generation. The seed is the VLD0 secret
-      key and the lookup key derives from its public half, so equal seeds address
-      equal records.
-    signature: "pub fn derive_owner_seed(identity_seed: &[u8; ML_DSA_SEED_LEN], peer_identity_pk: &[u8; ml_dsa::PK_LEN], generation: u64) -> Result<ChannelOwnerSeed, ChannelError>"
+      Derives the channel's Veilid owner seed from the writer's channel root
+      secret, the peer's identity public key and the generation. The seed is the
+      VLD0 secret key and the lookup key derives from its public half, so equal
+      seeds address equal records.
+    signature: "pub fn derive_owner_seed(channel_root: &DmChannelRootSecret, peer_identity_pk: &[u8; ml_dsa::PK_LEN], generation: u64) -> Result<ChannelOwnerSeed, ChannelError>"
     parameters:
-      - name: identity_seed
-        type: "&[u8; ML_DSA_SEED_LEN]"
+      - name: channel_root
+        type: "&DmChannelRootSecret"
         direction: in
-        description: The writer's own ML-DSA-87 seed.
+        description: The writer's own channel root secret (IdentityKeys::dm_channel_root).
       - name: peer_identity_pk
         type: "&[u8; ml_dsa::PK_LEN]"
         direction: in

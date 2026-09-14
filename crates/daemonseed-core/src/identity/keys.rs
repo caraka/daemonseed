@@ -251,7 +251,7 @@ impl core::fmt::Debug for KemKeypair {
 }
 
 /// Length of the share-root identity IKM (#156). A dedicated 32-byte secret,
-/// the FOURTH expansion of the identity PRK, from which per-share hiding nonces
+/// the FIFTH expansion of the identity PRK, from which per-share hiding nonces
 /// (`share_announce::derive_share_root_nonce`) are derived. Pinned length —
 /// a second implementation must reproduce it exactly or every `share_id` re-mints.
 pub const SHARE_ROOT_IKM_LEN: usize = 32;
@@ -263,6 +263,9 @@ pub const VEILID_NODE_SEED_LEN: usize = 32;
 
 /// Length of the DM doorbell slot secret (#233) — see [`DmDoorbellSlotSecret`].
 pub const DM_DOORBELL_SLOT_SECRET_LEN: usize = 32;
+
+/// Length of the DM channel root secret — see [`DmChannelRootSecret`].
+pub const DM_CHANNEL_ROOT_SECRET_LEN: usize = 32;
 
 redacted_secret_newtype! {
     /// The share-root identity IKM (#156). A dedicated secret derived from the same
@@ -280,7 +283,7 @@ redacted_secret_newtype! {
     ///
     /// Its newtype hygiene (inline `[u8; 32]`, `Clone`, zeroize-on-drop, redacted
     /// `Debug`) is the shared `redacted_secret_newtype!` `inline` shape; its
-    /// DERIVATION is distinct (the fourth expansion of the identity PRK, in
+    /// DERIVATION is distinct (the fifth expansion of the identity PRK, in
     /// [`derive_identity_keys`]) and is NOT shared with the boxed rendezvous-owner
     /// seeds.
     inline pub struct ShareRootIkm([u8; SHARE_ROOT_IKM_LEN]);
@@ -379,8 +382,95 @@ redacted_secret_newtype! {
     inline pub struct DmDoorbellSlotSecret([u8; DM_DOORBELL_SLOT_SECRET_LEN]);
 }
 
-/// Both keypairs an [`Identity`] produces, derived deterministically from a
-/// mnemonic, plus the Veilid node identity seed (D3).
+redacted_secret_newtype! {
+    /// The DM channel root secret: the sole secret input to channel owner-key
+    /// derivation ([`crate::dm::channel::derive_owner_seed`]). Derived from the
+    /// same mnemonic as the ML-DSA/ML-KEM identity but under a domain-separated,
+    /// identity-scoped label (`info::DOMAIN_DM_CHANNEL_ROOT`), a sibling of
+    /// [`DmDoorbellSlotSecret`], [`ShareRootIkm`] and [`VeilidNodeSeed`].
+    ///
+    /// Because it is **mnemonic-derived**, any installation holding the recovery
+    /// phrase recomputes it, and with it the owner keypair of every channel this
+    /// identity writes, so no channel owner key is ever stored. Because it is
+    /// **identity-scoped**, a Primary and a Device presentation of one mnemonic
+    /// own different channels. It is not derived from the ML-DSA seed, for the
+    /// key-separation reasoning [`ShareRootIkm`] gives: no secret with another use
+    /// descends from the signing key. It seals and opens nothing; it addresses
+    /// records and authorises writes to them. Zeroizes on drop; never persisted,
+    /// never on the wire.
+    ///
+    /// On the `inline_scoped` arm, for the reason [`VeilidNodeSeed`] is: it is a
+    /// **capability** — write authority over every channel of every conversation
+    /// this identity holds, a strictly larger grant than any one record's — so
+    /// the bytes are reached through `with_bytes` and the type is not `Clone`.
+    ///
+    /// # The surface, pinned at the type
+    ///
+    /// Positive control first, since every case after it is `compile_fail` and
+    /// would pass on a misspelt path:
+    ///
+    /// ```
+    /// fn reachable(s: &daemonseed_core::identity::keys::DmChannelRootSecret) -> usize {
+    ///     s.with_bytes(|b| b.len())
+    /// }
+    /// ```
+    ///
+    /// Not `Clone`:
+    ///
+    /// ```compile_fail
+    /// fn needs_clone<T: Clone>() {}
+    /// needs_clone::<daemonseed_core::identity::keys::DmChannelRootSecret>();
+    /// ```
+    ///
+    /// No borrowing accessor, under this name:
+    ///
+    /// ```compile_fail
+    /// fn borrows(s: &daemonseed_core::identity::keys::DmChannelRootSecret) {
+    ///     let _ = s.as_bytes();
+    /// }
+    /// ```
+    ///
+    /// No `Deref`:
+    ///
+    /// ```compile_fail
+    /// fn needs_deref<T: core::ops::Deref>() {}
+    /// needs_deref::<daemonseed_core::identity::keys::DmChannelRootSecret>();
+    /// ```
+    ///
+    /// And no `AsRef<[u8]>`:
+    ///
+    /// ```compile_fail
+    /// fn needs_as_ref<T: AsRef<[u8]>>() {}
+    /// needs_as_ref::<daemonseed_core::identity::keys::DmChannelRootSecret>();
+    /// ```
+    ///
+    /// Nor a public constructor, so no caller outside this crate can wrap
+    /// arbitrary bytes, an ML-DSA seed among them, as a channel root:
+    ///
+    /// ```compile_fail
+    /// let _ = daemonseed_core::identity::keys::DmChannelRootSecret::from_bytes([0u8; 32]);
+    /// ```
+    ///
+    /// **What this does not reach:** a borrowing accessor added under some *other*
+    /// name, or a blanket impl in a third crate. Neither is expressible as a
+    /// bound over a name that does not yet exist. The arm-text check in
+    /// `secret_seed.rs` catches the first when it is added to the macro; added
+    /// directly to this type, it is caught by review alone.
+    inline_scoped pub struct DmChannelRootSecret([u8; DM_CHANNEL_ROOT_SECRET_LEN]);
+}
+
+#[cfg(test)]
+impl DmChannelRootSecret {
+    /// Wrap fixed bytes as a channel root, for a known-answer vector or a
+    /// fixture that needs a root independent of any mnemonic.
+    pub(crate) fn from_bytes(bytes: [u8; DM_CHANNEL_ROOT_SECRET_LEN]) -> Self {
+        Self(bytes)
+    }
+}
+
+/// Everything one [`Identity`] derives from a mnemonic: the signing and KEM
+/// keypairs, the Veilid node identity seed (D3), the share-root IKM, the DM
+/// doorbell slot secret and the DM channel root secret.
 #[derive(Debug)]
 pub struct IdentityKeys {
     pub identity: Identity,
@@ -392,14 +482,17 @@ pub struct IdentityKeys {
     pub share_root_ikm: ShareRootIkm,
     /// DM doorbell slot secret (#233) — see [`DmDoorbellSlotSecret`].
     pub dm_doorbell_slot_secret: DmDoorbellSlotSecret,
+    /// DM channel root secret — see [`DmChannelRootSecret`].
+    pub dm_channel_root: DmChannelRootSecret,
 }
 
-/// Derive the signing + KEM keypair for one [`Identity`] from a mnemonic.
+/// Derive every key and secret of one [`Identity`] from a mnemonic.
 ///
-/// Walks the chain `mnemonic → BIP-39 seed → HKDF-Extract → 3× expand →
-/// ML-DSA-87 + ML-KEM-1024 keygen`. All intermediate seed buffers are
-/// zeroed via Drop before returning; the returned keypairs zero on their
-/// own drop.
+/// Walks the chain `mnemonic → BIP-39 seed → HKDF-Extract → 7× expand`: three
+/// expansions feed ML-DSA-87 and ML-KEM-1024 keygen, and four become the
+/// Veilid node seed, the share-root IKM, the doorbell slot secret and the
+/// channel root secret. All intermediate seed buffers are zeroed via Drop
+/// before returning; the returned keys and secrets zero on their own drop.
 pub fn derive_identity_keys(
     mnemonic: &Mnemonic,
     identity: Identity,
@@ -458,7 +551,7 @@ pub fn derive_identity_keys(
     .map_err(KeyDerivationError::Hkdf)?;
     let veilid_node_seed = VeilidNodeSeed(*veilid_seed);
 
-    // Share-root IKM (#156): a FOURTH expansion of the SAME PRK under a
+    // Share-root IKM (#156): a FIFTH expansion of the SAME PRK under a
     // domain-separated, identity-scoped label. This 32-byte secret is the ONE
     // normative IKM for per-share hiding nonces (share_announce), so GUI and TUI
     // — both re-deriving from the same (mnemonic, identity) — produce the
@@ -473,7 +566,7 @@ pub fn derive_identity_keys(
     .map_err(KeyDerivationError::Hkdf)?;
     let share_root_ikm = ShareRootIkm(*share_root_ikm_buf);
 
-    // DM doorbell slot secret (#233): a FIFTH expansion of the SAME PRK under a
+    // DM doorbell slot secret (#233): a SIXTH expansion of the SAME PRK under a
     // domain-separated, identity-scoped label. Picks which of a recipient's 32
     // doorbell slots this sender knocks on. Mnemonic-rooted so the slot survives a
     // reinstall (a retry overwrites its own entry); secret so a doorbell co-host
@@ -487,6 +580,19 @@ pub fn derive_identity_keys(
     .map_err(KeyDerivationError::Hkdf)?;
     let dm_doorbell_slot_secret = DmDoorbellSlotSecret(*dm_doorbell_slot_buf);
 
+    // DM channel root secret: a SEVENTH expansion of the SAME PRK under a
+    // domain-separated, identity-scoped label. Each expansion depends only on the
+    // PRK and its own label, so this one moves no other output. The sole secret
+    // input to channel owner seeds. Copied into a self-zeroizing wrapper before
+    // the transient buffer drops and zeroes.
+    let mut dm_channel_root_buf = SecretBuffer::<DM_CHANNEL_ROOT_SECRET_LEN>::zero();
+    hkdf.expand(
+        identity.info_for(info::DOMAIN_DM_CHANNEL_ROOT).as_bytes(),
+        &mut *dm_channel_root_buf,
+    )
+    .map_err(KeyDerivationError::Hkdf)?;
+    let dm_channel_root = DmChannelRootSecret(*dm_channel_root_buf);
+
     Ok(IdentityKeys {
         identity,
         signing,
@@ -494,6 +600,7 @@ pub fn derive_identity_keys(
         veilid_node_seed,
         share_root_ikm,
         dm_doorbell_slot_secret,
+        dm_channel_root,
     })
 }
 
@@ -806,7 +913,7 @@ mod tests {
     }
 
     /// #233 — the slot secret is identity-SCOPED, not mnemonic-global. This is the
-    /// tripwire for the decision recorded in `ISA.md` (2026-07-28, the fifth
+    /// tripwire for the decision recorded in `ISA.md` (2026-07-28, the sixth
     /// identity-PRK expansion): the frozen design's "multi-device-consistent"
     /// wording, read literally, would bypass `Identity::info_for` so every
     /// presentation of one mnemonic shared a slot. A Primary and a Device are two
@@ -836,6 +943,87 @@ mod tests {
             primary.dm_doorbell_slot_secret.as_bytes(),
             device.dm_doorbell_slot_secret.as_bytes(),
             "Primary and Device are distinct senders and must not share a slot"
+        );
+    }
+
+    /// The channel root secret is deterministic in the mnemonic — the property
+    /// that lets an installation restored from the phrase re-derive the owner of
+    /// every channel it writes — and equals none of its sibling secrets for the
+    /// same mnemonic and identity, the ML-DSA seed above all.
+    #[test]
+    fn dm_channel_root_is_deterministic_derived_and_distinct() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        for identity in [Identity::Primary, Identity::Device { uuid: Uuid::nil() }] {
+            let first = derive_identity_keys(&m, identity.clone()).unwrap();
+            let second = derive_identity_keys(&m, identity.clone()).unwrap();
+            let root = first.dm_channel_root.with_bytes(|b| *b);
+            assert_eq!(root, second.dm_channel_root.with_bytes(|b| *b));
+            assert_ne!(root, [0u8; DM_CHANNEL_ROOT_SECRET_LEN]);
+            assert_ne!(&root, first.dm_doorbell_slot_secret.as_bytes());
+            assert_ne!(&root, first.share_root_ikm.as_bytes());
+            assert_ne!(root, first.veilid_node_seed.with_bytes(|b| *b));
+
+            // The ML-DSA seed, recomputed from the same PRK and label the
+            // derivation uses.
+            let prk = HkdfSha384::extract(Some(info::IDENTITY_ROOT_SALT), &m.to_seed("")).unwrap();
+            let mut ml_dsa_seed = [0u8; ML_DSA_SEED_LEN];
+            prk.expand(
+                identity.info_for(info::DOMAIN_SIGN).as_bytes(),
+                &mut ml_dsa_seed,
+            )
+            .unwrap();
+            // The control: this is the seed the signing key was generated
+            // from, so the inequality below is against the real one.
+            assert_eq!(
+                &ml_dsa::keygen(&ml_dsa_seed).unwrap().0,
+                first.signing.public_key(),
+                "the recomputed seed is not the signing seed, so the check below proves nothing"
+            );
+            assert_ne!(
+                root, ml_dsa_seed,
+                "the channel root must not be the ML-DSA seed"
+            );
+        }
+    }
+
+    /// The channel root is identity-scoped: a Primary and a Device presentation
+    /// of one mnemonic are two identities and must own different channels, and
+    /// two mnemonics never share a root.
+    #[test]
+    fn dm_channel_root_diverges_by_mnemonic_and_identity() {
+        ensure_oxicrypt_initialized();
+        let m1 = Mnemonic::generate().unwrap();
+        let m2 = Mnemonic::generate().unwrap();
+        let root = |m: &Mnemonic, identity| {
+            derive_identity_keys(m, identity)
+                .unwrap()
+                .dm_channel_root
+                .with_bytes(|b| *b)
+        };
+        assert_ne!(root(&m1, Identity::Primary), root(&m2, Identity::Primary));
+        assert_ne!(
+            root(&m1, Identity::Primary),
+            root(&m1, Identity::Device { uuid: Uuid::nil() }),
+            "Primary and Device are distinct writers and must not share channels"
+        );
+    }
+
+    /// Known-answer vectors for the channel root, Primary and Device, captured
+    /// from this implementation to pin the derivation against drift.
+    #[test]
+    fn dm_channel_root_kat() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let primary = derive_identity_keys(&m, Identity::Primary).unwrap();
+        assert_eq!(
+            hex::encode(primary.dm_channel_root.with_bytes(|b| *b)),
+            "ca0401b3e73535ea222c47207f3e742445196d2a1fc237d89edba8befb0e38af",
+        );
+        let device = derive_identity_keys(&m, Identity::Device { uuid: Uuid::nil() }).unwrap();
+        assert_eq!(
+            hex::encode(device.dm_channel_root.with_bytes(|b| *b)),
+            "9715c7a903d82bbc1a5405a5984d60f95e7f0539e79a7b494e568aaf0b6ee7ce",
         );
     }
 
@@ -876,6 +1064,76 @@ mod tests {
         );
     }
 
+    /// Known-answer guard over the outputs of the identity chain other than the
+    /// channel root, for both a Primary and a Device presentation of one
+    /// mnemonic.
+    ///
+    /// Three of these values, the Primary row's node seed, share-root IKM and
+    /// doorbell slot secret, are the vectors `identity_secret_kat_byte_identity`
+    /// pins, which predate the channel root. The keypair digests and the Device
+    /// row were captured from this implementation and pin it against drift.
+    ///
+    /// The keypairs are pinned by the SHA-384 of each half rather than by the
+    /// halves themselves, which run to thousands of bytes. A change to the label
+    /// or the input of any of these expansions moves at least one value.
+    #[test]
+    fn identity_chain_kat_pins_every_existing_output() {
+        ensure_oxicrypt_initialized();
+        let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
+        let digest = |bytes: &[u8]| hex::encode(oxicrypt_sha::sha384(bytes).unwrap());
+        let cases = [
+            (
+                Identity::Primary,
+                [
+                    "39daecccd93e1820773ae5ba582cd666477aab6627aeca96fcd8b7bb297834c67d12ea72f372aba73a69201ed761fc4e",
+                    "15b3f746cbef257c26dd68d3da8562416c41be91cdda83fe415850904304ab7e6a3ff6b37955e406a55c7e1a01c821a0",
+                    "8029b3d4ee948192bf6088bea6d3d0de3b4574d074595dfb1f816677cdddb8341dc64d1564bcb32a1fecd88cc9c48fe2",
+                    "bd012325cca49240022b12d291f438854c019eff8c742d98a6fc3b2091d658210fad6ac5644daed19433b97504760473",
+                    "0c874e8deb6413ba9f6f8457fdcb89a57741812a8936dde45f23e7b64e5ec837",
+                    "e7d6ad2e24b9248f5e12c1b81a8c0a99eccae11c61d8213552cad7e91dc26c32",
+                    "ef02a92a7fa93125671e70e2922da90f5490e5709922e3245540ca767030c7d5",
+                ],
+            ),
+            (
+                Identity::Device { uuid: Uuid::nil() },
+                [
+                    "3e956365d19c35fcc5572ea44f90184ab83a31ce723561f40de2149a6cb57ee7b7f0fe8ddbae81f33ce3608b3c9562ef",
+                    "c185d1573755a4e8571d089c594d33b0458596ce186f5f88ab1d45af56c901c1738deeae806ab185ca1c215ab7a22add",
+                    "865700d008da4fbe79602830dabe7b3beb7b41c04243c98ad4e14a20a4e50df381425a2028699656af3c9f4744d07076",
+                    "f283f5b3d3a64e156c16ad6b6f08afb808af289ad8d9a955810448f4b9565ea7a0bf9d347e1bf56c9790cbbf5055f56c",
+                    "b1fd8f2a66d16217d7c70c568c30a3234d3dafff975ee91a4989f7fcca995d31",
+                    "ea9e2cf1ae76cb542435572e3199ec03ca55dc7eb534e75820a530204a483e40",
+                    "296efaa6fc3642c1c781491afaef0d50bfe0f61dbb3ab290a8da520969f6e5f5",
+                ],
+            ),
+        ];
+        for (identity, expected) in cases {
+            let label = format!("{identity:?}");
+            let keys = derive_identity_keys(&m, identity).unwrap();
+            let actual = [
+                digest(keys.signing.public_key()),
+                digest(keys.signing.secret_key()),
+                digest(keys.kem.encapsulation_key()),
+                digest(keys.kem.decapsulation_key()),
+                hex::encode(keys.veilid_node_seed.with_bytes(|b| *b)),
+                hex::encode(keys.share_root_ikm.as_bytes()),
+                hex::encode(keys.dm_doorbell_slot_secret.as_bytes()),
+            ];
+            let names = [
+                "signing public key",
+                "signing secret key",
+                "KEM encapsulation key",
+                "KEM decapsulation key",
+                "Veilid node seed",
+                "share-root IKM",
+                "doorbell slot secret",
+            ];
+            for ((name, want), got) in names.iter().zip(expected).zip(actual) {
+                assert_eq!(got, want, "{label}: the {name} moved");
+            }
+        }
+    }
+
     /// #135 — the shared macro's `inline` redacted `Debug` renders
     /// `"<Name>(<redacted>)"` for both identity-rooted secrets (ISC-A-C1). This is
     /// the one observable change from the consolidation: the previous
@@ -898,6 +1156,10 @@ mod tests {
         assert_eq!(
             format!("{:?}", keys.dm_doorbell_slot_secret),
             "DmDoorbellSlotSecret(<redacted>)"
+        );
+        assert_eq!(
+            format!("{:?}", keys.dm_channel_root),
+            "DmChannelRootSecret(<redacted>)"
         );
     }
 }
