@@ -127,11 +127,10 @@ pub fn next_keepalive_interval() -> Duration {
 /// [`crate::public_space::next_operator_keepalive_interval`]) and the direct-messaging
 /// bands. The copies this absorbed were byte-identical to it apart from their
 /// constants, and a second copy of jitter arithmetic is drift waiting to happen — the
-/// same argument [`crate::backoff::apply_jitter`] makes for the outbox reseed ladder,
-/// its one caller (#372).
+/// same argument [`crate::backoff::apply_jitter`] makes.
 ///
-/// `fill` is a parameter rather than a direct `getrandom` call for the reason
-/// [`crate::jitter::unit_or_zero`] takes one: the degrade is the single branch here
+/// `fill` is a parameter rather than a direct `getrandom` call because the degrade is
+/// the single branch here
 /// that cannot be provoked in production on demand, and it is the branch whose
 /// consequence is a timing signature. With the seam a fixture pins the midpoint,
 /// both band ends, and — the assertion this function exists to make possible — that
@@ -824,7 +823,7 @@ mod tests {
     /// `os_fill` were replaced by something that returned a narrow range. This one
     /// covers the source. The floors are stated against the band's real scale rather
     /// than against zero: `seen.len() > 1` "separates SOME spread from NO spread and
-    /// cannot see band WIDTH" (`dm/outbox.rs`), and a modulo draw quantised to a
+    /// cannot see band WIDTH", and a modulo draw quantised to a
     /// handful of values would clear a spread floor alone, which is why population is
     /// asserted too.
     ///

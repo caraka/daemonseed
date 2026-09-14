@@ -186,9 +186,8 @@ mod tests {
 
     /// `DmKeyRecord` round-trips at the proto-crate boundary. The two byte
     /// fields are exact-length on the wire (ML-KEM-1024 EK = 1568, ML-DSA-87
-    /// signature = 4627); prost itself enforces neither, which is why
-    /// `daemonseed_core::dm::keyrec::verify` length-gates both before any
-    /// signature check.
+    /// signature = 4627); prost itself enforces neither, so a verifier must
+    /// length-gate both before any signature check.
     #[test]
     fn dm_key_record_round_trips() {
         let original = DmKeyRecord {

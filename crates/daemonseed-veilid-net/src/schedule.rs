@@ -1103,8 +1103,7 @@ mod tests {
     /// coalesced elder's class (the shape of the `starved_since` inheritance sitting
     /// three lines away in `enqueue`) would land in the wrong lane with every existing
     /// assertion still green. `Chat` maps to `DispatchLane::Chat`; every other class
-    /// maps to `Window` or `Floor`, which is exactly the distinction the DM doorbell's
-    /// two dispatch classes turn on.
+    /// maps to `Window` or `Floor`.
     #[derive(Clone)]
     struct Rec {
         label: String,
@@ -1784,17 +1783,16 @@ mod tests {
     /// slot, NOT the never-coalesce property. Only `WriteKind::Ring` confers that.
     /// `docs/design/direct-messaging.md:127` describes the chat lane as "never
     /// coalesced", which is true of the writes it has in mind (all `Ring`) and not of
-    /// the lane; the DM doorbell is the first `Chat`-class `CurrentState` writer, so it
-    /// is the first place the distinction can bite.
+    /// the lane.
     ///
-    /// **This test previously pinned the survivor keeping its OWN class, and that was
-    /// wrong.** A review showed the consequence: a queued `Chat` first-contact
-    /// knock coalesced by its own `Keepalive` re-seed produced a `Keepalive` survivor,
-    /// which `drain_for_shutdown` then SHEDS — so on quit nothing reached the wire while
-    /// the coalesced caller already held an `Ok(())` from `drop_same_id_current_state`.
-    /// Un-coalesced, that same knock flushes. Three legs below: the promotion, the
-    /// absence of a spurious one, and the shutdown flush that is the whole reason the
-    /// promotion exists.
+    /// **The survivor takes the strongest class, never its own.** A queued `Chat`
+    /// current-state write coalesced by a later `Keepalive` write on the same logical
+    /// id would otherwise leave a `Keepalive` survivor, which `drain_for_shutdown`
+    /// SHEDS — so on quit nothing reaches the wire while the coalesced caller already
+    /// holds an `Ok(())` from `drop_same_id_current_state`. Un-coalesced, that same
+    /// `Chat` write flushes. Three legs below: the promotion, the absence of a
+    /// spurious one, and the shutdown flush that is the whole reason the promotion
+    /// exists.
     #[tokio::test(start_paused = true)]
     async fn a_coalesced_survivor_inherits_the_strongest_class_and_still_flushes() {
         let cs = |id: &str| WriteKind::CurrentState {
@@ -1809,18 +1807,13 @@ mod tests {
         let (occupy, _r0) = req(rec, WriteClass::Chat, WriteKind::Ring, "occupy");
         h.enqueue(occupy);
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let (first, _r1) = req(rec, WriteClass::Chat, cs("dm-doorbell-6"), "first-send");
+        let (first, _r1) = req(rec, WriteClass::Chat, cs("slot-6"), "first-send");
         h.enqueue(first);
-        let (reseed, _r2) = req(rec, WriteClass::Keepalive, cs("dm-doorbell-6"), "reseed");
+        let (reseed, _r2) = req(rec, WriteClass::Keepalive, cs("slot-6"), "reseed");
         h.enqueue(reseed);
         // A DIFFERENT logical id must NOT coalesce — the control that stops this
         // passing on a scheduler that simply dropped writes.
-        let (other, _r3) = req(
-            rec,
-            WriteClass::Keepalive,
-            cs("dm-doorbell-7"),
-            "other-slot",
-        );
+        let (other, _r3) = req(rec, WriteClass::Keepalive, cs("slot-7"), "other-slot");
         h.enqueue(other);
 
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -1911,9 +1904,9 @@ mod tests {
         let (occupy3, _t0) = req(rec3, WriteClass::Chat, WriteKind::Ring, "occupy");
         h3.enqueue(occupy3);
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let (knock, _t1) = req(rec3, WriteClass::Chat, cs("dm-doorbell-6"), "knock");
+        let (knock, _t1) = req(rec3, WriteClass::Chat, cs("slot-6"), "knock");
         h3.enqueue(knock);
-        let (knock_reseed, _t2) = req(rec3, WriteClass::Keepalive, cs("dm-doorbell-6"), "knock-rs");
+        let (knock_reseed, _t2) = req(rec3, WriteClass::Keepalive, cs("slot-6"), "knock-rs");
         h3.enqueue(knock_reseed);
         // A genuinely weak write on the same record, never coalesced with anything:
         // the control proving the shed still HAPPENS, so leg 3 is not passing because

@@ -150,14 +150,13 @@ use daemonseed_veilid_net::{VeilidNet, VeilidNetConfig, VeilidRecords, WriteCoun
 
 // ── what a run is configured with ────────────────────────────────────────────
 
-/// The at-rest key each side's [`DmPersist`] seals under. Per-run scratch
+/// The at-rest key each side's `Store` seals under. Per-run scratch
 /// directories, so this is a fixture rather than a secret.
 const AT_REST: [u8; AEAD_KEY_LEN] = [0x2b; AEAD_KEY_LEN];
 
 /// The budget for one hop: a write, its spread, and a correspondent's next sweep
-/// of it. A doorbell sweep reads every subkey of the record and a page sweep
-/// every subkey of its own, each a separate network round trip, so a hop is one
-/// tick plus an open plus a whole sweep.
+/// of it. A sweep reads every subkey of its record, each a separate network round
+/// trip, so a hop is one tick plus an open plus a whole sweep.
 const HOP: Duration = Duration::from_secs(600);
 
 /// How long the attach is given before a step gives up on the network.

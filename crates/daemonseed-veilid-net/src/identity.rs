@@ -28,7 +28,7 @@ use crate::error::{Result, VeilidNetError};
 /// or a rendezvous-owner seed (a circle's, a public room's). VLD0 is Ed25519,
 /// so the seed IS the secret and the public is its verifying key.
 ///
-/// **Residual, for callers holding a genuinely secret seed (a DM page's, #244).**
+/// **Residual, for callers holding a genuinely secret seed.**
 /// The returned `KeyPair` *contains* the seed — it is the VLD0 secret — held in
 /// veilid's `BareSecretKey`, a plain `Bytes` with no zeroize-on-drop. Three more
 /// unwiped copies exist for the length of this call: the `format!` below
@@ -48,15 +48,8 @@ use crate::error::{Result, VeilidNetError};
 /// long as the record stays open. daemonseed opens a record once per session and,
 /// for every family whose cardinality is bounded by peers rather than by traffic,
 /// never closes it (see `rendezvous::open_cached`), so for those the copy is
-/// effectively process-lifetime and is NOT under a caller's control. **DM channel
-/// pages are the exception, and a bound is what makes them one:** they are held in a
-/// `rendezvous::DM_PAGE_CACHE_CAPACITY` LRU whose eviction closes the record
-/// (`rendezvous::open_page_bounded`, #252), so a page's retained writer clone lives
-/// to its eviction — **and still to process exit in any session that never exceeds
-/// the bound**, which is the ordinary case for a handful of conversations. The
-/// residual is bounded under sustained traffic, not converted into something
-/// short-lived. Closing the record is the only lever on that clone, which is why
-/// #252 is a key-hygiene fix as much as a resource one.
+/// effectively process-lifetime and is NOT under a caller's control. Closing the
+/// record is the only lever on that clone.
 ///
 /// What a caller CAN control is everything on this side of that boundary: derive
 /// per operation, never cache a keypair yourself, and never key a long-lived map on
@@ -317,10 +310,7 @@ impl std::error::Error for OperatorCredentialError {
 /// belongs to a party entitled to keep it — a circle's and a
 /// public room's are derived by every member because every member writes, and the
 /// project-announce owner's is provisioned to the single instance that writes that
-/// record. The per-conversation secret seeds, a direct-message page's and an
-/// acknowledgement record's, travel instead as their own boxed, redacted,
-/// zeroize-on-drop address types (`DmPageAddress`, `DmAckAddress`) and never reach
-/// this type.
+/// record.
 #[derive(Clone)]
 pub struct OwnerSeed([u8; 32]);
 

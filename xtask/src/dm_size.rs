@@ -56,35 +56,11 @@ pub const CEILING_ENV: &str = "DM_SIZE_CEILING";
 /// declared under `#[cfg(test)]` by its parent, or is deleted. An entry naming
 /// no file is an error.
 pub const OUTSIDE_LAYER: &[&str] = &[
-    "crates/daemonseed-core/src/dm/ack.rs",
-    "crates/daemonseed-core/src/dm/ack_budget.rs",
-    "crates/daemonseed-core/src/dm/ack_cadence.rs",
-    "crates/daemonseed-core/src/dm/ack_record.rs",
-    "crates/daemonseed-core/src/dm/admission.rs",
     "crates/daemonseed-core/src/dm/block_list.rs",
-    "crates/daemonseed-core/src/dm/collect.rs",
     "crates/daemonseed-core/src/dm/contact_cache.rs",
     "crates/daemonseed-core/src/dm/domain.rs",
-    "crates/daemonseed-core/src/dm/doorbell.rs",
-    "crates/daemonseed-core/src/dm/firstcontact.rs",
-    "crates/daemonseed-core/src/dm/frame.rs",
-    "crates/daemonseed-core/src/dm/keyrec.rs",
     "crates/daemonseed-core/src/dm/mod.rs",
-    "crates/daemonseed-core/src/dm/outbox.rs",
-    "crates/daemonseed-core/src/dm/paging.rs",
-    "crates/daemonseed-core/src/dm/persist.rs",
-    "crates/daemonseed-core/src/dm/pow.rs",
-    "crates/daemonseed-core/src/dm/provisional.rs",
-    "crates/daemonseed-core/src/dm/ratchet.rs",
-    "crates/daemonseed-core/src/dm/reest.rs",
-    "crates/daemonseed-core/src/dm/resume.rs",
-    "crates/daemonseed-core/src/dm/spent_store.rs",
-    "crates/daemonseed-core/src/dm/token.rs",
-    "crates/daemonseed-veilid-net/src/dm/driver.rs",
-    "crates/daemonseed-veilid-net/src/dm/machine.rs",
     "crates/daemonseed-veilid-net/src/dm/mod.rs",
-    "crates/daemonseed-veilid-net/src/dm/seam.rs",
-    "crates/daemonseed-veilid-net/src/dm/types.rs",
 ];
 
 /// Which of the two totals a module's lines are added to.
@@ -1000,8 +976,8 @@ mod tests {
             .map(|m| repo.join(&m.path))
             .collect();
         assert!(
-            test_only.iter().any(|p| p.ends_with("dm/mock.rs")),
-            "positive control: the transport's mock is declared test-only"
+            test_only.iter().any(|p| p.ends_with("dm/runner/tests.rs")),
+            "positive control: the runner's tests module is declared test-only"
         );
         let lines: usize = files
             .iter()

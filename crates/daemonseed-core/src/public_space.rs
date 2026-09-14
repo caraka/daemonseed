@@ -1175,8 +1175,7 @@ mod tests {
     /// rate onto the announce record, and that figure is asserted in the rustdoc, the
     /// CHANGELOG, the ISA Decisions entry and `docs/design/operator-space-management.md`
     /// (~1 write/hour, each slot refreshed every `N` hours). Widening or narrowing the
-    /// band silently falsifies all four; this fails first. Mirrors
-    /// `dm::keyrec::reseed_cadence_matches_the_budgeted_rate`.
+    /// band silently falsifies all four; this fails first.
     #[test]
     fn operator_keepalive_cadence_matches_the_documented_rate() {
         let mean_secs = (OPERATOR_KEEPALIVE_INTERVAL_MIN.as_secs()

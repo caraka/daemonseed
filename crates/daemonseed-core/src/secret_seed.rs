@@ -384,22 +384,6 @@ mod tests {
         assert_zeroize_on_drop::<crate::identity::keys::VeilidNodeSeed>();
         assert_zeroize_on_drop::<crate::identity::keys::DmChannelRootSecret>();
 
-        // inline arm — the DM ratchet key schedule.
-        assert_zeroize_on_drop::<crate::dm::ratchet::RootKey>();
-        assert_zeroize_on_drop::<crate::dm::ratchet::ChainKey>();
-        assert_zeroize_on_drop::<crate::dm::ratchet::MessageKey>();
-
-        // inline arm — the re-establishment root. Added with #314: it was the ONE
-        // macro-generated newtype of twenty missing from this sweep, and its absence
-        // was load-bearing rather than cosmetic. `CommittedRoot::from_bytes` is
-        // `pub` and the type is dropped STANDALONE on `ResumeRecord::decode`'s error
-        // paths and at `dm/persist.rs`'s construction site — so on those paths
-        // nothing else wipes it. A hand-rolled replacement deriving only `Zeroize`
-        // passed every test in the tree, including the behavioural witness, because
-        // that witness only ever observes the root inside a `ResumeRecord` whose own
-        // derive wipes it in place.
-        assert_zeroize_on_drop::<crate::dm::resume::CommittedRoot>();
-
         // boxed arm — AEAD content keys.
         assert_zeroize_on_drop::<crate::circle::key::CircleKey>();
         assert_zeroize_on_drop::<crate::public_room::PublicRoomKey>();
@@ -411,53 +395,28 @@ mod tests {
         assert_zeroize_on_drop::<crate::public_room::RoomPresenceVeilidOwnerSeed>();
         assert_zeroize_on_drop::<crate::public_room::RoomShareVeilidOwnerSeed>();
         assert_zeroize_on_drop::<crate::public_space::ProjectAnnounceVeilidOwnerSeed>();
-
-        // boxed arm — DM.
-        assert_zeroize_on_drop::<crate::dm::ack::DmAckSealKey>();
-        // Added with the ack record. Its absence would have been the #314 shape
-        // exactly: `DmAckAddress` exists ONLY to keep this seed — a conversation
-        // write capability derived from `AR` — out of the `Copy` arrays that the
-        // command channel, the scheduler queue and the dispatch frame would each
-        // retain unwiped (#244). Without this line, reverting that address type to
-        // a raw `[u8; 32]` breaks exactly one test, and it breaks as a COMPILE
-        // ERROR rather than as a security assertion — so the property the refactor
-        // was for had no witness at all.
-        assert_zeroize_on_drop::<crate::dm::ack_record::DmAckOwnerSeed>();
-        assert_zeroize_on_drop::<crate::dm::doorbell::DmDoorbellOwnerSeed>();
-        assert_zeroize_on_drop::<crate::dm::keyrec::DmKeyRecordOwnerSeed>();
-        assert_zeroize_on_drop::<crate::dm::paging::DmPageOwnerSeed>();
-        assert_zeroize_on_drop::<crate::dm::ratchet::EphemeralDecapKey>();
-        // The per-correspondent signing key held by a provisional record. It is
-        // the widest secret in the sweep and the one with no re-derivation path
-        // of any kind, and `ProvisionalRecord` has no container `Drop` by
-        // design — so this newtype's own wipe is the only thing that clears the
-        // key when a handshake record is dropped.
-        assert_zeroize_on_drop::<crate::dm::provisional::SigningKeyPc>();
     }
 
-    /// The two secret-bearing structs the macro does not generate also carry
-    /// `ZeroizeOnDrop` — now by derive rather than by a hand-written `Drop`
-    /// (#267).
+    /// The secret-bearing struct the macro does not generate also carries
+    /// `ZeroizeOnDrop`, by derive rather than by a hand-written `Drop`.
     ///
     /// Kept separate from the sweep above because it asserts a different thing.
     /// That one says every macro expansion still has the property. This one says
-    /// two multi-field structs, which the macro cannot reach, are on the derive at
+    /// a multi-field struct, which the macro cannot reach, is on the derive at
     /// all — and the derive is what makes a *newly added* secret field wiped by
-    /// default instead of silently unwiped. Losing the derive would leave both
-    /// types compiling and their existing secrets partly covered (`entropy` by
-    /// `Zeroizing`, `ss0` and `body` by nothing), which is why the loss needs
-    /// stating somewhere that fails.
+    /// default instead of silently unwiped. Losing the derive would leave the type
+    /// compiling and its existing secret partly covered (`entropy` by
+    /// `Zeroizing`), which is why the loss needs stating somewhere that fails.
     ///
     /// The bound is breadth only, exactly as above: it says the trait is there,
     /// not that any byte reaches zero. `tests/secret_zeroize_on_drop.rs` is the
-    /// depth half for both types.
+    /// depth half.
     #[test]
     #[allow(clippy::extra_unused_type_parameters)]
     fn the_multi_field_secret_structs_are_zeroize_on_drop() {
         fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
         assert_zeroize_on_drop::<crate::storage::seeds::PersistedCircle>();
-        assert_zeroize_on_drop::<crate::dm::firstcontact::VerifiedFirstContact>();
         // Not a struct with secret *fields* but a secret used as a map KEY, which
         // is the shape neither the macro nor a containing derive can reach: no
         // `Zeroize` impl exists for `BTreeMap`, so `Seeds` cannot carry a derive

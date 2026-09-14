@@ -111,9 +111,7 @@ impl SignKeypair {
     ///
     /// **The pairing is the caller's to establish and is not re-checked
     /// here.** Every record that stores a pair writes both halves of a single
-    /// keypair in one call, and
-    /// [`ProvisionalRecord`](crate::dm::provisional::ProvisionalRecord)
-    /// additionally refuses halves that do not sign and verify when it opens.
+    /// keypair in one call.
     ///
     /// The secret half is written straight into its allocation. `Box::new(*key)`
     /// would materialise 4 896 secret bytes in this frame on the way to the
@@ -361,24 +359,15 @@ redacted_secret_newtype! {
 }
 
 redacted_secret_newtype! {
-    /// The DM doorbell slot secret (#233). Derived from the same mnemonic as the
+    /// The DM doorbell slot secret. Derived from the same mnemonic as the
     /// ML-DSA/ML-KEM identity but under a domain-separated, identity-scoped label
     /// (`info::DOMAIN_DM_DOORBELL_SLOT`), a sibling of [`VeilidNodeSeed`] and
-    /// [`ShareRootIkm`]. It is the sole input — with the recipient's public
-    /// identity key — to [`crate::dm::doorbell::slot_for`].
-    ///
-    /// Two properties make it load-bearing, and both come from what it is rather
-    /// than how it is used. Because it is **mnemonic-derived**, the sender's slot
-    /// is stable across reinstalls and restores, so a retried first contact
-    /// overwrites its own previous entry rather than orphaning it. Because it is
-    /// **secret**, the doorbell slot is not observer-computable: a storage node
-    /// co-hosting the record cannot test "slot 14 is occupied, and slot 14 is
-    /// where pubkey X would land", which is what keeps the doorbell sender-blind.
+    /// [`ShareRootIkm`].
     ///
     /// Deriving it from the ML-DSA secret key instead would work cryptographically
     /// and is deliberately NOT done — same key-separation reasoning as
-    /// [`ShareRootIkm`]. Content NEVER derives from this; it selects a slot index
-    /// and nothing else. Zeroizes on drop; never persisted, never on the wire.
+    /// [`ShareRootIkm`]. Content NEVER derives from this. Zeroizes on drop; never
+    /// persisted, never on the wire.
     inline pub struct DmDoorbellSlotSecret([u8; DM_DOORBELL_SLOT_SECRET_LEN]);
 }
 

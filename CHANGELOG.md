@@ -174,10 +174,8 @@ work lives in the maintainer's own planning notes, not here.
   end-state check and its result file covered by tests that need no network (#467).
 - `daemonseed-proto`: `DmAdvert`, `DmHello`, `DmChannelOpening`, `DmChannelControl`,
   `DmMessageHeader` and `DmChannelSlot` in `dm.proto` — the conversation records as wire-visible
-  messages, with the header's turn fields optional, alongside `KeySelector`, `DmKeyRecord`,
-  `DmAck`, `DmAckBody`, `FirstContactEntry`, `FirstContactBody`, `DmChannelFrame` and
-  `DmChannelBody`, which remain in the schema for the code that still writes them and leave it when
-  that code does; additive on the `daemonseed.v1` package, so SemVer MINOR (#466).
+  messages, with the header's turn fields optional; additive on the `daemonseed.v1` package, so
+  SemVer MINOR (#466).
 - `daemonseed-core`: `dm::chain`, the per-direction key schedule — `initiate` / `accept` seeding both
   directions' roots from the hello's shared secret, `Conversation::seal` opening a turn when the
   reading half names an unseen peer turn or `force_next_turn` is set and `Receiving::open`
@@ -218,38 +216,6 @@ work lives in the maintainer's own planning notes, not here.
   under `dm/` that names no founding claim and is not on the subcommand's outside list, whose
   modules are counted as a separate total so the ceiling applies to the modules that name a
   founding claim (#468).
-- `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `peer_ack_fetches_failed`, one per fetch of a
-  correspondent's acknowledgement record that came back with no answer (#429).
-- `daemonseed-tui`: a direct-message thread, opened with `Enter` on a correspondence row and left
-  with `Esc`. It draws the correspondence's messages, the word for each sent message's
-  `DeliveryState` — `composed`, `on-DHT`, `confirmed-collected`, `undelivered`, never `delivered` —
-  and the latest `RefusalReason` on that correspondence, one phrase per variant. Its composer sends
-  one `DmCommand::Send`, and a painted terminal delivery state — `ConfirmedCollected` or
-  `Undelivered`, the two the driver owes a surfacing for — sends one `DmCommand::Surfaced`, once per
-  sequence number, naming only rows `ui::RenderReport` reports the frame painted. The thread draws
-  its tail and wraps its own rows, so a row that did not fit is answered for by no frame. A
-  `DmEvent::ChannelLost` ends the sequence numbers it names. A correspondence the roster has not called established or blocked carries
-  `DM_HELLO_GRADE`. `App::dm_thread`,
-  `App::dm_thread_correspondence`, `App::dm_compose`, `App::dm_thread_drawn`, `DmThreadRow`,
-  `DM_HELLO_GRADE` and `DmCorrespondence::{thread, unnumbered, refusal, surfaced}` (#235, #339,
-  #418).
-- `daemonseed-tui`: a direct-message pane, opened and closed with `[c]` from any pane that does not
-  turn a printable key into text, and closed with `Esc`. It lists the pending contact requests and
-  then the correspondences, newest first by the last driver event that named one, with both counts
-  in its title. `[a]`, `[d]` and `[b]` on a selected request send one `DmCommand::Accept`,
-  `Decline` or `Block`, which the binary forwards to the DM driver; `App::dm_pane_open`,
-  `App::dm_sel`, `App::dm_requests`, `App::dm_correspondences`, `App::take_pending_dm`,
-  `MainFocus::consumes_text`, `app::dm_fingerprint`, `DmCorrespondence::last_activity` and
-  `DmState::activity_seq` (#236). Each action sets a one-shot status line and answers a request
-  once — a later press on the same request queues nothing. `DmEvent::Message` now folds, creating
-  the correspondence row and stamping its recency (#236).
-- `daemonseed-core`: `Collection::sweep_give_ups`, `RECEIVE_GIVE_UP_MS` and `AGE_STEP_CAP_MS`
-  (`dm::collect`) — the receiving side abandons a gap that has stood below the highest settled
-  position for the sender's `GIVE_UP` plus the longest `RESEED_LADDER` rung, advancing the contiguous
-  cursor over it and folding the beyond-prefix runs into the prefix. The age accumulates across
-  sweeps, each adding at most `AGE_STEP_CAP_MS`. The driver sweeps on the probe cadence and publishes
-  an acknowledgement for the moved cursor whether or not the standalone cadence has a live pending
-  message (#235).
 - `daemonseed-core`: `ProjectAnnounceSeed`, `ProjectAnnounceSeedText`, `ProjectAnnounceSeedSource` and
   `SeedOrigin` — the operator instance's project-announce seed, loaded at runtime from
   `DAEMONSEED_PROJECT_ANNOUNCE_SEED` (read first) or `<profile-root>/project-announce.seed`
@@ -262,15 +228,6 @@ work lives in the maintainer's own planning notes, not here.
   An example,
   `project_announce_pubkeys`, derives the two public keys a seed bakes (seed on standard input,
   never printed).
-- `daemonseed-veilid-net`: `DmPageWatch` and `VeilidNetHandle::watch_dm_page` — a DHT watch on one
-  receiving channel page, resolving `Changed` on a value change and `Lost` on expiry, on an absent
-  record, or when the record is closed or evicted. The watch is cancelled once it resolves
-  `Changed` and once its lease expires. The DM driver holds a watch on the current and next
-  receiving page and sweeps that page on a change, at most six times per page per probe interval;
-  a change inside that floor, or one arriving while that page's sweep is in flight, is swept by the
-  next tick clear of it. Value changes on channel-page records are never surfaced as
-  `VeilidNetEvent::Inbound` or `VeilidNetEvent::ValueChanged`. The 30-second probe cadence is
-  unchanged and collects every page whether or not a watch is standing (#234).
 - `ISC-A-S27`: no byte in the source tree derives the project-announce signing key or the announce
   owner key.
 - `.github/workflows/ci.yml` — the Definition-of-Done gate on every pull request and on `main`,
@@ -278,313 +235,26 @@ work lives in the maintainer's own planning notes, not here.
 - `cargo xtask gate` — runs the Definition-of-Done gate, `--group <preflight|dev-suite|release-suite>`
   for one group and `--list` for the step table. A test step reporting zero passing tests is red.
 - A `cargo doc --workspace --no-deps` step under `RUSTDOCFLAGS=-D warnings` in the gate table.
-- Coverage for the first-contact teardown across a re-establishment: a re-seeded introduction from
-  an established correspondent leaves a resumed channel and its queue alone, and a fresh
-  first-contact entry from that correspondent ends every pending entry under
-  `TeardownCause::CorrespondentStateLost`. The direction the teardown names is read off the key
-  schedule a completed re-establishment restores (#261).
-- Coverage that the entries such a teardown ends stop re-seeding: no further page is published for
-  them across the first rungs of `RESEED_LADDER`, and their failure reaches the user once (#261).
-- `DmEvent::Roster { correspondents: Vec<Correspondent> }`, emitted once before the DM driver's
-  first tick: every correspondence on disk under `CorrespondentState::Established`, `Pending` or
-  `Blocked`. `DmEvent::BlockListUnreadable` rides alongside it where the block-list record would not
-  read. Both front ends fold it onto `DmCorrespondence::state`; nothing renders it.
-- `crates/daemonseed-veilid-net/tests/two_node_dm_restart.rs` — a two-node network oracle,
-  `#[ignore]`: a sender that restarts between its knock and the acceptance composes a frame its
-  correspondent opens, and a correspondence whose stores both restarted and then re-established on
-  one committed root refuses a `DmCommand::Send` with `RefusalReason::NotEstablishedThisSession`,
-  spending no sequence number (#401, #402).
-- A `DmCommand::Send` on a correspondence whose channel was resumed by a completed
-  re-establishment is refused with `RefusalReason::NotEstablishedThisSession`, before the outbox is
-  asked and before the ratchet steps. Content frames on a resumed channel are unbuilt (#401, #402).
-- `daemonseed_core::identity::keys::SignKeypair::from_halves(&pk, &sk)` and
-  `daemonseed_core::dm::persist::PendingHandshake::signing_pc()`, which return the
-  per-correspondent keypair a stored record holds. A correspondence rebuilt at load takes it from
-  the resume record, and one whose first-contact entry is unanswered takes it from the provisional
-  record when its handshake is re-armed (#401, #402).
-- `daemonseed_core::dm::domain` — `DM_REEST_ROOT`, `DM_REEST_NEXT` and `DM_REEST_CHAN_ID`, the
-  domain labels for the retained re-establishment root, its successor, and a resumed channel's
-  identifier (#404).
-- `daemonseed_core::dm::firstcontact::ChannelRoots` — an `rs0` field carrying the retained
-  re-establishment root, the fourth Expand sibling of the `ss0` extraction (#404).
-- `daemonseed_core::dm::resume` — `Rerooted` and `reroot(&CommittedRoot, &[u8; SHARED_SECRET_LEN])`,
-  yielding the successor retained root, the re-rooted ratchet root and the resumed channel's
-  identifier from one call. `Rerooted::chan_id()` returns the identifier (#404).
-- `daemonseed_core::dm::reest` — `mint_ephemeral()`, `answer(&CommittedRoot, &ek)` and
-  `complete(&CommittedRoot, EphemeralDecapKey, &ct)`, the ML-KEM operations a re-establishment
-  performs. The shared secret does not leave the crate (#404).
-- `daemonseed_core::dm::resume::OwnSlot` — an `eph_dk` field holding the secret half of the
-  ephemeral its `RE-EST` published, sealed and zeroized with the slot. `OwnSlot::new` takes it
-  (#404).
-- `daemonseed_core::dm::ratchet` — `Ratchet::reestablished` and `ReconnectSide`, opening a ratchet
-  on a re-rooted root with the clear generation and the send sequence continuing. It takes the
-  agreed generation, one number on both sides. Both `ReconnectSide` variants carry
-  `last_persisted_generation`; a generation that is not ahead of it is refused with
-  `RatchetError::ReestablishedGenerationNotAhead { generation, persisted }` on either side (#404).
-- `daemonseed_core::dm::ratchet::Ratchet::can_send() -> bool` — whether a chain is in hand to mint
-  from, or a peer ephemeral to open one against (#404).
-- `daemonseed_core::dm::reest::agreed_generation(own_floor: u32, peer_floor: u32) -> u32` — the clear
-  ratchet generation a resumed channel opens at, one past the higher of the two floors, saturating at
-  `u32::MAX` (#404).
-- `daemonseed_core::dm::resume::AcceptanceSlot` carries the floor generation the answer advertised:
-  `AcceptanceSlot::accept` takes it and `AcceptanceSlot::advertised_floor()` reads it. The at-rest v2
-  body gains the field inside its fixed-width run, so a v2 record written before it existed fails to
-  decode as `ResumeError::Truncated`; no released build wrote one.
-  `ResumeError::AcceptanceFloorWithoutAttempt` refuses a floor beside an empty slot (#404).
-- `daemonseed_core::dm::outbox` — `Outbox::sweep_dead_chain(u32)`, `Outbox::next_send_seq()`,
-  `Outbox::last_clear_gen()` and `OutboxEntry::sealed_under_gen()` (#404).
-- `daemonseed_core::dm::resume` — `ResumeRecord::commit_reestablished(Rerooted, u32, i64) ->
-  Zeroizing<[u8; ROOT_KEY_LEN]>`, returning the resumed channel's identifier, and
-  `ResumeRecord::reroot_ratchet_gen()`; `ReEstState` gains `reroot_ratchet_gen` (#404).
-- `daemonseed_core::dm::reest` — the three A9 channel re-establishment legs. A leg is one
-  AES-256-GCM envelope over a plaintext padded to 8192 bytes, `LEG_LEN` on the wire for all three
-  kinds, with no clear kind, generation, seq, attempt or direction field and no AAD. The seal key is
-  `K(RS_n, gen, seq, attempt, leg, dir)` under `DM_REEST_SALT` / `DM_REEST_LEG`; the plaintext
-  carries the leg's payload followed by an ML-DSA-87 signature over `DM_REEST_SIG`, the same five
-  values and the payload, signed under `S_pc` and verified under the peer's `PK_pc`. `seal_re_est` takes a
-  `FreshAttempt`; `seal_re_ack` takes a `ReAckAuthority` minted only by `OpenedReEst::answer` and the
-  answering party's floor generation, read back by `OpenedReAck::floor_gen()`; `seal_re_confirm` takes
-  an `Attempt` and the agreed generation, read back by `OpenedReConfirm::agreed_gen()`. Both fields
-  are big-endian `u32`s inside the payload the leg's signature covers and the leg's AEAD, and
-  `LEG_LEN` is unchanged. `scan_re_est` / `scan_re_ack` / `scan_re_confirm` recover a
-  leg by bounded trial decryption over the attempt window `[last_seen, last_seen + MAX_GAP]`.
-  `tiebreak_winner` is the contest coin, the least-significant bit of the first byte expanded under
-  `DM_REEST_TIEBREAK`; `contest_outcome` is the local contest check. `ReEstGate::admit` evaluates
-  duplicate detection before the response budget. `AttemptBudget` is the toward-`C` count, exhausted
-  at `ATTEMPT_CEILING`. `ATTEMPT_CEILING` is 8 and `MAX_GAP` equals it; both are placeholders for the
-  design's tunable `C`. (#404)
-- `DM_REEST_SALT`, `DM_REEST_LEG`, `DM_REEST_TIEBREAK` and `DM_REEST_SIG` in
-  `daemonseed_core::dm::domain` — the re-establishment label family. (#404)
-- `daemonseed_core::dm::resume::ResumeRecord::open_attempt(seq, SealedReEst, EphemeralDecapKey)` —
-  occupy the own-initiation slot at `reconnect_gen + 1` and advance the attempt counter in one act.
-  Refused on an occupied slot (`ResumeError::AttemptAlreadyOpen`) and on an attempt that does not
-  advance the counter (#404).
-- `daemonseed_core::dm::resume::OwnSlot` — a `seq` field carrying the outbox position its sealed
-  `RE-EST` was addressed to; `OwnSlot::new` takes it and `OwnSlot::seq()` reads it. `seq` is bound
-  into the leg's seal key and signature preimage, so a re-emit has no other way to reach the position
-  the peer reads (#404).
-- `daemonseed_core::dm::resume::ResumeRecord::abandon_attempt()` — empty the own-initiation slot
-  while the attempt counter stands still, which is A3.8's give-up. `commit_resume` admits an empty
-  slot at an unchanged generation exactly when the counter has not moved; a slot emptied under a
-  fresh attempt is still `ResumeError::OwnSlotAbandonedWithoutAcceptance` (#404).
-- `daemonseed_core::dm::outbox::OutboxTarget::ReEstablishmentLeg` — a channel-paged entry the
-  dead-chain sweep and the give-up sweep both skip. A leg hangs off no ratchet chain, so the target rather than a generation
-  carries A3.12's exempting provenance (#404).
-- `daemonseed_core::dm::outbox::ReseedSchedule::deferred(now_ms)`,
-  `OutboxEntry::defer_first_dispatch(now_ms)`, `RECONNECT_FIRST_DISPATCH` and
-  `RECONNECT_JITTER_FRAC` — a first emission due at a delay drawn from A5.5's reconnect-cadence band
-  rather than at the enqueue instant, with the rung unspent. Refused past the first dispatch
-  (`OutboxError::FirstDispatchPassed`) (#404).
-- `daemonseed_veilid_net::dm` — the DM driver's load-time re-establishment pass. On the first tick
-  after a load, an established correspondence runs the dead-chain sweep against its resume record's
-  re-root generation, and — where the outbox holds pending mail — seals a `RE-EST` under the
-  committed re-establishment root, commits it to the resume record, and queues it on its own
-  direction record under `OutboxTarget::ReEstablishmentLeg` with a first dispatch drawn from A5.5's
-  reconnect-cadence band. A persisted attempt is re-emitted as the stored bytes at the sequence the
-  own slot records, never resealed (#404).
-- `daemonseed_veilid_net::dm` — the re-establishment exchange. A queued leg is published to this
-  side's direction record at `msg_addr(dir, seq)`, derived from the address root and the outbox's
-  stored direction rather than from a key schedule. A swept slot the ratchet cannot open, or that
-  arrives at a correspondence holding no key schedule, is trial-decrypted as the leg kinds the
-  resume record says this side expects: `RE-ACK` while an initiation stands, `RE-CONFIRM` while an
-  unconfirmed acceptance stands, `RE-EST` at one past the committed generation, and `RE-EST` under
-  the retained root at the generation an open exchange is at. An opened `RE-EST` is deduped, put to
-  the contest coin, admitted through `ReEstGate` under a per-session response-emission cap, answered
-  with a `RE-ACK` sealed under the root it opened under, committed, and then queued. An opened
-  `RE-ACK` at or above the current attempt completes: the record advances, the settling `RE-CONFIRM`
-  is sealed and queued, and the resumed ratchet opens one position past it. An opened `RE-CONFIRM`
-  settles the exchange this side answered, advancing the generation and retiring the superseded
-  root. A completion runs the dead-chain sweep and ends the legs the exchange finished with. A
-  correspondence with no key schedule sweeps its receiving pages, and an acceptor's knock position
-  is re-settled at load. Every tick runs one idempotent upkeep pass per established correspondence:
-  the retention ceiling, the initiating side's confirming observation, a re-queue of any stored leg
-  whose entry is absent, the retirement of a leg no slot names, and the give-up of a leg unanswered
-  for seven days. A fold that opened a leg and could not finish leaves the position unsettled and
-  writes nothing. **Ordinary mail after a re-establishment is NOT sealed** — a channel frame
-  binds this side's own `PK_pc`, which no record holds after a restart (#404).
-- `daemonseed_core::dm::paging` — `DmPageAddress::sending_on` and `DmPageAddress::receiving_on`,
-  taking an explicit `Direction` in place of a `Ratchet` (#404).
-- `daemonseed_core::dm::ratchet::Direction::opposite()` (#404).
-- `daemonseed_core::dm::resume` — `ResumeRecord::accept_peer_initiation(Rerooted, AcceptanceSlot,
-  bool, i64) -> Zeroizing<[u8; ROOT_KEY_LEN]>`, `ResumeRecord::confirm_acceptance(u32) -> bool`,
-  `ResumeRecord::take_own_slot() -> Option<OwnSlot>`, `ResumeRecord::set_window_anchor(u32)` and
-  `OwnSlot::into_eph_dk()` (#404).
-- `daemonseed_core::dm::outbox` — `Outbox::retire_leg(u64) -> bool` ends a leg the handshake
-  finished with (`ConfirmedCollected`); `Outbox::abandon_leg(u64) -> bool` ends one that will never
-  be opened — a conceded initiation or a leg past its give-up — as `Undelivered`. Both leave
-  `Surfacing::Clear` and refuse any entry that is not a pending leg (#404).
-- `daemonseed_core::dm::resume` — `ConfirmSlot`, the sealed `RE-CONFIRM` a completed exchange
-  persists, with `ResumeRecord::confirm_slot()` and `ResumeRecord::retire_confirm()`;
-  `AcceptanceSlot::accept` takes the outbox sequence its answer was addressed to and
-  `AcceptanceSlot::seq()` reads it; `ResumeRecord::commit_reestablished` takes the `ConfirmSlot`.
-  The at-rest v2 body gains the acceptance slot's `seq`, the confirm slot's generation and sequence,
-  and the sealed `RE-CONFIRM`, extended in place because no released build has written the layout
-  (#404).
-- `daemonseed_core::dm::resume::T_RETIRE_MS` — A3.5's retention ceiling at fourteen days, the
-  design's suggested value (#404).
-- `daemonseed_core::dm::persist::DmPersist::commit_resume` guards the confirm slot: a stored
-  settling leg is not dropped, re-sealed at one generation, or rolled back to an earlier one, except
-  by its confirming observation — which retires the retained root in the same write — or by a later
-  exchange. `ResumeError::ConfirmSlotDropped`, `ConfirmResealed` and `ConfirmSlotWouldRollBack`
-  (#404).
+- `daemonseed_core::identity::keys::SignKeypair::from_halves(&pk, &sk)`, which rebuilds a keypair
+  from its stored halves (#401, #402).
 - `daemonseed_core::trust_events::TrustEventKey` — `DmPeerStateRegressed`,
   `DmReestablishmentFailed`, `DmReestablishmentUnconfirmed` and `DmReestablishmentBackoffEngaged`,
-  A3.8's loud re-establishment states, all `PersistentNonBlocking` (#404).
-- `daemonseed_veilid_net::dm::DmEvent::ReestablishmentAnomaly { with, event }` — one variant for
-  that family, named by its classed key; routed to the audit log by both front ends (#404).
-- `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` — `leg_folds_deferred` and
-  `leg_unaddressable` (#404).
-- `daemonseed_tui::net` / `daemonseed_gui::net` — the front-end DM contract. `NetCommand::Connect`
-  carries `dm_session_keys: Option<DmSessionKeys>` (the full identity KEM keypair, the doorbell slot
-  secret and the profile at-rest key); the net actor moves it into `DmDriverParts` and spawns a
-  `DmDriver` beside itself, one per connect, sending `DmCommand::Shutdown` to any prior driver and to
-  the current one when the command channel closes. `NetCommand::Dm(DmCommand)` is forwarded to that
-  driver through `DmDriverHandle::try_send`, and `NetHandle::dm(cmd)` is the UI-side wrapper; a
-  command arriving with no driver running, or with a full one, is dropped rather than awaited.
-  `NetEvent::Dm(Arc<DmEvent>)` carries the driver's events back. The driver runs
-  `AdmissionPolicy::Open` with `PowDifficulty::PRODUCTION`, a 30-second idle tick, no spent-token
-  store, and a `DmPersist` opened at `<profile root>/dm` under the profile's at-rest key. It is
-  started with `DmDriver::try_spawn` and shut down on the next `Connect` — reached whether or not
-  the transport came up — on `NetCommand::GracefulClose`, and when the command channel closes.
-  Partial (#339): the refusal reaches the front end's state, not yet the user. (#232, #339)
-- `daemonseed_tui::app::DmState` and `daemonseed_gui::state::DmState` — the DM state a session
-  accumulates from `DmEvent`: held contact requests, per-correspondence delivery states and
-  undelivered sequence numbers, the last refusal, and the last doorbell and channel health reports.
-  Folded by `App::on_net_event` and `GuiState::on_dm_event`; nothing is rendered from it. The
-  held-request list is capped at `PENDING_REQUEST_CAP`, oldest dropped, because no event retires a
-  request. `Debug` prints body lengths and redacted identity keys, as `DmEvent`'s own does. Partial
-  (#339). (#339)
-- `daemonseed_tui::app::App::dm_session_keys` / `dm_state`, `daemonseed_gui::state::GuiState::dm_session_keys`
-  / `dm_state` / `on_dm_event`, and `daemonseed_gui::profile::Profile::dm_session_keys`. (#339)
+  all `PersistentNonBlocking` (#404).
 - `daemonseed_core::storage::seeds::SealingKey::to_bytes` — the raw at-rest key as a
   `Zeroizing<[u8; AEAD_KEY_LEN]>`, for a record store that takes it by reference rather than through
   the type. (#339)
-- `daemonseed_veilid_net::dm::DmDriver::try_spawn` and `DmSpawnError` — the startup conditions
-  `DmDriver::spawn` panics on, reported instead. The three fallible steps — both owner-seed
-  derivations and the block-list provision — run on the caller's thread, so a read-only or full
-  profile directory would otherwise kill a caller that has other work. `spawn` remains the panicking
-  wrapper. (#339)
-- `daemonseed_veilid_net::dm::DmDriverHandle::try_send` and `DmTrySendError` — queue one command
-  without waiting. `send` applies backpressure to its caller, which is wrong for a shared actor loop
-  where a full DM queue would stall every other command. (#339)
-- `daemonseed_veilid_net::dm::PENDING_REQUEST_CAP` — the driver's held-request bound, made public so
-  a front end's own list is bounded by the same number rather than a second one. (#339)
 
-- `daemonseed_core::dm::frame::seal_accept(outbound, chan_id, signing_pc, signing_lt, recipient_hash, sent_unix_ms, ack)` — the acceptor's ACCEPT: an ordinary channel frame at the acceptor's sequence zero with an empty body, carrying `pk_pc` and `bind_lt` in the sealed body. (#234, #236)
-- `daemonseed_core::dm::frame::ParsedFrame::open_accept(key, chan_id, dir, found_at, recipient_hash, peer_pk_lt) -> VerifiedAccept` — opens that frame with no prior pseudonym, verifying `bind_lt` under the peer's long-term key. `VerifiedAccept { frame, peer_pk_pc }`. (#234, #236)
-- `daemonseed_core::dm::frame::DmFrameError` — `Binding`, `MissingBinding`, `PseudonymMismatch` and `NotAccept { seq }`. (#234, #236)
-- `daemonseed_core::dm::persist::PendingHandshake::ratchet()` / `commit()` — derive the initiator's ratchet without erasing the provisional record, and erase it. `establish()` remains the pair. (#234, #236)
 - `DmChannelBody.pk_pc` (tag 6) and `DmChannelBody.bind_lt` (tag 7) — the acceptor's pseudonym key and its long-term binding, empty on every other frame. Wire-visible, MINOR. (#234, #236)
-- `daemonseed_veilid_net::dm::RefusalReason` / `AcceptFailure` — why a first contact stopped, and why
-  an accepted request was not established. `DmEvent::Refused` carries the first; the new
-  `DmEvent::AcceptFailed { request, from, reason }` carries the second and leaves the request held.
-  (#236)
-- `daemonseed_veilid_net::dm::DmEvent` — `ChannelLost` carries the `surfaced` sequence numbers the
-  user is owed; `DoorbellHealth` carries admission's running `AdmissionCounters`; new variants
-  `ChannelDirectionUnknown`, `ContactLookupFailed`, `BlockListProvisioned` and
-  `SpentTokensNotPersisted`. `DoorbellHealth` also carries `pending_full`, the slots this sweep
-  skipped because the held-request list was full. `RefusalReason::TaskPanicked` is a panicked
-  transport task, distinct from `MintPanicked`. (#236)
-- `daemonseed_core::dm::outbox::Outbox::room_for(seq, target, frame_len)` — whether a sealed entry of
-  that size would be accepted, priced by the same gate `enqueue_sealed` passes. (#236, #339)
-- `daemonseed_core::dm::collect::Collection::resuming_from_page(page)` — a collection whose probe
-  frontier starts at a persisted cursor's page; the settled set is not restored. (#236)
-- `daemonseed_core::dm::ratchet::Ratchet::next_send_seq` — the sequence number the next `send_next`
-  will place on a message. (#236, #339)
-- `daemonseed_veilid_net::dm::DmEvent::ChannelHealth { with, partial_sweeps, already_consumed,
-  unopenable, peer_pseudonym_unknown, peer_acks_deferred }` — one correspondence's channel-plane
-  accounting, cumulative per session, emitted only when a counter moves. (#236)
-- `daemonseed_veilid_net::dm::RefusalReason` — `OutboxFull { needed }`, `NotEstablishedThisSession`,
-  `BodyTooLarge` and `SealFailed`. (#236, #339)
-- `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` counts `peer_pseudonym_unknown`: an initiator
-  learns no pseudonym for its correspondent, so it verifies nothing and does not sweep. (#236)
-- `daemonseed_core::dm::admission::SeenSet::forget` — un-record one entry hash, for a caller that
-  abandoned an entry's verification rather than finishing it. (#236)
-- `daemonseed_core::dm::persist::DmPersistError::AlreadyEstablished` — `accept_first_contact` refuses a
-  second correspondence for one identity key rather than minting a second label. (#236)
-- `daemonseed_core::dm::spent_store::read_from` / `write_to` — read the sealed spent-token set at a
-  path (`Ok(None)` when absent, an error when present and unopenable) and replace it atomically.
-  `SpentStoreError` gains `Io` and `Replace`. (#236)
-- `daemonseed_veilid_net::dm` — the DM driver's doorbell half. On its cadence the driver sweeps its
-  own doorbell and runs each populated slot through `daemonseed_core::dm::admission::Admitter`;
-  an admitted knock from a stranger is held and surfaced as `DmEvent::ContactRequest`, one from a
-  blocked identity surfaces nothing, and one from a known correspondent reaches
-  `DmPersist::correspondent_state_lost` and surfaces `DmEvent::ChannelLost`. `DmCommand::Accept`
-  establishes the correspondence through `DmPersist::accept_first_contact`; `Decline` drops the held
-  request and writes nothing; `Block` / `Unblock` update the block list, with a refused 513th entry
-  surfacing as the new `DmEvent::BlockListFull { count }`. `DmCommand::FirstContact` fetches the
-  recipient's key record, mints the entry on a blocking thread, then writes the provisional record
-  and publishes the knock; an absent key record publishes nothing and surfaces `DmEvent::Refused`.
-  `DmDriverConfig` gains `policy` and `pow_difficulty`; `DmDriverParts` gains `spent_tokens`, a
-  `SpentTokenStore`. `DmDriver::spawn` derives the identity's own owner seeds, provisions the block
-  list and opens the spent-token set before the task starts, and panics if any of them fails; an
-  invite-only policy with no `spent_tokens` panics likewise. A doorbell sweep retires the seen set
-  and prunes the spent set, drops held requests whose admitting epoch has left the accept window,
-  forgets slots the doorbell no longer holds, and ends before recording anything when the block list
-  will not read. A slot arriving at a full held-request list is skipped before admission rather than
-  discarded after it, and a slot whose contact lookup failed is left unrecorded — both are read
-  normally on a later sweep. A panicked spawned job is attributed to what it was doing: a mint or a
-  transport task releases its introduction, a spent-token write poisons the store. `FirstContact` is refused
-  when a correspondence with that identity already exists or an introduction to it is in flight, and
-  reuses one provisional label per recipient. A spent-token set that will not open poisons the store
-  for the life of the driver rather than being written over. (#236)
-- `daemonseed_veilid_net::dm::SpentTokenStore` — where a profile's consumed invite-token nonces are
-  sealed, by profile root, passphrase, profile id and Argon2id parameters. (#236)
-- `daemonseed_core::dm::persist::DmPersist::accept_first_contact` — mints a correspondence label,
-  opens the recipient ratchet and writes the contact record from a verified knock, in one call.
-  (#236)
-- `daemonseed_core::dm::persist::DmPersist::provision_block_list` — writes an empty block list when
-  the profile has none, and reports whether it wrote. (#236)
-- `daemonseed_core::dm::provisional::Teardown::into_cause` — the teardown's cause, by value. (#236)
-- `daemonseed_core::dm::admission::AdmissionOutcome::Admitted` carries `entry_hash`, the value step 2
-  computed over the admitted entry. (#236)
-- `daemonseed_veilid_net::dm` — the DM driver's seam and harness. `DmDht`, a trait over the seven DM
-  DHT operations returning `DmDhtFuture<T>`, implemented for `VeilidNetHandle`. `DmDriver::spawn`
-  takes `DmDriverParts` (`dht`, `clock`, `identity`, `persist`, `cfg`) and returns a
-  `DmDriverHandle` plus an `mpsc::Receiver<DmEvent>`; the driver wakes on `cfg.idle_tick`, performs
-  no DHT operation, and ends on `DmCommand::Shutdown` or on the last handle dropping, aborting
-  whatever is in flight. A zero `idle_tick` panics at construction. Adds `DmCommand`, `DmEvent`,
-  `RequestId`, `PkLt`, `DmIdentity`, `DmDriverConfig`, and `WallClock` (unix milliseconds injected
-  as a closure). `DmCommand` and `DmEvent` redact message bodies and identity keys in `Debug`.
-  `dm.rs` becomes `dm/mod.rs` with `seam`, `types`, `machine` and `driver` siblings. (#235, #236)
 - `daemonseed_core::identity::keys::IDENTITY_PK_LEN` — the width of a long-term identity public key
   in bytes.
-- `daemonseed_core::dm::persist` — `DmPersist::correspondent_state_lost`, which answers an opened
-  first-contact entry against what is stored and stops that correspondence's outbox where the entry
-  means the correspondent lost their at-rest state. `StateLoss::NoCorrespondence` for an identity no
-  correspondence holds, `StateLoss::SameChannel` for an entry addressing the recorded channel (an
-  introduction re-seeded, which changes nothing), `StateLoss::Confirmed` for an entry under a channel
-  the store does not hold — which ends every pending entry as `Undelivered` and surfaces it at once,
-  without waiting out the `GIVE_UP_MS` window, carrying a `Teardown` for the reason.
-  `DmPersistError::AmbiguousCorrespondent` is propagated and nothing is marked. An idle queue is
-  not written. **Breaking (crate API):** `DmPersistError` gains a `FirstContact` variant. (#261)
-- `daemonseed_core::dm::persist` — `DmPersist::peek_channel_restart`, which returns the same
-  `StoredChannelRestart` arms as `restart_channel` and writes nothing: it deletes no lingering
-  provisional record and takes no lock. `DmMachine::provisional_label`'s scan across stored
-  correspondences uses it.
-- `daemonseed_core::dm::persist` — `DmPersist::sweep_lingering_provisionals() -> Result<usize, DmPersistError>`
-  deletes every provisional record left beside a readable resume record and reports how many. A
-  store that will not enumerate is an error; a single correspondence that will not read is skipped.
-  The DM driver runs it once when it rebuilds its correspondences from the store.
 - `daemonseed_core::dm::contact_cache` — `ContactRecord::addresses_same_channel`, which reports
   whether an address root is the one this record stores. The comparison is not
   constant-time. It holds only under one at-rest store per `pk_lt`, which nothing enforces. (#261)
 - `daemonseed_core::dm::contact_cache` — `ContactRecord::new` and `decode` refuse an all-zero
   address root as `ContactCacheError::PlaceholderAddressRoot`. **Breaking (crate API):**
   `ContactCacheError` gains a `PlaceholderAddressRoot` variant. (#261)
-- `daemonseed_core::dm::provisional` — `TeardownCause::CorrespondentStateLost`, the fourth cause and
-  the only one under which `Outbox::channel_torn_down` ends an `AwaitingCollection` entry. Its
-  `TeardownOutcome::retained` is always empty. (#261)
 - `daemonseed_core::trust_events` — `TrustEventKey::DmCorrespondentStateLost`, class
   `PersistentNonBlocking`, stable string `dm-correspondent-state-lost`. (#261)
-- `daemonseed_core::dm::persist` — `DmPersist::correspondence_for_pk_lt`, which names the
-  correspondence whose contact record holds a given long-term identity key. It is a scan of
-  the store's correspondences and their contact records, not a stored index, and is
-  lock-free. `Ok(None)` is no match; two or more matches is
-  `DmPersistError::AmbiguousCorrespondent`, carrying the count and no label. A
-  correspondence with no contact record is skipped; a contact record that exists and will
-  not decode fails the whole lookup. **Breaking (crate API):** `DmPersistError` gains an
-  `AmbiguousCorrespondent` variant. (#261)
 - `daemonseed_core::storage::dm_store` — `DmStore::correspondences`, the sorted list of every
   correspondence established under the store root, taken without the lock and creating
   nothing. A root entry counts when its name is a label's lower-case hex directory form and
@@ -598,14 +268,6 @@ work lives in the maintainer's own planning notes, not here.
   the ceiling with `BlockListError::Full` before any write; `decode` gives `Full` at the same
   ceiling, `NotWholeKeys` for a payload that is not a whole number of ML-DSA-87 public keys,
   and `NotAscending` for keys out of order or repeated. (#390)
-- `daemonseed_core::dm::persist` — `DmPersist::read_block_list` and
-  `DmPersist::update_block_list`, the block list's path to and from the DM at-rest store.
-  `read_block_list` is lock-free; an absent record is `DmPersistError::BlockListMissing`,
-  never an empty list. `update_block_list` is read-modify-write inside one profile critical
-  section and writes on every call, spending one seal whether or not the list changed;
-  nothing is written if the caller's closure fails or the resulting list is over the ceiling.
-  **Breaking (crate API):** `DmPersistError` gains `BlockList` and `BlockListMissing`
-  variants. (#390)
 - `daemonseed_core::storage::dm_store` — profile-scoped records, held at the store root
   rather than in a correspondence directory. `RecordScope` and `RecordKind::scope` name a
   kind's scope; `RecordKind::BlockList` is the block list's, sealed under
@@ -617,14 +279,6 @@ work lives in the maintainer's own planning notes, not here.
   `BlockList` variant. (#390)
 - `daemonseed_core::storage::atomic_file` — `FileLock::try_acquire` takes the lock if it is
   free and returns `Ok(None)` if another holder has it, never blocking. (#390)
-- `daemonseed_core::dm::persist` — `DmPersist::read_contact` and
-  `DmPersist::update_contact`, the contact record's path to and from the DM at-rest
-  store. `read_contact` is lock-free and creates nothing; a stored record that will
-  not decode is `DmPersistError::Contact`, never `Ok(None)`. `update_contact` is
-  read-modify-write inside one critical section, takes a seed closure built only when
-  the correspondence has no record, and writes a stored record back only on
-  `Mutation::Changed`; a seeded record is written whatever the closure reports.
-  **Breaking (crate API):** `DmPersistError` gains a `Contact` variant. (#236)
 - `identity::OwnerSeed`, `identity::OwnerPublic` and `identity::RendezvousOwner` in
   `daemonseed-veilid-net`: how a party holds a rendezvous record's owner, either `Held`
   (the owner seed) or `PublicOnly` (the owner public key). An `OwnerPublic` is
@@ -634,30 +288,10 @@ work lives in the maintainer's own planning notes, not here.
   public key naming a rendezvous owner, and the baked owner public key of the
   project-announce/MOTD record. Together they name that record's DHT address with no
   owner secret derived or held; they confer no write capability. (ISC-15)
-- Two-node integration test for the direct-message acknowledgement record: one node publishes
-  a state with gaps, the other derives the same record, fetches it, verifies it and merges it
-  under its own ceiling. (#235)
-- Direct-message acknowledgement piggyback: `DmChannelBody` carries `ack_high_water` and
-  `ack_beyond`, bound in `msg_sig` and surfaced as `VerifiedFrame::peer_ack`. A channel
-  frame reserves `WORST_CASE_ACK_FIELDS_LEN` when choosing its padding rung, so the rung
-  does not vary with whether an acknowledgement rode along. **BREAKING (MAJOR wire):** the
-  channel frame's signature preimage now binds these two fields, so a frame sealed by a
-  build without them does not verify against one with them, in either direction.
-  **Breaking (crate API):** `frame::seal` and `frame::frame_sig_input` take the
-  acknowledgement as a new argument, and `DmFrameError` gains a `PiggybackedAck` variant.
 - `cargo check --workspace --release` runs as a `pre-push` gate and a `release-gate` step,
   covering code that compiles under `debug_assertions` and not in the release profile. (#381)
 - `cargo xtask check-ui-strings` refuses placeholder text in any string a user can read,
   and runs as a `release-gate` step.
-- Direct-message doorbell transport: a first-contact entry publishes into a slot of the
-  recipient's world-derivable doorbell record, and a recipient sweeps all 32 slots of its own.
-  A user's first send is classified `Chat`; a scheduler re-dispatch is `Keepalive`. (#233)
-- First-contact admission: a knock carries a SHA-384 hashcash proof of work bound to the entry,
-  the recipient and the epoch, plus an invite token bound to its grantee and redeemable once.
-  A verifier disposes of a doorbell slot cheapest-check-first, admitting an entry to the
-  duplicate-suppression set only once its proof of work has been paid. (#233)
-- `daemonseed_core::dm::spent_store` — the spent-invite-token set's home at the profile root,
-  sealed under its own key. (#233)
 - `TrustEventLog::unreadable_entries` reports how many persisted entries this build could not
   read. (#337)
 - `ArgonParams::is_openable` bounds the Argon2 cost an opener will honour from a file
@@ -667,52 +301,9 @@ work lives in the maintainer's own planning notes, not here.
   Covers `docs/llm-api-manifest/*.yaml` and the root `lama.yaml`, and runs as part of
   `release-gate`. (#326)
 
-- `daemonseed_core::dm::resume` — the A9.2 re-establishment resume record.
-  `ResumeRecord` carries `S_pc`/`PK_pc`, the committed re-establishment root,
-  the `attempt` counter, the sealed RE-EST frame bytes, the send-side floor, the
-  window anchor and the toward-`C` count in one blob. `SendFloor` is
-  `(generation, seq)` and orders lexicographically, so a generation bump is not
-  a rollback. `SealedReEst` binds the sealed frame to the `Attempt` it was
-  sealed under; `SealedReEst::seal` consumes a `FreshAttempt`, minted solely by
-  `Attempt::advance` and `FreshAttempt::first`, so it cannot be called with an
-  attempt already in hand (A9.1). `ResumeRecord::decode` rebuilds the pairing
-  from at-rest bytes without a token, so the store remains the enforcement
-  point. `DmPersist::commit_resume` writes the record and returns the
-  sealed bytes to emit; `read_resume` reads it back. `RESUME_CAPACITY` is now
-  checked against a computed worst case rather than estimated.
-
 - Re-keyed the write funnel's FIFO and coalescing scope onto the owner's public
-  key at every enqueue site, through one `funnel_record_key` helper; four sites
-  still passed the raw owner seed while the DM page site used the public key. The
-  mapping is injective and all four moved together, so no coalescing group
-  changes. (#256)
-
-- `daemonseed_core::dm::paging` — a page address is checked against the ratchet's
-  conversation. `Ratchet` carries `ar_fingerprint()`, derived at construction from
-  the `ss0` it already takes, and `DmPageAddress::sending` / `::receiving` refuse a
-  root that does not match it with `DmPageError::ConversationMismatch`. Previously a
-  caller holding two channels could resolve one conversation's root against the
-  other's ratchet and receive a valid, wrongly-directed address; frames are
-  individually authenticated, so the conversation stopped progressing in silence
-  rather than anything being forged. `firstcontact::ar_fingerprint` and
-  `conversation_binding` are the derivation. (#270)
-
-- `daemonseed_core::dm::persist` — the wiring between the DM types and the
-  store, so DM state is finally written. `DmPersist` derives both the store key
-  and the provisional record's key from one at-rest key. `restart_channel`
-  returns `StoredChannelRestart::HandshakeResumes(PendingHandshake)` or a loud
-  `Teardown`; `PendingHandshake` owns the record and its one consuming method,
-  `establish`, builds the ratchet **and** deletes the record — so `ss0` is
-  actually erased on establishment rather than documented as erased.
-  `ProvisionalRecord::into_ratchet` is now `pub(crate)`, so outside the crate
-  `establish` is the only path from a record to a ratchet. `update_outbox` and
-  `advance_cursor` are read-modify-write inside one critical section; there is
-  no load-then-save pair to lose an update. `read_outbox` / `read_cursor` are
-  lock-free and create nothing. The provisional record is sealed by its own
-  path and again by the store: the two bind different facts — `RecordContext`
-  refuses a record lifted from another channel, the store's AAD refuses a blob
-  moved between slots — and neither layer can check the other's. Erasure is
-  `unlink`, not an overwrite (#293). (#281, #243)
+  key at every enqueue site, through one `funnel_record_key` helper. The mapping
+  is injective, so no coalescing group changes. (#256)
 
 - `daemonseed_core::storage::dm_store` — the DM at-rest store. `DmStore::open`
   derives one seal key from the profile at-rest key (HKDF-SHA384 under the new
@@ -757,78 +348,16 @@ work lives in the maintainer's own planning notes, not here.
 - The startup sweep scrubs an orphaned temp sibling before unlinking it, and
   skips one it cannot scrub rather than failing `DmStore::open`. (#293)
 
-- **Behaviour change:** a crash inside the erase destroys the provisional
-  record, where one before it left a resumable handshake.
-  `PendingHandshake::establish` is no longer a safe retry. An interrupted erase
-  reports as `TeardownCause::NoProvisionalRecord`, not `StoreUnreadable`. (#293)
-
 - `CorrespondenceLabel::mint` — a correspondence's on-disk directory name is
   minted from the CSPRNG and recorded in the contact cache, never derived from
-  `chan_id`, the recipient's key-record address, or a salted derivation over
+  a conversation identifier, a public-key-derived record address, or a salted derivation over
   either. ISC-A-C44. (#288)
 
-- `daemonseed_veilid_net::dm` — the DM driver's acknowledgement half. A receiver holds one
-  `StandaloneAckCadence` per correspondence and one client-global `StandaloneAckBudget`; on each tick
-  every correspondence that wants a write is ordered by `ack_cadence::pick_next`, oldest pending
-  first, and the budget grants at most one. A granted write builds the record with
-  `ack_record::build_encoded` over the collection's own state and publishes it at
-  `DmAckAddress::for_direction` over the receiving direction; the cadence advances on the write's
-  outcome, never on the decision. A refusal's `retry_after_ms` becomes a wake time. The taper is
-  keyed on each collected frame's own `sent_unix_ms`, and a correspondence stops wanting a write once
-  every message it collected has passed the sender's give-up. A sender holds one retained `AckState`
-  per correspondence: piggybacked acknowledgements are folded where the frame is opened, and on each
-  tick a correspondence with unsettled entries and a known pseudonym fetches the peer's record,
-  verifies it with `ack_record::decode_and_verify` and folds that. Each collected frame's asserted
-  send time is clamped to the moment it was collected before it enters the taper's set: a
-  peer-asserted time in the future never ages out of the give-up window, so stored verbatim it
-  terminates no conversation, writes for ever, and takes the client-global allowance from every
-  honest correspondence at once. The set is sorted, deduplicated and capped, dropping the
-  second-newest entry on overflow so the oldest and the newest both survive. Either fold merges under the
-  highest sequence this side has sent, then settles the outbox and emits
-  `DmEvent::Delivery { state: ConfirmedCollected }` for each settled sequence, once per run. Cadence
-  and budget state are not persisted: after a restart the taper restarts from the floor. (#235)
-
-- An acceptor's collection settles the knock's own sequence zero, which arrives by doorbell and no
-  page will ever hold, so the contiguous prefix starts and the initiator's opening message can be
-  confirmed. (#235)
-
-- `crates/daemonseed-veilid-net/tests/two_node_dm_driver.rs` — opt-in `#[ignore]`d live oracle: two
-  nodes, one `DmDriver` each over its own `VeilidNetHandle`, driven through the driver's command and
-  event channels. `FirstContact` → `ContactRequest` at the correspondent → `Accept` → the acceptance
-  collected at sequence zero → one channel message each way, each collected exactly once → both
-  outboxes at `DeliveryState::ConfirmedCollected`. Proof of work minted and verified at
-  `PowDifficulty::PRODUCTION`. (#235, #236)
-
-- `daemonseed_core::dm::persist::PendingHandshake::establish_with_resume` and
-  `commit_with_resume` take a `&ResumeRecord`, commit it, and then erase the provisional record
-  best-effort. `StoredChannelRestart::Established(Box<ResumeRecord>)` is a third restart outcome:
-  a stored resume record is the authority, and a provisional record beside it is ignored and
-  deleted. (#401)
-- `daemonseed_core::dm::persist::DmPersist::record_first_contact_sent(label, pk_lt, ar, now_ms)` —
-  writes the initiator's contact record when a first-contact entry is sent, with no pseudonym. A
-  record already there is re-addressed to the new root and keeps its `first_seen_ms`;
-  `DmPersistError::AlreadyEstablished` for an established correspondence and
-  `CorrespondenceHoldsAnotherIdentity` for one holding a different `pk_lt`. (#402)
-- `daemonseed_core::dm::persist::DmPersist::record_correspondent_pseudonym(label, pk_pc, now_ms) -> bool`
-  — fills the pseudonym on that record when the acceptance verifies, reporting whether it was newly
-  recorded, and records the sighting. `DmPersistError::ContactRecordMissing` where no record exists.
-  (#402)
 - `daemonseed_core::dm::contact_cache::ContactRecord::record_pseudonym(pk_pc) -> bool` — fills an
   absent pseudonym; `ContactCacheError::PseudonymAlreadyRecorded` for a different key, an identical
   key reports `false`. (#402)
 - `daemonseed_core::dm::contact_cache::ContactCacheError` — `UnknownPseudonymPresence { found }`,
   `PlaceholderPseudonym`, `PseudonymAlreadyRecorded`. (#402)
-- `daemonseed_core::dm::persist::DmPersistError` — `CorrespondenceHoldsAnotherIdentity`,
-  `ContactRecordMissing`. (#402)
-- `daemonseed_core::dm::persist::DmPersistError::retrying_cannot_help()` — whether repeating the
-  same call could answer differently. Every `Contact`, `ContactRecordMissing`,
-  `CorrespondenceHoldsAnotherIdentity`, `AlreadyEstablished`, `AmbiguousCorrespondent`,
-  `OutboxDirectionMismatch` and `CursorPayloadWrongLen` is settled, as is a `Store` error naming
-  unreadable bytes. (#402)
-- `daemonseed_core::dm::provisional::ProvisionalRecord::channel_roots()` and
-  `daemonseed_core::dm::persist::PendingHandshake::channel_roots()` — both channel roots
-  recomputed from the stored handshake, `AR` and `chan_id` together, in a `ChannelRoots` that
-  erases itself. (#402)
 - The graceful-close path traces every stage under `DAEMONSEED_VEILID_TRACE`: entry with the
   pre-flush budget, each share withdraw as posted or timed out with the withdraw budget left,
   each room's LEAVE tombstone as awaited or timed out, the flush budget handed over and whether
@@ -836,19 +365,6 @@ work lives in the maintainer's own planning notes, not here.
   `Command::Shutdown` dequeue with its budget, the scheduler flush return, and the teardown
   return or `TEARDOWN_CAP`. A leave or flush stage that is skipped for want of a session says
   so, so a silent trace means the close never ran rather than ran and did nothing. (#370)
-- `VeilidNetHandle::pin_dm_pages(u64, Vec<DmPageRecord>)` and `rendezvous::BoundedRing::set_pinned` —
-  the page records the open cache's capacity bound may not reclaim, stated as a whole set that
-  replaces any previous one. The `u64` is the statement number, strictly increasing per caller; a
-  statement no newer than the last applied is dropped. The DM driver states the watched pair of
-  every conversation it carries on cadence — one holding a key schedule, not torn down, not
-  suppressed by the block list — and restates it only when that set changes; a resumed
-  correspondence holding no key schedule is included, as it is swept on the same cadence. A pinned
-  set at or past the capacity stalls reclamation: the cache holds the pinned records plus the
-  entries in flight, one per concurrent open, and does not grow with traffic. An eviction
-  skips a pinned record as it already skips a leased one, so the bound no longer chooses the current
-  or next page of a sweep — the pages nothing holds between operations, and therefore the oldest
-  unheld records an LRU would pick. A close asked for by name is not refused by a pin.
-  `DM_PAGE_CACHE_CAPACITY` is 128. (#252)
 - `daemonseed-veilid-net`: the `two_node_dm_offline` and `two_node_dm_evict` oracles, one process per step
   over `dm::flows` and `VeilidRecords`, each driver `#[ignore]`d. `two_node_dm_offline`: A writes a first
   contact while no B process exists, a third identity writes one whose channel opening names A as writer
@@ -866,7 +382,45 @@ work lives in the maintainer's own planning notes, not here.
   control subkey comes back above its established network number and a lost message slot at or above it,
   and that each slot reads back byte-identical to its outbox entry.
 - `daemonseed-core`: `dm::drop::has_leading_zero_bits` and `dm::contact_cache::ROOT_LEN`.
-  `dm::pow::has_leading_zero_bits` re-exports the former.
+- `daemonseed-tui`: direct messaging over `dm::runner`. `App::dm_session_keys` gives a `DmSessionKeys`
+  holding `signing`, `dm_channel_root` and `at_rest_key`. A connect with a started node starts a runner
+  over `VeilidNetHandle::dm_records_parts`; Connect, `NetCommand::StopDm` (sent on disconnect) and
+  `GracefulClose` replace the runner in a spawned task that awaits the previous runner's task end before
+  the next starts. `NetCommand::Dm` carries a `RunnerCommand`, and `NetEvent::Dm` an `Arc<RunnerEvent>`,
+  beside `NetEvent::DmStopped`. `GracefulClose` waits for the runner to stop before its transport steps
+  and its ack, capped at `net::DM_CLOSE_CAP` (30 s); a stop still running after
+  `net::DM_CLOSE_NOTICE_AFTER` (500 ms) sends `NetEvent::DmCloseSlow`, and the client prints
+  `net::DM_CLOSE_MESSAGE` while it waits. A direct-message pane, opened and closed with `[c]` from any
+  pane that does not turn a printable key into text and closed with `Esc`, lists the pending contact
+  requests and then the conversations, newest first, with both counts in its title. It lists nothing
+  while no runner reports and draws one health line while the runner reports failures. On a selected
+  request, `[a]` opens an editable reply pre-filled with `DM_ACCEPT_REPLY`, sent as one
+  `RunnerCommand::Accept` and restored with the reason when refused; `[d]` hides the sender for the run;
+  `[b]` sends `RunnerCommand::Block` and marks the sender as blocking until `RunnerEvent::BlockList`
+  lists it or a refusal clears it. An identity reads blocked only once that list names it.
+  `RunnerEvent::BlockListUnreadable` shows `DM_BLOCK_LIST_UNREADABLE` in the pane and on the status line
+  until the next `BlockList`, and marks conversations not in the last list read as of unknown block
+  state. `Enter` on a conversation opens its thread and `Esc` leaves it. The thread draws sent messages
+  as composed, sent or delivered, and not sent when the runner stops; received messages with their
+  received time in UTC; and the refusal that stopped the last send, one phrase per reason. Its composer
+  sends one `RunnerCommand::Send`. A conversation the roster has not called established, and that is not
+  blocked, carries `DM_HELLO_GRADE`. `RunnerEvent::StartedOver` folds
+  `TrustEventKey::DmCorrespondentStateLost`. `App::dm_state`, `App::dm_pane_open`, `App::dm_sel`,
+  `App::dm_requests`, `App::dm_correspondences`, `App::dm_thread`, `App::dm_thread_correspondence`,
+  `App::dm_compose`, `App::take_pending_dm`, `MainFocus::consumes_text`, `app::dm_fingerprint`,
+  `DmState`, `DmCorrespondence` and `DmThreadRow` (#236, #339, #418).
+- `daemonseed-gui`: direct messaging over `dm::runner`, with no surface that draws messages.
+  `Profile::dm_session_keys` and `GuiState::dm_session_keys` give a `DmSessionKeys` holding `signing`,
+  `dm_channel_root` and `at_rest_key`. A connect with a started node starts a runner over
+  `VeilidNetHandle::dm_records_parts`; Connect, `NetCommand::StopDm` and `GracefulClose` replace the
+  runner in a spawned task that awaits the previous runner's task end before the next starts.
+  `NetCommand::Dm` carries a `RunnerCommand`, and `NetEvent::Dm` an `Arc<RunnerEvent>`, beside
+  `NetEvent::DmStopped`. A command sent with no runner is answered with `Refusal::ShuttingDown`.
+  `GuiState::on_dm_event` appends `TrustEventKey::DmCorrespondentStateLost` for
+  `RunnerEvent::StartedOver` and keeps nothing else. `GracefulClose` waits for the runner to stop
+  before its transport steps and its ack, capped at `net::DM_CLOSE_CAP` (30 s); a stop still running
+  after `net::DM_CLOSE_NOTICE_AFTER` (500 ms) sends `NetEvent::DmCloseSlow`, and the window shows
+  `net::DM_CLOSE_MESSAGE` in the connection status and stays open and drawing until the ack (#339).
 
 ### Fixed
 
@@ -877,7 +431,6 @@ work lives in the maintainer's own planning notes, not here.
   is refused `UnknownConversation`, and a hello for one is not counted in `hellos_unsettled`. `RunnerRecords` gains
   `open_existing_channel`, and `VeilidRecords::erase_channel` keeps the channel open when the erase fails.
 - Record opens release their un-gated permit and the caller's record lock on timeout instead of holding both across an unanswered open (#430)
-- DM key-record and ack fetches release their read-pool permit on timeout instead of holding it across an unanswered read (#411)
 - `daemonseed-tui`: a graceful close publishes a LEAVE tombstone for every joined circle as well as
   the lobby, each sealed under its own circle key and posted to that circle's presence record,
   awaited concurrently under the close budget. (#368)
@@ -887,53 +440,18 @@ work lives in the maintainer's own planning notes, not here.
 - The `daemonseed_core::presence` interval-draw documentation links `apply_jitter` in
   `daemonseed_core::backoff`, the module that defines it. (#332)
 
-- A direct-message leg fold works on its own copy of the page's resume record and writes it back
-  only when it consumes its leg, so a fold that defers or refuses leaves nothing for a later fold on
-  the same page to commit; a withheld attempt is not recorded in the seen-frame memory; the own
-  slot is emptied only after decapsulation succeeds. (#404)
-- A torn-down direct-message conversation opens no re-establishment at load, gets no upkeep, and
-  its queued leg is skipped before the retry ladder advances. (#404)
-- A direct-message first-contact entry sent and then restarted before it was accepted no longer
-  strands: the acceptance is collected and the correspondent's messages are delivered, where before
-  nothing mapped their identity key to the correspondence and every message they composed re-emitted
-  to the outbox's seven-day give-up. (#402)
 - Bounded each rendezvous sweep GET at `SWEEP_GET_TIMEOUT` (15s), with `SWEEP_READ_FANOUT` (4) in
   flight at once, so a sweep of an `o_cnt`-subkey record spends at most `o_cnt.div_ceil(4) × 15s`
   on its reads however many go unanswered; every slot is still read exactly once in index order.
   `SweepOutcome` gains `timed_out`, a subset of `failed`, and the rendezvous sweep traces its
   start as well as its counts on completion. (#397)
-- The terminal client shows a direct-message channel torn down for want of a stored handshake
-  record as "conversation ended — start a new one" in the status badge and Trust History,
-  through `trust_persistent_text`, rather than printing the event key
-  `dm-channel-torn-down-on-restart` verbatim. Every other key of that class still renders as
-  its stable string. The event key is unchanged.
-- `Display for TeardownCause::NoProvisionalRecord` no longer states that the application
-  restarted, a claim that does not hold on every path reaching that cause; it states that the
-  conversation cannot be resumed. The impl has no caller outside tests.
-- Corrected the direct-message outbox record's growth, which retained every entry ever
-  inserted and so grew with lifetime rather than owed messages, reaching a wall past which
-  every persist for that correspondence failed for good. `DmPersist::update_outbox` calls
-  `Outbox::prune` before running the caller's closure once the encoded record reaches half
-  the outbox record's capacity, so an enqueue's capacity gate prices against the reclaimed
-  bytes. Reclaiming an entry discards which terminal state its message reached:
-  `Outbox::pruned_high_water` records only that the sequence is gone, and an acknowledgement
-  reports a given-up sequence as settled. A prune that reclaims nothing spends no seal, and
-  one that reclaims writes once for the backlog. (#323)
-- Corrected the DHT open cache's treatment of DM channel page records, which opened a page
-  once per session and never closed it, so open-record cardinality grew with message volume.
-  The page subset of the cache is bounded by `DM_PAGE_CACHE_CAPACITY`, and an eviction closes
-  the record it drops. The lobby record and share adverts derive the same owner key and keep
-  the open-once behaviour. An open holds a lease that makes its record id non-evictable, and
-  an eviction closes under the evicted record's own lock, so a record another operation is
-  using is never closed. (#252)
+- The terminal client renders `TrustEventKey::DmChannelTornDownOnRestart` as "conversation
+  ended — start a new one" in the status badge and Trust History, through
+  `trust_persistent_text`. Every other key of that class renders as its stable string. The
+  event key is unchanged.
 - Corrected the rustdoc where the direct-message at-rest store is introduced, which left
-  the word *store* to be read as the place messages are kept. `storage::dm_store`, the
-  `dm_store` entry in `storage`, `dm::persist` and `dm::spent_store` name what it holds:
-  per correspondence the resume, provisional, outbox, receive-cursor and contact records,
-  plus the profile's block list. Message content is present only while an outbox entry is
-  in flight, and a received message is never written. `dm::spent_store`'s argument for
-  keeping the spent-token set outside the store rests on the fixed-size profile record's
-  shape rather than on every record belonging to a correspondence. (#384)
+  the word *store* to be read as the place messages are kept. `storage::dm_store` and the
+  `dm_store` entry in `storage` name what it holds. (#384)
 - Corrected the keepalive and heartbeat interval coverage, which asserted band membership and
   variation but not band width, so a draw collapsed to a tenth of its span passed.
   `interval_in_band` is the single definition for both and takes its entropy source as a
@@ -1004,20 +522,6 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Removed
 
-- `daemonseed-core`: `dm::block_list::BlockList::suppresses_knock`. A caller asks `is_blocked` with the
-  sender's identity key.
-
-- `daemonseed-tui`: the key-record publish and reseed, `net::StableKemEncapsulationKey`,
-  `NetCommand::Connect::stable_kem_encapsulation_key`, `App::stable_kem_encapsulation_key`,
-  `App::dm_thread_drawn`, `ui::RenderReport`, and the DM driver session (`DmDriver`, `DmPersist`
-  under `profile_root/dm`).
-
-- `daemonseed-gui`: the key-record publish and reseed, `NetCommand::Connect::stable_kem_encapsulation_key`,
-  `GuiState::stable_kem_encapsulation_key`, `Profile::stable_kem_encapsulation_key`,
-  `GuiState::dm_state`, `DmState`, `DmCorrespondence`, `DmContactRequest`, `DmRefusal`,
-  `DmDoorbellHealth`, `DmChannelHealth`, and the DM driver session (`DmDriver`, `DmPersist` under
-  `profile_root/dm`).
-
 - `daemonseed-core`: `TrustEventKey::ConnectionRateLimited` and
   `TrustEventKey::ConnectionRateLimitedExhausted`, their `class_of` and stable-string entries, and
   the `daemonseed-tui` toast that rendered the first as "server busy — backing off". Neither key has
@@ -1045,12 +549,6 @@ work lives in the maintainer's own planning notes, not here.
   are retained for the test and integration fixtures that build a `PresenceTracker` with a
   cadence; no production caller reads either. The crate-internal `interval_in_band` remains the
   single uniform-band draw. (#372)
-
-- `daemonseed_veilid_net::dm::spawn_dm_ack_publish`. The DM driver owns when a standalone
-  acknowledgement is written, and the helper decided nothing about it; no production caller
-  existed. Building and addressing a record remains
-  `daemonseed_core::dm::ack_record::build_encoded` plus `DmAckAddress::for_direction`, and the
-  write remains `VeilidNetHandle::publish_dm_ack`. (#235)
 
 - The default path for `cargo xtask findings-resolved`, which pointed outside the
   repository. The subcommand now requires `--draft <path>`.
@@ -1087,8 +585,6 @@ work lives in the maintainer's own planning notes, not here.
   probes, substrate facts, records, keys and forward secrecy, flows, delivery, eviction detection,
   abuse bounds, write budget, wire change, multi-device foundations and open questions. The earlier
   design moves to `docs/design/superseded/direct-messaging-2026-07-27.md`.
-- `daemonseed-veilid-net`: `DmEvent::ChannelHealth`'s `unopenable` counts one refusal per position,
-  not one per probe of it (#442).
 - ISC-C80 is withdrawn and deregistered. It described a reconnect on a capped exponential backoff
   timer, and the `Backoff` type that was the timer is deleted. `ISA.md` keeps the ID as a reserved
   tombstone and `daemonseed_isc::TOTAL` falls from 245 to 244.
@@ -1098,17 +594,6 @@ work lives in the maintainer's own planning notes, not here.
   80-column terminal with `[Esc] back` whole (#236).
 - `daemonseed-core`: rustdoc that introduces the DM record store names what it holds — five fixed
   records per correspondence plus the profile's block list, never a message archive. (#384)
-- A resumed channel's clear ratchet generation is agreed inside the settling legs rather than derived
-  on each side: the `RE-ACK` carries the answering party's floor, the initiating party computes
-  `reest::agreed_generation` from both floors, and the `RE-CONFIRM` carries the result. Each side
-  refuses a value at or below the floor it brought to the agreement, or `u32::MAX`, before the
-  exchange spends anything, and reports the refusal once per session as
-  `TrustEventKey::DmReestablishmentFailed`. The answering side judges the settlement against the
-  floor it advertised rather than against its live counter (#404).
-- `daemonseed-veilid-net`: `DmCommand::Send` composes on a channel a completed re-establishment
-  opened. The answering side is refused with `RefusalReason::AwaitingCorrespondentsFirstFrame` until
-  the correspondent's first frame under the re-rooted root opens its sending chain; the refusal
-  spends no sequence number (#404).
 - `.github/workflows/ci.yml`: the `release-suite` job runs on pushes to `main` and on manual dispatch,
   not on pull requests; `preflight` and `dev-suite` run on both.
 - Design documents, `README.md`, `AGENTS.md` and code comments state the design and the tests in
@@ -1136,110 +621,15 @@ work lives in the maintainer's own planning notes, not here.
 - Gate steps carry a group and a child environment; the table runs `preflight`, then `dev-suite`,
   then `release-suite`.
 - `daemonseed_core::public_space::{first_operator_keepalive_interval, next_operator_keepalive_interval}`
-  and `daemonseed_core::dm::keyrec::next_reseed_interval` draw through one crate-internal
-  interval-drawing helper; the private `public_space::jittered` helper is gone. Each band gains the
-  band-ceiling, entropy-degrade, spread, density and cardinality assertions (#372).
-- `daemonseed_core::dm::resume::ResumeRecord::new` returns `Result<Self, ResumeError>` and refuses
-  an own slot whose attempt disagrees with the counter, an acceptance below the committed
-  generation (`AcceptanceBelowGeneration`), a confirm slot ahead of it
-  (`ConfirmSlotAheadOfGeneration`), and a retained root without its stamp. (#404)
-- `daemonseed_core::dm::firstcontact::ChannelRoots` — fields private behind `ar()`, `chan_id()`
-  and `rs0()`; construction crate-private; `Clone` removed. (#404)
-- `daemonseed_core::dm::resume` — `ResumeRecord::commit_reestablished` carries the dedup memory into
-  the new retention rather than emptying it: the root moving into retention is the one every
-  recorded frame was sealed under, so A5.3's retirement gate has not fired for them (#404).
+  draw through one crate-internal interval-drawing helper; the private `public_space::jittered` helper
+  is gone. Each band gains the band-ceiling, entropy-degrade, spread, density and cardinality
+  assertions (#372).
 
-- `daemonseed_core::dm::persist::DmPersist::accept_first_contact` takes the acceptor's own
-  per-correspondent keypair as a `SignKeypair` and writes the correspondence's resume record before
-  its contact record (#404).
-- `daemonseed_core::dm::resume::ResumeRecord` carries this party's own verifying key beside `s_pc`,
-  read by `own_pk_pc()` and taken by `ResumeRecord::new`. At rest it sits between `s_pc` and the
-  peer's `pk_pc`; the magic is unchanged. `ResumeError::OwnVerifyingKeyAbsent` refuses an all-zero
-  one at construction and at decode.
-- `daemonseed_core::dm::provisional::ProvisionalRecord` carries this party's own per-correspondent
-  signing keypair, read by `s_pc()` and `pk_pc()` and taken by `ProvisionalRecord::new` and
-  `FirstContactState::into_provisional`. `SigningKeyPc` is the secret half's zeroizing newtype,
-  `ProvisionalError::MismatchedSigningPair` refuses halves that do not sign and verify, and
-  `PROVISIONAL_RECORD_LEN` is 12301 bytes.
-- `daemonseed_core::dm::resume` at-rest v2 carries the own slot's `seq` between its attempt and the
-  ephemeral-key presence flag. The magic is unchanged: no released build has written v2.
-  `ResumeError::EmptySlotHasSequence` refuses a non-zero sequence beside an empty slot (#404).
-- `daemonseed_core::dm::outbox` at-rest v5 assigns target tag `2` to
-  `OutboxTarget::ReEstablishmentLeg`. The magic is unchanged: no released build has written v5.
-  `OutboxError::FirstDispatchPassed` is new (#404).
-- `daemonseed_core::dm::outbox` at-rest format v5 (`daemonseed/dm/outbox/v5\0`): the header carries
-  `next_send_seq` and `last_clear_gen`, each entry carries `sealed_under_gen`. v4, v3 and v2 are
-  read with the new fields zero; v1 is still refused. `Outbox::publish` and `Outbox::enqueue_sealed`
-  take the sealing generation (#404).
-- `daemonseed_core::dm::resume` at-rest format v2 (`daemonseed/dm/resume/v2\0`): the own slot carries
-  its ephemeral decapsulation key behind a presence flag, and the record carries
-  `reroot_ratchet_gen`. `RESUME_MAGIC_V1` is refused with `ResumeError::ObsoleteV1Layout` (#404).
-- `daemonseed_core::dm::resume::ResumeRecord::commit_reestablished` re-qualifies the send floor by
-  the re-rooted ratchet generation, carrying its sequence across unchanged (#404).
-- `daemonseed_core::dm::outbox::Outbox::sweep_dead_chain` leaves `OutboxTarget::Doorbell` entries
-  alone; `Outbox::enqueue_awaiting_key` raises `next_send_seq` (#404).
-- `daemonseed_core::dm::resume::CommittedRoot::from_bytes` and
-  `daemonseed_core::dm::ratchet::RootKey::from_bytes` borrow their bytes (#404).
 - `daemonseed_core::dm::contact_cache::ContactRecord` holds `pk_pc` as `Option`: `new` takes
   `Option<Box<[u8; ml_dsa::PK_LEN]>>` and `pk_pc()` returns `Option<&[u8; ml_dsa::PK_LEN]>`. The
   at-rest form gains a presence byte before the key, which keeps its width when absent;
   `CONTACT_RECORD_LEN` is 5234. `decode` refuses a presence byte outside `{0, 1}` and a key claimed
   present and all-zero. (#402)
-- `daemonseed_core::dm::persist::DmPersist::correspondence_for_pk_lt` names a correspondence whose
-  contact record carries no pseudonym; `correspondent_state_lost` reports `NoCorrespondence` for
-  one. `accept_first_contact` refuses only an established correspondence and removes a
-  pseudonym-less record for the same identity before minting. (#402)
-- The direct-message driver writes the contact record when it sends a first-contact entry, fills the
-  pseudonym when the acceptance verifies, and seeds a restarted correspondence with the pseudonym
-  the record holds. Its established-correspondence checks read the record rather than the label.
-  On the first tick after a restart it recomputes the ratchet and channel roots of a correspondence
-  whose entry is unanswered, from the stored handshake at either live first-contact epoch, and
-  collects the acceptance. A page sweep requires the ratchet and channel roots, no longer this
-  side's own pseudonym keypair. It reuses a recorded correspondence's label when re-sending an
-  entry, and erases the stored handshake only once the collected pseudonym has reached the contact
-  record, retrying that write on the tick and releasing the handshake record when the refusal is
-  settled. A refused contact-record write erases the handshake record it wrote a moment earlier, and
-  a re-arm gives up after eight consecutive store faults, as does the pseudonym write. (#402)
-
-- Amended the direct-message design of record: the acknowledgement handshake terminates on an
-  elapsed-time taper rather than mutual observation, acknowledgement reads are priced against the
-  read pool at one fetch per tick per unsettled correspondence, and the receive cursor is sealed
-  at rest so the store has no unsealed record kind. ISC-C46 re-cut to "a blocked correspondent's
-  records are not read" and closed; block-stops-reads-not-writes recorded under ISC-A-C23. (#389)
-
-- The DM driver hands a channel page's DHT record back when it will not address the page again: a
-  receiving page below both the watched window and the first unsettled position, a sending page
-  whose every position the correspondent has settled, and every page of a torn-down conversation.
-  `daemonseed_veilid_net::dm::seam::DmDht::close_dm_page` and `VeilidNetHandle::close_dm_page`
-  take the new direction-erased `daemonseed_veilid_net::actor::DmPageRecord` and answer whether a
-  record was released; `Command::CloseDmPage` carries it to the actor, where
-  `rendezvous::close_page_now` drops the open-cache entry and closes the record under its own
-  `record_lock`, refusing a page an operation still holds.
-  `daemonseed_core::dm::collect::Collection::retired_below`,
-  `daemonseed_core::dm::collect::WATCHED_PAGES` and
-  `daemonseed_core::dm::ack::AckState::settled_pages_below` are the settlement bounds those
-  signals read; a sending position given up at the seven-day window settles for that bound, and a
-  torn-down conversation plans and writes nothing further on the channel plane — sweeps, page
-  writes, acknowledgement fetches and acknowledgement writes are all gated on it, the last at its
-  candidate scan so a dead correspondence cannot spend the client-global acknowledgement permit
-  or starve a live one — and a page an operation was holding at teardown is handed back when that
-  operation's outcome lands. The receiving side has no give-up signal — no record carries the
-  sender's abandonment, so a permanently lost inbound position pins its pages and
-  `Collection::abandoned` still has no production caller — and `rendezvous::RecordLocks` entries
-  are still never removed, an entry being unsafe to drop while any task holds a clone of its
-  `Arc`. Covers the open-cache and page-ring half of issue #252. (#252)
-
-- `daemonseed_core::dm::persist::DmPersist::advance_cursor` returns `CursorAdvance` (`moved()` /
-  `repaired()`) and replaces a `cursor.bin` it cannot read — wrong width, not authentic,
-  interrupted erase, or a payload that is not `RECEIVE_CURSOR_LEN` bytes — with the caller's own
-  page, reporting `repaired()`; an environment error and `DmPersistError::CursorNotCorroborated`
-  still propagate. A payload of another length is the new
-  `DmPersistError::CursorPayloadWrongLen`. `DmPersistError::is_unreadable_record` is public and
-  says which errors license that replacement. The DM driver flags a `cursor.bin` its seed cannot
-  read and replaces it on the next idle tick — the fold's repair only fires when the contiguous
-  prefix moved, which a correspondence with no live channel never does.
-  `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` carries `cursor_records_repaired`, folded
-  by `daemonseed_tui::app::DmChannelHealth` and `daemonseed_gui::state::DmChannelHealth`. (#389)
 
 - `daemonseed_core::storage::dm_store::RecordKind::ReceiveCursor` is sealed at rest under AAD tag
   4 and padded to a fixed bucket, like every other kind: `capacity` is `RECEIVE_CURSOR_LEN` = 8
@@ -1248,31 +638,6 @@ work lives in the maintainer's own planning notes, not here.
   padded and recovered exactly rather than refused, and a `cursor.bin` of the former 8-byte width
   reads as `DmStoreError::WrongFileLen`. (#389)
 
-- `daemonseed_veilid_net::dm::DmEvent::ChannelLost` carries `event:
-  daemonseed_core::trust_events::TrustEventKey`, the key
-  `daemonseed_core::dm::provisional::Teardown::event` classes the teardown's cause under (the
-  2026-07-30 loud-teardown note in `docs/design/direct-messaging.md`).
-  `daemonseed_tui::app::App::on_net_event` folds it into the trust-event audit log and raises its
-  ISC-C28 persistent-non-blocking affordance; `daemonseed_gui::state::GuiState` gains a
-  `TrustEventLog` and `GuiState::on_dm_event` appends to it only, the GUI having no affordance
-  surface. The entry carries the key, the wall clock and no correspondent.
-
-- `daemonseed_veilid_net::dm::DmEvent::Refused` carries `event:
-  Option<daemonseed_core::trust_events::TrustEventKey>` — `Some` where the refusal is a
-  provisional channel torn down as an introduction is minted, carrying
-  `daemonseed_core::dm::provisional::Teardown::event`'s key for that cause, and `None` on every
-  other refusal. `daemonseed_tui::app::App::on_net_event` folds a carried key into the
-  trust-event audit log and raises its ISC-C28 affordance;
-  `daemonseed_gui::state::GuiState::on_dm_event` appends it to the audit log.
-
-- The DM driver verifies a fetched key record through a per-correspondent
-  `daemonseed_core::dm::keyrec::KeyRecordCache` keyed by the correspondent's long-term identity
-  key, so a record naming a `version` below the highest already verified for that identity is
-  refused with the new `RefusalReason::KeyRecordRollback` instead of being sealed to (design M1);
-  an equal version is accepted as a re-fetch and a higher one advances the bound, which is held
-  for the life of the driver and not persisted.
-  `daemonseed_core::dm::keyrec::KeyRecordCache::accept_encoded` decodes and admits raw fetched
-  bytes in one step.
 - `daemonseed_core::dm::contact_cache::ContactRecord` stores the channel's address root `AR` in
   place of `ss0`. `new` takes `Zeroizing<[u8; ROOT_LEN]>`, `address_root` returns
   `[u8; ROOT_LEN]`, `addresses_same_channel` returns `bool`, and an all-zero root is
@@ -1281,59 +646,6 @@ work lives in the maintainer's own planning notes, not here.
   `ContactRecord::new`'s third parameter, `address_root`'s and
   `addresses_same_channel`'s return types, and `ContactCacheError`'s
   `PlaceholderSecret` variant, now `PlaceholderAddressRoot`.
-- `daemonseed_core::dm::resume::ResumeRecord::new` takes `sealed: Option<SealedReEst>`, and
-  `attempt`, `sealed` and `sealed_re_est` return `Option`. `None` is the empty handshake slot,
-  encoded at rest as attempt `0` with a zero-length frame and ordering below every `Attempt`;
-  attempt `0` beside a non-empty frame is `ResumeError::EmptySlotHasFrame { len }`.
-  `DmPersist::commit_resume` returns `Result<Option<Vec<u8>>, DmPersistError>`, `None` where the
-  slot is empty, and refuses `ResumeError::PseudonymPairChanged` when a write would change the
-  stored `s_pc` or `pk_pc`, `ResumeError::EmptySlotWouldReplaceAttempt { stored }` when an empty
-  slot is offered against a persisted attempt, and — at decode —
-  `ResumeError::OccupiedSlotHasNoFrame { attempt }` beside `EmptySlotHasFrame { len }`. (#401)
-
-- `daemonseed_tui::net::NetCommand` derives `Debug` only and `daemonseed_tui::net::NetEvent`
-  derives `Debug` and `Clone` only: `DmCommand` is not `Clone` and `DmEvent` has no equality.
-  (#339)
-
-- `daemonseed_veilid_net::dm::DmEvent::ChannelHealth` carries `peer_acks_clipped` and
-  `peer_acks_unverified`: a peer acknowledgement claiming a sequence above what this side has sent,
-  and a fetched record that did not decode or did not verify. `peer_acks_deferred` now counts
-  acknowledgements that would not merge into the retained state, where before it counted every
-  piggybacked one the driver did not fold. (#235)
-
-- `daemonseed_veilid_net::dm::DmCommand::Accept` also composes the acceptance and queues it at channel sequence zero, emitting `DmEvent::Delivery { seq: 0, state: Composed }`, and erases any provisional record this side held for the same identity. A refused acceptance emits `DmEvent::Delivery { seq: 0, state: Undelivered }` with a `DmEvent::Refused` naming the reason, and is retried on the idle cadence while the acceptor's sequence zero is unspent, reported once per distinct reason. A record the erase could not reach is retried on later ticks rather than dropped. (#234, #236)
-- A first-contact mint is refused with `RefusalReason::AlreadyEstablished` when a correspondence with that identity already carries the correspondent's pseudonym. (#234, #236)
-- `DmEvent::ChannelHealth`'s `peer_pseudonym_unknown` counts unsettled positions an initiator left alone, once per sweep that saw them, rather than sweeps skipped. (#234, #236)
-- `daemonseed_core::dm::frame::ParsedFrame::open` verifies a carried `pk_pc` against the author key it was given, before the authorship signature: a different key is `PseudonymMismatch`, and a carried binding that does not verify under the author's long-term key is `Binding`. A body carrying neither field takes the path it took before. (#234, #236)
-- The DM driver's initiator sweeps before it knows its correspondent's pseudonym, opens the acceptance at the acceptor's sequence zero, installs `pk_pc`, and erases the provisional record in the same act. Frames at later sequences are left unsettled and counted `peer_pseudonym_unknown` until then. (#234, #236)
-- The DM driver's initiator keeps its provisional record from the mint until a verified acceptance, rather than consuming it at the mint. (#234, #236)
-- The DM driver keeps at most one sweep of a record in flight: one of its own doorbell, one per receiving page of a conversation. A tick that finds a sweep still open asks for no second one; the record is released when the sweep returns, fails on the transport, or its task panics. An unread doorbell entry waits at most one sweep plus one idle tick. `DhtOutcome` carries the operation's `DhtOpKind`; `PanickedJob` gains `DoorbellSweep` and `PageSweep`. `MockDht` takes a per-method latency override set after construction.
-- `daemonseed_veilid_net::dm::DmCommand::Send` sends on an established channel: the outbox is priced
-  before the ratchet steps, the frame is sealed with the collection's acknowledgement piggybacked,
-  and `DmEvent::Delivery { state: Composed }` reports the queued sequence. A full outbox is
-  `DmEvent::Refused { reason: OutboxFull { needed } }` with nothing spent. (#236, #339)
-- `daemonseed_veilid_net::dm::DmCommand::Surfaced` clears the surfacing owed on the named sequence
-  numbers. (#236, #279)
-- The driver's idle cadence emits due outbox entries, publishes them at
-  `DmPageAddress::sending(..)`, confirms a landed write, sweeps given-up entries as
-  `DmEvent::Delivery { state: Undelivered }`, and sweeps the receiving pages
-  `Collection::probe_plan` names. A page sweep that did not read the whole record folds nothing.
-  (#236, #279)
-- A give-up is offered to the front end without clearing the outbox's surfacing flag; only
-  `DmCommand::Surfaced` clears it, and a session that has already offered one does not repeat it.
-  (#236, #279)
-- The outbox is driven for a correspondence recovered from disk: the direction comes from the stored
-  record, so a queued `OutboxTarget::Doorbell` entry is re-seeded and given up on without a key
-  schedule. A `ChannelPage` entry is left un-emitted, having no address without a ratchet. (#236)
-- A page sweep counts as complete only when nothing failed AND the transport attempted either no
-  subkey (an absent record) or every subkey the record holds. (#236)
-- A first contact queues its entry in the outbox as sequence zero against
-  `OutboxTarget::Doorbell { slot }`, so a re-seed re-emits the identical bytes and a failed publish
-  is an unconfirmed entry. The initiator's ratchet opens at that point, consuming the provisional
-  record. (#236)
-- `daemonseed_veilid_net::dm::DmEvent::Refused` covers a channel send as well as a first contact.
-  (#236)
-- The DM driver stops sweeping a blocked correspondent's channel and fetching its acknowledgement record from the next idle tick, and folds neither a page outcome nor an acknowledgement that arrives for a correspondent blocked since it was asked for, settling nothing it drops; after an unblock the next tick asks again and re-collects from the outcome it returns. An unreadable block list sweeps, fetches and folds nothing and emits `DmEvent::BlockListUnreadable` once for the tick. A block the store refuses leaves the held request from that identity on screen. Sends to a blocked identity are unchanged, and the correspondence, its channel and its outbox are left standing; an entry queued for a blocked correspondent therefore re-seeds to the seven-day give-up and is then surfaced `Undelivered` even where that correspondent collected it, the acknowledgement saying so being one of the reads the block stops. (#390)
 
 - `VeilidNetHandle::subscribe_room`, `resweep_rendezvous`, `repair_rendezvous` and
   `rendezvous_record_key` take a `RendezvousOwner` in place of a raw `[u8; 32]` owner
@@ -1352,8 +664,6 @@ work lives in the maintainer's own planning notes, not here.
 - The project-announce/MOTD reader addresses its record from the baked owner public key and
   holds no owner seed. The single instance that writes that record derives its owner key at
   each write and keeps nothing between them. (ISC-15)
-- The two-node doorbell oracle's closing control waits for a definitive answer and never
-  reads a transient error as an absent record. (#233)
 - Tests, manifests and design documents that need a public Veilid attach describe what the
   test does and how to opt into it, naming no machine, host or network topology.
 - `ISA.md` carries the design contract only — problem, boundaries, language, principles,
@@ -1366,21 +676,17 @@ work lives in the maintainer's own planning notes, not here.
 - Skipped and counted a trust-log entry whose event key this build does not know, where the
   whole log previously failed to open. (#337)
 - Refused a stated Argon2 cost outside `ArgonParams::is_openable` before any key is derived
-  from it, at all four readers: the trust log, the spent-token set, the `.dseed` recovery file
-  and `daemonseed.toml`. The bound covers `memory_kib × iterations`, which is what determines
-  the work; the per-field ceilings alone admit a corner costing minutes. (#337)
+  from it, at all three readers: the trust log, the `.dseed` recovery file and `daemonseed.toml`.
+  The bound covers `memory_kib × iterations`, which is what determines the work; the per-field
+  ceilings alone admit a corner costing minutes. (#337)
 - `ProfileConfig::from_toml` returns `ArgonParamsOutOfRange` for work factors outside that
   bound. (#337)
 - A trust-log body claiming an impossible entry count no longer pre-allocates for the
   claim. (#337)
-- `open_log` and `spent_store::open` zeroize the decrypted buffer on their malformed-body
-  paths, not only on success. (#337)
+- `open_log` zeroizes the decrypted buffer on its malformed-body paths, not only on success.
+  (#337)
 - A terminal-client trust badge carries the suite the event named, so dismissing a
   suite-scoped event matches it. (#337)
-
-- A decoded-but-unmerged peer acknowledgement is a `PeerAck`, which answers no question about
-  settlement; `merge_peer_ack` consumes it, so a peer's claim reaches our state only through the
-  ceiling that bounds it. (#257)
 
 - A trust event names the kind of record it concerns, so a blocked erasure is distinguishable
   from another blocked erasure without the audit log naming a correspondent. (#337)
@@ -1416,17 +722,6 @@ work lives in the maintainer's own planning notes, not here.
   daemonseed clone now builds on its own. A commented `[patch.crates-io]` block redirects to a
   local `../oxicrypt` for cross-repo work.
 
-- Corrected the DM channel-page address so a publish cannot name a slot its address does not
-  hold: `DmPageAddress<Sending>` carries the `PagePosition` it writes, and `publish_dm_page`
-  takes no separate position. **Breaking (crate API):** `publish_dm_page` loses an argument,
-  `DmPageAddress::sending` takes a `PagePosition` rather than a page, and
-  `VeilidNetError::DmPageWrongPage` is removed. Nothing on the wire moves. (#269)
-
-- Added the conversation to a page sweep's result. `DmPageSweep` is a struct carrying the `AR`
-  fingerprint alongside the slots and the outcome, so a caller sweeping several correspondents
-  attributes frames by a value it was handed. **Breaking (crate API):** the sweep result is no
-  longer a tuple. (#270)
-
 - Aligned module initialization on oxicrypt 0.24.0, which requires the pre-operational
   integrity group. `daemonseed_core::kats::initialize_module` is the one production entry
   point and passes `oxicrypt_integrity::KATS` with `CNSA_2_0_KATS` under
@@ -1454,120 +749,33 @@ work lives in the maintainer's own planning notes, not here.
   the re-hashing. Measured on a two-chunk fixture: two staged read-opens before, one after.
   (#212)
 
-- Corrected the DM store's nonce-budget documentation, which said the 2^32 birthday bound was
-  "unreachable at any realistic volume". The dominant cost is the unconditional write in
-  `update_outbox`: one seal per correspondence per sweep tick, reaching 61% of the bound in
-  ten years at 500 correspondences and a 60-second tick with no messages sent. The sweep
-  cadence is therefore a cryptographic parameter and is not yet set. A test recomputes the
-  re-seed count from `RESEED_LADDER` and `GIVE_UP` so the figures cannot go stale unnoticed.
-  The key construction is unchanged. (#289)
+- The DM store's nonce-budget documentation states that one per-profile key with random nonces
+  is bounded near 2^32 seals, that every record write spends one, and that nothing counts the
+  seals or rotates the key. The key construction is unchanged. (#289)
 
 - `concat_kats` asserts it filled every slot, so an under-filled CNSA 2.0 KATS slice is a
   build error rather than a slice of placeholders the power-up self-test counts as passing.
   Coverage is now checked by requiring every upstream KAT name to appear, in place of the
   length comparison that could not fail against `concat_kats`. (#305)
 
-- Extracted the runtime jitter draw into `daemonseed_core::jitter`. The byte-to-band
-  mapping and the degrade-to-no-jitter on entropy failure were written inline and
-  identically in `Backoff::next_jittered` and `ReseedSchedule::schedule_next_jittered`;
-  both now call one seam that takes the entropy read as a parameter, so the degrade is
-  reachable from a test. No behaviour change. (#280)
-
-- Corrected `ReseedSchedule`'s documentation, which described a `testing`-gated
-  re-export of the unit-taking method that does not exist, and the API manifest, which
-  described a `schedule_next(now_ms, unit)` entry point removed in `1b232e3`.
+- `daemonseed_core::jitter` (crate-internal) is the production entropy source for the
+  runtime draws: `os_fill` for an eight-byte draw and `os_fill_bytes` for a slice. A draw
+  takes its entropy read as a parameter, so its degrade on entropy failure is reachable
+  from a test. (#280)
 
 - `VeilidNodeSeed` is reached through `with_bytes` and is no longer `Clone`. A new
   `inline_scoped` arm on `redacted_secret_newtype!` emits the scoped accessor in
   place of `as_bytes`; the other secret newtypes are unchanged. (#271)
 
-- The DM outbox records whether a terminal transition still owes the user a
-  notification. `OutboxEntry` gains `Surfacing` (`Clear` / `Owed`), set by the
-  single private edge into a terminal lifecycle, so `sweep_give_ups`,
-  `settle_from_ack` and `channel_torn_down`'s surfacing arms cannot move an
-  entry without owing the notification. `Outbox::owed_surfacings` reads the
-  outstanding set and `record_surfaced` clears it, only once the consumption has
-  itself been persisted — the returned lists remain the fast path, and the flag
-  is what makes them survive a crash between the call returning and the store
-  write. `channel_torn_down`'s `retained` set is deliberately not flagged: those
-  entries are unchanged and are re-reported on their own merits. The at-rest
-  form is `daemonseed/dm/outbox/v2\0` with a 2-byte suite id after the magic;
-  v1 is refused rather than dual-read, because a v1 file cannot supply a
-  surfacing value and both defaults are wrong — `Clear` drops exactly the
-  notification this closes, `Owed` re-offers every message that ever finished.
-  Sealing, padding and the fixed on-disk size are `storage::dm_store`'s and are
-  deliberately not duplicated here. (#279)
-
-- The DM page transport takes a checked address. `daemonseed_core::dm::paging`
-  gains `DmPageAddress<D>`, binding the page owner seed, the page number and the
-  stream, built by `DmPageAddress::sending` / `receiving` from the ratchet's own
-  `send_direction` / `recv_direction`; `page()`, `direction()` and `owner_seed()`
-  read it. The stream rides in the type parameter (`Sending` / `Receiving` under
-  the sealed `PageDirection`), and a page above `MAX_PAGE` is refused as
-  `DmPageError::PageBeyondSequenceSpace`.
-  `VeilidNetHandle::publish_dm_page(DmPageAddress<Sending>, PagePosition, Vec<u8>)`
-  rejects a position whose page disagrees with the address as
-  `VeilidNetError::DmPageWrongPage`, before the write is enqueued; that error
-  carries the whole refused position, so its message names the page, the slot and
-  the sequence number.
-  `sweep_dm_page(DmPageAddress<Receiving>)` returns `(PagePosition, Vec<u8>)`
-  pairs built against the swept page, refuses a record whose `o_cnt` is not
-  `PAGE_SLOTS` as `VeilidNetError::DmPageShapeMismatch` before reading any slot,
-  and reports a slot the record cannot hold as
-  `VeilidNetError::DmPageSlotOutsideRecord`. `DmPageSweep` is that pair list plus
-  the sweep outcome; `DmPageSlots` is removed. Page addresses and the wire format
-  are unchanged. (#254)
-
 - The release profile panics on integer overflow (`[profile.release]
   overflow-checks = true`), workspace-wide. (#258)
 
-- `daemonseed-tui`: direct messaging runs on `dm::runner`. `NetCommand::Dm` carries a `RunnerCommand`
-  and `NetEvent::Dm` an `Arc<RunnerEvent>`; `NetEvent::DmStopped` is added. `DmSessionKeys` holds
-  `signing`, `dm_channel_root` and `at_rest_key`. A connect with a started node starts a runner over
-  `VeilidNetHandle::dm_records_parts`. Connect, `NetCommand::StopDm` (sent on disconnect) and
-  `GracefulClose` replace the runner in a spawned task that awaits the previous runner's task end
-  before the next starts. The pane lists nothing while no runner reports, and draws one health line
-  while the runner reports failures. Accept opens an editable reply pre-filled with
-  `DM_ACCEPT_REPLY`, restored with the reason when refused; decline hides the sender for the run;
-  block sends `RunnerCommand::Block` and marks the sender as blocking until `RunnerEvent::BlockList`
-  lists it or a refusal clears it; an identity reads blocked only once that list names it.
-  `RunnerEvent::BlockListUnreadable` shows `DM_BLOCK_LIST_UNREADABLE` in the pane and on the status
-  line until the next `BlockList`, and marks conversations not in the last list read as of unknown
-  block state. Sent messages
-  read composed, sent or delivered, and not sent when the runner stops; received messages show their
-  received time in UTC.
-  `RunnerEvent::StartedOver` folds `TrustEventKey::DmCorrespondentStateLost`. `ui::render` returns
-  `()`.
-
-- `daemonseed-gui`: direct messaging runs on `dm::runner`. `NetCommand::Dm` carries a `RunnerCommand`
-  and `NetEvent::Dm` an `Arc<RunnerEvent>`; `NetCommand::StopDm` and `NetEvent::DmStopped` are added.
-  `DmSessionKeys` holds `signing`, `dm_channel_root` and `at_rest_key`. A connect with a started node
-  starts a runner over `VeilidNetHandle::dm_records_parts`. Connect, `StopDm` and `GracefulClose`
-  replace the runner in a spawned task that awaits the previous runner's task end before the next
-  starts. A command sent with no runner is answered with `Refusal::ShuttingDown`.
-  `GuiState::on_dm_event` takes a `RunnerEvent`, appends `TrustEventKey::DmCorrespondentStateLost`
-  for `RunnerEvent::StartedOver`, and keeps nothing else.
-
-- `daemonseed-tui`, `daemonseed-gui`: `NetCommand::GracefulClose` waits for the direct-messaging runner
-  to stop before its transport steps and its ack, capped at `net::DM_CLOSE_CAP` (30 s). A stop still
-  running after `net::DM_CLOSE_NOTICE_AFTER` (500 ms) sends the new `NetEvent::DmCloseSlow`, shown as
-  `net::DM_CLOSE_MESSAGE`: the GUI puts it in the connection status and keeps its window open and
-  drawing until the ack; the terminal client prints it while it waits.
-
 ### Changed
-
-- The DM outbox's at-rest format is `v4`, adding a pruned high-water mark. `v3`
-  and `v2` records are read, with the field defaulting to zero. `Outbox::prune`
-  removes entries that are terminal **and** already surfaced, which nothing did
-  before. The high-water takes over the sequence dedup the pruned entries
-  provided, and `u64::MAX` is refused at enqueue so its successor is always
-  representable. Nothing calls `prune` yet, so the growth the issue describes is
-  still reachable in any build that wires this module. (#323)
 
 - `dm::domain`'s labels and their registry come from one `dm_labels!` invocation,
   so `ALL` cannot omit a label it declares and a byte value cannot drift from its
   declaration. Three tests that read the module's own source as text are retired
-  with the parser they fed. A known-answer test pins all 37 labels to their
+  with the parser they fed. A known-answer test pins all 28 labels to their
   pre-migration values, and one narrow source check remains, because a label
   declared outside the macro is still possible. (#296)
 
@@ -1579,10 +787,6 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
-- Corrected two `NOT YET AVAILABLE` notes in the core API manifest that named
-  capabilities the tree ships: persistence and restore, and a store that reads
-  and writes an outbox. Both are `dm::persist` over `storage::dm_store`.
-
 - `Locked::delete` repairs a record whose mode lost owner-write, then fails
   loudly instead of wedging. The delete stays fail-closed — erasing the record
   is the forward-secrecy premise — but `EACCES` is permanent, so every retry
@@ -1591,48 +795,6 @@ work lives in the maintainer's own planning notes, not here.
   directory refuses the unlink, `DmStoreError::ErasureBlocked` carries the
   `DmRecordErasureBlocked` trust event rather than a generic I/O error.
 
-### Added
-
-- `ResumeRecord`'s secret halves are covered by the out-of-crate zeroize witness.
-  `s_pc` and `committed_root` are asserted wiped before their memory is released,
-  with the skipped public field as the control. `#[zeroize(skip)]` on `s_pc` is a
-  silent leak of a per-correspondent ML-DSA-87 signing key and is now caught;
-  on `committed_root` it is inert, because the newtype zeroizes itself. (#314)
-
-### Changed
-
-- Re-seed jitter is drawn from the CSPRNG on every emission. `OutboxEntry::emit`
-  and `retry_key_fetch` no longer take a caller-supplied jitter unit; they call
-  `ReseedSchedule::schedule_next_jittered`, which had no call site. The
-  unit-taking door is private, re-exported only under the `testing` feature. A
-  caller passing a constant reconstitutes the M7 cross-record phase-lock the
-  jitter exists to prevent, so it is no longer reachable from production. (#280)
-
-### Added
-
-- `Outbox` refuses a message it cannot persist, at enqueue rather than at the
-  write. A send that would push the correspondence's outbox past
-  `OUTBOX_CAPACITY` returns `OutboxError::Full` carrying the sequence number and
-  the overshoot, and nothing is stored. The bucket holds 106–213 owed messages
-  against a seven-day give-up window, so this is expected to fire in ordinary
-  use. What the sender is shown is not decided here. (#291)
-
-- `Outbox::publish` installs a sealed frame on an entry awaiting its recipient's
-  key, under the same capacity refusal. `OutboxEntry::publish` is now
-  `pub(crate)`: installing a frame is the other edge that grows the record, and
-  an entry enqueued without one is admitted cheaply, so gating enqueue alone
-  allowed hundreds of frameless entries to be fattened past capacity afterwards.
-  A refused publish leaves the entry awaiting its key. (#291)
-
-### Fixed
-
-- Sweeping a DM page no longer creates it. `sweep_dm_page` opens through a new
-  `rendezvous::open_only`, which reports an absent record as `Ok(None)` instead of
-  creating one, so an unwritten page returns an empty sweep with `attempted: 0` and
-  is distinguishable from a present page whose slots are all empty. An absence is
-  never cached, so a page written later becomes visible, and each probe of a
-  still-unwritten page pays a fresh open rather than a one-off create. (#253)
-
 - `rendezvous::open_or_create` creates only on `KeyNotFound`. Any other open error
   now skips the create and goes straight to the reopen, so a transport fault no
   longer manufactures a DHT record. (#253)
@@ -1640,14 +802,6 @@ work lives in the maintainer's own planning notes, not here.
 - Removed a duplicate `security:` key from `IndexKey`'s entry in
   `docs/llm-api-manifest/daemonseed-core-api.yaml`. YAML has no duplicate-key
   semantics, so the first block was discarded on every parse. (#264)
-
-- Corrected the DM outbox's delivery state, which inferred *on the DHT* from the
-  re-seed rung and so reported a message as published after writes that errored
-  and after a key-fetch retry on an entry that had never been emitted. A
-  persisted `Acceptance` carries the fact, `OutboxEntry::confirm_written` is the
-  transport's report that sets it, and `emit` alone claims nothing. The at-rest
-  format is `daemonseed/dm/outbox/v3\0`; v2 records are read, every entry
-  defaulting to `Unconfirmed`. (#278)
 
 - `DmStoreError::Io`'s `Display` no longer renders the full path, which
   embedded the correspondence's directory name and put a stable
@@ -1669,20 +823,15 @@ work lives in the maintainer's own planning notes, not here.
   binaries from `target/{debug,release}` afterwards, including on a red run.
   (#274)
 
-- `VerifiedFirstContact` and `PersistedCircle` derive `Zeroize` +
-  `ZeroizeOnDrop` instead of naming fields in a hand-written `Drop`, with **no**
-  `#[zeroize(skip)]` on either. A field added later is now covered by
-  construction rather than by whoever remembers to extend the `Drop` — the old
-  arrangement had the test enumerating the same single field the code did, so
-  it looked like coverage while sharing the code's blind spot. The three boxed
-  public keys needed no exclusion: `Box<[u8; N]>` has no `Zeroize` impl, but the
-  derive's `field.zeroize()` auto-derefs to the array and clears the heap block
-  in place. The compile-time bound test now names both structs. **The
-  fail-closed property is honestly half:** a field with no reachable `Zeroize`
-  (`PathBuf`, `Uuid`, this crate's `boxed`-arm newtypes) is an `E0599` build
-  failure, while `String` / `Vec<u8>` / `[u8; N]` / `Box<[u8; N]>` silently
-  become wiped — the wanted outcome, but not a compile error. Both doc comments
-  say exactly that. (#267)
+- `PersistedCircle` derives `Zeroize` + `ZeroizeOnDrop` instead of naming fields in a
+  hand-written `Drop`, with **no** `#[zeroize(skip)]`. A field added later is now covered by
+  construction rather than by whoever remembers to extend the `Drop` — the old arrangement had
+  the test enumerating the same single field the code did, so it looked like coverage while
+  sharing the code's blind spot. The compile-time bound test names the struct. **The fail-closed
+  property is honestly half:** a field with no reachable `Zeroize` (`PathBuf`, `Uuid`, this
+  crate's `boxed`-arm newtypes) is an `E0599` build failure, while `String` / `Vec<u8>` /
+  `[u8; N]` / `Box<[u8; N]>` silently become wiped — the wanted outcome, but not a compile
+  error. Its doc comment says exactly that. (#267)
 
 - `Seeds::to_plaintext` assembles the at-rest payload into a single reservation
   and returns `Zeroizing<String>`. It previously grew the buffer from the
@@ -1696,38 +845,6 @@ work lives in the maintainer's own planning notes, not here.
   across assembly. The comments state plainly that this removes *our own*
   reallocation copies and nothing more: the buffer still outlives the call, and
   allocator reuse, swap and FTL remap remain out of reach. (#263)
-
-- DM test fixtures no longer sit on page 0, where a `PagePosition`'s slot
-  **equals** its sequence number and no test can tell the two apart. The
-  crate's only coverage of slot misfiling —
-  `a_frame_written_to_the_wrong_slot_is_rejected` — was at `(page 0, slot 1)`,
-  so a mutant reading `found_at.slot()` where `open` reads `found_at.seq()` had
-  nothing standing in its way, and it survives on the unfixed tree. It is now
-  at `(page 3, slot 9, seq 57)` with a fixture control asserting those values,
-  so a drift back to page 0 fails loudly rather than silently proving less.
-  `dm::collect`'s two fold tests moved likewise, and `dm::outbox`'s
-  `position()` — a site the issue did not list — gained a non-zero sibling.
-  Tests whose actual subject is sequence 0 keep it and gained non-zero
-  siblings. (#272)
-
-- `VerifiedFirstContact` now enforces the invariant its doc comment claims. All
-  eight fields were `pub`, so the type advertised "only constructible via
-  `open`, so holding one IS the proof" while any caller could forge one with no
-  seal opened and no signature verified — the reasoning that lets a call site
-  skip re-checking provenance, resting on nothing. Fields are private with
-  accessors for the public halves, and `into_ss0` is the only exit for the
-  secret: consuming, returning a `Zeroizing`, following `FirstContactState`,
-  which refuses a borrowing `ss0` accessor for the same reason. `Clone` is
-  removed — a clone of a witness is a second `ss0` and a second plaintext.
-  (#265)
-
-- `VerifiedFirstContact.body` is the decrypted first-contact message, and it was
-  printed verbatim by `Debug` and never wiped. One `debug!(?verified)` put a DM's
-  plaintext on a log surface, and the `Drop` added by #259 reasoned field by
-  field without mentioning it — so the struct wiped the key material and left
-  the message it protects in a freed buffer. `Debug` redacts it and `Drop` wipes
-  it. Whether the type should own the plaintext at all is open and tracked with
-  #262. (#266)
 
 - `daemonseed-tui`'s `JoinedCircle.entropy` held the canonicalized circle phrase
   — the `cot_key` IKM — in a bare `pub String` for the whole session: no wipe on
@@ -1748,27 +865,6 @@ work lives in the maintainer's own planning notes, not here.
   tests drive the parser over wrapped-declaration strings so each check is
   proved able to fail. (#283)
 
-- `derive_root`'s doc-comment named `the_three_roots_from_ss0_are_independent`
-  as holding the roots' non-derivability. That test asserts distinctness, which
-  passes for any three distinct labels and would pass unchanged if the roots
-  were refactored into a chain — the shape the sibling structure exists to
-  prevent, and the one the comment cited it for. The comment now separates the
-  assumption (HKDF-Expand does not yield its PRK) from the tested property
-  (still siblings of one extraction), and a known-answer test pins all three
-  roots under one `ss0` so any change to the derivation structure fails.
-  Verified: chaining `chan_id` off `ar` fails the new test and passes the old
-  one. (#282)
-
-- Two claims in `dm::provisional`'s docs outran what any store here does, and
-  one of them was load-bearing. The record was described as "overwritten in
-  place on establishment", and `ProvisionalRecord::open`'s rollback argument
-  rested on that phrase. The store commits a replacement with `rename(2)` and a
-  deletion with `unlink(2)`, so neither overwrites the bytes it supersedes. The
-  rollback argument survives on a different fact — there is only ever one
-  record, replaced in a single slot and deleted on establishment, so no earlier
-  record is *referenced* to roll back to — and the limit is now stated as what
-  it is: the superseded bytes are unreferenced, not scrubbed (#293).
-
 - `daemonseed_core::storage::seeds::PersistedCircle` holds `entropy` privately as a
   `Zeroizing<String>`, read through `entropy()` and built through `new()`. `Debug`
   redacts it; `PartialEq` / `Eq` are gone. (#259)
@@ -1782,40 +878,15 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed_core::storage::recovery_file::seal_under` holds the derived AEAD key
   and the mnemonic phrase in `Zeroizing`, wiping each on every path out. (#259)
 
-- `daemonseed_core::dm::firstcontact::VerifiedFirstContact` zeroizes `ss0` on
-  drop. (#259)
-
-- DM page transport carries the page owner seed as
-  `daemonseed_core::dm::paging::DmPageOwnerSeed` — the boxed, redacted,
-  zeroize-on-drop newtype — through `VeilidNetHandle::publish_dm_page` and
-  `sweep_dm_page`, the two commands behind them, and the scheduler's dispatch
-  token. It was a `Copy` `[u8; 32]`, duplicated into the command channel, the
-  actor stack, the pending queue and the dispatch frame, none of which zeroize.
-  A page's owner seed is the conversation secret; every other owner seed in the
-  crate is world-derivable. This bounds daemonseed's own copies, not the secret:
-  veilid retains the signing keypair in an opened record for as long as that
-  record stays open, and records are opened once per session. (#244, #252, #254)
-
-- A DM page write's funnel `record` — its FIFO and coalescing scope — is the
-  owner's PUBLIC key rather than the owner seed. `identity::rendezvous_owner_public_bytes`
-  is the total 32-byte derivation it uses. (#244, #254)
+- `identity::rendezvous_owner_public_bytes` is the total 32-byte derivation of an
+  owner's PUBLIC key, which a funnel write's `record` — its FIFO and coalescing
+  scope — carries in place of the owner seed. (#244, #254)
 
 - The rendezvous open-cache and per-record locks key on the owner's PUBLIC key
-  rather than the owner seed. Every record that existed when those caches were
-  written had a world-derivable seed, so holding one cost nothing; a DM channel
-  page is the first whose seed is the conversation secret, and under Veilid a
-  derivable owner seed *is* write access to the conversation. The public key
+  rather than the owner seed. A direct-message channel's owner seed is secret,
+  and under Veilid an owner seed is write access to its record. The public key
   identifies a record at least as precisely — it is what the DHT address derives
   from — and is public by construction. (#244)
-
-- `FirstContactState` zeroizes `ss0` on drop and carries its opening ratchet
-  decapsulation key as `ratchet::EphemeralDecapKey`, which zeroizes on drop; it
-  was a bare `Box<[u8; DK_LEN]>` with no wrapper. (#234, #135)
-
-- `dm::firstcontact::derive_channel_roots` zeroizes its transient buffers on
-  every path and `ChannelRoots` is zeroize-on-drop: `[u8; N]` is `Copy` with no
-  `Drop`, so the originals were staying live in the stack frame after the struct
-  took its copies. (#234, #135)
 
 - The DFLT subkey write guard is schema-derived (`RecordShape`): the cap is
   `min(MAX_SUBKEY_SIZE, MAX_RECORD_DATA_SIZE / o_cnt)`, the bound `veilid-core`
@@ -1827,102 +898,20 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Added
 
-- `daemonseed_core::dm::outbox` holds the persisted DM outbox (#235).
-  `Outbox::new(Direction)` keys `OutboxEntry` by sequence number over one
-  direction of one correspondence, covering the doorbell knock at sequence 0 and
-  every channel message after it; `direction()` reads it and there is no
-  `Default`. An entry carries an `OutboxTarget` (`Doorbell { slot }` /
-  `ChannelPage`), the compose timestamp, a `ReseedSchedule` and a `Lifecycle`.
-  `Lifecycle` is `AwaitingKey`, `AwaitingCollection(SealedFrame)`,
-  `ConfirmedCollected` or `Undelivered`; `OutboxEntry::delivery_state` maps it to
-  `DeliveryState` (`Composed` / `OnDht` / `ConfirmedCollected` / `Undelivered`),
-  with a sealed-but-never-emitted entry reading `Composed`. `SealedFrame` has no
-  mutating API, and `OutboxEntry::publish(now_ms, frame)` is the only edge that
-  installs one. `emit(now_ms, unit)` returns the stored bytes borrowed and
-  advances the schedule; `retry_key_fetch(now_ms, unit)` advances it for an
-  unsealed entry. All three take the clock and refuse an entry past its give-up
-  window with `OutboxError::GaveUp`, which is distinct from
-  `OutboxError::NothingToEmit`: the first is a live message owed a surfacing, the
-  second a terminal or inapplicable state needing nothing. `is_due` is false past
-  the window too. `RESEED_LADDER` is 1/2/4/8/16/32/64 minutes, hourly, then daily
-  repeating, jittered per emission by `RESEED_JITTER_FRAC` through
-  `backoff::apply_jitter`. `Outbox::due` lists entries due at a clock value,
-  `sweep_give_ups` moves entries past `GIVE_UP` (7 days from compose) to
-  `Undelivered`, and `settle_from_ack(ack, now_ms)` confirms only entries that
-  are `AwaitingCollection` and inside that window; both return the sequences they
-  moved and both are `#[must_use]`.
-  `channel_torn_down(&TeardownCause, now_ms)` returns a `TeardownOutcome`
-  (`#[must_use]` on the type): entries past the give-up window surfaced as
-  `Undelivered` whatever the cause, published entries retained with their bytes,
-  unsealed entries surfaced, and nothing else changed on
-  `TeardownCause::StoreUnreadable`.
-  `enqueue_sealed` / `enqueue_awaiting_key` take the caller's clock as the
-  compose time, so an entry composed outside the give-up window has no spelling.
-  `encode` / `decode(bytes, now_ms)` are the at-rest form under `OUTBOX_MAGIC`;
-  `decode` refuses an entry whose stored compose time is ahead of `now_ms` with
-  `OutboxError::ComposedInFuture` and rewrites no stored value. No caller writes
-  or reads one.
+- `rendezvous::open_only` opens a record without creating it, reporting an absent
+  record as `Ok(None)`. `dm::records` opens records through it. (#253)
+
 - `daemonseed_core::backoff::apply_jitter(delay, frac, unit)` applies `±frac`
   jitter to a delay. `BackoffPolicy::jitter` calls it.
-- `daemonseed_core::dm::collect` holds the pure DM collection state machine.
-  `Collection` carries the probe frontier — the highest page observed holding any
-  populated slot — and an `AckState` for the contiguous cursor. `observe_page`
-  folds a swept page into `PageObservation` (unsettled positions ascending and
-  deduplicated, plus whether the frontier moved) and records nothing on either
-  `CollectError::SlotOutsideRecord` or `CollectError::PageBeyondSequenceSpace`,
-  the second naming a page above `paging::MAX_PAGE`. `collected(PagePosition)`
-  and `abandoned(seq)` settle a position and lift the frontier to the cursor's
-  page when the cursor has run past it; a `TooManyRuns` refusal from either is
-  dropped rather than queued. `watched()` gives the current and next page;
-  `probe_plan(now_ms)` gives that pair plus up to `MAX_BACKFILL_PAGES` (2) pages
-  holding a hole — those `outstanding()` witnesses, then those between the cursor
-  and the frontier — or `None` inside `PROBE_INTERVAL_MS` (30 s).
-  `contiguous_through()`, `frontier_page()`, `outstanding()` and `view()` read
-  the state; `ack()` reads the acknowledgement. `AckState::beyond_runs` returns
-  the settled runs beyond the prefix as ascending inclusive ranges.
-  `paging::MAX_PAGE` is the highest page a sequence number lives on, which
-  `PagePosition::new` enforces. (#236)
 
 - `redacted_secret_newtype!`'s zeroize-on-drop and redacted `Debug` are under
   test. `crates/daemonseed-core/src/secret_seed.rs` asserts the `ZeroizeOnDrop`
-  bound on all seventeen generated secret types and pins both arms' `Debug`
+  bound on every generated secret type and pins both arms' `Debug`
   rendering; `crates/daemonseed-core/tests/secret_zeroize_on_drop.rs` installs a
   witness global allocator that reads each secret's block inside
   `GlobalAlloc::dealloc` and requires it to be zero, over three boxed-arm
-  rendezvous-owner seeds plus the ratchet's ephemeral decapsulation key, and the
-  three inline-arm identity-rooted secrets.
+  rendezvous-owner seeds and the inline-arm identity-rooted secrets.
   (#242)
-
-- DM restart handling — `daemonseed_core::dm::provisional` (`ProvisionalRecord`,
-  `ProvisionalError`, `ChannelRestart`, `Teardown`, `TeardownCause`,
-  `ReceiveCursor`, `RecordContext`, `derive_seal_key`,
-  `PROVISIONAL_RECORD_VERSION`, `PROVISIONAL_PLAINTEXT_LEN`,
-  `PROVISIONAL_RECORD_LEN`, `BINDING_TAG_LEN`). The steady-state ratchet is not
-  persisted. `ProvisionalRecord` holds `{ss0, eph_ek, eph_dk}` for a
-  pre-establishment channel and recomputes `AR`, `chan_id` and the ratchet root
-  from `ss0`; `address_root()`, `eph_ek()` and the consuming `into_ratchet()`
-  read it. `seal(&Aes256Key, &RecordContext)` / `open(&Aes256Key, &[u8],
-  &RecordContext)` are the at-rest form — one fixed `PROVISIONAL_RECORD_LEN`,
-  `nonce ‖ AES-256-GCM(version ‖ binding ‖ ss0 ‖ eph_ek ‖ eph_dk) ‖ tag` under
-  AAD `daemonseed/dm/provisional/aad/v1 ‖ lp(recipient_keyrec_addr) ‖
-  lp(fc_epoch)`, written to a fixed-size file overwritten in place on
-  establishment. `RecordContext` is `{recipient_keyrec_addr, fc_epoch}`. The
-  `BINDING_TAG_LEN`-byte binding tag is HKDF-SHA-384 over `ss0` under salt
-  `daemonseed/dm/provisional/bind-salt/v1` and info
-  `daemonseed/dm/provisional/bind/v1 ‖ lp(eph_ek)`. `open()` rejects a record
-  that is not `PROVISIONAL_RECORD_LEN` bytes, one that does not authenticate
-  under the given `RecordContext`, one naming another
-  `PROVISIONAL_RECORD_VERSION`, one whose binding tag does not match its
-  contents, and one whose ephemeral halves are not a keypair.
-  `derive_seal_key(&[u8; AEAD_KEY_LEN])` is HKDF-SHA-384 under salt
-  `daemonseed/dm/provisional/salt/v1` and info
-  `daemonseed/dm/provisional/seal/v1`. `restart(Result<Option<&[u8]>, E>,
-  &Aes256Key, &RecordContext)` returns `ChannelRestart::HandshakeResumes` or
-  `ChannelRestart::TornDown`; a `Teardown` carries its `TeardownCause` and the
-  `TrustEventKey` it surfaces as. `ReceiveCursor` is a page number bounded by
-  `paging::MAX_PAGE`; `advance_to(page, read_through)` and
-  `from_be_bytes(bytes, read_through)` refuse a page past what the caller has
-  read. (#243)
 
 - `daemonseed_core::trust_events::TrustEventKey` gains
   `DmChannelTornDownOnRestart` (`dm-channel-torn-down-on-restart`),
@@ -1930,176 +919,17 @@ work lives in the maintainer's own planning notes, not here.
   `DmProvisionalRecordUnreadable` (`dm-provisional-record-unreadable`), all
   `PersistentNonBlocking`. (#243)
 
-- `daemonseed_core::dm::firstcontact::FirstContactState` carries `eph_ek` and
-  holds `ss0` as `Zeroizing<[u8; SS0_LEN]>` with no `Drop` impl, so its fields
-  move out; the fields are private, read through `roots()` and `eph_ek()`, and
-  `into_provisional()` consumes it into a `ProvisionalRecord`. (#255)
-
-- DM delivery-acknowledgement core — `daemonseed_core::dm::ack`
-  (`derive_seal_key`, `ack_sig_input`, `AckState`, `PeerAckOutcome`,
-  `DmAckSealKey`, `AckError`, `MAX_ACK_RUNS`). `derive_seal_key(AR, dir)` is
-  HKDF-SHA-384 under salt `daemonseed/dm/ack/salt/v1` and info
-  `daemonseed/dm/ack/seal/v3 ‖ lp(dir)`. `AckState` holds a contiguous prefix
-  (`high_water() -> Option<u64>`) plus a set of settled positions beyond it,
-  encoded as canonical RLE runs. `collect(seq)` and `abandon(seq)` both settle;
-  `abandon` advances the prefix past the position. `is_settled(seq)` answers from
-  the prefix or a run and is false otherwise. `merge_own_ack(other)` is a
-  monotonic union. `merge_peer_ack(other, highest_sent)` is that union with the
-  peer's claim first clipped to `highest_sent`, returning `PeerAckOutcome`.
-  Beyond `MAX_ACK_RUNS` (64) an insert or merge returns `TooManyRuns` and leaves
-  the state unchanged. `encode_beyond()` emits a `u16` run count then a
-  big-endian `(gap, extent)` pair per run. `decode_unvalidated(high_water, bytes)`
-  rejects a count over the cap before allocating, a body length that is not
-  exactly `count × 16`, arithmetic leaving the sequence space, and any run at or
-  below the prefix. `ack_sig_input(chan_id, dir, state)` binds
-  `daemonseed/dm/ack/sig/v3 ‖ lp(chan_id) ‖ lp(dir) ‖ lp(high_water) ‖
-  lp(encoded runs)`, with an absent prefix as a zero-length component. `AckState`
-  carries no `chan_id`. Not included: the ack record, its seal, its jittered
-  standalone cadence, the piggyback path, the persisted outbox. (#235)
-
-- DM channel-page transport — `VeilidNetHandle::publish_dm_page` and
-  `sweep_dm_page`, over a third record shape, `RecordShape::DM_PAGE` (`dflt(16)`).
-  A publish writes one sealed frame into one slot as a non-coalescible chat-class
-  funnel write; the record open is warmed off the chat lane before the write is
-  enqueued. A sweep returns `(slot, bytes)` per populated slot plus the sweep
-  outcome, bounded by the shape on the record handle. Both move opaque bytes: this
-  layer never parses or verifies a frame. Write-once and partial-sweep recovery
-  are caller obligations, not properties this layer enforces. Rationale in
-  `docs/design/direct-messaging.md` and `ISA.md`. (#234)
-
 - `publish_at_subkey` rejects a subkey outside the record's schema locally,
   naming the slot and the bound, instead of letting veilid reject it after the
-  record has already been opened or created. Every pre-DM caller reduces its slot
-  mod the shape and cannot trip it; the DM page is the first to take a slot from
-  caller-supplied arithmetic.
-
-- DM ratchet key schedule — `daemonseed_core::dm::ratchet` (`derive_root`,
-  `advance_root`, `chain_key`, `chain_step`, `skip`, `SkippedKeys`, `KeySlot`,
-  `Direction`, `Role`, and the `RootKey` / `ChainKey` / `MessageKey` newtypes).
-  `RK0` is a third sibling of the `ss0` extraction that yields `AR` and `chan_id`;
-  a generation step extracts under the previous root as salt with the freshly
-  encapsulated secret as IKM. Each direction derives its own chain key; `MK` and
-  the successor `CK` are siblings of one extraction. `advance_root` and
-  `chain_step` take their key by value, so a stepped key cannot be retained.
-  `skip` returns each derived key tagged with its `KeySlot` and refuses a request
-  past `MAX_SKIP` (64) rather than truncating. `SkippedKeys` holds
-  `SKIPPED_KEY_CAPACITY` (2 × `MAX_SKIP`, so one generation change cannot evict
-  the previous chain's tail), is insertion-ordered, replaces rather than
-  duplicates an occupied slot, and counts evictions. `Role` maps an end of the
-  conversation onto its send and receive directions. `Direction::label` is the
-  sole definition of the `a2b` / `b2a` wire literals. Every derivation zeroizes
-  its transient buffer on both paths. The generation state machine, page
-  addressing and the wire frame are not wired yet. (#234, ISC-C38)
-
-- DM ratchet state machine — `daemonseed_core::dm::ratchet::Ratchet`
-  (`initiator`, `recipient`, `send_next`, `receive`, `role`, `generation`,
-  `skipped_stats`), with `FrameHeader`, `Outbound`, `EphemeralDecapKey`,
-  `EPHEMERAL_WINDOW`, `FIRST_INITIATOR_CHANNEL_SEQ`,
-  `FIRST_RECIPIENT_CHANNEL_SEQ`. `send_next` takes a generation step when the
-  peer has published an ephemeral newer than the one last stepped against, mints
-  a fresh ephemeral, and repeats the generation's ciphertext on every message of
-  it. `receive` takes the caller's open-and-verify as a closure, computes against
-  clones, and applies its state changes only if that closure succeeds; it runs
-  the previous chain out to the arriving chain's base so messages in flight
-  across a ratchet step stay readable, and serves an already-skipped position
-  from the cache without touching anything else. A frame at generation `G`
-  decapsulates with the ephemeral published at `G-1`, so no selector rides the
-  wire. The initiator's channel sequence starts at 1 (sequence 0 is the
-  first-contact entry, carried by doorbell); the recipient's starts at 0.
-  `MAX_SKIP` bounds how many keys are kept and `MAX_CATCH_UP` (16 x `MAX_SKIP`)
-  how far a chain is walked, so a receiver returning from a long absence loses
-  the messages it missed rather than the direction; a previous chain too far
-  behind to walk is retired outright at a ratchet step. `Ratchet::losses`
-  reports pending, evicted and abandoned counts separately. `initiator` rejects
-  an opening ephemeral whose halves are not a keypair. `RatchetError`
-  distinguishes `AlreadyConsumed`, `GenerationTooOld`, `SeqBeforeChainBase`,
-  `BacklogTooWide`, `MissingCiphertext`, `UnknownEphemeral`, `MismatchedEphemeral`,
-  `GenerationExhausted`, `SequenceExhausted` and `NotYetEstablished`. A chain
-  refuses to step past the last sequence number rather than wrapping its cursor
-  to zero. The wire frame and page addressing are not wired yet.
-  (#234, #243, ISC-C38)
-
-- DM channel page addressing — `daemonseed_core::dm::paging` (`derive_owner_seed`,
-  `position_of`, `PagePosition`, `PAGE_SLOTS`, `DmPageOwnerSeed`). A
-  `PagePosition` is built only through the checked `PagePosition::new`, which
-  rejects a slot at or past `PAGE_SLOTS` and a page whose first sequence number
-  would overflow, so `position_of` and `PagePosition::seq` are inverses in both
-  directions. A page's Veilid owner seed is
-  `HKDF(salt = daemonseed/dm/page/salt/v1, ikm = AR, info = daemonseed/dm/page/addr/v4 || lp(dir) || lp(page_be))`,
-  so only the two parties can derive the address and therefore only they can
-  write it; the ongoing channel needs no admission control against strangers.
-  `AR` is symmetric, so the address separates the two streams and not the two
-  authors — authorship within the pair rests on `msg_sig`, never on the address. `PAGE_SLOTS` (16)
-  is the record's `o_cnt` and part of its address; a writer must build its
-  `RecordShape` from it. `position_of` maps a per-direction sequence number to
-  one page and slot, total and injective, so a message is written once and never
-  wrapped or overwritten. The page record and its transport are not wired yet.
-  (#234, ISC-C42, ISC-A-C24)
-
-- DM ongoing-channel wire frame — `daemonseed_core::dm::frame` (`seal`, `parse`,
-  `ParsedFrame`, `VerifiedFrame`, `frame_sig_input`, `FRAME_KIND_CHANNEL`,
-  `PAD_BUCKETS`, `MAX_FRAME_LEN`, `DmFrameError`) and the `DmChannelFrame` /
-  `DmChannelBody` wire messages. The frame carries the ratchet header
-  (`ratchet_gen`, `chain_base`, `seq`), the sender's current ephemeral and the
-  generation ciphertext in the clear — everything a receiver needs before it can
-  derive a key — and seals the rest under the ratchet message key. No identity,
-  pseudonym key or signature appears in the clear. Every clear field is bound in
-  the AAD and again in `msg_sig`, which extends the shared `/v6` preimage under
-  the `msg` frame kind with the generation, the chain base and the generation
-  ciphertext, an absent ciphertext binding as a zero-length component.
-  `ParsedFrame::open` takes a message key rather than a ratchet, so it composes
-  as the closure of `Ratchet::receive` and no ratchet state moves for a frame
-  that fails to authenticate; it verifies `msg_sig` unconditionally, since page
-  owner-write authority is symmetric and nothing else establishes authorship. The
-  plaintext is padded to one of two buckets before sealing. (#234, ISC-C42,
-  ISC-A-C20, ISC-A-C21, ISC-A-C22)
-
-- Domain labels `DM_PAGE_SALT`, `DM_PAGE_ADDR`, `DM_RATCHET_ROOT`, `DM_RATCHET_STEP`, `DM_CHAIN_SALT`,
-  `DM_CHAIN_A2B`, `DM_CHAIN_B2A`, `DM_CHAIN_STEP_SALT`, `DM_MK`, `DM_CK`. (#234)
-
-- DM first-contact entry — `daemonseed_core::dm::firstcontact` (`build`, `open`,
-  `derive_channel_roots`, `bind_lt_input`, `msg_sig_input`, `FirstContactState`).
-  ML-KEM-1024 to the recipient's published static key; AES-256-GCM under a key
-  derived from the encapsulated secret, AAD binding the recipient's key-record
-  address and the first-contact epoch, current or previous accepted. The seal
-  carries a per-contact pseudonym, a `bind_lt` signature under the long-term key,
-  and a mandatory `msg_sig` under the pseudonym. `open` exact-length gates every
-  field, requires `seq == 0` and `key_selector == STATIC`, and verifies both
-  signatures. Padded to one of two buckets. `build` generates the opening ratchet
-  ephemeral and returns its secret half. Admission checks and transport are not
-  wired yet, nor is the established-channel replay rule (v6 minor invariant (b)).
-  (#233, ISC-C41)
+  record has already been opened or created.
 
 - Wire: `FirstContactEntry` and `FirstContactBody` (additive MINOR). (#233)
-
-- DM doorbell address and slot derivation — `daemonseed_core::dm::doorbell`
-  (`derive_owner_seed`, `slot_for`, `DOORBELL_SLOTS`). The record, entry and
-  admission checks are not wired yet. (#233, ISC-C41)
 
 - `DmDoorbellSlotSecret` — a sixth identity-PRK expansion under the
   identity-scoped label `dm-doorbell-slot/v1`, carried on `IdentityKeys`. (#233)
 
-- DM key records are published and re-seeded by both clients (ISC-C40). Each
-  publishes its static ML-KEM-1024 encapsulation key once the session is live and
-  re-seeds it against eviction on a jittered ~50-minute cadence (Veilid has no
-  TTL, so a record survives only while its owner re-writes it). An ephemeral /
-  no-profile session publishes nothing — with no persistent key it is genuinely
-  not DM-reachable. (#232, ISC-C40)
-
-- DM key-record transport: `VeilidNetHandle::publish_dm_key_record` enqueues the
-  signed record on the WB-3 funnel as a coalescible `Keepalive` write to subkey 0
-  of its `dflt(1)` record; `fetch_dm_key_record` reads it back off the actor loop,
-  returning `Ok(None)` for an empty slot distinctly from a transport error. Bytes
-  stay opaque to the transport — verification needs the identity key only the
-  caller holds. (#232, ISC-C40)
-
-- `daemonseed_core::dm` — direct-messaging core. The key record publishes an
-  identity's static ML-KEM-1024 encapsulation key at a `dflt(1)` Veilid record
-  whose owner is derived from the identity's ML-DSA-87 public key, so any holder
-  of that key computes the address. Sign/verify, a highest-verified-version-wins
-  rollback guard, the clock-derived first-contact epoch, and the
-  `daemonseed/dm/…` domain-label namespace. Wire: `DmKeyRecord` and the reserved
-  `KeySelector` enum (additive MINOR). (#232, ISC-C40)
+- `daemonseed_core::dm` — direct-messaging core and the `daemonseed/dm/…` domain-label
+  namespace. Wire: `DmKeyRecord` and the reserved `KeySelector` enum (additive MINOR). (#232)
 - The GUI announcements pane orders posts newest first by `sent_unix_ms`, ties
   broken by content-address slot key (#237). Posts previously rendered in
   content-address order, placing a newer announcement below an older one.
@@ -2108,98 +938,11 @@ work lives in the maintainer's own planning notes, not here.
   public keys, `ss0`, and first/last-seen timestamps, in a fixed
   `CONTACT_RECORD_LEN` layout sealed by the store. (#236)
 - `daemonseed_core::dm::block_list::BlockList` — a set of long-term identity
-  public keys with `block`, `unblock`, `is_blocked`, and the two suppression
-  predicates `suppresses_knock` (over an opened first-contact entry) and
-  `suppresses_channel`. In memory only; not persisted. (#236)
-- `daemonseed_core::dm::ack_budget` — the client-global allowance for standalone
-  acknowledgements. `StandaloneAckBudget::request(now_ms)` returns `AckPermit::Granted` or
-  `AckPermit::Refused { retry_after_ms }` against `STANDALONE_ACK_MIN_INTERVAL_MS` (60 s),
-  shared across every conversation rather than held per channel. The clock is an argument, and
-  one that goes backwards refuses. (#235)
-- `daemonseed_core::dm::ack_cadence` — when a receiver writes a standalone acknowledgement.
-  `oldest_live_pending_ms` drops every pending message past its own give-up and returns the
-  oldest that remains; `standalone_interval_ms` interpolates linearly from `MAX_INTERVAL_MS`
-  (24 h) to `MIN_INTERVAL_MS` (60 s) across that message's remaining window, and is `None`
-  when nothing is left. `StandaloneAckCadence::on_collected` makes the next acknowledgement
-  due wherever the curve has reached; `on_acked` clears it. `pick_next` takes the candidate
-  whose oldest pending message was sent first, with the sort key clamped to one give-up
-  window and the previous winner skipped unless it is the only candidate. The clock and the
-  window are arguments, and a clock that goes backwards is not due. (#391)
-- `daemonseed_core::dm::ack_record` — the DHT record an `AckState` is published in.
-  `derive_owner_seed(AR, dir)` is `HKDF-SHA-384(salt=daemonseed/dm/ack/addr/salt/v1, ikm=AR,
-  info=daemonseed/dm/ack/addr/v1 || lp(dir))`, and `DmAckAddress::for_direction` pairs that
-  seed with its direction. `build` / `build_encoded` sign an `AckState` under the pseudonym
-  key, pad the body to `ACK_PAD_BUCKETS` and seal it under `K_ack(dir)` binding
-  `daemonseed/dm/ack/aad/v3 || lp(chan_id) || lp(dir)`; `decode_and_verify` / `verify` open
-  and authenticate one, returning `PeerAck`. `ACK_RECORD_SLOTS` is 1. (#235)
+  public keys with `block`, `unblock`, `is_blocked`, and the suppression
+  predicate `suppresses_channel`. In memory only; not persisted. (#236)
 - `DmAck` and `DmAckBody` wire messages — a sealed acknowledgement envelope and its
   contents: an optional `high_water`, the canonical run encoding, and the ML-DSA-87
   signature over both. (#235)
-- `daemonseed/dm/ack/addr/salt/v1`, `daemonseed/dm/ack/addr/v1` and
-  `daemonseed/dm/ack/aad/v3` domain labels. (#235)
-- `VeilidNetHandle::publish_dm_ack` and `fetch_dm_ack` write and read subkey 0 of a
-  conversation's `dflt(1)` acknowledgement record; the publish is a coalescible `Keepalive`
-  current-state write, and an empty slot fetches as `Ok(None)`. `RecordShape::DM_ACK` is that
-  record's shape. (#235)
-- `daemonseed_veilid_net::dm::spawn_dm_ack_publish` builds, addresses and publishes one
-  direction's acknowledgement off the caller's loop. (#235)
-
-### Changed
-
-- The closure that `DmPersist::update_outbox` takes returns `Mutation<T>` —
-  `Changed(T)` or `Unchanged(T)`, `must_use` — and the record is written only on
-  `Changed`. An `Unchanged` report for a correspondence with no record writes no
-  record and spends no seal, so `DmPersistError::OutboxDirectionMismatch` arises
-  once an entry has been queued. Debug builds panic when an `Unchanged` report
-  follows a change. A record is re-encoded to the current format and write suite
-  only on a `Changed` write. `DmStore` counts its seals in test builds. (#347)
-- `daemonseed_core::dm::resume::ResumeRecord` carries the re-establishment state that must agree
-  with itself, written by one `replace_atomically`. `new` takes two grouped structs in place of
-  eight positional fields: `ReEstState { reconnect_gen, attempt, own, acceptance,
-  attempt_at_window_start }` holds the two handshake slots, the committed generation, the monotone
-  attempt counter and the window anchor (A3.14, A3.4, A5.2, A7.3), and `Retention { retained, dedup,
-  stopped }` holds everything scoped to the retained `RS_n`. New: the peer-acceptance slot
-  (`AcceptanceSlot`, carrying the sealed `RE-ACK` that is re-served byte-identically and the
-  confirmation lock; A3.4, A5.1(ii)), the retained `RS_n` with its write-once `superseded_at_ms`
-  (`RetainedRoot`), the dedup memory keyed `(gen, attempt, leg, dir, seq)` (`DedupMemory`,
-  `DedupKey`, `Leg`, `Novelty`, bounded at `DEDUP_CAPACITY` and holding the one plane a party
-  receives on; A5.3), `reconnect_gen`, the `attempt` counter as a field of its own, and the
-  retained-but-stopped flag (A5.4). `retire_retained` drops the retained root, its stamp, its dedup
-  memory and the flag together; `observe_accepted` raises the `RE-EST` window base and, in the same
-  call, drops the dedup entries whose frames the scan can no longer open. `last_seen_re_est` and
-  `last_seen_re_ack` are the two window bases, one per direction (A6.1); the `RE-EST` base is a
-  stored, monotone field of `ReEstState` rather than a reading of the acceptance slot, which is
-  zeroed on completion. `commit_resume` licenses dropping a dedup position below the offered base and refuses
-  dropping one at or above it, so the record's eviction is committable and the memory does not grow
-  without bound across the window rollovers a retention contains.
-  Removed: `window_anchor_ms` and the stored `toward_c`, replaced by `attempt_at_window_start` — an
-  attempt number from which the toward-`C` count is a subtraction (A7.3). `previously_established`,
-  the peer's `PK_lt` and cached EK, and the clear ratchet-generation counter are **not** in the
-  record: their homes are the record's own presence, `dm::contact_cache`, and the outbox (A4.8)
-  respectively, and the module docs record each. The at-rest form changes; no released build has
-  written this record. (#404)
-- `daemonseed_core::dm::persist::DmPersist::commit_resume` narrows
-  `ResumeError::EmptySlotWouldReplaceAttempt` to an empty own slot at an unchanged `reconnect_gen`,
-  so the slot may be zeroed on completion (A3.14), and adds guards for the acceptance slot
-  (no attempt rollback within a generation, no reseal of an accepted attempt, no clearing a confirmed
-  slot without a generation advance), the write-once `superseded_at_ms`, monotone `reconnect_gen`,
-  and dedup positions dropped while their `RS_n` is retained (a subset test, so a swap is refused as
-  well as a shrink). The own slot may be emptied by an abandonment (A3.7) — recognised by an acceptance
-  newly occupying the contested generation — or by the completion that advances `reconnect_gen`, and
-  by nothing else. `ResumeRecord::decode` additionally refuses an empty frame, a slot whose attempt
-  disagrees with the counter, a generation on an empty slot, retained bytes under a clear presence
-  flag, and a duplicate dedup position. (#404)
-- `daemonseed_core::dm::reest::ReEstGate` is built by `from_record` and carries the persisted
-  confirmation lock (A5.1(ii)); `admit` answers the new `ReEstAdmission::Locked` for any differing
-  attempt at a confirmed generation, ahead of the budget closure (A9.4(ii)). The type
-  no longer derives `Default`. `AttemptBudget` is anchor-based: it carries
-  `attempt_at_window_start` beside the monotone attempt counter, derives the toward-`C` count as
-  their difference, and resets the anchor only through `observe_peer_opened`, which takes the attempt
-  an opened `RE-ACK` names — the `last_seen`-derived rollover (A8.2). Together these bound
-  `attempt − last_seen` by `C`, so `MAX_GAP = C` is sufficient and the multi-window lockout is
-  unreachable (A7.3). The gate additionally carries the record's committed `reconnect_gen` as a
-  floor, so a gate reloaded after a completion — which zeroes the acceptance slot — still drops the
-  generations that handshake closed. (#404)
 
 ## [0.36.3] — 2026-07-28
 

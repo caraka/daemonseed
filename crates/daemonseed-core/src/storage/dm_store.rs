@@ -63,7 +63,7 @@
 //! kind, [`Locked::replace`] pads every payload out to it and refuses anything
 //! that will not fit, and [`Locked::read`] strips the padding again. The true
 //! length travels in a length prefix *inside* the sealed plaintext (the
-//! `crate::dm::LEN_PREFIX` convention, shared with the frame paddings) — put
+//! `crate::dm::LEN_PREFIX` convention) — put
 //! outside it, the prefix would hand back the exact length the padding was
 //! there to hide.
 //!
@@ -72,9 +72,8 @@
 //! Every kind is sealed with `seal_envelope` before it reaches the disk, so the
 //! store holds opaque bytes and nothing else (ISC-A-C6). The AAD binds the record kind and the correspondence label, so a
 //! blob lifted from one slot cannot be replayed into another — the key is
-//! per-*profile*, exactly as [`crate::dm::provisional::derive_seal_key`]'s is,
-//! and without a per-slot binding every file in a profile would be an
-//! interchangeable ciphertext.
+//! per-*profile*, and without a per-slot binding every file in a profile would be
+//! an interchangeable ciphertext.
 //!
 //! ## Two scopes: per-correspondence, and per-profile
 //!
@@ -87,8 +86,8 @@
 //!
 //! **The scope is forced by the data, not chosen for convenience.**
 //! [`RecordKind::BlockList`] names identities a user refuses, and refusing
-//! somebody does not require ever having corresponded with them — the doorbell
-//! plane exists precisely for the stranger's first contact — so there is no
+//! somebody does not require ever having corresponded with them — first contact
+//! comes from strangers — so there is no
 //! correspondence whose directory could hold it. Reserving a
 //! [`CorrespondenceLabel`] value for it is not available either:
 //! [`CorrespondenceLabel::from_bytes`] is a `const fn` over any 32 bytes and
@@ -113,99 +112,11 @@
 //! key. Every [`Locked::replace`] is one encryption, so the budget is spent by
 //! record *writes*, not by bytes or by correspondences.
 //!
-//! **The arithmetic, because "unreachable at any realistic volume" was asserted
-//! here and is wrong (#289).** The budget is spent by record writes, and the term
-//! that dominates is not messages at all.
-//!
-//! **Polling was the governing cost.** [`crate::dm::persist::DmPersist::update_outbox`]
-//! wrote on every successful call, so every `sweep_give_ups`, `settle_from_ack`
-//! and `channel_torn_down` poll spent one seal per correspondence per tick
-//! whether or not anything happened. Over ten years, with no messages sent at
-//! all, that is what an idle correspondence cost:
-//!
-//! | correspondences | sweep tick | seals | of 2^32 |
-//! |---|---|---|---|
-//! | 500 | 60 s | 2.63 G | **61%** |
-//! | 500 | 10 min | 263 M | 6.1% |
-//! | 500 | 1 h | 43.8 M | 1.0% |
-//! | 50 | 1 h | 4.4 M | 0.1% |
-//!
-//! **A poll that changes nothing no longer spends a seal** (#347). The closure
-//! reports [`Mutation::Unchanged`](crate::dm::persist::Mutation) and the write is
-//! skipped, so an idle correspondence pays none of that table and the sweep
-//! cadence is a latency choice again rather than a cryptographic one.
-//!
-//! The table still bounds the *active* case: a correspondence that genuinely
-//! changes on every tick pays exactly these rows, so the cadence is not free —
-//! it is merely no longer charged for doing nothing. The cadence is still unset;
-//! there is no transport driver to set it.
-//!
-//! Messages are the smaller term. An ordinary message costs 4 seals (enqueue,
-//! first emission rewriting outbox and resume, ack settlement) and one never
-//! acknowledged costs 32 — it rides [`crate::dm::outbox::RESEED_LADDER`] to
-//! [`crate::dm::outbox::GIVE_UP`] for **15 emissions**, being due immediately on
-//! compose and then after each rung. At 4 seals it takes a billion messages to
-//! reach the bound alone.
-//!
-//! ⚠️ **The "rewriting outbox and resume" half is still the higher reading.** The
-//! resume record now has production writers —
-//! [`DmPersist::accept_first_contact`](crate::dm::persist::DmPersist::accept_first_contact)
-//! writes one at the acceptor's establishment,
-//! [`commit_with_resume`](crate::dm::persist::PendingHandshake::commit_with_resume)
-//! writes one at the initiator's, and the load-time re-establishment pass writes
-//! one per opened attempt — but none of those is an *emission*. A message's
-//! re-seed rewrites the outbox alone. So the per-message costs are 3 and 17
-//! rather than 4 and 32, and the figures above stay at the higher reading
-//! deliberately: a resume write per emission is what a later slice may add, and
-//! the bound must not have to be re-derived when it does.
-//!
-//! What the resume record does cost is **one seal per establishment** and one per
-//! re-establishment attempt, both per correspondence rather than per message, so
-//! neither is a term beside the poll table.
-//!
-//! Not counted: `RecordKind::Provisional` writes (per-correspondence, first
-//! contact only), and the per-message accounting over-counts because one
-//! correspondence has one outbox, so several due entries settle in one seal.
-//! Both are small against the poll term.
-//!
-//! **The cursor became a term in this budget when it was sealed** (#389), and
-//! its size is not yet measured. What bounds it is that
-//! [`crate::dm::persist::DmPersist::advance_cursor`] writes only when the number
-//! genuinely moves — a refused or unchanged advance returns before the replace —
-//! so the draw is one seal per *advance*, not one per receive poll. An advance
-//! is one page of received messages rather than one message, which puts it below
-//! the per-message terms above for any correspondence whose pages fill. The
-//! rate under representative traffic is an open measurement; there is no
-//! transport driver cadence to measure it against yet, which is the same reason
-//! the poll table's cadence is still unset.
-//!
-//! `reseeds_before_give_up_is_the_documented_figure` pins the ladder arithmetic to
-//! the constants it is computed from, so a cadence change fails rather than
-//! silently invalidating this.
-//!
 //! **Nothing warns as the count grows** — no counter, no rotation, no re-key — so
 //! the first symptom of crossing it would be a silent loss of the guarantee rather
 //! than an error. Rotation is deliberately not implemented: it needs a key epoch
 //! in every record's AAD and a migration for records already on disk, which is a
 //! record-format decision that belongs with the format, not with this module.
-//!
-//! **The cursor is sealed like everything else** (#389). It was the one kind
-//! written in the clear, on the argument that
-//! [`crate::dm::provisional::ReceiveCursor`] is not secret. It is not secret;
-//! it is a *disclosure* — eight plaintext bytes naming how far reading has got
-//! is a monotone proxy for how many messages a correspondence has received,
-//! legible to anyone holding the disk and no key. The directory name discloses
-//! that a correspondence exists; its file contents should not go on to
-//! disclose its volume.
-//!
-//! **The seal does not make the number trustworthy, and nothing here should be
-//! read as saying it does.** A cursor that opens says only that something
-//! holding this profile's key wrote it, which includes this profile writing a
-//! wrong one. [`crate::dm::persist::DmPersist::read_cursor`] still bounds every
-//! value it recovers by what the caller has actually read
-//! ([`crate::dm::provisional::ReceiveCursor::from_be_bytes`]'s `read_through`),
-//! and that check is what the correctness of a resumed sweep rests on — before
-//! this change and after it.
 //!
 //! Two things this store does **not** do, stated so no one reads them into it:
 //!
@@ -215,8 +126,8 @@
 //!   the blocks the filesystem believes it wrote. What it cannot reach is the
 //!   hardware beneath: an SSD's FTL remaps an overwrite onto a fresh block and a
 //!   copy-on-write filesystem writes a new extent by design, so an adversary
-//!   holding the raw flash is outside what any store here delivers. The same
-//!   bound [`crate::dm::provisional`] records for `ss0`. Note the asymmetry with
+//!   holding the raw flash is outside what any store here delivers. Note the
+//!   asymmetry with
 //!   *replacement*, which is `rename(2)` and scrubs nothing — deliberate, and
 //!   argued where the trade is taken.
 //! - **It does not make the directory's shape invariant.** Fixed sizes hold
@@ -229,8 +140,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-#[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use oxicrypt_aes::{Aes256Key, ModeError};
 use oxicrypt_kdf::HkdfSha384;
@@ -240,8 +149,6 @@ use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::dm::block_list::BLOCK_LIST_CAPACITY;
 use crate::dm::contact_cache::CONTACT_RECORD_LEN;
-use crate::dm::provisional::PROVISIONAL_RECORD_LEN;
-use crate::dm::resume::MAX_ENCODED_LEN;
 use crate::dm::store::{ADVERT_KEYS_RECORD_LEN, CONV_OUTBOX_RECORD_LEN, CONV_RECORD_LEN};
 use crate::dm::{LEN_PREFIX, domain, push_lp, unpad};
 use crate::storage::atomic_file::{
@@ -324,83 +231,19 @@ const LOCK_FILE_NAME: &str = ".lock";
 
 /// Largest payload a [`RecordKind::Resume`] record may carry.
 ///
-/// **No longer a guess: the format exists and its worst case is computed.**
-/// [`crate::dm::resume::MAX_ENCODED_LEN`] is the arithmetic sum of every fixed
-/// field plus [`crate::dm::frame::MAX_FRAME_LEN`], which
-/// [`crate::dm::resume::SealedReEst::seal`] refuses to exceed and
-/// [`crate::dm::resume::ResumeRecord::decode`] re-checks before allocating — so
-/// it is a real ceiling rather than a typical case, and this constant is checked against it
-/// by the `const` assertion immediately below — not by a test, because both
-/// sides are `const` and a runtime assertion over two constants is a probe that
-/// cannot fire (`clippy::assertions_on_constants` says so). A field added to the
-/// record that outgrows this bucket fails the **build**.
-///
-/// The headroom left over is deliberate. A9.2's field set is closed today, but
-/// the re-establishment protocol that produces it is not built, and a record
-/// that grows after records exist needs a migration — see below.
-///
-/// If a resume record outgrows this, [`Locked::replace`] refuses the write with
+/// If a payload outgrows this, [`Locked::replace`] refuses the write with
 /// [`DmStoreError::PayloadTooLong`] — loudly, at the moment of the write, with
 /// both numbers in the message. It never truncates, and it never silently grows
 /// the file: growing it is a deliberate edit here, and because the bucket is the
 /// on-disk size, that edit changes the length of every existing record and
-/// therefore needs a migration. Sizing it generously now is much cheaper than
-/// resizing it later.
+/// therefore needs a migration.
 pub const RESUME_CAPACITY: usize = 65_536;
 
-/// The bucket holds the worst case, checked at **compile time**.
-///
-/// A runtime test of this would be a probe that cannot fire: both sides are
-/// `const`, so the comparison is settled before any test runs — which is what
-/// `clippy::assertions_on_constants` says when it refuses one. A `const`
-/// assertion states the same fact where it is actually decided, and a field
-/// added to [`crate::dm::resume::ResumeRecord`] that outgrows this bucket then
-/// fails the **build** rather than a test somebody might not run.
-const _: () = assert!(
-    MAX_ENCODED_LEN <= RESUME_CAPACITY,
-    "the worst-case resume record exceeds RESUME_CAPACITY"
-);
+/// Bytes in a [`RecordKind::Provisional`] record's payload, which is also its
+/// bucket: the kind has one fixed size.
+const PROVISIONAL_RECORD_LEN: usize = 12_301;
 
 /// Largest payload a [`RecordKind::Outbox`] record may carry.
-///
-/// [`crate::dm::outbox::Outbox::encode`] is variable-length by nature: a header,
-/// then one entry per message, each *owed* entry carrying its sealed frame. Per
-/// entry the fixed fields cost about forty bytes.
-///
-/// **Two counts matter and they differ by two orders of magnitude.**
-///
-/// *Owed* messages — those still carrying a frame — are the binding one:
-/// **106 at [`crate::dm::frame::WORST_CASE_SEALED_FRAME_LEN`], 213 at the
-/// smallest frame a padding rung permits** (both measured 2026-08-15; the first
-/// is pinned by `the_bucket_holds_its_claimed_owed_message_count`).
-///
-/// *Lifetime* messages are the second: a terminal entry sheds its frame but
-/// keeps its forty bytes for ever, and **nothing prunes**, so a record also dies
-/// at ~52 000 messages ever sent. That ceiling is far away and is tracked
-/// separately; the owed count is what ordinary use reaches.
-///
-/// **Do not size this against [`crate::dm::frame::MAX_FRAME_LEN`], and do not
-/// assume a small typical frame.** Both errors were made here before the frame
-/// was measured (#291): the cap is a subkey bound `seal` cannot reach, and
-/// [`crate::dm::frame::PAD_BUCKETS`] means no frame is ever small. Sizing
-/// against either produces a number off by a third in one direction or an order
-/// of magnitude in the other.
-///
-/// **The consequence, stated because the arithmetic does not flatter this
-/// design:** the give-up window is seven days, and 106–213 owed messages is well
-/// under a day of chatty sending. No affordable fixed size closes that gap —
-/// covering a thousand owed messages costs ~20 MB *per correspondence* — because
-/// frame padding multiplies against the fixed bucket. So the send-path refusal
-/// #291 tracks is **the mechanism, not a backstop**: it is expected to fire in
-/// ordinary use.
-///
-/// **That refusal is built.** [`crate::dm::outbox::Outbox`] prices a candidate
-/// entry against this constant before accepting it and answers
-/// [`crate::dm::outbox::OutboxError::Full`], so a sender is told at enqueue rather
-/// than discovering it at the write — the gate sits inside the private `insert`
-/// that both public enqueue doors funnel through, so nothing can enqueue around
-/// it. What it does NOT decide is what the user is shown; that surface is still
-/// open.
 ///
 /// **The trade is disk against the leak.** Every correspondence pays this in
 /// full whether it owes one message or none, which is the price of the file
@@ -409,8 +252,8 @@ const _: () = assert!(
 /// [`DmStoreError::PayloadTooLong`], never truncated.
 pub const OUTBOX_CAPACITY: usize = 2_097_152;
 
-/// Bytes in a persisted [`crate::dm::provisional::ReceiveCursor`] — its
-/// `to_be_bytes` form. The record's *payload* length, not its length on disk:
+/// Bytes in a persisted receive cursor, a big-endian `u64`. The record's
+/// *payload* length, not its length on disk:
 /// the cursor is sealed and padded like every other kind, so
 /// [`RecordKind::ReceiveCursor`]'s [`RecordKind::on_disk_len`] is larger.
 pub const RECEIVE_CURSOR_LEN: usize = 8;
@@ -420,25 +263,18 @@ pub const RECEIVE_CURSOR_LEN: usize = 8;
 /// determine the path, so no caller ever names a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RecordKind {
-    /// A9's re-establishment resume record: the durable home of every piece of
-    /// hard crypto state a reconnect needs.
+    /// A re-establishment resume record.
     Resume,
-    /// The initiator's provisional handshake record
-    /// ([`crate::dm::provisional::ProvisionalRecord`]), already sealed under its
-    /// own per-channel context before it gets here.
+    /// An initiator's provisional handshake record, sealed under its own
+    /// per-channel context before it gets here.
     Provisional,
-    /// The persisted outbox ([`crate::dm::outbox::Outbox::encode`]) — what this
-    /// side still owes the correspondent.
+    /// A persisted outbox: what this side still owes the correspondent.
     Outbox,
-    /// How far the receiver has read ([`crate::dm::provisional::ReceiveCursor`]).
+    /// How far the receiver has read.
     ///
-    /// **Sealed like every other kind** (#389). It held the store's one
-    /// plaintext record until then, and eight clear bytes of read-through page
-    /// number is a per-correspondence message-volume disclosure to anyone
-    /// holding the disk. Sealing it does not make the number *trustworthy* —
-    /// [`crate::dm::persist::DmPersist::read_cursor`] bounds every value it
-    /// recovers by what the caller has actually read, and that is still the
-    /// only thing standing behind it.
+    /// **Sealed like every other kind.** Eight clear bytes of read-through page
+    /// number would be a per-correspondence message-volume disclosure to anyone
+    /// holding the disk. Sealing it does not make the number *trustworthy*.
     ReceiveCursor,
     /// What is known about the correspondent themselves
     /// ([`crate::dm::contact_cache::ContactRecord`]) — their long-term and
@@ -588,8 +424,8 @@ impl RecordKind {
     pub const fn capacity(self) -> usize {
         match self {
             RecordKind::Resume => RESUME_CAPACITY,
-            // The record is already one fixed size by construction, so the
-            // store's bucket is exactly it — no slack, nothing to choose.
+            // The kind has one fixed size, so the store's bucket is exactly it —
+            // no slack, nothing to choose.
             RecordKind::Provisional => PROVISIONAL_RECORD_LEN,
             RecordKind::Outbox => OUTBOX_CAPACITY,
             RecordKind::ReceiveCursor => RECEIVE_CURSOR_LEN,
@@ -682,13 +518,13 @@ impl RecordKind {
 /// Which correspondence a record belongs to — an opaque 32-byte name supplied by
 /// the caller.
 ///
-/// **A label is minted from the CSPRNG, never derived** ([`Self::mint`]; decided
-/// 2026-08-07, `docs/design/direct-messaging.md` § *What names a correspondence
-/// directory on disk*, #288). It must not be `chan_id`, which
-/// [`crate::dm::provisional`] states must never be serialized anywhere; and it
-/// must not be the key-record address, which is world-derivable from a harvested
-/// public key, so a derived name would let anyone who can read the directory
-/// test membership over any candidate pubkey with no key at all.
+/// **A label is minted from the CSPRNG, never derived** ([`Self::mint`];
+/// `docs/design/direct-messaging.md` § *What names a correspondence directory on
+/// disk*). It must not be a conversation identifier, which is never serialized
+/// anywhere; and it must not be a record address derived from a public key, which
+/// is world-derivable from a harvested key, so a derived name would let anyone who
+/// can read the directory test membership over any candidate pubkey with no key at
+/// all.
 ///
 /// **What minting buys over a *salted* derivation is narrower than "unlinkable",
 /// and worth stating precisely.** The mapping has to be persisted somewhere —
@@ -786,16 +622,9 @@ impl core::fmt::Debug for CorrespondenceLabel {
     }
 }
 
-/// Derive the store's at-rest seal key from the profile's at-rest key material —
-/// the store being five fixed records per correspondence (resume state,
-/// provisional handshake state, the outbox, the receive cursor and the contact
-/// cache) plus the profile's block list, never a message archive.
-///
-/// [`crate::dm::provisional::derive_seal_key`]'s construction under this module's
-/// own label pair. Its own label rather than the provisional record's: that key
-/// protects one record kind's contents, this one protects every record's *slot*,
-/// and deriving both from one label would let a provisional record and a store
-/// blob open as each other wherever the inputs coincided.
+/// Derive the store's at-rest seal key from the profile's at-rest key material,
+/// under this module's own label pair. The store holds fixed-size records, never a
+/// message archive.
 ///
 /// Per-profile, like every at-rest key here. The per-record separation is the
 /// AAD's job ([`seal_aad`]), not the key's.
@@ -817,9 +646,8 @@ fn derive_store_key(at_rest_key: &[u8; AEAD_KEY_LEN]) -> Result<Aes256Key, DmSto
 /// The AAD a record's seal binds: the domain label, then the correspondence and
 /// the kind, length-prefixed.
 ///
-/// [`crate::dm::provisional`]'s `seal_aad` construction — prefix, then
-/// length-prefixed fields — so the two cannot be parsed into each other and
-/// neither can be extended by an implementation that guesses.
+/// A prefix, then length-prefixed fields, so the AAD cannot be parsed into another
+/// construction's and cannot be extended by an implementation that guesses.
 ///
 /// Both fields are load-bearing and neither implies the other. Without the
 /// label, one correspondence's record opens in another's directory and the
@@ -941,21 +769,6 @@ pub struct DmStore {
     /// in order to release. Keying on the label alone would refuse the
     /// legitimate case, which is the case a shared `DmStore` produces.
     held: Mutex<HeldSet>,
-
-    /// How many records this store has sealed. **Test builds only.**
-    ///
-    /// The module header's *"nothing anywhere counts the seals"* stays true of
-    /// the shipped store; this exists so a test can assert a seal *budget*
-    /// directly instead of inferring one from whether a record's bytes changed.
-    ///
-    /// Byte-identity is the tempting proxy and it is a weaker instrument for the
-    /// same question. Every seal draws a fresh random nonce, so unchanged bytes
-    /// do imply no seal happened — but only while the write path is the sole
-    /// reason bytes could stay put. The moment a write is skipped for some
-    /// unrelated reason the proxy passes for the wrong reason, and a write being
-    /// skipped is precisely the change this counter is here to police.
-    #[cfg(test)]
-    seals: AtomicU64,
 }
 
 impl core::fmt::Debug for DmStore {
@@ -1010,8 +823,6 @@ impl DmStore {
             root,
             key,
             held: Mutex::new(HeldSet::new()),
-            #[cfg(test)]
-            seals: AtomicU64::new(0),
         };
         store.sweep_orphans()?;
         store.tend_profile_records();
@@ -1034,10 +845,7 @@ impl DmStore {
     /// not make the whole store unopenable, because every correspondence read —
     /// none of which touches this record — would go with it. A read-only mount,
     /// a full disk or a lost permission would otherwise brick every profile that
-    /// predates this record, on a path none of them asked for. What is lost by
-    /// failing soft is bounded and lands where it can be seen:
-    /// [`crate::dm::persist::DmPersist::read_block_list`] refuses a missing
-    /// record loudly rather than reading it as "nobody is blocked".
+    /// predates this record, on a path none of them asked for.
     ///
     /// **The lock is taken with [`FileLock::try_acquire`], so `open` cannot
     /// hang.** [`Self::profile_critical_section`] blocks by design and is held
@@ -1130,14 +938,6 @@ impl DmStore {
         Ok(removed)
     }
 
-    /// How many records this store has sealed since it was opened. **Test
-    /// builds only** — see the `seals` field for why byte-identity is not an
-    /// adequate substitute.
-    #[cfg(test)]
-    pub(crate) fn seal_count(&self) -> u64 {
-        self.seals.load(Ordering::Relaxed)
-    }
-
     /// The root directory.
     pub fn root(&self) -> &Path {
         &self.root
@@ -1198,13 +998,7 @@ impl DmStore {
             let outcome = seal_envelope(&self.key, &aad, &plain)
                 .map_err(|e| DmStoreError::from_envelope(kind, e));
             plain.zeroize();
-            let sealed = outcome?;
-            // Counted after the seal succeeded, not before it is attempted: a
-            // failure inside `seal_envelope` draws no nonce, so counting the
-            // attempt would model a budget the failed call never spent.
-            #[cfg(test)]
-            self.seals.fetch_add(1, Ordering::Relaxed);
-            sealed
+            outcome?
         };
 
         debug_assert_eq!(
@@ -1354,8 +1148,7 @@ impl DmStore {
             // absence. Swallowing those would report an empty list for a store
             // full of correspondences, and the caller's remedy for "not there"
             // is to mint a second label for an identity that already has one —
-            // the ambiguity this enumeration exists to let
-            // `crate::dm::persist::DmPersist::correspondence_for_pk_lt` detect.
+            // the ambiguity this enumeration exists to let a caller detect.
             // `Self::sweep_root_orphans` may skip, because a missed orphan
             // merely survives; here the direction of the failure is inverted.
             // `NotFound` alone is real absence, as in `Self::read_record`.
@@ -1775,9 +1568,7 @@ impl Locked<'_> {
     /// A payload *shorter* than the capacity is padded and recovered exactly,
     /// [`RecordKind::ReceiveCursor`] included — it was the one kind that had to
     /// be handed exactly its width, because unsealed it had nowhere to record
-    /// that it had been padded (#389). What still requires the cursor to be
-    /// eight bytes is [`crate::dm::persist`], which is the module that supplies
-    /// the payload and the only one that decodes it.
+    /// that it had been padded.
     ///
     /// On error the destination is in the state
     /// [`DmStoreError::Write`]'s inner [`AtomicReplaceError`] names — untouched,
@@ -2404,9 +2195,8 @@ impl DmStoreError {
 
     /// Map an envelope failure, preserving the authentication/module split.
     ///
-    /// [`crate::dm::provisional`]'s mapping, for the same reason: routing a
-    /// retryable module state to the authentication variant would report an
-    /// intact record as tampered.
+    /// Routing a retryable module state to the authentication variant would
+    /// report an intact record as tampered.
     fn from_envelope(kind: RecordKind, e: EnvelopeError) -> Self {
         match e {
             EnvelopeError::EntropySource(e) => DmStoreError::EntropySource(e),
@@ -2513,8 +2303,7 @@ impl core::fmt::Display for DmStoreError {
 impl DmStoreError {
     /// The trust event this failure must be surfaced as, if any.
     ///
-    /// Same shape as `dm::provisional::Teardown::event`, and for the same reason:
-    /// a returned value a caller could ignore would not be a fix, while a classed
+    /// A returned value a caller could ignore would not be a fix, while a classed
     /// event it is forbidden to down-class is. Only the permanent conditions get
     /// one — a retryable I/O error is not a trust event, it is a bad minute.
     ///
@@ -2806,9 +2595,11 @@ mod tests {
 
     #[test]
     fn bucket_sizes_are_pinned() {
-        // The provisional record's size is the module's, not a copy of it.
-        assert_eq!(RecordKind::Provisional.capacity(), PROVISIONAL_RECORD_LEN);
-        assert_eq!(PROVISIONAL_RECORD_LEN, 12_301, "the sealed record's size");
+        assert_eq!(
+            RecordKind::Provisional.capacity(),
+            12_301,
+            "the sealed record's size"
+        );
         assert_eq!(RecordKind::Resume.capacity(), 65_536);
         assert_eq!(RecordKind::Outbox.capacity(), 2_097_152);
         assert_eq!(RecordKind::ReceiveCursor.capacity(), 8);
@@ -4026,9 +3817,7 @@ mod tests {
     /// Before #389 it took neither: unsealed it carried no length prefix, so the
     /// store had to demand exactly [`RECEIVE_CURSOR_LEN`] and a shorter payload
     /// was an error. Sealed, a shorter one is padded and recovered exactly like
-    /// any other kind, and only an over-long one is refused. What still requires
-    /// eight bytes is `crate::dm::persist`, which decodes them —
-    /// `the_cursor_is_eight_sealed_bytes` there is that half.
+    /// any other kind, and only an over-long one is refused.
     #[test]
     fn a_short_cursor_payload_round_trips_and_an_over_long_one_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5968,59 +5757,6 @@ mod tests {
         }
     }
 
-    /// Domain separation from [`crate::dm::provisional::derive_seal_key`], which
-    /// the module docs assert and nothing tested. Collapsing the two derivations
-    /// onto one HKDF label pair would leave every other test in this module
-    /// green.
-    #[test]
-    fn a_record_sealed_under_the_provisional_records_key_does_not_open() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path());
-        let l = label(29);
-        let kind = RecordKind::Provisional;
-        let path = tmp
-            .path()
-            .join("dm")
-            .join(l.dir_name())
-            .join("provisional.bin");
-
-        s.critical_section::<_, DmStoreError>(&l, |g| {
-            g.replace(kind, &payload(PROVISIONAL_RECORD_LEN))
-        })
-        .unwrap();
-
-        let plain = pad_with_filler(kind, b"lifted").unwrap();
-        let aad = seal_aad(&l, kind);
-
-        // Positive control: this exact plaintext, this exact AAD, this exact
-        // slot — sealed under the store's key it opens.
-        std::fs::write(&path, seal_envelope(&s.key, &aad, &plain).unwrap()).unwrap();
-        assert_eq!(
-            s.critical_section::<_, DmStoreError>(&l, |g| g.read(kind))
-                .unwrap()
-                .as_deref(),
-            Some(&b"lifted"[..])
-        );
-
-        // Everything held identical except the key's HKDF labels. The store's
-        // AAD is used deliberately rather than the provisional module's: with
-        // both the key and the AAD changed the read would fail for either
-        // reason, and the test would pass even with the key derivations
-        // collapsed. Isolating the key is what makes this catch that.
-        let theirs = crate::dm::provisional::derive_seal_key(&AT_REST).unwrap();
-        let wrong = seal_envelope(&theirs, &aad, &plain).unwrap();
-        assert_eq!(wrong.len(), kind.on_disk_len(), "still a valid-size file");
-        std::fs::write(&path, &wrong).unwrap();
-
-        let err = s
-            .critical_section::<_, DmStoreError>(&l, |g| g.read(kind))
-            .unwrap_err();
-        assert!(
-            matches!(err, DmStoreError::NotAuthentic { .. }),
-            "the store key and the provisional record's key must be different keys, got {err:?}"
-        );
-    }
-
     /// A contact record survives the whole path — encoded by its own module,
     /// padded and sealed by the store, written, read, unpadded and decoded —
     /// with every stored field intact and the file at the kind's fixed size.
@@ -6031,7 +5767,7 @@ mod tests {
     #[test]
     fn a_contact_record_round_trips_through_the_store() {
         use crate::dm::contact_cache::ContactRecord;
-        use crate::dm::firstcontact::ROOT_LEN;
+        use crate::dm::contact_cache::ROOT_LEN;
         use oxicrypt_ml_dsa as ml_dsa;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -6110,7 +5846,7 @@ mod tests {
     #[test]
     fn a_contact_record_from_another_correspondence_does_not_open() {
         use crate::dm::contact_cache::ContactRecord;
-        use crate::dm::firstcontact::ROOT_LEN;
+        use crate::dm::contact_cache::ROOT_LEN;
         use oxicrypt_ml_dsa as ml_dsa;
 
         let tmp = tempfile::tempdir().unwrap();

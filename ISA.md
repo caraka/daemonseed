@@ -367,7 +367,6 @@ Each criterion is a verifiable boundary: positive ISCs describe a durable end-st
 - [x] ISC-A-C44: Anti: a correspondence's on-disk directory name is never a function of any value an observer can compute or harvest. It is minted from the CSPRNG at first contact and recorded in the contact cache — never derived from `chan_id` (which is never serialized anywhere), never from the recipient's key-record address (world-derivable from a harvested public key, so a derived name would make a directory listing a confirmable membership test over any candidate set), and never from a salted derivation over either. The property this buys, stated exactly: against an attacker holding the **disk but not the profile key**, a derived name is a standing oracle answering "is this candidate pubkey a correspondent?" for every directory *including orphaned ones whose cache entry is gone*, while a minted name reveals only what the contact cache still holds — so deleting a contact deletes its linkage, which under a derived scheme outlives the contact for as long as the salt does. **This criterion does NOT claim unlinkability under key compromise:** the mapping is persisted in the contact cache, which lives on the same disk under the same profile key, so an attacker who obtains the key obtains the mapping whichever scheme is used. **Accepted residuals, in scope and deliberately not closed here:** (i) the *number* of correspondence directories reveals the correspondent count, and no naming scheme conceals cardinality — fixed buckets make total profile size report it even if the names were hidden; (ii) the fixed record filenames — one per `RecordKind`, so the set grows as kinds are added — make record *presence* reveal handshake state, and per-file mtimes give a keyless per-directory activity signal that joins to observed online windows exactly as A9's F1 cross-plane join already prices (`docs/design/direct-messaging.md` § *What names a correspondence directory on disk*, #288).
 - [x] ISC-A-C45: Anti: the DM store never unlinks a record without first overwriting its payload and forcing that overwrite to the medium. Deletion is two fsynced phases then the unlink — an erasure sentinel made durable first, the body overwritten and made durable second — and it applies to **every** `RecordKind`, not only the provisional record that holds `ss0`: the resume record carries A9.2's key material under the same threat. The barrier between the overwrite and the unlink is part of the criterion, not an implementation detail; without it the overwrite may remain dirty page cache that the unlink discards, which is a no-op indistinguishable from a fix by any inspection of the resulting bytes. A crash between the two phases must read as `ErasureInterrupted` and never as an authentication failure, so a power cut is never reported to the user as tampering. **What this criterion does NOT claim:** an SSD's FTL remaps an overwrite to a fresh erase block and a copy-on-write filesystem writes a new extent, so on either the original blocks survive and nothing here reaches them; the property is real on ext4-over-LUKS on rotating or dm-mapped storage and best-effort by construction elsewhere (`docs/design/direct-messaging.md` § *Scrub every record before unlinking it*, #293).
 
-
 - [ ] ISC-A-C1: The client persists no plaintext identifiers, no session-activity logs, no message content, and no recently-contacted lists — only the encrypted at-rest blob (ISC-C3) and a minimal configuration file. Optional ephemeral debug logs must be opt-in, auto-truncated, and exclude identifiers and message content.
 - [ ] ISC-A-C2: The BIP-39 mnemonic is the only mechanism for cross-device setup and post-loss/post-passphrase-loss recovery — no server-side recovery, no email reset, no backup service. It exists on the device only transiently and is zeroed from RAM immediately after seed derivation. Circle entropy, though persisted in the at-rest blob (ISC-C59, M13), is **not** derived from the mnemonic; a mnemonic-only recovery on a clean device therefore does not restore circle memberships — this preserves the invariant that the mnemonic alone never reconstructs the social graph.
   - rationale: Real limitation — the mnemonic regenerates the identity seeds but not the circle-of-trust seeds (user-chosen entropy not derivable from the mnemonic), so recovery via mnemonic alone regains identity but loses circle access unless the circle passphrase is retained separately. This is intentional (circles are shared secrets, not personal-recovery surface) and must be told to the user at enrollment.
@@ -502,7 +501,6 @@ The write-budget family takes permanent `WB-ISC-N` IDs from the FROZEN 2026-07-0
 - [x] CRSH-ISC-26: A verified withdraw releases the share's imported route — immediately when idle, or deferred to in-flight-fetch completion — and drops its route_guard entry, so no imported route leaks past withdraw and route_guard does not grow unbounded; the release is idempotent (a re-withdraw hands out no route) (#180 F7, §RS-3) (probe: route_guard unit tests — idle-withdraw releases+drops, in-flight-withdraw defers to completion, re-withdraw returns None).
 - [x] CRSH-ISC-27: A consumer re-imports a share's rotated route even when the catalog folds the re-advert `Unchanged`. A sharer restart / route-death re-advertises the SAME sealed advert (same `sent_unix_ms` + metadata) with only the `route_blob` rotated; the F3 identical-re-read arm folds `Unchanged` (`route_blob` lives in `discovered`, not the catalog), so the route-import path gated behind `change != CatalogChange::Unchanged` was skipped and the consumer stayed wedged on the dead route (share listed + `Unresolved`) — unrecoverable by the cadence repair (the record session was alive; only the imported route died), auto-reheal, manual re-download, or Refresh, until a consumer restart. The frontends now detect the blob change independently of the catalog verdict (`route_changed = discovered[id].route_blob != env.route_blob`) and re-import + stamp a fresh generation to arm the parked browse retry, preserving the share's `unresolved` flag; an identical re-read (no rotation) still folds with no generation churn (F3 / CRSH-ISC-21 preserved). Security (#152/#156): honoring the rotation does not reopen the hijack path — the announce reaches this point only after `share_binding_is_valid` (#156) and `verify_route_advert`, so `env.route_blob` is provably the id's verified owner's route (probe: gui + tui `crsh_isc_27_route_rotation_reimports_on_catalog_unchanged`; live wedge-heal via attended CRSH-ISC-12).
 - [x] CRSH-ISC-28: The manual Refresh re-indexes each own published root and re-announces it, so a file added to a shared folder mid-session becomes fetchable by peers without a relaunch. The Veilid publish path hashes a root once at publish (`ShareContent::index_dir`), so a mid-session folder change is otherwise invisible until the next launch's auto-republish. On the user-initiated Refresh, the GUI re-sends `PublishShare` for every persisted own root (`state.persisted_published()`), which re-runs `index_dir` and re-announces under the SAME deterministic `share_id` (#156), so a fetcher folds the fresh manifest onto the existing catalog entry (no duplicate / dead second copy). The own-share list upserts by `share_id` (`upsert_own_share`) so repeated Refresh never duplicates an entry. Gated on Connected (no spurious "not connected" toast per root) and ridden only by the user-initiated Refresh (`on_refresh_shares` → `ResweepShares`), never the 3 s liveness poll (which sends the cheap local-only `RefreshShares`), so mid-session re-hashing is user-paced, not a background CPU storm (probe: gui `upsert_own_share_replaces_same_id_without_duplicating`; live add-file-then-Refresh via an attended manual test) (#195).
-
 
 ## Test Strategy
 
@@ -1168,125 +1166,11 @@ step earlier, at the signing key. That line is read by eye, and a rotation addit
 operator build with the new seed and reads its `this instance is the operator` trace before the
 constants are trusted.
 
-**ISC-C44's `ss0` exclusion is guarded in exactly one place, and it is not where the name suggests.**
+**ISC-C44's `ss0` exclusion.**
 `ROOT_LEN` and `SS0_LEN` are both 32, so a caller writing `ss0` where the derived root belongs
 compiles clean. `dm::contact_cache`'s `ss0`-absence scan cannot catch that — the type has no field
 either value could come from, so the scan is a regression guard against re-adding one and cannot
-fail today. The live guard is `dm::persist`'s
-`accepting_a_knock_establishes_a_findable_correspondence`, whose `addresses_same_channel` assertion
-kills the substitution. Measured by mutation, not by reading: the substitution fails that one test
-and no other.
-
-**The DM driver (`daemonseed_veilid_net::dm`) calls every DM module in production, and both front
-ends spawn it beside their net actor on connect.** The acknowledgement record, its piggyback path
-and the standalone cadence (ISC-C39, ISC-A-C21), the doorbell and first-contact path (ISC-C41), the
-paged channel (ISC-C42) and the established-contact channel (ISC-C43) run through it. The two-node
-oracle `two_node_dm_driver.rs` passed against the public Veilid network, from a host that can reach
-it: first contact, acceptance, one message in each direction, and both outboxes
-confirmed-collected, each exactly once (`test result: ok. 1 passed`, 1221 s). The criteria named
-above stay open until each is closed against its own text; the oracle is evidence for them, not a
-closing pass. The front ends send no `DmCommand` but shutdown. The GUI renders nothing from
-`DmEvent` at all; the TUI renders nothing from it either, except the teardown affordance below.
-
-**A torn-down DM channel is raised as its classed trust event, and the event cannot be separated
-from the loss.** `DmEvent::ChannelLost` carries the `TrustEventKey` that `Teardown::event` assigns
-its cause, read at the single site in `DmMachine` that emits the loss — so there is no path that
-emits `ChannelLost` without the key the taxonomy owes for it. (The introduce-probe and erase paths
-in the same module hold a `Teardown` too, but report a refusal or a trace rather than a loss.)
-**Once per process lifetime, not once per correspondence:** the doorbell's seen set is in memory and
-epoch-retired, and `correspondent_state_lost` neither rebinds the address root nor drops the
-correspondence, so a driver restart inside the same first-contact epoch with the entry still live
-re-admits it and emits a second `ChannelLost` and a second audit entry. `App::persistent` dedupes
-the TUI affordance; `TrustEventLog::append` does not dedupe the log.
-Both front ends write it to the ISC-C28 audit log, asymmetrically: the TUI's `fold_trust_event`
-writes the log *and* raises the persistent-non-blocking affordance, while the GUI appends to a
-`TrustEventLog` it now holds and raises nothing, having no affordance surface to raise it on. The entry carries the key and the wall clock and nothing naming the
-correspondent, which is what ISC-C28's scope rule and ISC-A-C1 require of it. **`ChannelLost`
-carries exactly one key**: `correspondent_state_lost` is the only teardown that reaches it, so
-`DmCorrespondentStateLost` is the only value the field takes. The other three causes —
-`NoProvisionalRecord`, `RecordUnusable`, `StoreUnreadable` — arise on three paths and have three
-dispositions. The introduce-probe path carries the cause's key to the client on
-`DmEvent::Refused`'s `event`, which both front ends fold into the audit log. The erase path keeps
-its cause as a trace. The label lookup discards it: `provisional_label` asks every stored label
-whether it opens for this recipient, so a teardown there is ordinarily another correspondence's
-record declining to open, and the lookup cannot separate that from this recipient's own record
-being corrupt — it mints a fresh label and the old record stays on disk. A cause discarded there
-reaches no audit entry, and that is the accounting gap the taxonomy still owes. That key is
-unpinned at its
-source: `on_mint`'s teardown arm reads the record `save_provisional` wrote immediately above it,
-under the same label and the same context, so no test drives the arm. What is pinned is everything
-below it — `refused()` carries the key it is given, and each front end logs it exactly once — and
-the cause-to-key mapping itself, which core pins per cause. Pinned by
-`a_torn_down_channel_raises_its_trust_event_exactly_once` (the driver's public path: the knock that
-loses the channel is re-delivered twice more and still raises one event, within the one process),
-`a_re_knock_from_a_known_correspondent_is_channel_lost` (the loss and the key arrive together),
-`dm_channel_lost_is_audit_logged_at_its_class` (TUI) and `dm_channel_lost_is_audit_logged` (GUI).
-The cause-to-key mapping itself stays pinned in core, per cause, by
-`an_established_channel_is_torn_down_loudly`, `an_unusable_record_strands_the_handshake_loudly` and
-`an_unreadable_store_does_not_declare_the_handshake_lost`. ISC-C28 and ISC-A-C12 stay open: only the
-DM teardown keys are wired this way, the GUI draws nothing from its log, and neither front end
-persists it yet.
-
-**ISC-C40's reader clause is enforced where the driver reads a key record, and what that protects
-is narrower than the path.** The DM driver holds one `KeyRecordCache` per correspondent, keyed by
-the correspondent's long-term identity key, and `on_key_record` admits every fetched record through
-it — so an authentic pre-rotation record is refused as `RefusalReason::KeyRecordRollback` rather
-than sealed to, an equal version is accepted as a re-fetch, and a higher one advances the bound.
-**The bound can only fire on a second introduction to the same identity inside one process:**
-`start_introduction` refuses an identity already in flight and one already holding a correspondence
-on disk, so a first introduction is always a cold read and a completed one never fetches again. The bound is the driver process's own: a key record
-is fetched before any correspondence exists to hold one at rest, and the contact record's five
-fixed-width fields are the store's whole bucket for that kind, so the cold reader stays the accepted
-rollback residual ISC-A-C23 names. Pinned by
-`a_replayed_older_key_record_is_refused_and_the_bound_holds`,
-`a_higher_version_advances_the_bound_and_the_old_one_is_then_refused`,
-`a_fresh_correspondent_is_accepted_at_any_version` and
-`the_bound_is_this_sessions_and_a_restart_takes_the_older_record_again`, each with the byte-level
-`accept_encoded_refuses_a_replayed_older_record` under it.
-
-**Manually tested for real, 2026-08-28: `two_node_dm_ack.rs`'s live oracle passed against the
-public Veilid network, from a host that can reach it** —
-`an_acknowledgement_published_by_one_node_merges_at_the_other`, 39.12s, collect-with-gaps → publish
-→ fetch from the far end → verify → merge under a ceiling, all OK. The record's transport half is
-now proven over a real network, not merely gate-green; what remains open is GUI/TUI production
-wiring, not the transport primitive itself.
-
-**`two_node_dm_ack.rs` is the live oracle for the record's transport half, matching the sibling it
-was missing next to** (`two_node_dm_key_record.rs`, `two_node_dm_page.rs`, `two_node_doorbell.rs`,
-`two_node_dm_channel.rs`) — one node publishes a gapped acknowledgement, the other fetches,
-verifies, and merges it under both a permissive and a clipping ceiling, plus confirms an unwritten
-record reads `Ok(None)`. `#[ignore]`d for the same reason as its siblings (needs a host that can
-attach to the public Veilid network); two non-ignored companions pin its pure claims so a broken
-fixture is caught without attach access. **`fetch_dm_ack`'s use of `open_or_create` (rather than the
-`open_only` issue #253 introduced for the page sweep) was checked against #253's own reasoning and
-left as built** — #253 draws the line at an *advancing frontier* silently manufacturing empty
-records as a side effect of ordinary cadence; the ack record, like the key record, is one fixed
-address per (conversation, direction), the case #253's own text names as fine to leave alone.
-
-**The block list's channel plane is wired and pinned, and ISC-C46 is closed.** The driver reads the
-stored list once per idle tick and plans no page sweep for a suppressed correspondent, and re-checks
-it when a page outcome or an acknowledgement record lands, so a block taken while an operation was
-in flight drops what it returns without settling anything. The acknowledgement plane is gated with
-the sweep: a blocked correspondent's record is neither fetched nor folded. A tick that cannot read
-the list sweeps, fetches and folds nothing and says so once through `DmEvent::BlockListUnreadable`,
-which both front ends accept and drop —
-`a_blocked_correspondence_is_not_swept_and_an_unblock_resumes_it`,
-`a_page_arriving_after_a_block_surfaces_nothing_and_settles_nothing`,
-`an_unreadable_block_list_sweeps_no_channel`,
-`an_unreadable_block_list_folds_no_page`,
-`an_unreadable_block_list_folds_no_acknowledgement`,
-`a_blocked_correspondents_acknowledgement_is_not_fetched_or_folded`,
-`a_refused_block_keeps_the_held_request` (machine) and
-`a_block_stops_a_live_conversation_and_an_unblock_resumes_it` (two live drivers over one record
-store), each with a second correspondence or an earlier message as its control. What the criterion
-no longer asks for — it moved to ISC-A-C23 as a bounded residual — is the *byte-identical to "never
-came online"* clause: this side's own outbox re-seeds and acknowledgement writes to a blocked
-identity continue, so a blocked correspondent holding an unacknowledged conversation can still
-observe that this side is running — and the same split costs this side an accurate delivery report,
-since an entry queued for a blocked correspondent re-seeds to the seven-day give-up and is surfaced
-`Undelivered` even where that correspondent collected it, the acknowledgement that would have
-settled it being one of the reads the block stops. Both are bounded and deliberate under "the block
-stops reads, not writes".
+fail today.
 
 **The gate.** One table of steps in `xtask`, in three groups: `preflight` (format, lint, a
 release-profile type-check, rustdoc with warnings denied, and the proto, coverage, manifest and
@@ -1311,109 +1195,12 @@ documentation is already true.
   injected write sink, which decide ordering, cadence, and independence but say nothing about
   behaviour against a live DHT.
 
-**DM page records are released on the driver's own settlement signal, so the count of open page
-records does not grow with a conversation's length (#252).** ISC-C42's paging is the one record
-family whose cardinality is per-message rather than per-peer, and the driver now hands a page back
-on three signals: a receiving page below both the watched window and the first unsettled position
-(`Collection::retired_below`), a sending page every position of which the correspondent has settled
-(`AckState::settled_pages_below`), and every page of a conversation torn down. A page whose sweep or
-publish is in flight is skipped rather than closed — the write side counts its in-flight writes,
-because one tick puts up to `PAGE_SLOTS` of them on one record — and a torn-down conversation is
-recorded as such, which is what actually stops a later plan or write naming the records the teardown
-released: a teardown leaves the ratchet and channel roots in place and every planner reads exactly
-those, so sweeps, page writes, acknowledgement fetches and acknowledgement writes are each gated on
-that record — the acknowledgement cadence at its candidate scan, before the client-global permit is
-spent, and the teardown drops the pending set that would otherwise carry the oldest key for a week. A page an operation was holding at teardown is skipped there and handed back when that
-operation's outcome lands, which is the last signal a dead conversation produces. The
-transport's own capacity bound (`rendezvous::DM_PAGE_CACHE_CAPACITY`) remains the backstop for a page
-a close does not reach. **The receiving side's give-up is a measurement and the record-lock map is
-untouched, both deliberately.** The design's prefix-advance-on-give-up rule needs the receiver to
-learn that the sender abandoned a position, and no record carries that — an acknowledgement and a
-frame's piggyback both carry only the receiver's own `high_water` and runs — so what releases a
-permanently lost inbound position is the receiver's own horizon (`Collection::sweep_give_ups`, the
-entry below), and its conversation's receiving pages are released after that horizon rather than by
-the capacity bound. A page under a standing watch is skipped by the same in-flight rule as a page
-under a sweep, and handed back by the first settlement pass after that watch resolves.
-`rendezvous::RecordLocks` entries are never
-removed: an entry can only be dropped safely when no task holds a clone of its `Arc`, and a second
-lock created for a record another task is already serializing on would under-serialize it — the
-CRSH-ISC-3 invariant. This change reclaims the open cache and the page ring, which are the two
-structures that hold a record open. A closed page a later plan names again is re-opened by the
-ordinary open path at the cost of one open; the record's contents are untouched by a close. Pinned by
-`the_open_page_count_stays_at_the_watched_window_across_a_long_conversation` (a conversation
-spanning four distinct pages ends holding the watched window and nothing more),
-`a_page_with_a_sweep_in_flight_is_not_closed_until_the_outcome_lands`,
-`a_torn_down_channel_hands_back_every_page_of_its_conversation` and
-`a_closed_page_named_again_is_re_opened_with_its_contents_intact`,
-`a_given_up_sending_page_is_handed_back`, `a_panicked_page_write_releases_the_page_it_was_holding`,
-`a_torn_down_conversation_plans_nothing_more`,
-`a_page_in_flight_at_teardown_is_handed_back_when_its_outcome_lands`,
-`a_peer_acknowledgement_hands_back_the_sending_page_it_finishes`,
-`a_page_with_a_publish_in_flight_is_not_closed_until_the_outcome_lands`,
-`a_page_is_closed_under_the_id_it_was_opened_with` and
-`a_change_on_a_passed_page_sweeps_once_and_does_not_re_arm` (a page the frontier has passed stops
-being watched by the re-arm declining, and the sweep that re-opened it hands it back). ISC-C42 stays open: this bounds the record count
-and settles nothing else in its text.
-
-**2026-09-08 — the receiver gives up on a position it never collected, on its own clock, and the
-entry above is superseded on that point.** That entry records that a permanently lost inbound
-position pins its conversation's receiving pages until the transport's capacity bound reclaims them,
-because no record tells the receiver that the sender abandoned a position. The premise stands — the
-wire carries nothing of the kind, and no field is added — and the conclusion does not: the receiver
-measures the horizon itself. `Collection::sweep_give_ups` abandons a gap that has stood for
-`RECEIVE_GIVE_UP_MS`, the sender's `GIVE_UP` plus the longest `RESEED_LADDER` rung, and the cursor
-advances over it, so `Collection::abandoned` has a production caller and the pages are released after
-one horizon rather than by the capacity bound. **The age is accumulated, not read off the clock:**
-each sweep adds the time since the last one capped at `AGE_STEP_CAP_MS`, so a host clock that steps
-forward cannot abandon positions the sender is still re-seeding — the dangerous direction, since an
-abandoned position is settled and a settled position is filtered out of everything a page fold
-offers. **A give-up is its own reason to write an acknowledgement**, distinct from the standalone
-cadence: that cadence is keyed on the live pending set, which ages out at the sender's give-up, so
-the ordinary case of one lost message and no later traffic would move the cursor at a moment when
-nothing would ever publish it. What was rejected: accepting the stall, which lets `MAX_ACK_RUNS`
-permanent losses refuse every later collection and report read messages as undelivered; and a give-up
-marker on the wire, a frame-shape change carrying a number the receiver can already derive. Pinned by
-`a_gap_past_the_horizon_is_given_up_on`, `a_clock_that_steps_forward_does_not_age_a_gap_by_the_step`,
-`a_gap_filled_from_below_does_not_restart_its_horizon`, `a_split_gap_keeps_its_age_in_both_halves`,
-`a_give_up_with_no_later_traffic_still_publishes_the_moved_cursor`, its mirror
-`a_probe_that_moves_no_cursor_writes_no_acknowledgement`, and
-`a_watched_page_the_horizon_finished_closes_one_tick_after_the_watch_is_lost` (a page the horizon
-finishes under a standing watch is handed back by the first settlement pass after that watch
-resolves, and by the pass itself where no watch stands).
-
 **Anti-criteria are verified by negative fixtures**, each of which must be shown to fail before its
 guard lands: replay, clock skew, counter rollback, handle mismatch, forged provenance, a forged share
 identifier on both the announce and withdraw paths, and an outsider key against a room seal.
 
-**The resume record is written at first establishment, and read back at load.**
-`PendingHandshake::establish_with_resume` and `commit_with_resume` implement the create-then-erase
-order, and `restart_channel` consults the resume record first, answering
-`StoredChannelRestart::Established`. `commit_with_resume` is the driver's establishment path, so a
-correspondence created in one process is found by the next: `seed_from_store` rebuilds it and
-restores its own signing keypair from the record. What a rebuilt correspondence cannot do is send —
-`DmMachine::send` refuses a resumed channel with `RefusalReason::NotEstablishedThisSession`, because
-each side derives the resumed generation from its own outbox counter and the two can disagree, and
-the answering side's resumed schedule opens a receiving chain only. Agreeing one generation for both
-sides is open (`docs/design/direct-messaging.md`, build note). What the tests settle: the pseudonym pair recovered after a store is dropped and reopened
-signs and verifies real frames, with a crossed-key control; the create-then-erase order holds when
-the resume write is refused; an empty handshake slot round-trips, admits a first attempt, cannot
-replace a persisted one, and leaves the send-floor guard unchanged; and a record's on-disk length
-does not report whether the slot is occupied.
-
-**`commit_resume` refuses a changed pseudonym pair**, because two records whose slots are both empty
-are otherwise indistinguishable to every other guard — the rollback and reseal comparisons both
-degenerate — and a second write would leave a correspondence signing under a key its correspondent
-never saw. An identical pair is still admitted so a send-floor advance can rewrite the record.
-
-**A resume record whose plaintext will not decode is reported as an unreadable store**, which is the
-outcome whose contract is that nothing is lost and the caller may retry. That contract fits a
-transient store fault and not a decode failure, which is permanent: every restart retries a record
-that will never read, and the user is never told to re-establish. The honest variant cannot carry a
-decode error, so the collapse is forced by the type rather than chosen.
-
 **ISC-A-C44 is met by construction and held by the label tests.** `CorrespondenceLabel::mint` draws
-32 bytes from the CSPRNG and is the only path a new correspondence takes — `DmPersist` and the
-driver's mint site call it, and `from_bytes` has no non-test caller, so no production label descends
+32 bytes from the CSPRNG and is the only path a new correspondence takes, and `from_bytes` has no non-test caller, so no production label descends
 from a harvestable value. `minted_labels_are_distinct`,
 `every_byte_position_of_a_minted_label_varies_across_draws` and
 `successive_minted_labels_do_not_differ_by_a_fixed_step` hold the draw; a directory name is the
@@ -1436,77 +1223,3 @@ record whose mode blocks the scrub fails closed as `ErasureBlocked` rather than 
 that erased nothing. Orphaned temp siblings take the same overwrite before their unlink, which is
 the path that would otherwise bypass `delete` entirely. The FTL and copy-on-write limits the
 criterion excludes are unchanged.
-
-**What the live two-node driver oracle settles, and what it does not.**
-`two_node_dm_driver` runs first contact, acceptance, one channel message each way and both outboxes
-settling on the correspondent's acknowledgement, over the public network at
-`PowDifficulty::PRODUCTION`, with every address derived independently at both ends. It is the
-evidence for the delivery path as a whole, and it leaves each of these criteria owing something
-specific:
-
-- **ISC-C39** — the engine is proven: both outboxes reach `DeliveryState::ConfirmedCollected` on a
-  verified acknowledgement, and nothing reports delivered before one. The criterion's three truthful
-  UI states are not rendered by either front end, and the seven-day give-up to `Undelivered` is
-  exercised only in paused time.
-- **ISC-C41** — the doorbell, the sender-secret slot and the self-contained entry are proven under a
-  production-difficulty proof of work. Admission is proven at two of its three legs: the oracle runs
-  `AdmissionPolicy::Open`, so the grantee-bound one-time invite token under an invite-only policy is
-  held by unit tests and has no live run.
-- **ISC-C38** — the criterion's shape is proven end to end by
-  `two_drivers_carry_a_round_trip_end_to_end_exactly_once`: one knock over an ML-KEM-1024
-  encapsulation with no handshake round trip, an acceptance that installs the per-contact pseudonym,
-  and a message in each direction whose keys each side's own ratchet derived. The ratchet's named
-  mechanisms are held one layer down, by `dm::ratchet`'s own tests and by no driver-level probe —
-  the bounded skipped-message-key cache by `max_skip_is_pinned`,
-  `the_cache_holds_two_full_catch_ups` and
-  `catching_up_yields_the_keys_it_stepped_over_at_the_right_slots`, the per-generation step by
-  `both_sides_open_at_the_agreed_generation` and
-  `a_generation_change_does_not_evict_the_previous_chains_tail`, and key uniqueness along a chain by
-  `a_chain_never_repeats_a_key`. The in-seal binding of the pseudonym to the long-term identity is
-  held by `a_frame_does_not_open_in_another_conversation_or_the_reverse_direction`. What the
-  criterion still owes is forward secrecy after B's first reply: nothing asserts that the material a
-  completed step leaves behind cannot open the generation before it.
-- **ISC-C42** — a page round-trips over the real store. The paging tests bound the record count and
-  settle nothing else in the criterion's text. The `watchable` clause is now probed at the driver:
-  `a_value_change_collects_the_message_before_the_probe_cadence` collects a message on a value
-  change with the receiving driver's cadence held away from it,
-  `without_a_watch_the_message_waits_for_the_probe_cadence` is its control — the same write, no
-  watch standing, nothing collected until the cadence comes round and the message there when it does
-  — and `a_failed_watch_leaves_what_an_absent_one_leaves` pins the three watch seams (lost, failing,
-  never armed) to the same end state, so a broken watch degrades to the cadence rather than losing
-  the message. All three read the receiving driver's tick counter across the window, so none can
-  pass on a driver that ticked. What the criterion still owes is the write budget: the `K:1` open
-  amortization and the ≈3.13/min close under a client-global aggregate ack cap are design arithmetic
-  with no measurement behind them, and `dflt(16)` is checked against the record's own shape rather
-  than against a record the live network created.
-- **ISC-C43** — established contact rides the AR-derived channel and the doorbell is consulted only
-  for first contact, both within one session. The criterion's negative — that doorbell
-  erasure cannot suppress an established conversation — has no probe: nothing erases a doorbell and
-  then asserts the channel carries on.
-- **ISC-A-C20** — the forgeable-authorship half is held by
-  `a_tampered_frame_is_counted_and_settles_nothing`, which flips one byte inside the envelope and
-  watches the frame reach the ratchet, fail to authenticate, and settle nothing. That the signature
-  lives inside the seal is what `a_frame_does_not_open_in_another_conversation_or_the_reverse_direction`
-  and `a_frame_replayed_into_another_carrier_record_is_refused` exercise, both refusing on material
-  no unsealing party could have read. What no probe covers is the storage node's own view: nothing
-  asserts that the bytes a record holds carry no cleartext and no signature outside the seal, and
-  the AR-owner write gate is a property of the address derivation rather than of anything a test
-  observes a third party being refused.
-- **ISC-A-C21** — exactly-once survives the settle window on the live network while the sender is
-  still re-seeding the same slot, and `a_frame_does_not_open_in_another_conversation_or_the_reverse_direction`
-  binds a frame to its pair and direction. The acknowledgement plane cannot assert a position that
-  was never sent (`a_peer_cannot_settle_a_position_we_never_sent`) and a stale acknowledgement is a
-  no-op. Replay into a different carrier record is refused by
-  `a_frame_replayed_into_another_carrier_record_is_refused`: a frame sealed at page 3 slot 9 and
-  offered at page 5 slot 9 — another record at the same slot index, so a check comparing slots alone
-  would admit it — is refused as `DmFrameError::Misplaced`, with the frame opening at its honest
-  position as the control. That was the clause the criterion was open on.
-- **ISC-A-C24** — the positive half is proven by the addresses themselves: both parties derive the
-  same page record from `AR` alone, which is what makes every two-driver oracle here run at all, and
-  `paging.rs` pins the derivation's separations — `distinct_conversations_address_distinct_pages`,
-  `the_two_directions_address_different_records`, `consecutive_pages_are_unrelated`, with
-  `an_address_refuses_a_root_from_another_conversation` and
-  `an_initiator_ratchet_binds_its_conversation_too` binding an address to the root its correspondence
-  actually holds. The criterion's negative has no probe: nothing constructs a third-party observer
-  holding only a candidate recipient pubkey and shows it cannot derive or confirm a channel. What is
-  established is that the two parties CAN derive the address, not that an observer cannot.

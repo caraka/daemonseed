@@ -55,23 +55,12 @@ pub const DOMAIN_VEILID_NODE: &str = "veilid-node";
 /// share-id commitment nonce.
 pub const DOMAIN_SHARE_ROOT_IKM: &str = "share-root-ikm/v2";
 
-/// Domain separator for the DM doorbell slot secret (#233). The SIXTH expansion
+/// Domain separator for the DM doorbell slot secret. The SIXTH expansion
 /// of the identity PRK (sibling of `sign` / `kem-d` / `kem-z` / `veilid-node` /
-/// `share-root-ikm`), yielding the 32-byte secret that picks which of the
-/// recipient's 32 doorbell slots this sender knocks on
-/// (`dm::doorbell::slot_for`).
-///
-/// Being an expansion of the mnemonic PRK is the point: the slot survives a
-/// reinstall, so a retried first contact overwrites the sender's OWN previous
-/// entry instead of orphaning it in a second slot — the `#118` ephemeral-key
-/// ring bug class applied in reverse. And because it is a *secret*, a storage
-/// node co-hosting the doorbell cannot compute which slot a candidate pubkey
-/// maps to, so it cannot learn who is knocking.
+/// `share-root-ikm`), yielding a 32-byte secret.
 ///
 /// Passed through [`primary`]/[`device`] like `share-root-ikm`, so the secret is
-/// identity-scoped. Two presentations of one mnemonic are two identities with
-/// different long-term keys, hence two distinct senders to a recipient; giving
-/// them one shared slot would make them clobber each other's knocks.
+/// identity-scoped.
 pub const DOMAIN_DM_DOORBELL_SLOT: &str = "dm-doorbell-slot/v1";
 
 /// Domain separator for the DM channel root secret. The SEVENTH expansion of

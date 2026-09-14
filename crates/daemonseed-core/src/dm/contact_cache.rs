@@ -633,9 +633,8 @@ impl ContactRecord {
     /// the store pre-sealed or non-secret bytes, so this is the first at-rest
     /// cleartext key-material buffer in the tree, and
     /// [`crate::storage::dm_store::Locked::read`] returns a plain `Vec<u8>` that
-    /// nothing would otherwise own. `crate::dm::resume` solves this by wrapping
-    /// at each call site — a convention that holds only while every caller
-    /// remembers it. Requiring the wrapper here makes forgetting it a compile
+    /// nothing would otherwise own. Wrapping at each call site is a convention
+    /// that holds only while every caller remembers it. Requiring the wrapper here makes forgetting it a compile
     /// error instead.
     pub fn decode(bytes: &Zeroizing<Vec<u8>>) -> Result<Self, ContactCacheError> {
         if bytes.len() != CONTACT_RECORD_LEN {
