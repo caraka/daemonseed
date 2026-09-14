@@ -165,6 +165,19 @@ modules:
     no_std: false
     depends_on:
       - daemonseed_veilid_net::error
+  - name: daemonseed_veilid_net::dht_gate
+    description: >-
+      The partitioned DHT permit accountant (DhtGate) sitting above veilid's
+      process-global DHT-operation gate. Four dedicated pools — chat, starvation floor,
+      non-chat window and read — sum to DHT_BUDGET concurrent operations with no
+      cross-pool fallback, so no lane can drain another, and a margin-sized limiter
+      bounds the un-gated open_dht_record / watch_dht_values calls.
+    no_std: false
+    depends_on: []
+  - name: daemonseed_veilid_net::resweep
+    description: The round-robin cursor selector (next_resweep_record) the frontend net actors share for their steady-state resweep clocks.
+    no_std: false
+    depends_on: []
 
 # ─────────────────────────────────────────────────────────────────────
 # Types
@@ -944,6 +957,103 @@ types:
         description: CHAN subkey 0 — the marker naming the conversation closed, written before the record is erased.
       - name: ChannelErase
         description: The erasure of the writer's own channel record, on delete-conversation.
+  - name: WriteScheduler
+    module: daemonseed_veilid_net::schedule
+    kind: struct
+    description: >-
+      The scheduler entry point — a unit struct carrying the two constructors.
+      `spawn(sink, cfg)` starts the driver task and returns a WriteSchedulerHandle
+      generic over the sink's Item. `spawn_with_probe(sink, cfg, latency_probe)` does the
+      same and additionally publishes, on each non-chat completion, the median of the
+      last five non-chat enqueue-to-ack latencies in milliseconds into the supplied
+      Arc<AtomicU64>; a partial window is padded with zeros, and no consumer of that
+      value may enqueue writes from it. The driver task runs until every handle is
+      dropped or WriteSchedulerHandle::shutdown completes.
+  - name: WriteSchedulerHandle
+    module: daemonseed_veilid_net::schedule
+    kind: struct
+    description: >-
+      A cloneable handle onto one running scheduler task, generic over the sink's
+      dispatch token. `enqueue(req)` submits a write and `shutdown(budget)` runs the
+      graceful-close flush. Every clone addresses the same scheduler.
+  - name: WriteSink
+    module: daemonseed_veilid_net::schedule
+    kind: trait
+    description: >-
+      The seam over the physical DHT write. The scheduler decides when, in what order and
+      on which DispatchLane a write goes out; the sink acquires that lane's DhtGate
+      permit, performs exactly one write, and returns a DispatchOutcome. The associated
+      type Item is the opaque per-write dispatch token the scheduler carries and hands
+      back at dispatch. `dispatch(&self, item: Self::Item, lane: DispatchLane)` returns a
+      pinned boxed Send future, which the scheduler spawns off its driver loop. Bounds
+      are Send + Sync + 'static.
+  - name: daemonseed_veilid_net::schedule::DispatchLane
+    kind: enum
+    description: >-
+      Which DhtGate pool a dispatched write draws. The scheduler picks the lane and the
+      sink acquires the matching pool; there is no cross-pool fallback, so the combined
+      in-flight count is pool arithmetic.
+    variants:
+      - name: Chat
+        description: The chat pool, for chat and user-action writes. A chat write never waits on a non-chat pool.
+      - name: Floor
+        description: The one-permit floor pool — the starvation floor and the deadline lane, an additional guaranteed write slot.
+      - name: Window
+        description: The non-chat window pool, capped at W_MAX.
+  - name: DispatchOutcome
+    module: daemonseed_veilid_net::schedule
+    kind: struct
+    description: >-
+      The result of one WriteSink dispatch. `bare(result)` builds one carrying no
+      acquire-wait signal.
+    fields:
+      - name: result
+        type: "Result<()>"
+        description: The DHT write result.
+      - name: acquire_wait
+        type: "Option<Duration>"
+        description: The delay the sink observed between requesting its DhtGate permit and holding one. Telemetry only — no scheduler, gate or window logic consumes it. None when the transport cannot surface it.
+  - name: SchedulerConfig
+    module: daemonseed_veilid_net::schedule
+    kind: struct
+    description: >-
+      The scheduler's tunable parameters, passed to WriteScheduler::spawn. Copy, and its
+      Default is nonchat_cap 2 with age bounds 2s / 30s / 60s / 120s / 90s.
+    fields:
+      - name: nonchat_cap
+        type: usize
+        description: W_max — the non-chat window ceiling. The window is min(distinct pending non-chat records, nonchat_cap) and tracks no latency signal.
+      - name: age_bounds
+        type: "[Duration; 5]"
+        description: Per-class starvation age bound, indexed by WriteClass::rank() - 1. A write older than its bound escalates one class on the window lane; at twice its bound it becomes eligible for the floor lane. Both are measured against the write's starvation clock, which survives coalescing.
+  - name: DhtGate
+    module: daemonseed_veilid_net::dht_gate
+    kind: struct
+    description: >-
+      The partitioned DHT permit accountant, shared as an Arc by the write sink and every
+      read-lane call site so all lanes draw on one partition. It holds four dedicated
+      pools — chat CHAT_PERMITS, floor FLOOR_PERMITS, window W_MAX, read READ_PERMITS,
+      summing to DHT_BUDGET — plus a separate DHT_GATE_MARGIN-sized limiter for the
+      un-gated open_dht_record and watch_dht_values calls. `new()` builds the four pools
+      at those sizes and `with_pools(chat, floor, write, read)` at explicit ones, each
+      forced to at least 1. `acquire_chat`, `acquire_floor`, `acquire_write`,
+      `acquire_read` and `acquire_ungated` each await a GatePermit from one pool and are
+      FIFO-fair within it; a read permit is held around one get_dht_value and released
+      before the next. A caller holds a permit from at most one of the four pools at a
+      time, and never holds a read permit across an acquire_ungated. `available_chat`,
+      `available_floor`, `available_write`, `available_read` and `available_ungated`
+      report a pool's free permits, and `total_in_flight(chat, floor, write, read)` takes
+      the four pool sizes and returns their summed occupancy.
+  - name: GatePermit
+    module: daemonseed_veilid_net::dht_gate
+    kind: struct
+    description: >-
+      One held DHT-op permit from exactly one DhtGate pool. Dropping it, including on a
+      panic unwind, releases the permit back to that pool.
+    fields:
+      - name: acquire_wait
+        type: Duration
+        description: The delay between requesting the permit and holding it. Telemetry only — no scheduler, gate or window logic consumes it.
 
 # ─────────────────────────────────────────────────────────────────────
 # Functions
@@ -2184,6 +2294,48 @@ functions:
     returns:
       type: "WriteRequest<D>"
       description: The request to hand WriteSchedulerHandle::enqueue.
+  - name: WriteSchedulerHandle::enqueue
+    module: daemonseed_veilid_net::schedule
+    description: >-
+      Submit one write to the funnel. This is the only write entry point; no read path
+      reaches it. The call is non-blocking and returns once the request is queued — the
+      write result arrives on req.reply, as does an Ok when a newer same-record,
+      same-logical-id write coalesces this one away. When the scheduler task is already
+      gone the reply resolves with an error rather than the request being dropped
+      silently.
+    signature: "impl<D: Send + 'static> WriteSchedulerHandle<D> { pub fn enqueue(&self, req: WriteRequest<D>) }"
+    parameters:
+      - name: req
+        type: "WriteRequest<D>"
+        direction: in
+        description: The write to queue — target record, class, kind, optional deadline, dispatch token and optional reply channel.
+    returns:
+      type: "()"
+      description: None; the outcome arrives on req.reply.
+
+  # ── resweep ──────────────────────────────────────────────────────────
+  - name: next_resweep_record
+    module: daemonseed_veilid_net::resweep
+    description: >-
+      Pick the record a steady-state resweep tick sweeps next: the smallest identity
+      strictly greater than `last`, wrapping to the smallest when `last` is None, is the
+      largest, or has left the set. Selection is key-based rather than index-based, so a
+      record joining or leaving between ticks is never skipped. Every identity in one
+      caller's set must be the same kind of identity — an owner seed or an owner public
+      key, never a mix, since a cursor cannot order across the two.
+    signature: "pub fn next_resweep_record(records: &mut Vec<[u8; 32]>, last: Option<[u8; 32]>) -> Option<[u8; 32]>"
+    parameters:
+      - name: records
+        type: "&mut Vec<[u8; 32]>"
+        direction: in
+        description: The currently subscribed record identities. Sorted and deduplicated in place, so traversal order is stable across ticks whatever the caller's insertion order.
+      - name: last
+        type: "Option<[u8; 32]>"
+        direction: in
+        description: The identity swept on the previous tick, or None to start at the smallest.
+    returns:
+      type: "Option<[u8; 32]>"
+      description: The identity to sweep on this tick, or None when the set is empty.
 
 # ─────────────────────────────────────────────────────────────────────
 # Error types
@@ -2321,6 +2473,46 @@ constants:
     type: usize
     value: "4"
     description: Per-download in-flight file cap (bookkeeping, not route protection).
+  - name: DHT_GATE_PERMITS
+    module: daemonseed_veilid_net::dht_gate
+    type: usize
+    value: "16"
+    description: veilid's process-global DHT-operation gate size (its `network.dht.max_concurrent_operations` default). A stock build does not change it.
+  - name: DHT_GATE_MARGIN
+    module: daemonseed_veilid_net::dht_gate
+    type: usize
+    value: "2"
+    description: Headroom kept below veilid's gate for daemonseed's un-gated DHT ops (open_dht_record, watch_dht_values). It also sizes DhtGate's un-gated-op limiter, which bounds their peak concurrency to this number.
+  - name: DHT_BUDGET
+    module: daemonseed_veilid_net::dht_gate
+    type: usize
+    value: "DHT_GATE_PERMITS - DHT_GATE_MARGIN"
+    description: daemonseed's self-imposed combined chat + floor + window + read in-flight DHT-op budget, 14 at the current margin. The four pool sizes sum to exactly this.
+  - name: CHAT_PERMITS
+    module: daemonseed_veilid_net::dht_gate
+    type: usize
+    value: "2"
+    description: Chat-lane pool size — two cross-record chat writes proceed in parallel; a third queues behind chat alone, never behind a non-chat lane.
+  - name: FLOOR_PERMITS
+    module: daemonseed_veilid_net::dht_gate
+    type: usize
+    value: "1"
+    description: Floor-lane pool size — the starvation-floor and deadline lane's single additional guaranteed write slot, so saturated aggregate write concurrency is W_MAX + 1.
+  - name: W_MAX
+    module: daemonseed_veilid_net::dht_gate
+    type: usize
+    value: "2"
+    description: The non-chat window pool size — the ceiling on concurrent non-chat window-lane writes. Raising it is a static re-construction of the gate at the new value, never a live re-partition.
+  - name: READ_PERMITS
+    module: daemonseed_veilid_net::dht_gate
+    type: usize
+    value: "DHT_BUDGET - CHAT_PERMITS - FLOOR_PERMITS - W_MAX"
+    description: Read-lane pool size — the residual of the budget after the other three pools, 9 at the current W_MAX. A sweep holds one read permit per get_dht_value, so read occupancy stays within it whatever the live sweep count.
+  - name: R_MIN
+    module: daemonseed_veilid_net::dht_gate
+    type: usize
+    value: "6"
+    description: The read-partition floor. READ_PERMITS may not fall below it, which caps W_MAX at 5. A compile-time assertion block checks this alongside the partition sum.
   - name: ROUTE_ADVERT_DOMAIN
     module: daemonseed_veilid_net::discovery
     type: "&[u8]"
