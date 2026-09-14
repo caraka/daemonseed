@@ -194,15 +194,7 @@ fn run(
         App::new()
     };
     while !app.should_quit() {
-        // (#235 / #279) The frame reports which direct-message rows it painted,
-        // and the surfacing answers for those and nothing else. After the draw
-        // and not before: the driver's flag is durable precisely so a crash
-        // between the two re-offers the state. A frame an overlay covered
-        // reports nothing, which `ui::render` decides, because that is where the
-        // overlays are drawn.
-        let mut report = ui::RenderReport::default();
-        terminal.draw(|frame| report = ui::render(&app, frame))?;
-        app.dm_thread_drawn(&report.painted_dm_seqs);
+        terminal.draw(|frame| ui::render(&app, frame))?;
 
         // Drain network events into UI state (non-blocking).
         for event in net.drain_events() {
@@ -227,16 +219,9 @@ fn run(
             // (#156) Derive the share-root IKM once here too (same derivation) so
             // the veilid actor derives a receiver-verifiable share_id on publish.
             let stable_share_root_ikm = app.stable_share_root_ikm();
-            // (#232) Derive the stable KEM encapsulation key so the actor can publish
-            // the DM key record that makes this identity reachable for direct
-            // messages. Public half only; wrapped for the Clone+Debug command enum.
-            let stable_kem_encapsulation_key = app
-                .stable_kem_encapsulation_key()
-                .map(|k| daemonseed_tui::net::StableKemEncapsulationKey(std::sync::Arc::new(k)));
-            // (#339) Derive the DM driver's own halves — the FULL KEM keypair,
-            // the doorbell slot secret and the profile at-rest key — for the
-            // driver the actor spawns beside itself. `None` before Unlock or on
-            // the ephemeral path, where no driver is spawned.
+            // The direct-messaging runner's halves: the signing keypair, the
+            // channel root and the profile at-rest key. `None` before Unlock,
+            // where no runner is started.
             let dm_session_keys = app.dm_session_keys();
             let _ = net.send(NetCommand::Connect {
                 server_id: req.server_id,
@@ -244,7 +229,6 @@ fn run(
                 trusted: req.trusted,
                 stable_signing_key,
                 stable_share_root_ikm,
-                stable_kem_encapsulation_key,
                 dm_session_keys,
                 // (step 8b-2 / DL-ISC-20) Hand the profile root to the actor so a
                 // verified resume anchors each fetch's manifest digest in the
@@ -302,10 +286,13 @@ fn run(
         if let Some((topic, body)) = app.take_pending_upload_announcement() {
             let _ = net.send(NetCommand::UploadAnnouncement { topic, body });
         }
-        // (#236) Answers to contact requests, forwarded verbatim to the DM
-        // driver. Each is queued by one keypress in the direct-message pane.
+        // Direct-messaging commands, forwarded to the runner in the order they
+        // were queued.
         for cmd in app.take_pending_dm() {
             let _ = net.send(NetCommand::Dm(cmd));
+        }
+        if app.take_pending_dm_stop() {
+            let _ = net.send(NetCommand::StopDm);
         }
         if app.take_pending_deprecation_refresh() {
             let _ = net.send(NetCommand::RefreshDeprecation);

@@ -1001,6 +1001,11 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-core`: `dm::block_list::BlockList::suppresses_knock`. A caller asks `is_blocked` with the
   sender's identity key.
 
+- `daemonseed-tui`: the key-record publish and reseed, `net::StableKemEncapsulationKey`,
+  `NetCommand::Connect::stable_kem_encapsulation_key`, `App::stable_kem_encapsulation_key`,
+  `App::dm_thread_drawn`, `ui::RenderReport`, and the DM driver session (`DmDriver`, `DmPersist`
+  under `profile_root/dm`).
+
 - `daemonseed-core`: `TrustEventKey::ConnectionRateLimited` and
   `TrustEventKey::ConnectionRateLimitedExhausted`, their `class_of` and stable-string entries, and
   the `daemonseed-tui` toast that rendered the first as "server busy — backing off". Neither key has
@@ -1503,6 +1508,24 @@ work lives in the maintainer's own planning notes, not here.
 
 - The release profile panics on integer overflow (`[profile.release]
   overflow-checks = true`), workspace-wide. (#258)
+
+- `daemonseed-tui`: direct messaging runs on `dm::runner`. `NetCommand::Dm` carries a `RunnerCommand`
+  and `NetEvent::Dm` an `Arc<RunnerEvent>`; `NetEvent::DmStopped` is added. `DmSessionKeys` holds
+  `signing`, `dm_channel_root` and `at_rest_key`. A connect with a started node starts a runner over
+  `VeilidNetHandle::dm_records_parts`. Connect, `NetCommand::StopDm` (sent on disconnect) and
+  `GracefulClose` replace the runner in a spawned task that awaits the previous runner's task end
+  before the next starts. The pane lists nothing while no runner reports, and draws one health line
+  while the runner reports failures. Accept opens an editable reply pre-filled with
+  `DM_ACCEPT_REPLY`, restored with the reason when refused; decline hides the sender for the run;
+  block sends `RunnerCommand::Block` and marks the sender as blocking until `RunnerEvent::BlockList`
+  lists it or a refusal clears it; an identity reads blocked only once that list names it.
+  `RunnerEvent::BlockListUnreadable` shows `DM_BLOCK_LIST_UNREADABLE` in the pane and on the status
+  line until the next `BlockList`, and marks conversations not in the last list read as of unknown
+  block state. Sent messages
+  read composed, sent or delivered, and not sent when the runner stops; received messages show their
+  received time in UTC.
+  `RunnerEvent::StartedOver` folds `TrustEventKey::DmCorrespondentStateLost`. `ui::render` returns
+  `()`.
 
 ### Changed
 
