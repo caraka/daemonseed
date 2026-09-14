@@ -852,9 +852,10 @@ impl AdvertKeys {
     /// the canonical encoding; otherwise nothing. `fetched` is `None` when
     /// the poll read no bytes back, which the report alone then settles.
     ///
-    /// The decision is taken before anything is signed: a poll that finds the
-    /// record intact and read nothing back performs no ML-DSA operation at
-    /// all, which is most polls.
+    /// The decision is taken before anything is signed only where `fetched` is
+    /// `None`: a poll that finds the record intact and read nothing back
+    /// performs no ML-DSA operation, while a poll that passes `fetched` signs
+    /// once to compare it with the canonical encoding.
     pub fn on_poll(
         &self,
         signer: &SignKeypair,

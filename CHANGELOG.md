@@ -66,6 +66,10 @@ work lives in the maintainer's own planning notes, not here.
   `RunnerRecords::same_local_refusal` and `RecordFailure` added.
 - `daemonseed-veilid-net`: `VeilidNetError::TimedOut` and `VeilidNetError::Local` added; `RecordsError` gains
   `ChannelNotOpened`, `SubkeyCount` and `OwnerKey`.
+- `daemonseed-veilid-net`: the runner's advert poll compares the advert bytes this node reads back, its local
+  copy, with the current key's advert and republishes where they differ, and records each confirmed
+  publication (a rewrite the network took, or matching sequence numbers with the current key's bytes) with
+  `Store::mark_advert_published`, so a reset's rotated key reaches the network and a later reset rotates again.
 - `daemonseed-veilid-net`: `rendezvous::inspect_sync_set` refuses a report that does not start at subkey 0.
 - `daemonseed-veilid-net`: the `two_node_dm_async` oracle's six step bodies drive `dm::flows`
   — `first_contact`, `collect`, `accept`, `send_message`, `collect_batch`, `peer_cursor`,

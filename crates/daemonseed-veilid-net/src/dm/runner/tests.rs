@@ -207,6 +207,8 @@ struct Faults {
     scan_failure: Option<RecordError>,
     /// Fail the next read of this drop slot as the fault says, then forget it.
     fail_drop_slot_read: Option<(u16, Fault)>,
+    /// Write every advert publish to the network, then report it refused.
+    refuse_after_advert_write: bool,
     /// Writes attempted since the counter was last reset.
     writes: usize,
     /// Refuse the write with this 1-based index.
@@ -526,7 +528,11 @@ impl RunnerRecords for Fake {
         bytes: &[u8],
     ) -> Result<(), RecordError> {
         self.count(|calls| calls.advert_publishes += 1);
-        self.write((ADVERT, *owner.as_bytes(), 0), bytes.to_vec())
+        self.write((ADVERT, *owner.as_bytes(), 0), bytes.to_vec())?;
+        if self.faults().refuse_after_advert_write {
+            return Err(RecordError::new(Refused));
+        }
+        Ok(())
     }
 
     fn erase_channel(
@@ -1560,6 +1566,349 @@ async fn an_outstanding_hello_is_rewritten_only_where_its_slot_differs() {
         "a drop seen while the network does not answer is not rewritten"
     );
     assert!(health(&aw.seen[at]).network_not_answering >= 1);
+    assert!(finished(&aw.stop().await));
+}
+
+/// The advert keys `profile`'s store holds.
+fn stored_advert_keys(profile: &Profile) -> AdvertKeys {
+    let store = Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("the store opens");
+    AdvertKeys::restore(
+        store
+            .load_advert_keys()
+            .expect("the advert keys read")
+            .expect("the advert keys exist"),
+    )
+}
+
+/// Run a reset over `profile`'s store, as its owner would: between runs, or
+/// while a runner holds the same profile.
+fn reset_between_runs(profile: &Profile) {
+    let store = Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("the store opens");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_secs();
+    flows::reset(&store, os_fill, now).expect("the reset runs");
+}
+
+/// The advert bytes the network holds for `profile`.
+fn published_advert(dht: &Arc<Mutex<Dht>>, profile: &Profile) -> Option<Vec<u8>> {
+    dht.lock()
+        .expect("the network lock")
+        .records
+        .get(&profile.advert_key())
+        .map(|(bytes, _)| bytes.clone())
+}
+
+/// A reset rotates the advert keys in the store, and the next advert poll finds
+/// the network still holding the advert of the key rotated away: its numbers
+/// match, its bytes do not. The poll publishes the rotated advert and records it
+/// as published, so a later reset rotates again, while a reset repeated before
+/// any poll publishes the rotated key does not.
+#[tokio::test(start_paused = true)]
+async fn a_reset_advert_is_published_by_the_next_poll_so_a_later_reset_rotates() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    assert!(finished(&aw.stop().await));
+    let minted = stored_advert_keys(&a);
+    assert_eq!(
+        published_advert(&dht, &a),
+        Some(
+            minted
+                .advert_bytes(&a.keys().signing)
+                .expect("the minted advert signs")
+        ),
+        "the minted advert is on the network"
+    );
+
+    reset_between_runs(&a);
+    let rotated = stored_advert_keys(&a);
+    assert_eq!(
+        rotated.serial(),
+        minted.serial() + 1,
+        "the minted advert was recorded as published, so the reset rotates"
+    );
+    let relaunched = a_fake.restart();
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    assert!(finished(&aw.stop().await));
+    assert_eq!(
+        relaunched.calls().advert_publishes,
+        1,
+        "the rotated advert is published once"
+    );
+    assert_eq!(
+        published_advert(&dht, &a),
+        Some(
+            rotated
+                .advert_bytes(&a.keys().signing)
+                .expect("the rotated advert signs")
+        ),
+        "the network holds the rotated advert"
+    );
+
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        rotated.serial() + 1,
+        "the rotated advert was recorded as published, so a second reset rotates again"
+    );
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        rotated.serial() + 1,
+        "a reset before the newly rotated key is published does not rotate again"
+    );
+}
+
+/// A profile whose advert reached the network without being recorded as
+/// published, here a publish that landed but reported a failure, is recorded as
+/// published by the first poll that finds that advert intact, and a reset after
+/// that poll rotates. Before it, a reset does not.
+#[tokio::test(start_paused = true)]
+async fn an_intact_advert_found_by_a_poll_is_recorded_as_published() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    a_fake.faults().refuse_after_advert_write = true;
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    let at = aw.wait_for("A's startup", is_health).await;
+    assert_eq!(
+        health(&aw.seen[at]).advert_write_failures,
+        1,
+        "the publish reported a failure"
+    );
+    assert!(finished(&aw.stop().await));
+    let minted = stored_advert_keys(&a);
+    assert_eq!(
+        published_advert(&dht, &a),
+        Some(
+            minted
+                .advert_bytes(&a.keys().signing)
+                .expect("the minted advert signs")
+        ),
+        "the advert reached the network all the same"
+    );
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        minted.serial(),
+        "an advert never recorded as published is not rotated away"
+    );
+
+    let relaunched = a_fake.restart();
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    assert!(finished(&aw.stop().await));
+    assert_eq!(
+        relaunched.calls().advert_publishes,
+        0,
+        "the intact advert is not rewritten"
+    );
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        minted.serial() + 1,
+        "the intact advert the poll found was recorded as published, so the reset rotates"
+    );
+}
+
+/// A reset made while the runner runs is published by the runner's own
+/// scheduled advert poll, byte for byte, and recorded as published, with no
+/// relaunch: the poll reloads the rotated keys from the store.
+#[tokio::test(start_paused = true)]
+async fn a_reset_made_while_running_is_published_by_the_scheduled_poll() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    let minted = stored_advert_keys(&a);
+    reset_between_runs(&a);
+    let rotated = stored_advert_keys(&a);
+    assert_eq!(
+        rotated.serial(),
+        minted.serial() + 1,
+        "the reset rotates the keys in the store the runner holds"
+    );
+    let publishes_before = a_fake.calls().advert_publishes;
+    tokio::time::sleep(advert::POLL_INTERVAL_MAX + Duration::from_secs(60)).await;
+    assert_eq!(
+        a_fake.calls().advert_publishes,
+        publishes_before + 1,
+        "the scheduled poll publishes the rotated advert once"
+    );
+    assert_eq!(
+        published_advert(&dht, &a),
+        Some(
+            rotated
+                .advert_bytes(&a.keys().signing)
+                .expect("the rotated advert signs")
+        ),
+        "the network holds the rotated advert, byte for byte"
+    );
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        rotated.serial() + 1,
+        "the scheduled poll recorded the rotated advert as published"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A poll that must replace a rotated-away key's advert and has its rewrite
+/// refused records nothing as published: that advert stays on the network, and a
+/// reset after that poll does not rotate again.
+#[tokio::test(start_paused = true)]
+async fn a_refused_rewrite_of_an_old_advert_records_nothing() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    assert!(finished(&aw.stop().await));
+    let minted = stored_advert_keys(&a);
+    reset_between_runs(&a);
+    let rotated = stored_advert_keys(&a);
+    assert_eq!(rotated.serial(), minted.serial() + 1);
+
+    let relaunched = a_fake.restart();
+    relaunched
+        .faults()
+        .plan
+        .push((ADVERT, Op::Write, Fault::Refused));
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    assert_eq!(
+        health(&aw.seen[at]).advert_write_failures,
+        1,
+        "the rewrite was refused"
+    );
+    assert!(finished(&aw.stop().await));
+    assert_eq!(
+        published_advert(&dht, &a),
+        Some(
+            minted
+                .advert_bytes(&a.keys().signing)
+                .expect("the minted advert signs")
+        ),
+        "the rotated-away key's advert is still what the network holds"
+    );
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        rotated.serial(),
+        "nothing was recorded as published, so the reset does not rotate again"
+    );
+}
+
+/// An advert poll whose read of the advert fails counts that failure once and
+/// decides from the numbers alone: where they match it neither rewrites nor
+/// records anything as published, and where the network holds no number it
+/// rewrites the advert as the numbers say.
+#[tokio::test(start_paused = true)]
+async fn a_failed_advert_read_leaves_the_decision_to_the_numbers() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    a_fake.faults().refuse_after_advert_write = true;
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    assert!(finished(&aw.stop().await));
+    let minted = stored_advert_keys(&a);
+
+    let matching = a_fake.restart();
+    matching
+        .faults()
+        .plan
+        .push((ADVERT, Op::Read, Fault::Refused));
+    let mut aw = a.spawn(&matching, RunnerConfig::default());
+    let at = aw
+        .wait_for("the relaunch with matching numbers", is_health)
+        .await;
+    assert_eq!(
+        health(&aw.seen[at]).advert_read_failures,
+        1,
+        "the failed read is counted once"
+    );
+    assert!(finished(&aw.stop().await));
+    assert_eq!(
+        matching.calls().advert_publishes,
+        0,
+        "matching numbers and no bytes: no rewrite"
+    );
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        minted.serial(),
+        "a poll that read no bytes records nothing as published"
+    );
+
+    a_fake.net().evict(a.advert_key());
+    let lost = a_fake.restart();
+    lost.faults().plan.push((ADVERT, Op::Read, Fault::Refused));
+    let mut aw = a.spawn(&lost, RunnerConfig::default());
+    let at = aw
+        .wait_for("the relaunch with the advert lost", is_health)
+        .await;
+    assert_eq!(
+        health(&aw.seen[at]).advert_read_failures,
+        1,
+        "the failed read is counted once"
+    );
+    assert!(finished(&aw.stop().await));
+    assert_eq!(
+        lost.calls().advert_publishes,
+        1,
+        "the network holds no number, so the advert is rewritten"
+    );
+    assert_eq!(
+        published_advert(&dht, &a),
+        Some(
+            minted
+                .advert_bytes(&a.keys().signing)
+                .expect("the minted advert signs")
+        ),
+        "the current key's advert is back on the network"
+    );
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        minted.serial() + 1,
+        "the rewrite the network took was recorded as published"
+    );
+}
+
+/// An advert poll that finds the network holding the current key's advert, bytes
+/// and numbers both, writes nothing: at a relaunch, and at the schedule's own
+/// polls after it.
+#[tokio::test(start_paused = true)]
+async fn an_intact_advert_of_the_current_key_is_not_rewritten() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    assert!(finished(&aw.stop().await));
+
+    let relaunched = a_fake.restart();
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    tokio::time::sleep(advert::POLL_INTERVAL_MAX * 2 + Duration::from_secs(60)).await;
+    assert!(
+        relaunched.calls().inspect_advert >= 3,
+        "the relaunch and two later polls inspected the advert"
+    );
+    assert_eq!(
+        relaunched.calls().advert_publishes,
+        0,
+        "an intact advert is not rewritten"
+    );
     assert!(finished(&aw.stop().await));
 }
 

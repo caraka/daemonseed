@@ -33,7 +33,14 @@
 //!   what is left undone that startup takes, preceded by a drop scan for a
 //!   conversation still awaiting acceptance.
 //! - **Advert**, on § Write budget's 40 to 60 minute band: the weekly rotation,
-//!   and a rewrite where the network's copy is missing or differs.
+//!   the advert keys reloaded from the store, so a reset's rotation is seen, and
+//!   a rewrite where the network holds no number for the record, where this
+//!   node's number and the network's differ, or where the bytes this node reads
+//!   back are not the current key's advert. That read is served from this node's
+//!   local copy, and the matching numbers are what tie that copy to the network.
+//!   Each rewrite the network takes, and each poll whose numbers match and whose
+//!   bytes are the current key's advert, is recorded as the published advert,
+//!   which a later reset rotates past.
 //!
 //! The schedule reads [`tokio::time`], so a paused test clock drives it, and the
 //! wall-clock time the flows and events see advances with it.
@@ -44,7 +51,9 @@
 //! node's sequence number beside the network's. A channel subkey, which only
 //! its owner writes, is rewritten where the network holds nothing or holds an
 //! older number. A drop slot or an advert, which anyone may write, is
-//! rewritten where the two numbers differ at all. An outstanding hello is also
+//! rewritten where the two numbers differ at all, and an advert also where the
+//! bytes this node reads back for it, which are its local copy, are not the
+//! current key's advert. An outstanding hello is also
 //! rewritten where this node's copy of its slot holds bytes other than the
 //! hello the store holds. A subkey Veilid still has queued for its flush is
 //! never rewritten.
@@ -1747,6 +1756,8 @@ impl<R: RunnerRecords> Runner<R> {
                 .update_advert_keys(|keys| keys.rotate_if_due(now, os_fill))
             {
                 Ok(Ok(rotation)) => {
+                    // A reload that fails leaves the keys last loaded, which at
+                    // worst republishes and re-marks a key already published.
                     match self.store.load_advert_keys() {
                         Ok(Some(snapshot)) => self.advert_keys = AdvertKeys::restore(snapshot),
                         Ok(None) | Err(_) => self.records.health.store_failures += 1,
@@ -1766,12 +1777,32 @@ impl<R: RunnerRecords> Runner<R> {
                             local_seq: report.local_seq,
                             network_seq: report.network_seq,
                         };
-                        match self.advert_keys.on_poll(&self.signer, &observed, None) {
+                        // The bytes, not only the numbers: a record whose numbers
+                        // match can still hold an advert of a key a reset has
+                        // since rotated away. A read that fails leaves the report
+                        // to decide.
+                        let fetched = self
+                            .records
+                            .read_advert(&owner, advert::ADVERT_SUBKEYS)
+                            .ok()
+                            .flatten();
+                        match self
+                            .advert_keys
+                            .on_poll(&self.signer, &observed, fetched.as_deref())
+                        {
                             Ok(actions) => {
                                 rewrite = actions
                                     .into_iter()
                                     .next()
-                                    .map(|AdvertAction::Rewrite(bytes)| bytes)
+                                    .map(|AdvertAction::Rewrite(bytes)| bytes);
+                                // With bytes to compare, no rewrite means the
+                                // network holds the current key's advert: it is
+                                // confirmed published. The mark only moves forward,
+                                // so marking again on each intact poll changes
+                                // nothing.
+                                if rewrite.is_none() && fetched.is_some() {
+                                    self.mark_advert_published();
+                                }
                             }
                             Err(_) => self.records.health.advert_failures += 1,
                         }
@@ -1783,7 +1814,21 @@ impl<R: RunnerRecords> Runner<R> {
             if self.stopping() {
                 return;
             }
-            let _ = self.records.publish_advert(&owner, &bytes);
+            if self.records.publish_advert(&owner, &bytes).is_ok() {
+                self.mark_advert_published();
+            }
+        }
+    }
+
+    /// Record the current advert key as confirmed published, which is what lets
+    /// a reset rotate past it. The store refuses a serial above its own current
+    /// key's, which names no advert this profile built; that is counted as a
+    /// local refusal.
+    fn mark_advert_published(&mut self) {
+        match self.store.mark_advert_published(self.advert_keys.serial()) {
+            Ok(()) => {}
+            Err(StoreError::UnbuiltAdvertSerial { .. }) => self.records.health.local_refusals += 1,
+            Err(_) => self.records.health.store_failures += 1,
         }
     }
 
