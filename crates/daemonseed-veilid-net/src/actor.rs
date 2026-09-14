@@ -3398,6 +3398,37 @@ async fn publish_dm_key_record(
     rendezvous::publish_at_subkey(rc, &handle, &owner, DM_KEY_RECORD_SUBKEY, record).await
 }
 
+/// The error of a read the bounded read lane wraps, which that lane can tell
+/// apart as running out of time.
+pub(crate) trait ReadError: std::fmt::Display {
+    /// How this error failed the read.
+    fn failure(&self) -> crate::error::VeilidFailure;
+}
+
+impl ReadError for veilid_core::VeilidAPIError {
+    /// As [`crate::error::veilid_failure`] classes Veilid's variants.
+    fn failure(&self) -> crate::error::VeilidFailure {
+        crate::error::veilid_failure(self)
+    }
+}
+
+impl ReadError for VeilidNetError {
+    fn failure(&self) -> crate::error::VeilidFailure {
+        match self {
+            VeilidNetError::TimedOut(_) => crate::error::VeilidFailure::TimedOut,
+            VeilidNetError::Local(_) => crate::error::VeilidFailure::Local,
+            _ => crate::error::VeilidFailure::Refused,
+        }
+    }
+}
+
+impl ReadError for String {
+    /// A message carries no kind, so it is a refusal.
+    fn failure(&self) -> crate::error::VeilidFailure {
+        crate::error::VeilidFailure::Refused
+    }
+}
+
 /// Run one read-lane GET under a read permit, bounded by
 /// [`rendezvous::SWEEP_GET_TIMEOUT`] (#411).
 ///
@@ -3408,11 +3439,15 @@ async fn publish_dm_key_record(
 /// read cannot hold a read-pool slot past the bound and later readers are not queued
 /// behind it for ever.
 ///
-/// A read cut off at the bound is reported as [`VeilidNetError::Routing`], the same
-/// transport failure an erroring GET produces. Both say the same thing to a caller —
-/// the read did not deliver an answer and the record's state is unknown — and both
-/// stay distinct from `Ok(None)`, which is the authoritative *empty slot*.
-pub(crate) async fn gated_bounded_get<T, E: std::fmt::Display>(
+/// A read cut off at the bound, and a read Veilid itself answers with `Timeout`,
+/// is [`VeilidNetError::TimedOut`]; a read refused before it left this node is
+/// [`VeilidNetError::Local`]; any other erroring GET is
+/// [`VeilidNetError::Routing`]. Both say the read did not deliver an answer and
+/// the record's state is unknown, and both stay distinct from `Ok(None)`, which
+/// is the authoritative *empty slot*. They are told apart here, where the typed
+/// error is still in hand, so a caller counting failures can count a timeout as
+/// one.
+pub(crate) async fn gated_bounded_get<T, E: ReadError>(
     gate: &Arc<DhtGate>,
     what: &str,
     get: impl std::future::Future<Output = std::result::Result<T, E>>,
@@ -3423,8 +3458,14 @@ pub(crate) async fn gated_bounded_get<T, E: std::fmt::Display>(
     };
     match got {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(VeilidNetError::Routing(e.to_string())),
-        Err(_elapsed) => Err(VeilidNetError::Routing(format!(
+        Ok(Err(e)) => Err(match e.failure() {
+            crate::error::VeilidFailure::TimedOut => {
+                VeilidNetError::TimedOut(format!("{what}: {e}"))
+            }
+            crate::error::VeilidFailure::Local => VeilidNetError::Local(format!("{what}: {e}")),
+            crate::error::VeilidFailure::Refused => VeilidNetError::Routing(e.to_string()),
+        }),
+        Err(_elapsed) => Err(VeilidNetError::TimedOut(format!(
             "{what}: GET exceeded {}s, abandoned",
             rendezvous::SWEEP_GET_TIMEOUT.as_secs()
         ))),
@@ -7733,9 +7774,8 @@ mod tests {
     /// read for the process's lifetime. The read pool is sized to ONE permit, so the
     /// later acquire can only succeed by the wedged read having given its permit back.
     ///
-    /// The abandoned read surfaces as [`VeilidNetError::Routing`] — the transport
-    /// failure the fetch callers already handle — and never as `Ok(None)`, which would
-    /// report an unread slot as an authoritative empty one.
+    /// The abandoned read surfaces as [`VeilidNetError::TimedOut`] and never as
+    /// `Ok(None)`, which would report an unread slot as an authoritative empty one.
     ///
     /// This exercises [`gated_bounded_get`], the bounded read both DM fetch paths go
     /// through; the fetch functions themselves need a live `RoutingContext` to reach
@@ -7794,9 +7834,8 @@ mod tests {
             .expect("the wedged read's task finished")
             .expect_err("an abandoned read is a failure, never an empty slot");
         assert!(
-            matches!(err, VeilidNetError::Routing(_)),
-            "an abandoned read is reported as the existing transport failure, not a \
-             new error class: {err:?}"
+            matches!(err, VeilidNetError::TimedOut(ref text) if text.contains("abandoned")),
+            "an abandoned read is reported as running out of time: {err:?}"
         );
         drop(later_read);
     }
@@ -7842,6 +7881,36 @@ mod tests {
             gate.available_read(),
             1,
             "an erroring read gives its permit back"
+        );
+
+        let err = gated_bounded_get(&gate, "fetch_dm_ack", async {
+            Err::<Option<Vec<u8>>, _>(veilid_core::VeilidAPIError::Timeout)
+        })
+        .await
+        .expect_err("a read Veilid answers with Timeout is a failure");
+        assert!(
+            matches!(err, VeilidNetError::TimedOut(ref text) if text.contains("fetch_dm_ack")),
+            "a read Veilid answers with Timeout is reported as running out of time: {err:?}"
+        );
+        let err = gated_bounded_get(&gate, "fetch_dm_ack", async {
+            Err::<Option<Vec<u8>>, _>(veilid_core::VeilidAPIError::TryAgain {
+                message: "offline".to_owned(),
+            })
+        })
+        .await
+        .expect_err("a read Veilid refuses is a failure");
+        assert!(
+            matches!(err, VeilidNetError::Routing(_)),
+            "a read Veilid refuses for any other reason is not a timeout: {err:?}"
+        );
+        let err = gated_bounded_get(&gate, "fetch_dm_ack", async {
+            Err::<Option<Vec<u8>>, _>(veilid_core::VeilidAPIError::Shutdown)
+        })
+        .await
+        .expect_err("a read Veilid refuses while shutting down is a failure");
+        assert!(
+            matches!(err, VeilidNetError::Local(ref text) if text.contains("fetch_dm_ack")),
+            "a read Veilid refuses before sending it is a local refusal: {err:?}"
         );
     }
 

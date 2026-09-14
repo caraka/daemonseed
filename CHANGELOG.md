@@ -61,6 +61,11 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-veilid-net`: `dm::runner::RunnerRecords` and `SubkeyReport` added; `VeilidRecords` implements
   `RunnerRecords` (`inspect_channel`, `inspect_advert`, `inspect_drop`).
 - `daemonseed-veilid-net`: `RunnerParts::over_veilid` added.
+- `daemonseed-veilid-net`: `HealthCounters` gains a `_timeouts` counter beside each record call's `_failures`
+  counter, and `local_refusals`; `RunnerRecords::classify`, `RunnerRecords::take_scan_failure`,
+  `RunnerRecords::same_local_refusal` and `RecordFailure` added.
+- `daemonseed-veilid-net`: `VeilidNetError::TimedOut` and `VeilidNetError::Local` added; `RecordsError` gains
+  `ChannelNotOpened`, `SubkeyCount` and `OwnerKey`.
 - `daemonseed-veilid-net`: `rendezvous::inspect_sync_set` refuses a report that does not start at subkey 0.
 - `daemonseed-veilid-net`: the `two_node_dm_async` oracle's six step bodies drive `dm::flows`
   — `first_contact`, `collect`, `accept`, `send_message`, `collect_batch`, `peer_cursor`,

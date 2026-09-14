@@ -61,7 +61,9 @@
 //! carries no count of the nodes it reached
 //! (`src/veilid_api/types/dht/dht_record_report.rs:13-23`), so the error is the
 //! only signal that the network was not asked: such an inspect writes nothing,
-//! and the inspect-failure counter for its record kind counts it.
+//! and its record kind's inspect counter counts it, the `_timeouts` one where
+//! [`RunnerRecords::classify`] says the call ran out of time and the
+//! `_failures` one where it was refused.
 //!
 //! A report with no network number on any subkey is also what a node that is
 //! attached but whose routing table is not yet warm gets, because its fanout
@@ -207,6 +209,48 @@ pub trait RunnerRecords: Records {
 
     /// How many writes of each kind this store has submitted.
     fn write_counts(&self) -> WriteCountsSnapshot;
+
+    /// How a failed call failed, which decides the [`HealthCounters`] field it
+    /// is counted in. A store that cannot tell reports every failure as
+    /// [`RecordFailure::Refused`].
+    fn classify(error: &RecordError) -> RecordFailure {
+        let _ = error;
+        RecordFailure::Refused
+    }
+
+    /// The failure of the drop inspect a scan takes before its first slot read,
+    /// if one failed since this was last asked. The slot read goes on without
+    /// the scan and reads every slot, so the failure is not the read's; the
+    /// runner counts it under the drop inspect counters. A store that takes no
+    /// such inspect has none.
+    fn take_scan_failure(&mut self) -> Option<RecordError> {
+        None
+    }
+
+    /// Whether a scan's failure and the failure of the slot read after it, both
+    /// [`RecordFailure::Local`], are the same local refusal, which is counted
+    /// once. A store that cannot tell answers `false`, and both are counted.
+    fn same_local_refusal(scan: &RecordError, read: &RecordError) -> bool {
+        let _ = (scan, read);
+        false
+    }
+}
+
+/// How a failed record store call failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordFailure {
+    /// The network or the transport refused the call.
+    Refused,
+    /// The call ran out of time.
+    TimedOut,
+    /// The call was refused before it reached the network: a write or an
+    /// erasure of a channel this process has not opened, a record address or
+    /// owner key that would not derive, a runtime the store cannot use, a record
+    /// a write's confirmation finds this node no longer holds, a write the
+    /// store's scheduler never took, or a call the transport refused before
+    /// sending it. Counted in [`HealthCounters::local_refusals`] and under no
+    /// record call's counter.
+    Local,
 }
 
 /// How a runner paces itself.
@@ -427,34 +471,67 @@ pub enum Refusal {
 /// Named failure and drop counters, since the runner started.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct HealthCounters {
-    /// Advert reads that failed.
+    /// Advert reads that failed for a reason other than running out of time.
     pub advert_read_failures: u64,
-    /// Advert inspects that failed.
+    /// Advert reads that ran out of time.
+    pub advert_read_timeouts: u64,
+    /// Advert inspects that failed for a reason other than running out of time.
     pub advert_inspect_failures: u64,
-    /// Advert writes that failed.
+    /// Advert inspects that ran out of time.
+    pub advert_inspect_timeouts: u64,
+    /// Advert writes that failed for a reason other than running out of time.
     pub advert_write_failures: u64,
+    /// Advert writes that ran out of time.
+    pub advert_write_timeouts: u64,
     /// Advert keys that would not derive, sign or decide a poll.
     pub advert_failures: u64,
     /// Records whose report held no network number on any subkey in a pass
-    /// where this node's own advert showed none either, so nothing was
-    /// rewritten.
+    /// where this node's own advert showed none either, or where the inspect of
+    /// that advert failed, so nothing was rewritten. A failed inspect is also
+    /// counted under its own advert inspect counter.
     pub network_not_answering: u64,
-    /// Drop slot reads that failed.
+    /// Drop slot reads that failed for a reason other than running out of time.
     pub drop_read_failures: u64,
-    /// Drop slot writes and erasures that failed.
+    /// Drop slot reads that ran out of time.
+    pub drop_read_timeouts: u64,
+    /// Drop slot writes and erasures that failed for a reason other than
+    /// running out of time.
     pub drop_write_failures: u64,
-    /// Drop inspects that failed.
+    /// Drop slot writes and erasures that ran out of time.
+    pub drop_write_timeouts: u64,
+    /// Drop inspects that failed for a reason other than running out of time,
+    /// including the one a scan takes before its first slot read.
     pub drop_inspect_failures: u64,
-    /// Channel opens that failed, or reopened a record other than the stored one.
+    /// Drop inspects that ran out of time, including the one a scan takes
+    /// before its first slot read.
+    pub drop_inspect_timeouts: u64,
+    /// Channel opens that failed for a reason other than running out of time,
+    /// or reopened a record other than the stored one.
     pub channel_open_failures: u64,
-    /// Channel subkey reads that failed.
+    /// Channel opens that ran out of time.
+    pub channel_open_timeouts: u64,
+    /// Channel subkey reads that failed for a reason other than running out of
+    /// time.
     pub channel_read_failures: u64,
-    /// Channel inspects that failed.
+    /// Channel subkey reads that ran out of time.
+    pub channel_read_timeouts: u64,
+    /// Channel inspects that failed for a reason other than running out of time.
     pub channel_inspect_failures: u64,
-    /// Channel subkey writes that failed.
+    /// Channel inspects that ran out of time.
+    pub channel_inspect_timeouts: u64,
+    /// Channel subkey writes that failed for a reason other than running out of
+    /// time.
     pub channel_write_failures: u64,
-    /// Channel erasures that failed.
+    /// Channel subkey writes that ran out of time.
+    pub channel_write_timeouts: u64,
+    /// Channel erasures that failed for a reason other than running out of time.
     pub channel_erase_failures: u64,
+    /// Channel erasures that ran out of time.
+    pub channel_erase_timeouts: u64,
+    /// Record store calls refused before they reached the network, as
+    /// [`RecordFailure::Local`] lists them. None is counted under a record
+    /// call's own counter.
+    pub local_refusals: u64,
     /// Hellos from a blocked identity, dropped.
     pub hellos_dropped: u64,
     /// Rewrites of a hello already collected, erased.
@@ -867,7 +944,10 @@ async fn run<R: RunnerRecords>(
         };
         let step = match wake {
             Wake::Command(None | Some(RunnerCommand::Shutdown)) => Err(Halt::Stopped),
-            Wake::Command(Some(command)) => runner.serve(command).await,
+            Wake::Command(Some(command)) => match runner.serve(command).await {
+                Ok(()) => runner.report_health().await,
+                halted => halted,
+            },
             Wake::Due => runner.run_due().await,
         };
         match step {
@@ -876,6 +956,10 @@ async fn run<R: RunnerRecords>(
             Err(Halt::Stopped) => break Ok(()),
         }
     };
+    // A counter the last command or pass moved is reported before the queue is
+    // answered, however the loop ended. A closed event stream has no reader to
+    // report to.
+    let _ = runner.report_health().await;
     runner.refuse_queued(&commands).await;
     result
 }
@@ -967,24 +1051,49 @@ impl Clock {
 struct Tracked<R> {
     inner: R,
     health: HealthCounters,
+    /// Drop slot reads that failed, however they failed, since the runner
+    /// started. A scan during which this rose left a slot unread, so it is
+    /// partial and must not drop the requests it did not see. The drop inspect a
+    /// scan takes is not a slot read and is not counted here: a scan whose
+    /// inspect failed reads every slot.
+    failed_drop_reads: u64,
 }
 
-/// `result`, having counted it against `counter` if it failed.
-fn count<T>(result: Result<T, RecordError>, counter: &mut u64) -> Result<T, RecordError> {
-    if result.is_err() {
-        *counter += 1;
+/// `result`, having counted it if it failed, as `classify` says it failed:
+/// against `failures` where it was refused, against `timeouts` where it ran out
+/// of time, and against [`HealthCounters::local_refusals`] where it never
+/// reached the network.
+fn tally<T>(
+    result: Result<T, RecordError>,
+    classify: fn(&RecordError) -> RecordFailure,
+    health: &mut HealthCounters,
+    failures: fn(&mut HealthCounters) -> &mut u64,
+    timeouts: fn(&mut HealthCounters) -> &mut u64,
+) -> Result<T, RecordError> {
+    if let Err(error) = &result {
+        match classify(error) {
+            RecordFailure::Refused => *failures(health) += 1,
+            RecordFailure::TimedOut => *timeouts(health) += 1,
+            RecordFailure::Local => health.local_refusals += 1,
+        }
     }
     result
 }
 
-impl<R: Records> Records for Tracked<R> {
+impl<R: RunnerRecords> Records for Tracked<R> {
     fn read_advert(
         &mut self,
         owner: &AdvertOwnerSeed,
         subkeys: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
         let result = self.inner.read_advert(owner, subkeys);
-        count(result, &mut self.health.advert_read_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.advert_read_failures,
+            |h| &mut h.advert_read_timeouts,
+        )
     }
 
     fn read_drop_slot(
@@ -994,7 +1103,32 @@ impl<R: Records> Records for Tracked<R> {
         slot: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
         let result = self.inner.read_drop_slot(owner, subkeys, slot);
-        count(result, &mut self.health.drop_read_failures)
+        if result.is_err() {
+            self.failed_drop_reads += 1;
+        }
+        if let Some(scan) = self.inner.take_scan_failure() {
+            // A scan refused locally is followed by its read refusing for the
+            // same local reason: that is one refusal, counted with the read.
+            let one_local_refusal = R::classify(&scan) == RecordFailure::Local
+                && matches!(&result, Err(read) if R::classify(read) == RecordFailure::Local
+                    && R::same_local_refusal(&scan, read));
+            if !one_local_refusal {
+                let _ = tally::<()>(
+                    Err(scan),
+                    R::classify,
+                    &mut self.health,
+                    |h| &mut h.drop_inspect_failures,
+                    |h| &mut h.drop_inspect_timeouts,
+                );
+            }
+        }
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.drop_read_failures,
+            |h| &mut h.drop_read_timeouts,
+        )
     }
 
     fn write_drop_slot(
@@ -1005,7 +1139,13 @@ impl<R: Records> Records for Tracked<R> {
         bytes: &[u8],
     ) -> Result<(), RecordError> {
         let result = self.inner.write_drop_slot(owner, subkeys, slot, bytes);
-        count(result, &mut self.health.drop_write_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.drop_write_failures,
+            |h| &mut h.drop_write_timeouts,
+        )
     }
 
     fn erase_drop_slot(
@@ -1015,7 +1155,13 @@ impl<R: Records> Records for Tracked<R> {
         slot: u16,
     ) -> Result<(), RecordError> {
         let result = self.inner.erase_drop_slot(owner, subkeys, slot);
-        count(result, &mut self.health.drop_write_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.drop_write_failures,
+            |h| &mut h.drop_write_timeouts,
+        )
     }
 
     fn open_channel(
@@ -1024,7 +1170,13 @@ impl<R: Records> Records for Tracked<R> {
         subkeys: u16,
     ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
         let result = self.inner.open_channel(owner, subkeys);
-        count(result, &mut self.health.channel_open_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.channel_open_failures,
+            |h| &mut h.channel_open_timeouts,
+        )
     }
 
     fn read_channel(
@@ -1033,7 +1185,13 @@ impl<R: Records> Records for Tracked<R> {
         subkey: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
         let result = self.inner.read_channel(lookup_key, subkey);
-        count(result, &mut self.health.channel_read_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.channel_read_failures,
+            |h| &mut h.channel_read_timeouts,
+        )
     }
 
     fn write_channel(
@@ -1043,7 +1201,13 @@ impl<R: Records> Records for Tracked<R> {
         bytes: &[u8],
     ) -> Result<(), RecordError> {
         let result = self.inner.write_channel(lookup_key, subkey, bytes);
-        count(result, &mut self.health.channel_write_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.channel_write_failures,
+            |h| &mut h.channel_write_timeouts,
+        )
     }
 }
 
@@ -1053,7 +1217,13 @@ impl<R: RunnerRecords> Tracked<R> {
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> Result<Vec<SubkeyReport>, RecordError> {
         let result = self.inner.inspect_channel(lookup_key);
-        count(result, &mut self.health.channel_inspect_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.channel_inspect_failures,
+            |h| &mut h.channel_inspect_timeouts,
+        )
     }
 
     fn inspect_advert(
@@ -1061,19 +1231,37 @@ impl<R: RunnerRecords> Tracked<R> {
         owner: &AdvertOwnerSeed,
     ) -> Result<Vec<SubkeyReport>, RecordError> {
         let result = self.inner.inspect_advert(owner, advert::ADVERT_SUBKEYS);
-        count(result, &mut self.health.advert_inspect_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.advert_inspect_failures,
+            |h| &mut h.advert_inspect_timeouts,
+        )
     }
 
     fn inspect_drop(&mut self, owner: &DropOwnerSeed) -> Result<Vec<SubkeyReport>, RecordError> {
         let result = self.inner.inspect_drop(owner, drop_plane::DROP_SUBKEYS);
-        count(result, &mut self.health.drop_inspect_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.drop_inspect_failures,
+            |h| &mut h.drop_inspect_timeouts,
+        )
     }
 
     fn publish_advert(&mut self, owner: &AdvertOwnerSeed, bytes: &[u8]) -> Result<(), RecordError> {
         let result = self
             .inner
             .publish_advert(owner, advert::ADVERT_SUBKEYS, bytes);
-        count(result, &mut self.health.advert_write_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.advert_write_failures,
+            |h| &mut h.advert_write_timeouts,
+        )
     }
 
     fn erase_channel(
@@ -1081,7 +1269,13 @@ impl<R: RunnerRecords> Tracked<R> {
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> Result<(), RecordError> {
         let result = self.inner.erase_channel(lookup_key);
-        count(result, &mut self.health.channel_erase_failures)
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.channel_erase_failures,
+            |h| &mut h.channel_erase_timeouts,
+        )
     }
 }
 
@@ -1334,6 +1528,7 @@ impl<R: RunnerRecords> Runner<R> {
             records: Tracked {
                 inner: records,
                 health: HealthCounters::default(),
+                failed_drop_reads: 0,
             },
             store,
             signer,
@@ -1504,7 +1699,7 @@ impl<R: RunnerRecords> Runner<R> {
                 &conv.state.peer_identity_pk,
                 conv.state.generation,
             ) else {
-                self.records.health.channel_open_failures += 1;
+                self.records.health.local_refusals += 1;
                 continue;
             };
             if let Ok(lookup_key) = self.records.open_channel(&owner, channel::CHANNEL_SUBKEYS) {
@@ -1608,7 +1803,7 @@ impl<R: RunnerRecords> Runner<R> {
             self.records.health.store_failures += 1;
             return Ok(None);
         };
-        let failures_before = self.records.health.drop_read_failures;
+        let unread_before = self.records.failed_drop_reads;
         let me = Me {
             signer: &self.signer,
             channel_root: &self.channel_root,
@@ -1621,7 +1816,7 @@ impl<R: RunnerRecords> Runner<R> {
             |identity| blocked.is_blocked(identity),
         );
         self.last_scan = Some(Instant::now());
-        let partial = self.records.health.drop_read_failures > failures_before;
+        let partial = self.records.failed_drop_reads > unread_before;
         match collected {
             Ok(surfaced) => self.surface(surfaced, partial).await?,
             Err(e) => note_failure(&mut self.records.health, &e),
@@ -2167,12 +2362,18 @@ impl<R: RunnerRecords> Runner<R> {
                 repair.due = floor;
             }
         }
+        self.report_health().await
+    }
+
+    /// Emit [`RunnerEvent::Health`] where a counter has moved since the last
+    /// report.
+    async fn report_health(&mut self) -> Result<(), Halt> {
         let health = self.records.health;
-        if health != self.health_reported {
-            self.health_reported = health;
-            self.emit(RunnerEvent::Health(health)).await?;
+        if health == self.health_reported {
+            return Ok(());
         }
-        Ok(())
+        self.health_reported = health;
+        self.emit(RunnerEvent::Health(health)).await
     }
 
     /// Push a conversation's repair back after the store would not load.

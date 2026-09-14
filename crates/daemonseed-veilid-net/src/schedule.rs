@@ -367,7 +367,8 @@ impl<D: Send + 'static> WriteSchedulerHandle<D> {
             self.tx.send(SchedMsg::Enqueue(req))
         {
             if let Some(reply) = req.reply {
-                let _ = reply.send(Err(VeilidNetError::Actor("write scheduler is gone".into())));
+                // Never taken, so never sent: a local refusal.
+                let _ = reply.send(Err(VeilidNetError::Local("write scheduler is gone".into())));
             }
         }
     }

@@ -386,15 +386,34 @@ types:
     description: >-
       Why VeilidRecords::new refused: NoRuntime (no tokio runtime on this thread),
       NotMultiThread (the runtime is not multi-threaded, so the synchronous bridge
-      would panic).
+      would panic). Also the error inside a RecordError for a call refused before
+      it reached the network: ChannelNotOpened (a write or erasure of a channel
+      this process has not opened), SubkeyCount(u16) (a subkey count no record can
+      be addressed with) and OwnerKey (an owner keypair that would not derive).
   - name: RunnerRecords
     module: daemonseed_veilid_net::dm::runner
     kind: trait
     description: >-
       daemonseed_core::dm::flows::Records plus inspect_channel, inspect_advert and
       inspect_drop (a SubkeyReport per subkey of a channel, advert or drop
-      record), publish_advert, erase_channel and write_counts. VeilidRecords
-      implements it.
+      record), publish_advert, erase_channel and write_counts, the associated fn
+      classify(&RecordError) -> RecordFailure (default Refused) that decides the
+      counter a failed call is counted in, and take_scan_failure(&mut self) ->
+      Option<RecordError> (default None), the failure of the drop inspect a scan
+      took before its first slot read, and same_local_refusal(&RecordError,
+      &RecordError) -> bool (default false), whether a scan's local refusal and
+      its slot read's are the same one and so counted once. VeilidRecords
+      implements it, classing VeilidNetError::TimedOut as TimedOut, a
+      RecordsError or VeilidNetError::Local as Local, and everything else,
+      VeilidNetError::Actor (a dropped scheduler reply or a panicked dispatch)
+      included, as Refused.
+  - name: RecordFailure
+    module: daemonseed_veilid_net::dm::runner
+    kind: enum
+    description: >-
+      How a failed record store call failed: Refused (the network or transport
+      refused), TimedOut (ran out of time) or Local (refused before it reached the
+      network, counted in HealthCounters::local_refusals).
   - name: SubkeyReport
     module: daemonseed_veilid_net::dm::runner
     kind: struct
@@ -484,11 +503,16 @@ types:
     module: daemonseed_veilid_net::dm::runner
     kind: struct
     description: >-
-      Counters since the runner started: failed reads, inspects and writes per
-      record kind (advert, drop, channel, plus channel opens and erasures),
+      Counters since the runner started: reads, inspects and writes per record
+      kind (advert, drop, channel, plus channel opens and erasures), each as a
+      _failures counter (refused) and a _timeouts counter (ran out of time, as
+      RunnerRecords::classify classes it; the drop inspect counters include the
+      scan's inspect before its first slot read), local_refusals (calls refused
+      before they reached the network),
       advert_failures, network_not_answering (a record with no network number on
-      any subkey in a pass where this node's own advert showed none either, left
-      alone), hellos_dropped (blocked sender),
+      any subkey in a pass where this node's own advert showed none either, or
+      the inspect of that advert failed, left alone), hellos_dropped (blocked
+      sender),
       hellos_already_collected, hellos_unsettled, conversation_failures,
       store_failures and
       requests_evicted (held requests dropped, oldest-seen first, above one per
@@ -2563,6 +2587,10 @@ error_types:
         condition: A routing / private-route error.
       - name: Send
         condition: A send / transport failure (offline / slow / dead route).
+      - name: TimedOut
+        condition: A network call that ran out of time — an open or read cut off at its bound, a call Veilid answered with Timeout, or a write the network had not taken (or could not be checked) within its confirmation budget. Classified where the typed error is first seen, never from message text.
+      - name: Local
+        condition: A failure that never left this node — a runtime the synchronous record bridge cannot use, a record this node just wrote and no longer holds, a write the scheduler never took because it is gone, or a call Veilid refused before sending it (NotInitialized, AlreadyInitialized, Shutdown, Unimplemented, ParseError, InvalidArgument, MissingArgument, TransactionNotFound). Veilid's Internal is a refusal, since Veilid also raises it after a fanout.
       - name: NotServed
         condition: The peer answered but does not serve the requested share/chunk (withdrawn or never offered) — an authoritative negative distinct from a transport error.
       - name: Integrity

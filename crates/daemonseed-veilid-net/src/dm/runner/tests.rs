@@ -1,5 +1,6 @@
 use super::*;
 
+use std::collections::HashSet;
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 use daemonseed_core::identity::keys::{derive_identity_keys, Identity, IdentityKeys};
@@ -31,16 +32,76 @@ impl core::fmt::Display for Refused {
 
 impl core::error::Error for Refused {}
 
+/// A record store call that ran out of time, for fault injection.
+#[derive(Debug)]
+struct TimedOut;
+
+impl core::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the fake record store call ran out of time")
+    }
+}
+
+impl core::error::Error for TimedOut {}
+
+/// A record store call refused before it reached the network, for fault
+/// injection.
+#[derive(Debug)]
+struct LocalRefusal(u8);
+
+impl core::fmt::Display for LocalRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the fake record store refused this call before the network")
+    }
+}
+
+impl core::error::Error for LocalRefusal {}
+
+/// The record store operation a planned fault lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Read,
+    Inspect,
+    Write,
+    Open,
+    Erase,
+    /// The drop inspect a scan takes before its first slot read.
+    Scan,
+}
+
+/// How a planned fault fails the call it lands on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    TimedOut,
+    Refused,
+    Local,
+    /// Refused before the network, for a reason other than [`Fault::Local`]'s.
+    LocalOther,
+}
+
+/// The error a planned fault fails its call with.
+fn fault_error(fault: Fault) -> RecordError {
+    match fault {
+        Fault::TimedOut => RecordError::new(TimedOut),
+        Fault::Refused => RecordError::new(Refused),
+        Fault::Local => RecordError::new(LocalRefusal(0)),
+        Fault::LocalOther => RecordError::new(LocalRefusal(1)),
+    }
+}
+
 /// The network every fake in one test shares: each subkey's bytes and the
 /// sequence number of the write that put them there.
 #[derive(Default)]
 struct Dht {
     records: HashMap<Key, (Vec<u8>, u64)>,
     writes: u64,
+    /// Every value ever written, in order, with the subkey it was written to.
+    written: Vec<(Key, Vec<u8>)>,
 }
 
 impl Dht {
     fn put(&mut self, key: Key, bytes: Vec<u8>) -> u64 {
+        self.written.push((key, bytes.clone()));
         self.writes += 1;
         self.records.insert(key, (bytes, self.writes));
         self.writes
@@ -75,6 +136,7 @@ struct Node {
 /// What one runner's fake was asked to do. Writes are counted as attempts.
 #[derive(Debug, Default, Clone, Copy)]
 struct Calls {
+    drop_reads: usize,
     hello_writes: usize,
     ring_writes: usize,
     control_writes: usize,
@@ -137,6 +199,14 @@ impl Drop for ReleaseOnDrop {
 
 #[derive(Default)]
 struct Faults {
+    /// Planned faults, each failing the first call of its kind and operation
+    /// and then gone.
+    plan: Vec<(u8, Op, Fault)>,
+    /// The failure of the scan the last slot-0 drop read took, until the runner
+    /// takes it.
+    scan_failure: Option<RecordError>,
+    /// Fail the next read of this drop slot as the fault says, then forget it.
+    fail_drop_slot_read: Option<(u16, Fault)>,
     /// Writes attempted since the counter was last reset.
     writes: usize,
     /// Refuse the write with this 1-based index.
@@ -214,7 +284,22 @@ impl Fake {
         faults.fail_write_at = Some(index);
     }
 
+    /// Fail this call as the first planned fault for its kind and operation
+    /// says, consuming that fault.
+    fn inject(&self, kind: u8, op: Op) -> Result<(), RecordError> {
+        let mut faults = self.faults();
+        let Some(at) = faults
+            .plan
+            .iter()
+            .position(|(k, o, _)| *k == kind && *o == op)
+        else {
+            return Ok(());
+        };
+        Err(fault_error(faults.plan.remove(at).2))
+    }
+
     fn write(&self, key: Key, bytes: Vec<u8>) -> Result<(), RecordError> {
+        self.inject(key.0, Op::Write)?;
         {
             let mut faults = self.faults();
             faults.writes += 1;
@@ -248,6 +333,7 @@ impl Fake {
         name: [u8; 32],
         subkeys: u16,
     ) -> Result<Vec<SubkeyReport>, RecordError> {
+        self.inject(kind, Op::Inspect)?;
         let (unreachable, cold, pending) = {
             let faults = self.faults();
             (faults.unreachable, faults.cold, faults.pending)
@@ -292,6 +378,7 @@ impl Records for Fake {
         owner: &AdvertOwnerSeed,
         _subkeys: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
+        self.inject(ADVERT, Op::Read)?;
         Ok(self.read((ADVERT, *owner.as_bytes(), 0)))
     }
 
@@ -304,6 +391,26 @@ impl Records for Fake {
         let gate = self.faults().gate_drop.clone();
         if let Some(gate) = gate {
             tokio::task::block_in_place(|| gate.hold());
+        }
+        self.count(|calls| calls.drop_reads += 1);
+        if slot == 0 {
+            if let Err(failure) = self.inject(DROP, Op::Scan) {
+                self.faults().scan_failure = Some(failure);
+            }
+        }
+        self.inject(DROP, Op::Read)?;
+        let slot_fault = {
+            let mut faults = self.faults();
+            match faults.fail_drop_slot_read {
+                Some((at, fault)) if at == slot => {
+                    faults.fail_drop_slot_read = None;
+                    Some(fault)
+                }
+                _ => None,
+            }
+        };
+        if let Some(fault) = slot_fault {
+            return Err(fault_error(fault));
         }
         let key = (DROP, *owner.as_bytes(), slot);
         // A node reading a slot it wrote a hello into is served its own copy,
@@ -348,6 +455,7 @@ impl Records for Fake {
         _subkeys: u16,
     ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
         self.count(|calls| calls.open_channel += 1);
+        self.inject(CHANNEL, Op::Open)?;
         Ok(Self::lookup_key(owner))
     }
 
@@ -357,6 +465,7 @@ impl Records for Fake {
         subkey: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
         self.count(|calls| calls.channel_reads += 1);
+        self.inject(CHANNEL, Op::Read)?;
         Ok(self.read((CHANNEL, *lookup_key, subkey)))
     }
 
@@ -427,6 +536,7 @@ impl RunnerRecords for Fake {
         if self.faults().fail_erase {
             return Err(RecordError::new(Refused));
         }
+        self.inject(CHANNEL, Op::Erase)?;
         self.net()
             .records
             .retain(|(kind, name, _), _| !(*kind == CHANNEL && name == lookup_key));
@@ -436,6 +546,31 @@ impl RunnerRecords for Fake {
             .local
             .retain(|(kind, name, _), _| !(*kind == CHANNEL && name == lookup_key));
         Ok(())
+    }
+
+    fn classify(error: &RecordError) -> RecordFailure {
+        let inner = error.inner();
+        if inner.downcast_ref::<TimedOut>().is_some() {
+            RecordFailure::TimedOut
+        } else if inner.downcast_ref::<LocalRefusal>().is_some() {
+            RecordFailure::Local
+        } else {
+            RecordFailure::Refused
+        }
+    }
+
+    fn take_scan_failure(&mut self) -> Option<RecordError> {
+        self.faults().scan_failure.take()
+    }
+
+    fn same_local_refusal(scan: &RecordError, read: &RecordError) -> bool {
+        match (
+            scan.inner().downcast_ref::<LocalRefusal>(),
+            read.inner().downcast_ref::<LocalRefusal>(),
+        ) {
+            (Some(scan), Some(read)) => scan.0 == read.0,
+            _ => false,
+        }
     }
 
     fn write_counts(&self) -> WriteCountsSnapshot {
@@ -2080,6 +2215,1114 @@ async fn a_failed_write_is_counted_in_the_next_health_report() {
     assert_eq!(health(&bw.seen[at]).advert_write_failures, 0);
     assert!(finished(&aw.stop().await));
     assert!(finished(&bw.stop().await));
+}
+
+/// Every counter of a failed or timed-out record store call, by name.
+fn record_call_counters(counters: &HealthCounters) -> [(&'static str, u64); 23] {
+    [
+        ("advert_read_failures", counters.advert_read_failures),
+        ("advert_read_timeouts", counters.advert_read_timeouts),
+        ("advert_inspect_failures", counters.advert_inspect_failures),
+        ("advert_inspect_timeouts", counters.advert_inspect_timeouts),
+        ("advert_write_failures", counters.advert_write_failures),
+        ("advert_write_timeouts", counters.advert_write_timeouts),
+        ("drop_read_failures", counters.drop_read_failures),
+        ("drop_read_timeouts", counters.drop_read_timeouts),
+        ("drop_write_failures", counters.drop_write_failures),
+        ("drop_write_timeouts", counters.drop_write_timeouts),
+        ("drop_inspect_failures", counters.drop_inspect_failures),
+        ("drop_inspect_timeouts", counters.drop_inspect_timeouts),
+        ("channel_open_failures", counters.channel_open_failures),
+        ("channel_open_timeouts", counters.channel_open_timeouts),
+        ("channel_read_failures", counters.channel_read_failures),
+        ("channel_read_timeouts", counters.channel_read_timeouts),
+        (
+            "channel_inspect_failures",
+            counters.channel_inspect_failures,
+        ),
+        (
+            "channel_inspect_timeouts",
+            counters.channel_inspect_timeouts,
+        ),
+        ("channel_write_failures", counters.channel_write_failures),
+        ("channel_write_timeouts", counters.channel_write_timeouts),
+        ("channel_erase_failures", counters.channel_erase_failures),
+        ("channel_erase_timeouts", counters.channel_erase_timeouts),
+        ("local_refusals", counters.local_refusals),
+    ]
+}
+
+/// Every counter that is not a record store call's, by name.
+fn other_counters(counters: &HealthCounters) -> [(&'static str, u64); 8] {
+    [
+        ("advert_failures", counters.advert_failures),
+        ("network_not_answering", counters.network_not_answering),
+        ("hellos_dropped", counters.hellos_dropped),
+        (
+            "hellos_already_collected",
+            counters.hellos_already_collected,
+        ),
+        ("hellos_unsettled", counters.hellos_unsettled),
+        ("conversation_failures", counters.conversation_failures),
+        ("store_failures", counters.store_failures),
+        ("requests_evicted", counters.requests_evicted),
+    ]
+}
+
+/// A drop holding nothing on the network is left alone, and counted only in
+/// `network_not_answering`, by a pass whose own advert the network has lost:
+/// a relaunch whose advert rewrite is refused counts that refusal as its one
+/// record call failure and does not write the hello. The same relaunch with the
+/// advert back on the network writes it.
+#[tokio::test(start_paused = true)]
+async fn a_lost_advert_leaves_an_empty_drop_alone_and_counts_no_drop_call() {
+    let dht = network();
+    let (a, c) = (Profile::new(), Profile::new());
+    let mut cw = c.spawn(&Fake::on(&dht), RunnerConfig::default());
+    cw.wait_for("C's startup", is_health).await;
+    assert!(finished(&cw.stop().await));
+
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    a_fake.faults().fail_drop_writes = true;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: c.pk.clone(),
+        body: b"to C".to_vec(),
+    })
+    .await;
+    aw.wait_for("the refused hello", refused(1)).await;
+    assert!(finished(&aw.stop().await));
+    let drop_held = |dht: &Arc<Mutex<Dht>>| {
+        dht.lock()
+            .expect("the network lock")
+            .records
+            .keys()
+            .any(|(kind, name, _)| *kind == DROP && *name == c.drop_name())
+    };
+    assert!(!drop_held(&dht), "C's drop holds nothing on the network");
+
+    a_fake.net().evict(a.advert_key());
+    let unanswered = a_fake.restart();
+    unanswered
+        .faults()
+        .plan
+        .push((ADVERT, Op::Write, Fault::Refused));
+    let mut aw = a.spawn(&unanswered, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    let report = health(&aw.seen[at]);
+    for (counter, count) in record_call_counters(&report) {
+        let expected = u64::from(counter == "advert_write_failures");
+        assert_eq!(count, expected, "{counter} after the relaunch");
+    }
+    for (counter, count) in other_counters(&report) {
+        let expected = u64::from(counter == "network_not_answering");
+        assert_eq!(count, expected, "{counter} after the relaunch");
+    }
+    assert!(
+        unanswered.faults().plan.is_empty(),
+        "the advert rewrite was refused"
+    );
+    assert_eq!(
+        unanswered.calls().hello_writes,
+        0,
+        "the hello is left alone"
+    );
+    assert!(!drop_held(&dht));
+    assert!(finished(&aw.stop().await));
+
+    let answering = a_fake.restart();
+    let mut aw = a.spawn(&answering, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch with the advert", is_health).await;
+    let report = health(&aw.seen[at]);
+    for (counter, count) in record_call_counters(&report)
+        .into_iter()
+        .chain(other_counters(&report))
+    {
+        assert_eq!(count, 0, "{counter} after the relaunch with the advert");
+    }
+    assert_eq!(
+        answering.calls().advert_publishes,
+        1,
+        "the advert is put back"
+    );
+    assert_eq!(answering.calls().hello_writes, 1, "the hello is written");
+    assert!(drop_held(&dht), "C's drop holds the hello");
+    assert!(finished(&aw.stop().await));
+}
+
+/// A scan whose read of a held request's slot runs out of time is partial: the
+/// request keeps its id, is not surfaced again, and is accepted under that id.
+#[tokio::test(start_paused = true)]
+async fn a_held_request_survives_a_scan_whose_read_of_its_slot_times_out() {
+    held_request_survives_an_unread_slot(Fault::TimedOut, |counters| counters.drop_read_timeouts)
+        .await;
+}
+
+/// A scan whose read of a held request's slot is refused before it reaches the
+/// network is partial in the same way.
+#[tokio::test(start_paused = true)]
+async fn a_held_request_survives_a_scan_whose_read_of_its_slot_is_refused_locally() {
+    held_request_survives_an_unread_slot(Fault::Local, |counters| counters.local_refusals).await;
+}
+
+/// A scan whose drop inspect fails but whose slot reads all answer is complete:
+/// a held request whose hello the network no longer holds is withdrawn, and an
+/// accept under its id is refused.
+#[tokio::test(start_paused = true)]
+async fn a_scan_whose_inspect_fails_still_withdraws_a_request_whose_hello_is_gone() {
+    withdrawn_after_a_scan_fault(Fault::Refused, |counters| counters.drop_inspect_failures).await;
+}
+
+/// A scan whose drop inspect is refused before the network but whose slot
+/// reads all answer is complete in the same way.
+#[tokio::test(start_paused = true)]
+async fn a_scan_whose_inspect_is_refused_locally_still_withdraws_a_request_whose_hello_is_gone() {
+    withdrawn_after_a_scan_fault(Fault::Local, |counters| counters.local_refusals).await;
+}
+
+/// A drop scan and the slot read after it, each refused before the network but
+/// for different reasons, are two local refusals.
+#[tokio::test(start_paused = true)]
+async fn a_scan_and_its_read_refused_locally_for_different_reasons_count_twice() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    {
+        let mut faults = a_fake.faults();
+        faults.plan.push((DROP, Op::Scan, Fault::Local));
+        faults.plan.push((DROP, Op::Read, Fault::LocalOther));
+    }
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    let at = aw.wait_for("A's startup", is_health).await;
+    let report = health(&aw.seen[at]);
+    for (counter, count) in record_call_counters(&report)
+        .into_iter()
+        .chain(other_counters(&report))
+    {
+        let expected = if counter == "local_refusals" { 2 } else { 0 };
+        assert_eq!(count, expected, "{counter} after the startup scan");
+    }
+    assert!(
+        a_fake.faults().plan.is_empty(),
+        "both refusals landed in the scan"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// B holds A's request; A's hello leaves the network; the next scan's drop
+/// inspect fails as `fault` says, which `counted` reads back, while every slot
+/// read answers. The scan is complete, so the request is withdrawn and an
+/// accept under its id is refused.
+async fn withdrawn_after_a_scan_fault(fault: Fault, counted: fn(&HealthCounters) -> u64) {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let b_fake = Fake::on(&dht);
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut aw = a.spawn(&Fake::on(&dht), RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"the first body".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    assert!(finished(&aw.stop().await));
+
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+    let slot = hello_slot(&dht, &b);
+    dht.lock()
+        .expect("the network lock")
+        .evict((DROP, b.drop_name(), slot));
+    b_fake.faults().plan.push((DROP, Op::Scan, fault));
+    let from = bw.seen.len();
+    bw.wait_from(
+        from,
+        "the scan whose inspect failed",
+        |event| matches!(event, RunnerEvent::Health(counters) if counted(counters) == 1),
+    )
+    .await;
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    let at = bw
+        .wait_for("the answer to the accept", |event| {
+            sent(2)(event) || refused(2)(event)
+        })
+        .await;
+    assert_eq!(
+        refusal(&bw.seen[at]),
+        Refusal::UnknownRequest,
+        "the request whose hello is gone was withdrawn"
+    );
+    assert!(finished(&bw.stop().await));
+}
+
+/// A drop scan refused before it reaches the network, followed by the slot read
+/// refusing for the same local reason, is one local refusal.
+#[tokio::test(start_paused = true)]
+async fn a_scan_and_its_read_refused_locally_together_count_once() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    {
+        let mut faults = a_fake.faults();
+        faults.plan.push((DROP, Op::Scan, Fault::Local));
+        faults.plan.push((DROP, Op::Read, Fault::Local));
+    }
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    let at = aw.wait_for("A's startup", is_health).await;
+    let report = health(&aw.seen[at]);
+    for (counter, count) in record_call_counters(&report)
+        .into_iter()
+        .chain(other_counters(&report))
+    {
+        assert_eq!(
+            count,
+            u64::from(counter == "local_refusals"),
+            "{counter} after the startup scan"
+        );
+    }
+    assert!(
+        a_fake.faults().plan.is_empty(),
+        "both refusals landed in the scan"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A counter a command moves is reported as soon as the command is answered,
+/// before the schedule wakes again.
+#[tokio::test(start_paused = true)]
+async fn a_failure_a_command_counts_is_reported_before_the_next_wake() {
+    let Scene {
+        a: _a,
+        b: _b,
+        a_fake,
+        mut aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    a_fake
+        .faults()
+        .plan
+        .push((CHANNEL, Op::Write, Fault::Refused));
+    let asked = tokio::time::Instant::now();
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(31),
+        peer: a_peer,
+        body: b"refused".to_vec(),
+    })
+    .await;
+    let from = aw.seen.len();
+    aw.wait_from(from, "the report of the refused write", |event| {
+        matches!(event, RunnerEvent::Health(counters) if counters.channel_write_failures == 1)
+    })
+    .await;
+    assert!(
+        asked.elapsed() < Duration::from_secs(1),
+        "reported with no wake of the schedule between: {:?}",
+        asked.elapsed()
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A counter a pass moves before a stop cuts that pass short is reported among
+/// the events the shutdown hands back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_counted_in_a_pass_a_stop_cuts_short_is_reported() {
+    let config = real_clock();
+    let Scene {
+        a: _a,
+        b: _b,
+        a_fake,
+        aw,
+        bw,
+        ..
+    } = establish(config).await;
+    assert!(finished(&bw.stop().await));
+    let held = Arc::new(Gate::default());
+    let _release_held = ReleaseOnDrop(Arc::clone(&held));
+    {
+        let mut faults = a_fake.faults();
+        faults.plan.push((DROP, Op::Read, Fault::Refused));
+        faults.gate_drop = Some(Arc::clone(&held));
+    }
+    let Watch { handle, .. } = aw;
+    held.reached().await;
+    let mut stopping = Box::pin(handle.shutdown());
+    // A shutdown's first poll sets the stop flag before it waits on anything, so
+    // polling it once here orders the stop before the held read is released.
+    tokio::select! {
+        biased;
+        _ = &mut stopping => panic!("the shutdown returned while a read was held"),
+        () = std::future::ready(()) => {}
+    }
+    a_fake.faults().gate_drop = None;
+    held.release();
+    let stop = tokio::time::timeout(Duration::from_secs(30), stopping)
+        .await
+        .expect("shutdown returned");
+    assert!(finished(&stop), "{stop:?}");
+    assert!(
+        a_fake.faults().plan.is_empty(),
+        "the refused read landed in the pass the stop cut short"
+    );
+    assert!(
+        stop.undelivered.iter().any(|event| matches!(
+            event,
+            RunnerEvent::Health(counters) if counters.drop_read_failures == 1
+        )),
+        "the report of the refused read is among the events the shutdown hands back: {:?}",
+        stop.undelivered
+    );
+}
+
+/// The slot of the one hello in `to`'s drop.
+fn hello_slot(dht: &Arc<Mutex<Dht>>, to: &Profile) -> u16 {
+    dht.lock()
+        .expect("the network lock")
+        .records
+        .keys()
+        .find(|(kind, name, _)| *kind == DROP && *name == to.drop_name())
+        .map(|(_, _, slot)| *slot)
+        .expect("a hello is in the drop")
+}
+
+/// B holds A's request; the next scan fails to read its slot as `fault` says,
+/// which `counted` reads back. The scan is partial, so the request keeps its id
+/// through later scans, is not surfaced again, and is accepted under that id.
+async fn held_request_survives_an_unread_slot(fault: Fault, counted: fn(&HealthCounters) -> u64) {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let b_fake = Fake::on(&dht);
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut aw = a.spawn(&Fake::on(&dht), RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"the first body".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    assert!(finished(&aw.stop().await));
+
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+    let slot = hello_slot(&dht, &b);
+    b_fake.faults().fail_drop_slot_read = Some((slot, fault));
+    let from = bw.seen.len();
+    bw.wait_from(
+        from,
+        "the scan whose read failed",
+        |event| matches!(event, RunnerEvent::Health(counters) if counted(counters) == 1),
+    )
+    .await;
+    assert!(
+        b_fake.faults().fail_drop_slot_read.is_none(),
+        "the read of the request's slot failed"
+    );
+    let reads_before = b_fake.calls().drop_reads;
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    bw.drain();
+    assert!(
+        b_fake.calls().drop_reads >= reads_before + usize::from(drop_plane::DROP_SUBKEYS),
+        "a later scan read every slot again"
+    );
+    let surfaced = bw
+        .seen
+        .iter()
+        .filter(|event| request_from(&a.pk)(event))
+        .count();
+    assert_eq!(
+        surfaced, 1,
+        "the request is surfaced once, whatever later scans read"
+    );
+
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    let at = bw
+        .wait_for("the answer to the accept", |event| {
+            sent(2)(event) || refused(2)(event)
+        })
+        .await;
+    assert!(
+        matches!(bw.seen[at], RunnerEvent::Sent { .. }),
+        "the request is accepted under the id it was first surfaced with: {:?}",
+        bw.seen[at]
+    );
+    assert!(finished(&bw.stop().await));
+}
+
+/// A counter a command moves is reported before a shutdown that follows at
+/// once: the events the shutdown hands back carry the report.
+#[tokio::test(start_paused = true)]
+async fn a_failure_a_command_counts_is_reported_before_the_runner_stops() {
+    let Scene {
+        a: _a,
+        b: _b,
+        a_fake,
+        mut aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    a_fake
+        .faults()
+        .plan
+        .push((CHANNEL, Op::Write, Fault::Refused));
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(30),
+        peer: a_peer,
+        body: b"refused".to_vec(),
+    })
+    .await;
+    let at = aw.wait_for("the refused send", refused(30)).await;
+    assert_eq!(refusal(&aw.seen[at]), Refusal::Network);
+    let stop = aw.stop().await;
+    assert!(finished(&stop));
+    assert!(
+        stop.undelivered.iter().any(|event| matches!(
+            event,
+            RunnerEvent::Health(counters) if counters.channel_write_failures == 1
+        )),
+        "the report of the refused write is among the events the shutdown hands back: {:?}",
+        stop.undelivered
+    );
+}
+
+/// Faults of different kinds pending at once are each counted once in the pass
+/// they land in, beside exactly the `network_not_answering` that pass must
+/// produce. A relaunch whose own channel the network has lost entirely meets
+/// three: the startup advert check's inspect refused, the drop scan's first
+/// slot read timed out, and the advert inspect the channel repair takes to see
+/// whether the network answers timed out, so the channel is left alone.
+#[tokio::test(start_paused = true)]
+async fn faults_of_different_kinds_pending_in_one_pass_are_each_counted_once() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        aw,
+        bw,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    assert!(finished(&aw.stop().await));
+    let lookup_key = a.outgoing_lookup_key(&b);
+    {
+        let mut net = dht.lock().expect("the network lock");
+        let lost: Vec<Key> = net
+            .records
+            .keys()
+            .filter(|(kind, name, _)| *kind == CHANNEL && *name == lookup_key)
+            .copied()
+            .collect();
+        assert!(
+            lost.len() >= 2,
+            "A's channel holds its control subkey and a slot"
+        );
+        for key in lost {
+            net.evict(key);
+        }
+    }
+    let relaunched = a_fake.restart();
+    {
+        let mut faults = relaunched.faults();
+        faults.plan.push((ADVERT, Op::Inspect, Fault::Refused));
+        faults.plan.push((DROP, Op::Read, Fault::TimedOut));
+        faults.plan.push((ADVERT, Op::Inspect, Fault::TimedOut));
+    }
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    let report = health(&aw.seen[at]);
+    for (counter, count) in record_call_counters(&report)
+        .into_iter()
+        .chain(other_counters(&report))
+    {
+        let expected = u64::from(matches!(
+            counter,
+            "advert_inspect_failures"
+                | "advert_inspect_timeouts"
+                | "drop_read_timeouts"
+                | "network_not_answering"
+        ));
+        assert_eq!(count, expected, "{counter} after the pass");
+    }
+    assert!(
+        relaunched.faults().plan.is_empty(),
+        "every planned fault landed in the pass"
+    );
+    assert_eq!(
+        relaunched.calls().control_writes,
+        0,
+        "the lost channel is left alone"
+    );
+    assert_eq!(
+        relaunched.calls().ring_writes,
+        0,
+        "the lost channel is left alone"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// What sets off the record call a planned fault lands on.
+#[derive(Debug, Clone, Copy)]
+enum Trigger {
+    /// The schedule alone: a tick, a repair look or an advert poll.
+    Schedule,
+    /// A message to B, with this token.
+    Send(u64),
+    /// A first contact with C, with this token.
+    FirstContact(u64),
+    /// A delete of the conversation with B, with this token.
+    Delete(u64),
+    /// The network losing A's advert, which the next advert poll rewrites.
+    LoseAdvert,
+}
+
+/// Every fetch, inspect, write, open and erasure of an advert, a drop slot or a
+/// channel that fails is counted in the next health report: under its
+/// `_timeouts` counter where the call ran out of time, under its `_failures`
+/// counter where it was refused, under `local_refusals` where it never reached
+/// the network, and under no other counter, except that a failed look at this
+/// node's own advert may also leave a drop holding nothing alone, which
+/// `network_not_answering` counts. The drop inspect a scan takes before its
+/// first slot read counts under the drop inspect counters.
+#[tokio::test(start_paused = true)]
+async fn every_failed_or_timed_out_record_call_is_counted_by_name() {
+    let Scene {
+        dht,
+        a,
+        b: _b,
+        a_fake,
+        mut aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    let c = Profile::new();
+    let mut cw = c.spawn(&Fake::on(&dht), RunnerConfig::default());
+    cw.wait_for("C's startup", is_health).await;
+    assert!(finished(&cw.stop().await));
+
+    // B no longer collects, so this message keeps a repair look scheduled.
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(50),
+        peer: a_peer,
+        body: b"outstanding".to_vec(),
+    })
+    .await;
+    aw.wait_for("the uncollected send", sent(50)).await;
+    let at = aw
+        .seen
+        .iter()
+        .rposition(is_health)
+        .expect("A reported its health");
+    let mut before = health(&aw.seen[at]);
+    for (counter, count) in record_call_counters(&before) {
+        assert_eq!(count, 0, "{counter} reads zero before any fault");
+    }
+
+    let plan = [
+        (
+            CHANNEL,
+            Op::Read,
+            Fault::TimedOut,
+            "channel_read_timeouts",
+            Trigger::Schedule,
+        ),
+        (
+            CHANNEL,
+            Op::Read,
+            Fault::Refused,
+            "channel_read_failures",
+            Trigger::Schedule,
+        ),
+        (
+            DROP,
+            Op::Read,
+            Fault::TimedOut,
+            "drop_read_timeouts",
+            Trigger::Schedule,
+        ),
+        (
+            DROP,
+            Op::Read,
+            Fault::Refused,
+            "drop_read_failures",
+            Trigger::Schedule,
+        ),
+        (
+            DROP,
+            Op::Scan,
+            Fault::TimedOut,
+            "drop_inspect_timeouts",
+            Trigger::Schedule,
+        ),
+        (
+            DROP,
+            Op::Scan,
+            Fault::Refused,
+            "drop_inspect_failures",
+            Trigger::Schedule,
+        ),
+        (
+            CHANNEL,
+            Op::Write,
+            Fault::TimedOut,
+            "channel_write_timeouts",
+            Trigger::Send(51),
+        ),
+        (
+            CHANNEL,
+            Op::Write,
+            Fault::Refused,
+            "channel_write_failures",
+            Trigger::Send(52),
+        ),
+        (
+            CHANNEL,
+            Op::Write,
+            Fault::Local,
+            "local_refusals",
+            Trigger::Send(53),
+        ),
+        (
+            CHANNEL,
+            Op::Inspect,
+            Fault::TimedOut,
+            "channel_inspect_timeouts",
+            Trigger::Schedule,
+        ),
+        (
+            CHANNEL,
+            Op::Inspect,
+            Fault::Refused,
+            "channel_inspect_failures",
+            Trigger::Schedule,
+        ),
+        (
+            CHANNEL,
+            Op::Erase,
+            Fault::TimedOut,
+            "channel_erase_timeouts",
+            Trigger::Delete(70),
+        ),
+        (
+            CHANNEL,
+            Op::Erase,
+            Fault::Refused,
+            "channel_erase_failures",
+            Trigger::Delete(71),
+        ),
+        (
+            ADVERT,
+            Op::Read,
+            Fault::TimedOut,
+            "advert_read_timeouts",
+            Trigger::FirstContact(60),
+        ),
+        (
+            ADVERT,
+            Op::Read,
+            Fault::Refused,
+            "advert_read_failures",
+            Trigger::FirstContact(61),
+        ),
+        (
+            CHANNEL,
+            Op::Open,
+            Fault::TimedOut,
+            "channel_open_timeouts",
+            Trigger::FirstContact(64),
+        ),
+        (
+            CHANNEL,
+            Op::Open,
+            Fault::Refused,
+            "channel_open_failures",
+            Trigger::FirstContact(65),
+        ),
+        (
+            DROP,
+            Op::Write,
+            Fault::TimedOut,
+            "drop_write_timeouts",
+            Trigger::FirstContact(62),
+        ),
+        (
+            DROP,
+            Op::Write,
+            Fault::Refused,
+            "drop_write_failures",
+            Trigger::FirstContact(63),
+        ),
+        (
+            DROP,
+            Op::Inspect,
+            Fault::TimedOut,
+            "drop_inspect_timeouts",
+            Trigger::Schedule,
+        ),
+        (
+            DROP,
+            Op::Inspect,
+            Fault::Refused,
+            "drop_inspect_failures",
+            Trigger::Schedule,
+        ),
+        (
+            ADVERT,
+            Op::Inspect,
+            Fault::TimedOut,
+            "advert_inspect_timeouts",
+            Trigger::Schedule,
+        ),
+        (
+            ADVERT,
+            Op::Inspect,
+            Fault::Refused,
+            "advert_inspect_failures",
+            Trigger::Schedule,
+        ),
+        (
+            ADVERT,
+            Op::Write,
+            Fault::TimedOut,
+            "advert_write_timeouts",
+            Trigger::LoseAdvert,
+        ),
+        (
+            ADVERT,
+            Op::Write,
+            Fault::Refused,
+            "advert_write_failures",
+            Trigger::Schedule,
+        ),
+    ];
+    for (kind, op, fault, name, trigger) in plan {
+        assert!(
+            record_call_counters(&before)
+                .iter()
+                .any(|(counter, _)| *counter == name),
+            "{name} is a record call counter"
+        );
+        // C's drop holds nothing on the network while every write of A's hello
+        // to it has failed. A pass that finds it so asks A's own advert whether
+        // the network answers; where that inspect fails, or the network has
+        // lost the advert, the drop is left alone and counted in
+        // `network_not_answering`, never as a drop or channel call. So the
+        // advert inspect and advert write cases may move that counter, in the
+        // report that carries their fault or in one before it, and no case
+        // moves any other counter but its own.
+        let liveness_may_fail = kind == ADVERT && op != Op::Read;
+        let from = aw.seen.len();
+        a_fake.faults().plan.push((kind, op, fault));
+        match trigger {
+            Trigger::Schedule => {}
+            Trigger::Send(token) => {
+                aw.send(RunnerCommand::Send {
+                    token: CommandToken(token),
+                    peer: a_peer,
+                    body: b"to B".to_vec(),
+                })
+                .await
+            }
+            Trigger::FirstContact(token) => {
+                aw.send(RunnerCommand::FirstContact {
+                    token: CommandToken(token),
+                    peer_identity_pk: c.pk.clone(),
+                    body: b"to C".to_vec(),
+                })
+                .await
+            }
+            Trigger::Delete(token) => {
+                aw.send(RunnerCommand::DeleteConversation {
+                    token: CommandToken(token),
+                    peer: a_peer,
+                })
+                .await
+            }
+            Trigger::LoseAdvert => a_fake.net().evict(a.advert_key()),
+        }
+        let mut at = aw.wait_from(from, name, is_health).await;
+        loop {
+            let after = health(&aw.seen[at]);
+            let landed = a_fake.faults().plan.is_empty();
+            for ((counter, was), (_, now)) in record_call_counters(&before)
+                .into_iter()
+                .zip(record_call_counters(&after))
+            {
+                let expected = if counter == name && landed {
+                    was + 1
+                } else {
+                    was
+                };
+                assert_eq!(
+                    now, expected,
+                    "{counter} in a report after the fault planned for {name} \
+                     (landed: {landed})"
+                );
+            }
+            for ((counter, was), (_, now)) in other_counters(&before)
+                .into_iter()
+                .zip(other_counters(&after))
+            {
+                if counter == "network_not_answering" && liveness_may_fail {
+                    assert!(now >= was, "{counter} never falls");
+                } else {
+                    assert_eq!(
+                        now, was,
+                        "{counter} in a report after the fault planned for {name}"
+                    );
+                }
+            }
+            assert!(
+                landed || after.network_not_answering > before.network_not_answering,
+                "a report before the fault planned for {name} landed moved a counter"
+            );
+            before = after;
+            if landed {
+                break;
+            }
+            at = aw.wait_from(at + 1, name, is_health).await;
+        }
+    }
+    for (counter, count) in record_call_counters(&before) {
+        let planned = plan
+            .iter()
+            .filter(|(_, _, _, name, _)| *name == counter)
+            .count() as u64;
+        assert_eq!(
+            count, planned,
+            "{counter} counts exactly its planned faults"
+        );
+    }
+    assert!(finished(&aw.stop().await));
+}
+
+/// Every 32-byte window of each of `keys`.
+fn key_windows(keys: &[&IdentityPk]) -> HashSet<[u8; 32]> {
+    keys.iter()
+        .flat_map(|key| key.windows(32))
+        .map(|window| <[u8; 32]>::try_from(window).expect("a 32-byte window"))
+        .collect()
+}
+
+/// How many 32-byte windows of `value` are windows of an identity key, and
+/// whether `value` holds any of `keys` whole.
+fn key_hits(value: &[u8], windows: &HashSet<[u8; 32]>, keys: &[&IdentityPk]) -> (usize, bool) {
+    let hits = value
+        .windows(32)
+        .filter(|window| windows.contains(*window))
+        .count();
+    let whole = keys.iter().any(|key| {
+        value
+            .windows(key.len())
+            .any(|window| window == key.as_slice())
+    });
+    (hits, whole)
+}
+
+/// No value either runner writes to a channel or a drop slot carries either
+/// identity public key, whole or as any 32-byte window, over a whole
+/// conversation: a first contact and its acceptance, messages both ways, a
+/// relaunch that reseals the lost control subkey and rewrites a lost slot, and
+/// a delete. The same scan finds the keys in the opening those control
+/// subkeys seal.
+#[tokio::test(start_paused = true)]
+async fn no_identity_key_appears_in_any_value_the_runner_writes() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        mut aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(20),
+        peer: a_peer,
+        body: b"m1".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's m1", sent(20)).await;
+    bw.wait_for("m1 at B", message(b_peer, 1, b"m1")).await;
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(21),
+        peer: b_peer,
+        body: b"b1".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's b1", sent(21)).await;
+    aw.wait_for("b1 at A", message(a_peer, 1, b"b1")).await;
+    aw.wait_for("delivery of m1", delivered(a_peer, 1)).await;
+    assert!(finished(&bw.stop().await));
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(22),
+        peer: a_peer,
+        body: b"m2".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's m2", sent(22)).await;
+    assert!(finished(&aw.stop().await));
+
+    let a_lookup_key = a.outgoing_lookup_key(&b);
+    let b_lookup_key = b.outgoing_lookup_key(&a);
+    let written_to = |dht: &Arc<Mutex<Dht>>, name: [u8; 32], control: bool| {
+        dht.lock()
+            .expect("the network lock")
+            .written
+            .iter()
+            .filter(|((kind, n, subkey), _)| {
+                *kind == CHANNEL && *n == name && (*subkey == channel::CONTROL_SUBKEY) == control
+            })
+            .count()
+    };
+    let setup_controls = written_to(&dht, a_lookup_key, true);
+    assert!(setup_controls >= 1, "A's opening was written");
+    assert!(
+        written_to(&dht, b_lookup_key, true) >= 1,
+        "B's control values are among the values scanned"
+    );
+    assert!(
+        written_to(&dht, a_lookup_key, false) + written_to(&dht, b_lookup_key, false) >= 3,
+        "message slots of both directions are among the values scanned"
+    );
+
+    let opening = {
+        let store = Store::open(a.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+            .expect("A's store opens");
+        let loaded = store.load().expect("A's store loads");
+        assert_eq!(loaded.convs.len(), 1);
+        loaded.convs[0]
+            .state
+            .own_opening
+            .as_ref()
+            .expect("A's opening is recorded")
+            .to_vec()
+    };
+
+    let lookup_key = a.outgoing_lookup_key(&b);
+    {
+        let mut net = dht.lock().expect("the network lock");
+        net.evict((CHANNEL, lookup_key, channel::CONTROL_SUBKEY));
+        net.evict((CHANNEL, lookup_key, channel::slot_for(2)));
+    }
+    let relaunched = a_fake.restart();
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    assert_eq!(
+        relaunched.calls().control_writes,
+        1,
+        "the lost control subkey is resealed"
+    );
+    assert_eq!(
+        relaunched.calls().ring_writes,
+        1,
+        "the lost slot is rewritten"
+    );
+    let before_delete = dht.lock().expect("the network lock").written.len();
+    aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(23),
+        peer: a_peer,
+    })
+    .await;
+    aw.wait_for("the delete's answer", |event| {
+        matches!(event, RunnerEvent::Deleted { token, peer }
+            if token.0 == 23 && *peer == a_peer)
+    })
+    .await;
+    assert_eq!(
+        relaunched.calls().control_writes,
+        2,
+        "the closed marker is written"
+    );
+    let marker: Vec<(Key, Vec<u8>)> = dht.lock().expect("the network lock").written
+        [before_delete..]
+        .iter()
+        .filter(|((kind, name, subkey), _)| {
+            *kind == CHANNEL && *name == a_lookup_key && *subkey == channel::CONTROL_SUBKEY
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        marker.len(),
+        1,
+        "the delete writes one control value, the closed marker"
+    );
+    assert!(finished(&aw.stop().await));
+
+    let keys = [&a.pk, &b.pk];
+    let windows = key_windows(&keys);
+    assert!(
+        key_hits(&opening, &windows, &keys).1,
+        "the scan finds an identity key whole in a plaintext opening"
+    );
+    assert!(
+        key_hits(&opening, &windows, &keys).0 >= 2 * (a.pk.len() - 31),
+        "the scan finds every window of both keys in a plaintext opening"
+    );
+
+    let written: Vec<(Key, Vec<u8>)> = dht
+        .lock()
+        .expect("the network lock")
+        .written
+        .iter()
+        .filter(|((kind, _, _), _)| *kind == CHANNEL || *kind == DROP)
+        .cloned()
+        .collect();
+    let control_writes = written
+        .iter()
+        .filter(|((kind, name, subkey), _)| {
+            *kind == CHANNEL && *name == lookup_key && *subkey == channel::CONTROL_SUBKEY
+        })
+        .count();
+    assert!(
+        written.iter().any(|((kind, _, _), _)| *kind == DROP),
+        "the hellos are among the values scanned"
+    );
+    assert_eq!(
+        control_writes,
+        setup_controls + 2,
+        "the setup's control writes, the reseal and the closed marker, and no other"
+    );
+    assert!(
+        written.contains(&marker[0]),
+        "the closed marker is among the values scanned"
+    );
+    for (key, value) in &written {
+        assert_eq!(
+            key_hits(value, &windows, &keys),
+            (0, false),
+            "no identity key in the value written to {key:?}"
+        );
+    }
 }
 
 /// The sequence numbers of every message from `from` among `events`.

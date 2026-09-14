@@ -335,7 +335,9 @@ async fn rendezvous_key_for(
     let key = api
         .get_dht_record_key(schema(shape)?, owner_key, None)
         .await
-        .map_err(|e| VeilidNetError::Routing(e.to_string()))?;
+        .map_err(|e| {
+            VeilidNetError::from_veilid("get_dht_record_key", e, VeilidNetError::Routing)
+        })?;
     Ok(RendezvousHandle::new(key, shape))
 }
 
@@ -384,7 +386,8 @@ pub const OPEN_TIMEOUT: std::time::Duration = SWEEP_GET_TIMEOUT;
 /// keeps two properties the callers depend on: it is **not** `KeyNotFound`, so
 /// [`open_or_create`] reads it as a transport fault and creates nothing, and it
 /// is the same error type a refusing open returns, so every caller's existing
-/// `Err` handling covers it and surfaces it as [`VeilidNetError::Routing`].
+/// `Err` handling covers it, and [`open_failure`] reports it as
+/// [`VeilidNetError::TimedOut`].
 async fn gated_bounded_open<T>(
     gate: &Arc<DhtGate>,
     what: &str,
@@ -405,6 +408,23 @@ async fn gated_bounded_open<T>(
             Err(veilid_core::VeilidAPIError::Timeout)
         }
     }
+}
+
+/// The error an open reports for anything but an absent record, as
+/// [`VeilidNetError::from_veilid`] classes it: Veilid's `Timeout`, which is also
+/// what [`gated_bounded_open`] returns for an open cut off at its bound, as
+/// [`VeilidNetError::TimedOut`], a local refusal as [`VeilidNetError::Local`],
+/// and every other refusal as [`VeilidNetError::Routing`]. Each names `what`,
+/// because the error itself does not say which open it was.
+pub(crate) fn open_failure(what: &str, error: veilid_core::VeilidAPIError) -> VeilidNetError {
+    VeilidNetError::from_veilid(what, error, VeilidNetError::Routing)
+}
+
+/// The error the call `what`, a subkey write or a record deletion, reports, as
+/// [`VeilidNetError::from_veilid`] classes it, with every refusal
+/// [`VeilidNetError::Send`].
+pub(crate) fn write_failure(what: &str, error: veilid_core::VeilidAPIError) -> VeilidNetError {
+    VeilidNetError::from_veilid(what, error, VeilidNetError::Send)
 }
 
 /// Open the circle's rendezvous record, creating it deterministically if it is
@@ -493,7 +513,7 @@ pub async fn open_or_create(
     .map(|_| handle)
     // Named, because an abandoned open surfaces as a bare `Timeout` that says
     // nothing about which open it was.
-    .map_err(|e| VeilidNetError::Routing(format!("open_or_create reopen: {e}")));
+    .map_err(|e| open_failure("open_or_create reopen", e));
     crate::vtrace!(
         "open_or_create: reopen {}",
         if r.is_ok() { "ok -> Ok" } else { "ERR" }
@@ -559,18 +579,29 @@ pub async fn open_only(
         rc.open_dht_record(key, Some(owner.clone())),
     )
     .await;
+    open_outcome("open_only", opened, handle)
+}
+
+/// What an open named `what` came to: `handle` where the record opened, `None`
+/// where Veilid holds no such record, and otherwise the open's failure as
+/// [`open_failure`] reports it.
+pub(crate) fn open_outcome<T, H>(
+    what: &str,
+    opened: std::result::Result<T, veilid_core::VeilidAPIError>,
+    handle: H,
+) -> Result<Option<H>> {
     match opened {
         Ok(_) => {
-            crate::vtrace!("open_only: open ok -> Some");
+            crate::vtrace!("{what}: open ok -> Some");
             Ok(Some(handle))
         }
         Err(veilid_core::VeilidAPIError::KeyNotFound { .. }) => {
-            crate::vtrace!("open_only: KeyNotFound -> None (absent, not created)");
+            crate::vtrace!("{what}: KeyNotFound -> None (absent, not created)");
             Ok(None)
         }
         Err(e) => {
-            crate::vtrace!("open_only: open failed ({e}) -> Err");
-            Err(VeilidNetError::Routing(format!("open_only: {e}")))
+            crate::vtrace!("{what}: open failed ({e}) -> Err");
+            Err(open_failure(what, e))
         }
     }
 }
@@ -622,20 +653,7 @@ pub async fn open_read_only(
     // function issues no gated GET, so the single-permit rule (CRSH-ISC-17) is
     // respected.
     let opened = gated_bounded_open(gate, "open_read_only", rc.open_dht_record(key, None)).await;
-    match opened {
-        Ok(_) => {
-            crate::vtrace!("open_read_only: open ok -> Some");
-            Ok(Some(handle))
-        }
-        Err(veilid_core::VeilidAPIError::KeyNotFound { .. }) => {
-            crate::vtrace!("open_read_only: KeyNotFound -> None (absent, not created)");
-            Ok(None)
-        }
-        Err(e) => {
-            crate::vtrace!("open_read_only: open failed ({e}) -> Err");
-            Err(VeilidNetError::Routing(format!("open_read_only: {e}")))
-        }
-    }
+    open_outcome("open_read_only", opened, handle)
 }
 
 /// A session cache of rendezvous records already opened, keyed by
@@ -1368,7 +1386,7 @@ pub async fn publish_at_subkey(
     )
     .await
     .map(|_| ())
-    .map_err(|e| VeilidNetError::Send(e.to_string()))
+    .map_err(|e| write_failure("set_dht_value", e))
 }
 
 /// The options every write here passes: the caller's own writer, and Veilid's
@@ -1525,7 +1543,7 @@ pub async fn delete_record(rc: &RoutingContext, handle: &RendezvousHandle) -> Re
     }
     rc.delete_dht_record(key)
         .await
-        .map_err(|e| VeilidNetError::Send(e.to_string()))
+        .map_err(|e| write_failure("delete_dht_record", e))
 }
 
 /// Forget the cached open handle for `id`, if there is one.
