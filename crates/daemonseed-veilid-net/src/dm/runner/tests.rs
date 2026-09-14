@@ -142,6 +142,8 @@ struct Calls {
     control_writes: usize,
     advert_publishes: usize,
     open_channel: usize,
+    open_existing: usize,
+    erases: usize,
     channel_reads: usize,
     inspect_channel: usize,
     inspect_advert: usize,
@@ -215,6 +217,13 @@ struct Faults {
     fail_write_at: Option<usize>,
     /// Refuse every channel erasure.
     fail_erase: bool,
+    /// The channels this run opened, where set, as the record store holds them:
+    /// a channel write or erase is refused locally unless its channel is here,
+    /// a refused erase keeps the channel, and one that goes through ends it.
+    owned: Option<HashSet<[u8; HELLO_LOOKUP_KEY_LEN]>>,
+    /// Answer an open without create with a lookup key other than the one the
+    /// owner seed derives.
+    open_under_other_key: bool,
     /// Refuse every drop slot write.
     fail_drop_writes: bool,
     /// Fail every inspect, as a node that cannot ask the network does.
@@ -363,6 +372,22 @@ impl Fake {
             .collect())
     }
 
+    /// Record a channel this run opened, where ownership is tracked.
+    fn hold(&self, lookup_key: [u8; HELLO_LOOKUP_KEY_LEN]) {
+        if let Some(owned) = self.faults().owned.as_mut() {
+            owned.insert(lookup_key);
+        }
+    }
+
+    /// Refuse locally a write or erase of a channel this run did not open,
+    /// where ownership is tracked.
+    fn refuse_unheld(&self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> Result<(), RecordError> {
+        match &self.faults().owned {
+            Some(owned) if !owned.contains(lookup_key) => Err(RecordError::new(LocalRefusal(2))),
+            _ => Ok(()),
+        }
+    }
+
     /// A channel's lookup key: a function of the owner seed that is not the
     /// seed itself.
     fn lookup_key(owner: &ChannelOwnerSeed) -> [u8; HELLO_LOOKUP_KEY_LEN] {
@@ -458,7 +483,9 @@ impl Records for Fake {
     ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
         self.count(|calls| calls.open_channel += 1);
         self.inject(CHANNEL, Op::Open)?;
-        Ok(Self::lookup_key(owner))
+        let lookup_key = Self::lookup_key(owner);
+        self.hold(lookup_key);
+        Ok(lookup_key)
     }
 
     fn read_channel(
@@ -486,6 +513,7 @@ impl Records for Fake {
         } else {
             self.count(|calls| calls.ring_writes += 1);
         }
+        self.refuse_unheld(lookup_key)?;
         self.write((CHANNEL, *lookup_key, subkey), bytes.to_vec())
     }
 }
@@ -539,6 +567,8 @@ impl RunnerRecords for Fake {
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> Result<(), RecordError> {
+        self.count(|calls| calls.erases += 1);
+        self.refuse_unheld(lookup_key)?;
         if self.faults().fail_erase {
             return Err(RecordError::new(Refused));
         }
@@ -551,7 +581,41 @@ impl RunnerRecords for Fake {
             .expect("the node lock")
             .local
             .retain(|(kind, name, _), _| !(*kind == CHANNEL && name == lookup_key));
+        if let Some(owned) = self.faults().owned.as_mut() {
+            owned.remove(lookup_key);
+        }
         Ok(())
+    }
+
+    fn open_existing_channel(
+        &mut self,
+        owner: &ChannelOwnerSeed,
+        _subkeys: u16,
+    ) -> Result<Option<[u8; HELLO_LOOKUP_KEY_LEN]>, RecordError> {
+        self.count(|calls| calls.open_existing += 1);
+        self.inject(CHANNEL, Op::Open)?;
+        let lookup_key = Self::lookup_key(owner);
+        let on_network = self
+            .net()
+            .records
+            .keys()
+            .any(|(kind, name, _)| *kind == CHANNEL && *name == lookup_key);
+        let on_node = self
+            .node
+            .lock()
+            .expect("the node lock")
+            .local
+            .keys()
+            .any(|(kind, name, _)| *kind == CHANNEL && *name == lookup_key);
+        if !on_network && !on_node {
+            return Ok(None);
+        }
+        let mut lookup_key = lookup_key;
+        if self.faults().open_under_other_key {
+            lookup_key[0] ^= 0xff;
+        }
+        self.hold(lookup_key);
+        Ok(Some(lookup_key))
     }
 
     fn classify(error: &RecordError) -> RecordFailure {
@@ -3008,6 +3072,431 @@ async fn a_delete_is_answered_and_stops_on_any_refused_write() {
     assert_eq!(refusal(&aw.seen[at]), Refusal::UnknownConversation);
     assert!(finished(&aw.stop().await));
     assert!(finished(&bw.stop().await));
+}
+
+/// Mark `peer`'s conversation in `profile`'s store for delete, as a teardown
+/// does before its erase.
+fn mark_for_delete(profile: &Profile, peer: CorrespondenceLabel) {
+    let store = Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("the store opens");
+    delivery::prepare_delete(&store, &peer, false).expect("the conversation is marked");
+}
+
+/// The conversations `profile`'s store holds marked for delete.
+fn pending_deletes(profile: &Profile) -> Vec<CorrespondenceLabel> {
+    let store = Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("the store opens");
+    store
+        .pending_deletes()
+        .expect("the store lists its pending deletes")
+}
+
+/// Whether `event` is a roster that does not list `peer`.
+fn roster_without(event: &RunnerEvent, peer: CorrespondenceLabel) -> bool {
+    matches!(event, RunnerEvent::Roster(rows) if rows.iter().all(|row| row.peer != peer))
+}
+
+/// Whether `event` is a roster that lists `peer`.
+fn roster_with(event: &RunnerEvent, peer: CorrespondenceLabel) -> bool {
+    matches!(event, RunnerEvent::Roster(rows) if rows.iter().any(|row| row.peer == peer))
+}
+
+/// `fake` relaunched holding channels as the record store does: a channel
+/// write or erase needs a channel this run opened, a refused erase keeps it,
+/// and `fail_erase` refuses every erase.
+fn relaunch_owning(fake: &Fake, fail_erase: bool) -> Fake {
+    let relaunched = fake.restart();
+    {
+        let mut faults = relaunched.faults();
+        faults.owned = Some(HashSet::new());
+        faults.fail_erase = fail_erase;
+    }
+    relaunched
+}
+
+/// The one conversation `profile`'s store holds.
+fn only_conversation(profile: &Profile) -> CorrespondenceLabel {
+    let store = Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("the store opens");
+    let loaded = store.load().expect("the store loads");
+    assert_eq!(loaded.convs.len(), 1, "the store holds one conversation");
+    loaded.convs[0].peer
+}
+
+/// A delete command whose erase is refused keeps the conversation marked, and
+/// the repair poll in the same run finishes it, reporting a roster without the
+/// conversation and no `Deleted`.
+#[tokio::test(start_paused = true)]
+async fn a_refused_delete_command_is_finished_by_the_repair_poll() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+    let relaunched = relaunch_owning(&a_fake, false);
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+
+    relaunched.faults().fail_erase = true;
+    aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(51),
+        peer: a_peer,
+    })
+    .await;
+    let at = aw
+        .wait_for("the delete's answer", |event| {
+            refused(51)(event)
+                || matches!(event, RunnerEvent::Deleted { token, .. } if token.0 == 51)
+        })
+        .await;
+    assert_eq!(refusal(&aw.seen[at]), Refusal::Network);
+    assert_eq!(
+        pending_deletes(&a),
+        vec![a_peer],
+        "the conversation stays marked"
+    );
+
+    relaunched.faults().fail_erase = false;
+    tokio::time::sleep(delivery::POLL_INTERVAL_MAX * 2).await;
+    aw.drain();
+    let after = &aw.seen[at + 1..];
+    assert!(
+        after.iter().any(|event| roster_without(event, a_peer)),
+        "the repair poll finishes the delete: {after:?}"
+    );
+    assert!(
+        !after
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::Deleted { .. })),
+        "and no Deleted follows: {after:?}"
+    );
+    let lookup_key = a.outgoing_lookup_key(&b);
+    assert!(
+        !dht.lock()
+            .expect("the network lock")
+            .records
+            .keys()
+            .any(|(kind, name, _)| *kind == CHANNEL && *name == lookup_key),
+        "the channel is erased"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(pending_deletes(&a).is_empty(), "no delete is left pending");
+}
+
+/// A marked conversation whose channel opens under a lookup key other than the
+/// one it recorded has the mismatch counted, erases nothing, and stays marked
+/// with its channel on the network.
+#[tokio::test(start_paused = true)]
+async fn a_marked_channel_opened_under_another_key_is_not_erased() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+    mark_for_delete(&a, a_peer);
+
+    let relaunched = relaunch_owning(&a_fake, false);
+    relaunched.faults().open_under_other_key = true;
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    assert!(
+        health(&aw.seen[at]).channel_open_failures >= 1,
+        "the mismatch is counted: {:?}",
+        aw.seen[at]
+    );
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+    assert!(
+        !aw.seen.iter().any(|event| roster_without(event, a_peer)),
+        "the conversation stays on the roster: {:?}",
+        aw.seen
+    );
+    assert_eq!(relaunched.calls().erases, 0, "no channel is erased");
+    let lookup_key = a.outgoing_lookup_key(&b);
+    assert!(
+        dht.lock()
+            .expect("the network lock")
+            .records
+            .keys()
+            .any(|(kind, name, _)| *kind == CHANNEL && *name == lookup_key),
+        "the recorded channel stays on the network"
+    );
+    assert!(finished(&aw.stop().await));
+    assert_eq!(
+        pending_deletes(&a),
+        vec![a_peer],
+        "the conversation stays marked"
+    );
+}
+
+/// An acceptance left pending on a conversation marked for delete is not
+/// carried on: the next launch reads no ring, writes nothing for it and
+/// surfaces no message, and finishes the delete.
+#[tokio::test(start_paused = true)]
+async fn a_marked_pending_acceptance_is_not_carried_on_and_its_delete_finishes() {
+    let (_a, b, b_fake) = leave_an_acceptance_pending().await;
+    let peer = only_conversation(&b);
+    mark_for_delete(&b, peer);
+
+    let relaunched = relaunch_owning(&b_fake, false);
+    let mut bw = b.spawn(&relaunched, RunnerConfig::default());
+    let at = bw.wait_for("B's relaunch", is_health).await;
+    assert!(
+        bw.seen[..at]
+            .iter()
+            .any(|event| roster_without(event, peer)),
+        "the launch finishes the delete: {:?}",
+        bw.seen
+    );
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    bw.drain();
+    assert!(
+        !bw.seen
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::Message { .. })),
+        "no message surfaces: {:?}",
+        bw.seen
+    );
+    let calls = relaunched.calls();
+    assert_eq!(
+        (calls.channel_reads, calls.ring_writes, calls.control_writes),
+        (0, 0, 0),
+        "no ring is read and no acceptance is written"
+    );
+    assert!(finished(&bw.stop().await));
+    assert!(pending_deletes(&b).is_empty(), "no delete is left pending");
+}
+
+/// A conversation marked for delete whose channel was erased before the stop
+/// is finished by the next launch, before its first health report: it leaves
+/// the roster, nothing is written for it, and no delete is left pending.
+#[tokio::test(start_paused = true)]
+async fn a_delete_stopped_after_its_erase_is_finished_by_the_next_launch() {
+    let Scene {
+        a,
+        b,
+        a_fake,
+        aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+    mark_for_delete(&a, a_peer);
+    assert!(
+        RunnerRecords::erase_channel(&mut a_fake.clone(), &a.outgoing_lookup_key(&b)).is_ok(),
+        "the channel is erased"
+    );
+
+    let relaunched = relaunch_owning(&a_fake, false);
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    assert!(
+        !roster_without(&aw.seen[0], a_peer),
+        "the launch roster still lists the conversation: {:?}",
+        aw.seen
+    );
+    assert!(
+        aw.seen[1..at]
+            .iter()
+            .any(|event| roster_without(event, a_peer)),
+        "the conversation leaves the roster during the launch: {:?}",
+        aw.seen
+    );
+    let calls = relaunched.calls();
+    assert_eq!(
+        (calls.hello_writes, calls.ring_writes, calls.control_writes),
+        (0, 0, 0),
+        "nothing is written for the conversation"
+    );
+    assert_eq!(
+        (calls.open_channel, calls.open_existing),
+        (0, 1),
+        "the channel record is looked for without being created"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(pending_deletes(&a).is_empty(), "no delete is left pending");
+}
+
+/// A launch whose erase of a marked conversation's channel is refused leaves
+/// the conversation marked and on the roster, and looks at, reads and writes
+/// nothing for it; once the network takes the erase, the repair poll finishes
+/// the delete in the same run.
+#[tokio::test(start_paused = true)]
+async fn a_delete_whose_erase_is_refused_at_launch_is_finished_by_the_repair_poll() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        mut aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    // A message B has not collected leaves a cursor for collection to read.
+    assert!(finished(&bw.stop().await));
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(9),
+        peer: a_peer,
+        body: b"uncollected".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's message", sent(9)).await;
+    assert!(finished(&aw.stop().await));
+    mark_for_delete(&a, a_peer);
+    let lookup_key = a.outgoing_lookup_key(&b);
+    // A control subkey the network has lost is one a rewrite would put back.
+    a_fake
+        .net()
+        .evict((CHANNEL, lookup_key, channel::CONTROL_SUBKEY));
+
+    let relaunched = relaunch_owning(&a_fake, true);
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(10),
+        peer: a_peer,
+        body: b"to a conversation being deleted".to_vec(),
+    })
+    .await;
+    let at = aw
+        .wait_for("the answer to the send", |event| {
+            sent(10)(event) || refused(10)(event)
+        })
+        .await;
+    assert_eq!(refusal(&aw.seen[at]), Refusal::UnknownConversation);
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+    assert!(
+        aw.seen.iter().any(|event| roster_with(event, a_peer)),
+        "a roster listing the conversation is seen: {:?}",
+        aw.seen
+    );
+    assert!(
+        !aw.seen.iter().any(|event| roster_without(event, a_peer)),
+        "the conversation stays on the roster: {:?}",
+        aw.seen
+    );
+    assert_eq!(pending_deletes(&a), vec![a_peer], "and stays marked");
+    let calls = relaunched.calls();
+    assert_eq!(
+        (
+            calls.ring_writes,
+            calls.control_writes,
+            calls.inspect_channel,
+            calls.channel_reads
+        ),
+        (0, 0, 0, 0),
+        "nothing is looked at, read or written for the conversation"
+    );
+
+    relaunched.faults().fail_erase = false;
+    tokio::time::sleep(delivery::POLL_INTERVAL_MAX * 2).await;
+    aw.drain();
+    assert!(
+        aw.seen.iter().any(|event| roster_without(event, a_peer)),
+        "the repair poll finishes the delete: {:?}",
+        aw.seen
+    );
+    assert!(
+        !dht.lock()
+            .expect("the network lock")
+            .records
+            .keys()
+            .any(|(kind, name, _)| *kind == CHANNEL && *name == lookup_key),
+        "the channel is erased"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(pending_deletes(&a).is_empty(), "no delete is left pending");
+}
+
+/// A marked conversation still awaiting acceptance, relaunched with its erase
+/// refused, has its outstanding hello neither looked at nor rewritten, and the
+/// acceptance the correspondent wrote meanwhile is not counted as unsettled.
+#[tokio::test(start_paused = true)]
+async fn a_marked_first_contact_is_left_alone_while_its_erase_is_refused() {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let mut bw = b.spawn(&Fake::on(&dht), RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    let at = aw.wait_for("A's first contact", sent(1)).await;
+    let a_peer = sent_peer(&aw.seen[at]);
+    assert!(finished(&aw.stop().await));
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's acceptance", sent(2)).await;
+    assert!(finished(&bw.stop().await));
+    mark_for_delete(&a, a_peer);
+
+    let relaunched = relaunch_owning(&a_fake, true);
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+    let calls = relaunched.calls();
+    assert_eq!(
+        (
+            calls.hello_writes,
+            calls.inspect_drop,
+            calls.ring_writes,
+            calls.control_writes,
+            calls.inspect_channel
+        ),
+        (0, 0, 0, 0, 0),
+        "the marked conversation's hello and channel are left alone"
+    );
+    let reports: Vec<HealthCounters> = aw
+        .seen
+        .iter()
+        .filter(|e| is_health(e))
+        .map(health)
+        .collect();
+    assert!(!reports.is_empty(), "a health report is seen");
+    assert!(
+        reports
+            .iter()
+            .all(|counters| counters.hellos_unsettled == 0),
+        "the acceptance for the marked conversation is not counted unsettled: {reports:?}"
+    );
+    assert_eq!(
+        pending_deletes(&a),
+        vec![a_peer],
+        "the conversation stays marked"
+    );
+    assert!(finished(&aw.stop().await));
 }
 
 /// Shutdown returns within the grace period while a record call is blocked, and

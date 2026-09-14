@@ -870,6 +870,12 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- `daemonseed-veilid-net`: the DM runner finishes at launch every conversation delete a previous run marked and did
+  not finish, whatever the block list holds, opening the channel record without creating it and erasing it where
+  this node still holds it; a delete that stops short keeps the mark, and the repair poll retries it in the same run
+  and reports the finish with a `Roster`. Launch passes and collection skip a marked conversation, a command on one
+  is refused `UnknownConversation`, and a hello for one is not counted in `hellos_unsettled`. `RunnerRecords` gains
+  `open_existing_channel`, and `VeilidRecords::erase_channel` keeps the channel open when the erase fails.
 - Record opens release their un-gated permit and the caller's record lock on timeout instead of holding both across an unanswered open (#430)
 - DM key-record and ack fetches release their read-pool permit on timeout instead of holding it across an unanswered read (#411)
 - `daemonseed-tui`: a graceful close publishes a LEAVE tombstone for every joined circle as well as

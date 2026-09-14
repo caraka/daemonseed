@@ -481,16 +481,17 @@ impl VeilidRecords {
     /// record ends because nobody rewrites it. A caller that wants the
     /// correspondent to see the conversation closed writes the marker first,
     /// through [`Records::write_channel`].
+    ///
+    /// **A failed erase keeps the channel open.** The owner keypair stays held,
+    /// so the delete can be retried in the same process. An erase that went
+    /// through ends the channel, and this side does not write it again.
     pub fn erase_channel(
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> core::result::Result<(), RecordError> {
         let (kind, write) = channel_erase_write(self.own(lookup_key)?);
         let erased = self.write(*lookup_key, kind, write);
-        // Dropped whatever the write did. A channel this side has stopped
-        // writing is one it must not write again, and a delete that failed has
-        // still closed the record this node held open.
-        self.own_channels.remove(lookup_key);
+        release_erased(&mut self.own_channels, lookup_key, &erased);
         erased
     }
 
@@ -1083,6 +1084,55 @@ impl RunnerRecords for VeilidRecords {
         VeilidRecords::erase_channel(self, lookup_key)
     }
 
+    /// Open the channel record the seed owns without creating it. `None` is
+    /// Veilid finding no such record, which is not evidence that no node holds
+    /// one; a record this node does not hold has no local copy to erase.
+    fn open_existing_channel(
+        &mut self,
+        owner: &ChannelOwnerSeed,
+        subkeys: u16,
+    ) -> core::result::Result<Option<[u8; HELLO_LOOKUP_KEY_LEN]>, RecordError> {
+        let (shape, keypair, lookup_key) = channel_open_plan(owner.as_bytes(), subkeys)?;
+        let transport = &self.transport;
+        let opening = keypair.clone();
+        let opened = block(retry_transient(
+            "dm records channel open without create",
+            || {
+                let opening = opening.clone();
+                async move {
+                    let record_lock =
+                        rendezvous::record_lock(&transport.record_locks, &opening.key());
+                    let _open_guard = record_lock.lock().await;
+                    rendezvous::open_cached_optional(
+                        &transport.opened,
+                        &rendezvous::cached_record_id(&opening.key(), shape),
+                        rendezvous::open_only(
+                            &transport.gate,
+                            &transport.api,
+                            &transport.rc,
+                            &opening,
+                            shape,
+                        ),
+                    )
+                    .await
+                    .map(|handle| handle.is_some())
+                }
+            },
+        ))
+        .map_err(RecordError::new)?;
+        if !opened {
+            return Ok(None);
+        }
+        self.own_channels.insert(
+            lookup_key,
+            OwnChannel {
+                owner: keypair,
+                shape,
+            },
+        );
+        Ok(Some(lookup_key))
+    }
+
     fn write_counts(&self) -> WriteCountsSnapshot {
         VeilidRecords::write_counts(self)
     }
@@ -1365,6 +1415,17 @@ fn subkey_write(
             },
         },
     ))
+}
+
+/// Stop holding a channel whose erase went through, and keep one whose erase failed.
+fn release_erased(
+    own_channels: &mut HashMap<[u8; HELLO_LOOKUP_KEY_LEN], OwnChannel>,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    erased: &core::result::Result<(), RecordError>,
+) {
+    if erased.is_ok() {
+        own_channels.remove(lookup_key);
+    }
 }
 
 /// The kind and dispatch token for erasing a channel record this side owns.
@@ -2573,6 +2634,26 @@ mod tests {
         assert!(
             write.confirm_target().is_none(),
             "and has no network state to wait for"
+        );
+    }
+
+    /// A channel whose erase failed stays held, so the delete can be retried,
+    /// and one whose erase went through is released.
+    #[test]
+    fn a_failed_channel_erase_keeps_the_channel_and_a_successful_one_releases_it() {
+        let (shape, owner, lookup_key) =
+            channel_open_plan(&SEED, CHANNEL_SUBKEYS).expect("the plan shapes");
+        let mut own = HashMap::from([(lookup_key, OwnChannel { owner, shape })]);
+        let refused = Err(RecordError::new(RecordsError::ChannelNotOpened));
+        release_erased(&mut own, &lookup_key, &refused);
+        assert!(
+            own.contains_key(&lookup_key),
+            "a failed erase keeps the channel"
+        );
+        release_erased(&mut own, &lookup_key, &Ok(()));
+        assert!(
+            !own.contains_key(&lookup_key),
+            "an erase that went through releases it"
         );
     }
 

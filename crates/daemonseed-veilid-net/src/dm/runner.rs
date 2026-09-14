@@ -13,7 +13,8 @@
 //! ## Startup
 //!
 //! Once the store has loaded, the task reports the [`RunnerEvent::Roster`],
-//! reopens every channel this side owns, restores or mints the advert keys and
+//! reopens every channel this side owns, finishes every conversation delete a
+//! previous run marked and did not finish, restores or mints the advert keys and
 //! repairs the advert, and scans the drop. Only then does it look at what a
 //! previous run left: a first contact or an acceptance that stopped part way
 //! is carried on, an outstanding hello is re-encapsulated where it is still
@@ -21,6 +22,13 @@
 //! control subkey and outstanding message slot the network reports lost is
 //! rewritten. The scan comes first because a hello the correspondent has
 //! already accepted must be recognised, not re-encapsulated.
+//!
+//! A delete is finished without a closed marker and whatever the block list
+//! holds, since tearing a conversation down surfaces nothing. Its channel record
+//! is opened without being created, and a record this node no longer holds
+//! leaves nothing to erase. A delete that stops short keeps its mark: every later
+//! launch pass and collection skips the conversation, and each repair look in the
+//! same run retries the delete and nothing else.
 //!
 //! ## Schedule
 //!
@@ -212,9 +220,22 @@ pub trait RunnerRecords: Records {
         bytes: &[u8],
     ) -> Result<(), RecordError>;
 
-    /// Erase a channel record this side owns.
+    /// Erase a channel record this side owns. Where the erase fails, the
+    /// channel stays open, so a retry can erase it.
     fn erase_channel(&mut self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN])
         -> Result<(), RecordError>;
+
+    /// The lookup key of the channel record the seed owns, opening it without
+    /// creating it, or `None` where this node holds no such record. The default
+    /// opens it as [`Records::open_channel`] does, creating an absent record; a
+    /// store that can open without creating overrides it.
+    fn open_existing_channel(
+        &mut self,
+        owner: &ChannelOwnerSeed,
+        subkeys: u16,
+    ) -> Result<Option<[u8; HELLO_LOOKUP_KEY_LEN]>, RecordError> {
+        self.open_channel(owner, subkeys).map(Some)
+    }
 
     /// How many writes of each kind this store has submitted.
     fn write_counts(&self) -> WriteCountsSnapshot;
@@ -398,7 +419,12 @@ pub enum RunnerCommand {
         peer: IdentityPk,
     },
     /// Delete a conversation: write the closed marker, erase this side's
-    /// channel and drop the local records.
+    /// channel and drop the local records. A delete that a stop, a refused
+    /// marker write, a refused erase or a refused removal of the local records
+    /// leaves unfinished keeps the conversation marked, and the repair poll in
+    /// the same run, or the next launch, finishes it without the marker. That
+    /// finish is reported by a [`RunnerEvent::Roster`] without the conversation,
+    /// and no [`RunnerEvent::Deleted`] follows.
     DeleteConversation {
         /// Echoed on the answer.
         token: CommandToken,
@@ -476,7 +502,7 @@ impl core::fmt::Debug for ConversationSummary {
 /// Why a command did not go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// No conversation under that label.
+    /// No conversation under that label, or a delete of it is under way.
     UnknownConversation,
     /// No held request under that id in this run.
     UnknownRequest,
@@ -577,7 +603,8 @@ pub struct HealthCounters {
     pub hellos_dropped: u64,
     /// Rewrites of a hello already collected, erased.
     pub hellos_already_collected: u64,
-    /// Verified hellos a scan could not settle.
+    /// Verified hellos a scan could not settle, not counting a hello for a
+    /// conversation whose delete is under way.
     pub hellos_unsettled: u64,
     /// Flow calls on a conversation that failed for a reason other than the
     /// record store or the local store.
@@ -1339,6 +1366,21 @@ impl<R: RunnerRecords> Tracked<R> {
             |h| &mut h.channel_erase_timeouts,
         )
     }
+
+    fn open_existing_channel(
+        &mut self,
+        owner: &ChannelOwnerSeed,
+        subkeys: u16,
+    ) -> Result<Option<[u8; HELLO_LOOKUP_KEY_LEN]>, RecordError> {
+        let result = self.inner.open_existing_channel(owner, subkeys);
+        tally(
+            result,
+            R::classify,
+            &mut self.health,
+            |h| &mut h.channel_open_failures,
+            |h| &mut h.channel_open_timeouts,
+        )
+    }
 }
 
 /// Why the block list could not be read or changed.
@@ -1471,12 +1513,14 @@ fn first_contact_incomplete(state: &ConvState) -> bool {
     state.awaiting_acceptance && state.outstanding_hello.is_none()
 }
 
-/// Whether a conversation has anything the repair poll looks after.
+/// Whether a conversation has anything the repair poll looks after, a delete
+/// under way included.
 fn outstanding(conv: &LoadedConv) -> bool {
     conv.state.outstanding_hello.is_some()
         || !conv.outstanding_outbox.is_empty()
         || first_contact_incomplete(&conv.state)
         || conv.state.acceptance_pending
+        || conv.state.delete_pending
 }
 
 /// The roster rows for `convs`.
@@ -1503,7 +1547,9 @@ fn summaries(convs: &[LoadedConv]) -> Vec<ConversationSummary> {
 /// The refusal a front end is given for a flow's error.
 fn refusal_for(error: &FlowError) -> Refusal {
     match error {
-        FlowError::Store(StoreError::MissingConversation) => Refusal::UnknownConversation,
+        FlowError::Store(StoreError::MissingConversation) | FlowError::DeletePending => {
+            Refusal::UnknownConversation
+        }
         FlowError::Store(_) => Refusal::Store,
         FlowError::Channel(ChannelError::RingFull { .. }) => Refusal::RingFull,
         FlowError::AwaitingAcceptance => Refusal::AwaitingAcceptance,
@@ -1537,6 +1583,23 @@ fn own_control(
     let key = state.own_control_key.as_ref()?;
     let opening = ChannelOpening::decode(state.own_opening.as_ref()?.as_slice()).ok()?;
     channel::seal_control_with_key(key, &build(opening)).ok()
+}
+
+/// Where a teardown stopped before the local records were dropped. A stop
+/// after the conversation was marked leaves the mark for the next attempt.
+enum TeardownStop {
+    /// No conversation record under that label.
+    Missing,
+    /// The local store refused while marking the conversation, whose mark may
+    /// or may not have reached the disk.
+    Unmarked,
+    /// The local store refused after the conversation was marked.
+    Store,
+    /// The channel could not be named locally: its owner seed would not derive,
+    /// or the record opened under a lookup key other than the one recorded.
+    Local,
+    /// The record store refused the closed marker, the open or the erase.
+    Network,
 }
 
 /// The closed-marker control record for a conversation being deleted.
@@ -1673,6 +1736,7 @@ impl<R: RunnerRecords> Runner<R> {
             }
         }
         runner.reopen_channels(&loaded.convs)?;
+        runner.resume_deletes().await?;
         runner.refresh_advert(minted);
         runner.answering = None;
         runner.scan_drop().await?;
@@ -1858,12 +1922,14 @@ impl<R: RunnerRecords> Runner<R> {
             .fold(self.next_tick.min(self.next_advert_poll), Instant::min)
     }
 
-    /// Open every channel this side owns, so the record store can write it.
+    /// Open every channel this side owns, so the record store can write it. A
+    /// conversation whose delete is under way is left to its teardown, which
+    /// opens the record without creating it.
     fn reopen_channels(&mut self, convs: &[LoadedConv]) -> Result<(), Halt> {
         for conv in convs {
             self.check_stop()?;
             let stored = conv.state.outgoing_lookup_key;
-            if stored == NO_LOOKUP_KEY {
+            if stored == NO_LOOKUP_KEY || conv.state.delete_pending {
                 continue;
             }
             let Ok(owner) = channel::derive_owner_seed(
@@ -2044,8 +2110,52 @@ impl<R: RunnerRecords> Runner<R> {
         Ok(Some(blocked))
     }
 
+    /// Finish every conversation delete a previous run marked and did not
+    /// finish, without a closed marker, before anything else is written for it.
+    /// The block list is not consulted. A delete that stops short keeps its
+    /// mark, and the launch's rescheduling puts it on the repair schedule.
+    async fn resume_deletes(&mut self) -> Result<(), Halt> {
+        let pending = match self.store.pending_deletes() {
+            Ok(pending) => pending,
+            Err(_) => {
+                self.records.health.store_failures += 1;
+                return Ok(());
+            }
+        };
+        let mut finished = false;
+        for peer in pending {
+            self.check_stop()?;
+            finished |= self.resume_delete(&peer);
+        }
+        if finished {
+            self.emit_roster().await?;
+        }
+        Ok(())
+    }
+
+    /// Carry on one marked conversation's teardown, returning whether its
+    /// records are gone.
+    fn resume_delete(&mut self, peer: &CorrespondenceLabel) -> bool {
+        match self.teardown(peer, false) {
+            Ok(()) => true,
+            Err(TeardownStop::Missing) => {
+                self.repairs.remove(peer);
+                true
+            }
+            Err(TeardownStop::Unmarked | TeardownStop::Store) => {
+                self.records.health.store_failures += 1;
+                false
+            }
+            // Counted where the channel failed to name itself.
+            Err(TeardownStop::Local) => false,
+            Err(TeardownStop::Network) => false,
+        }
+    }
+
     /// Carry on a first contact or an acceptance a previous call stopped part
     /// way.
+    ///
+    /// Nothing is carried on for a conversation whose delete is under way.
     ///
     /// An acceptance is left pending, untouched, while the block list will not
     /// read or while it lists the correspondent: finishing it reads the
@@ -2055,6 +2165,9 @@ impl<R: RunnerRecords> Runner<R> {
         self.check_stop()?;
         let state = &conv.state;
         let peer = conv.peer;
+        if state.delete_pending {
+            return Ok(());
+        }
         if first_contact_incomplete(state) {
             // The record already holds sequence 0, the encapsulation and the
             // opening, so the flow only redoes writes.
@@ -2132,8 +2245,9 @@ impl<R: RunnerRecords> Runner<R> {
     ///
     /// Called only after a drop scan, so a hello the correspondent has already
     /// accepted has been recognised and is no longer awaiting acceptance.
+    /// Nothing is looked at for a conversation whose delete is under way.
     fn rewrite_hello(&mut self, peer: &CorrespondenceLabel, state: &ConvState) {
-        if state.outstanding_hello.is_none() || self.stopping() {
+        if state.outstanding_hello.is_none() || state.delete_pending || self.stopping() {
             return;
         }
         // An acceptor learns its hello back was read only from the
@@ -2251,10 +2365,11 @@ impl<R: RunnerRecords> Runner<R> {
 
     /// Rewrite this side's channel where the network has lost it: the control
     /// subkey, resealed from the conversation record, and every outstanding
-    /// message slot, from the outbox.
+    /// message slot, from the outbox. Nothing is looked at for a conversation
+    /// whose delete is under way.
     fn rewrite_evicted(&mut self, state: &ConvState, entries: &[OutboxEntry]) {
         let lookup_key = state.outgoing_lookup_key;
-        if lookup_key == NO_LOOKUP_KEY {
+        if state.delete_pending || lookup_key == NO_LOOKUP_KEY {
             return;
         }
         let has_control = state.own_control_key.is_some() && state.own_opening.is_some();
@@ -2536,45 +2651,112 @@ impl<R: RunnerRecords> Runner<R> {
     }
 
     async fn delete(&mut self, token: CommandToken, peer: CorrespondenceLabel) -> Result<(), Halt> {
-        let erase = match delivery::prepare_delete(&self.store, &peer, true) {
-            Ok(erase) => erase,
-            Err(StoreError::MissingConversation) => {
+        let refusal = match self.teardown(&peer, true) {
+            Ok(()) => {
+                self.emit(RunnerEvent::Deleted { token, peer }).await?;
+                return self.emit_roster().await;
+            }
+            Err(TeardownStop::Missing) => {
                 return self.refuse(Some(token), Refusal::UnknownConversation).await
             }
-            Err(_) => return self.refuse(Some(token), Refusal::Store).await,
+            Err(TeardownStop::Unmarked) => {
+                // A refused write of the mark may still have reached the disk.
+                if matches!(self.store.load_conv(&peer), Ok(Some(state)) if state.delete_pending) {
+                    self.ensure_repair(peer);
+                }
+                return self.refuse(Some(token), Refusal::Store).await;
+            }
+            Err(TeardownStop::Store) => Refusal::Store,
+            Err(TeardownStop::Local) => Refusal::Flow,
+            Err(TeardownStop::Network) => Refusal::Network,
+        };
+        // The conversation is marked, so the repair poll finishes the delete.
+        self.ensure_repair(peer);
+        self.refuse(Some(token), refusal).await
+    }
+
+    /// Tear a conversation down: mark it delete-pending, write the closed
+    /// marker where `closed_marker` asks for one, erase this side's channel,
+    /// drop the local records and take the conversation off the schedule.
+    ///
+    /// Without the marker, the channel record is first opened without being
+    /// created: the delete may be a retry in a process that has not opened the
+    /// channel, or one after an erase that went through. A record this node
+    /// does not hold leaves nothing to erase.
+    fn teardown(
+        &mut self,
+        peer: &CorrespondenceLabel,
+        closed_marker: bool,
+    ) -> Result<(), TeardownStop> {
+        let erase = match delivery::prepare_delete(&self.store, peer, closed_marker) {
+            Ok(erase) => erase,
+            Err(StoreError::MissingConversation) => return Err(TeardownStop::Missing),
+            Err(_) => return Err(TeardownStop::Unmarked),
         };
         if erase.lookup_key != NO_LOOKUP_KEY {
-            let state = match self.store.load_conv(&peer) {
+            let state = match self.store.load_conv(peer) {
                 Ok(Some(state)) => state,
-                Ok(None) => return self.refuse(Some(token), Refusal::UnknownConversation).await,
-                Err(_) => return self.refuse(Some(token), Refusal::Store).await,
+                Ok(None) => return Err(TeardownStop::Missing),
+                Err(_) => return Err(TeardownStop::Store),
             };
-            if let Some(marker) = erase.marker {
-                match closed_control(&state, marker) {
-                    Some(control) => {
-                        let written = self.records.write_channel(
-                            &erase.lookup_key,
-                            channel::CONTROL_SUBKEY,
-                            &control,
-                        );
-                        if written.is_err() {
-                            return self.refuse(Some(token), Refusal::Network).await;
+            let held = match erase.marker {
+                Some(marker) => {
+                    match closed_control(&state, marker) {
+                        Some(control) => {
+                            let written = self.records.write_channel(
+                                &erase.lookup_key,
+                                channel::CONTROL_SUBKEY,
+                                &control,
+                            );
+                            if written.is_err() {
+                                return Err(TeardownStop::Network);
+                            }
                         }
+                        None => self.records.health.conversation_failures += 1,
                     }
-                    None => self.records.health.conversation_failures += 1,
+                    true
                 }
-            }
-            if self.records.erase_channel(&erase.lookup_key).is_err() {
-                return self.refuse(Some(token), Refusal::Network).await;
+                None => self.open_channel_if_held(&state)?,
+            };
+            if held && self.records.erase_channel(&erase.lookup_key).is_err() {
+                return Err(TeardownStop::Network);
             }
         }
-        if delivery::finish_delete(&self.store, &peer).is_err() {
-            return self.refuse(Some(token), Refusal::Store).await;
+        if delivery::finish_delete(&self.store, peer).is_err() {
+            return Err(TeardownStop::Store);
         }
-        self.repairs.remove(&peer);
-        self.delivered.remove(&peer);
-        self.emit(RunnerEvent::Deleted { token, peer }).await?;
-        self.emit_roster().await
+        self.repairs.remove(peer);
+        self.delivered.remove(peer);
+        Ok(())
+    }
+
+    /// Open this side's channel for `state` without creating it, returning
+    /// whether this node holds the record.
+    ///
+    /// A record that opens under a lookup key other than the one the
+    /// conversation recorded is not the channel the conversation names: the
+    /// mismatch is counted, nothing is erased, and the delete is refused.
+    fn open_channel_if_held(&mut self, state: &ConvState) -> Result<bool, TeardownStop> {
+        let Ok(owner) = channel::derive_owner_seed(
+            &self.channel_root,
+            &state.peer_identity_pk,
+            state.generation,
+        ) else {
+            self.records.health.local_refusals += 1;
+            return Err(TeardownStop::Local);
+        };
+        match self
+            .records
+            .open_existing_channel(&owner, channel::CHANNEL_SUBKEYS)
+        {
+            Ok(None) => Ok(false),
+            Ok(Some(lookup_key)) if lookup_key != state.outgoing_lookup_key => {
+                self.records.health.channel_open_failures += 1;
+                Err(TeardownStop::Local)
+            }
+            Ok(Some(_)) => Ok(true),
+            Err(_) => Err(TeardownStop::Network),
+        }
     }
 
     /// Run everything the schedule has due, then report the counters if they
@@ -2631,9 +2813,18 @@ impl<R: RunnerRecords> Runner<R> {
     }
 
     /// One repair look at one conversation: a drop scan first where it is still
-    /// awaiting acceptance, then what startup does for it.
+    /// awaiting acceptance, then what startup does for it. For a conversation
+    /// whose delete is under way the look retries the delete and nothing else.
     async fn repair(&mut self, peer: &CorrespondenceLabel) -> Result<(), Halt> {
         let awaiting = match self.load_one(peer) {
+            Ok(Some(conv)) if conv.state.delete_pending => {
+                if self.resume_delete(peer) {
+                    self.emit_roster().await?;
+                } else {
+                    self.reschedule(&conv);
+                }
+                return Ok(());
+            }
             Ok(Some(conv)) => conv.state.awaiting_acceptance,
             Ok(None) => {
                 self.repairs.remove(peer);
@@ -2672,7 +2863,8 @@ impl<R: RunnerRecords> Runner<R> {
         Ok(())
     }
 
-    /// One collection pass: the drop, then every established conversation.
+    /// One collection pass: the drop, then every established conversation whose
+    /// delete is not under way.
     async fn collect_tick(&mut self) -> Result<(), Halt> {
         let Some(blocked) = self.scan_drop().await? else {
             return Ok(());
@@ -2684,6 +2876,7 @@ impl<R: RunnerRecords> Runner<R> {
             self.check_stop()?;
             if conv.state.awaiting_acceptance
                 || conv.state.acceptance_pending
+                || conv.state.delete_pending
                 || blocked.is_blocked(&conv.state.peer_identity_pk)
             {
                 continue;
@@ -2782,6 +2975,11 @@ impl<R: RunnerRecords> Runner<R> {
                 Surfaced::AlreadyCollected { .. } => {
                     self.records.health.hellos_already_collected += 1
                 }
+                // Left for the delete under way, which removes the conversation.
+                Surfaced::Failed {
+                    error: FlowError::DeletePending,
+                    ..
+                } => {}
                 Surfaced::Failed { .. } => self.records.health.hellos_unsettled += 1,
                 Surfaced::Accepted(acceptance) => accepted.push(acceptance),
                 Surfaced::ContactRequest(request) => {

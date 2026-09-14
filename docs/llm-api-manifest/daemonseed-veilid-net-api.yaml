@@ -342,12 +342,14 @@ types:
       erasure keeps it. Inherent methods outside the trait: publish_advert writes
       subkey 0 of an advert record, erase_channel closes and deletes a channel
       record this side owns from this node's local store without creating an
-      absent one, write_counts reports writes so far per kind, and
+      absent one and keeps the channel open for a retry when the erase fails,
+      write_counts reports writes so far per kind, and
       inspect_channel, inspect_advert and inspect_drop report a SubkeyReport per
       subkey (local and network sequence numbers, and whether Veilid still has
       the subkey queued for its flush). It implements
-      daemonseed_veilid_net::dm::runner::RunnerRecords through them. Every method bridges the
-      synchronous trait onto the asynchronous transport with
+      daemonseed_veilid_net::dm::runner::RunnerRecords through them, with
+      open_existing_channel opening a channel record without creating it. Every
+      method bridges the synchronous trait onto the asynchronous transport with
       tokio::task::block_in_place, so every call must be on a multi-thread runtime
       worker; the flavor is checked at construction and at every bridged call.
       Every network call is retried while Veilid refuses transiently (TryAgain,
@@ -396,7 +398,11 @@ types:
     description: >-
       daemonseed_core::dm::flows::Records plus inspect_channel, inspect_advert and
       inspect_drop (a SubkeyReport per subkey of a channel, advert or drop
-      record), publish_advert, erase_channel and write_counts, the associated fn
+      record), publish_advert, erase_channel (a failed erase leaves the channel
+      open), open_existing_channel(&mut self, &ChannelOwnerSeed, u16) ->
+      Result<Option<lookup key>, RecordError> (opens without creating, None where
+      this node holds no such record; the default calls open_channel) and
+      write_counts, the associated fn
       classify(&RecordError) -> RecordFailure (default Refused) that decides the
       counter a failed call is counted in, and take_scan_failure(&mut self) ->
       Option<RecordError> (default None), the failure of the drop inspect a scan
@@ -506,7 +512,8 @@ types:
     module: daemonseed_veilid_net::dm::runner
     kind: enum
     description: >-
-      UnknownConversation, UnknownRequest, StartedOverNotAcceptable, RingFull (63
+      UnknownConversation (also a conversation whose delete is under way),
+      UnknownRequest, StartedOverNotAcceptable, RingFull (63
       messages uncollected), AwaitingAcceptance, AcceptanceUnfinished (this side's acceptance has not
       finished; the repair poll carries it on), AlreadyEstablished, NoAdvert,
       DropFull, BlockListFull (a Block past the maximum), Store (also a stored
