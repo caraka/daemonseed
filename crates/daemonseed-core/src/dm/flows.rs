@@ -201,6 +201,14 @@ pub enum FlowError {
     Incomplete(&'static str),
     /// A hello was sealed to a length other than [`HELLO_LEN`].
     HelloLength(usize),
+    /// A delete of this conversation is under way
+    /// ([`crate::dm::store::ConvState::delete_pending`]), so nothing more is
+    /// written for it: [`send_message`], [`collect_batch`],
+    /// [`recognise_acceptance`], [`accept`] on an existing record,
+    /// [`continue_acceptance`], [`continue_first_contact`] and through it
+    /// [`first_contact`] to a marked identity, [`resume_first_contact`] and
+    /// [`refresh_first_contact`] refuse it.
+    DeletePending,
 }
 
 impl core::fmt::Display for FlowError {
@@ -233,6 +241,7 @@ impl core::fmt::Display for FlowError {
             Self::DropFull => f.write_str("every slot the hello picked was taken"),
             Self::Incomplete(what) => write!(f, "the conversation record holds no {what}"),
             Self::HelloLength(n) => write!(f, "a hello sealed to {n} bytes"),
+            Self::DeletePending => f.write_str("a delete of this conversation is under way"),
         }
     }
 }
@@ -410,6 +419,7 @@ pub fn first_contact<R: Records>(
             peer_control_key: None,
             peer_advert_serial: None,
             own_opening: Some(opening_bytes),
+            delete_pending: false,
         },
     )?;
 
@@ -437,6 +447,9 @@ pub fn continue_first_contact<R: Records>(
     mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
 ) -> Result<FirstContact, FlowError> {
     let state = load(store, peer)?;
+    if state.delete_pending {
+        return Err(FlowError::DeletePending);
+    }
     if !state.awaiting_acceptance {
         return Err(FlowError::AlreadyEstablished);
     }
@@ -678,12 +691,19 @@ pub enum Resumed {
 /// stopped. The bytes written are the persisted ones, so a relaunch at any step
 /// boundary writes the same hello rather than minting a second one: the
 /// encapsulation is fixed, and `kem_ct` is unchanged across every rewrite.
+///
+/// Refused with [`FlowError::DeletePending`] for a conversation marked for
+/// delete. The mark is checked at the load and the write runs outside the
+/// store's lock, so a delete marked between the two does not stop the write.
 pub fn resume_first_contact<R: Records>(
     store: &Store,
     records: &mut R,
     peer: &CorrespondenceLabel,
 ) -> Result<Resumed, FlowError> {
     let state = load(store, peer)?;
+    if state.delete_pending {
+        return Err(FlowError::DeletePending);
+    }
     let Some(hello) = state.outstanding_hello else {
         return Ok(Resumed::Nothing);
     };
@@ -734,6 +754,9 @@ pub fn refresh_first_contact<R: Records>(
     now: u64,
 ) -> Result<bool, FlowError> {
     let state = load(store, peer)?;
+    if state.delete_pending {
+        return Err(FlowError::DeletePending);
+    }
     if !state.awaiting_acceptance {
         return Err(FlowError::AlreadyAccepted);
     }
@@ -1124,6 +1147,9 @@ pub fn accept<R: Records>(
 ) -> Result<Accepted, FlowError> {
     if let Some(peer) = correspondence_for(store, &request.identity)? {
         let state = load(store, &peer)?;
+        if state.delete_pending {
+            return Err(FlowError::DeletePending);
+        }
         if !state.acceptance_pending {
             return already_established(store, &peer, &state);
         }
@@ -1175,6 +1201,7 @@ pub fn accept<R: Records>(
             peer_control_key: Some(channel::control_key(&request.shared_secret)?),
             peer_advert_serial: Some(request.advert_serial),
             own_opening: None,
+            delete_pending: false,
         },
     )?;
 
@@ -1215,6 +1242,9 @@ pub fn continue_acceptance<R: Records>(
     now: u64,
 ) -> Result<Accepted, FlowError> {
     let state = load(store, peer)?;
+    if state.delete_pending {
+        return Err(FlowError::DeletePending);
+    }
     if !state.acceptance_pending {
         return already_established(store, peer, &state);
     }
@@ -1490,10 +1520,14 @@ pub fn recognise_acceptance<R: Records>(
     }
     let control_bytes = Zeroizing::new(*channel::control_key(&peer_secret)?.as_bytes());
     drop(peer_secret);
-    store.update_conv(peer, |state| {
+    // Refused here rather than at the load: this section is the first thing
+    // the recognition changes, and before it the flow has only read the record.
+    store.try_update_conv(peer, |state| {
+        refuse_if_marked(state)?;
         state.incoming_lookup_key = *lookup_key;
         state.peer_control_key = Some(ControlKey::from_bytes(&control_bytes));
-    })?;
+        Ok::<_, FlowError>(())
+    })??;
 
     let loaded_forced = state.conversation.sending.force_turn;
     let mut conversation = Conversation::restore(state.conversation);
@@ -1509,7 +1543,8 @@ pub fn recognise_acceptance<R: Records>(
         lookup_key,
         state.my_collected,
     )?;
-    store.update_conv(peer, |state| {
+    store.try_update_conv(peer, |state| {
+        refuse_if_marked(state)?;
         write_conversation(state, &conversation, loaded_forced);
         state.my_collected = read.collected;
         state.peer_collected = ring.peer_collected();
@@ -1518,7 +1553,8 @@ pub fn recognise_acceptance<R: Records>(
         // The first contact is over, so no rewrite will carry this side's
         // hello secret again, and that secret roots this side's first turn.
         state.own_hello_secret = None;
-    })?;
+        Ok::<_, FlowError>(())
+    })??;
     let my_drop = drop_plane::derive_owner_seed(me.signer.public_key())?;
     records.erase_drop_slot(&my_drop, drop_plane::DROP_SUBKEYS, slot)?;
     Ok(Acceptance {
@@ -1630,6 +1666,17 @@ fn write_conversation(state: &mut ConvState, written: &Conversation, loaded_forc
     state.conversation = snapshot;
 }
 
+/// Refuse, from inside the critical section that is about to change a
+/// conversation record, a conversation a delete has marked since the flow
+/// loaded it.
+fn refuse_if_marked(state: &ConvState) -> Result<(), FlowError> {
+    if state.delete_pending {
+        Err(FlowError::DeletePending)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Run once by [`send_message`] between its load and its write, so a test
@@ -1647,6 +1694,13 @@ thread_local! {
 /// contact is unaccepted, because first contact carries sequence 0 and nothing
 /// else, and while this side's acceptance of the correspondent's is not
 /// finished, because the step that finishes it records the key schedule.
+///
+/// Refused with [`FlowError::DeletePending`] for a conversation marked for
+/// delete: at the load, or at the commit where the mark lands after the load,
+/// before the slot is written. A send refused at its commit has already
+/// persisted its outbox entry. No launch lists that entry, because its
+/// sequence is at or above the unchanged `send_seq`, and the delete removes
+/// it.
 pub fn send_message<R: Records>(
     store: &Store,
     records: &mut R,
@@ -1655,6 +1709,9 @@ pub fn send_message<R: Records>(
     fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
 ) -> Result<u64, FlowError> {
     let state = load(store, peer)?;
+    if state.delete_pending {
+        return Err(FlowError::DeletePending);
+    }
     if state.awaiting_acceptance || state.acceptance_pending {
         return Err(FlowError::AwaitingAcceptance);
     }
@@ -1671,10 +1728,12 @@ pub fn send_message<R: Records>(
     if let Some(hook) = BETWEEN_SEND_LOAD_AND_WRITE.with(|hook| hook.borrow_mut().take()) {
         hook();
     }
-    store.update_conv(peer, |state| {
+    store.try_update_conv(peer, |state| {
+        refuse_if_marked(state)?;
         write_conversation(state, &conversation, loaded_forced);
         state.send_seq = ring.send_seq();
-    })?;
+        Ok::<_, FlowError>(())
+    })??;
     records.write_channel(&lookup_key, channel::slot_for(seq), &slot_bytes)?;
     Ok(seq)
 }
@@ -1715,6 +1774,9 @@ pub fn collect_batch<R: Records>(
     peer: &CorrespondenceLabel,
 ) -> Result<Batch, FlowError> {
     let state = load(store, peer)?;
+    if state.delete_pending {
+        return Err(FlowError::DeletePending);
+    }
     if state.acceptance_pending {
         return Err(FlowError::AwaitingAcceptance);
     }
@@ -1730,11 +1792,13 @@ pub fn collect_batch<R: Records>(
         &incoming,
         state.my_collected,
     )?;
-    store.update_conv(peer, |state| {
+    store.try_update_conv(peer, |state| {
+        refuse_if_marked(state)?;
         write_conversation(state, &conversation, loaded_forced);
         state.my_collected = read.collected;
         state.peer_collected = ring.peer_collected();
-    })?;
+        Ok::<_, FlowError>(())
+    })??;
     store.delete_outbox_through(peer, ring.peer_collected())?;
 
     if read.collected <= state.cursor_published {
@@ -1892,6 +1956,8 @@ mod tests {
         /// a collection reads a hello's opening before the flow it hands the
         /// hello to loads its record.
         before_message_read: Option<Box<dyn FnOnce()>>,
+        /// Every channel subkey read, control and message alike.
+        channel_reads: usize,
     }
 
     impl Net {
@@ -2044,6 +2110,7 @@ mod tests {
             lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
             subkey: u16,
         ) -> Result<Option<Vec<u8>>, RecordError> {
+            self.channel_reads += 1;
             if let Some(hook) = self
                 .before_message_read
                 .take_if(|_| subkey != channel::CONTROL_SUBKEY)
@@ -3587,6 +3654,754 @@ mod tests {
                 .bodies,
             vec![b"from A".to_vec()]
         );
+    }
+
+    /// The core half of deleting a conversation. `prepare_delete` marks the
+    /// record delete-pending and names a closed marker that carries this side's
+    /// cursor and seals and opens as closed; `finish_delete` then removes the
+    /// conversation record and an outbox still owing a message. Writing the
+    /// marker and erasing the channel are the transport's, and are not
+    /// exercised here. A later hello from the correspondent, who has started
+    /// over, is a new first contact: a contact request rather than a
+    /// start-over, accepted into a working conversation.
+    #[test]
+    fn the_core_half_of_a_delete_marks_names_the_marker_and_drops_the_records() {
+        let (a, b, mut net) = scene();
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+
+        // A message B never collects, so the outbox the delete removes still
+        // owes one.
+        let mut entropy = Seeded::at(918);
+        let never = send_message(&a.store(), &mut net, &peer_a, b"never collected", |x| {
+            entropy.fill(x)
+        })
+        .expect("A sends");
+        let record_file = |kind: crate::storage::dm_store::RecordKind| {
+            a.store()
+                .records()
+                .root()
+                .join(hex::encode(peer_a.as_bytes()))
+                .join(kind.file_name())
+        };
+        let conversation_file = record_file(crate::storage::dm_store::RecordKind::Conversation);
+        let outbox_file = record_file(crate::storage::dm_store::RecordKind::ConversationOutbox);
+        assert!(
+            conversation_file.exists() && outbox_file.exists(),
+            "the control: both records are on disk"
+        );
+        // Two owed: A's first message, owed until A reads a cursor past it,
+        // and the message B never collects.
+        let owed: Vec<u64> = a.store().load().expect("load").convs[0]
+            .outstanding_outbox
+            .iter()
+            .map(|entry| entry.seq)
+            .collect();
+        assert_eq!(
+            owed,
+            vec![0, never],
+            "the control: the outbox owes the first message and the new one"
+        );
+        let state = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+
+        let erase = crate::dm::delivery::prepare_delete(&a.store(), &peer_a, true)
+            .expect("prepare the delete");
+        assert_eq!(erase.lookup_key, state.outgoing_lookup_key);
+        assert!(
+            a.store()
+                .load_conv(&peer_a)
+                .expect("load")
+                .expect("A's record")
+                .delete_pending,
+            "prepare_delete did not mark the record"
+        );
+        assert_eq!(
+            a.store().pending_deletes().expect("pending deletes"),
+            vec![peer_a]
+        );
+        let own_key = state.own_control_key.as_ref().expect("A's control key");
+        let opening =
+            ChannelOpening::decode(state.own_opening.as_ref().expect("A's opening").as_slice())
+                .expect("decode A's opening");
+        let marker = channel::seal_control_with_key(
+            own_key,
+            &erase
+                .marker
+                .expect("a closed marker")
+                .control(Some(opening)),
+        )
+        .expect("seal the closed marker");
+        let sealed = channel::open_control_with_key(own_key, &marker).expect("the marker opens");
+        assert!(sealed.closed, "the marker is not closed");
+        assert_eq!(
+            sealed.collected_cursor, state.my_collected,
+            "the marker does not carry this side's cursor"
+        );
+
+        crate::dm::delivery::finish_delete(&a.store(), &peer_a).expect("drop the records");
+        assert!(
+            !conversation_file.exists(),
+            "the conversation record survived the delete"
+        );
+        assert!(
+            !outbox_file.exists(),
+            "an outbox still owing a message survived the delete"
+        );
+        assert!(
+            a.store().load().expect("load").convs.is_empty(),
+            "a launch still reads a conversation to poll"
+        );
+        assert!(
+            a.store()
+                .pending_deletes()
+                .expect("pending deletes")
+                .is_empty(),
+            "the mark outlived the delete"
+        );
+
+        // Re-contact derives the same channel records the deleted conversation
+        // used, so both old channels are cleared here rather than left for the
+        // new conversation to read.
+        net.channels.retain(|(key, _), _| {
+            *key != state.outgoing_lookup_key && *key != state.incoming_lookup_key
+        });
+
+        // B starts over under the same identity, and its hello reaches A as a
+        // new first contact.
+        let b_again = Party::new(0xb2);
+        b_again.publish(&mut net);
+        assert_eq!(
+            b_again.pk().as_slice(),
+            b.pk().as_slice(),
+            "the control: B starts over under the same identity"
+        );
+        a_opens(&b_again, &a, &mut net, b"hello again");
+        let request = only_request(
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects"),
+        );
+        assert_eq!(request.identity.as_slice(), b.pk().as_slice());
+
+        let mut entropy = Seeded::at(919);
+        let accepted = accept(
+            &a.store(),
+            &mut net,
+            &a.me(),
+            &request,
+            b"welcome back",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A accepts the new first contact");
+        assert_eq!(accepted.bodies, vec![b"hello again".to_vec()]);
+        assert_eq!(
+            a.store().load().expect("load").convs.len(),
+            1,
+            "A holds one conversation after the new first contact"
+        );
+        let surfaced = collect(
+            &b_again.store(),
+            &mut net,
+            &b_again.me(),
+            &b_again.advert_keys,
+            |_| false,
+        )
+        .expect("B collects");
+        match surfaced.as_slice() {
+            [Surfaced::Accepted(acceptance)] => {
+                assert_eq!(acceptance.bodies, vec![b"welcome back".to_vec()]);
+            }
+            other => panic!("expected B's acceptance, got {other:?}"),
+        }
+    }
+
+    /// Collection and the published cursor stop at a slot missing from the
+    /// middle of the ring, and carry on past it once it is written back.
+    #[test]
+    fn collection_and_the_cursor_stop_at_a_missing_slot_until_it_is_rewritten() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(930);
+        let mut seqs = Vec::new();
+        for body in [b"one".as_slice(), b"two", b"three"] {
+            seqs.push(
+                send_message(&a.store(), &mut net, &peer_a, body, |x| entropy.fill(x))
+                    .expect("A sends"),
+            );
+        }
+        let lookup_key = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record")
+            .outgoing_lookup_key;
+        let gap = (lookup_key, channel::slot_for(seqs[1]));
+        let held = net
+            .channels
+            .remove(&gap)
+            .expect("the middle slot was written");
+
+        let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
+        assert_eq!(
+            batch.bodies,
+            vec![b"one".to_vec()],
+            "collection went past the missing slot"
+        );
+        assert_eq!(
+            batch.my_collected, seqs[1],
+            "the cursor counted past the missing slot"
+        );
+        assert_eq!(
+            peer_cursor(&a.store(), &mut net, &peer_a).expect("A reads B's cursor"),
+            Some(seqs[1]),
+            "the published cursor counted past the missing slot"
+        );
+
+        net.channels.insert(gap, held);
+        let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
+        assert_eq!(batch.bodies, vec![b"two".to_vec(), b"three".to_vec()]);
+        assert_eq!(batch.my_collected, seqs[2] + 1);
+        assert_eq!(
+            peer_cursor(&a.store(), &mut net, &peer_a).expect("A reads B's cursor"),
+            Some(seqs[2] + 1)
+        );
+    }
+
+    /// A conversation marked for delete refuses a send, a collection batch
+    /// and the recognition of its acceptance, and a delete that finishes takes
+    /// the mark with the record.
+    #[test]
+    fn a_conversation_marked_for_delete_refuses_to_send_or_collect() {
+        let (a, b, mut net) = scene();
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(940);
+        send_message(&a.store(), &mut net, &peer_a, b"before", |x| {
+            entropy.fill(x)
+        })
+        .expect("the control: A sends before the mark");
+
+        crate::dm::delivery::prepare_delete(&a.store(), &peer_a, true).expect("prepare");
+        let before = untouched(&a, &peer_a);
+        net.reset_writes();
+        net.channel_reads = 0;
+        assert!(
+            matches!(
+                send_message(&a.store(), &mut net, &peer_a, b"after", |x| {
+                    entropy.fill(x)
+                }),
+                Err(FlowError::DeletePending)
+            ),
+            "a marked conversation took a send"
+        );
+        assert!(
+            matches!(
+                collect_batch(&a.store(), &mut net, &peer_a),
+                Err(FlowError::DeletePending)
+            ),
+            "a marked conversation took a collection batch"
+        );
+        assert_eq!(net.writes.total(), 0, "a refused flow wrote");
+        assert_eq!(net.channel_reads, 0, "a refused flow read the ring");
+        assert_eq!(
+            untouched(&a, &peer_a),
+            before,
+            "a refused flow changed the record or the outbox"
+        );
+        crate::dm::delivery::finish_delete(&a.store(), &peer_a).expect("finish");
+        assert!(
+            a.store()
+                .pending_deletes()
+                .expect("pending deletes")
+                .is_empty(),
+            "the mark outlived the delete"
+        );
+
+        // A first contact marked for delete before its acceptance is
+        // recognised: the recognition refuses and changes nothing.
+        let (c, d, mut net) = scene();
+        let peer_c = opened_peer(&a_opens(&c, &d, &mut net, b"the first message"));
+        b_accepts(&d, &mut net, b"the reply");
+        crate::dm::delivery::prepare_delete(&c.store(), &peer_c, false).expect("prepare");
+        let before = untouched(&c, &peer_c);
+        net.reset_writes();
+        let surfaced =
+            collect(&c.store(), &mut net, &c.me(), &c.advert_keys, |_| false).expect("C collects");
+        assert!(
+            matches!(
+                surfaced.as_slice(),
+                [Surfaced::Failed {
+                    error: FlowError::DeletePending,
+                    ..
+                }]
+            ),
+            "a marked first contact's acceptance was not refused: {surfaced:?}"
+        );
+        assert!(
+            c.store()
+                .load_conv(&peer_c)
+                .expect("load")
+                .expect("C's record")
+                .awaiting_acceptance,
+            "the refused recognition changed the record"
+        );
+        assert_eq!(net.writes.total(), 0, "the refused recognition wrote");
+        assert_eq!(
+            untouched(&c, &peer_c),
+            before,
+            "the refused recognition changed the record or the outbox"
+        );
+    }
+
+    /// What a flow refused for a marked conversation must leave as it was: the
+    /// send sequence, this side's cursor, the outbox record, the channel the
+    /// correspondent writes, and the key its control subkey opens under.
+    type Untouched = (
+        u64,
+        u64,
+        Option<Vec<u8>>,
+        [u8; HELLO_LOOKUP_KEY_LEN],
+        Option<[u8; 32]>,
+    );
+
+    fn untouched(party: &Party, peer: &CorrespondenceLabel) -> Untouched {
+        let store = party.store();
+        let state = store.load_conv(peer).expect("load").expect("a record");
+        let outbox = store
+            .records()
+            .critical_section::<_, crate::storage::dm_store::DmStoreError>(peer, |g| {
+                g.read(crate::storage::dm_store::RecordKind::ConversationOutbox)
+            })
+            .expect("read the outbox record");
+        (
+            state.send_seq,
+            state.my_collected,
+            outbox,
+            state.incoming_lookup_key,
+            state.peer_control_key.as_ref().map(|key| *key.as_bytes()),
+        )
+    }
+
+    /// A delete of `peer`'s conversation in `party`'s store, opened afresh from
+    /// its directory, to land inside another flow.
+    fn delete_of(party: &Party, peer: CorrespondenceLabel) -> impl FnOnce() + 'static {
+        let root = party.root.path().to_path_buf();
+        let at_rest = party.at_rest;
+        move || {
+            let store = Store::open(root, &at_rest).expect("open the store");
+            crate::dm::delivery::prepare_delete(&store, &peer, true).expect("mark the delete");
+        }
+    }
+
+    /// A delete mark on one conversation refuses nothing on the others in the
+    /// same store: an established one still sends and collects, and a first
+    /// contact stopped part way is still carried on.
+    #[test]
+    fn a_delete_mark_on_one_conversation_leaves_the_others_working() {
+        let (a, b, mut net) = scene();
+        let c = Party::new(0xc3);
+        let d = Party::new(0xd4);
+        c.publish(&mut net);
+        d.publish(&mut net);
+        let (peer_b, accepted_b) = round_trip(&a, &b, &mut net);
+        let (peer_d, _) = round_trip(&a, &d, &mut net);
+
+        // A's first contact to C lands its opening and stops.
+        net.reset_writes();
+        net.fail_after = Some(1);
+        let mut entropy = Seeded::at(1_010);
+        assert!(
+            first_contact(
+                &a.store(),
+                &mut net,
+                &a.me(),
+                c.pk(),
+                b"to C",
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .is_err(),
+            "the first contact to C must stop short"
+        );
+        net.fail_after = None;
+        let peer_c = a
+            .store()
+            .load()
+            .expect("load")
+            .convs
+            .into_iter()
+            .find(|conv| conv.state.peer_identity_pk.as_slice() == c.pk().as_slice())
+            .expect("A's record for C")
+            .peer;
+
+        crate::dm::delivery::prepare_delete(&a.store(), &peer_d, true).expect("mark D's delete");
+        assert_eq!(
+            a.store().pending_deletes().expect("pending deletes"),
+            vec![peer_d],
+            "the control: exactly one conversation is marked"
+        );
+
+        let mut entropy = Seeded::at(1_011);
+        send_message(&a.store(), &mut net, &peer_b, b"to B", |x| entropy.fill(x))
+            .expect("a send on an unmarked conversation");
+        send_message(&b.store(), &mut net, &accepted_b.peer, b"from B", |x| {
+            entropy.fill(x)
+        })
+        .expect("B sends");
+        assert_eq!(
+            collect_batch(&a.store(), &mut net, &peer_b)
+                .expect("a batch on an unmarked conversation")
+                .bodies,
+            vec![b"from B".to_vec()]
+        );
+        continue_first_contact(&a.store(), &mut net, &peer_c, |x| entropy.fill(x))
+            .expect("a relaunch of an unmarked first contact");
+    }
+
+    /// A first contact marked for delete before it finished is not carried on:
+    /// the continuation a relaunch runs writes nothing and changes nothing.
+    #[test]
+    fn a_first_contact_marked_for_delete_is_not_carried_on() {
+        let (a, b, mut net) = scene();
+        // The opening lands and the first message slot is refused.
+        net.fail_after = Some(1);
+        let mut entropy = Seeded::at(950);
+        assert!(
+            first_contact(
+                &a.store(),
+                &mut net,
+                &a.me(),
+                b.pk(),
+                b"the first message",
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .is_err(),
+            "the first contact must stop short"
+        );
+        net.fail_after = None;
+        let peer_a = a.store().load().expect("load").convs[0].peer;
+        crate::dm::delivery::prepare_delete(&a.store(), &peer_a, false).expect("prepare");
+        let before = untouched(&a, &peer_a);
+        net.reset_writes();
+
+        let mut entropy = Seeded::at(951);
+        assert!(
+            matches!(
+                continue_first_contact(&a.store(), &mut net, &peer_a, |x| entropy.fill(x)),
+                Err(FlowError::DeletePending)
+            ),
+            "a marked first contact was carried on"
+        );
+        assert_eq!(net.writes.total(), 0, "the refused continuation wrote");
+        assert_eq!(
+            untouched(&a, &peer_a),
+            before,
+            "the refused continuation changed the record or the outbox"
+        );
+    }
+
+    /// A first contact marked for delete republishes no hello: neither the
+    /// rewrite of the persisted hello nor its refresh after the correspondent's
+    /// advert rotates writes anything.
+    #[test]
+    fn a_first_contact_marked_for_delete_republishes_no_hello() {
+        let (a, mut b, mut net) = scene();
+        let peer_a = opened_peer(&a_opens(&a, &b, &mut net, b"the first message"));
+        let at = NOW + advert::ROTATION_PERIOD_SECS;
+        rotate(&mut b, &mut net, at, 2_020);
+        crate::dm::delivery::prepare_delete(&a.store(), &peer_a, false).expect("prepare");
+        let before = untouched(&a, &peer_a);
+        net.reset_writes();
+
+        assert!(
+            matches!(
+                resume_first_contact(&a.store(), &mut net, &peer_a),
+                Err(FlowError::DeletePending)
+            ),
+            "a marked first contact's hello was rewritten"
+        );
+        assert!(
+            matches!(
+                a_refreshes(&a, &mut net, &peer_a, at, 3_030),
+                Err(FlowError::DeletePending)
+            ),
+            "a marked first contact's hello was refreshed"
+        );
+        assert_eq!(net.writes.total(), 0, "a refused hello was written");
+        assert_eq!(untouched(&a, &peer_a), before);
+    }
+
+    /// An acceptance marked for delete before it finished is not carried on,
+    /// whether a relaunch continues it from the record or the request is
+    /// accepted again.
+    #[test]
+    fn an_acceptance_marked_for_delete_is_not_carried_on() {
+        let (a, b, mut net) = scene();
+        a_opens(&a, &b, &mut net, b"the first message");
+        let request = only_request(b_collects(&b, &mut net));
+        // The acceptance stops at its first write.
+        net.reset_writes();
+        net.fail_after = Some(0);
+        let mut entropy = Seeded::at(909);
+        assert!(
+            accept(
+                &b.store(),
+                &mut net,
+                &b.me(),
+                &request,
+                b"the reply",
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .is_err(),
+            "the acceptance must stop short"
+        );
+        net.fail_after = None;
+        let b_peer = b.store().load().expect("load").convs[0].peer;
+        assert!(
+            b.store()
+                .load_conv(&b_peer)
+                .expect("load")
+                .expect("B's record")
+                .acceptance_pending,
+            "the control: B's acceptance is not finished"
+        );
+        crate::dm::delivery::prepare_delete(&b.store(), &b_peer, false).expect("prepare");
+        let before = untouched(&b, &b_peer);
+        net.reset_writes();
+
+        let mut entropy = Seeded::at(960);
+        assert!(
+            matches!(
+                accept(
+                    &b.store(),
+                    &mut net,
+                    &b.me(),
+                    &request,
+                    b"the reply",
+                    |x| entropy.fill(x),
+                    NOW,
+                ),
+                Err(FlowError::DeletePending)
+            ),
+            "a marked acceptance was accepted again"
+        );
+        assert!(
+            matches!(
+                continue_acceptance(
+                    &b.store(),
+                    &mut net,
+                    &b.me(),
+                    &b_peer,
+                    |x| entropy.fill(x),
+                    NOW,
+                ),
+                Err(FlowError::DeletePending)
+            ),
+            "a marked acceptance was continued"
+        );
+        assert_eq!(net.writes.total(), 0, "a refused acceptance wrote");
+        assert_eq!(untouched(&b, &b_peer), before);
+    }
+
+    /// A delete marked while a send holds the state it loaded stops the send at
+    /// its commit, before its slot is written.
+    #[test]
+    fn a_delete_marked_during_a_send_stops_it_before_its_write() {
+        let (a, b, mut net) = scene();
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+        let send_seq = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record")
+            .send_seq;
+        let hook = delete_of(&a, peer_a);
+        BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        net.reset_writes();
+
+        let mut entropy = Seeded::at(970);
+        let sent = send_message(&a.store(), &mut net, &peer_a, b"too late", |x| {
+            entropy.fill(x)
+        });
+        assert!(
+            BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| slot.borrow().is_none()),
+            "the delete did not run inside the send"
+        );
+        assert!(
+            matches!(sent, Err(FlowError::DeletePending)),
+            "a send committed after the delete was marked: {sent:?}"
+        );
+        assert_eq!(
+            net.writes.total(),
+            0,
+            "a slot was written after the delete was marked"
+        );
+        let after = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        assert!(after.delete_pending, "the control: the delete was marked");
+        assert_eq!(
+            after.send_seq, send_seq,
+            "the refused send advanced the sequence"
+        );
+    }
+
+    /// A delete marked while a collection batch holds the state it loaded stops
+    /// the batch at its commit, before a cursor is written.
+    #[test]
+    fn a_delete_marked_during_a_collection_batch_stops_it_before_its_write() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(980);
+        send_message(&b.store(), &mut net, &accepted.peer, b"from B", |x| {
+            entropy.fill(x)
+        })
+        .expect("B sends");
+        let my_collected = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record")
+            .my_collected;
+        net.before_message_read = Some(Box::new(delete_of(&a, peer_a)));
+        net.reset_writes();
+
+        let refused = matches!(
+            collect_batch(&a.store(), &mut net, &peer_a),
+            Err(FlowError::DeletePending)
+        );
+        assert!(
+            net.before_message_read.is_none(),
+            "the delete did not run inside the batch"
+        );
+        assert!(refused, "a batch committed after the delete was marked");
+        assert_eq!(
+            net.writes.total(),
+            0,
+            "a cursor was written after the delete was marked"
+        );
+        assert_eq!(
+            a.store()
+                .load_conv(&peer_a)
+                .expect("load")
+                .expect("A's record")
+                .my_collected,
+            my_collected,
+            "the refused batch recorded a read"
+        );
+    }
+
+    /// A delete marked while the recognition of an acceptance holds the state
+    /// it loaded stops the recognition at its commit, before the hello slot is
+    /// erased.
+    #[test]
+    fn a_delete_marked_during_a_recognition_stops_it_before_its_write() {
+        let (a, b, mut net) = scene();
+        let peer_a = opened_peer(&a_opens(&a, &b, &mut net, b"the first message"));
+        b_accepts(&b, &mut net, b"the reply");
+        net.before_message_read = Some(Box::new(delete_of(&a, peer_a)));
+        net.reset_writes();
+
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        assert!(
+            net.before_message_read.is_none(),
+            "the delete did not run inside the recognition"
+        );
+        assert!(
+            matches!(
+                surfaced.as_slice(),
+                [Surfaced::Failed {
+                    error: FlowError::DeletePending,
+                    ..
+                }]
+            ),
+            "a recognition committed after the delete was marked: {surfaced:?}"
+        );
+        assert_eq!(
+            net.writes.total(),
+            0,
+            "the hello slot was erased after the delete was marked"
+        );
+        assert!(
+            a.store()
+                .load_conv(&peer_a)
+                .expect("load")
+                .expect("A's record")
+                .awaiting_acceptance,
+            "the refused recognition ended the first contact"
+        );
+    }
+
+    /// Collection and the cursor stop at a slot that does not decode, and at a
+    /// slot whose header names another sequence, and carry on past each once
+    /// the right bytes are back.
+    #[test]
+    fn collection_stops_at_a_slot_that_does_not_decode_or_names_another_sequence() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup_key = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record")
+            .outgoing_lookup_key;
+        let mut entropy = Seeded::at(990);
+        let mut send = |net: &mut Net, body: &[u8]| {
+            send_message(&a.store(), net, &peer_a, body, |x| entropy.fill(x)).expect("A sends")
+        };
+
+        send(&mut net, b"one");
+        let two = send(&mut net, b"two");
+        let held = net
+            .channels
+            .insert((lookup_key, channel::slot_for(two)), vec![0u8; 3])
+            .expect("the second slot was written");
+        let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
+        assert_eq!(
+            batch.bodies,
+            vec![b"one".to_vec()],
+            "collection went past a slot that does not decode"
+        );
+        assert_eq!(
+            batch.my_collected, two,
+            "the cursor counted past a slot that does not decode"
+        );
+        net.channels
+            .insert((lookup_key, channel::slot_for(two)), held);
+        let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
+        assert_eq!(batch.bodies, vec![b"two".to_vec()]);
+
+        let three = send(&mut net, b"three");
+        let four = send(&mut net, b"four");
+        let fourth = net
+            .channels
+            .get(&(lookup_key, channel::slot_for(four)))
+            .cloned()
+            .expect("the fourth slot was written");
+        let held = net
+            .channels
+            .insert((lookup_key, channel::slot_for(three)), fourth)
+            .expect("the third slot was written");
+        let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
+        assert!(
+            batch.bodies.is_empty(),
+            "collection opened a slot holding another sequence"
+        );
+        assert_eq!(
+            batch.my_collected, three,
+            "the cursor counted past a slot holding another sequence"
+        );
+        net.channels
+            .insert((lookup_key, channel::slot_for(three)), held);
+        let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
+        assert_eq!(batch.bodies, vec![b"three".to_vec(), b"four".to_vec()]);
+        assert_eq!(batch.my_collected, four + 1);
     }
 
     /// Whether `needle` appears anywhere in `haystack`.

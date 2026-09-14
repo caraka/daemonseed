@@ -99,7 +99,18 @@ const RECORD_VERSION: u8 = 1;
 /// the conversation record's format turns over without the others being
 /// refused. A reader refuses any other value as an unknown version rather than
 /// reading the record at the wrong length.
-const CONV_RECORD_VERSION: u8 = 2;
+const CONV_RECORD_VERSION: u8 = 3;
+
+/// The order [`Store::delete_conv`] removes a correspondence's records in.
+const DELETE_ORDER: [RecordKind; 2] = [RecordKind::Conversation, RecordKind::ConversationOutbox];
+
+#[cfg(test)]
+thread_local! {
+    /// Every record kind [`Store::delete_conv`] has removed on this thread, in
+    /// the order it removed them.
+    static DELETED: core::cell::RefCell<Vec<RecordKind>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
 
 /// The version byte the advert-keys record carries after its magic, carried
 /// apart for [`CONV_RECORD_VERSION`]'s reason.
@@ -177,6 +188,7 @@ pub const CONV_RECORD_LEN: usize = CONV_MAGIC.len()
     + (1 + 8)
     + (1 + OPENING_LEN)
     + SNAPSHOT_LEN
+    + 1
     + 1;
 
 /// Bytes one outbox entry takes: an occupancy flag, the sequence it holds, the
@@ -403,6 +415,10 @@ pub struct ConvState {
     /// rewritten control record would otherwise carry an opening whose bytes
     /// differ from the one already published.
     pub own_opening: Option<Box<[u8; OPENING_LEN]>>,
+    /// Whether a delete of this conversation is under way: set by
+    /// [`crate::dm::delivery::prepare_delete`] before the channel record is
+    /// erased, and gone with the record when the delete finishes.
+    pub delete_pending: bool,
 }
 
 impl core::fmt::Debug for ConvState {
@@ -417,6 +433,7 @@ impl core::fmt::Debug for ConvState {
             .field("cursor_published", &self.cursor_published)
             .field("awaiting_acceptance", &self.awaiting_acceptance)
             .field("acceptance_pending", &self.acceptance_pending)
+            .field("delete_pending", &self.delete_pending)
             .field("outstanding_hello", &self.outstanding_hello.is_some())
             .finish_non_exhaustive()
     }
@@ -442,6 +459,10 @@ pub struct LoadedConv {
     /// The messages committed but not yet collected, ascending by sequence.
     /// Every one of them has a slot to be rewritten if the network no longer
     /// holds it.
+    ///
+    /// Empty for a conversation whose [`ConvState::delete_pending`] is set,
+    /// whatever its outbox record holds: its channel is being erased, and a
+    /// rewrite would put the slots back.
     pub outstanding_outbox: Vec<OutboxEntry>,
 }
 
@@ -643,19 +664,76 @@ impl Store {
         })
     }
 
+    /// [`Store::update_conv`] for a change that can be refused: the record is
+    /// written only where `f` returns `Ok`, so a refusal leaves the record's
+    /// bytes as they were.
+    pub fn try_update_conv<T, E>(
+        &self,
+        peer: &CorrespondenceLabel,
+        f: impl FnOnce(&mut ConvState) -> Result<T, E>,
+    ) -> Result<Result<T, E>, StoreError> {
+        self.inner.critical_section::<_, StoreError>(peer, |g| {
+            let mut state = read_conv(g)?.ok_or(StoreError::MissingConversation)?;
+            let out = f(&mut state);
+            if out.is_ok() {
+                g.replace(RecordKind::Conversation, &encode_conv(&state))?;
+            }
+            Ok(out)
+        })
+    }
+
     /// Remove one correspondence's conversation and outbox records.
     ///
     /// Both in one section, so no reader sees a conversation without the
     /// ciphertext it still owes or an outbox with no conversation to place it
-    /// in. The correspondence's directory stays: it is what
-    /// [`DmStore::critical_section`] establishes by being entered, and removing
-    /// it is the record store's business rather than this module's.
+    /// in. The removals run in `DELETE_ORDER`, conversation record first: a
+    /// stop between the two leaves an outbox with no conversation record, which
+    /// nothing lists or polls and [`Store::load`] deletes, rather than a
+    /// conversation the user deleted still being listed. The correspondence's
+    /// directory stays: it is what [`DmStore::critical_section`] establishes by
+    /// being entered, and removing it is the record store's business rather
+    /// than this module's.
     pub fn delete_conv(&self, peer: &CorrespondenceLabel) -> Result<(), StoreError> {
         self.inner.critical_section::<_, StoreError>(peer, |g| {
-            g.delete(RecordKind::ConversationOutbox)?;
-            g.delete(RecordKind::Conversation)?;
+            for kind in DELETE_ORDER {
+                g.delete(kind)?;
+                #[cfg(test)]
+                DELETED.with(|deleted| deleted.borrow_mut().push(kind));
+            }
             Ok(())
         })
+    }
+
+    /// Record that a delete of `peer`'s conversation is under way, returning
+    /// the state as it stood.
+    ///
+    /// Written in the section that reads the state, so the mark and the values
+    /// a teardown is built from are one read. Refuses
+    /// [`StoreError::MissingConversation`] where there is no record.
+    pub fn mark_delete_pending(&self, peer: &CorrespondenceLabel) -> Result<ConvState, StoreError> {
+        self.inner.critical_section::<_, StoreError>(peer, |g| {
+            let mut state = read_conv(g)?.ok_or(StoreError::MissingConversation)?;
+            state.delete_pending = true;
+            g.replace(RecordKind::Conversation, &encode_conv(&state))?;
+            Ok(state)
+        })
+    }
+
+    /// Every correspondence whose conversation record carries a delete-pending
+    /// mark: a teardown that marked it and had not dropped its records when
+    /// the process stopped. A launch resumes each one rather than polling or
+    /// rewriting it.
+    pub fn pending_deletes(&self) -> Result<Vec<CorrespondenceLabel>, StoreError> {
+        let mut pending = Vec::new();
+        for peer in self.inner.correspondences()? {
+            let marked = self.inner.critical_section::<_, StoreError>(&peer, |g| {
+                Ok(read_conv(g)?.is_some_and(|state| state.delete_pending))
+            })?;
+            if marked {
+                pending.push(peer);
+            }
+        }
+        Ok(pending)
     }
 
     /// Record the exact ciphertext written to `seq`'s slot, before it is
@@ -769,7 +847,9 @@ impl Store {
             let mut outstanding: Vec<OutboxEntry> = table
                 .into_iter()
                 .flatten()
-                .filter(|e| e.seq >= state.peer_collected && e.seq < state.send_seq)
+                .filter(|e| {
+                    !state.delete_pending && e.seq >= state.peer_collected && e.seq < state.send_seq
+                })
                 .collect();
             outstanding.sort_unstable_by_key(|e| e.seq);
             convs.push(LoadedConv {
@@ -1207,6 +1287,7 @@ pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
     }
     w.peer_turn(receiving.peer_latest.as_ref());
     w.u8(u8::from(state.acceptance_pending));
+    w.u8(u8::from(state.delete_pending));
     w.0
 }
 
@@ -1293,6 +1374,7 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         peer_latest: r.peer_turn()?,
     };
     let acceptance_pending = r.flag()?;
+    let delete_pending = r.flag()?;
     r.finish()?;
 
     Ok(ConvState {
@@ -1320,6 +1402,7 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         peer_control_key,
         peer_advert_serial,
         own_opening,
+        delete_pending,
     })
 }
 
@@ -1533,6 +1616,7 @@ mod tests {
             peer_control_key: Some(ControlKey::from_bytes(&[0x55u8; 32])),
             peer_advert_serial: Some(9),
             own_opening: Some(Box::new([0x66u8; OPENING_LEN])),
+            delete_pending: false,
         }
     }
 
@@ -2091,6 +2175,7 @@ mod tests {
                         peer_control_key: None,
                         peer_advert_serial: None,
                         own_opening: None,
+                        delete_pending: false,
                     },
                 )
                 .unwrap();
@@ -2117,6 +2202,7 @@ mod tests {
                         peer_control_key: None,
                         peer_advert_serial: None,
                         own_opening: None,
+                        delete_pending: false,
                     },
                 )
                 .unwrap();
@@ -2604,6 +2690,235 @@ mod tests {
             ),
             "a record that will not decode must be refused, not skipped"
         );
+    }
+
+    /// A delete stopped after its first removal leaves no conversation record,
+    /// so nothing a launch would list or poll; the outbox it had not yet
+    /// removed is an orphan the next load deletes.
+    #[test]
+    fn a_delete_stopped_after_its_first_removal_leaves_no_conversation() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x30)).unwrap();
+        let peer = label(0x33);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store.persist_outbox(&peer, 0, &[0x7c; 64]).unwrap();
+        let file = |kind: RecordKind| {
+            store
+                .records()
+                .root()
+                .join(hex::encode(peer.as_bytes()))
+                .join(kind.file_name())
+        };
+        assert!(
+            file(RecordKind::Conversation).exists()
+                && file(RecordKind::ConversationOutbox).exists(),
+            "the control: both records are on disk"
+        );
+
+        // The delete's first removal, and a stop.
+        store
+            .records()
+            .critical_section::<_, DmStoreError>(&peer, |g| g.delete(DELETE_ORDER[0]))
+            .unwrap();
+        assert!(
+            !file(RecordKind::Conversation).exists(),
+            "the first removal left the conversation record, which a launch would list"
+        );
+        assert!(
+            file(RecordKind::ConversationOutbox).exists(),
+            "the control: the stop landed between the two removals"
+        );
+    }
+
+    /// A change refused inside `try_update_conv` leaves the conversation
+    /// record's bytes on disk exactly as they were, and an accepted one
+    /// rewrites them.
+    #[test]
+    fn a_refused_change_leaves_the_record_bytes_unchanged() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x3a)).unwrap();
+        let peer = label(0x3b);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        let file = store
+            .records()
+            .root()
+            .join(hex::encode(peer.as_bytes()))
+            .join(RecordKind::Conversation.file_name());
+        let before = std::fs::read(&file).unwrap();
+
+        let refused = store
+            .try_update_conv(&peer, |state| {
+                state.send_seq += 1;
+                Err::<(), _>("refused")
+            })
+            .unwrap();
+        assert_eq!(refused, Err("refused"));
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "a refused change rewrote the record"
+        );
+
+        store
+            .try_update_conv(&peer, |state| {
+                state.send_seq += 1;
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            std::fs::read(&file).unwrap(),
+            before,
+            "the control: an accepted change rewrote the record"
+        );
+    }
+
+    /// `delete_conv` removes the conversation record and then the outbox, in
+    /// that order.
+    #[test]
+    fn a_delete_removes_the_conversation_record_before_the_outbox() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x38)).unwrap();
+        let peer = label(0x39);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store.persist_outbox(&peer, 0, &[0x7e; 64]).unwrap();
+        DELETED.with(|deleted| deleted.borrow_mut().clear());
+
+        store.delete_conv(&peer).unwrap();
+        assert_eq!(
+            DELETED.with(|deleted| deleted.borrow().clone()),
+            vec![RecordKind::Conversation, RecordKind::ConversationOutbox],
+            "delete_conv did not remove the conversation record first"
+        );
+        assert!(
+            store.load().unwrap().convs.is_empty(),
+            "the control: the delete removed the conversation"
+        );
+    }
+
+    /// A conversation marked for delete is loaded carrying its mark and with no
+    /// outstanding outbox, so a launch rewrites none of its slots.
+    #[test]
+    fn a_conversation_marked_for_delete_offers_no_outbox_to_rewrite() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x36)).unwrap();
+        let peer = label(0x37);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store.persist_outbox(&peer, 0, &[0x7d; 64]).unwrap();
+        let loaded = |store: &Store| {
+            store
+                .load()
+                .unwrap()
+                .convs
+                .into_iter()
+                .next()
+                .expect("the conversation")
+        };
+
+        let unmarked = loaded(&store);
+        assert!(!unmarked.state.delete_pending);
+        assert_eq!(
+            unmarked.outstanding_outbox.len(),
+            1,
+            "the control: the message is outstanding"
+        );
+
+        store.mark_delete_pending(&peer).unwrap();
+        let marked = loaded(&store);
+        assert!(
+            marked.state.delete_pending,
+            "the loaded conversation does not carry its mark"
+        );
+        assert!(
+            marked.outstanding_outbox.is_empty(),
+            "a conversation being deleted offered its outbox for rewriting"
+        );
+    }
+
+    /// A delete-pending byte other than 0 or 1 is refused as corrupt rather
+    /// than read as a mark.
+    #[test]
+    fn a_delete_pending_byte_other_than_zero_or_one_is_refused() {
+        let (a, _b) = pair();
+        let mut bytes = encode_conv(&conv_state(&a, 1, 0, 0, None)).to_vec();
+        let at = bytes.len() - 1;
+        bytes[at] = 1;
+        assert!(
+            decode_conv(&bytes)
+                .expect("the control: a set mark decodes")
+                .delete_pending
+        );
+        bytes[at] = 2;
+        match decode_conv(&bytes) {
+            Err(StoreError::Corrupt { .. }) => {}
+            other => panic!("a delete-pending byte of 2 was not refused: {other:?}"),
+        }
+    }
+
+    /// The delete-pending mark survives a reopen, names the correspondence in
+    /// `pending_deletes` and nothing else, and goes with the conversation
+    /// record.
+    #[test]
+    fn a_delete_pending_mark_survives_a_reopen_and_goes_with_the_record() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let marked = label(0x34);
+        let other = label(0x35);
+        {
+            let store = Store::open(tmp.path(), &at_rest_key(0x31)).unwrap();
+            store
+                .create_conv(&marked, &conv_state(&a, 1, 0, 0, None))
+                .unwrap();
+            store
+                .create_conv(&other, &conv_state(&a, 1, 0, 0, None))
+                .unwrap();
+            assert!(
+                store.pending_deletes().unwrap().is_empty(),
+                "the control: nothing is pending before the mark"
+            );
+            assert!(store.mark_delete_pending(&marked).unwrap().delete_pending);
+        }
+
+        let store = Store::open(tmp.path(), &at_rest_key(0x31)).unwrap();
+        assert!(
+            store
+                .load_conv(&marked)
+                .unwrap()
+                .expect("the marked record")
+                .delete_pending,
+            "the mark did not survive a reopen"
+        );
+        assert!(
+            !store
+                .load_conv(&other)
+                .unwrap()
+                .expect("the other record")
+                .delete_pending,
+            "an unmarked record reads as marked"
+        );
+        assert_eq!(store.pending_deletes().unwrap(), vec![marked]);
+
+        store.delete_conv(&marked).unwrap();
+        assert!(
+            store.pending_deletes().unwrap().is_empty(),
+            "the mark outlived its record"
+        );
+        assert!(matches!(
+            store.mark_delete_pending(&marked),
+            Err(StoreError::MissingConversation)
+        ));
     }
 
     /// An outbox record whose correspondence holds no conversation record is

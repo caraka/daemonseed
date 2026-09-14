@@ -117,6 +117,16 @@ work lives in the maintainer's own planning notes, not here.
   `Store::update_advert_state` hands that serial to a closure in the critical section that writes; the
   advert-keys record is at version 2 and `ADVERT_KEYS_RECORD_LEN` is 6407. `send_message`, `collect_batch`,
   `recognise_acceptance` and `accept` keep a force-turn flag stored after they loaded the key schedule (#474).
+- `daemonseed-core`: `Store::delete_conv` removes the conversation record before the outbox, so a stop between
+  the two leaves only an outbox that `Store::load` deletes. Conversation records carry `delete_pending`, which
+  `delivery::prepare_delete` sets through `Store::mark_delete_pending` before the channel is erased and
+  `Store::pending_deletes` lists; `Store::load` offers no outstanding outbox for a marked conversation, and
+  `send_message`, `collect_batch`, `recognise_acceptance`, `accept` on an existing record,
+  `continue_acceptance`, `continue_first_contact` (and through it `first_contact` to a marked identity),
+  `resume_first_contact` and `refresh_first_contact` refuse it with `FlowError::DeletePending`, the first three
+  re-checking the mark where they commit through `Store::try_update_conv`, which writes a record only where its
+  closure returns `Ok`. The conversation record is at version 3 and `CONV_RECORD_LEN`
+  is 36863.
 - `daemonseed-core`: `dm::delivery`, the direct-messaging delivery rules — `channel::collected(seq, peer_cursor)`,
   re-exported here, true exactly when the correspondent's published cursor is above the sequence and
   now also the predicate `Store::delete_outbox_through` frees a slot on;

@@ -2426,7 +2426,7 @@ modules:
       advert_serial }>, own_hello_secret: Option<advert::AdvertSharedSecret>,
       own_hello_kem_ct, own_control_key: Option<channel::ControlKey>,
       peer_control_key: Option<channel::ControlKey>, peer_advert_serial,
-      own_opening: Option<[u8; channel::OPENING_LEN]> } as
+      own_opening: Option<[u8; channel::OPENING_LEN]>, delete_pending: bool } as
       RecordKind::Conversation. OutstandingHello holds the sealed hello as
       written to the drop slot, so a rewrite after an abort or an eviction is
       byte-identical rather than a fresh encapsulation under a different ss0.
@@ -2444,8 +2444,18 @@ modules:
       record, one critical_section for the whole of it, and refuses
       StoreError::MissingConversation where there is no record; no whole-record
       write is reachable from outside the crate, so a caller cannot blank a field
-      it does not track;
-      delete_conv(peer) removes the conversation and outbox records together.
+      it does not track; try_update_conv(peer, FnOnce(&mut ConvState) ->
+      Result<T, E>) -> Result<Result<T, E>, StoreError> is the same door for a
+      change that can be refused, writing the record only where the closure
+      returns Ok;
+      delete_conv(peer) removes the conversation and outbox records together,
+      the conversation record first, so a stop between the two leaves only an
+      outbox with no conversation record, which load deletes.
+      mark_delete_pending(peer) -> Result<ConvState, StoreError> sets
+      delete_pending in the section that reads the record and returns the state,
+      refusing StoreError::MissingConversation where there is none;
+      pending_deletes() -> Result<Vec<CorrespondenceLabel>, StoreError> names
+      every correspondence whose record carries the mark.
       Every read here takes the lock. persist_outbox(peer, seq,
       ciphertext) records the exact bytes a slot will hold as
       RecordKind::ConversationOutbox, one record holding one entry per ring slot
@@ -2457,16 +2467,17 @@ modules:
       outstanding_outbox: Vec<OutboxEntry { seq, ciphertext }> }> }, StoreError>
       is what a launch reads; an outbox entry is outstanding only while
       peer_collected <= seq < send_seq, so an entry at or above send_seq is a seal
-      whose conversation record did not commit and is not reported. An outbox record
+      whose conversation record did not commit and is not reported. A conversation
+      carrying delete_pending is loaded with an empty outstanding_outbox. An outbox record
       whose correspondence holds no conversation record is deleted, scrubbed first. The caller
       rewrites every outstanding entry whose slot differs, byte for byte.
       The record encodings are crate-private: a magic, a version byte, then
       fixed-width fields, an absent value written as a zero flag byte and its own
-      width in zeros. A decoder refuses an unknown version (the conversation and
-      advert-keys records are at version 2, the outbox record at version 1), an outbox entry whose
+      width in zeros. A decoder refuses an unknown version (the conversation record is
+      at version 3, the advert-keys record at version 2, the outbox record at version 1), an outbox entry whose
       sequence is not its ring position, a hello slot at or above DROP_SUBKEYS,
       and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6407),
-      CONV_RECORD_LEN (36862) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
+      CONV_RECORD_LEN (36863) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
       widths and are the RecordKind buckets. StoreError is Store(DmStoreError),
       Corrupt { kind, reason }, OutboxSlotOccupied, CiphertextTooLong,
       MissingConversation, ConversationExists, MissingAdvertKeys and
@@ -2491,17 +2502,30 @@ modules:
       CSPRNG. The clock is an argument and the module reads none.
       A teardown is two calls around the caller's own erase. prepare_delete(
       &Store, &CorrespondenceLabel, closed_marker: bool) -> Result<ChannelErase,
-      StoreError> reads the conversation and returns ChannelErase { lookup_key,
-      marker: Option<ClosedMarker { collected_cursor }> } without changing
-      anything; lookup_key names this side's channel record for the transport to
+      StoreError> marks the conversation delete_pending through
+      Store::mark_delete_pending, in the section that reads it, and returns
+      ChannelErase { lookup_key, marker: Option<ClosedMarker { collected_cursor }> };
+      lookup_key names this side's channel record for the transport to
       erase, collected_cursor is my_collected as read there, and
       ClosedMarker::control(Option<ChannelOpening>) -> channel::Control builds the
       closed control record the caller seals with channel::seal_control.
       finish_delete(&Store, &CorrespondenceLabel) -> Result<(), StoreError> drops
       the conversation and outbox records through Store::delete_conv once the
       erase has been performed, and the caller stops polling the correspondence
-      once it returns; a crash between the two leaves the conversation intact and
-      the caller re-runs both, the erase being idempotent. Both refuse
+      once it returns; the mark goes with the record. A stop between the two
+      leaves the record marked: Store::pending_deletes names it, Store::load offers
+      none of its outbox, and send_message, collect_batch, recognise_acceptance,
+      accept on an existing record, continue_acceptance, continue_first_contact,
+      first_contact to a marked identity through continue_first_contact,
+      resume_first_contact and refresh_first_contact refuse it with
+      FlowError::DeletePending; the caller re-runs the erase and finish_delete, the
+      erase being idempotent. send_message, collect_batch and recognise_acceptance
+      re-check the mark in the critical section that commits their state, before
+      any network write; the gap between that commit and the write that follows is
+      not covered, and the other flows check the mark only at their load, so a
+      teardown and a flow on one conversation are not run at once. collect still
+      erases a rewritten hello's slot in this side's own drop for a marked,
+      established conversation. Both refuse
       StoreError::MissingConversation where the correspondence holds no
       conversation record. The module performs no network write.
       Sub-module dm::flows drives first contact and the ordinary message and
@@ -2517,7 +2541,7 @@ modules:
       own error; FlowError is Advert, Drop, Channel, Chain, Store, Records,
       NoAdvert, NoOpening, NotOutstanding, AlreadyEstablished,
       AwaitingAcceptance, AlreadyAccepted, OpeningWriter, OpeningRatchetKey, DropFull,
-      Incomplete and HelloLength. Me { signer, channel_root } is this side's
+      Incomplete, HelloLength and DeletePending. Me { signer, channel_root } is this side's
       identity, FIRST_GENERATION is 0 and MAX_REPICKS is 1.
       first_contact(store, records, me, peer_identity_pk, body, fill, now) ->
       Result<FirstContact, FlowError> holds one conversation per correspondent
@@ -2594,10 +2618,12 @@ modules:
       erases the slot. send_message(store, records,
       peer, body, fill) -> Result<u64, FlowError> persists the ciphertext and
       the advanced send_seq and writes one ring slot; it is
+      FlowError::DeletePending while delete_pending is set, and
       FlowError::AwaitingAcceptance while awaiting_acceptance or acceptance_pending is
       set. collect_batch(store,
       records, peer) -> Result<Batch { bodies, my_collected, cursor_published },
-      FlowError> is FlowError::AwaitingAcceptance while acceptance_pending is set, and
+      FlowError> is FlowError::DeletePending while delete_pending is set,
+      FlowError::AwaitingAcceptance while acceptance_pending is set, and
       otherwise reads the correspondent's ring from this side's cursor and
       publishes the new cursor in one control write where my_collected is above
       the record's cursor_published, sealed under own_control_key and carrying

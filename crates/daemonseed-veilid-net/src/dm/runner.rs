@@ -1424,10 +1424,12 @@ fn refusal_for(error: &FlowError) -> Refusal {
 }
 
 /// Count a flow failure the schedule met. A record store failure is already
-/// counted where the store refused.
+/// counted where the store refused. A conversation whose delete is under way
+/// refuses every flow until the delete finishes, and that refusal is not a
+/// failure.
 fn note_failure(health: &mut HealthCounters, error: &FlowError) {
     match error {
-        FlowError::Records(_) => {}
+        FlowError::Records(_) | FlowError::DeletePending => {}
         FlowError::Store(_) => health.store_failures += 1,
         _ => health.conversation_failures += 1,
     }
