@@ -128,6 +128,12 @@ impl Platform for GuiPlatform {
 const W: u32 = 1100;
 const H: u32 = 680;
 
+/// Added to the window close's backstop. The backstop runs from the send, and the
+/// actor starts the close only after the commands queued ahead of it, so a close that
+/// spends its whole cap and budget still acks inside the backstop.
+#[cfg(feature = "desktop")]
+const CLOSE_BACKSTOP_MARGIN: Duration = Duration::from_secs(1);
+
 /// Released build version shown in-app (auth-screen readout, issue #59 surface).
 /// Stamped at release from the git tag — like `lama.yaml` `version` and the README
 /// Status line — NOT Cargo's tag-driven `0.1.0`.
@@ -434,9 +440,10 @@ fn materialize_and_select(
                 // disk failure is surfaced quietly — the circle still works this
                 // session (no-history property means nothing is lost but the rejoin).
                 if let Err(e) = st.persist_circle(idx) {
-                    ui.set_connection_status(SharedString::from(format!(
-                        "circle active · saved in memory only ({e})"
-                    )));
+                    set_status_unless_closing(
+                        ui,
+                        SharedString::from(format!("circle active · saved in memory only ({e})")),
+                    );
                 }
                 // The JoinCircle inputs come from the STORED net contract (the
                 // keystone is the source of truth), not the passed-through arg.
@@ -722,7 +729,7 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
                 } else {
                     "Couldn't access the clipboard — read it off the screen."
                 };
-                ui.set_connection_status(SharedString::from(msg));
+                set_status_unless_closing(&ui, SharedString::from(msg));
             }
         }
     });
@@ -774,9 +781,12 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
                 drop(st);
                 ui.set_circle_phrase_revealed(SharedString::from(""));
                 if let Err(reason) = outcome {
-                    ui.set_connection_status(SharedString::from(format!(
-                        "Left, but couldn't update the profile: {reason}"
-                    )));
+                    set_status_unless_closing(
+                        &ui,
+                        SharedString::from(format!(
+                            "Left, but couldn't update the profile: {reason}"
+                        )),
+                    );
                 }
             });
         }
@@ -1465,7 +1475,7 @@ fn start_drain(
                     Ok(Some(evt)) => evt,
                     Ok(None) => break,
                     Err(()) => {
-                        ui.set_connection_status(SharedString::from("offline"));
+                        set_status_unless_closing(&ui, SharedString::from("offline"));
                         ui.set_connected(false);
                         break;
                     }
@@ -1613,10 +1623,33 @@ fn connect_now(
             ui.set_mask_peer_count(SharedString::default());
         }
         Err(reason) => {
-            ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
+            set_status_unless_closing(ui, SharedString::from(format!("offline · {reason}")));
             ui.set_connected(false);
         }
     }
+}
+
+/// Set the connection status, unless the closing message is already shown: once a
+/// close has said it is finishing up, nothing replaces that until the process exits.
+fn set_status_unless_closing(ui: &AppWindow, status: SharedString) {
+    if ui.get_connection_status() != net::DM_CLOSE_MESSAGE {
+        ui.set_connection_status(status);
+    }
+}
+
+/// Handle a window close request against whether a close is already under way.
+///
+/// With none under way it returns `false` and shows nothing, leaving the close to
+/// start. With one under way the user is waiting on it, so the closing message is
+/// shown at once, whether or not the actor has said the close is slow, and it
+/// returns `true`.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn close_request_while_closing(ui: &AppWindow, closing: &Cell<bool>) -> bool {
+    if !closing.get() {
+        return false;
+    }
+    ui.set_connection_status(SharedString::from(net::DM_CLOSE_MESSAGE));
+    true
 }
 
 /// #144: dismiss the startup "assembling network" mask a short SETTLE window after
@@ -1653,11 +1686,15 @@ fn apply_net_event(
         // No interface draws direct messages, so a stopped runner changes nothing
         // on screen.
         NetEvent::DmStopped => {}
+        // A close still waiting on the runner says so where "connecting…" is shown.
+        NetEvent::DmCloseSlow => {
+            ui.set_connection_status(SharedString::from(net::DM_CLOSE_MESSAGE));
+        }
         NetEvent::Connected => {
             // #182: transport-level status — a client attaches to the Veilid network,
             // not to a room. Room-scoped phrasing ("connected · lobby") was relay-era
             // and misleading when viewing a circle; "veilid" is always accurate.
-            ui.set_connection_status(SharedString::from("connected · veilid"));
+            set_status_unless_closing(ui, SharedString::from("connected · veilid"));
             ui.set_connected(true);
         }
         // #144: the attach peer count climbing during the cold-start warmup — shown
@@ -1676,11 +1713,11 @@ fn apply_net_event(
         NetEvent::RoomJoined => {
             // #182: static transport-level status (see NetEvent::Connected) — never the
             // joined room name, which read as "connected · lobby" even inside a circle.
-            ui.set_connection_status(SharedString::from("connected · veilid"));
+            set_status_unless_closing(ui, SharedString::from("connected · veilid"));
             ui.set_connected(true);
         }
         NetEvent::ConnectFailed { reason } => {
-            ui.set_connection_status(SharedString::from(format!("offline · {reason}")));
+            set_status_unless_closing(ui, SharedString::from(format!("offline · {reason}")));
             ui.set_connected(false);
         }
         // A surface-level operation error is NOT a connection-state change. It must
@@ -1800,7 +1837,7 @@ fn apply_net_event(
             // Non-fatal (the connection may still be up). Surface on the status
             // line for manual test diagnostics; no per-circle status surface yet.
             let _ = circle_id;
-            ui.set_connection_status(SharedString::from(format!("circle: {reason}")));
+            set_status_unless_closing(ui, SharedString::from(format!("circle: {reason}")));
         }
         // ── Shares: browse tree (commit 1) ──
         // SharesSnapshot + FetchManifest drive the Shares-tab tree. Publish events and
@@ -2797,6 +2834,12 @@ fn main() {
             // --portable / --config instance saves into its own directory, not XDG.
             let last_size = std::rc::Rc::new(std::cell::Cell::new(None::<(u32, u32)>));
             let ws_root = profile_root.clone();
+            // Set once a close is under way, so a second close request while the actor
+            // finishes is ignored rather than sent again.
+            let closing = Rc::new(Cell::new(false));
+            // Polls the close's ack while the window stays open, so the event loop keeps
+            // drawing and can show the closing message.
+            let close_watch = Rc::new(Timer::default());
             ui.window().on_winit_window_event(move |_w, event| {
                 match event {
                     // #39: re-grab keyboard focus on activation so input survives an
@@ -2812,6 +2855,15 @@ fn main() {
                     }
                     WindowEvent::Resized(sz) => last_size.set(Some((sz.width, sz.height))),
                     WindowEvent::CloseRequested => {
+                        // A second request while closing shows the closing message at
+                        // once and changes nothing else.
+                        let already_closing = match weak.upgrade() {
+                            Some(ui) => close_request_while_closing(&ui, &closing),
+                            None => closing.get(),
+                        };
+                        if already_closing {
+                            return EventResult::PreventDefault;
+                        }
                         if let Some((w, h)) = last_size.get() {
                             save_window_size(&ws_root.borrow(), w, h);
                         }
@@ -2819,32 +2871,47 @@ fn main() {
                         // (the common restart path) so a relaunch seeds the marks and
                         // does not re-trip the unread dot for already-seen backlog.
                         state_close.borrow_mut().persist_all_circle_seen();
-                        // Business-as-usual on a graceful quit: withdraw owned shares so
-                        // they drop from peers' lists immediately, publish a LEAVE
-                        // tombstone per joined room, and run the WB-3.I7 scheduler flush
-                        // (#161), then block the close until the actor acks. The actor
-                        // acks only AFTER each withdraw + leave `set_dht_value` returns
-                        // (i.e. after it is written to the DHT's responsible nodes) and
-                        // the flush has run, so the ack means the departure has actually
-                        // landed — the block returns the instant it arrives, keeping a
-                        // healthy close fast. The actor bounds the work itself with
-                        // GRACEFUL_CLOSE_BUDGET; this timeout is the backstop for an ack
-                        // that never comes at all, not the bound. The TTL still covers
-                        // whatever the budget cut short. Safe: the net actor runs off the
-                        // main thread, so blocking here never starves it.
+                        // Business-as-usual on a graceful quit: let the direct-messaging
+                        // runner stop, up to `net::DM_CLOSE_CAP`, then withdraw owned
+                        // shares so they drop from peers' lists immediately, publish a
+                        // LEAVE tombstone per joined room, and run the final scheduler
+                        // flush, and exit only once the actor acks. The actor acks only
+                        // AFTER each withdraw + leave `set_dht_value` returns (i.e. after
+                        // it is written to the DHT's responsible nodes) and the flush has
+                        // run, so the ack means the departure has actually landed. The
+                        // window stays open and the event loop keeps running meanwhile,
+                        // so the drain timer shows `net::DM_CLOSE_MESSAGE` if messaging is
+                        // slow to stop; the loop ends the moment the ack arrives, keeping
+                        // a healthy close fast. The actor bounds its own work with the cap
+                        // and GRACEFUL_CLOSE_BUDGET; the deadline below is the backstop
+                        // for an ack that never comes at all. The TTL still covers
+                        // whatever the budget cut short.
                         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                         let sent = net_close
                             .borrow()
                             .send(NetCommand::GracefulClose { ack: ack_tx })
                             .is_ok();
-                        if sent && let Some(rt) = PICKER_RT.get() {
-                            let _ = rt.block_on(async {
-                                tokio::time::timeout(
-                                    daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET,
-                                    ack_rx,
-                                )
-                                .await
-                            });
+                        if sent {
+                            closing.set(true);
+                            let deadline = std::time::Instant::now()
+                                + net::DM_CLOSE_CAP
+                                + daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET
+                                + CLOSE_BACKSTOP_MARGIN;
+                            let mut ack_rx = ack_rx;
+                            close_watch.start(
+                                TimerMode::Repeated,
+                                Duration::from_millis(50),
+                                move || {
+                                    let acked = !matches!(
+                                        ack_rx.try_recv(),
+                                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                                    );
+                                    if acked || std::time::Instant::now() >= deadline {
+                                        let _ = slint::quit_event_loop();
+                                    }
+                                },
+                            );
+                            return EventResult::PreventDefault;
                         }
                     }
                     _ => {}
@@ -3238,5 +3305,82 @@ mod tests {
         }
         assert!(p.contains("Type words"));
         assert!(p.ends_with("of your recovery phrase."));
+    }
+
+    /// Run `f` with a window on the offscreen software platform, on a thread of its
+    /// own with a stack large enough to build the window: a test thread's default
+    /// stack overflows while the window is created. The platform is per thread, so
+    /// that thread installs its own. A panic in `f` is raised again here.
+    fn with_offscreen_window(f: impl FnOnce(AppWindow) + Send + 'static) {
+        let joined = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+                let _ = slint::platform::set_platform(Box::new(GuiPlatform { window }));
+                f(AppWindow::new().expect("create AppWindow"));
+            })
+            .expect("spawn the window thread")
+            .join();
+        if let Err(panic) = joined {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// A close request while a close is already under way shows the closing message
+    /// at once; the first request shows nothing.
+    #[test]
+    fn a_second_close_request_shows_the_closing_message_at_once() {
+        with_offscreen_window(|ui| {
+            let closing = Cell::new(false);
+
+            assert!(
+                !close_request_while_closing(&ui, &closing),
+                "a first close request was taken for a second"
+            );
+            assert_ne!(
+                ui.get_connection_status(),
+                net::DM_CLOSE_MESSAGE,
+                "control: the first close request showed the closing message"
+            );
+
+            closing.set(true);
+            assert!(close_request_while_closing(&ui, &closing));
+            assert_eq!(ui.get_connection_status(), net::DM_CLOSE_MESSAGE);
+        });
+    }
+
+    /// A slow close puts the closing message in the connection status, and no later
+    /// event replaces it.
+    #[test]
+    fn a_slow_close_sets_the_status_and_keeps_it() {
+        with_offscreen_window(|ui| {
+            let state = Rc::new(RefCell::new(GuiState::lobby_only()));
+            let browser = Rc::new(RefCell::new(ShareBrowser::new()));
+
+            apply_net_event(&ui, &state, &browser, NetEvent::Connected);
+            assert_eq!(
+                ui.get_connection_status(),
+                "connected · veilid",
+                "control: an event sets the status before the close"
+            );
+
+            apply_net_event(&ui, &state, &browser, NetEvent::DmCloseSlow);
+            assert_eq!(ui.get_connection_status(), net::DM_CLOSE_MESSAGE);
+
+            apply_net_event(
+                &ui,
+                &state,
+                &browser,
+                NetEvent::ConnectFailed {
+                    reason: "gone".to_owned(),
+                },
+            );
+            apply_net_event(&ui, &state, &browser, NetEvent::Connected);
+            assert_eq!(
+                ui.get_connection_status(),
+                net::DM_CLOSE_MESSAGE,
+                "a later status replaced the closing message"
+            );
+        });
     }
 }

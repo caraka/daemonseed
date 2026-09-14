@@ -59,6 +59,18 @@ pub(crate) fn republish_name(root: &Path, persisted: Option<&str>) -> String {
         .unwrap_or_else(|| "share".to_owned())
 }
 
+/// The longest a close waits for the direct-messaging runner to stop before it
+/// carries on without it.
+pub const DM_CLOSE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a close waits for the direct-messaging runner to stop before the
+/// user is told it is finishing up.
+pub const DM_CLOSE_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What the connection status says while a close is still waiting on the runner
+/// after [`DM_CLOSE_NOTICE_AFTER`].
+pub const DM_CLOSE_MESSAGE: &str = "closing — finishing up with your conversations";
+
 /// The secret halves the direct-messaging runner needs, derived once at connect
 /// and moved into the runner's parts. The net actor keeps no copy.
 ///
@@ -455,6 +467,9 @@ pub enum NetEvent {
     /// The direct-messaging runner stopped. Nothing reports until a later
     /// connect with a started node starts another.
     DmStopped,
+    /// A close is still waiting for the direct-messaging runner to stop after
+    /// [`DM_CLOSE_NOTICE_AFTER`]. Sent at most once per close.
+    DmCloseSlow,
 }
 
 /// One file in an A1 fetch-preview ([`NetEvent::FetchManifest`]): the file's

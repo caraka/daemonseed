@@ -65,6 +65,12 @@ library:
 # stop, whether running or produced by a start still in flight, is reported by one
 # `NetEvent::DmStopped`; with no runner running or starting they report nothing. A
 # runner that ends on its own is also reported by one `NetEvent::DmStopped`.
+# `GracefulClose` then waits for that stop before its transport steps and its ack,
+# up to `net::DM_CLOSE_CAP` (30 s); a stop still running after
+# `net::DM_CLOSE_NOTICE_AFTER` (500 ms) emits `NetEvent::DmCloseSlow` once, which
+# sets the connection status to `net::DM_CLOSE_MESSAGE`. On window close the binary
+# keeps the window open and drawing until the ack, or until the cap plus the close
+# budget has passed.
 # `NetEvent::Dm(Arc<RunnerEvent>)` reaches `GuiState::on_dm_event`, which draws
 # nothing and, for `RunnerEvent::StartedOver`, appends
 # `TrustEventKey::DmCorrespondentStateLost` to `GuiState::trust_log`, the audit

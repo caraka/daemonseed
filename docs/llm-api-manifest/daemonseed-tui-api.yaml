@@ -185,14 +185,22 @@ modules:
       still running: it stops the previous runner, awaits TaskEnd::finish when
       the shutdown timed out, forwards the events not delivered, emits
       DmStopped, and only then starts the next runner, which the actor installs
-      when the task ends. The actor loop serves every other command meanwhile,
-      and a Dm command arriving meanwhile is refused with ShuttingDown.
+      when the task ends. For Connect and StopDm the actor loop serves every
+      other command meanwhile, and a Dm command arriving meanwhile is refused
+      with ShuttingDown. GracefulClose instead awaits that task before its
+      transport steps and its ack, up to net::DM_CLOSE_CAP (Duration, 30 s),
+      emitting DmCloseSlow once if the task is still running after
+      net::DM_CLOSE_NOTICE_AFTER (Duration, 500 ms); past the cap the close
+      carries on. net::DM_CLOSE_MESSAGE (&str) is "closing — finishing up with
+      your conversations".
       NetCommand derives Debug only: RunnerCommand is not Clone.
       Events: Dm(Arc<RunnerEvent>) (one runner event, forwarded by the actor and
       folded into App's DmState; Arc because RunnerEvent is not Clone), DmStopped
       (the runner stopped; nothing reports until a later Connect starts another;
       App marks every unanswered send not sent and says how many on the status
-      line),
+      line), DmCloseSlow (a close is still waiting for the runner to stop after
+      DM_CLOSE_NOTICE_AFTER; App ignores it, and the binary's close wait, which
+      runs after the terminal is restored, prints DM_CLOSE_MESSAGE once),
       Connected/ConnectFailed, CircleJoined ({ circle_id: u64, label:
       String, entropy: String } — the added circle's stable id + client-local
       label, plus the canonicalized entropy echoed back in-process so the app can

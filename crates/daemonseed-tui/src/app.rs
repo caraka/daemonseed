@@ -2412,6 +2412,9 @@ impl App {
                 }
                 self.clamp_dm_sel();
             }
+            // A close waits for the runner after this state is no longer drawn, so
+            // the binary tells the user itself.
+            NetEvent::DmCloseSlow => {}
             NetEvent::DmStopped => {
                 let unsent = self.dm.stop();
                 if unsent > 0 {

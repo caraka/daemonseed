@@ -58,6 +58,18 @@ impl std::fmt::Debug for StableSigningKey {
     }
 }
 
+/// The longest a close waits for the direct-messaging runner to stop before it
+/// carries on without it.
+pub const DM_CLOSE_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long a close waits for the direct-messaging runner to stop before the
+/// user is told it is finishing up.
+pub const DM_CLOSE_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What the user is told while a close is still waiting on the runner after
+/// [`DM_CLOSE_NOTICE_AFTER`].
+pub const DM_CLOSE_MESSAGE: &str = "closing — finishing up with your conversations";
+
 /// The secret halves the direct-messaging runner needs, derived once at connect
 /// and moved into the runner's parts. The net actor keeps no copy.
 ///
@@ -688,11 +700,15 @@ pub enum NetEvent {
     /// The direct-messaging runner stopped. Nothing reports until a later
     /// connect with a started node starts another.
     DmStopped,
+    /// A close is still waiting for the direct-messaging runner to stop after
+    /// [`DM_CLOSE_NOTICE_AFTER`]. Sent at most once per close.
+    DmCloseSlow,
 }
 
 /// Owns the network thread and the command/event channels. Held by the binary
-/// for the life of the session; dropped on quit (dropping `cmd_tx` ends the
-/// actor loop, which returns the runtime and joins the thread).
+/// for the life of the session; dropped on quit. Dropping `cmd_tx` ends the actor
+/// loop; the thread's handle is dropped without a join, so the thread is detached
+/// and ends when its runtime returns or the process exits.
 pub struct NetHandle {
     cmd_tx: mpsc::UnboundedSender<NetCommand>,
     evt_rx: mpsc::UnboundedReceiver<NetEvent>,

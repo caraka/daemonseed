@@ -9,7 +9,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use daemonseed_core::profile::resolve::resolve;
 use daemonseed_core::profile::{
@@ -18,7 +18,9 @@ use daemonseed_core::profile::{
 };
 use daemonseed_core::storage::seeds;
 use daemonseed_tui::app::App;
-use daemonseed_tui::net::{NetCommand, NetHandle, RootKind};
+use daemonseed_tui::net::{
+    DM_CLOSE_CAP, DM_CLOSE_MESSAGE, NetCommand, NetEvent, NetHandle, RootKind,
+};
 use daemonseed_tui::ui;
 use ratatui::crossterm::event::{self, Event};
 
@@ -31,6 +33,14 @@ const TICK: Duration = Duration::from_millis(100);
 /// a real DHT write the user is better off seeing than guessing at. Two render ticks —
 /// long enough to cover a no-op close, short enough not to feel like a pause.
 const QUIET_CLOSE_WINDOW: Duration = Duration::from_millis(200);
+
+/// How often the close wait checks for the ack and for events.
+const CLOSE_POLL: Duration = Duration::from_millis(50);
+
+/// Added to the close wait's backstop. The backstop runs from the send, and the actor
+/// starts the close only after the commands queued ahead of it, so a close that spends
+/// its whole cap and budget still acks inside the backstop.
+const CLOSE_BACKSTOP_MARGIN: Duration = Duration::from_secs(1);
 
 fn main() -> io::Result<()> {
     // Bring the oxicrypt module Operational before touching the terminal — a
@@ -95,7 +105,7 @@ fn main() -> io::Result<()> {
     // Graceful close AFTER the terminal is restored (#161): the wait can run to the
     // full close budget, and a frozen alternate-screen frame for that long reads as a
     // hang. On a plain terminal a slow close can say so and be watched finish.
-    graceful_close(&net);
+    graceful_close(&mut net);
     result
 }
 
@@ -104,28 +114,53 @@ fn main() -> io::Result<()> {
 /// rosters for the full `PRESENCE_TTL`, making a graceful quit indistinguishable from
 /// a crash.
 ///
-/// Bounded on BOTH sides: the actor stops its own work at the budget, and this
-/// `recv_timeout` is the backstop for an actor that never acks at all (a wedged or
+/// Before that the actor waits for the direct-messaging runner to stop, up to
+/// `DM_CLOSE_CAP`, so a message sent just before quitting lands. When that stop is
+/// slow the actor sends `NetEvent::DmCloseSlow`, and this prints `DM_CLOSE_MESSAGE`
+/// once.
+///
+/// Bounded on BOTH sides: the actor stops its own work at the cap and the budget, and
+/// this wait is the backstop for an actor that never acks at all (a wedged or
 /// already-dead net thread). A session that never connected acks immediately, so
 /// quitting from the unlock screen stays instant.
-fn graceful_close(net: &NetHandle) {
+fn graceful_close(net: &mut NetHandle) {
     let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
     if net.send(NetCommand::GracefulClose { ack: ack_tx }).is_err() {
         return; // the net thread is already gone — nothing to flush
     }
-    let budget = daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET;
-    // A session with nothing to publish (never connected, no lobby) acks well inside
-    // this, so quitting from the unlock screen stays silent and instant. Announce only
-    // once it is clear there is real network work to wait on — otherwise the notice
-    // would claim a departure that never happened.
-    if ack_rx.recv_timeout(QUIET_CLOSE_WINDOW).is_ok() {
-        return;
+    let backstop =
+        DM_CLOSE_CAP + daemonseed_veilid_net::GRACEFUL_CLOSE_BUDGET + CLOSE_BACKSTOP_MARGIN;
+    let started = Instant::now();
+    let (mut said_closing, mut said_finishing) = (false, false);
+    loop {
+        match ack_rx.recv_timeout(CLOSE_POLL) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let events = net.drain_events();
+        if !said_finishing
+            && events
+                .iter()
+                .any(|event| matches!(event, NetEvent::DmCloseSlow))
+        {
+            eprintln!("daemonseed-tui: {DM_CLOSE_MESSAGE}");
+            said_finishing = true;
+        }
+        let waited = started.elapsed();
+        // A session with nothing to publish (never connected, no lobby) acks well
+        // inside this, so quitting from the unlock screen stays silent and instant.
+        // Announce only once it is clear there is real network work to wait on —
+        // otherwise the notice would claim a departure that never happened. It says
+        // what is being waited on, not what is being published: the actor may be
+        // finishing an earlier command rather than the leave.
+        if !said_closing && waited >= QUIET_CLOSE_WINDOW {
+            eprintln!("daemonseed-tui: closing network session…");
+            said_closing = true;
+        }
+        if waited >= backstop {
+            return;
+        }
     }
-    // Deliberately says what is being waited on, not what is being published: the actor
-    // may be finishing an earlier command rather than the leave, so "leaving the lobby"
-    // would not always be true.
-    eprintln!("daemonseed-tui: closing network session…");
-    let _ = ack_rx.recv_timeout(budget.saturating_sub(QUIET_CLOSE_WINDOW));
 }
 
 /// The OS default Downloads directory (ISC-C68 / A3). Resolved per-platform via

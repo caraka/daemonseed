@@ -1548,6 +1548,12 @@ work lives in the maintainer's own planning notes, not here.
   `GuiState::on_dm_event` takes a `RunnerEvent`, appends `TrustEventKey::DmCorrespondentStateLost`
   for `RunnerEvent::StartedOver`, and keeps nothing else.
 
+- `daemonseed-tui`, `daemonseed-gui`: `NetCommand::GracefulClose` waits for the direct-messaging runner
+  to stop before its transport steps and its ack, capped at `net::DM_CLOSE_CAP` (30 s). A stop still
+  running after `net::DM_CLOSE_NOTICE_AFTER` (500 ms) sends the new `NetEvent::DmCloseSlow`, shown as
+  `net::DM_CLOSE_MESSAGE`: the GUI puts it in the connection status and keeps its window open and
+  drawing until the ack; the terminal client prints it while it waits.
+
 ### Changed
 
 - The DM outbox's at-rest format is `v4`, adding a pruned high-water mark. `v3`

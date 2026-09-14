@@ -1655,6 +1655,38 @@ async fn wait_dm_start(
     dm_start.as_mut().unwrap().await
 }
 
+/// Wait for the runner stop a close began, so a message sent just before close is
+/// not cut off mid write.
+///
+/// The wait ends when the stop ends or at [`crate::net::DM_CLOSE_CAP`], whichever
+/// comes first; past the cap the close carries on and the stop is left running.
+/// A stop still running after [`crate::net::DM_CLOSE_NOTICE_AFTER`] sends
+/// [`NetEvent::DmCloseSlow`] once. A stop with nothing to wait on ends at once, so
+/// an idle close adds no delay.
+async fn finish_dm_for_close(dm_start: &mut Option<DmStart>, evt_tx: &UnboundedSender<NetEvent>) {
+    let Some(mut start) = dm_start.take() else {
+        return;
+    };
+    let notice_after = crate::net::DM_CLOSE_NOTICE_AFTER;
+    let cap = crate::net::DM_CLOSE_CAP;
+    let ended = match tokio::time::timeout(notice_after, &mut start).await {
+        Ok(ended) => Some(ended),
+        Err(_) => {
+            let _ = evt_tx.send(NetEvent::DmCloseSlow);
+            tokio::time::timeout(cap.saturating_sub(notice_after), &mut start)
+                .await
+                .ok()
+        }
+    };
+    match ended {
+        Some(Ok(_)) => {}
+        Some(Err(e)) => daemonseed_veilid_net::vtrace!("gui dm: runner stop task failed ({e})"),
+        None => daemonseed_veilid_net::vtrace!(
+            "gui close: messaging stop still running at the {cap:?} cap, closing without it"
+        ),
+    }
+}
+
 /// Start the runner a connect calls for, in place of any earlier one: over the
 /// connection's node where it started, and none where it did not, which still
 /// stops the previous connection's runner.
@@ -1954,13 +1986,15 @@ async fn handle_command(
             unpublish_share(shares, evt_tx, net, &share_id).await;
         }
         NetCommand::GracefulClose { ack } => {
-            // The runner goes down with the transport it rides. It is stopped off
-            // this loop, so the close budget never waits on its flow call.
+            // The runner is stopped, and its task awaited up to a cap, before the
+            // transport it rides goes down, so a message sent just before close
+            // lands. The steps below keep their own budget.
             begin_dm_restart(dm, dm_start, evt_tx, async { None });
+            finish_dm_for_close(dm_start, evt_tx).await;
             // Every step below is bounded, and the bounds compose inside
             // GRACEFUL_CLOSE_BUDGET (see its carve-up). Nothing here may await a DHT
-            // write unbounded: `main.rs` blocks the UI thread on this ack, so a stalled
-            // step would freeze the window AND skip the I7 flush entirely.
+            // write unbounded: `main.rs` keeps the window open until this ack, so a
+            // stalled step would hold it open AND skip the final flush entirely.
             let preflush_deadline = Instant::now() + CLOSE_PREFLUSH_BUDGET;
             daemonseed_veilid_net::vtrace!(
                 "gui close: entry, preflush budget {CLOSE_PREFLUSH_BUDGET:?}, \
@@ -8506,17 +8540,254 @@ mod tests {
         stop_chains_onto_a_start_in_flight(NetCommand::StopDm, "StopDm").await;
     }
 
-    /// `GracefulClose` arriving while a start is still in flight chains onto it,
-    /// and still acks.
+    /// `GracefulClose` arriving while a start is still in flight waits for it: the
+    /// runner that start produces is stopped, and its task ended, before the close
+    /// acks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn graceful_close_stops_a_runner_whose_start_is_still_in_flight() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let mut dm: Option<DmSession> = None;
+        let mut dm_start: Option<DmStart> = None;
+
+        let records = EmptyRecords::new(Duration::ZERO);
+        let alive = records.alive.clone();
+        let root = profile.path().to_path_buf();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_in_start = entered.clone();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        begin_dm_restart(&mut dm, &mut dm_start, &evt_tx, async move {
+            entered_in_start.store(true, Ordering::SeqCst);
+            let _ = released.await;
+            Some(empty_runner(&root, records, RunnerConfig::default()))
+        });
+        wait_for(&entered, "the start to begin").await;
+
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
-        stop_chains_onto_a_start_in_flight(
+        let closing = tokio::spawn({
+            let evt_tx = evt_tx.clone();
+            async move {
+                let mut dm = dm;
+                let mut dm_start = dm_start;
+                dispatch(
+                    NetCommand::GracefulClose { ack: ack_tx },
+                    &evt_tx,
+                    &mut dm,
+                    &mut dm_start,
+                )
+                .await;
+                dm.is_none() && dm_start.is_none()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !closing.is_finished(),
+            "the close did not wait for the start in flight"
+        );
+
+        release.send(()).expect("the start is waiting");
+        assert!(
+            closing.await.expect("the close task"),
+            "the close left a runner or its stop in the slot"
+        );
+        assert!(ack_rx.await.is_ok(), "the close must still ack");
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the close acked while the runner the start produced was still running"
+        );
+        assert!(
+            drain(&mut evt_rx)
+                .iter()
+                .any(|event| matches!(event, NetEvent::DmStopped)),
+            "the stop of the runner the start produced was not reported"
+        );
+    }
+
+    /// Whether `events` hold the closing notice.
+    fn said_close_slow(events: &[NetEvent]) -> bool {
+        events
+            .iter()
+            .any(|event| matches!(event, NetEvent::DmCloseSlow))
+    }
+
+    /// A close with a runner inside a flow call that outlasts its shutdown's
+    /// grace period acks only once the runner's task has ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_acks_only_after_a_slow_runner_has_ended() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let records = EmptyRecords::new(Duration::from_millis(20));
+        let (reading, alive) = (records.reading.clone(), records.alive.clone());
+        let mut dm = Some(DmSession::new(
+            empty_runner(profile.path(), records, slow_config()),
+            &evt_tx,
+        ));
+        let mut dm_start: Option<DmStart> = None;
+        wait_for(&reading, "the runner's first read").await;
+
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel::<()>();
+        dispatch(
             NetCommand::GracefulClose { ack: ack_tx },
-            "GracefulClose",
+            &evt_tx,
+            &mut dm,
+            &mut dm_start,
         )
         .await;
-        assert!(ack_rx.await.is_ok(), "the close must still ack");
+
+        // The ack is the close's last act, so the store count read straight after
+        // it is the count the close acked with.
+        assert!(ack_rx.try_recv().is_ok(), "the close did not ack");
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the close acked while the runner's task still held the store"
+        );
+        assert!(dm.is_none() && dm_start.is_none());
+    }
+
+    /// A close whose runner stop never ends acks at `DM_CLOSE_CAP` and not before,
+    /// having said exactly once that it is finishing up.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_whose_stop_outlasts_the_cap_acks_at_the_cap() {
+        let cap = crate::net::DM_CLOSE_CAP;
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let started = tokio::time::Instant::now();
+        let closing = tokio::spawn({
+            let evt_tx = evt_tx.clone();
+            async move {
+                let mut dm: Option<DmSession> = None;
+                let mut dm_start: Option<DmStart> =
+                    Some(tokio::spawn(std::future::pending::<Option<RunnerHandle>>()));
+                dispatch(
+                    NetCommand::GracefulClose { ack: ack_tx },
+                    &evt_tx,
+                    &mut dm,
+                    &mut dm_start,
+                )
+                .await;
+            }
+        });
+
+        tokio::time::sleep(cap / 2).await;
+        assert!(
+            ack_rx.try_recv().is_err(),
+            "the close acked while its runner stop was still running, before the cap"
+        );
+
+        tokio::time::timeout(cap * 2, closing)
+            .await
+            .expect("the close did not end at the cap")
+            .expect("the close task");
+        let waited = started.elapsed();
+
+        assert!(ack_rx.try_recv().is_ok(), "the close did not ack");
+        assert!(
+            waited >= cap && waited < cap + Duration::from_secs(1),
+            "the close acked after {waited:?}, not at the {cap:?} cap"
+        );
+        let notices = drain(&mut evt_rx)
+            .iter()
+            .filter(|event| matches!(event, NetEvent::DmCloseSlow))
+            .count();
+        assert_eq!(notices, 1, "the closing notice was sent {notices} times");
+    }
+
+    /// A close whose runner stop is still running at `DM_CLOSE_NOTICE_AFTER`
+    /// says it is finishing up then, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_close_says_so_after_the_threshold() {
+        let notice_after = crate::net::DM_CLOSE_NOTICE_AFTER;
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel::<()>();
+        let closing = tokio::spawn({
+            let evt_tx = evt_tx.clone();
+            async move {
+                let mut dm: Option<DmSession> = None;
+                let mut dm_start: Option<DmStart> = Some(tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    None
+                }));
+                dispatch(
+                    NetCommand::GracefulClose { ack: ack_tx },
+                    &evt_tx,
+                    &mut dm,
+                    &mut dm_start,
+                )
+                .await;
+            }
+        });
+
+        tokio::time::sleep(notice_after - Duration::from_millis(1)).await;
+        assert!(
+            !said_close_slow(&drain(&mut evt_rx)),
+            "the close said it was finishing up before the threshold"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(
+            said_close_slow(&drain(&mut evt_rx)),
+            "the close did not say it was finishing up after the threshold"
+        );
+        closing.await.expect("the close task");
+        assert!(ack_rx.try_recv().is_ok(), "the close did not ack");
+    }
+
+    /// A close whose runner stop ends inside `DM_CLOSE_NOTICE_AFTER` never says it
+    /// is finishing up.
+    #[tokio::test(start_paused = true)]
+    async fn a_fast_close_says_nothing() {
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let mut dm: Option<DmSession> = None;
+        let mut dm_start: Option<DmStart> = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            None
+        }));
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel::<()>();
+
+        dispatch(
+            NetCommand::GracefulClose { ack: ack_tx },
+            &evt_tx,
+            &mut dm,
+            &mut dm_start,
+        )
+        .await;
+
+        assert!(ack_rx.try_recv().is_ok(), "the close did not ack");
+        assert!(
+            !said_close_slow(&drain(&mut evt_rx)),
+            "a fast close said it was finishing up"
+        );
+    }
+
+    /// A close with no runner acks at once and says nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_with_no_runner_acks_at_once_and_says_nothing() {
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let mut dm: Option<DmSession> = None;
+        let mut dm_start: Option<DmStart> = None;
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let started = tokio::time::Instant::now();
+        dispatch(
+            NetCommand::GracefulClose { ack: ack_tx },
+            &evt_tx,
+            &mut dm,
+            &mut dm_start,
+        )
+        .await;
+        let waited = started.elapsed();
+
+        assert!(ack_rx.try_recv().is_ok(), "the close did not ack");
+        assert!(
+            waited < Duration::from_millis(1),
+            "a close with no runner waited {waited:?}"
+        );
+        assert!(
+            !said_close_slow(&drain(&mut evt_rx)),
+            "a close with no runner said it was finishing up"
+        );
     }
 
     /// A stop `command` arriving while a start is still in flight chains onto it:
@@ -8728,8 +8999,8 @@ mod tests {
         assert!(dm.is_none());
     }
 
-    /// `GracefulClose` takes the runner down with the transport without waiting
-    /// on it, and still acks.
+    /// `GracefulClose` stops the runner and waits for its task to end before it
+    /// acks.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn graceful_close_stops_the_runner() {
         let profile = tempfile::tempdir().expect("tempdir");
@@ -8753,12 +9024,7 @@ mod tests {
 
         assert!(dm.is_none(), "GracefulClose left the runner in the slot");
         assert!(ack_rx.await.is_ok(), "the close must still ack");
-        assert!(
-            wait_dm_start(&mut dm_start)
-                .await
-                .expect("the start task")
-                .is_none()
-        );
+        assert!(dm_start.is_none(), "the close left its stop in the slot");
         assert_eq!(
             Arc::strong_count(&alive),
             1,
