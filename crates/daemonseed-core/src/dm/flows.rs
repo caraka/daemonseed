@@ -1348,6 +1348,7 @@ fn finish_accept<R: Records>(
     // The correspondent's ring from where this side left off, read on a copy
     // of the key schedule. Nothing of the read is persisted until the
     // acceptance is finished.
+    let loaded_forced = state.conversation.sending.force_turn;
     let mut reader = Conversation::restore(state.conversation);
     let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
     let read = read_ring(
@@ -1439,7 +1440,7 @@ fn finish_accept<R: Records>(
     // The end of the acceptance, recorded together with the collection it read.
     let peer_collected = ring.peer_collected();
     store.update_conv(&peer, |state| {
-        state.conversation = reader.snapshot();
+        write_conversation(state, &reader, loaded_forced);
         state.my_collected = read.collected;
         state.peer_collected = state.peer_collected.max(peer_collected);
         state.acceptance_pending = false;
@@ -1494,6 +1495,7 @@ pub fn recognise_acceptance<R: Records>(
         state.peer_control_key = Some(ControlKey::from_bytes(&control_bytes));
     })?;
 
+    let loaded_forced = state.conversation.sending.force_turn;
     let mut conversation = Conversation::restore(state.conversation);
     let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
     let cursor = peer_cursor(store, records, peer)?;
@@ -1508,7 +1510,7 @@ pub fn recognise_acceptance<R: Records>(
         state.my_collected,
     )?;
     store.update_conv(peer, |state| {
-        state.conversation = conversation.snapshot();
+        write_conversation(state, &conversation, loaded_forced);
         state.my_collected = read.collected;
         state.peer_collected = ring.peer_collected();
         state.outstanding_hello = None;
@@ -1562,6 +1564,80 @@ fn read_ring<R: Records>(
     Ok(RingRead { bodies, collected })
 }
 
+/// Reset every conversation — § Keys and forward secrecy, *Reset,
+/// user-triggered*.
+///
+/// Sets the force-turn flag in every conversation record, so the next message
+/// sent in each starts a new turn whatever has been read. Then rotates the
+/// advert keys now ([`AdvertKeys::rotate_now`]) where the current key has been
+/// published, which is where its serial is at or below the one
+/// [`Store::mark_advert_published`] recorded, in the same critical section that
+/// reads that serial. Where the current key has not been published, the
+/// advert keys are left as they are: rotating again would retire a key nobody
+/// has been told of and drop the one hellos in flight were encapsulated to. A
+/// reset repeated, or run again after a stop part way, before the rotated key
+/// is published therefore rotates once.
+///
+/// Each flag is persisted before the message it forces, and the rotated keys
+/// before any advert naming them. Publication belongs to the runner's advert
+/// poll, which republishes when the network record differs from the current
+/// key. The identity key is not covered.
+///
+/// A profile that has never minted advert keys has nothing to rotate, so its
+/// reset flags every conversation and succeeds. A conversation deleted between
+/// the reset's load and its flag write is skipped, and the rest are flagged.
+/// Two resets that land inside one flow's gap between its load and its write
+/// count as one: a send whose seal consumed the flag drops a reset that arrived
+/// after its load.
+pub fn reset(
+    store: &Store,
+    mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+    now: u64,
+) -> Result<(), FlowError> {
+    for loaded in store.load()?.convs {
+        match store.update_conv(&loaded.peer, |state| {
+            state.conversation.sending.force_turn = true;
+        }) {
+            Ok(()) | Err(StoreError::MissingConversation) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    match store.update_advert_state(|keys, published| {
+        if published.is_some_and(|serial| keys.serial() <= serial) {
+            keys.rotate_now(now, &mut fill)
+        } else {
+            Ok(())
+        }
+    }) {
+        Ok(rotated) => rotated?,
+        Err(StoreError::MissingAdvertKeys) => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+/// Write a key schedule held in memory over its conversation record, keeping a
+/// force-turn flag stored after the schedule was loaded.
+///
+/// A [`reset`] flags the stored record while a flow holds the schedule it
+/// loaded, and a whole-schedule write would erase that flag. A flag stored
+/// since the load is kept. Where the schedule was loaded flagged
+/// (`loaded_forced`), the written schedule already carries the flag as far as
+/// it got: still set, or cleared by the seal that started the forced turn.
+fn write_conversation(state: &mut ConvState, written: &Conversation, loaded_forced: bool) {
+    let mut snapshot = written.snapshot();
+    snapshot.sending.force_turn |= state.conversation.sending.force_turn && !loaded_forced;
+    state.conversation = snapshot;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by [`send_message`] between its load and its write, so a test
+    /// can land a change in that gap.
+    static BETWEEN_SEND_LOAD_AND_WRITE: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
 /// Send one ordinary message — § Flows, *Ordinary message*.
 ///
 /// The ciphertext reaches disk, then the state that commits it, then the slot.
@@ -1583,6 +1659,7 @@ pub fn send_message<R: Records>(
         return Err(FlowError::AwaitingAcceptance);
     }
     let lookup_key = state.outgoing_lookup_key;
+    let loaded_forced = state.conversation.sending.force_turn;
     let mut conversation = Conversation::restore(state.conversation);
     let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
     let seq = ring.reserve()?;
@@ -1590,8 +1667,12 @@ pub fn send_message<R: Records>(
     let mut slot_bytes = header.encode();
     slot_bytes.extend_from_slice(&sealed);
     store.persist_outbox(peer, seq, &slot_bytes)?;
+    #[cfg(test)]
+    if let Some(hook) = BETWEEN_SEND_LOAD_AND_WRITE.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     store.update_conv(peer, |state| {
-        state.conversation = conversation.snapshot();
+        write_conversation(state, &conversation, loaded_forced);
         state.send_seq = ring.send_seq();
     })?;
     records.write_channel(&lookup_key, channel::slot_for(seq), &slot_bytes)?;
@@ -1639,6 +1720,7 @@ pub fn collect_batch<R: Records>(
     }
     let incoming = state.incoming_lookup_key;
     let outgoing = state.outgoing_lookup_key;
+    let loaded_forced = state.conversation.sending.force_turn;
     let mut conversation = Conversation::restore(state.conversation);
     let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
     let read = read_ring(
@@ -1649,7 +1731,7 @@ pub fn collect_batch<R: Records>(
         state.my_collected,
     )?;
     store.update_conv(peer, |state| {
-        state.conversation = conversation.snapshot();
+        write_conversation(state, &conversation, loaded_forced);
         state.my_collected = read.collected;
         state.peer_collected = ring.peer_collected();
     })?;
@@ -1805,6 +1887,11 @@ mod tests {
         /// which is the check a substrate's schema makes of a value's writer
         /// against the record's owner.
         channel_owners: HashMap<[u8; HELLO_LOOKUP_KEY_LEN], [u8; channel::CHANNEL_OWNER_SEED_LEN]>,
+        /// Run once, at the next read of a message subkey, so something can
+        /// land between a flow's load and its write. Control reads pass it by:
+        /// a collection reads a hello's opening before the flow it hands the
+        /// hello to loads its record.
+        before_message_read: Option<Box<dyn FnOnce()>>,
     }
 
     impl Net {
@@ -1957,6 +2044,12 @@ mod tests {
             lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
             subkey: u16,
         ) -> Result<Option<Vec<u8>>, RecordError> {
+            if let Some(hook) = self
+                .before_message_read
+                .take_if(|_| subkey != channel::CONTROL_SUBKEY)
+            {
+                hook();
+            }
             if self
                 .refuse_reads_after
                 .is_some_and(|n| self.writes.total() >= n)
@@ -2978,6 +3071,521 @@ mod tests {
             net.channel_log.len(),
             2,
             "A's two writes were not both recorded"
+        );
+    }
+
+    /// Put a party's advert keys in its store, which a reset rotates.
+    fn persist_advert_keys(party: &Party) {
+        party
+            .store()
+            .persist_advert_keys(&party.advert_keys.snapshot())
+            .expect("persist the advert keys");
+    }
+
+    /// Whether the message a party's outbox holds at `seq` starts a turn.
+    fn starts_turn(party: &Party, peer: &CorrespondenceLabel, seq: u64) -> bool {
+        let bytes = party
+            .store()
+            .load()
+            .expect("load")
+            .convs
+            .into_iter()
+            .find(|c| &c.peer == peer)
+            .expect("the correspondence")
+            .outstanding_outbox
+            .into_iter()
+            .find(|e| e.seq == seq)
+            .expect("the message is owed")
+            .ciphertext;
+        channel::MessageHeader::decode(&bytes)
+            .expect("a message header")
+            .0
+            .starts_turn()
+    }
+
+    /// A reset — § Keys and forward secrecy, *Reset, user-triggered* — flags
+    /// every conversation and rotates a published advert, both persisted. Read
+    /// back from disk, the next message in each conversation starts a turn,
+    /// and the correspondent opens it.
+    #[test]
+    fn a_reset_forces_a_turn_in_every_conversation_and_rotates_the_advert() {
+        let (a, b, mut net) = scene();
+        let c = Party::new(0xc3);
+        c.publish(&mut net);
+        persist_advert_keys(&a);
+
+        // A opens to B, and accepts C's first contact.
+        let (peer_b, accepted_b) = round_trip(&a, &b, &mut net);
+        a_opens(&c, &a, &mut net, b"from C");
+        let request = only_request(
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects"),
+        );
+        let mut entropy = Seeded::at(606);
+        let peer_c = accept(
+            &a.store(),
+            &mut net,
+            &a.me(),
+            &request,
+            b"to C",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A accepts C")
+        .peer;
+        let surfaced =
+            collect(&c.store(), &mut net, &c.me(), &c.advert_keys, |_| false).expect("C collects");
+        let c_peer = match surfaced.as_slice() {
+            [Surfaced::Accepted(acceptance)] => acceptance.peer,
+            other => panic!("expected C's acceptance, got {other:?}"),
+        };
+
+        // Without a reset, a message sent after one that started or continued
+        // a turn, with nothing read in between, continues that turn.
+        let send = |store: &Store, net: &mut Net, peer: &CorrespondenceLabel, seed: u64| {
+            let mut entropy = Seeded::at(seed);
+            send_message(store, net, peer, b"a message", |x| entropy.fill(x)).expect("A sends")
+        };
+        send(&a.store(), &mut net, &peer_b, 700);
+        let continuing_b = send(&a.store(), &mut net, &peer_b, 701);
+        let continuing_c = send(&a.store(), &mut net, &peer_c, 702);
+        assert!(
+            !starts_turn(&a, &peer_b, continuing_b),
+            "the control: with nothing read, A's second message to B continues the turn"
+        );
+        assert!(
+            !starts_turn(&a, &peer_c, continuing_c),
+            "the control: A's first message to C continues the acceptance's turn"
+        );
+
+        let serial_before = a
+            .store()
+            .load_advert_keys()
+            .expect("load")
+            .expect("A's advert keys")
+            .serial;
+        a.store()
+            .mark_advert_published(serial_before)
+            .expect("A's advert is published");
+        let mut entropy = Seeded::at(808);
+        reset(&a.store(), |x| entropy.fill(x), NOW + 60).expect("the reset");
+
+        // Every step from here opens A's store afresh from its directory, and
+        // no party holds a store between steps, so each reads only what the
+        // reset persisted.
+        let rotated = AdvertKeys::restore(
+            a.store()
+                .load_advert_keys()
+                .expect("load")
+                .expect("A's advert keys"),
+        );
+        assert!(
+            rotated.serial() > serial_before,
+            "the advert did not rotate"
+        );
+        assert_eq!(
+            rotated.previous_serial(),
+            Some(serial_before),
+            "the rotation did not retain the previous key"
+        );
+        let forced_b = send(&a.store(), &mut net, &peer_b, 703);
+        let forced_c = send(&a.store(), &mut net, &peer_c, 704);
+        assert!(
+            starts_turn(&a, &peer_b, forced_b),
+            "the message to B continued the turn"
+        );
+        assert!(
+            starts_turn(&a, &peer_c, forced_c),
+            "the message to C continued the turn"
+        );
+
+        // The forced turn consumed each flag, so the message after it
+        // continues that turn.
+        assert!(
+            !flagged(&a, &peer_b) && !flagged(&a, &peer_c),
+            "a forced send left its record flagged"
+        );
+        let after_b = send(&a.store(), &mut net, &peer_b, 705);
+        let after_c = send(&a.store(), &mut net, &peer_c, 706);
+        assert!(
+            !starts_turn(&a, &peer_b, after_b),
+            "the message after the forced one to B started another turn"
+        );
+        assert!(
+            !starts_turn(&a, &peer_c, after_c),
+            "the message after the forced one to C started another turn"
+        );
+
+        // Each correspondent opens everything A sent it, the forced turn
+        // included.
+        let batch = collect_batch(&b.store(), &mut net, &accepted_b.peer).expect("B collects");
+        assert_eq!(
+            batch.bodies.len(),
+            4,
+            "B opened {} of A's four messages",
+            batch.bodies.len()
+        );
+        let batch = collect_batch(&c.store(), &mut net, &c_peer).expect("C collects");
+        assert_eq!(
+            batch.bodies.len(),
+            3,
+            "C opened {} of A's three messages",
+            batch.bodies.len()
+        );
+    }
+
+    /// Whether a party's record for `peer` holds the force-turn flag.
+    fn flagged(party: &Party, peer: &CorrespondenceLabel) -> bool {
+        party
+            .store()
+            .load_conv(peer)
+            .expect("load")
+            .expect("a record")
+            .conversation
+            .sending
+            .force_turn
+    }
+
+    /// A reset rotates the advert only once its current key has been
+    /// published. Before that it flags and leaves the advert keys as they are,
+    /// so a second reset before the rotated key is published keeps the key
+    /// hellos in flight were encapsulated to. Once the rotated key is published,
+    /// a reset rotates again.
+    #[test]
+    fn a_reset_rotates_only_an_advert_key_that_has_been_published() {
+        let (a, b, mut net) = scene();
+        persist_advert_keys(&a);
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+        let keys = || {
+            a.store()
+                .load_advert_keys()
+                .expect("load")
+                .expect("A's advert keys")
+        };
+        let clear_flag = || {
+            a.store()
+                .update_conv(&peer_a, |state| {
+                    state.conversation.sending.force_turn = false;
+                })
+                .expect("clear the flag");
+        };
+        let mut entropy = Seeded::at(730);
+        let mut reset_a = |at: u64| reset(&a.store(), |x| entropy.fill(x), at).expect("the reset");
+        let first = keys().serial;
+
+        // Never published: the reset flags and does not rotate.
+        reset_a(NOW + 60);
+        assert_eq!(
+            keys().serial,
+            first,
+            "a reset rotated a key never published"
+        );
+        assert!(flagged(&a, &peer_a), "the reset did not flag");
+
+        // Published: the reset rotates, retaining the published key.
+        a.store().mark_advert_published(first).expect("mark");
+        clear_flag();
+        reset_a(NOW + 61);
+        let once = keys();
+        assert_eq!(once.serial, first + 1, "the published key did not rotate");
+        assert_eq!(once.previous.as_ref().map(|p| p.serial), Some(first));
+        assert!(flagged(&a, &peer_a), "the rotating reset did not flag");
+
+        // Again before the rotated key is published: flagged, not rotated.
+        clear_flag();
+        reset_a(NOW + 62);
+        let twice = keys();
+        assert_eq!(twice.serial, first + 1, "a second reset rotated again");
+        assert_eq!(
+            twice.previous.as_ref().map(|p| p.serial),
+            Some(first),
+            "a second reset dropped the key hellos in flight were encapsulated to"
+        );
+        assert!(flagged(&a, &peer_a), "the second reset did not flag");
+
+        // The rotated key published: the next reset rotates again.
+        a.store().mark_advert_published(first + 1).expect("mark");
+        reset_a(NOW + 63);
+        let again = keys();
+        assert_eq!(
+            again.serial,
+            first + 2,
+            "a reset after the rotated key was published did not rotate"
+        );
+        assert_eq!(again.previous.as_ref().map(|p| p.serial), Some(first + 1));
+    }
+
+    /// A reset that lands while a collection batch holds the key schedule it
+    /// loaded is not erased by the batch's write.
+    #[test]
+    fn a_reset_during_a_collection_batch_keeps_its_flag() {
+        let (a, b, mut net) = scene();
+        persist_advert_keys(&a);
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(740);
+        send_message(&b.store(), &mut net, &accepted.peer, b"from B", |x| {
+            entropy.fill(x)
+        })
+        .expect("B sends");
+        assert!(
+            !flagged(&a, &peer_a),
+            "the control: nothing is flagged before the reset"
+        );
+
+        // The reset runs at the batch's first message read, after its load and
+        // before its write.
+        net.before_message_read = Some(Box::new(reset_of(&a, 741)));
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("A collects");
+        assert!(
+            net.before_message_read.is_none(),
+            "the reset did not run inside the batch"
+        );
+        assert_eq!(batch.bodies.len(), 1, "A read B's message");
+        assert!(
+            flagged(&a, &peer_a),
+            "the batch's write erased the flag the reset stored"
+        );
+    }
+
+    /// A reset of `party`'s store, opened afresh from its directory, to land
+    /// inside another flow.
+    fn reset_of(party: &Party, seed: u64) -> impl FnOnce() + 'static {
+        let root = party.root.path().to_path_buf();
+        let at_rest = party.at_rest;
+        move || {
+            let store = Store::open(root, &at_rest).expect("open the store");
+            let mut entropy = Seeded::at(seed);
+            reset(&store, |x| entropy.fill(x), NOW + 60).expect("the reset");
+        }
+    }
+
+    /// A reset that lands while an acceptance holds the key schedule it loaded
+    /// is not erased by the write that finishes the acceptance.
+    #[test]
+    fn a_reset_during_an_acceptance_keeps_its_flag() {
+        let (a, b, mut net) = scene();
+        persist_advert_keys(&b);
+        a_opens(&a, &b, &mut net, b"the first message");
+        let request = only_request(b_collects(&b, &mut net));
+
+        // The reset runs at the acceptance's read of A's ring, after its load
+        // and before its write.
+        net.before_message_read = Some(Box::new(reset_of(&b, 760)));
+        let mut entropy = Seeded::at(909);
+        let accepted = accept(
+            &b.store(),
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B accepts");
+        assert!(
+            net.before_message_read.is_none(),
+            "the reset did not run inside the acceptance"
+        );
+        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
+        assert!(
+            flagged(&b, &accepted.peer),
+            "the acceptance's write erased the flag the reset stored"
+        );
+    }
+
+    /// A reset that lands while the recognition of an acceptance holds the key
+    /// schedule it loaded is not erased by the recognition's write.
+    #[test]
+    fn a_reset_during_the_recognition_of_an_acceptance_keeps_its_flag() {
+        let (a, b, mut net) = scene();
+        persist_advert_keys(&a);
+        let peer_a = opened_peer(&a_opens(&a, &b, &mut net, b"the first message"));
+        b_accepts(&b, &mut net, b"the reply");
+
+        // The reset runs at the recognition's read of B's ring, after its load
+        // and before its write.
+        net.before_message_read = Some(Box::new(reset_of(&a, 770)));
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        assert!(
+            net.before_message_read.is_none(),
+            "the reset did not run inside the recognition"
+        );
+        match surfaced.as_slice() {
+            [Surfaced::Accepted(acceptance)] => {
+                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+            }
+            other => panic!("expected one acceptance, got {other:?}"),
+        }
+        assert!(
+            flagged(&a, &peer_a),
+            "the recognition's write erased the flag the reset stored"
+        );
+    }
+
+    /// A reset that lands while a send holds the key schedule it loaded is not
+    /// erased by the send's write, and the send after it starts a turn.
+    #[test]
+    fn a_reset_during_a_send_keeps_its_flag() {
+        let (a, b, mut net) = scene();
+        persist_advert_keys(&a);
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+
+        let hook = reset_of(&a, 780);
+        BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let mut entropy = Seeded::at(781);
+        send_message(&a.store(), &mut net, &peer_a, b"from A", |x| {
+            entropy.fill(x)
+        })
+        .expect("A sends");
+        assert!(
+            BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| slot.borrow().is_none()),
+            "the reset did not run inside the send"
+        );
+        assert!(
+            flagged(&a, &peer_a),
+            "the send's write erased the flag the reset stored"
+        );
+
+        let mut entropy = Seeded::at(782);
+        let next = send_message(&a.store(), &mut net, &peer_a, b"from A again", |x| {
+            entropy.fill(x)
+        })
+        .expect("A sends again");
+        assert!(
+            starts_turn(&a, &peer_a, next),
+            "the send after the reset continued a turn"
+        );
+    }
+
+    /// A reset in a profile that has never minted advert keys flags every
+    /// conversation and succeeds, writing no advert keys.
+    #[test]
+    fn a_reset_without_advert_keys_flags_and_succeeds() {
+        let (a, b, mut net) = scene();
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+        assert!(
+            a.store().load_advert_keys().expect("load").is_none(),
+            "the control: A's store holds no advert keys"
+        );
+        let mut entropy = Seeded::at(790);
+        reset(&a.store(), |x| entropy.fill(x), NOW + 60)
+            .expect("a reset with nothing to rotate succeeds");
+        assert!(flagged(&a, &peer_a), "the reset did not flag");
+        assert!(
+            a.store().load_advert_keys().expect("load").is_none(),
+            "the reset wrote advert keys"
+        );
+    }
+
+    /// A reset while a first contact awaits its acceptance, and while the
+    /// correspondent's acceptance is not finished, flags both records. The
+    /// flags survive the steps that finish the first contact, and each side's
+    /// next message starts a turn, which the other opens.
+    #[test]
+    fn a_reset_during_a_first_contact_flags_both_sides() {
+        let (a, b, mut net) = scene();
+        persist_advert_keys(&a);
+        persist_advert_keys(&b);
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let request = only_request(b_collects(&b, &mut net));
+
+        // B's acceptance stops after its hello back lands.
+        net.reset_writes();
+        net.refuse_reads_after = Some(4);
+        let mut entropy = Seeded::at(909);
+        assert!(
+            accept(
+                &b.store(),
+                &mut net,
+                &b.me(),
+                &request,
+                b"the reply",
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .is_err(),
+            "the acceptance must stop after its hello back"
+        );
+        net.refuse_reads_after = None;
+        let b_peer = b.store().load().expect("load").convs[0].peer;
+        let record = |party: &Party, peer: &CorrespondenceLabel| {
+            party
+                .store()
+                .load_conv(peer)
+                .expect("load")
+                .expect("a record")
+        };
+        assert!(
+            record(&a, &peer_a).awaiting_acceptance,
+            "the control: A awaits its acceptance"
+        );
+        assert!(
+            record(&b, &b_peer).acceptance_pending,
+            "the control: B's acceptance is not finished"
+        );
+
+        let mut entropy = Seeded::at(750);
+        reset(&a.store(), |x| entropy.fill(x), NOW + 60).expect("A's reset");
+        reset(&b.store(), |x| entropy.fill(x), NOW + 60).expect("B's reset");
+        assert!(flagged(&a, &peer_a), "A's reset did not flag");
+        assert!(flagged(&b, &b_peer), "B's reset did not flag");
+
+        // B finishes its acceptance, and A recognises it.
+        let mut entropy = Seeded::at(751);
+        continue_acceptance(
+            &b.store(),
+            &mut net,
+            &b.me(),
+            &b_peer,
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B finishes the acceptance");
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        assert!(
+            matches!(surfaced.as_slice(), [Surfaced::Accepted(_)]),
+            "expected one acceptance, got {surfaced:?}"
+        );
+        assert!(
+            flagged(&a, &peer_a),
+            "recognising the acceptance erased A's flag"
+        );
+        assert!(
+            flagged(&b, &b_peer),
+            "finishing the acceptance erased B's flag"
+        );
+
+        // Each side's next message starts a turn, and the other opens it.
+        let mut entropy = Seeded::at(752);
+        let from_b = send_message(&b.store(), &mut net, &b_peer, b"from B", |x| {
+            entropy.fill(x)
+        })
+        .expect("B sends");
+        assert!(
+            starts_turn(&b, &b_peer, from_b),
+            "B's first message after its reset continued its reply's turn"
+        );
+        let from_a = send_message(&a.store(), &mut net, &peer_a, b"from A", |x| {
+            entropy.fill(x)
+        })
+        .expect("A sends");
+        assert!(
+            starts_turn(&a, &peer_a, from_a),
+            "A's first message after its reset continued a turn"
+        );
+        assert_eq!(
+            collect_batch(&a.store(), &mut net, &peer_a)
+                .expect("A collects")
+                .bodies,
+            vec![b"from B".to_vec()]
+        );
+        assert_eq!(
+            collect_batch(&b.store(), &mut net, &b_peer)
+                .expect("B collects")
+                .bodies,
+            vec![b"from A".to_vec()]
         );
     }
 

@@ -103,6 +103,15 @@ work lives in the maintainer's own planning notes, not here.
   before the record, and `accept` records the bodies it read and its cursor only when the acceptance
   finishes, publishing in its control record the cursor already persisted; `send_message` and `collect_batch`
   are `FlowError::AwaitingAcceptance` while `acceptance_pending` is set (#474).
+- `daemonseed-core`: `flows::reset(store, fill, now)` sets the force-turn flag in every conversation record,
+  persisted before any message it forces, and rotates the advert keys only where the current key has been
+  confirmed published, so a reset repeated before the rotated key is published rotates once. A profile with
+  no advert keys has nothing to rotate, and a conversation deleted since the reset's load is skipped.
+  `Store::mark_advert_published(serial)` records a confirmed publication, only moving forward and refusing a
+  serial above the current key's as `StoreError::UnbuiltAdvertSerial`, and
+  `Store::update_advert_state` hands that serial to a closure in the critical section that writes; the
+  advert-keys record is at version 2 and `ADVERT_KEYS_RECORD_LEN` is 6407. `send_message`, `collect_batch`,
+  `recognise_acceptance` and `accept` keep a force-turn flag stored after they loaded the key schedule (#474).
 - `daemonseed-core`: `dm::delivery`, the direct-messaging delivery rules — `channel::collected(seq, peer_cursor)`,
   re-exported here, true exactly when the correspondent's published cursor is above the sequence and
   now also the predicate `Store::delete_outbox_through` frees a slot on;

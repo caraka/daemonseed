@@ -2825,7 +2825,7 @@ mod tests {
         // The three direct-messaging records' sizes are their module's, not a
         // copy of them.
         assert_eq!(RecordKind::AdvertKeys.capacity(), ADVERT_KEYS_RECORD_LEN);
-        assert_eq!(ADVERT_KEYS_RECORD_LEN, 6_398);
+        assert_eq!(ADVERT_KEYS_RECORD_LEN, 6_407);
         assert_eq!(RecordKind::Conversation.capacity(), CONV_RECORD_LEN);
         assert_eq!(CONV_RECORD_LEN, 36_862);
         assert_eq!(

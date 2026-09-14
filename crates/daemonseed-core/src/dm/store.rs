@@ -95,11 +95,15 @@ const RECORD_VERSION: u8 = 1;
 
 /// The version byte a conversation record carries after its magic.
 ///
-/// Carried apart from [`RECORD_VERSION`], which the advert-keys and outbox
-/// records carry, so the conversation record's format turns over without the
-/// other two being refused. A reader refuses any other value as an unknown
-/// version rather than reading the record at the wrong length.
+/// Carried apart from [`RECORD_VERSION`], which the outbox record carries, so
+/// the conversation record's format turns over without the others being
+/// refused. A reader refuses any other value as an unknown version rather than
+/// reading the record at the wrong length.
 const CONV_RECORD_VERSION: u8 = 2;
+
+/// The version byte the advert-keys record carries after its magic, carried
+/// apart for [`CONV_RECORD_VERSION`]'s reason.
+const ADVERT_KEYS_RECORD_VERSION: u8 = 2;
 
 /// A flag byte's two accepted values. Any other byte is a corrupt record rather
 /// than a truthy value, because nothing this module writes produces one.
@@ -147,9 +151,10 @@ const HELLO_FIELD_LEN: usize = 1 + 2 + HELLO_R_LEN + ml_kem::CT_LEN + HELLO_LEN 
 const CONTROL_KEY_LEN: usize = 32;
 
 /// Bytes the advert-keys record occupies, and so
-/// [`RecordKind::AdvertKeys`]'s bucket.
+/// [`RecordKind::AdvertKeys`]'s bucket: the current key, the retained key as
+/// an optional field, and the published serial as an optional field.
 pub const ADVERT_KEYS_RECORD_LEN: usize =
-    ADVERT_KEYS_MAGIC.len() + 1 + 8 + 8 + ml_kem::DK_LEN + (1 + 8 + 8 + ml_kem::DK_LEN);
+    ADVERT_KEYS_MAGIC.len() + 1 + 8 + 8 + ml_kem::DK_LEN + (1 + 8 + 8 + ml_kem::DK_LEN) + (1 + 8);
 
 /// Bytes a conversation record occupies, and so
 /// [`RecordKind::Conversation`]'s bucket.
@@ -220,6 +225,14 @@ pub enum StoreError {
     /// [`Store::update_advert_keys`] was asked to change advert state the
     /// profile has never written.
     MissingAdvertKeys,
+    /// [`Store::mark_advert_published`] was handed a serial above the current
+    /// advert key's, which names no advert this profile has built.
+    UnbuiltAdvertSerial {
+        /// The serial offered.
+        serial: u64,
+        /// The current key's serial.
+        current: u64,
+    },
 }
 
 impl From<DmStoreError> for StoreError {
@@ -255,6 +268,10 @@ impl core::fmt::Display for StoreError {
                 write!(f, "the correspondence already holds a conversation record")
             }
             Self::MissingAdvertKeys => write!(f, "the profile holds no advert key state"),
+            Self::UnbuiltAdvertSerial { serial, current } => write!(
+                f,
+                "advert serial {serial} is above the current key's serial {current}"
+            ),
         }
     }
 }
@@ -471,8 +488,12 @@ impl Store {
     /// Ordered before the advert record's own DHT write: an advert published
     /// under a key whose secret did not reach disk is one nobody can open a
     /// hello to, including its owner.
+    ///
+    /// A record written whole names no published advert: the keys it carries
+    /// have not been confirmed published through
+    /// [`Store::mark_advert_published`].
     pub fn persist_advert_keys(&self, snapshot: &AdvertSnapshot) -> Result<(), StoreError> {
-        let bytes = encode_advert_keys(snapshot);
+        let bytes = encode_advert_keys(snapshot, None);
         self.inner.profile_critical_section::<_, StoreError>(|g| {
             g.replace(RecordKind::AdvertKeys, &bytes)?;
             Ok(())
@@ -481,8 +502,9 @@ impl Store {
 
     /// Read the advert KEM state back, or `None` where none has been written.
     pub fn load_advert_keys(&self) -> Result<Option<AdvertSnapshot>, StoreError> {
-        self.inner
-            .profile_critical_section::<_, StoreError>(|g| read_advert_keys(g))
+        self.inner.profile_critical_section::<_, StoreError>(|g| {
+            Ok(read_advert_keys(g)?.map(|(snapshot, _)| snapshot))
+        })
     }
 
     /// Rotate, prune or otherwise change the advert state inside a single
@@ -501,15 +523,56 @@ impl Store {
         &self,
         f: impl FnOnce(&mut AdvertKeys) -> R,
     ) -> Result<R, StoreError> {
+        self.update_advert_state(|keys, _| f(keys))
+    }
+
+    /// [`Store::update_advert_keys`], with the serial of the last advert
+    /// confirmed published handed to `f` beside the keys, so a decision that
+    /// depends on whether the current key has been published is made in the
+    /// critical section that writes. The published serial is carried over
+    /// unchanged.
+    pub fn update_advert_state<R>(
+        &self,
+        f: impl FnOnce(&mut AdvertKeys, Option<u64>) -> R,
+    ) -> Result<R, StoreError> {
         self.inner.profile_critical_section::<_, StoreError>(|g| {
-            let snapshot = read_advert_keys(g)?.ok_or(StoreError::MissingAdvertKeys)?;
+            let (snapshot, published) =
+                read_advert_keys(g)?.ok_or(StoreError::MissingAdvertKeys)?;
             let mut keys = AdvertKeys::restore(snapshot);
-            let out = f(&mut keys);
+            let out = f(&mut keys, published);
             g.replace(
                 RecordKind::AdvertKeys,
-                &encode_advert_keys(&keys.snapshot()),
+                &encode_advert_keys(&keys.snapshot(), published),
             )?;
             Ok(out)
+        })
+    }
+
+    /// Record that the advert at `serial` has been confirmed published.
+    ///
+    /// The recorded serial only moves forward, so a late confirmation of an
+    /// older advert changes nothing. Refuses [`StoreError::MissingAdvertKeys`]
+    /// where no state has been written, and
+    /// [`StoreError::UnbuiltAdvertSerial`], recording nothing, for a serial
+    /// above the current key's: a mark only moves forward, so one past the
+    /// current key would stand for ever and let every later reset rotate
+    /// away the key hellos in flight were encapsulated to.
+    pub fn mark_advert_published(&self, serial: u64) -> Result<(), StoreError> {
+        self.inner.profile_critical_section::<_, StoreError>(|g| {
+            let (snapshot, published) =
+                read_advert_keys(g)?.ok_or(StoreError::MissingAdvertKeys)?;
+            if serial > snapshot.serial {
+                return Err(StoreError::UnbuiltAdvertSerial {
+                    serial,
+                    current: snapshot.serial,
+                });
+            }
+            let published = Some(published.map_or(serial, |p| p.max(serial)));
+            g.replace(
+                RecordKind::AdvertKeys,
+                &encode_advert_keys(&snapshot, published),
+            )?;
+            Ok(())
         })
     }
 
@@ -719,10 +782,13 @@ impl Store {
     }
 }
 
-/// The advert-keys record under an open profile guard, or `None` where the
-/// profile has none. An empty payload is the record every [`DmStore::open`]
-/// creates and nothing has written to yet.
-fn read_advert_keys(g: &LockedProfile<'_>) -> Result<Option<AdvertSnapshot>, StoreError> {
+/// The advert-keys record under an open profile guard, with the serial of the
+/// last advert confirmed published, or `None` where the profile has none. An
+/// empty payload is the record every [`DmStore::open`] creates and nothing has
+/// written to yet.
+fn read_advert_keys(
+    g: &LockedProfile<'_>,
+) -> Result<Option<(AdvertSnapshot, Option<u64>)>, StoreError> {
     let Some(bytes) = g.read(RecordKind::AdvertKeys)? else {
         return Ok(None);
     };
@@ -991,11 +1057,15 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Encode the advert KEM state.
-pub(crate) fn encode_advert_keys(snapshot: &AdvertSnapshot) -> Zeroizing<Vec<u8>> {
+/// Encode the advert KEM state, and the serial of the last advert confirmed
+/// published.
+pub(crate) fn encode_advert_keys(
+    snapshot: &AdvertSnapshot,
+    published: Option<u64>,
+) -> Zeroizing<Vec<u8>> {
     let mut w = Writer::with_capacity(ADVERT_KEYS_RECORD_LEN);
     w.bytes(ADVERT_KEYS_MAGIC);
-    w.u8(RECORD_VERSION);
+    w.u8(ADVERT_KEYS_RECORD_VERSION);
     w.u64(snapshot.serial);
     w.u64(snapshot.not_before);
     w.bytes(snapshot.decapsulation_key.as_bytes());
@@ -1011,13 +1081,26 @@ pub(crate) fn encode_advert_keys(snapshot: &AdvertSnapshot) -> Zeroizing<Vec<u8>
             w.padded(&[], 8 + 8 + ml_kem::DK_LEN);
         }
     }
+    match published {
+        Some(serial) => {
+            w.u8(PRESENT);
+            w.u64(serial);
+        }
+        None => {
+            w.u8(ABSENT);
+            w.padded(&[], 8);
+        }
+    }
     w.0
 }
 
-/// Decode the advert KEM state.
-pub(crate) fn decode_advert_keys(bytes: &[u8]) -> Result<AdvertSnapshot, StoreError> {
+/// Decode the advert KEM state, and the serial of the last advert confirmed
+/// published.
+pub(crate) fn decode_advert_keys(
+    bytes: &[u8],
+) -> Result<(AdvertSnapshot, Option<u64>), StoreError> {
     let mut r = Reader::new(bytes, RecordKind::AdvertKeys);
-    r.header(ADVERT_KEYS_MAGIC)?;
+    r.header_version(ADVERT_KEYS_MAGIC, ADVERT_KEYS_RECORD_VERSION)?;
     let serial = r.u64()?;
     let not_before = r.u64()?;
     let dk = r.array::<{ ml_kem::DK_LEN }>()?;
@@ -1025,8 +1108,9 @@ pub(crate) fn decode_advert_keys(bytes: &[u8]) -> Result<AdvertSnapshot, StoreEr
     let prev_serial = r.u64()?;
     let retired_at = r.u64()?;
     let prev_dk = r.array::<{ ml_kem::DK_LEN }>()?;
+    let published = r.opt_u64()?;
     r.finish()?;
-    Ok(AdvertSnapshot {
+    let snapshot = AdvertSnapshot {
         serial,
         not_before,
         decapsulation_key: AdvertDecapKey::from_bytes(&dk),
@@ -1035,7 +1119,8 @@ pub(crate) fn decode_advert_keys(bytes: &[u8]) -> Result<AdvertSnapshot, StoreEr
             retired_at,
             decapsulation_key: AdvertDecapKey::from_bytes(&prev_dk),
         }),
-    })
+    };
+    Ok((snapshot, published))
 }
 
 /// Encode one correspondence's state.
@@ -1501,8 +1586,8 @@ mod tests {
 
         let read_advert = loaded.advert_keys.expect("the advert record is there");
         assert_eq!(
-            encode_advert_keys(&read_advert).to_vec(),
-            encode_advert_keys(&advert).to_vec(),
+            encode_advert_keys(&read_advert, None).to_vec(),
+            encode_advert_keys(&advert, None).to_vec(),
             "the advert record did not round trip"
         );
         assert_eq!(read_advert.previous.expect("retained key").serial, 0);
@@ -2585,9 +2670,9 @@ mod tests {
         let cases: Vec<(&str, Vec<u8>, usize, u8)> = vec![
             (
                 "advert keys",
-                encode_advert_keys(&rotated_advert()).to_vec(),
+                encode_advert_keys(&rotated_advert(), Some(1)).to_vec(),
                 ADVERT_KEYS_MAGIC.len(),
-                RECORD_VERSION,
+                ADVERT_KEYS_RECORD_VERSION,
             ),
             (
                 "conversation",
@@ -2614,6 +2699,16 @@ mod tests {
                 "refused for the wrong reason: {reason}"
             ),
             other => panic!("a conversation record at RECORD_VERSION decoded: {other:?}"),
+        }
+        // And so is an advert-keys record carrying the outbox record's version.
+        let mut shared = encode_advert_keys(&rotated_advert(), Some(1)).to_vec();
+        shared[ADVERT_KEYS_MAGIC.len()] = RECORD_VERSION;
+        match decode_advert_keys(&shared).map(|_| ()) {
+            Err(StoreError::Corrupt { reason, .. }) => assert!(
+                reason.contains("version"),
+                "refused for the wrong reason: {reason}"
+            ),
+            other => panic!("an advert-keys record at RECORD_VERSION decoded: {other:?}"),
         }
 
         for (name, good, version_at, version) in cases {
@@ -2793,6 +2888,99 @@ mod tests {
         assert_ne!(read.serial, first_serial, "the current key moved on");
         let retained = read.previous.expect("the retired key was persisted");
         assert_eq!(retained.serial, first_serial);
+    }
+
+    /// A change to a correspondence whose conversation record has been deleted
+    /// is refused as a missing conversation, which is the refusal a reset
+    /// skips.
+    #[test]
+    fn a_change_to_a_deleted_conversation_is_a_missing_conversation() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x2f)).unwrap();
+        store
+            .create_conv(&label(1), &conv_state(&a, 4, 2, 0, None))
+            .unwrap();
+        // The control: the record takes a change.
+        store.update_conv(&label(1), |_| ()).unwrap();
+        store.delete_conv(&label(1)).unwrap();
+        assert!(matches!(
+            store.update_conv(&label(1), |_| ()),
+            Err(StoreError::MissingConversation)
+        ));
+    }
+
+    /// The serial of the last advert confirmed published survives a reopen and
+    /// a rotation through the store, only moves forward, is never above the
+    /// current key's, and is absent from a record written whole.
+    #[test]
+    fn the_published_advert_serial_survives_a_reopen_and_a_rotation() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let published =
+            |store: &Store| store.update_advert_state(|_, published| published).unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x2e)).unwrap();
+        assert!(matches!(
+            store.mark_advert_published(0),
+            Err(StoreError::MissingAdvertKeys)
+        ));
+
+        let keys = advert::AdvertKeys::new(NOW, counting_fill(0x63)).expect("advert keys");
+        let first = keys.serial();
+        store.persist_advert_keys(&keys.snapshot()).unwrap();
+        assert_eq!(
+            published(&store),
+            None,
+            "the control: a fresh record names no published advert"
+        );
+
+        store.mark_advert_published(first).unwrap();
+        drop(store);
+        let store = Store::open(tmp.path(), &at_rest_key(0x2e)).unwrap();
+        assert_eq!(
+            published(&store),
+            Some(first),
+            "the published serial did not survive a reopen"
+        );
+
+        store
+            .update_advert_keys(|k| k.rotate_now(NOW + 1, counting_fill(0x64)).expect("rotate"))
+            .unwrap();
+        assert_eq!(
+            published(&store),
+            Some(first),
+            "a rotation dropped the published serial"
+        );
+
+        // A serial above the current key's is refused and records nothing.
+        assert!(
+            matches!(
+                store.mark_advert_published(first + 2),
+                Err(StoreError::UnbuiltAdvertSerial { serial, current })
+                    if serial == first + 2 && current == first + 1
+            ),
+            "a serial above the current key's was accepted"
+        );
+        assert_eq!(
+            published(&store),
+            Some(first),
+            "a refused mark changed the published serial"
+        );
+
+        store.mark_advert_published(first + 1).unwrap();
+        store.mark_advert_published(first).unwrap();
+        assert_eq!(
+            published(&store),
+            Some(first + 1),
+            "a late confirmation of an older advert moved the serial back"
+        );
+
+        store.persist_advert_keys(&keys.snapshot()).unwrap();
+        assert_eq!(
+            published(&store),
+            None,
+            "a record written whole kept a published serial"
+        );
     }
 
     #[test]

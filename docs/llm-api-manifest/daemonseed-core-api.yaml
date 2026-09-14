@@ -2404,10 +2404,18 @@ modules:
       persist_advert_keys(&AdvertSnapshot) and load_advert_keys() ->
       Result<Option<AdvertSnapshot>, StoreError> carry the advert KEM secrets and
       serial as RecordKind::AdvertKeys, one record per profile; an empty payload is
-      absent state. update_advert_keys(FnOnce(&mut advert::AdvertKeys) -> R) ->
+      absent state. The record also carries the serial of the last advert
+      confirmed published, as an optional field, which persist_advert_keys writes
+      absent. update_advert_keys(FnOnce(&mut advert::AdvertKeys) -> R) ->
       Result<R, StoreError> is the door a rotation takes, read and write in one
-      profile_critical_section, and refuses StoreError::MissingAdvertKeys where no
-      state has been written. create_conv(&CorrespondenceLabel, &ConvState)
+      profile_critical_section, carrying the published serial over, and refuses
+      StoreError::MissingAdvertKeys where no state has been written.
+      update_advert_state(FnOnce(&mut advert::AdvertKeys, Option<u64>) -> R) ->
+      Result<R, StoreError> is the same door with the published serial handed to
+      the closure. mark_advert_published(serial) -> Result<(), StoreError> records
+      a confirmed publication; the recorded serial only moves forward, and a
+      serial above the current key's is refused as
+      StoreError::UnbuiltAdvertSerial { serial, current }, recording nothing. create_conv(&CorrespondenceLabel, &ConvState)
       establishes a correspondence's first record and refuses
       StoreError::ConversationExists where one is already there;
       load_conv(&CorrespondenceLabel) -> Result<Option<ConvState>, StoreError> carry
@@ -2454,14 +2462,15 @@ modules:
       rewrites every outstanding entry whose slot differs, byte for byte.
       The record encodings are crate-private: a magic, a version byte, then
       fixed-width fields, an absent value written as a zero flag byte and its own
-      width in zeros. A decoder refuses an unknown version (the conversation record is at
-      CONV_RECORD_VERSION 2, the advert-keys and outbox records at version 1), an outbox entry whose
+      width in zeros. A decoder refuses an unknown version (the conversation and
+      advert-keys records are at version 2, the outbox record at version 1), an outbox entry whose
       sequence is not its ring position, a hello slot at or above DROP_SUBKEYS,
-      and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6398),
+      and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6407),
       CONV_RECORD_LEN (36862) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
       widths and are the RecordKind buckets. StoreError is Store(DmStoreError),
       Corrupt { kind, reason }, OutboxSlotOccupied, CiphertextTooLong,
-      MissingConversation, ConversationExists and MissingAdvertKeys.
+      MissingConversation, ConversationExists, MissingAdvertKeys and
+      UnbuiltAdvertSerial { serial, current }.
       The module holds no clock, mutates no key-schedule state, writes no
       message body, and stores no channel opening — an evicted opening is
       re-signed from the identity key and the generation.
@@ -2594,7 +2603,20 @@ modules:
       the record's cursor_published, sealed under own_control_key and carrying
       own_opening. peer_cursor(store, records, peer) ->
       Result<Option<u64>, FlowError> reads the correspondent's published cursor
-      under peer_control_key. The module opens no socket, reads no clock and
+      under peer_control_key. reset(store, fill, now) -> Result<(), FlowError> sets
+      force_turn in every conversation record, so the next message in each starts
+      a turn, then, under update_advert_state, rotates the advert keys through
+      AdvertKeys::rotate_now only where the current key's serial is at or below
+      the published serial, and otherwise leaves them as they are. With no
+      advert keys there is nothing to rotate and the reset succeeds, and a
+      conversation deleted since the reset's load is skipped. Each flag is
+      persisted before the message it forces and the rotated keys before any
+      advert naming them; reset publishes nothing. Publication belongs to the
+      runner's advert poll, which republishes when the network record differs
+      from the current key. send_message, collect_batch, recognise_acceptance and
+      accept write the key schedule they hold keeping a force_turn stored since
+      they loaded it, cleared only where their own seal started the forced turn.
+      The module opens no socket, reads no clock and
       draws no entropy of its own.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label
