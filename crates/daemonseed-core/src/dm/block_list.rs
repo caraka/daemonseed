@@ -1,49 +1,29 @@
 //! The block list — the direct-messaging revocation primitive (ISC-C46).
 //!
 //! Design of record: `docs/design/direct-messaging.md`. A set of long-term
-//! identity public keys, and the one predicate that both suppression planes ask.
+//! identity public keys, and the one predicate every suppression asks.
 //!
-//! ## One rule, asked at two planes
+//! ## One rule, asked at two points
 //!
-//! ISC-C46 names two suppressions: a blocked sender's doorbell entry is dropped
-//! at sweep, and the client stops sweeping a blocked correspondent's channel.
-//! They are **the same predicate over the same key**, and this module does not
-//! pretend otherwise — [`BlockList::is_blocked`] is the rule, and
-//! [`BlockList::suppresses_knock`] and [`BlockList::suppresses_channel`] are
-//! named wrappers so a call site says which plane it is standing on. Naming them
-//! is worth a line each because the two planes fail differently when one is
-//! forgotten: a missed knock suppression lets a blocked stranger reach the
-//! contact-request surface, while a missed channel suppression keeps a
-//! conversation that was already established alive.
+//! ISC-C46 names two suppressions: a hello from a blocked identity is dropped
+//! when the drop is collected, and the client stops collecting a blocked
+//! correspondent's channel. They are **the same predicate over the same key** —
+//! [`BlockList::is_blocked`] is the rule, and [`BlockList::suppresses_channel`]
+//! is a named wrapper so a channel call site says which point it stands at.
+//! The two fail differently when one is forgotten: a missed drop suppression
+//! lets a blocked stranger reach the contact-request surface, while a missed
+//! channel suppression keeps a conversation that was already established alive.
 //!
-//! ## Where the doorbell suppression can actually run
+//! ## Where the drop suppression can actually run
 //!
-//! **Not at the fetch.** A doorbell sweep returns slots of unverified, still
-//! sealed bytes — a per-message KEM ciphertext, the sealed body, and a proof of
-//! work — none of which names a sender, and the sweeping layer holds no
-//! decapsulation key. Only [`open`](crate::dm::firstcontact::open) decides an
-//! entry is genuine and reveals who wrote it, so the drop happens **after** the
-//! open, at the slot the entry came from — which is why a doorbell sweep hands
-//! its slot back beside the bytes.
-//!
-//! **The slot index is a real pre-open correlate, and refusing to use it is a
-//! choice worth recording.** A slot is derived per sender-and-recipient pair and
-//! is stable across restarts, so a recipient who has already opened one knock
-//! from someone could suppress that slot without opening the next. It would leak
-//! nothing outward — the sweep fetches every slot regardless, so no timing or
-//! traffic changes — but with only thirty-two slots it would also silently
-//! suppress roughly one unrelated stranger in thirty-two. Sender-blindness is
-//! the reason a *general* pre-open filter is impossible; this collision rate is
-//! the reason the one available shortcut is refused.
+//! **Not at the fetch.** A drop slot holds sealed bytes that name no sender.
+//! The identity is known only once the hello has opened and the channel opening
+//! it points at has verified, so the suppression runs **after** that, and the
+//! predicate takes an identity key rather than a slot.
 //!
 //! ISC-C46's own wording — *"dropped at sweep on the sealed sender hash"* — is
-//! stale lineage. The sender-hash field it names was refuted as attacker-chosen
-//! and does not exist in the current entry. The substance survives, in the form
-//! above; the criterion's text has not caught up.
-//!
-//! [`BlockList::suppresses_knock`] therefore takes an opened
-//! [`VerifiedFirstContact`], not a slot. A predicate that took raw slot bytes
-//! could not be written honestly.
+//! stale lineage. No sender-hash field exists in a hello. The substance
+//! survives, in the form above; the criterion's text has not caught up.
 //!
 //! ## Where it lives at rest
 //!
@@ -66,25 +46,18 @@
 //! **created whether or not anyone has blocked anybody**, so its presence says
 //! nothing about whether the feature is in use.
 //!
-//! ## What this module is not, yet
-//!
-//! **Nothing consults it.** No doorbell consumer and no channel-sweep path asks
-//! either predicate; the wiring belongs to a later slice. So the obligations
-//! below are written for a caller that does not exist yet, and are here to be
-//! read when it does.
-//!
 //! ## What this module cannot enforce
 //!
 //! **"Byte-identical to never came online" is the caller's obligation, and it
-//! holds fully only at the doorbell.** That indistinguishability is **not**
+//! holds fully only at the drop.** That indistinguishability is **not**
 //! ISC-C46's, which asks only that a blocked sender's records are not read and
 //! that the block is silent and unilateral; it is the bounded residual named by
 //! **ISC-A-C23**, which records that a block stops reads and not writes. At the
-//! doorbell it is nevertheless achievable, and it is the caller's to achieve:
-//! drop the entry where an un-blocked one would have been filed, emit nothing,
-//! write nothing, and take the same time doing it. A refusal that logs, replies,
-//! or returns early enough to be timed reintroduces exactly the oracle the
-//! doorbell plane is otherwise free of, widening the ISC-A-C23 residual past
+//! drop it is nevertheless achievable, and it is the caller's to achieve:
+//! drop the hello where an un-blocked one would have been surfaced, emit
+//! nothing, write nothing, and take the same time doing it. A refusal that
+//! logs, replies, or returns early enough to be timed reintroduces exactly the
+//! oracle the drop is otherwise free of, widening the ISC-A-C23 residual past
 //! what the design accepts.
 //!
 //! **At the channel plane a residual survives any amount of caller care.**
@@ -92,7 +65,7 @@
 //! known minor: a block is third-party-detectable, because writes continue while
 //! the re-sweep GETs stop. It is not visible to the blocked *sender*, who does
 //! not observe another party's reads — which is why the criterion's own wording
-//! survives — but it is not nothing, and a reader should not take the doorbell
+//! survives — but it is not nothing, and a reader should not take the drop
 //! paragraph above as the whole story.
 //!
 //! **Reversal is the caller's too, and the criterion says what it costs:**
@@ -107,15 +80,13 @@ use std::collections::BTreeSet;
 
 use oxicrypt_ml_dsa as ml_dsa;
 
-use crate::dm::firstcontact::VerifiedFirstContact;
-
 /// The set of identity keys a client refuses.
 ///
 /// Keyed on the **long-term** identity public key. That is what ISC-C46 names,
 /// and it is the key the in-seal binding exists to expose: blocking a pseudonym
 /// would be undone by the next conversation, and `pk_lt` is authenticated by
-/// `bind_lt` before a [`VerifiedFirstContact`] exists at all, so it is proven
-/// rather than claimed.
+/// the signature over a channel opening before any caller can ask about it,
+/// so it is proven rather than claimed.
 ///
 /// **The limit of that, stated rather than implied:** a long-term key cannot be
 /// rotated in place, so a block cannot be shed by rotation — but one mnemonic
@@ -173,16 +144,6 @@ impl BlockList {
     /// Whether the list blocks nobody.
     pub fn is_empty(&self) -> bool {
         self.blocked.is_empty()
-    }
-
-    /// **Doorbell plane.** Whether an opened knock must be dropped.
-    ///
-    /// Takes the opened entry rather than a slot for the reason the module
-    /// header gives: before the open there is no sender to test. The caller
-    /// drops the entry at the slot it arrived in and does nothing else — see
-    /// *What this module cannot enforce*.
-    pub fn suppresses_knock(&self, entry: &VerifiedFirstContact) -> bool {
-        self.is_blocked(entry.pk_lt())
     }
 
     /// **Channel plane.** Whether an established correspondent's channel must
@@ -327,11 +288,6 @@ impl core::error::Error for BlockListError {}
 mod tests {
     use super::*;
 
-    use crate::dm::firstcontact::{self, FirstContactRequest};
-    use crate::dm::pow::PowDifficulty;
-    use crate::identity::keys::{Identity, IdentityKeys, derive_identity_keys};
-    use crate::identity::mnemonic::Mnemonic;
-
     fn key(seed: u8) -> [u8; ml_dsa::PK_LEN] {
         let mut k = [0u8; ml_dsa::PK_LEN];
         k[0] = seed;
@@ -421,11 +377,11 @@ mod tests {
         );
     }
 
-    /// **The channel plane asks the same rule as the doorbell plane.**
+    /// **The channel plane asks the same rule as [`BlockList::is_blocked`].**
     ///
     /// Pinned because the two are separate methods: a change that made one of
     /// them consult a different set, or answer a different key, would leave a
-    /// blocked correspondent suppressed at one plane and reachable at the other,
+    /// blocked correspondent suppressed at one point and reachable at the other,
     /// and nothing else in the suite would notice.
     #[test]
     fn both_planes_answer_the_same_rule_for_the_same_identity() {
@@ -533,124 +489,6 @@ mod tests {
         let mut d = BlockList::default();
         assert!(!d.is_blocked(&key(13)), "a defaulted list blocks nobody");
         assert!(d.block(&key(13)), "and is usable as a fresh list");
-    }
-
-    // ── The doorbell plane ──────────────────────────────────────────────────
-
-    const FC_EPOCH: u64 = 2_900_000;
-    const SENT_UNIX_MS: i64 = 1_700_000_000_000;
-
-    /// A fresh random identity. A real pseudonym is random per correspondent, so
-    /// the sender's long-term identity and its pseudonym are made the same way.
-    fn fresh_identity() -> IdentityKeys {
-        // In the fixture rather than in one test body: an uninitialised
-        // process-global crypto module makes these tests fail when this module
-        // is run on its own and pass when something earlier in the suite
-        // happened to initialise it first.
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
-        derive_identity_keys(&Mnemonic::generate().unwrap(), Identity::Primary).unwrap()
-    }
-
-    /// A genuine opened knock, built and opened by the real path.
-    ///
-    /// There is no other way to hold a [`VerifiedFirstContact`] — which is
-    /// exactly why the doorbell plane had no test while the channel plane did.
-    fn opened_knock() -> VerifiedFirstContact {
-        let sender = fresh_identity();
-        let sender_pseudonym = fresh_identity();
-        let recipient = fresh_identity();
-
-        let (entry, _state) = firstcontact::build(FirstContactRequest {
-            signing_lt: &sender.signing,
-            signing_pc: &sender_pseudonym.signing,
-            recipient_pk_lt: recipient.signing.public_key(),
-            kem_ek_b: recipient.kem.encapsulation_key(),
-            fc_epoch: FC_EPOCH,
-            sent_unix_ms: SENT_UNIX_MS,
-            body: "knock",
-            token: None,
-            difficulty: PowDifficulty::reduced_for_test(4),
-        })
-        .expect("the test knock builds");
-
-        firstcontact::open(
-            &entry,
-            recipient.kem.decapsulation_key(),
-            recipient.signing.public_key(),
-            FC_EPOCH,
-        )
-        .expect("the test knock opens")
-    }
-
-    /// Blocking the sender's long-term identity suppresses its knock.
-    #[test]
-    fn blocking_the_long_term_key_suppresses_the_knock() {
-        let entry = opened_knock();
-        let mut list = BlockList::new();
-
-        assert!(
-            !list.suppresses_knock(&entry),
-            "the control: an un-blocked sender's knock is not suppressed"
-        );
-        assert!(list.block(entry.pk_lt()), "blocking the sender is a change");
-        assert!(
-            list.suppresses_knock(&entry),
-            "and then the doorbell plane suppresses it"
-        );
-    }
-
-    /// **Blocking the pseudonym does not suppress the knock.**
-    ///
-    /// The whole reason [`BlockList::suppresses_knock`] exists rather than the
-    /// call site asking [`BlockList::is_blocked`] itself: it must read the
-    /// entry's long-term key, because a block on a pseudonym is undone the next
-    /// time the correspondent rotates one.
-    ///
-    /// **What this test uniquely catches is over-blocking, not the swap.** A
-    /// version reading `pk_pc` instead of `pk_lt` fails the test above as well,
-    /// so that mutation is not this test's to catch. The one it alone kills is a
-    /// version asking whether *either* key is blocked — which looks harmless,
-    /// passes every other test here, and quietly makes a pseudonym block
-    /// permanent.
-    #[test]
-    fn blocking_the_pseudonym_does_not_suppress_the_knock() {
-        let entry = opened_knock();
-        // Without this the test is vacuous: if the two keys were the same value
-        // there would be nothing for the method to get wrong.
-        assert_ne!(
-            &entry.pk_lt()[..],
-            &entry.pk_pc()[..],
-            "the fixture's long-term and pseudonym keys must actually differ"
-        );
-
-        let mut list = BlockList::new();
-        assert!(
-            list.block(entry.pk_pc()),
-            "block the pseudonym, and only it"
-        );
-        assert!(
-            !list.is_blocked(entry.pk_lt()),
-            "the long-term key is deliberately not blocked"
-        );
-
-        assert!(
-            !list.suppresses_knock(&entry),
-            "a pseudonym block must not suppress the knock — \
-             suppression is keyed on the long-term identity"
-        );
-    }
-
-    /// An empty list does not suppress a genuine knock.
-    ///
-    /// The degenerate case: a `suppresses_knock` that answered `true`
-    /// unconditionally would satisfy the first test on its own.
-    #[test]
-    fn an_empty_list_does_not_suppress_a_genuine_knock() {
-        let entry = opened_knock();
-        let list = BlockList::new();
-
-        assert!(list.is_empty());
-        assert!(!list.suppresses_knock(&entry));
     }
 
     // ---- the at-rest form --------------------------------------------------

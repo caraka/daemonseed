@@ -1,10 +1,9 @@
 //! What a client keeps about a correspondent between conversations (ISC-C44).
 //!
-//! [`crate::dm::provisional`] is the sender's half of § v4 4.1 and says where
-//! the other half lives: the recipient's `PK_pc_A` — the peer pseudonym it must
-//! verify frames against — "is not here and is not recomputable from `ss0`; its
-//! home is the ISC-C44 contact cache, which holds 'long-term + pseudonym
-//! pubkeys' per contact". This module is that home.
+//! A correspondent's pseudonym public key — the key frames are verified
+//! against — is not recomputable from `ss0`. Its home is the ISC-C44 contact
+//! cache, which holds "long-term + pseudonym pubkeys" per contact. This module
+//! is that record.
 //!
 //! ## What the record stores
 //!
@@ -29,9 +28,8 @@
 //!
 //! A record is nonetheless written at knock time, because it is the only thing
 //! that maps a correspondent's identity key back to the correspondence that is
-//! waiting on them:
-//! [`DmPersist::correspondence_for_pk_lt`](crate::dm::persist::DmPersist::correspondence_for_pk_lt)
-//! scans contact records and nothing else. An initiator that wrote no record
+//! waiting on them: a lookup by identity key scans contact records and nothing
+//! else. An initiator that wrote no record
 //! until acceptance could not answer that question across a restart, so the
 //! acceptance it was waiting for would never be collected and every message the
 //! correspondent composed would re-emit to the seven-day give-up.
@@ -64,19 +62,16 @@
 //! substitution costs nothing at the call sites and removes the retention. It
 //! also removes an internal-consistency question rather than creating one: with
 //! `ss0` gone there is no second stored fact for the root to disagree with, and
-//! [`crate::dm::firstcontact::derive_channel_roots`] runs once at the caller, before the record exists.
+//! the root derivation runs once at the caller, before the record exists.
 //!
 //! **`ss0` is still what a caller holds when it builds one.** The caller derives
 //! the root, hands it over, and lets its own `ss0` destroy itself; the record
-//! never sees it. That is the same discipline
-//! [`crate::dm::provisional::ProvisionalRecord`] applies at the other end of the
-//! handshake, where `ss0` genuinely must be kept until establishment and is then
-//! erased.
+//! never sees it.
 //!
 //! `chan_id` is deliberately not exposed beside it: § v4's minor invariant says
 //! it must never be serialized anywhere, and handing it out alongside a record's
 //! other outputs invites a caller to persist it with them. A caller that
-//! genuinely needs it reaches [`crate::dm::firstcontact::derive_channel_roots`] directly and keeps it in
+//! genuinely needs it derives it from the secret it holds and keeps it in
 //! memory.
 //!
 //! ## The record is encoded here and sealed by the store
@@ -85,10 +80,8 @@
 //! [`crate::storage::dm_store`] is what seals it — a store of five fixed records
 //! per correspondence (resume state, provisional handshake state, the outbox,
 //! the receive cursor and the contact cache) plus the profile's block list,
-//! never a message archive. **That is the whole difference
-//! from [`crate::dm::provisional`], and it follows from where each record can
-//! travel.** `ProvisionalRecord::seal` returns sealed bytes because a
-//! provisional record has a life outside the store. A contact record has none —
+//! never a message archive. **It carries no seal of its own because of where
+//! the record can travel.** A contact record has no life outside the store —
 //! ISC-A-C25 states that the contact cache never leaves the at-rest blob and
 //! that no wire message carries any portion of it — so a record that only ever
 //! exists inside the store is already sealed by the store, under
@@ -131,7 +124,8 @@
 use oxicrypt_ml_dsa as ml_dsa;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::dm::firstcontact::ROOT_LEN;
+/// Bytes in a correspondence's address root `AR`.
+pub const ROOT_LEN: usize = 32;
 
 /// Format version of a [`ContactRecord`]'s encoding.
 ///
@@ -203,7 +197,7 @@ pub enum ContactCacheError {
     ///
     /// Refused at **construction** as well as at [`ContactRecord::decode`], so
     /// an inconsistent record is unconstructible rather than something a
-    /// validator has to catch — [`crate::dm::provisional`]'s principle. The
+    /// validator has to catch. The
     /// decode-side check is still needed, because bytes that did not come from
     /// [`ContactRecord::new`] have made no such promise.
     TimestampsOutOfOrder {
@@ -304,8 +298,7 @@ impl std::error::Error for ContactCacheError {}
 /// One type serves both, so there is no second shape to translate between and no
 /// moment where a second copy of the root exists.
 ///
-/// **`Box` for the public keys, [`Zeroizing`] for the root** —
-/// [`crate::dm::provisional::ProvisionalRecord`]'s split, and it is a split
+/// **`Box` for the public keys, [`Zeroizing`] for the root** — a split
 /// rather than one uniform choice. The public keys are large and not secret, so
 /// they are boxed to keep them off the stack; `AR` is small and is key-bearing
 /// material, so it destroys itself wherever the value ends up owned. It is not
@@ -349,8 +342,8 @@ impl ContactRecord {
     /// `ar` for the same reason — see
     /// [`ContactCacheError::PlaceholderAddressRoot`].
     ///
-    /// **Takes `AR`, never `ss0`.** The caller derives the root with
-    /// [`crate::dm::firstcontact::derive_channel_roots`] and keeps `ss0` to itself; this type must not
+    /// **Takes `AR`, never `ss0`.** The caller derives the root and keeps
+    /// `ss0` to itself; this type must not
     /// retain it (§ D-PFS, and the module docs above). A constructor taking
     /// `ss0` and deriving internally would read as tidier and would put the one
     /// value that reconstructs every deleted message key into the frame of every
@@ -489,10 +482,9 @@ impl ContactRecord {
     /// **What the bool means: the record now reflects a sighting at `at_ms`.**
     /// Not "the stamp moved" — re-recording the same instant is accepted and
     /// changes nothing, which is idempotent rather than a failure. That is
-    /// deliberately weaker than
-    /// [`crate::dm::provisional::ReceiveCursor::advance_to`], whose bool does
+    /// deliberately weaker than a receive cursor's advance, whose bool does
     /// mean *moved* because a no-op advance there is a cursor that failed to
-    /// make progress. It is `#[must_use]` for that type's reason all the same:
+    /// make progress. It is `#[must_use]` for that reason all the same:
     /// an ignored refusal is an observation the caller believes it recorded and
     /// did not.
     #[must_use = "an ignored refusal is a sighting that was silently not recorded"]
@@ -517,8 +509,8 @@ impl ContactRecord {
     /// **`chan_id` is not available here at all.** It must never be serialized
     /// anywhere (§ v4 minor invariant), and a record without `ss0` cannot
     /// derive it: a
-    /// caller that genuinely needs it reaches [`crate::dm::firstcontact::derive_channel_roots`] with the
-    /// secret it holds, and keeps the result in memory only.
+    /// caller that genuinely needs it derives it from the secret it holds, and
+    /// keeps the result in memory only.
     pub fn address_root(&self) -> [u8; ROOT_LEN] {
         *self.ar
     }
@@ -702,8 +694,7 @@ impl ContactRecord {
 ///
 /// `Box::new(*array)` materialises the array as a value in the caller's frame on
 /// the way to the allocation and leaves it there. A zeroed `Vec` is allocated on
-/// the heap and written in place. [`crate::dm::provisional`]'s helper, verbatim,
-/// because the hazard is the same one.
+/// the heap and written in place.
 fn boxed_from_slice<const N: usize>(bytes: &[u8]) -> Box<[u8; N]> {
     let mut buf = vec![0u8; N].into_boxed_slice();
     buf.copy_from_slice(bytes);
@@ -725,7 +716,6 @@ fn i64_from_slice(bytes: &[u8]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dm::firstcontact::{SS0_LEN, derive_channel_roots};
 
     const FIRST_SEEN: i64 = 1_700_000_000_000;
     const LAST_SEEN: i64 = 1_700_000_123_456;
@@ -741,37 +731,21 @@ mod tests {
         out.try_into().unwrap()
     }
 
-    fn ss0() -> [u8; SS0_LEN] {
-        let mut out = [0u8; SS0_LEN];
+    /// The fixture's address root: byte-distinct and non-zero, so a field
+    /// written reversed or at the wrong offset cannot pass by coincidence.
+    fn ar() -> [u8; ROOT_LEN] {
+        let mut out = [0u8; ROOT_LEN];
         for (i, b) in out.iter_mut().enumerate() {
             *b = 0x10u8.wrapping_add(i as u8 * 7);
         }
         out
     }
 
-    /// The fixture's address root, derived the way a caller derives it.
-    ///
-    /// **It initialises the crypto module**, because [`crate::dm::firstcontact::derive_channel_roots`]
-    /// runs a real derivation and the module is process-global. Without this the
-    /// module's tests pass only when some *other* test happened to initialise it
-    /// first — green under the whole suite, failing when run alone, which is the
-    /// worst way for a test to be wrong.
-    ///
-    /// Derived rather than a literal so the tests below can also assert what is
-    /// **not** in the record: the `ss0` it came from is a real input to a real
-    /// derivation, so a record that had kept it would be found.
-    fn ar() -> [u8; ROOT_LEN] {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
-        derive_channel_roots(&ss0()).expect("derives").ar()
-    }
-
-    /// A second correspondence's root: a different `ss0`, which is the only way
-    /// a different root arises.
+    /// A second correspondence's root, one byte away from [`ar`].
     fn other_ar() -> [u8; ROOT_LEN] {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
-        let mut other = ss0();
+        let mut other = ar();
         other[0] ^= 0xAA;
-        derive_channel_roots(&other).expect("derives").ar()
+        other
     }
 
     /// The shared fixture.
@@ -842,33 +816,14 @@ mod tests {
         assert_eq!(other.address_root(), other_ar());
     }
 
-    /// **The at-rest layout of `AR`, plus two regression guards that cannot
-    /// currently fail. Which is which is stated, because it decides what may be
-    /// deleted later.**
-    ///
-    /// **Live, and the only assertion pinning where `AR` sits in the encoding:**
-    /// the root appears in the record's bytes at its declared offset. A mutation
-    /// that writes the field reversed and reads it back reversed survives both
-    /// the round-trip test and the accessor test and is killed only here.
-    ///
-    /// **Regression guards, not oracles:** the `ss0` and `chan_id` scans cannot
-    /// fail while [`ContactRecord`] has no field either could come from — no
-    /// production mutation makes them fire. They exist to fail loudly if the
-    /// struct ever regains an `ss0` field, which is what design line 706 forbids
-    /// ("retaining `ss0` is not a live option — it regenerates `RK0` and with it
-    /// every message key the ratchet believes it deleted") and line 710's
-    /// retained set names among what is deleted. Do not read them as evidence
-    /// that anything was checked today.
-    ///
-    /// **The production guard for the same property is elsewhere**, in
-    /// `dm::persist`'s `accepting_a_knock_establishes_a_findable_correspondence`:
-    /// storing `ss0` in place of the derived root compiles, because both are 32
-    /// bytes, and that test is what kills it.
+    /// **The at-rest layout of `AR`**, and the only assertion pinning where it
+    /// sits in the encoding: the root appears in the record's bytes at its
+    /// declared offset. A mutation that writes the field reversed and reads it
+    /// back reversed survives both the round-trip test and the accessor test and
+    /// is killed only here.
     #[test]
-    fn the_address_root_is_at_its_at_rest_offset_and_neither_ss0_nor_chan_id_is() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+    fn the_address_root_is_at_its_at_rest_offset() {
         let encoded = record().encode();
-        let roots = derive_channel_roots(&ss0()).unwrap();
 
         assert_eq!(encoded.len(), CONTACT_RECORD_LEN);
 
@@ -877,19 +832,8 @@ mod tests {
         let at = 1 + 2 * ml_dsa::PK_LEN + PSEUDONYM_PRESENCE_LEN;
         assert_eq!(
             &encoded[at..at + ROOT_LEN],
-            roots.ar().as_slice(),
+            ar().as_slice(),
             "the address root is not at its at-rest offset"
-        );
-
-        assert!(
-            !encoded.windows(SS0_LEN).any(|w| w == ss0()),
-            "ss0 is in the record, against design lines 706 and 710"
-        );
-        assert!(
-            !encoded
-                .windows(roots.chan_id().len())
-                .any(|w| w == roots.chan_id()),
-            "the channel id is in the record"
         );
     }
 
@@ -1140,8 +1084,8 @@ mod tests {
             "a record did not recognise its own address root"
         );
 
-        // A different `ss0`, which is the only way a different root arises, and
-        // is what a correspondent who lost their at-rest state mints.
+        // A different root, which is what a correspondent who lost their
+        // at-rest state mints.
         let other = other_ar();
         assert_ne!(mine, other, "the fixture built two equal roots");
         assert!(

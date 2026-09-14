@@ -5956,7 +5956,7 @@ impl DmMachine {
                 continue;
             }
             self.previous_slots.insert(slot, bytes);
-            if block_list.suppresses_knock(&verified) {
+            if block_list.is_blocked(verified.pk_lt()) {
                 continue;
             }
             out.extend(self.surface(

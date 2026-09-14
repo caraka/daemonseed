@@ -1273,10 +1273,8 @@ modules:
       on the long-term identity public key ([u8; ml_dsa::PK_LEN]);
       block(pk_lt) -> bool and unblock(pk_lt) -> bool report whether the list
       changed, is_blocked(pk_lt) -> bool is the rule, and len / is_empty report
-      size. suppresses_knock(&VerifiedFirstContact) -> bool is the doorbell
-      plane and reads the entry's pk_lt, not its pk_pc;
-      suppresses_channel(pk_lt) -> bool is the channel plane. Both are the same
-      rule. BlockList is neither Copy nor Clone. encode() -> Result<Vec<u8>,
+      size. suppresses_channel(pk_lt) -> bool is the channel plane and is the
+      same rule. BlockList is neither Copy nor Clone. encode() -> Result<Vec<u8>,
       BlockListError> is the at-rest form — every blocked key concatenated in
       ascending byte order, with no header, count or occupancy map — and
       decode(&[u8]) -> Result<Self, BlockListError> reads it back, an empty
@@ -3021,7 +3019,6 @@ modules:
     no_std: false
     depends_on:
       - daemonseed_core::dm::advert
-      - daemonseed_core::dm::pow
       - daemonseed_core::dm::domain
       - daemonseed_core::aead_envelope
       - daemonseed_core::secret_seed
@@ -9635,6 +9632,25 @@ functions:
     returns:
       type: "Result<ReadBack, DropError>"
       description: What the read-back settled, or Entropy / Module from the repick.
+  - name: "drop::has_leading_zero_bits"
+    module: daemonseed_core::dm::drop
+    description: >-
+      Whether a digest opens with at least `bits` zero bits, read MSB-first: byte 0
+      first, and the 0x80 bit first within a byte. A `bits` wider than the digest
+      answers false. Re-exported as dm::pow::has_leading_zero_bits.
+    signature: "pub fn has_leading_zero_bits(digest: &[u8], bits: u32) -> bool"
+    parameters:
+      - name: digest
+        type: "&[u8]"
+        direction: in
+        description: The bytes to test.
+      - name: bits
+        type: u32
+        direction: in
+        description: The required count of leading zero bits.
+    returns:
+      type: bool
+      description: True when the leading zero run is at least `bits`.
 
   # ── dm::channel ─────────────────────────────────────────────────────
   - name: "channel::slot_for"
@@ -10771,6 +10787,12 @@ constants:
     type: usize
     value: "1701"
     description: Byte length of an encoded hello, original or rewritten, kem_ct(1568) || nonce(12) || ciphertext(97) || tag(16) || pow_tag(8).
+
+  - name: ROOT_LEN
+    module: daemonseed_core::dm::contact_cache
+    type: usize
+    value: "32"
+    description: Byte length of a correspondence's address root AR, the root a ContactRecord stores.
 
   - name: CHANNEL_SUBKEYS
     module: daemonseed_core::dm::channel

@@ -845,6 +845,8 @@ work lives in the maintainer's own planning notes, not here.
   owner's rewrite step still shows every lost subkey lost, that the owner rewrote each one, that a lost
   control subkey comes back above its established network number and a lost message slot at or above it,
   and that each slot reads back byte-identical to its outbox entry.
+- `daemonseed-core`: `dm::drop::has_leading_zero_bits` and `dm::contact_cache::ROOT_LEN`.
+  `dm::pow::has_leading_zero_bits` re-exports the former.
 
 ### Fixed
 
@@ -975,6 +977,9 @@ work lives in the maintainer's own planning notes, not here.
   is active and a lobby exists. (#354)
 
 ### Removed
+
+- `daemonseed-core`: `dm::block_list::BlockList::suppresses_knock`. A caller asks `is_blocked` with the
+  sender's identity key.
 
 - `daemonseed-core`: `TrustEventKey::ConnectionRateLimited` and
   `TrustEventKey::ConnectionRateLimitedExhausted`, their `class_of` and stable-string entries, and

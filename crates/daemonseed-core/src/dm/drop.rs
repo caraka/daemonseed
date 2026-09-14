@@ -76,7 +76,6 @@ use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
-use crate::dm::pow::has_leading_zero_bits;
 use crate::dm::{advert, domain, push_lp};
 use crate::secret_seed::{derive_boxed_seed, redacted_secret_newtype};
 
@@ -374,6 +373,30 @@ pub fn pow_tag(
     let mut tag = [0u8; DROP_POW_TAG_LEN];
     tag.copy_from_slice(&digest[..DROP_POW_TAG_LEN]);
     Ok(tag)
+}
+
+/// Whether `digest` opens with at least `bits` zero bits, read MSB-first.
+///
+/// Bit order is the whole content of this function and is the thing most likely to
+/// drift between two implementations, so it is spelled out: byte 0 is the most
+/// significant, and within a byte the 0x80 bit is the first. A `bits` past the
+/// digest's own width answers `false` rather than indexing off the end — an
+/// attacker does not choose `bits`, but a caller might get it wrong, and a panic
+/// on a sweep path is worse than a rejection.
+pub fn has_leading_zero_bits(digest: &[u8], bits: u32) -> bool {
+    let whole = (bits / 8) as usize;
+    let remainder = bits % 8;
+    if whole + usize::from(remainder > 0) > digest.len() {
+        return false;
+    }
+    if digest[..whole].iter().any(|&b| b != 0) {
+        return false;
+    }
+    if remainder == 0 {
+        return true;
+    }
+    // The high `remainder` bits of the next byte must be clear.
+    digest[whole] >> (8 - remainder) == 0
 }
 
 /// Which slot of a drop a hello with this `r` occupies:
@@ -1192,5 +1215,67 @@ mod tests {
             seed_a.as_bytes().as_slice(),
             advert::derive_owner_seed(&a).unwrap().as_bytes().as_slice()
         );
+    }
+
+    /// **Exactly `bits` zeros passes; `bits + 1` fails.** The off-by-one here is
+    /// invisible to a round-trip test, because a minter and a verifier that agree
+    /// on the wrong threshold still agree with each other.
+    ///
+    /// Hand-built digests, so the boundary is exercised at every bit position
+    /// rather than at whichever ones a random search happens to produce.
+    #[test]
+    fn the_threshold_accepts_exactly_bits_zeros_and_refuses_one_more() {
+        for bits in 0u32..=32 {
+            // A digest whose leading zero run is exactly `bits`: clear the first
+            // `bits` bits, then set the very next one.
+            let mut digest = [0xffu8; 48];
+            for i in 0..bits as usize {
+                digest[i / 8] &= !(0x80u8 >> (i % 8));
+            }
+            assert!(
+                has_leading_zero_bits(&digest, bits),
+                "a run of exactly {bits} zeros must satisfy {bits} bits"
+            );
+            assert!(
+                !has_leading_zero_bits(&digest, bits + 1),
+                "a run of exactly {bits} zeros must NOT satisfy {} bits",
+                bits + 1
+            );
+            if bits > 0 {
+                assert!(
+                    has_leading_zero_bits(&digest, bits - 1),
+                    "a run of exactly {bits} zeros must satisfy {} bits",
+                    bits - 1
+                );
+            }
+        }
+    }
+
+    /// Bit order is MSB-first, within the byte as well as across bytes. An
+    /// implementation reading the 0x01 bit first would pass every round-trip and
+    /// interoperate with nothing.
+    #[test]
+    fn the_threshold_reads_bits_most_significant_first() {
+        // 0b0000_0001 has seven leading zeros read MSB-first, zero read LSB-first.
+        let digest = [0x01u8; 48];
+        assert!(has_leading_zero_bits(&digest, 7));
+        assert!(!has_leading_zero_bits(&digest, 8));
+        // 0b1000_0000 has none.
+        let digest = [0x80u8; 48];
+        assert!(!has_leading_zero_bits(&digest, 1));
+        assert!(has_leading_zero_bits(&digest, 0));
+    }
+
+    /// A `bits` past the digest's own width answers false rather than indexing
+    /// off the end. An all-zero digest is the case that would otherwise walk past
+    /// the buffer, because every byte it reads satisfies the check.
+    #[test]
+    fn a_threshold_wider_than_the_digest_is_refused_not_a_panic() {
+        let zeros = [0u8; 48];
+        assert!(has_leading_zero_bits(&zeros, 384));
+        assert!(!has_leading_zero_bits(&zeros, 385));
+        assert!(!has_leading_zero_bits(&zeros, u32::MAX));
+        assert!(!has_leading_zero_bits(&[], 1));
+        assert!(has_leading_zero_bits(&[], 0));
     }
 }
