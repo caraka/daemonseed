@@ -457,14 +457,20 @@ const WORKSPACE_BINS: &[&str] = &["daemonseed-tui", "daemonseed-gui", "xtask"];
 /// taken as given when absolute, resolved against the workspace root when relative
 /// — and `<repo>/target` otherwise.
 fn target_dir(repo: &Path) -> PathBuf {
-    match std::env::var_os("CARGO_TARGET_DIR") {
-        Some(dir) => repo.join(PathBuf::from(dir)),
+    resolve_target_dir(repo, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+}
+
+/// [`target_dir`]'s rule over an explicit `CARGO_TARGET_DIR` value.
+fn resolve_target_dir(repo: &Path, cargo_target_dir: Option<&std::ffi::OsStr>) -> PathBuf {
+    match cargo_target_dir {
+        Some(dir) => repo.join(dir),
         None => repo.join("target"),
     }
 }
 
 /// Delete the binaries the gate's `cargo test`/`clippy --all-targets` steps linked into
-/// the profile directories under the cargo target directory.
+/// the profile directories under `target`, the cargo target directory (see
+/// [`target_dir`]).
 ///
 /// **This is not tidiness — it prevents a cross-machine miscompile.** Where a
 /// `target/` directory is shared between two machines whose glibc versions differ,
@@ -474,8 +480,7 @@ fn target_dir(repo: &Path) -> PathBuf {
 /// running the unusable binary with nothing to say why. Removing the linked bins forces
 /// a genuine relink wherever they are next built. Missing files are not an error: most
 /// gate runs never link most of these.
-fn remove_linked_bins(repo: &Path) -> Result<()> {
-    let target = target_dir(repo);
+fn remove_linked_bins(target: &Path) -> Result<()> {
     for profile in ["debug", "release"] {
         for bin in WORKSPACE_BINS {
             let path = target.join(profile).join(bin);
@@ -781,7 +786,7 @@ fn run_gate(group: Option<GateGroup>) -> Result<()> {
     // After every step, green, red or errored: the paths below all leave the run, and
     // the linked binaries must not survive any of them. Where both the sweep and a step
     // failed, the step's error is what started it and is carried as the sweep's context.
-    let swept = remove_linked_bins(&repo);
+    let swept = remove_linked_bins(&target_dir(&repo));
     match (step_error, swept) {
         (Some(step), Err(sweep)) => {
             return Err(sweep.context(format!("after the gate step failed: {step}")));
@@ -894,7 +899,7 @@ mod tests {
         let bystander = release.join("libdaemonseed_core.rlib");
         fs::write(&bystander, b"keep me").unwrap();
 
-        remove_linked_bins(&repo).expect("the sweep must tolerate absent binaries");
+        remove_linked_bins(&repo.join("target")).expect("the sweep must tolerate absent binaries");
 
         for f in &planted {
             assert!(!f.exists(), "{} must be gone", f.display());
@@ -904,6 +909,23 @@ mod tests {
             "the sweep must not touch non-bin artifacts"
         );
         fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The target directory is `<repo>/target` when `CARGO_TARGET_DIR` is unset, the
+    /// value as given when it is absolute, and the value under the repository when it
+    /// is relative.
+    #[test]
+    fn the_target_directory_follows_cargo_target_dir() {
+        let repo = std::path::Path::new("/work/repo");
+        assert_eq!(resolve_target_dir(repo, None), repo.join("target"));
+        assert_eq!(
+            resolve_target_dir(repo, Some(std::ffi::OsStr::new("/elsewhere/build"))),
+            std::path::PathBuf::from("/elsewhere/build")
+        );
+        assert_eq!(
+            resolve_target_dir(repo, Some(std::ffi::OsStr::new("out/build"))),
+            repo.join("out/build")
+        );
     }
 
     /// Every group in the enum names at least one step, so a caller asking for a
