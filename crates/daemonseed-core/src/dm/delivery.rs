@@ -26,7 +26,7 @@ use core::time::Duration;
 
 use crate::dm::channel::{ChannelOpening, Control};
 use crate::dm::drop::HELLO_LOOKUP_KEY_LEN;
-use crate::dm::store::{Store, StoreError};
+use crate::dm::store::{LoadedConv, Store, StoreError};
 use crate::storage::dm_store::CorrespondenceLabel;
 
 pub use crate::dm::advert::{POLL_INTERVAL_MAX, POLL_INTERVAL_MIN};
@@ -85,6 +85,33 @@ pub fn next_poll_interval_os(outstanding_since_secs: u64, now_secs: u64) -> Dura
         now_secs,
         crate::jitter::os_fill_bytes,
     )
+}
+
+/// The send time of a conversation's oldest message still owed to the
+/// correspondent, in Unix seconds, or `None` where nothing is owed.
+///
+/// Read from the entries [`Store::load`] reports as outstanding, so a message
+/// the correspondent has collected, or any message of a conversation marked for
+/// delete, does not count. `now` minus this is how long the oldest owed message
+/// has been uncollected, which a caller can measure a poll's backoff or a nudge
+/// against.
+pub fn oldest_uncollected_at(conv: &LoadedConv) -> Option<u64> {
+    conv.outstanding_outbox
+        .iter()
+        .map(|entry| entry.sent_at)
+        .min()
+}
+
+/// Whether a conversation's oldest uncollected message has been waiting for
+/// `threshold_secs` or longer at `now_secs`.
+///
+/// `oldest_uncollected_at` is [`oldest_uncollected_at`]'s answer, and nothing
+/// owed is never due. The threshold is the caller's: the design leaves its
+/// value open, so there is no default here. A clock that reads earlier than the
+/// send time reads as age zero. This reports and does nothing else: nothing in
+/// this crate deletes a conversation because a message has waited.
+pub fn nudge_due(oldest_uncollected_at: Option<u64>, now_secs: u64, threshold_secs: u64) -> bool {
+    oldest_uncollected_at.is_some_and(|at| now_secs.saturating_sub(at) >= threshold_secs)
 }
 
 /// The "closed" marker a deleting client may leave in its channel's control
@@ -321,7 +348,7 @@ mod tests {
         };
         store.create_conv(&peer, &state).expect("create");
         store
-            .persist_outbox(&peer, OWED_SEQ, &[0x5f; 64])
+            .persist_outbox(&peer, OWED_SEQ, &[0x5f; 64], NOW)
             .expect("persist an owed ciphertext");
         Fixture {
             _tmp: tmp,
@@ -511,6 +538,106 @@ mod tests {
         assert!(
             owed(&f.store).is_empty(),
             "a cursor past the sequence did not release the message"
+        );
+    }
+
+    // ── the age of what is owed ─────────────────────────────────────────────
+
+    /// The oldest uncollected send time is the earliest of the entries still
+    /// owed, wherever it sits among them: a collected entry does not count, and
+    /// a conversation marked for delete reports none.
+    #[test]
+    fn the_oldest_uncollected_send_time_is_the_earliest_outstanding_entry() {
+        let f = fixture();
+        f.store
+            .update_conv(&f.peer, |state| state.send_seq = 4)
+            .expect("four sequences sent");
+        f.store
+            .persist_outbox(&f.peer, 1, &[0x51; 64], NOW + 50)
+            .expect("persist sequence 1");
+        f.store
+            .persist_outbox(&f.peer, 3, &[0x53; 64], NOW + 80)
+            .expect("persist sequence 3");
+        f.store
+            .persist_outbox(&f.peer, 0, &[0x50; 64], NOW - 100)
+            .expect("persist a sequence the correspondent collected");
+        let loaded = || {
+            f.store
+                .load()
+                .expect("load")
+                .convs
+                .into_iter()
+                .next()
+                .expect("the conversation")
+        };
+        let conv = loaded();
+        assert_eq!(
+            conv.outstanding_outbox
+                .iter()
+                .map(|entry| entry.seq)
+                .collect::<Vec<_>>(),
+            vec![1, OWED_SEQ, 3],
+            "the control: sequences 1 to 3 are owed, and 0 was collected"
+        );
+        assert_eq!(
+            conv.outstanding_outbox
+                .iter()
+                .map(|entry| entry.sent_at)
+                .collect::<Vec<_>>(),
+            vec![NOW + 50, NOW, NOW + 80],
+            "the control: the oldest owed entry is neither the first nor the last"
+        );
+        assert_eq!(
+            oldest_uncollected_at(&conv),
+            Some(NOW),
+            "the oldest owed send time is not the earliest outstanding entry's"
+        );
+
+        prepare_delete(&f.store, &f.peer, false).expect("prepare");
+        assert_eq!(
+            oldest_uncollected_at(&loaded()),
+            None,
+            "a conversation being deleted reported an age"
+        );
+    }
+
+    /// The nudge check on explicit times: not due below the threshold, due at
+    /// it and above it, never due with nothing owed, and a clock earlier than
+    /// the send time reads as age zero.
+    #[test]
+    fn a_nudge_is_due_at_the_threshold_and_not_before() {
+        let threshold = 3 * DAY;
+        assert!(
+            !nudge_due(Some(NOW), NOW + threshold - 1, threshold),
+            "due below the threshold"
+        );
+        assert!(
+            nudge_due(Some(NOW), NOW + threshold, threshold),
+            "not due at the threshold"
+        );
+        assert!(
+            nudge_due(Some(NOW), NOW + threshold + 1, threshold),
+            "not due above the threshold"
+        );
+        assert!(
+            !nudge_due(None, NOW + 365 * DAY, threshold),
+            "due with nothing owed"
+        );
+        assert!(
+            !nudge_due(Some(NOW), NOW - DAY, threshold),
+            "a clock earlier than the send time read as an age"
+        );
+        assert!(
+            nudge_due(Some(NOW), NOW - DAY, 0),
+            "a threshold of zero was not due on a clock earlier than the send time"
+        );
+        assert!(
+            !nudge_due(Some(u64::MAX - 1), u64::MAX, 2),
+            "an age below the threshold at the top of the clock was due"
+        );
+        assert!(
+            nudge_due(Some(u64::MAX - 2), u64::MAX, 2),
+            "an age at the threshold at the top of the clock was not due"
         );
     }
 

@@ -48,8 +48,9 @@ use crate::storage::dm_store::CorrespondenceLabel;
 
 /// The conversation generation a first contact opens at.
 ///
-/// A generation is turned over by the delete flow, which treats a later hello
-/// from the same correspondent as a new first contact under the next one.
+/// Every first contact and every acceptance opens at this generation, and no
+/// flow turns it over, so a conversation established again after a delete
+/// derives the same channel records as the one deleted.
 pub const FIRST_GENERATION: u64 = 0;
 
 /// How many times a hello re-picks its slot after a clobbered read-back.
@@ -396,7 +397,7 @@ pub fn first_contact<R: Records>(
     let (header, sealed) = conversation.seal(body, channel::DEVICE_ID_SINGLE_DEVICE, &mut fill)?;
     let mut slot_bytes = header.encode();
     slot_bytes.extend_from_slice(&sealed);
-    store.persist_outbox(&peer, seq, &slot_bytes)?;
+    store.persist_outbox(&peer, seq, &slot_bytes, now)?;
 
     store.create_conv(
         &peer,
@@ -831,9 +832,18 @@ pub enum Surfaced {
     },
     /// From an identity an established conversation already exists with. It is
     /// surfaced for explicit accept and nothing else was done.
+    ///
+    /// `request` is what [`accept`] proceeds from. `accept` refuses it with
+    /// [`FlowError::AlreadyEstablished`] while the old conversation's record is
+    /// there, and with [`FlowError::DeletePending`] while that record is marked
+    /// for delete, so accepting a correspondent who started over follows the
+    /// delete of the old conversation.
     StartedOver {
         /// The identity that signed the opening.
         identity: Box<[u8; ml_dsa::PK_LEN]>,
+        /// The verified material an acceptance of the new first contact
+        /// proceeds from.
+        request: ContactRequest,
     },
     /// The acceptance of this side's own outstanding first contact, completed
     /// by [`recognise_acceptance`].
@@ -861,7 +871,9 @@ impl core::fmt::Debug for Surfaced {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Dropped { .. } => f.write_str("Dropped"),
-            Self::StartedOver { .. } => f.write_str("StartedOver"),
+            Self::StartedOver { request, .. } => {
+                f.debug_tuple("StartedOver").field(request).finish()
+            }
             Self::Accepted(a) => f.debug_tuple("Accepted").field(a).finish(),
             Self::ContactRequest(r) => f.debug_tuple("ContactRequest").field(r).finish(),
             Self::Failed { error, .. } => f.debug_tuple("Failed").field(error).finish(),
@@ -966,14 +978,13 @@ fn settle<R: Records>(
     slot: u16,
 ) -> Result<Surfaced, FlowError> {
     let Some(peer) = correspondence_for(store, identity)? else {
-        return Ok(Surfaced::ContactRequest(ContactRequest {
-            identity: Box::new(*identity),
-            lookup_key: hello.lookup_key,
-            first_ratchet_pk: opening.first_ratchet_pk,
-            slot,
-            advert_serial: opening.advert_serial,
+        return Ok(Surfaced::ContactRequest(contact_request(
+            identity,
+            hello,
+            opening,
             shared_secret,
-        }));
+            slot,
+        )));
     };
     let state = load(store, &peer)?;
     if state.awaiting_acceptance {
@@ -999,7 +1010,27 @@ fn settle<R: Records>(
     }
     Ok(Surfaced::StartedOver {
         identity: Box::new(*identity),
+        request: contact_request(identity, hello, opening, shared_secret, slot),
     })
+}
+
+/// The contact request a verified hello becomes: everything [`accept`]
+/// proceeds from, whether the identity is unknown or has started over.
+fn contact_request(
+    identity: &[u8; ml_dsa::PK_LEN],
+    hello: &drop_plane::Hello,
+    opening: ChannelOpening,
+    shared_secret: AdvertSharedSecret,
+    slot: u16,
+) -> ContactRequest {
+    ContactRequest {
+        identity: Box::new(*identity),
+        lookup_key: hello.lookup_key,
+        first_ratchet_pk: opening.first_ratchet_pk,
+        slot,
+        advert_serial: opening.advert_serial,
+        shared_secret,
+    }
 }
 
 /// Try the current advert secret and then the retained one.
@@ -1129,8 +1160,8 @@ pub struct Accepted {
 ///
 /// One conversation per correspondent identity, as first contact holds: a
 /// correspondent whose record holds an unfinished acceptance is carried on
-/// from it, and one with any other record is
-/// [`FlowError::AlreadyEstablished`].
+/// from it only for a request naming the channel that record reads, and any
+/// other request, or any other record, is [`FlowError::AlreadyEstablished`].
 ///
 /// One channel opening and one hello back, the hello read back once and
 /// re-picked at most [`MAX_REPICKS`] times, plus the reply's own slot and the
@@ -1149,6 +1180,12 @@ pub fn accept<R: Records>(
         let state = load(store, &peer)?;
         if state.delete_pending {
             return Err(FlowError::DeletePending);
+        }
+        // A pending acceptance is finished only for the request it was created
+        // from. A request naming another channel is another first contact from
+        // the same identity, and is not carried into this record.
+        if state.acceptance_pending && request.lookup_key != state.incoming_lookup_key {
+            return Err(FlowError::AlreadyEstablished);
         }
         if !state.acceptance_pending {
             return already_established(store, &peer, &state);
@@ -1178,7 +1215,7 @@ pub fn accept<R: Records>(
     let (header, sealed) = conversation.seal(reply, channel::DEVICE_ID_SINGLE_DEVICE, &mut fill)?;
     let mut slot_bytes = header.encode();
     slot_bytes.extend_from_slice(&sealed);
-    store.persist_outbox(&peer, seq, &slot_bytes)?;
+    store.persist_outbox(&peer, seq, &slot_bytes, now)?;
 
     store.create_conv(
         &peer,
@@ -1701,12 +1738,16 @@ thread_local! {
 /// persisted its outbox entry. No launch lists that entry, because its
 /// sequence is at or above the unchanged `send_seq`, and the delete removes
 /// it.
+///
+/// `now` is the caller's clock in Unix seconds, recorded with the outbox entry
+/// as the time the message was sent.
 pub fn send_message<R: Records>(
     store: &Store,
     records: &mut R,
     peer: &CorrespondenceLabel,
     body: &[u8],
     fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+    now: u64,
 ) -> Result<u64, FlowError> {
     let state = load(store, peer)?;
     if state.delete_pending {
@@ -1723,7 +1764,7 @@ pub fn send_message<R: Records>(
     let (header, sealed) = conversation.seal(body, channel::DEVICE_ID_SINGLE_DEVICE, fill)?;
     let mut slot_bytes = header.encode();
     slot_bytes.extend_from_slice(&sealed);
-    store.persist_outbox(peer, seq, &slot_bytes)?;
+    store.persist_outbox(peer, seq, &slot_bytes, now)?;
     #[cfg(test)]
     if let Some(hook) = BETWEEN_SEND_LOAD_AND_WRITE.with(|hook| hook.borrow_mut().take()) {
         hook();
@@ -2420,9 +2461,14 @@ mod tests {
         net.reset_writes();
         let store_a = a.store();
         let mut entropy = Seeded::at(77);
-        let seq = send_message(&store_a, &mut net, &peer_a, b"an ordinary message", |x| {
-            entropy.fill(x)
-        })
+        let seq = send_message(
+            &store_a,
+            &mut net,
+            &peer_a,
+            b"an ordinary message",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("A sends");
 
         assert_eq!(seq, 1, "the second message A has sent");
@@ -2441,9 +2487,14 @@ mod tests {
         // B sends one more, so A's next batch has something to read.
         let store_b = b.store();
         let mut entropy = Seeded::at(31);
-        send_message(&store_b, &mut net, &accepted.peer, b"another", |x| {
-            entropy.fill(x)
-        })
+        send_message(
+            &store_b,
+            &mut net,
+            &accepted.peer,
+            b"another",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("B sends");
 
         net.reset_writes();
@@ -2475,9 +2526,14 @@ mod tests {
         let (peer_a, accepted) = round_trip(&a, &b, &mut net);
         let store_b = b.store();
         let mut entropy = Seeded::at(31);
-        send_message(&store_b, &mut net, &accepted.peer, b"another", |x| {
-            entropy.fill(x)
-        })
+        send_message(
+            &store_b,
+            &mut net,
+            &accepted.peer,
+            b"another",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("B sends");
 
         // The stop: every write refused, so the collection is recorded and the
@@ -2657,9 +2713,14 @@ mod tests {
 
         // Both control subkeys still seal and open from the stored keys.
         let mut entropy = Seeded::at(31);
-        send_message(&b.store(), &mut net, &accepted.peer, b"another", |x| {
-            entropy.fill(x)
-        })
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            b"another",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("B sends");
         let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("A collects a batch");
         assert!(batch.cursor_published, "A published its cursor");
@@ -2811,9 +2872,14 @@ mod tests {
         // Several messages each way, each side's cursor published by a batch.
         for round in 0..3u64 {
             let mut entropy = Seeded::at(100 + round);
-            send_message(&a.store(), &mut net, &peer_a, b"from A", |x| {
-                entropy.fill(x)
-            })
+            send_message(
+                &a.store(),
+                &mut net,
+                &peer_a,
+                b"from A",
+                |x| entropy.fill(x),
+                NOW,
+            )
             .expect("A sends");
             assert!(
                 collect_batch(&b.store(), &mut net, &accepted.peer)
@@ -2822,9 +2888,14 @@ mod tests {
                 "round {round}: B published no cursor"
             );
             let mut entropy = Seeded::at(200 + round);
-            send_message(&b.store(), &mut net, &accepted.peer, b"from B", |x| {
-                entropy.fill(x)
-            })
+            send_message(
+                &b.store(),
+                &mut net,
+                &accepted.peer,
+                b"from B",
+                |x| entropy.fill(x),
+                NOW,
+            )
             .expect("B sends");
             assert!(
                 collect_batch(&a.store(), &mut net, &peer_a)
@@ -2957,6 +3028,7 @@ mod tests {
             &accepted_d.peer,
             b"from D",
             |x| entropy.fill(x),
+            NOW,
         )
         .expect("D sends");
         collect_batch(&c.store(), &mut elsewhere, &peer_c).expect("C collects");
@@ -3210,7 +3282,7 @@ mod tests {
         // a turn, with nothing read in between, continues that turn.
         let send = |store: &Store, net: &mut Net, peer: &CorrespondenceLabel, seed: u64| {
             let mut entropy = Seeded::at(seed);
-            send_message(store, net, peer, b"a message", |x| entropy.fill(x)).expect("A sends")
+            send_message(store, net, peer, b"a message", |x| entropy.fill(x), NOW).expect("A sends")
         };
         send(&a.store(), &mut net, &peer_b, 700);
         let continuing_b = send(&a.store(), &mut net, &peer_b, 701);
@@ -3389,9 +3461,14 @@ mod tests {
         persist_advert_keys(&a);
         let (peer_a, accepted) = round_trip(&a, &b, &mut net);
         let mut entropy = Seeded::at(740);
-        send_message(&b.store(), &mut net, &accepted.peer, b"from B", |x| {
-            entropy.fill(x)
-        })
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            b"from B",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("B sends");
         assert!(
             !flagged(&a, &peer_a),
@@ -3500,9 +3577,14 @@ mod tests {
         let hook = reset_of(&a, 780);
         BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
         let mut entropy = Seeded::at(781);
-        send_message(&a.store(), &mut net, &peer_a, b"from A", |x| {
-            entropy.fill(x)
-        })
+        send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"from A",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("A sends");
         assert!(
             BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| slot.borrow().is_none()),
@@ -3514,9 +3596,14 @@ mod tests {
         );
 
         let mut entropy = Seeded::at(782);
-        let next = send_message(&a.store(), &mut net, &peer_a, b"from A again", |x| {
-            entropy.fill(x)
-        })
+        let next = send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"from A again",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("A sends again");
         assert!(
             starts_turn(&a, &peer_a, next),
@@ -3626,17 +3713,27 @@ mod tests {
 
         // Each side's next message starts a turn, and the other opens it.
         let mut entropy = Seeded::at(752);
-        let from_b = send_message(&b.store(), &mut net, &b_peer, b"from B", |x| {
-            entropy.fill(x)
-        })
+        let from_b = send_message(
+            &b.store(),
+            &mut net,
+            &b_peer,
+            b"from B",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("B sends");
         assert!(
             starts_turn(&b, &b_peer, from_b),
             "B's first message after its reset continued its reply's turn"
         );
-        let from_a = send_message(&a.store(), &mut net, &peer_a, b"from A", |x| {
-            entropy.fill(x)
-        })
+        let from_a = send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"from A",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("A sends");
         assert!(
             starts_turn(&a, &peer_a, from_a),
@@ -3672,9 +3769,14 @@ mod tests {
         // A message B never collects, so the outbox the delete removes still
         // owes one.
         let mut entropy = Seeded::at(918);
-        let never = send_message(&a.store(), &mut net, &peer_a, b"never collected", |x| {
-            entropy.fill(x)
-        })
+        let never = send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"never collected",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("A sends");
         let record_file = |kind: crate::storage::dm_store::RecordKind| {
             a.store()
@@ -3827,8 +3929,15 @@ mod tests {
         let mut seqs = Vec::new();
         for body in [b"one".as_slice(), b"two", b"three"] {
             seqs.push(
-                send_message(&a.store(), &mut net, &peer_a, body, |x| entropy.fill(x))
-                    .expect("A sends"),
+                send_message(
+                    &a.store(),
+                    &mut net,
+                    &peer_a,
+                    body,
+                    |x| entropy.fill(x),
+                    NOW,
+                )
+                .expect("A sends"),
             );
         }
         let lookup_key = a
@@ -3877,9 +3986,14 @@ mod tests {
         let (a, b, mut net) = scene();
         let (peer_a, _) = round_trip(&a, &b, &mut net);
         let mut entropy = Seeded::at(940);
-        send_message(&a.store(), &mut net, &peer_a, b"before", |x| {
-            entropy.fill(x)
-        })
+        send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"before",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("the control: A sends before the mark");
 
         crate::dm::delivery::prepare_delete(&a.store(), &peer_a, true).expect("prepare");
@@ -3888,9 +4002,14 @@ mod tests {
         net.channel_reads = 0;
         assert!(
             matches!(
-                send_message(&a.store(), &mut net, &peer_a, b"after", |x| {
-                    entropy.fill(x)
-                }),
+                send_message(
+                    &a.store(),
+                    &mut net,
+                    &peer_a,
+                    b"after",
+                    |x| entropy.fill(x),
+                    NOW
+                ),
                 Err(FlowError::DeletePending)
             ),
             "a marked conversation took a send"
@@ -3954,32 +4073,24 @@ mod tests {
         );
     }
 
-    /// What a flow refused for a marked conversation must leave as it was: the
-    /// send sequence, this side's cursor, the outbox record, the channel the
-    /// correspondent writes, and the key its control subkey opens under.
-    type Untouched = (
-        u64,
-        u64,
-        Option<Vec<u8>>,
-        [u8; HELLO_LOOKUP_KEY_LEN],
-        Option<[u8; 32]>,
-    );
+    /// What a refused flow must leave as it was: the bytes on disk of the
+    /// conversation record and of the outbox record. Each record is sealed
+    /// under a fresh nonce whenever it is written, so a rewrite that changes no
+    /// field still changes these bytes.
+    type Untouched = (Option<Vec<u8>>, Option<Vec<u8>>);
 
     fn untouched(party: &Party, peer: &CorrespondenceLabel) -> Untouched {
-        let store = party.store();
-        let state = store.load_conv(peer).expect("load").expect("a record");
-        let outbox = store
+        let dir = party
+            .store()
             .records()
-            .critical_section::<_, crate::storage::dm_store::DmStoreError>(peer, |g| {
-                g.read(crate::storage::dm_store::RecordKind::ConversationOutbox)
-            })
-            .expect("read the outbox record");
+            .root()
+            .join(hex::encode(peer.as_bytes()));
+        let read = |kind: crate::storage::dm_store::RecordKind| {
+            std::fs::read(dir.join(kind.file_name())).ok()
+        };
         (
-            state.send_seq,
-            state.my_collected,
-            outbox,
-            state.incoming_lookup_key,
-            state.peer_control_key.as_ref().map(|key| *key.as_bytes()),
+            read(crate::storage::dm_store::RecordKind::Conversation),
+            read(crate::storage::dm_store::RecordKind::ConversationOutbox),
         )
     }
 
@@ -3992,6 +4103,621 @@ mod tests {
             let store = Store::open(root, &at_rest).expect("open the store");
             crate::dm::delivery::prepare_delete(&store, &peer, true).expect("mark the delete");
         }
+    }
+
+    /// Every outbox entry carries the `now` the flow that sealed it was given:
+    /// a first contact's first message, an acceptance's reply and an ordinary
+    /// message, each read back from disk.
+    #[test]
+    fn each_outbox_entry_records_the_time_it_was_sent() {
+        let (a, b, mut net) = scene();
+        let mut entropy = Seeded::at(4_242);
+        let outcome = first_contact(
+            &a.store(),
+            &mut net,
+            &a.me(),
+            b.pk(),
+            b"the first message",
+            |x| entropy.fill(x),
+            NOW + 1,
+        )
+        .expect("A's first contact");
+        let peer_a = opened_peer(&outcome);
+        let request = only_request(b_collects(&b, &mut net));
+        let mut entropy = Seeded::at(909);
+        let accepted = accept(
+            &b.store(),
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW + 2,
+        )
+        .expect("B accepts");
+        let sent_at = |party: &Party, peer: &CorrespondenceLabel| -> Vec<(u64, u64)> {
+            party
+                .store()
+                .load()
+                .expect("load")
+                .convs
+                .into_iter()
+                .find(|conv| &conv.peer == peer)
+                .expect("the conversation")
+                .outstanding_outbox
+                .iter()
+                .map(|entry| (entry.seq, entry.sent_at))
+                .collect()
+        };
+        assert_eq!(
+            sent_at(&a, &peer_a),
+            vec![(0, NOW + 1)],
+            "A's first message"
+        );
+        assert_eq!(sent_at(&b, &accepted.peer), vec![(0, NOW + 2)], "B's reply");
+
+        collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        let mut entropy = Seeded::at(4_343);
+        let seq = send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"later",
+            |x| entropy.fill(x),
+            NOW + 3,
+        )
+        .expect("A sends");
+        let owed = sent_at(&a, &peer_a);
+        assert!(
+            owed.contains(&(seq, NOW + 3)),
+            "A's ordinary message does not carry its send time: {owed:?}"
+        );
+    }
+
+    /// Nothing in core tears a conversation down because a message has waited
+    /// past a nudge threshold. Ten years after A's message to B was sent, every
+    /// flow that takes a clock runs on A's store with that clock, beside a
+    /// collection, a collection batch and a cursor read. A's conversation with
+    /// B keeps its record, its owed message and no delete mark; its channel's
+    /// control record and the owed message's slot are still on the network; and
+    /// no control record written to that channel is a closed marker. A
+    /// conversation's records are removed only by `delivery::finish_delete`,
+    /// and marked only by `delivery::prepare_delete`, both of which a caller
+    /// asks for.
+    #[test]
+    fn nothing_in_core_tears_down_a_conversation_past_the_nudge_threshold() {
+        let (mut a, b, mut net) = scene();
+        let mut c = Party::new(0xc3);
+        let mut d = Party::new(0xd4);
+        c.publish(&mut net);
+        d.publish(&mut net);
+        persist_advert_keys(&a);
+        let (peer_b, _) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(1_020);
+        let owed = send_message(
+            &a.store(),
+            &mut net,
+            &peer_b,
+            b"never collected",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A sends");
+        let own = a
+            .store()
+            .load_conv(&peer_b)
+            .expect("load")
+            .expect("A's record");
+        let day = 24 * 60 * 60;
+        let threshold = 7 * day;
+        let later = NOW + 10 * 365 * day;
+        let aged = a
+            .store()
+            .load()
+            .expect("load")
+            .convs
+            .into_iter()
+            .find(|conv| conv.peer == peer_b)
+            .expect("A's conversation");
+        assert!(
+            crate::dm::delivery::nudge_due(
+                crate::dm::delivery::oldest_uncollected_at(&aged),
+                later,
+                threshold,
+            ),
+            "the control: the message is past the threshold"
+        );
+
+        // Every advert a flow below encapsulates to is rotated at `later`, so
+        // those flows run rather than stopping at an expired advert.
+        rotate(&mut a, &mut net, later, 1_022);
+        rotate(&mut c, &mut net, later, 1_023);
+        rotate(&mut d, &mut net, later, 1_024);
+
+        collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        collect_batch(&a.store(), &mut net, &peer_b).expect("A collects a batch");
+        peer_cursor(&a.store(), &mut net, &peer_b).expect("A reads B's cursor");
+        let mut entropy = Seeded::at(1_025);
+        send_message(
+            &a.store(),
+            &mut net,
+            &peer_b,
+            b"still here",
+            |x| entropy.fill(x),
+            later,
+        )
+        .expect("A sends ten years on");
+        reset(&a.store(), |x| entropy.fill(x), later).expect("A resets");
+        let _ = crate::dm::delivery::next_poll_interval(NOW, later, |x| entropy.fill(x));
+
+        // A first contact from A to C, and its refresh.
+        let to_c = first_contact(
+            &a.store(),
+            &mut net,
+            &a.me(),
+            c.pk(),
+            b"to C",
+            |x| entropy.fill(x),
+            later,
+        )
+        .expect("A's first contact to C");
+        refresh_first_contact(
+            &a.store(),
+            &mut net,
+            &opened_peer(&to_c),
+            |x| entropy.fill(x),
+            later,
+        )
+        .expect("A refreshes its first contact to C");
+
+        // D's first contact to A, accepted by A in a run stopped at its first
+        // write and continued from the record.
+        let mut d_entropy = Seeded::at(1_026);
+        first_contact(
+            &d.store(),
+            &mut net,
+            &d.me(),
+            a.pk(),
+            b"from D",
+            |x| d_entropy.fill(x),
+            later,
+        )
+        .expect("D's first contact to A");
+        let request = collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false)
+            .expect("A collects D's hello")
+            .into_iter()
+            .find_map(|surfaced| match surfaced {
+                Surfaced::ContactRequest(request) => Some(request),
+                _ => None,
+            })
+            .expect("D's contact request");
+        net.reset_writes();
+        net.fail_after = Some(0);
+        assert!(
+            accept(
+                &a.store(),
+                &mut net,
+                &a.me(),
+                &request,
+                b"to D",
+                |x| entropy.fill(x),
+                later,
+            )
+            .is_err(),
+            "the acceptance must stop at its first write"
+        );
+        net.fail_after = None;
+        let peer_d = a
+            .store()
+            .load()
+            .expect("load")
+            .convs
+            .into_iter()
+            .find(|conv| conv.state.peer_identity_pk.as_slice() == d.pk().as_slice())
+            .expect("A's record for D")
+            .peer;
+        continue_acceptance(
+            &a.store(),
+            &mut net,
+            &a.me(),
+            &peer_d,
+            |x| entropy.fill(x),
+            later,
+        )
+        .expect("A continues its acceptance of D");
+
+        let after = a
+            .store()
+            .load()
+            .expect("load")
+            .convs
+            .into_iter()
+            .find(|conv| conv.peer == peer_b)
+            .expect("A's conversation with B survived");
+        assert!(
+            !after.state.delete_pending,
+            "a flow marked the conversation for delete"
+        );
+        assert!(
+            after
+                .outstanding_outbox
+                .iter()
+                .any(|entry| entry.seq == owed),
+            "the message owed past the threshold was dropped"
+        );
+        assert!(
+            a.store()
+                .pending_deletes()
+                .expect("pending deletes")
+                .is_empty(),
+            "a delete is pending"
+        );
+        assert!(
+            net.channels
+                .contains_key(&(own.outgoing_lookup_key, channel::CONTROL_SUBKEY)),
+            "A's channel to B lost its control record"
+        );
+        assert!(
+            net.channels
+                .contains_key(&(own.outgoing_lookup_key, channel::slot_for(owed))),
+            "the owed message's slot left the network"
+        );
+        let own_key = own.own_control_key.as_ref().expect("A's control key");
+        let controls: Vec<&Vec<u8>> = net
+            .channel_log
+            .iter()
+            .filter(|(key, subkey, _)| {
+                *key == own.outgoing_lookup_key && *subkey == channel::CONTROL_SUBKEY
+            })
+            .map(|(_, _, bytes)| bytes)
+            .collect();
+        assert!(
+            !controls.is_empty(),
+            "the control: A wrote control records to its channel to B"
+        );
+        for bytes in controls {
+            assert!(
+                !channel::open_control_with_key(own_key, bytes)
+                    .expect("A's control record opens")
+                    .closed,
+                "a closed marker was written to A's channel to B"
+            );
+        }
+    }
+
+    /// A send refused at its commit and tried again later is a new message:
+    /// its outbox entry takes the retry's `now`, not the refused attempt's.
+    #[test]
+    fn a_send_refused_at_its_commit_is_resealed_with_the_retrys_time() {
+        let (a, b, mut net) = scene();
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+        let hook = delete_of(&a, peer_a);
+        BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        let mut entropy = Seeded::at(1_030);
+        let refused = send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"first try",
+            |x| entropy.fill(x),
+            NOW + 10,
+        );
+        assert!(
+            matches!(refused, Err(FlowError::DeletePending)),
+            "the control: the first attempt was refused at its commit"
+        );
+        let seq = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record")
+            .send_seq;
+        let raw = a
+            .store()
+            .records()
+            .critical_section::<_, crate::storage::dm_store::DmStoreError>(&peer_a, |g| {
+                g.read(crate::storage::dm_store::RecordKind::ConversationOutbox)
+            })
+            .expect("read the outbox record")
+            .expect("an outbox record");
+        let table = crate::dm::store::decode_conv_outbox(&raw).expect("decode the outbox");
+        assert_eq!(
+            table[(seq % channel::RING_SLOTS) as usize]
+                .as_ref()
+                .map(|entry| (entry.seq, entry.sent_at)),
+            Some((seq, NOW + 10)),
+            "the control: the refused attempt persisted its entry at the sequence the retry reuses"
+        );
+
+        // The mark is cleared so the retry commits.
+        a.store()
+            .update_conv(&peer_a, |state| state.delete_pending = false)
+            .expect("clear the mark");
+        let resent = send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"second try",
+            |x| entropy.fill(x),
+            NOW + 500,
+        )
+        .expect("the retry sends");
+        assert_eq!(resent, seq, "the retry did not reuse the sequence");
+        let entry = a
+            .store()
+            .load()
+            .expect("load")
+            .convs
+            .into_iter()
+            .find(|conv| conv.peer == peer_a)
+            .expect("A's conversation")
+            .outstanding_outbox
+            .into_iter()
+            .find(|entry| entry.seq == seq)
+            .expect("the retry's entry is owed");
+        assert_eq!(
+            entry.sent_at,
+            NOW + 500,
+            "the retry kept the refused attempt's send time"
+        );
+    }
+
+    /// A hello from a correspondent who started over is surfaced carrying the
+    /// request an acceptance proceeds from. `accept` refuses that request while
+    /// the old conversation's record is there, and once the old conversation is
+    /// deleted it accepts the same request into the new conversation, reading
+    /// the correspondent's new first message.
+    #[test]
+    fn a_started_over_hello_is_accepted_once_the_old_conversation_is_deleted() {
+        let (a, b, mut net) = scene();
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+
+        // B's second hello is built by hand at the next generation, because no
+        // flow turns the generation over yet; for the same reason the deleted
+        // conversation's channel record is cleared below, since the new
+        // conversation derives it again.
+        let restart_key = plant_started_over_hello(&mut net, &b, &a, b"starting over", 6_161);
+
+        let mut surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        assert_eq!(surfaced.len(), 1, "one hello in A's drop");
+        let request = match surfaced.remove(0) {
+            Surfaced::StartedOver { identity, request } => {
+                assert_eq!(identity.as_slice(), b.pk().as_slice());
+                request
+            }
+            other => panic!("expected B to have started over, got {other:?}"),
+        };
+        assert_eq!(request.identity.as_slice(), b.pk().as_slice());
+        assert_eq!(request.lookup_key, restart_key);
+
+        // The control: the old conversation is still there, so the request is
+        // refused, nothing is written and the old record is as it was.
+        let old = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        let before = untouched(&a, &peer_a);
+        net.reset_writes();
+        let mut entropy = Seeded::at(6_262);
+        assert!(
+            matches!(
+                accept(
+                    &a.store(),
+                    &mut net,
+                    &a.me(),
+                    &request,
+                    b"welcome back",
+                    |x| entropy.fill(x),
+                    NOW,
+                ),
+                Err(FlowError::AlreadyEstablished)
+            ),
+            "a started-over request was accepted over the old conversation"
+        );
+        assert_eq!(net.writes.total(), 0, "the refused acceptance wrote");
+        let kept = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        assert_eq!(
+            a.store().load().expect("load").convs.len(),
+            1,
+            "the refused acceptance created a conversation"
+        );
+        assert_eq!(untouched(&a, &peer_a), before);
+        assert_eq!(kept.outgoing_lookup_key, old.outgoing_lookup_key);
+        assert!(
+            old.own_hello_secret.is_none() && kept.own_hello_secret.is_none(),
+            "the control: A's record holds no hello secret before or after"
+        );
+
+        let erase = crate::dm::delivery::prepare_delete(&a.store(), &peer_a, false)
+            .expect("prepare the delete");
+        net.channels.retain(|(key, _), _| *key != erase.lookup_key);
+        crate::dm::delivery::finish_delete(&a.store(), &peer_a).expect("finish the delete");
+
+        let accepted = accept(
+            &a.store(),
+            &mut net,
+            &a.me(),
+            &request,
+            b"welcome back",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A accepts B's new first contact");
+        assert_eq!(accepted.bodies, vec![b"starting over".to_vec()]);
+        let convs = a.store().load().expect("load").convs;
+        assert_eq!(convs.len(), 1, "A holds one conversation with B");
+        assert_eq!(convs[0].state.incoming_lookup_key, restart_key);
+        let a_drop = drop_plane::derive_owner_seed(a.pk()).expect("A's drop");
+        assert!(
+            !net.drops.contains_key(&(*a_drop.as_bytes(), request.slot)),
+            "the accepted hello's drop slot was not erased"
+        );
+    }
+
+    /// Place by hand a first contact from `from` to `to` under `from`'s next
+    /// channel generation, because no flow turns the generation over yet: an
+    /// opening over a real first ratchet key, message 0 carrying `body`, and
+    /// the hello in `to`'s drop. Returns the new channel's lookup key.
+    fn plant_started_over_hello(
+        net: &mut Net,
+        from: &Party,
+        to: &Party,
+        body: &[u8],
+        seed: u64,
+    ) -> [u8; HELLO_LOOKUP_KEY_LEN] {
+        let mut entropy = Seeded::at(seed);
+        let encapsulation = advert::encapsulate_to(
+            &advert::verify(
+                to.pk(),
+                &to.advert_keys
+                    .advert_bytes(&to.signer)
+                    .expect("the recipient's advert"),
+            )
+            .expect("verify the recipient's advert"),
+            NOW,
+            |x| entropy.fill(x),
+        )
+        .expect("encapsulate to the recipient");
+        let owner = channel::derive_owner_seed(&from.channel_root, to.pk(), FIRST_GENERATION + 1)
+            .expect("the next channel owner");
+        let restart_key = net
+            .open_channel(&owner, channel::CHANNEL_SUBKEYS)
+            .expect("open the next channel");
+        let opened = chain::initiate(&encapsulation.shared_secret, |x| entropy.fill(x))
+            .expect("the key schedule");
+        let opening = ChannelOpening::build(
+            &from.signer,
+            to.pk(),
+            &restart_key,
+            &opened.ratchet_pk,
+            encapsulation.serial,
+        )
+        .expect("the opening");
+        let control = channel::seal_control(
+            &encapsulation.shared_secret,
+            &Control {
+                opening: Some(opening),
+                collected_cursor: 0,
+                closed: false,
+            },
+        )
+        .expect("seal the control");
+        net.write_channel(&restart_key, channel::CONTROL_SUBKEY, &control)
+            .expect("write the control");
+        let mut conversation = opened.conversation;
+        let (header, sealed) = conversation
+            .seal(body, channel::DEVICE_ID_SINGLE_DEVICE, |x| entropy.fill(x))
+            .expect("seal message 0");
+        let mut slot_bytes = header.encode();
+        slot_bytes.extend_from_slice(&sealed);
+        net.write_channel(&restart_key, channel::slot_for(0), &slot_bytes)
+            .expect("write message 0");
+        let r = drop_plane::repick(|x| entropy.fill(x)).expect("r");
+        let hello = drop_plane::seal_hello(&encapsulation, &restart_key, &r, to.pk())
+            .expect("seal the hello");
+        let drop_owner = drop_plane::derive_owner_seed(to.pk()).expect("the recipient's drop");
+        net.write_drop_slot(
+            &drop_owner,
+            drop_plane::DROP_SUBKEYS,
+            drop_plane::slot_for(&r).expect("slot"),
+            &hello,
+        )
+        .expect("write the hello");
+        restart_key
+    }
+
+    /// A started-over request is not carried into an acceptance of the same
+    /// identity that stopped part way: `accept` refuses it, writes nothing,
+    /// leaves the pending record as it was, and leaves the new hello in its
+    /// slot.
+    #[test]
+    fn a_started_over_request_is_not_finished_into_a_pending_acceptance() {
+        let (a, b, mut net) = scene();
+        a_opens(&a, &b, &mut net, b"the first message");
+        let request = only_request(b_collects(&b, &mut net));
+        // B's acceptance stops at its first write.
+        net.reset_writes();
+        net.fail_after = Some(0);
+        let mut entropy = Seeded::at(909);
+        assert!(
+            accept(
+                &b.store(),
+                &mut net,
+                &b.me(),
+                &request,
+                b"the reply",
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .is_err(),
+            "the acceptance must stop short"
+        );
+        net.fail_after = None;
+        let b_peer = b.store().load().expect("load").convs[0].peer;
+        let pending = b
+            .store()
+            .load_conv(&b_peer)
+            .expect("load")
+            .expect("B's record");
+        assert!(
+            pending.acceptance_pending,
+            "the control: B's acceptance is pending"
+        );
+
+        // A's second hello is built by hand at the next generation, because no
+        // flow turns the generation over yet.
+        let restart_key = plant_started_over_hello(&mut net, &a, &b, b"starting over", 6_363);
+        let started_over = collect(&b.store(), &mut net, &b.me(), &b.advert_keys, |_| false)
+            .expect("B collects")
+            .into_iter()
+            .find_map(|surfaced| match surfaced {
+                Surfaced::StartedOver { request, .. } => Some(request),
+                _ => None,
+            })
+            .expect("A's second hello surfaced as started over");
+        assert_eq!(started_over.lookup_key, restart_key);
+        assert_ne!(started_over.lookup_key, pending.incoming_lookup_key);
+
+        let before = untouched(&b, &b_peer);
+        net.reset_writes();
+        let mut entropy = Seeded::at(6_464);
+        assert!(
+            matches!(
+                accept(
+                    &b.store(),
+                    &mut net,
+                    &b.me(),
+                    &started_over,
+                    b"the reply",
+                    |x| entropy.fill(x),
+                    NOW,
+                ),
+                Err(FlowError::AlreadyEstablished)
+            ),
+            "a started-over request was carried into a pending acceptance"
+        );
+        assert_eq!(net.writes.total(), 0, "the refused acceptance wrote");
+        assert_eq!(untouched(&b, &b_peer), before);
+        assert!(
+            b.store()
+                .load_conv(&b_peer)
+                .expect("load")
+                .expect("B's record")
+                .acceptance_pending,
+            "the refused acceptance changed the pending record"
+        );
+        let b_drop = drop_plane::derive_owner_seed(b.pk()).expect("B's drop");
+        assert!(
+            net.drops
+                .contains_key(&(*b_drop.as_bytes(), started_over.slot)),
+            "the refused acceptance erased the new hello"
+        );
     }
 
     /// A delete mark on one conversation refuses nothing on the others in the
@@ -4043,11 +4769,23 @@ mod tests {
         );
 
         let mut entropy = Seeded::at(1_011);
-        send_message(&a.store(), &mut net, &peer_b, b"to B", |x| entropy.fill(x))
-            .expect("a send on an unmarked conversation");
-        send_message(&b.store(), &mut net, &accepted_b.peer, b"from B", |x| {
-            entropy.fill(x)
-        })
+        send_message(
+            &a.store(),
+            &mut net,
+            &peer_b,
+            b"to B",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("a send on an unmarked conversation");
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted_b.peer,
+            b"from B",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("B sends");
         assert_eq!(
             collect_batch(&a.store(), &mut net, &peer_b)
@@ -4223,9 +4961,14 @@ mod tests {
         net.reset_writes();
 
         let mut entropy = Seeded::at(970);
-        let sent = send_message(&a.store(), &mut net, &peer_a, b"too late", |x| {
-            entropy.fill(x)
-        });
+        let sent = send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"too late",
+            |x| entropy.fill(x),
+            NOW,
+        );
         assert!(
             BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| slot.borrow().is_none()),
             "the delete did not run inside the send"
@@ -4258,9 +5001,14 @@ mod tests {
         let (a, b, mut net) = scene();
         let (peer_a, accepted) = round_trip(&a, &b, &mut net);
         let mut entropy = Seeded::at(980);
-        send_message(&b.store(), &mut net, &accepted.peer, b"from B", |x| {
-            entropy.fill(x)
-        })
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            b"from B",
+            |x| entropy.fill(x),
+            NOW,
+        )
         .expect("B sends");
         let my_collected = a
             .store()
@@ -4353,7 +5101,7 @@ mod tests {
             .outgoing_lookup_key;
         let mut entropy = Seeded::at(990);
         let mut send = |net: &mut Net, body: &[u8]| {
-            send_message(&a.store(), net, &peer_a, body, |x| entropy.fill(x)).expect("A sends")
+            send_message(&a.store(), net, &peer_a, body, |x| entropy.fill(x), NOW).expect("A sends")
         };
 
         send(&mut net, b"one");
@@ -5138,6 +5886,7 @@ mod tests {
             &peer_a,
             b"after the acceptance",
             |x| entropy.fill(x),
+            NOW,
         )
         .expect("A sends");
         let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
@@ -5656,7 +6405,14 @@ mod tests {
 
         net.fail_after = Some(0);
         let mut entropy = Seeded::at(88);
-        let refused = send_message(&store_a, &mut net, &peer_a, b"owed", |x| entropy.fill(x));
+        let refused = send_message(
+            &store_a,
+            &mut net,
+            &peer_a,
+            b"owed",
+            |x| entropy.fill(x),
+            NOW,
+        );
         // The control: the write really was refused, so the outbox assertion
         // below is about a message whose slot never reached the network.
         assert!(refused.is_err(), "the slot write was refused");
@@ -6477,17 +7233,29 @@ mod tests {
 
         let store_a = a.store();
         let mut entropy = Seeded::at(99);
-        let refused = send_message(&store_a, &mut net, &peer_a, b"too early", |x| {
-            entropy.fill(x)
-        });
+        let refused = send_message(
+            &store_a,
+            &mut net,
+            &peer_a,
+            b"too early",
+            |x| entropy.fill(x),
+            NOW,
+        );
         assert!(matches!(refused, Err(FlowError::AwaitingAcceptance)));
 
         b_accepts(&b, &mut net, b"the reply");
         collect(&store_a, &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
 
         let mut entropy = Seeded::at(100);
-        let seq = send_message(&store_a, &mut net, &peer_a, b"now", |x| entropy.fill(x))
-            .expect("the same call succeeds once the acceptance is in");
+        let seq = send_message(
+            &store_a,
+            &mut net,
+            &peer_a,
+            b"now",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("the same call succeeds once the acceptance is in");
         assert_eq!(seq, 1);
     }
 

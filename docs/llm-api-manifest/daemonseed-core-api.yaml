@@ -2455,14 +2455,15 @@ modules:
       pending_deletes() -> Result<Vec<CorrespondenceLabel>, StoreError> names
       every correspondence whose record carries the mark.
       Every read here takes the lock. persist_outbox(peer, seq,
-      ciphertext) records the exact bytes a slot will hold as
+      ciphertext, sent_at) records the exact bytes a slot will hold, with the
+      send time in Unix seconds, as
       RecordKind::ConversationOutbox, one record holding one entry per ring slot
       indexed by seq mod RING_SLOTS, and refuses StoreError::OutboxSlotOccupied
       { offered, holding } when that entry holds a different sequence and
       StoreError::CiphertextTooLong { len } above CHANNEL_SUBKEY_LEN;
       delete_outbox_through(peer, cursor) drops every entry below cursor.
       load() -> Result<Loaded { advert_keys, convs: Vec<LoadedConv { peer, state,
-      outstanding_outbox: Vec<OutboxEntry { seq, ciphertext }> }> }, StoreError>
+      outstanding_outbox: Vec<OutboxEntry { seq, sent_at, ciphertext }> }> }, StoreError>
       is what a launch reads; an outbox entry is outstanding only while
       peer_collected <= seq < send_seq, so an entry at or above send_seq is a seal
       whose conversation record did not commit and is not reported. A conversation
@@ -2472,10 +2473,10 @@ modules:
       The record encodings are crate-private: a magic, a version byte, then
       fixed-width fields, an absent value written as a zero flag byte and its own
       width in zeros. A decoder refuses an unknown version (the conversation record is
-      at version 3, the advert-keys record at version 2, the outbox record at version 1), an outbox entry whose
+      at version 3, the advert-keys and outbox records at version 2), an outbox entry whose
       sequence is not its ring position, a hello slot at or above DROP_SUBKEYS,
       and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6407),
-      CONV_RECORD_LEN (36863) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
+      CONV_RECORD_LEN (36863) and CONV_OUTBOX_RECORD_LEN (1033544) are the three
       widths and are the RecordKind buckets. StoreError is Store(DmStoreError),
       Corrupt { kind, reason }, OutboxSlotOccupied, CiphertextTooLong,
       MissingConversation, ConversationExists, MissingAdvertKeys and
@@ -2497,7 +2498,15 @@ modules:
       error degrades to the band's fixed midpoint, and a now_secs below
       outstanding_since_secs reads as age zero. next_poll_interval_os(
       outstanding_since_secs, now_secs) -> Duration is the same over the OS
-      CSPRNG. The clock is an argument and the module reads none.
+      CSPRNG. oldest_uncollected_at(&LoadedConv) -> Option<u64> is the earliest
+      sent_at among the entries load reports outstanding, None where nothing is
+      owed or the conversation is marked for delete; now minus it is how long
+      the oldest owed message has been uncollected, which a caller can measure a
+      poll's backoff or a nudge against. nudge_due(oldest_uncollected_at:
+      Option<u64>, now_secs, threshold_secs) -> bool is true once that age is at
+      or above threshold_secs, which the caller supplies with no default, and
+      false with nothing owed; nothing in the crate tears a conversation down on
+      it. The clock is an argument and the module reads none.
       A teardown is two calls around the caller's own erase. prepare_delete(
       &Store, &CorrespondenceLabel, closed_marker: bool) -> Result<ChannelErase,
       StoreError> marks the conversation delete_pending through
@@ -2586,8 +2595,13 @@ modules:
       A verified hello is Surfaced::Dropped for a blocked identity,
       Accepted(Acceptance) where this side's own first contact is awaiting one,
       AlreadyCollected where the hello names the channel this side already
-      reads (its slot is erased), StartedOver for any other established
-      correspondent, ContactRequest { identity, lookup_key, first_ratchet_pk,
+      reads (its slot is erased), StartedOver { identity, request:
+      ContactRequest } for a hello from an established correspondent naming a
+      channel other than the one this side reads, where accept
+      refuses request with FlowError::AlreadyEstablished while the old
+      conversation's record exists and FlowError::DeletePending while that
+      record is marked for delete, and accepts it into the new conversation once
+      the old one is deleted, ContactRequest { identity, lookup_key, first_ratchet_pk,
       slot, advert_serial, shared_secret } for an unknown one, and Failed {
       identity, error } where settling that one correspondent failed — the scan
       carries on past it, and only a failure of this side's own store returns.
@@ -2614,8 +2628,10 @@ modules:
       the control key derived from peer_secret, reads its cursor and any reply,
       clears the outstanding hello, awaiting_acceptance and own_hello_secret, and
       erases the slot. send_message(store, records,
-      peer, body, fill) -> Result<u64, FlowError> persists the ciphertext and
-      the advanced send_seq and writes one ring slot; it is
+      peer, body, fill, now) -> Result<u64, FlowError> persists the ciphertext
+      with now as its send time and the advanced send_seq, and writes one ring
+      slot; first_contact and accept record their own now with the entry they
+      persist; it is
       FlowError::DeletePending while delete_pending is set, and
       FlowError::AwaitingAcceptance while awaiting_acceptance or acceptance_pending is
       set. collect_batch(store,

@@ -1281,7 +1281,7 @@ fn line_of(pass: u32, one: &Surfaced) -> SurfacedLine {
             lookup: Some(request.lookup_key.to_vec()),
         },
         Surfaced::Dropped { identity } => named("dropped", identity.as_slice()),
-        Surfaced::StartedOver { identity } => named("started-over", identity.as_slice()),
+        Surfaced::StartedOver { identity, .. } => named("started-over", identity.as_slice()),
         Surfaced::Failed { identity, .. } => named("failed", identity.as_slice()),
         Surfaced::AlreadyCollected { identity } => named("already-collected", identity.as_slice()),
         Surfaced::Accepted(_) => SurfacedLine {

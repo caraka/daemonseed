@@ -2832,7 +2832,7 @@ mod tests {
             RecordKind::ConversationOutbox.capacity(),
             CONV_OUTBOX_RECORD_LEN
         );
-        assert_eq!(CONV_OUTBOX_RECORD_LEN, 1_033_040);
+        assert_eq!(CONV_OUTBOX_RECORD_LEN, 1_033_544);
 
         // Every kind, with no exemption: the cursor's exemption is what #389
         // removed, so a loop that filtered any kind out would be the shape of

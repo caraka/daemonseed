@@ -131,6 +131,11 @@ work lives in the maintainer's own planning notes, not here.
   `Store::update_advert_state` hands that serial to a closure in the critical section that writes; the
   advert-keys record is at version 2 and `ADVERT_KEYS_RECORD_LEN` is 6407. `send_message`, `collect_batch`,
   `recognise_acceptance` and `accept` keep a force-turn flag stored after they loaded the key schedule (#474).
+- `daemonseed-core`: `dm::store::OutboxEntry` carries `sent_at`, the send time in Unix seconds, recorded from
+  the `now` of the flow that sealed the message. The outbox record is at version 2 and `CONV_OUTBOX_RECORD_LEN`
+  is 1033544. `delivery::oldest_uncollected_at(conv)` is the earliest send time still owed, and
+  `delivery::nudge_due(oldest_uncollected_at, now_secs, threshold_secs)` reports whether it has waited for a
+  caller-supplied threshold; nothing tears a conversation down on it.
 - `daemonseed-core`: `Store::delete_conv` removes the conversation record before the outbox, so a stop between
   the two leaves only an outbox that `Store::load` deletes. Conversation records carry `delete_pending`, which
   `delivery::prepare_delete` sets through `Store::mark_delete_pending` before the channel is erased and
@@ -1048,6 +1053,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-core`: `flows::Surfaced::StartedOver` gains `request: ContactRequest`, which `flows::accept`
+  refuses while the correspondent's old conversation record remains and accepts once it is deleted. Patterns
+  naming the variant's fields need `..`.
+- `daemonseed-core`: `Store::persist_outbox(peer, seq, ciphertext, sent_at)` takes the send time, and
+  `flows::send_message(store, records, peer, body, fill, now)` takes the caller's clock and records it.
 - `daemonseed-core`: DM channel owner seeds derive from `identity::keys::DmChannelRootSecret`, a seventh
   identity-scoped expansion of the identity PRK under `kdf::info::DOMAIN_DM_CHANNEL_ROOT`
   (`dm-channel-root/v1`), carried as `IdentityKeys::dm_channel_root`. `DmChannelRootSecret` is on the

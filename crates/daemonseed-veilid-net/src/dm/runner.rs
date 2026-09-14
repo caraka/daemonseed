@@ -2404,7 +2404,14 @@ impl<R: RunnerRecords> Runner<R> {
         peer: CorrespondenceLabel,
         body: &[u8],
     ) -> Result<(), Halt> {
-        match flows::send_message(&self.store, &mut self.records, &peer, body, os_fill) {
+        match flows::send_message(
+            &self.store,
+            &mut self.records,
+            &peer,
+            body,
+            os_fill,
+            self.clock.now_secs(),
+        ) {
             Ok(seq) => {
                 self.ensure_repair(peer);
                 self.emit(RunnerEvent::Sent { token, peer, seq }).await
@@ -2793,7 +2800,7 @@ impl<R: RunnerRecords> Runner<R> {
                         },
                     );
                 }
-                Surfaced::StartedOver { identity } => {
+                Surfaced::StartedOver { identity, .. } => {
                     let id = self.request_id(&held, &identity, true);
                     if !prior.contains(&id) && !held.contains_key(&id) {
                         fresh.push(RunnerEvent::StartedOver {

@@ -1467,8 +1467,15 @@ async fn a_collects_and_replies(
         result.opened
     );
 
-    let seq = flows::send_message(store, records, &acceptance.peer, A_REPLY.as_bytes(), fill)
-        .expect("A's reply sends");
+    let seq = flows::send_message(
+        store,
+        records,
+        &acceptance.peer,
+        A_REPLY.as_bytes(),
+        fill,
+        now_secs(),
+    )
+    .expect("A's reply sends");
     assert_eq!(seq, 1, "A's reply follows the message its knock carried");
 }
 

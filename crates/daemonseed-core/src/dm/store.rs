@@ -85,20 +85,21 @@ const CONV_MAGIC: &[u8] = b"daemonseed/dm/store/conv/v1\0";
 /// The magic heading a conversation's outbox record.
 const CONV_OUTBOX_MAGIC: &[u8] = b"daemonseed/dm/store/obox/v1\0";
 
-/// The version byte every record carries after its magic.
+/// The version byte an outbox record carries after its magic.
 ///
-/// The magic already names a version and the two move together; the byte is
-/// what a format change that keeps the same record identity turns over, so a
-/// reader's refusal names a version rather than failing to recognise the record
-/// at all.
-const RECORD_VERSION: u8 = 1;
+/// The magic names the record kind and does not change when its format does;
+/// the byte is what a format change turns over, so a reader's refusal names a
+/// version rather than failing to recognise the record at all. Each record kind
+/// carries its own, so one kind's format turns over without the others being
+/// refused.
+const CONV_OUTBOX_RECORD_VERSION: u8 = 2;
 
 /// The version byte a conversation record carries after its magic.
 ///
-/// Carried apart from [`RECORD_VERSION`], which the outbox record carries, so
-/// the conversation record's format turns over without the others being
-/// refused. A reader refuses any other value as an unknown version rather than
-/// reading the record at the wrong length.
+/// Carried apart from the other record kinds' versions, so the conversation
+/// record's format turns over without the others being refused. A reader
+/// refuses any other value as an unknown version rather than reading the record
+/// at the wrong length.
 const CONV_RECORD_VERSION: u8 = 3;
 
 /// The order [`Store::delete_conv`] removes a correspondence's records in.
@@ -192,8 +193,9 @@ pub const CONV_RECORD_LEN: usize = CONV_MAGIC.len()
     + 1;
 
 /// Bytes one outbox entry takes: an occupancy flag, the sequence it holds, the
-/// ciphertext length, and a whole subkey of space for the ciphertext.
-const CONV_OUTBOX_ENTRY_LEN: usize = 1 + 8 + 4 + CHANNEL_SUBKEY_LEN;
+/// time it was sent, the ciphertext length, and a whole subkey of space for the
+/// ciphertext.
+const CONV_OUTBOX_ENTRY_LEN: usize = 1 + 8 + 8 + 4 + CHANNEL_SUBKEY_LEN;
 
 /// Bytes the outbox record occupies, and so
 /// [`RecordKind::ConversationOutbox`]'s bucket: one entry per ring slot,
@@ -445,6 +447,9 @@ impl core::fmt::Debug for ConvState {
 pub struct OutboxEntry {
     /// The message's sequence within this side's direction.
     pub seq: u64,
+    /// When the message was sent, in Unix seconds on the caller's clock: the
+    /// `now` the flow that sealed it was given.
+    pub sent_at: u64,
     /// The bytes the slot holds, as written.
     pub ciphertext: Vec<u8>,
 }
@@ -744,11 +749,15 @@ impl Store {
     /// sequence maps onto the slot of one 63 messages older — surfacing here
     /// rather than as a silently dropped entry, and a caller reaching it has
     /// skipped [`Store::delete_outbox_through`].
+    ///
+    /// `sent_at` is when the message was sent, in Unix seconds on the caller's
+    /// clock, and is kept with the entry for as long as it is owed.
     pub fn persist_outbox(
         &self,
         peer: &CorrespondenceLabel,
         seq: u64,
         ciphertext: &[u8],
+        sent_at: u64,
     ) -> Result<(), StoreError> {
         if ciphertext.len() > CHANNEL_SUBKEY_LEN {
             return Err(StoreError::CiphertextTooLong {
@@ -768,6 +777,7 @@ impl Store {
             }
             table[at] = Some(OutboxEntry {
                 seq,
+                sent_at,
                 ciphertext: ciphertext.to_vec(),
             });
             g.replace(RecordKind::ConversationOutbox, &encode_conv_outbox(&table))?;
@@ -1111,11 +1121,6 @@ impl<'a> Reader<'a> {
         }))
     }
 
-    /// The magic and [`RECORD_VERSION`] at the head of a record.
-    fn header(&mut self, magic: &[u8]) -> Result<(), StoreError> {
-        self.header_version(magic, RECORD_VERSION)
-    }
-
     /// The magic and a record's own version at the head of a record.
     fn header_version(&mut self, magic: &[u8], version: u8) -> Result<(), StoreError> {
         if self.take(magic.len())? != magic {
@@ -1413,12 +1418,13 @@ type OutboxTable = Vec<Option<OutboxEntry>>;
 pub(crate) fn encode_conv_outbox(table: &[Option<OutboxEntry>]) -> Zeroizing<Vec<u8>> {
     let mut w = Writer::with_capacity(CONV_OUTBOX_RECORD_LEN);
     w.bytes(CONV_OUTBOX_MAGIC);
-    w.u8(RECORD_VERSION);
+    w.u8(CONV_OUTBOX_RECORD_VERSION);
     for slot in table {
         match slot {
             Some(e) => {
                 w.u8(PRESENT);
                 w.u64(e.seq);
+                w.u64(e.sent_at);
                 w.u32(e.ciphertext.len() as u32);
                 w.padded(&e.ciphertext, CHANNEL_SUBKEY_LEN);
             }
@@ -1434,11 +1440,12 @@ pub(crate) fn encode_conv_outbox(table: &[Option<OutboxEntry>]) -> Zeroizing<Vec
 /// Decode the outbox table.
 pub(crate) fn decode_conv_outbox(bytes: &[u8]) -> Result<OutboxTable, StoreError> {
     let mut r = Reader::new(bytes, RecordKind::ConversationOutbox);
-    r.header(CONV_OUTBOX_MAGIC)?;
+    r.header_version(CONV_OUTBOX_MAGIC, CONV_OUTBOX_RECORD_VERSION)?;
     let mut table = Vec::with_capacity(RING_SLOTS as usize);
     for index in 0..RING_SLOTS {
         let present = r.flag()?;
         let seq = r.u64()?;
+        let sent_at = r.u64()?;
         let len = r.u32()? as usize;
         let body = r.take(CHANNEL_SUBKEY_LEN)?;
         if !present {
@@ -1457,7 +1464,11 @@ pub(crate) fn decode_conv_outbox(bytes: &[u8]) -> Result<OutboxTable, StoreError
             .get(..len)
             .ok_or_else(|| r.corrupt("an entry's length runs past its slot"))?
             .to_vec();
-        table.push(Some(OutboxEntry { seq, ciphertext }));
+        table.push(Some(OutboxEntry {
+            seq,
+            sent_at,
+            ciphertext,
+        }));
     }
     r.finish()?;
     Ok(table)
@@ -1662,7 +1673,9 @@ mod tests {
         let store = Store::open(tmp.path(), &at_rest_key(1)).unwrap();
         store.persist_advert_keys(&advert).unwrap();
         store.create_conv(&label(1), &state).unwrap();
-        store.persist_outbox(&label(1), 0, &ciphertext).unwrap();
+        store
+            .persist_outbox(&label(1), 0, &ciphertext, NOW)
+            .unwrap();
         drop(store);
 
         let store = Store::open(tmp.path(), &at_rest_key(1)).unwrap();
@@ -1770,6 +1783,7 @@ mod tests {
             conv.outstanding_outbox,
             vec![OutboxEntry {
                 seq: 0,
+                sent_at: NOW,
                 ciphertext: ciphertext.clone()
             }],
             "the outbox record did not round trip"
@@ -1807,12 +1821,14 @@ mod tests {
         let _ = crate::kats::initialize_module_unsigned_test_binary();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(3)).unwrap();
-        store.persist_outbox(&label(4), 0, b"first").unwrap();
+        store.persist_outbox(&label(4), 0, b"first", NOW).unwrap();
         // The control: the same sequence again is a re-seal, and is allowed.
-        store.persist_outbox(&label(4), 0, b"first again").unwrap();
+        store
+            .persist_outbox(&label(4), 0, b"first again", NOW)
+            .unwrap();
 
         let err = store
-            .persist_outbox(&label(4), RING_SLOTS, b"a full ring later")
+            .persist_outbox(&label(4), RING_SLOTS, b"a full ring later", NOW)
             .expect_err("the slot is occupied");
         assert!(matches!(
             err,
@@ -1824,7 +1840,7 @@ mod tests {
 
         store.delete_outbox_through(&label(4), 1).unwrap();
         store
-            .persist_outbox(&label(4), RING_SLOTS, b"a full ring later")
+            .persist_outbox(&label(4), RING_SLOTS, b"a full ring later", NOW)
             .expect("the slot is free once the cursor passes it");
     }
 
@@ -2016,7 +2032,7 @@ mod tests {
 
             budget.act()?;
             self.store
-                .persist_outbox(&self.label, seq, &ciphertext)
+                .persist_outbox(&self.label, seq, &ciphertext, NOW)
                 .expect("persist the outbox");
             budget.act()?;
             self.persist();
@@ -2704,7 +2720,7 @@ mod tests {
         store
             .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
             .unwrap();
-        store.persist_outbox(&peer, 0, &[0x7c; 64]).unwrap();
+        store.persist_outbox(&peer, 0, &[0x7c; 64], NOW).unwrap();
         let file = |kind: RecordKind| {
             store
                 .records()
@@ -2779,6 +2795,54 @@ mod tests {
         );
     }
 
+    /// An owed entry keeps its send time when another entry is persisted after
+    /// it, and when a cursor drops an entry before it and the record is
+    /// rewritten.
+    #[test]
+    fn an_owed_entry_keeps_its_send_time_across_later_writes() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x3c)).unwrap();
+        let peer = label(0x3d);
+        let sent_at = |store: &Store| -> Vec<(u64, u64)> {
+            let raw = store
+                .records()
+                .critical_section::<_, DmStoreError>(&peer, |g| {
+                    g.read(RecordKind::ConversationOutbox)
+                })
+                .unwrap()
+                .expect("an outbox record");
+            decode_conv_outbox(&raw)
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .map(|entry| (entry.seq, entry.sent_at))
+                .collect()
+        };
+
+        store.persist_outbox(&peer, 0, &[0x70; 64], NOW).unwrap();
+        store
+            .persist_outbox(&peer, 1, &[0x71; 64], NOW + 10)
+            .unwrap();
+        assert_eq!(
+            sent_at(&store),
+            vec![(0, NOW), (1, NOW + 10)],
+            "a later persist changed an earlier entry's send time"
+        );
+
+        store.delete_outbox_through(&peer, 1).unwrap();
+        assert_eq!(
+            sent_at(&store),
+            vec![(1, NOW + 10)],
+            "dropping an earlier entry changed a later entry's send time"
+        );
+
+        store
+            .persist_outbox(&peer, 2, &[0x72; 64], NOW + 20)
+            .unwrap();
+        assert_eq!(sent_at(&store), vec![(1, NOW + 10), (2, NOW + 20)]);
+    }
+
     /// `delete_conv` removes the conversation record and then the outbox, in
     /// that order.
     #[test]
@@ -2790,7 +2854,7 @@ mod tests {
         store
             .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
             .unwrap();
-        store.persist_outbox(&peer, 0, &[0x7e; 64]).unwrap();
+        store.persist_outbox(&peer, 0, &[0x7e; 64], NOW).unwrap();
         DELETED.with(|deleted| deleted.borrow_mut().clear());
 
         store.delete_conv(&peer).unwrap();
@@ -2816,7 +2880,7 @@ mod tests {
         store
             .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
             .unwrap();
-        store.persist_outbox(&peer, 0, &[0x7d; 64]).unwrap();
+        store.persist_outbox(&peer, 0, &[0x7d; 64], NOW).unwrap();
         let loaded = |store: &Store| {
             store
                 .load()
@@ -2933,11 +2997,11 @@ mod tests {
         let store = Store::open(tmp.path(), &at_rest_key(1)).unwrap();
         let orphan = label(0x31);
         let genuine = label(0x32);
-        store.persist_outbox(&orphan, 0, &[0x5a; 64]).unwrap();
+        store.persist_outbox(&orphan, 0, &[0x5a; 64], NOW).unwrap();
         store
             .create_conv(&genuine, &conv_state(&a, 1, 0, 0, None))
             .unwrap();
-        store.persist_outbox(&genuine, 0, &[0x6b; 64]).unwrap();
+        store.persist_outbox(&genuine, 0, &[0x6b; 64], NOW).unwrap();
         let outbox_of = |peer: &CorrespondenceLabel| {
             store
                 .records()
@@ -2981,6 +3045,9 @@ mod tests {
 
     #[test]
     fn a_record_carrying_an_unknown_version_is_refused() {
+        // The version every record kind carried before its format first turned
+        // over.
+        const FIRST_RECORD_VERSION: u8 = 1;
         let (a, _b) = pair();
         let cases: Vec<(&str, Vec<u8>, usize, u8)> = vec![
             (
@@ -2999,31 +3066,40 @@ mod tests {
                 "outbox",
                 encode_conv_outbox(&vec![None; RING_SLOTS as usize]).to_vec(),
                 CONV_OUTBOX_MAGIC.len(),
-                RECORD_VERSION,
+                CONV_OUTBOX_RECORD_VERSION,
             ),
         ];
         let _ = &a;
 
-        // A conversation record carrying the version the other two records
-        // carry is refused as an unknown version, not read at a wrong length.
-        let mut shared = conv_bytes_with_hello();
-        shared[CONV_MAGIC.len()] = RECORD_VERSION;
-        match decode_conv(&shared) {
+        // A record of any kind carrying the first version is refused as an
+        // unknown version, not read at a wrong length.
+        let mut old = conv_bytes_with_hello();
+        old[CONV_MAGIC.len()] = FIRST_RECORD_VERSION;
+        match decode_conv(&old) {
             Err(StoreError::Corrupt { reason, .. }) => assert!(
                 reason.contains("version"),
                 "refused for the wrong reason: {reason}"
             ),
-            other => panic!("a conversation record at RECORD_VERSION decoded: {other:?}"),
+            other => panic!("a conversation record at the first version decoded: {other:?}"),
         }
-        // And so is an advert-keys record carrying the outbox record's version.
-        let mut shared = encode_advert_keys(&rotated_advert(), Some(1)).to_vec();
-        shared[ADVERT_KEYS_MAGIC.len()] = RECORD_VERSION;
-        match decode_advert_keys(&shared).map(|_| ()) {
+        let mut old = encode_advert_keys(&rotated_advert(), Some(1)).to_vec();
+        old[ADVERT_KEYS_MAGIC.len()] = FIRST_RECORD_VERSION;
+        match decode_advert_keys(&old).map(|_| ()) {
             Err(StoreError::Corrupt { reason, .. }) => assert!(
                 reason.contains("version"),
                 "refused for the wrong reason: {reason}"
             ),
-            other => panic!("an advert-keys record at RECORD_VERSION decoded: {other:?}"),
+            other => panic!("an advert-keys record at the first version decoded: {other:?}"),
+        }
+        // An outbox record written before entries carried a send time.
+        let mut old = encode_conv_outbox(&vec![None; RING_SLOTS as usize]).to_vec();
+        old[CONV_OUTBOX_MAGIC.len()] = FIRST_RECORD_VERSION;
+        match decode_conv_outbox(&old) {
+            Err(StoreError::Corrupt { reason, .. }) => assert!(
+                reason.contains("version"),
+                "refused for the wrong reason: {reason}"
+            ),
+            other => panic!("an outbox record at the first version decoded: {other:?}"),
         }
 
         for (name, good, version_at, version) in cases {
@@ -3056,6 +3132,7 @@ mod tests {
         let mut table: OutboxTable = vec![None; RING_SLOTS as usize];
         table[0] = Some(OutboxEntry {
             seq: 0,
+            sent_at: NOW,
             ciphertext: b"a message".to_vec(),
         });
         let good = encode_conv_outbox(&table).to_vec();
