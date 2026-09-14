@@ -1161,6 +1161,609 @@ async fn a_request_id_from_an_earlier_run_is_refused() {
     assert!(finished(&bw.stop().await));
 }
 
+fn is_block_list(event: &RunnerEvent) -> bool {
+    matches!(event, RunnerEvent::BlockList(_))
+}
+
+fn block_list(event: &RunnerEvent) -> Vec<IdentityPk> {
+    match event {
+        RunnerEvent::BlockList(identities) => identities.clone(),
+        other => panic!("expected BlockList, got {other:?}"),
+    }
+}
+
+/// The runner reports the whole block list: the stored list once at startup,
+/// straight after the first roster, and the list as it then stands after each
+/// block and unblock, exactly; a relaunch reports what the store kept.
+#[tokio::test(start_paused = true)]
+async fn the_block_list_is_reported_at_startup_and_after_each_change() {
+    let dht = network();
+    let (a, b, c) = (Profile::new(), Profile::new(), Profile::new());
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    let at = aw.wait_for("the startup block list", is_block_list).await;
+    assert_eq!(at, 1, "straight after the first roster: {:?}", aw.seen);
+    assert!(is_roster(&aw.seen[0]), "the roster comes first");
+    assert_eq!(block_list(&aw.seen[at]), Vec::<IdentityPk>::new());
+
+    aw.send(RunnerCommand::Block { peer: b.pk.clone() }).await;
+    let at = aw
+        .wait_from(at + 1, "the list after blocking B", is_block_list)
+        .await;
+    assert_eq!(block_list(&aw.seen[at]), vec![b.pk.clone()]);
+
+    aw.send(RunnerCommand::Block { peer: c.pk.clone() }).await;
+    let at = aw
+        .wait_from(at + 1, "the list after blocking C", is_block_list)
+        .await;
+    let mut both = vec![b.pk.clone(), c.pk.clone()];
+    both.sort();
+    assert_eq!(block_list(&aw.seen[at]), both, "both, in ascending order");
+
+    aw.send(RunnerCommand::Unblock { peer: b.pk.clone() }).await;
+    let at = aw
+        .wait_from(at + 1, "the list after unblocking B", is_block_list)
+        .await;
+    assert_eq!(block_list(&aw.seen[at]), vec![c.pk.clone()]);
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+    assert!(
+        !aw.seen[at + 1..].iter().any(is_block_list),
+        "no further block list before the stop: {:?}",
+        &aw.seen[at + 1..]
+    );
+    assert!(finished(&aw.stop().await));
+
+    let mut aw = a.spawn(&a_fake.restart(), RunnerConfig::default());
+    let at = aw
+        .wait_for("the relaunch's block list", is_block_list)
+        .await;
+    assert_eq!(
+        block_list(&aw.seen[at]),
+        vec![c.pk.clone()],
+        "the relaunch reports the list the store kept"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A block the full list refuses is answered by a refusal and by no block list,
+/// before it or after it, so a front end never shows that identity as blocked.
+#[tokio::test(start_paused = true)]
+async fn a_block_the_full_list_refuses_reports_no_block_list() {
+    use daemonseed_core::dm::block_list::BLOCK_LIST_MAX_ENTRIES;
+    let dht = network();
+    let a = Profile::new();
+    let mut aw = a.spawn(&Fake::on(&dht), RunnerConfig::default());
+    let mut at = aw.wait_for("the startup block list", is_block_list).await;
+    let identity = |n: u16| -> IdentityPk {
+        let mut key = Box::new([0u8; IDENTITY_PK_LEN]);
+        key[..2].copy_from_slice(&n.to_be_bytes());
+        key
+    };
+    let ceiling = u16::try_from(BLOCK_LIST_MAX_ENTRIES).expect("the ceiling fits a u16");
+    for n in 0..ceiling {
+        aw.send(RunnerCommand::Block { peer: identity(n) }).await;
+        at = aw
+            .wait_from(at + 1, "the list after a block", is_block_list)
+            .await;
+    }
+    assert_eq!(
+        block_list(&aw.seen[at]).len(),
+        BLOCK_LIST_MAX_ENTRIES,
+        "the list is full"
+    );
+
+    aw.send(RunnerCommand::Block {
+        peer: identity(ceiling),
+    })
+    .await;
+    let refused_at = aw
+        .wait_from(at + 1, "the refusal of a block past the ceiling", |event| {
+            matches!(
+                event,
+                RunnerEvent::Refused {
+                    token: None,
+                    reason: Refusal::BlockListFull
+                }
+            )
+        })
+        .await;
+    assert!(
+        !aw.seen[at + 1..refused_at].iter().any(is_block_list),
+        "no block list before the refusal: {:?}",
+        &aw.seen[at + 1..refused_at]
+    );
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+    assert!(
+        !aw.seen[refused_at + 1..].iter().any(is_block_list),
+        "and none after it: {:?}",
+        &aw.seen[refused_at + 1..]
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// Where `profile`'s block list record lives.
+fn block_list_record(profile: &Profile) -> std::path::PathBuf {
+    profile.root.path().join(STORE_DIR).join("block-list.bin")
+}
+
+/// Overwrite `profile`'s block list record with bytes that are not a sealed
+/// record.
+fn overwrite_block_list_record(profile: &Profile) {
+    let path = block_list_record(profile);
+    assert!(
+        path.exists(),
+        "the block list record is where it is looked for"
+    );
+    std::fs::write(&path, b"not a sealed block list").expect("the record is overwritten");
+}
+
+/// Seal a payload that is not a whole number of keys into `profile`'s block
+/// list record.
+fn write_undecodable_block_list(profile: &Profile) {
+    let store = Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("the store opens");
+    store
+        .records()
+        .profile_critical_section(|guard| -> Result<(), DmStoreError> {
+            guard.replace(RecordKind::BlockList, &[1, 2, 3])?;
+            Ok(())
+        })
+        .expect("a payload that is not whole keys is written");
+}
+
+/// Delete `profile`'s block list record.
+fn remove_block_list_record(profile: &Profile) {
+    std::fs::remove_file(block_list_record(profile)).expect("the block list record is removed");
+}
+
+/// Store a block list holding only `identity` in `profile`'s record.
+fn write_block_list(profile: &Profile, identity: &IdentityPk) {
+    let mut list = BlockList::new();
+    list.block(identity);
+    let encoded = list.encode().expect("one identity encodes");
+    let store = Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("the store opens");
+    store
+        .records()
+        .profile_critical_section(|guard| -> Result<(), DmStoreError> {
+            guard.replace(RecordKind::BlockList, &encoded)?;
+            Ok(())
+        })
+        .expect("the block list is written");
+}
+
+/// A block list whose record will not read at startup is reported unreadable.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_block_list_record_at_startup_is_reported_and_counted_once_by_startup() {
+    block_list_reported_unreadable_at_startup(overwrite_block_list_record).await;
+}
+
+/// A block list whose sealed record holds a payload that does not decode is
+/// reported unreadable in the same way.
+#[tokio::test(start_paused = true)]
+async fn an_undecodable_block_list_at_startup_is_reported_and_counted_once_by_startup() {
+    block_list_reported_unreadable_at_startup(write_undecodable_block_list).await;
+}
+
+/// A profile whose block list `corrupt` breaks between runs relaunches
+/// reporting it unreadable straight after the first roster, in place of any
+/// block list; startup counts the failed read once, its own drop scan adding
+/// nothing; and no drop is scanned while the list stays unknown.
+async fn block_list_reported_unreadable_at_startup(corrupt: fn(&Profile)) {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    assert!(finished(&aw.stop().await));
+    corrupt(&a);
+
+    let relaunched = a_fake.restart();
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    assert!(is_roster(&aw.seen[0]), "the roster comes first");
+    assert!(
+        matches!(aw.seen[1], RunnerEvent::BlockListUnreadable),
+        "the unreadable list is reported in place of a block list: {:?}",
+        aw.seen
+    );
+    assert!(
+        !aw.seen[..at].iter().any(is_block_list),
+        "no block list is reported: {:?}",
+        aw.seen
+    );
+    assert_eq!(
+        health(&aw.seen[at]).store_failures,
+        1,
+        "startup counts the failed read once"
+    );
+    assert_eq!(
+        relaunched.calls().drop_reads,
+        0,
+        "no drop is scanned while the block list is unknown"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+fn is_block_list_unreadable(event: &RunnerEvent) -> bool {
+    matches!(event, RunnerEvent::BlockListUnreadable)
+}
+
+/// A block list record deleted while the runner runs is not recreated: the
+/// list is reported unreadable, never empty, and B stays blocked.
+#[tokio::test(start_paused = true)]
+async fn a_block_list_record_deleted_mid_run_is_reported_unreadable_and_not_recreated() {
+    let a = block_list_lost_mid_run(remove_block_list_record).await;
+    assert!(
+        !block_list_record(&a).exists(),
+        "the record is not recreated"
+    );
+}
+
+/// A block list record overwritten while the runner runs is reported
+/// unreadable in the same way.
+#[tokio::test(start_paused = true)]
+async fn a_block_list_record_overwritten_mid_run_is_reported_unreadable() {
+    block_list_lost_mid_run(overwrite_block_list_record).await;
+}
+
+/// A block list whose sealed record stops decoding while the runner runs is
+/// reported unreadable in the same way.
+#[tokio::test(start_paused = true)]
+async fn a_block_list_that_stops_decoding_mid_run_is_reported_unreadable() {
+    block_list_lost_mid_run(write_undecodable_block_list).await;
+}
+
+/// A runner that has blocked B and then has its block list broken by
+/// `break_list` reports the list unreadable exactly once and never as a list,
+/// counts the failure, reads no drop slot from then on, and surfaces no request
+/// for a hello B writes to its drop afterwards. Returns A's profile.
+async fn block_list_lost_mid_run(break_list: fn(&Profile)) -> Profile {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    let at = aw.wait_for("the startup block list", is_block_list).await;
+    aw.send(RunnerCommand::Block { peer: b.pk.clone() }).await;
+    let blocked_at = aw
+        .wait_from(at + 1, "the list after blocking B", is_block_list)
+        .await;
+    assert_eq!(block_list(&aw.seen[blocked_at]), vec![b.pk.clone()]);
+
+    break_list(&a);
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+    let lost = &aw.seen[blocked_at + 1..];
+    assert!(
+        lost.iter().any(is_block_list_unreadable),
+        "the unreadable list is reported within three ticks: {lost:?}"
+    );
+    assert!(
+        lost.iter()
+            .any(|event| matches!(event, RunnerEvent::Health(h) if h.store_failures >= 1)),
+        "the failed read is counted: {lost:?}"
+    );
+    let reads = a_fake.calls().drop_reads;
+
+    let mut bw = b.spawn(&Fake::on(&dht), RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    bw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: a.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's hello to A", sent(1)).await;
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+
+    let after = &aw.seen[blocked_at + 1..];
+    assert!(
+        !after.iter().any(is_block_list),
+        "no block list is reported once the list is lost: {after:?}"
+    );
+    assert_eq!(
+        after.iter().filter(|e| is_block_list_unreadable(e)).count(),
+        1,
+        "the unreadable list is reported once: {after:?}"
+    );
+    assert!(
+        !after.iter().any(request_from(&b.pk)),
+        "B's hello surfaces no request: {after:?}"
+    );
+    assert_eq!(
+        a_fake.calls().drop_reads,
+        reads,
+        "no drop slot is read while the list is unknown"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+    a
+}
+
+/// A profile that blocked `blocked`, relaunched with its block list record
+/// overwritten, and whose record is put back exactly as it was once the
+/// relaunch has reported the list unreadable. Returns the profile, the
+/// relaunch's records, its watch and the index of its startup health report.
+async fn relaunch_with_a_block_list_that_reads_again(
+    blocked: &IdentityPk,
+) -> (Profile, Fake, Watch, usize) {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    let at = aw.wait_for("the startup block list", is_block_list).await;
+    aw.send(RunnerCommand::Block {
+        peer: blocked.clone(),
+    })
+    .await;
+    aw.wait_from(at + 1, "the list after the block", is_block_list)
+        .await;
+    assert!(finished(&aw.stop().await));
+
+    let path = block_list_record(&a);
+    let stored = std::fs::read(&path).expect("the record reads");
+    overwrite_block_list_record(&a);
+    let relaunched = a_fake.restart();
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    assert!(
+        is_block_list_unreadable(&aw.seen[1]),
+        "the relaunch reports the list unreadable: {:?}",
+        aw.seen
+    );
+    std::fs::write(&path, &stored).expect("the record is put back");
+    (a, relaunched, aw, at)
+}
+
+/// An unreadable block list that reads again is reported by the next
+/// collection, exactly once, as the identities the record holds, and the drop
+/// is scanned again.
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_block_list_that_reads_again_is_reported_once() {
+    let b = Profile::new();
+    let (_a, relaunched, mut aw, at) = relaunch_with_a_block_list_that_reads_again(&b.pk).await;
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+    let lists: Vec<&RunnerEvent> = aw.seen[at + 1..]
+        .iter()
+        .filter(|e| is_block_list(e))
+        .collect();
+    assert_eq!(lists.len(), 1, "one block list: {:?}", &aw.seen[at + 1..]);
+    assert_eq!(block_list(lists[0]), vec![b.pk.clone()]);
+    assert!(
+        relaunched.calls().drop_reads > 0,
+        "the drop is scanned again"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A block the store accepts while the block list is unknown makes it known:
+/// its list is reported, and the next collection reports no second one.
+#[tokio::test(start_paused = true)]
+async fn a_block_accepted_while_the_list_is_unknown_is_reported_once() {
+    let (b, c) = (Profile::new(), Profile::new());
+    let (_a, relaunched, mut aw, at) = relaunch_with_a_block_list_that_reads_again(&b.pk).await;
+    aw.send(RunnerCommand::Block { peer: c.pk.clone() }).await;
+    let at = aw
+        .wait_from(at + 1, "the list after blocking C", is_block_list)
+        .await;
+    let mut both = vec![b.pk.clone(), c.pk.clone()];
+    both.sort();
+    assert_eq!(block_list(&aw.seen[at]), both);
+    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    aw.drain();
+    assert!(
+        !aw.seen[at + 1..].iter().any(is_block_list),
+        "no second block list: {:?}",
+        &aw.seen[at + 1..]
+    );
+    assert!(
+        relaunched.calls().drop_reads > 0,
+        "the drop is scanned again"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// B's acceptance of A's first contact, refused at its second write so that
+/// B's conversation holds the acceptance pending, with both runners stopped.
+async fn leave_an_acceptance_pending() -> (Profile, Profile, Fake) {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let b_fake = Fake::on(&dht);
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut aw = a.spawn(&Fake::on(&dht), RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"message zero".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+    b_fake.fail_write(2);
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    bw.wait_for("the refused acceptance", refused(2)).await;
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+    (a, b, b_fake)
+}
+
+/// B, relaunched with an acceptance pending after `prepare` changes its block
+/// list, surfaces no message across startup and the repair polls that follow,
+/// shows the conversation pending throughout, and still holds the acceptance
+/// pending once stopped. Returns what the relaunch reported.
+async fn a_pending_acceptance_stays_pending(prepare: fn(&Profile, &Profile)) -> Vec<RunnerEvent> {
+    let (a, b, b_fake) = leave_an_acceptance_pending().await;
+    prepare(&a, &b);
+    let mut bw = b.spawn(&b_fake.restart(), RunnerConfig::default());
+    bw.wait_for("B's relaunch", is_health).await;
+    tokio::time::sleep(delivery::POLL_INTERVAL_MAX * 2).await;
+    bw.drain();
+    let rows = roster(&bw.seen[0]);
+    assert!(
+        rows.len() == 1 && rows[0].state == ConversationState::Pending,
+        "the relaunch shows the conversation pending: {:?}",
+        bw.seen
+    );
+    assert!(
+        !bw.seen
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::Message { .. })),
+        "no message surfaces: {:?}",
+        bw.seen
+    );
+    assert!(
+        !bw.seen
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::Roster(rows)
+            if rows.iter().any(|row| row.state == ConversationState::Established))),
+        "the conversation is never shown established: {:?}",
+        bw.seen
+    );
+    let Watch { handle, seen, .. } = bw;
+    assert!(finished(&handle.shutdown().await));
+
+    let store =
+        Store::open(b.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).expect("the store opens");
+    let Ok(loaded) = store.load() else {
+        panic!("the store loads");
+    };
+    assert!(
+        loaded.convs.len() == 1 && loaded.convs[0].state.acceptance_pending,
+        "the acceptance is still pending in the store"
+    );
+    seen
+}
+
+/// An acceptance left unfinished is not carried on while the block list will
+/// not read.
+#[tokio::test(start_paused = true)]
+async fn a_pending_acceptance_is_not_carried_on_while_the_block_list_is_unreadable() {
+    let seen = a_pending_acceptance_stays_pending(|_, b| overwrite_block_list_record(b)).await;
+    assert!(
+        is_block_list_unreadable(&seen[1]),
+        "the relaunch reports the list unreadable: {seen:?}"
+    );
+}
+
+/// An acceptance left unfinished is not carried on while the block list holds
+/// the correspondent.
+#[tokio::test(start_paused = true)]
+async fn a_pending_acceptance_of_a_blocked_correspondent_is_not_carried_on() {
+    let seen = a_pending_acceptance_stays_pending(|a, b| write_block_list(b, &a.pk)).await;
+    assert!(
+        is_block_list(&seen[1]) && block_list(&seen[1]).len() == 1,
+        "the relaunch reports the one blocked identity: {seen:?}"
+    );
+}
+
+/// An Accept that arrives while the block list will not read is refused as a
+/// store failure and writes nothing: no channel, no reply and no conversation.
+#[tokio::test(start_paused = true)]
+async fn an_accept_while_the_block_list_is_unreadable_is_refused_and_writes_nothing() {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let b_fake = Fake::on(&dht);
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut aw = a.spawn(&Fake::on(&dht), RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+
+    overwrite_block_list_record(&b);
+    let before = b_fake.calls();
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    let at = bw
+        .wait_from(at + 1, "the answer to the Accept", |event| {
+            sent(2)(event) || refused(2)(event)
+        })
+        .await;
+    assert_eq!(refusal(&bw.seen[at]), Refusal::Store);
+    let after = b_fake.calls();
+    assert_eq!(
+        (after.open_channel, after.control_writes, after.ring_writes),
+        (
+            before.open_channel,
+            before.control_writes,
+            before.ring_writes
+        ),
+        "nothing is written to the network"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+
+    let store =
+        Store::open(b.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).expect("the store opens");
+    let Ok(loaded) = store.load() else {
+        panic!("the store loads");
+    };
+    assert!(loaded.convs.is_empty(), "no conversation is recorded");
+}
+
+/// A stored block list holding more identities than the maximum is corruption,
+/// refused as a store failure; only a change past the maximum is a full list.
+#[test]
+fn an_oversized_stored_block_list_is_refused_as_a_store_failure() {
+    use daemonseed_core::dm::block_list::{BlockListError, BLOCK_LIST_CAPACITY};
+    let oversized = vec![0u8; BLOCK_LIST_CAPACITY + IDENTITY_PK_LEN];
+    assert!(
+        matches!(
+            BlockList::decode(&oversized),
+            Err(BlockListError::Full { .. })
+        ),
+        "the decode names the record full"
+    );
+    let Err(failure) = decode_stored_block_list(&oversized) else {
+        panic!("an oversized record does not decode");
+    };
+    assert_eq!(failure.refusal(), Refusal::Store);
+    assert_eq!(BlockListFailure::Full.refusal(), Refusal::BlockListFull);
+}
+
+/// A block list event's `Debug` output names how many identities it holds and
+/// none of their bytes.
+#[test]
+fn a_block_list_event_prints_its_count_and_no_key_bytes() {
+    let mut key: IdentityPk = Box::new([0u8; IDENTITY_PK_LEN]);
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = u8::try_from(i % 251).expect("below 251") + 1;
+    }
+    let shown = format!("{:?}", RunnerEvent::BlockList(vec![key.clone(), key]));
+    assert_eq!(shown, "BlockList(2 identities)");
+    assert_eq!(
+        format!("{:?}", RunnerEvent::BlockListUnreadable),
+        "BlockListUnreadable"
+    );
+}
+
 /// A hello from a blocked identity surfaces nothing and moves the dropped
 /// counter; unblocked, the same hello is a contact request.
 #[tokio::test(start_paused = true)]

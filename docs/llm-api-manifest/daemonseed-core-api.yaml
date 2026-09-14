@@ -5619,6 +5619,19 @@ functions:
         - name: "oxicrypt_module::Error::ConditionalTestFailed"
           condition: A conditional self-test failed. The module is in the error state.
 
+  # ── dm::block_list ──────────────────────────────────────────────────
+  - name: BlockList::iter
+    module: daemonseed_core::dm::block_list
+    description: >-
+      Every blocked identity public key, each once, in ascending byte order,
+      the order encode writes them in. Read-only: it changes nothing, and it is
+      how a caller lists which identities a profile blocks.
+    signature: "pub fn iter(&self) -> impl Iterator<Item = &[u8; ml_dsa::PK_LEN]>"
+    parameters: []
+    returns:
+      type: "impl Iterator<Item = &[u8; ml_dsa::PK_LEN]>"
+      description: The blocked keys, each once, ascending.
+
   # ── identity::mnemonic ──────────────────────────────────────────────
   - name: Mnemonic::generate
     module: daemonseed_core::identity::mnemonic

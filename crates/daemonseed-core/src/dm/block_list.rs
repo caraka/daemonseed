@@ -146,6 +146,12 @@ impl BlockList {
         self.blocked.is_empty()
     }
 
+    /// Every blocked identity, each once, in ascending byte order: the order
+    /// [`Self::encode`] writes them in.
+    pub fn iter(&self) -> impl Iterator<Item = &[u8; ml_dsa::PK_LEN]> {
+        self.blocked.iter().map(|key| &**key)
+    }
+
     /// **Channel plane.** Whether an established correspondent's channel must
     /// stop being swept.
     ///
@@ -295,6 +301,26 @@ mod tests {
         // looked at a prefix would still have to be wrong on purpose to pass.
         k[ml_dsa::PK_LEN - 1] = seed.wrapping_mul(7);
         k
+    }
+
+    /// The keys come back each once, in ascending byte order whatever order they
+    /// were blocked in, and a key unblocked is gone from them.
+    #[test]
+    fn iter_yields_each_blocked_key_once_in_ascending_order() {
+        let mut list = BlockList::new();
+        assert_eq!(list.iter().count(), 0, "an empty list yields nothing");
+        for seed in [3, 1, 2, 1] {
+            list.block(&key(seed));
+        }
+        let keys: Vec<[u8; ml_dsa::PK_LEN]> = list.iter().copied().collect();
+        assert_eq!(
+            keys,
+            vec![key(1), key(2), key(3)],
+            "each key once, ascending"
+        );
+        list.unblock(&key(2));
+        let keys: Vec<[u8; ml_dsa::PK_LEN]> = list.iter().copied().collect();
+        assert_eq!(keys, vec![key(1), key(3)], "the unblocked key is gone");
     }
 
     /// The rule, both ways round. A predicate tested only on the blocked case

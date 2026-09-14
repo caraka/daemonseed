@@ -68,6 +68,14 @@ work lives in the maintainer's own planning notes, not here.
   `ChannelNotOpened`, `SubkeyCount` and `OwnerKey`.
 - `daemonseed-veilid-net`: a `test-support` cargo feature, off by default, adds
   `dm::runner::ContactRequestId::for_test(epoch, serial)` for a front end's tests to build the events a runner sends.
+- `daemonseed-veilid-net`: `RunnerEvent::BlockList(Vec<IdentityPk>)`, every blocked identity in ascending byte
+  order, emitted at startup after the first `Roster`, after each `Block` and `Unblock` the store accepted
+  (changed or not), and when an unreadable list reads again; `RunnerEvent::BlockListUnreadable` in its place when
+  the list cannot be read or decoded or its record is gone mid-run, while the runner scans no drop and collects no
+  conversation. An absent record is created empty only at startup. A `Block` or `Unblock` that meets an absent or
+  undecodable stored list is refused `Store`. An `Accept` is refused `Store` while the list will not read and
+  `UnknownRequest` where it holds the requester, and an acceptance left unfinished by an earlier run stays pending
+  while the list will not read or holds the correspondent.
 - `daemonseed-veilid-net`: the runner's advert poll compares the advert bytes this node reads back, its local
   copy, with the current key's advert and republishes where they differ, and records each confirmed
   publication (a rewrite the network took, or matching sequence numbers with the current key's bytes) with
@@ -177,6 +185,7 @@ work lives in the maintainer's own planning notes, not here.
   domain labels (#464).
 - `daemonseed-core`: `dm::advert::AdvertKeys::rotate_now`, an unconditional rotation for the reset
   path, retaining the retired key from the moment of the call (#464).
+- `daemonseed-core`: `dm::block_list::BlockList::iter`, every blocked identity public key in ascending byte order.
 - `daemonseed-core`: `dm::drop` and `dm::channel`, the two conversation record layouts — the drop's
   `DROP_SUBKEYS` × `DROP_SLOT_LEN` hello record with `seal_hello` / `open_hello`, slot-bound by
   `slot_for` and refusing `SlotMismatch`, `pow_tag` at `DROP_POW_BITS` and the `HelloAttempt`

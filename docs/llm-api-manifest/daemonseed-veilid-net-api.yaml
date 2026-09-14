@@ -462,10 +462,19 @@ types:
       StartedOver{request, from}, Message{from, seq, body, received_at (Unix ms,
       stamped by the runner)}, Sent{token, peer, seq}, Deleted{token, peer},
       Delivered{peer, through_seq}, Accepted{peer}, Refused{token:
-      Option<CommandToken>, reason: Refusal}, Health(HealthCounters). Every
-      command with a token is answered by Sent, Deleted or Refused. Health is
-      emitted once at startup and then when a counter changes, at most once per
-      scheduled wake. Debug omits bodies and keys.
+      Option<CommandToken>, reason: Refusal}, Health(HealthCounters),
+      BlockList(Vec<IdentityPk>), BlockListUnreadable. Every command with a token
+      is answered by Sent, Deleted or Refused. Health is emitted once at startup
+      and then when a counter changes, at most once per scheduled wake. BlockList
+      lists every blocked identity in ascending byte order: once at startup
+      straight after the first Roster, after each Block and Unblock the store
+      accepted (changed or not), and when an unreadable list reads again; a
+      refused Block or Unblock emits none. BlockListUnreadable replaces it at
+      startup, and follows a later failed read of a known list, when the list
+      cannot be read or decoded or its record is gone: blocked state is unknown,
+      and the runner scans no drop and collects no conversation until a read
+      succeeds. An absent record is created empty only at startup, never while
+      running. Debug omits bodies and keys.
   - name: ConversationSummary
     module: daemonseed_veilid_net::dm::runner
     kind: struct
@@ -500,8 +509,11 @@ types:
       UnknownConversation, UnknownRequest, StartedOverNotAcceptable, RingFull (63
       messages uncollected), AwaitingAcceptance, AcceptanceUnfinished (this side's acceptance has not
       finished; the repair poll carries it on), AlreadyEstablished, NoAdvert,
-      DropFull, BlockListFull, Store, Network, Flow, ShuttingDown (the runner
-      stopped with the command still queued).
+      DropFull, BlockListFull (a Block past the maximum), Store (also a stored
+      block list that is absent or does not decode, and an Accept while it will
+      not read), Network, Flow, ShuttingDown (the runner stopped with the command
+      still queued). An Accept of a request whose identity the block list holds
+      is UnknownRequest.
   - name: HealthCounters
     module: daemonseed_veilid_net::dm::runner
     kind: struct
@@ -517,7 +529,8 @@ types:
       the inspect of that advert failed, left alone), hellos_dropped (blocked
       sender),
       hellos_already_collected, hellos_unsettled, conversation_failures,
-      store_failures and
+      store_failures (a block list that will not read adds one at startup and one
+      for each later drop scan that meets it) and
       requests_evicted (held requests dropped, oldest-seen first, above one per
       drop slot).
   - name: ShutdownOutcome

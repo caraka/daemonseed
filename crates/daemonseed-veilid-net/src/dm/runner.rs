@@ -123,7 +123,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use daemonseed_core::dm::advert::{
     self, AdvertAction, AdvertError, AdvertKeys, AdvertOwnerSeed, InspectReport,
 };
-use daemonseed_core::dm::block_list::{BlockList, BlockListError};
+use daemonseed_core::dm::block_list::BlockList;
 use daemonseed_core::dm::channel::{self, ChannelError, ChannelOpening, ChannelOwnerSeed, Control};
 use daemonseed_core::dm::delivery::{self, ClosedMarker};
 use daemonseed_core::dm::drop::{self as drop_plane, DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
@@ -375,7 +375,9 @@ pub enum RunnerCommand {
         /// The message.
         body: Vec<u8>,
     },
-    /// Accept a surfaced contact request, replying with `reply`.
+    /// Accept a surfaced contact request, replying with `reply`. Refused with
+    /// [`Refusal::Store`], writing nothing, while the block list will not read,
+    /// and with [`Refusal::UnknownRequest`] where it holds the requester.
     Accept {
         /// Echoed on the answer.
         token: CommandToken,
@@ -496,7 +498,8 @@ pub enum Refusal {
     DropFull,
     /// The block list holds its maximum number of identities.
     BlockListFull,
-    /// The local store refused.
+    /// The local store refused, or the stored block list is absent or does not
+    /// decode.
     Store,
     /// The record store refused.
     Network,
@@ -580,6 +583,9 @@ pub struct HealthCounters {
     /// record store or the local store.
     pub conversation_failures: u64,
     /// Local store and block list operations the schedule could not complete.
+    /// A block list that will not read adds one at startup, where the startup
+    /// read and the first drop scan share the count, and one for every later
+    /// drop scan that meets it.
     pub store_failures: u64,
     /// Held requests dropped, oldest-seen first, to keep at most one per drop
     /// slot.
@@ -653,6 +659,22 @@ pub enum RunnerEvent {
     },
     /// The counters, once at startup and then when they change.
     Health(HealthCounters),
+    /// Every identity the block list holds, in ascending byte order: once at
+    /// startup, straight after the first [`RunnerEvent::Roster`]; after each
+    /// [`RunnerCommand::Block`] and [`RunnerCommand::Unblock`] the store
+    /// accepted, whether or not it changed the list; and when a list that could
+    /// not be read reads again. A block or unblock that is refused reports none,
+    /// so a front end shows an identity as blocked only once this lists it.
+    BlockList(Vec<IdentityPk>),
+    /// The block list could not be read or decoded, so which identities are
+    /// blocked is unknown: at startup in place of [`RunnerEvent::BlockList`],
+    /// and later when a read fails, or finds the record gone, after the list was
+    /// known. A record gone while the runner runs is not recreated. The runner
+    /// fails closed while it stays so: it scans no drop and collects no
+    /// conversation, so neither a hello nor a message surfaces, until a read
+    /// succeeds and a [`RunnerEvent::BlockList`] follows. A front end shows it as
+    /// an alarm.
+    BlockListUnreadable,
 }
 
 impl core::fmt::Debug for RunnerEvent {
@@ -671,6 +693,8 @@ impl core::fmt::Debug for RunnerEvent {
             Self::Accepted { peer } => write!(f, "Accepted({peer:?})"),
             Self::Refused { token, reason } => write!(f, "Refused({token:?}, {reason:?})"),
             Self::Health(counters) => f.debug_tuple("Health").field(counters).finish(),
+            Self::BlockListUnreadable => f.write_str("BlockListUnreadable"),
+            Self::BlockList(identities) => write!(f, "BlockList({} identities)", identities.len()),
         }
     }
 }
@@ -1318,11 +1342,23 @@ impl<R: RunnerRecords> Tracked<R> {
 }
 
 /// Why the block list could not be read or changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BlockListFailure {
-    /// The store refused; every such refusal is answered the same way.
+    /// The store refused, the record is absent, or the stored bytes do not
+    /// decode, whatever the decode error names.
     Store,
-    /// The list is full or its record does not decode.
-    List(BlockListError),
+    /// The change would take the list past its maximum number of identities.
+    Full,
+}
+
+impl BlockListFailure {
+    /// How a block or unblock that met this failure is refused.
+    fn refusal(self) -> Refusal {
+        match self {
+            Self::Store => Refusal::Store,
+            Self::Full => Refusal::BlockListFull,
+        }
+    }
 }
 
 impl From<DmStoreError> for BlockListFailure {
@@ -1331,14 +1367,15 @@ impl From<DmStoreError> for BlockListFailure {
     }
 }
 
-impl From<BlockListError> for BlockListFailure {
-    fn from(e: BlockListError) -> Self {
-        Self::List(e)
-    }
+/// Decode a stored block list. Every decode error is [`BlockListFailure::Store`],
+/// a record holding more identities than the maximum included: no write here
+/// stores such a record, so it is corruption and not a full list.
+fn decode_stored_block_list(bytes: &[u8]) -> Result<BlockList, BlockListFailure> {
+    BlockList::decode(bytes).map_err(|_| BlockListFailure::Store)
 }
 
 /// Read the block list, let `change` change it, and write it back, all under the
-/// profile lock. An absent record is the empty list and is created.
+/// profile lock. An absent record is refused, never read as the empty list.
 fn update_block_list(
     store: &Store,
     change: impl FnOnce(&mut BlockList),
@@ -1346,12 +1383,29 @@ fn update_block_list(
     store
         .records()
         .profile_critical_section(|guard| -> Result<BlockList, BlockListFailure> {
-            let mut list = match guard.read(RecordKind::BlockList)? {
-                Some(bytes) => BlockList::decode(&bytes)?,
-                None => BlockList::new(),
+            let Some(bytes) = guard.read(RecordKind::BlockList)? else {
+                return Err(BlockListFailure::Store);
             };
+            let mut list = decode_stored_block_list(&bytes)?;
             change(&mut list);
-            guard.replace(RecordKind::BlockList, &list.encode()?)?;
+            let encoded = list.encode().map_err(|_| BlockListFailure::Full)?;
+            guard.replace(RecordKind::BlockList, &encoded)?;
+            Ok(list)
+        })
+}
+
+/// The stored block list, with an empty one written first where the record is
+/// absent, the check and the write both under the profile lock.
+fn provision_block_list(store: &Store) -> Result<BlockList, BlockListFailure> {
+    store
+        .records()
+        .profile_critical_section(|guard| -> Result<BlockList, BlockListFailure> {
+            if let Some(bytes) = guard.read(RecordKind::BlockList)? {
+                return decode_stored_block_list(&bytes);
+            }
+            let list = BlockList::new();
+            let encoded = list.encode().map_err(|_| BlockListFailure::Full)?;
+            guard.replace(RecordKind::BlockList, &encoded)?;
             Ok(list)
         })
 }
@@ -1523,6 +1577,19 @@ struct Runner<R> {
     /// Whether the network answers in the current pass, once asked.
     answering: Option<bool>,
     health_reported: HealthCounters,
+    /// Whether the runner holds a readable block list, so a failure after a
+    /// success is reported once and a success after a failure is reported too.
+    /// Starts `true`. Set `false` at startup where the stored list will not read,
+    /// and by a drop scan whose read fails or finds no record. Set `true` by a
+    /// drop scan whose read succeeds, and by a block or unblock the store
+    /// accepts.
+    block_list_known: bool,
+    /// Whether a failed block list read has already been counted, so the drop
+    /// scan that follows does not count the same failure again. Set `true` only
+    /// at startup, where the stored list will not read. Cleared by the next drop
+    /// scan, whatever its read finds, and by a block or unblock the store
+    /// accepts.
+    block_list_failure_counted: bool,
 }
 
 impl<R: RunnerRecords> Runner<R> {
@@ -1593,8 +1660,18 @@ impl<R: RunnerRecords> Runner<R> {
             last_scan: None,
             answering: None,
             health_reported: HealthCounters::default(),
+            block_list_known: true,
+            block_list_failure_counted: false,
         };
 
+        match runner.stored_block_list() {
+            Some(list) => runner.emit_blocked(&list).await?,
+            None => {
+                runner.block_list_known = false;
+                runner.block_list_failure_counted = true;
+                runner.emit(RunnerEvent::BlockListUnreadable).await?;
+            }
+        }
         runner.reopen_channels(&loaded.convs)?;
         runner.refresh_advert(minted);
         runner.answering = None;
@@ -1655,6 +1732,61 @@ impl<R: RunnerRecords> Runner<R> {
             {
                 return;
             }
+        }
+    }
+
+    /// Emit [`RunnerEvent::BlockList`] for `list`.
+    async fn emit_blocked(&mut self, list: &BlockList) -> Result<(), Halt> {
+        let identities = list.iter().map(|identity| Box::new(*identity)).collect();
+        self.emit(RunnerEvent::BlockList(identities)).await
+    }
+
+    /// The block list the store holds at startup, or `None`, counted, where the
+    /// record would not read or decode, or could not be created.
+    ///
+    /// An absent record is created empty, once, where it is still absent under
+    /// the profile lock. That cannot tell a record another store open had not
+    /// yet created from one deleted from the disk, so a deleted record reads as
+    /// empty here: the same exposure [`Store::open`] already takes when it
+    /// creates the record. [`Self::scan_drop`] never creates it.
+    fn stored_block_list(&mut self) -> Option<BlockList> {
+        match self
+            .store
+            .records()
+            .read_profile_unlocked(RecordKind::BlockList)
+        {
+            Ok(Some(bytes)) => match decode_stored_block_list(&bytes) {
+                Ok(list) => Some(list),
+                Err(_) => {
+                    self.records.health.store_failures += 1;
+                    None
+                }
+            },
+            Ok(None) => match provision_block_list(&self.store) {
+                Ok(list) => Some(list),
+                Err(_) => {
+                    self.records.health.store_failures += 1;
+                    None
+                }
+            },
+            Err(_) => {
+                self.records.health.store_failures += 1;
+                None
+            }
+        }
+    }
+
+    /// The block list as the store holds it now, or `None` where the record is
+    /// absent or would not read or decode. Neither counts nor reports: the drop
+    /// scan does both.
+    fn readable_block_list(&self) -> Option<BlockList> {
+        match self
+            .store
+            .records()
+            .read_profile_unlocked(RecordKind::BlockList)
+        {
+            Ok(Some(bytes)) => decode_stored_block_list(&bytes).ok(),
+            Ok(None) | Err(_) => None,
         }
     }
 
@@ -1864,21 +1996,33 @@ impl<R: RunnerRecords> Runner<R> {
     /// Scan the drop and surface what it holds, returning the block list the
     /// scan used, or `None` where the block list could not be read and nothing
     /// was scanned.
+    ///
+    /// An absent record is a failed read: it is counted and reported like one,
+    /// and it is not recreated, so a deleted list unblocks nobody.
     async fn scan_drop(&mut self) -> Result<Option<BlockList>, Halt> {
         self.check_stop()?;
-        let blocked = match self
+        let read = self
             .store
             .records()
-            .read_profile_unlocked(RecordKind::BlockList)
-        {
-            Ok(Some(bytes)) => BlockList::decode(&bytes).ok(),
-            Ok(None) => update_block_list(&self.store, |_| {}).ok(),
-            Err(_) => None,
+            .read_profile_unlocked(RecordKind::BlockList);
+        let blocked = match read {
+            Ok(Some(bytes)) => decode_stored_block_list(&bytes).ok(),
+            Ok(None) | Err(_) => None,
         };
         let Some(blocked) = blocked else {
-            self.records.health.store_failures += 1;
+            // The startup read already counted the failure the first scan meets.
+            if !std::mem::take(&mut self.block_list_failure_counted) {
+                self.records.health.store_failures += 1;
+            }
+            if std::mem::replace(&mut self.block_list_known, false) {
+                self.emit(RunnerEvent::BlockListUnreadable).await?;
+            }
             return Ok(None);
         };
+        self.block_list_failure_counted = false;
+        if !std::mem::replace(&mut self.block_list_known, true) {
+            self.emit_blocked(&blocked).await?;
+        }
         let unread_before = self.records.failed_drop_reads;
         let me = Me {
             signer: &self.signer,
@@ -1902,6 +2046,11 @@ impl<R: RunnerRecords> Runner<R> {
 
     /// Carry on a first contact or an acceptance a previous call stopped part
     /// way.
+    ///
+    /// An acceptance is left pending, untouched, while the block list will not
+    /// read or while it lists the correspondent: finishing it reads the
+    /// correspondent's messages and records them as collected. A later call
+    /// carries it on once the list reads and no longer lists them.
     async fn resume_incomplete(&mut self, conv: &LoadedConv) -> Result<(), Halt> {
         self.check_stop()?;
         let state = &conv.state;
@@ -1916,6 +2065,12 @@ impl<R: RunnerRecords> Runner<R> {
             return Ok(());
         }
         if !state.acceptance_pending {
+            return Ok(());
+        }
+        let Some(blocked) = self.readable_block_list() else {
+            return Ok(());
+        };
+        if blocked.is_blocked(&state.peer_identity_pk) {
             return Ok(());
         }
         let now = self.clock.now_secs();
@@ -2280,6 +2435,14 @@ impl<R: RunnerRecords> Runner<R> {
         let Some(identity) = identity else {
             return self.refuse(Some(token), Refusal::UnknownRequest).await;
         };
+        // Nothing is written for a request whose identity cannot be checked
+        // against the block list, or that the list holds.
+        let Some(blocked) = self.readable_block_list() else {
+            return self.refuse(Some(token), Refusal::Store).await;
+        };
+        if blocked.is_blocked(&identity) {
+            return self.refuse(Some(token), Refusal::UnknownRequest).await;
+        }
         let first = match self.conv_with(&identity) {
             Ok(Some(conv)) => conv.state.my_collected,
             Ok(None) | Err(()) => 0,
@@ -2350,17 +2513,18 @@ impl<R: RunnerRecords> Runner<R> {
             }
         });
         match updated {
-            Ok(_) => {
+            Ok(list) => {
                 if block {
                     self.requests
                         .retain(|_, entry| entry.held.identity() != identity);
                 }
-                Ok(())
+                // The locked read succeeded, so the list is known again and the
+                // next drop scan reports nothing new.
+                self.block_list_known = true;
+                self.block_list_failure_counted = false;
+                self.emit_blocked(&list).await
             }
-            Err(BlockListFailure::List(BlockListError::Full { .. })) => {
-                self.refuse(None, Refusal::BlockListFull).await
-            }
-            Err(_) => self.refuse(None, Refusal::Store).await,
+            Err(failure) => self.refuse(None, failure.refusal()).await,
         }
     }
 
