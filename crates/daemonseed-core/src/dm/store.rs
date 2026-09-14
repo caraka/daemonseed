@@ -69,7 +69,7 @@ use crate::dm::chain::{
     CHAIN_KEY_LEN, ChainKey, ConversationSnapshot, DirectionState, OWN_TURNS_RETAINED, OwnTurn,
     PeerTurn, ROOT_LEN, RatchetDecapKey, RatchetKeypair, ReceivingState, Root, TurnSecret,
 };
-use crate::dm::channel::{CHANNEL_SUBKEY_LEN, OPENING_LEN, RING_SLOTS};
+use crate::dm::channel::{CHANNEL_SUBKEY_LEN, ControlKey, OPENING_LEN, RING_SLOTS};
 use crate::dm::drop::{DROP_SUBKEYS, HELLO_LEN, HELLO_LOOKUP_KEY_LEN, HELLO_R_LEN};
 use crate::storage::dm_store::{
     CorrespondenceLabel, DmStore, DmStoreError, Locked, LockedProfile, RecordKind,
@@ -135,6 +135,9 @@ const SNAPSHOT_LEN: usize = SENDING_LEN + RECEIVING_LEN;
 /// advert serial it was encapsulated to.
 const HELLO_FIELD_LEN: usize = 1 + 2 + HELLO_R_LEN + ml_kem::CT_LEN + HELLO_LEN + 8;
 
+/// Bytes a control key takes: the width of a [`ControlKey`].
+const CONTROL_KEY_LEN: usize = 32;
+
 /// Bytes the advert-keys record occupies, and so
 /// [`RecordKind::AdvertKeys`]'s bucket.
 pub const ADVERT_KEYS_RECORD_LEN: usize =
@@ -156,7 +159,8 @@ pub const CONV_RECORD_LEN: usize = CONV_MAGIC.len()
     + HELLO_FIELD_LEN
     + (1 + ml_kem::SHARED_SECRET_LEN)
     + (1 + ml_kem::CT_LEN)
-    + (1 + ml_kem::SHARED_SECRET_LEN)
+    + (1 + CONTROL_KEY_LEN)
+    + (1 + CONTROL_KEY_LEN)
     + (1 + 8)
     + (1 + OPENING_LEN)
     + SNAPSHOT_LEN;
@@ -325,10 +329,14 @@ pub struct ConvState {
     pub awaiting_acceptance: bool,
     /// The hello awaiting collection, while there is one.
     pub outstanding_hello: Option<OutstandingHello>,
-    /// The secret this side's own hello established.
+    /// The secret this side's own hello established, held only while a hello
+    /// may still have to be sealed from it.
     ///
-    /// Seals this side's control subkey and nothing else. Absent until this
-    /// side has encapsulated a hello of its own.
+    /// The initiator keeps it while awaiting acceptance, because a rewritten
+    /// hello carries it. The acceptor keeps it until its hello back is
+    /// persisted. It is deleted after that: the initiator's hello secret roots
+    /// its first turn, and the control subkey needs only
+    /// [`Self::own_control_key`].
     pub own_hello_secret: Option<AdvertSharedSecret>,
     /// The encapsulation this side's own hello carries.
     ///
@@ -336,11 +344,17 @@ pub struct ConvState {
     /// decapsulates to reach it: a rewritten hello that carried a fresh
     /// ciphertext would establish a secret this record does not hold.
     pub own_hello_kem_ct: Option<Box<[u8; ml_kem::CT_LEN]>>,
-    /// The secret the correspondent's hello established.
+    /// The key this side's control subkey is sealed under, derived from this
+    /// side's hello secret.
     ///
-    /// Opens the correspondent's control subkey and nothing else. Absent until
-    /// the correspondent's hello has been opened.
-    pub peer_hello_secret: Option<AdvertSharedSecret>,
+    /// Absent until this side has encapsulated a hello of its own.
+    pub own_control_key: Option<ControlKey>,
+    /// The key the correspondent's control subkey opens under, derived from
+    /// the secret the correspondent's hello established.
+    ///
+    /// The secret itself is never stored. Absent until the correspondent's
+    /// hello has been opened.
+    pub peer_control_key: Option<ControlKey>,
     /// The advert serial the correspondent's channel opening binds.
     ///
     /// The serial of this side's own advert that the correspondent
@@ -1027,8 +1041,12 @@ pub(crate) fn encode_conv(state: &ConvState) -> Zeroizing<Vec<u8>> {
         ml_kem::CT_LEN,
     );
     w.opt(
-        state.peer_hello_secret.as_ref().map(|s| &s.as_bytes()[..]),
-        ml_kem::SHARED_SECRET_LEN,
+        state.own_control_key.as_ref().map(|k| &k.as_bytes()[..]),
+        CONTROL_KEY_LEN,
+    );
+    w.opt(
+        state.peer_control_key.as_ref().map(|k| &k.as_bytes()[..]),
+        CONTROL_KEY_LEN,
     );
     w.opt_u64(state.peer_advert_serial);
     w.opt(
@@ -1113,10 +1131,14 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         .as_deref()
         .map(AdvertSharedSecret::from_bytes);
     let own_hello_kem_ct = r.opt_array::<{ ml_kem::CT_LEN }>()?.map(|b| Box::new(*b));
-    let peer_hello_secret = r
-        .opt_array::<{ ml_kem::SHARED_SECRET_LEN }>()?
+    let own_control_key = r
+        .opt_array::<CONTROL_KEY_LEN>()?
         .as_deref()
-        .map(AdvertSharedSecret::from_bytes);
+        .map(ControlKey::from_bytes);
+    let peer_control_key = r
+        .opt_array::<CONTROL_KEY_LEN>()?
+        .as_deref()
+        .map(ControlKey::from_bytes);
     let peer_advert_serial = r.opt_u64()?;
     let own_opening = r.opt_array::<OPENING_LEN>()?.map(|b| Box::new(*b));
 
@@ -1172,7 +1194,8 @@ pub(crate) fn decode_conv(bytes: &[u8]) -> Result<ConvState, StoreError> {
         }),
         own_hello_secret,
         own_hello_kem_ct,
-        peer_hello_secret,
+        own_control_key,
+        peer_control_key,
         peer_advert_serial,
         own_opening,
     })
@@ -1383,7 +1406,8 @@ mod tests {
             outstanding_hello: hello,
             own_hello_secret: Some(shared_secret(0x44)),
             own_hello_kem_ct: Some(Box::new([0x77u8; ml_kem::CT_LEN])),
-            peer_hello_secret: Some(shared_secret(0x55)),
+            own_control_key: Some(ControlKey::from_bytes(&[0x45u8; 32])),
+            peer_control_key: Some(ControlKey::from_bytes(&[0x55u8; 32])),
             peer_advert_serial: Some(9),
             own_opening: Some(Box::new([0x66u8; OPENING_LEN])),
         }
@@ -1485,11 +1509,19 @@ mod tests {
         );
         assert_eq!(
             conv.state
-                .peer_hello_secret
+                .own_control_key
                 .as_ref()
-                .expect("the peer hello secret round trips")
+                .expect("the own control key round trips")
                 .as_bytes(),
-            shared_secret(0x55).as_bytes()
+            &[0x45u8; 32]
+        );
+        assert_eq!(
+            conv.state
+                .peer_control_key
+                .as_ref()
+                .expect("the peer control key round trips")
+                .as_bytes(),
+            &[0x55u8; 32]
         );
         assert_eq!(
             conv.state
@@ -1514,7 +1546,8 @@ mod tests {
         let bare = ConvState {
             own_hello_secret: None,
             own_hello_kem_ct: None,
-            peer_hello_secret: None,
+            own_control_key: None,
+            peer_control_key: None,
             peer_advert_serial: None,
             own_opening: None,
             ..bare
@@ -1522,7 +1555,8 @@ mod tests {
         let decoded = decode_conv(&encode_conv(&bare)).expect("a bare record decodes");
         assert!(decoded.own_hello_secret.is_none());
         assert!(decoded.own_hello_kem_ct.is_none());
-        assert!(decoded.peer_hello_secret.is_none());
+        assert!(decoded.own_control_key.is_none());
+        assert!(decoded.peer_control_key.is_none());
         assert!(decoded.peer_advert_serial.is_none());
         assert!(decoded.own_opening.is_none());
         assert_eq!(
@@ -1929,7 +1963,8 @@ mod tests {
                         outstanding_hello: None,
                         own_hello_secret: None,
                         own_hello_kem_ct: None,
-                        peer_hello_secret: None,
+                        own_control_key: None,
+                        peer_control_key: None,
                         peer_advert_serial: None,
                         own_opening: None,
                     },
@@ -1953,7 +1988,8 @@ mod tests {
                         outstanding_hello: None,
                         own_hello_secret: None,
                         own_hello_kem_ct: None,
-                        peer_hello_secret: None,
+                        own_control_key: None,
+                        peer_control_key: None,
                         peer_advert_serial: None,
                         own_opening: None,
                     },

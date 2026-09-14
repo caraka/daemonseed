@@ -31,11 +31,12 @@
 
 use oxicrypt_ml_dsa as ml_dsa;
 use oxicrypt_ml_kem as ml_kem;
+use zeroize::Zeroizing;
 
 use crate::dm::advert::{self, AdvertError, AdvertKeys, AdvertOwnerSeed, AdvertSharedSecret};
 use crate::dm::chain::{self, ChainError, Conversation};
 use crate::dm::channel::{
-    self, ChannelError, ChannelOpening, ChannelOwnerSeed, Control, OPENING_LEN, Ring,
+    self, ChannelError, ChannelOpening, ChannelOwnerSeed, Control, ControlKey, OPENING_LEN, Ring,
 };
 use crate::dm::drop as drop_plane;
 use crate::dm::drop::{
@@ -403,9 +404,10 @@ pub fn first_contact<R: Records>(
             cursor_published: 0,
             awaiting_acceptance: true,
             outstanding_hello: None,
+            own_control_key: Some(channel::control_key(&encapsulation.shared_secret)?),
             own_hello_secret: Some(encapsulation.shared_secret),
             own_hello_kem_ct: Some(encapsulation.ciphertext),
-            peer_hello_secret: None,
+            peer_control_key: None,
             peer_advert_serial: None,
             own_opening: Some(opening_bytes),
         },
@@ -465,8 +467,12 @@ fn finish_first_contact<R: Records>(
             bytes
         }
     };
-    let control = channel::seal_control(
-        own_secret,
+    let own_control_key = state
+        .own_control_key
+        .as_ref()
+        .ok_or(FlowError::Incomplete("control key of its own"))?;
+    let control = channel::seal_control_with_key(
+        own_control_key,
         &Control {
             opening: Some(opening),
             collected_cursor: 0,
@@ -524,6 +530,13 @@ fn place_hello<R: Records>(
         let written = *hello.sealed;
         store.update_conv(peer, |state| {
             state.outstanding_hello = Some(hello);
+            // From here on the accepting side's hello back is rewritten from
+            // these sealed bytes, so the secret it was sealed from goes in the
+            // same write. The initiator keeps its own while a rewrite may
+            // still carry it.
+            if !state.awaiting_acceptance {
+                state.own_hello_secret = None;
+            }
         })?;
         records.write_drop_slot(
             &drop_owner,
@@ -858,7 +871,10 @@ pub fn collect<R: Records>(
         // not under the one its own decapsulation yielded.
         let rewritten = hello.original_secret.is_some();
         let shared_secret = hello.original_secret.take().unwrap_or(decapsulated);
-        let Some(opening) = read_opening(records, &shared_secret, &hello.lookup_key) else {
+        let Ok(control_key) = channel::control_key(&shared_secret) else {
+            continue;
+        };
+        let Some(opening) = read_opening(records, &control_key, &hello.lookup_key) else {
             continue;
         };
         let Some(bound) = opening_serial(rewritten, serial, &opening) else {
@@ -1002,16 +1018,18 @@ fn opening_serial(
 
 /// The opening in a channel's control subkey, or `None` where the record store
 /// will not read it, the subkey holds nothing, or it will not open under this
-/// secret.
+/// key.
 fn read_opening<R: Records>(
     records: &mut R,
-    shared_secret: &AdvertSharedSecret,
+    control_key: &ControlKey,
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
 ) -> Option<ChannelOpening> {
     let bytes = records
         .read_channel(lookup_key, channel::CONTROL_SUBKEY)
         .ok()??;
-    channel::open_control(shared_secret, &bytes).ok()?.opening
+    channel::open_control_with_key(control_key, &bytes)
+        .ok()?
+        .opening
 }
 
 /// The cursor the correspondent publishes, from the control subkey of the
@@ -1026,15 +1044,15 @@ pub fn peer_cursor<R: Records>(
     peer: &CorrespondenceLabel,
 ) -> Result<Option<u64>, FlowError> {
     let state = load(store, peer)?;
-    let secret = state
-        .peer_hello_secret
+    let key = state
+        .peer_control_key
         .as_ref()
-        .ok_or(FlowError::Incomplete("hello secret of the correspondent"))?;
+        .ok_or(FlowError::Incomplete("control key of the correspondent"))?;
     let Some(bytes) = records.read_channel(&state.incoming_lookup_key, channel::CONTROL_SUBKEY)?
     else {
         return Ok(None);
     };
-    let control = channel::open_control(secret, &bytes)?;
+    let control = channel::open_control_with_key(key, &bytes)?;
     Ok(Some(control.collected_cursor))
 }
 
@@ -1084,6 +1102,11 @@ pub fn accept<R: Records>(
     if let Some(peer) = correspondence_for(store, &request.identity)? {
         let state = load(store, &peer)?;
         if state.outstanding_hello.is_some() {
+            // A record that holds its hello back and still holds the secret
+            // that hello was sealed from has the secret deleted here.
+            if state.own_hello_secret.is_some() {
+                store.update_conv(&peer, |state| state.own_hello_secret = None)?;
+            }
             return Err(FlowError::AlreadyEstablished);
         }
         return finish_accept(
@@ -1117,9 +1140,8 @@ pub fn accept<R: Records>(
             outstanding_hello: None,
             own_hello_secret: None,
             own_hello_kem_ct: None,
-            peer_hello_secret: Some(AdvertSharedSecret::from_bytes(
-                request.shared_secret.as_bytes(),
-            )),
+            own_control_key: None,
+            peer_control_key: Some(channel::control_key(&request.shared_secret)?),
             peer_advert_serial: Some(request.advert_serial),
             own_opening: None,
         },
@@ -1162,14 +1184,14 @@ fn finish_accept<R: Records>(
 ) -> Result<Accepted, FlowError> {
     let identity = state.peer_identity_pk.clone();
     let incoming = state.incoming_lookup_key;
-    let peer_secret = state
-        .peer_hello_secret
+    let peer_key = state
+        .peer_control_key
         .as_ref()
-        .ok_or(FlowError::Incomplete("hello secret of the correspondent"))?;
+        .ok_or(FlowError::Incomplete("control key of the correspondent"))?;
     let peer_serial = state
         .peer_advert_serial
         .ok_or(FlowError::Incomplete("advert serial of the correspondent"))?;
-    let opening = read_opening(records, peer_secret, &incoming).ok_or(FlowError::NoOpening)?;
+    let opening = read_opening(records, peer_key, &incoming).ok_or(FlowError::NoOpening)?;
     opening.verify(me.signer.public_key(), &incoming, peer_serial)?;
     // The opening must be the one this record was created from: signed by the
     // correspondent the record names, and naming the ratchet key the reading
@@ -1273,11 +1295,14 @@ fn finish_accept<R: Records>(
                 .try_into()
                 .map(Box::new)
                 .expect("an opening encodes to OPENING_LEN bytes");
-            let secret_bytes = *encapsulation.shared_secret.as_bytes();
+            let secret_bytes = Zeroizing::new(*encapsulation.shared_secret.as_bytes());
+            let control_bytes =
+                Zeroizing::new(*channel::control_key(&encapsulation.shared_secret)?.as_bytes());
             let kem_ct = encapsulation.ciphertext.clone();
             let carried = opening_bytes.clone();
             store.update_conv(&peer, |state| {
                 state.cursor_published = read.collected;
+                state.own_control_key = Some(ControlKey::from_bytes(&control_bytes));
                 state.own_hello_secret = Some(AdvertSharedSecret::from_bytes(&secret_bytes));
                 state.own_hello_kem_ct = Some(kem_ct.clone());
                 state.own_opening = Some(carried.clone());
@@ -1365,10 +1390,11 @@ pub fn recognise_acceptance<R: Records>(
     if !state.awaiting_acceptance {
         return Err(FlowError::NotOutstanding);
     }
-    let secret_bytes = *peer_secret.as_bytes();
+    let control_bytes = Zeroizing::new(*channel::control_key(&peer_secret)?.as_bytes());
+    drop(peer_secret);
     store.update_conv(peer, |state| {
         state.incoming_lookup_key = *lookup_key;
-        state.peer_hello_secret = Some(AdvertSharedSecret::from_bytes(&secret_bytes));
+        state.peer_control_key = Some(ControlKey::from_bytes(&control_bytes));
     })?;
 
     let mut conversation = Conversation::restore(state.conversation);
@@ -1390,6 +1416,9 @@ pub fn recognise_acceptance<R: Records>(
         state.peer_collected = ring.peer_collected();
         state.outstanding_hello = None;
         state.awaiting_acceptance = false;
+        // The first contact is over, so no rewrite will carry this side's
+        // hello secret again, and that secret roots this side's first turn.
+        state.own_hello_secret = None;
     })?;
     let my_drop = drop_plane::derive_owner_seed(me.signer.public_key())?;
     records.erase_drop_slot(&my_drop, drop_plane::DROP_SUBKEYS, slot)?;
@@ -1525,16 +1554,16 @@ pub fn collect_batch<R: Records>(
             cursor_published: false,
         });
     }
-    let secret = state
-        .own_hello_secret
+    let key = state
+        .own_control_key
         .as_ref()
-        .ok_or(FlowError::Incomplete("hello secret of its own"))?;
+        .ok_or(FlowError::Incomplete("control key of its own"))?;
     let opening_bytes = state
         .own_opening
         .as_ref()
         .ok_or(FlowError::Incomplete("channel opening of its own"))?;
-    let control = channel::seal_control(
-        secret,
+    let control = channel::seal_control_with_key(
+        key,
         &Control {
             opening: Some(ChannelOpening::decode(opening_bytes.as_slice())?),
             collected_cursor: read.collected,
@@ -2222,6 +2251,89 @@ mod tests {
         );
     }
 
+    /// Once a first contact is accepted, neither conversation record holds a
+    /// hello secret. The initiator's roots its first turn, so a record that
+    /// kept it would let a copy of the device derive that turn for as long as
+    /// the conversation lasts. The cursor and control paths still work from
+    /// the stored control keys.
+    #[test]
+    fn no_hello_secret_survives_an_acceptance() {
+        let (a, b, mut net) = scene();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        let peer_a = opened_peer(&outcome);
+        let before = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        let ss0 = AdvertSharedSecret::from_bytes(
+            before
+                .own_hello_secret
+                .as_ref()
+                .expect("A holds its hello secret while awaiting acceptance")
+                .as_bytes(),
+        );
+        // The control: the same search finds the secret before acceptance.
+        assert!(
+            contains(&encode_conv(&before), ss0.as_bytes()),
+            "A's hello secret is absent before acceptance, so the search proves nothing"
+        );
+
+        let accepted = b_accepts(&b, &mut net, b"the reply");
+        // B's hello back secret, recovered the way A recovers it.
+        let a_drop = drop_plane::derive_owner_seed(a.pk()).expect("A's drop");
+        let (slot, hello_back) = net
+            .drops
+            .iter()
+            .find(|((owner, _), _)| owner == a_drop.as_bytes())
+            .map(|((_, slot), bytes)| (*slot, bytes.clone()))
+            .expect("B's hello back is in A's drop");
+        let (_, ss_b, _) = open_against_either(&a.advert_keys, &hello_back, a.pk(), slot)
+            .expect("B's hello back opens");
+        collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+
+        let image_a = encode_conv(
+            &a.store()
+                .load_conv(&peer_a)
+                .expect("load")
+                .expect("A's record"),
+        );
+        let image_b = encode_conv(
+            &b.store()
+                .load_conv(&accepted.peer)
+                .expect("load")
+                .expect("B's record"),
+        );
+        for (side, image) in [("A", &image_a), ("B", &image_b)] {
+            assert!(
+                !contains(image, ss0.as_bytes()),
+                "{side}'s record holds A's hello secret after acceptance"
+            );
+            assert!(
+                !contains(image, ss_b.as_bytes()),
+                "{side}'s record holds B's hello secret after acceptance"
+            );
+        }
+
+        // Both control subkeys still seal and open from the stored keys.
+        let mut entropy = Seeded::at(31);
+        send_message(&b.store(), &mut net, &accepted.peer, b"another", |x| {
+            entropy.fill(x)
+        })
+        .expect("B sends");
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("A collects a batch");
+        assert!(batch.cursor_published, "A published its cursor");
+        assert_eq!(
+            peer_cursor(&b.store(), &mut net, &accepted.peer).expect("B reads A's cursor"),
+            Some(batch.my_collected)
+        );
+        assert_eq!(
+            peer_cursor(&a.store(), &mut net, &peer_a).expect("A reads B's cursor"),
+            Some(1),
+            "B's acceptance published its cursor over A's first message"
+        );
+    }
+
     /// Whether `needle` appears anywhere in `haystack`.
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
@@ -2584,8 +2696,8 @@ mod tests {
         assert_eq!(state.incoming_lookup_key, accepted.outgoing_lookup_key);
         assert_eq!(state.my_collected, 1);
         assert!(
-            state.peer_hello_secret.is_some(),
-            "the secret that opens B's control subkey is recorded"
+            state.peer_control_key.is_some(),
+            "the key that opens B's control subkey is recorded"
         );
     }
 
@@ -3397,7 +3509,12 @@ mod tests {
             .expect("A's hello is in B's drop");
         let (hello, secret, serial) =
             open_against_either(&b.advert_keys, &bytes, b.pk(), slot).expect("the hello opens");
-        let original = read_opening(&mut net, &secret, &hello.lookup_key).expect("the opening");
+        let original = read_opening(
+            &mut net,
+            &channel::control_key(&secret).expect("the control key"),
+            &hello.lookup_key,
+        )
+        .expect("the opening");
         let forged = ChannelOpening::build(
             &a.signer,
             b.pk(),
@@ -3597,6 +3714,92 @@ mod tests {
             NOW,
         );
         assert!(matches!(again, Err(FlowError::AlreadyEstablished)));
+    }
+
+    /// An acceptance stopped after its hello back is persisted and before that
+    /// hello is written leaves no hello secret in the record, and neither does
+    /// the relaunch that finds the hello back already there.
+    #[test]
+    fn a_stopped_hello_back_leaves_no_hello_secret() {
+        let (a, b, mut net) = scene();
+        a_opens(&a, &b, &mut net, b"the first message");
+        let request = only_request(b_collects(&b, &mut net));
+
+        // An acceptance writes the collected slot's erase, the control
+        // subkey, the reply and the hello back, in that order. Refusing the
+        // fourth stops the run after the hello back is persisted.
+        let store = b.store();
+        net.reset_writes();
+        net.fail_after = Some(3);
+        let mut entropy = Seeded::at(909);
+        let stopped = accept(
+            &store,
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(stopped.is_err(), "the hello back write was refused");
+        assert_eq!(net.writes.hello, 0, "no hello back reached the drop");
+
+        let peer = store.load().expect("load").convs[0].peer;
+        let state = store.load_conv(&peer).expect("load").expect("B's record");
+        let hello = state
+            .outstanding_hello
+            .as_ref()
+            .expect("the hello back was persisted before its write");
+        let secret = a
+            .advert_keys
+            .decapsulate(hello.advert_serial, &hello.kem_ct)
+            .expect("decapsulate")
+            .expect("A holds the key B encapsulated to");
+        // The controls: the recovered secret is the hello back's, and the
+        // search finds the hello's own encapsulation in the same bytes.
+        assert!(
+            drop_plane::open_hello(&secret, hello.sealed.as_slice(), a.pk(), hello.slot).is_ok(),
+            "the recovered secret does not open the hello back"
+        );
+        let image = encode_conv(&state);
+        assert!(
+            contains(&image, hello.kem_ct.as_slice()),
+            "the hello's encapsulation is absent, so the search proves nothing"
+        );
+        assert!(
+            !contains(&image, secret.as_bytes()),
+            "a stopped acceptance left its hello secret in the record"
+        );
+
+        // The relaunch finds the hello back in place and leaves no secret.
+        net.fail_after = None;
+        let mut entropy = Seeded::at(7_070);
+        let again = accept(
+            &store,
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(matches!(again, Err(FlowError::AlreadyEstablished)));
+        let image = encode_conv(&store.load_conv(&peer).expect("load").expect("B's record"));
+        assert!(
+            !contains(&image, secret.as_bytes()),
+            "the relaunch left the hello secret in the record"
+        );
+
+        // The conversation still completes from what is on disk.
+        resume_first_contact(&store, &mut net, &peer).expect("the hello back is written");
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        match surfaced.as_slice() {
+            [Surfaced::Accepted(acceptance)] => {
+                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+            }
+            other => panic!("expected one acceptance, got {other:?}"),
+        }
     }
 
     /// An acceptance refuses a contact request whose fields do not all come

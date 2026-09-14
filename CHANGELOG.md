@@ -77,8 +77,11 @@ work lives in the maintainer's own planning notes, not here.
   recording the correspondent's channel lookup key and hello secret, and `send_message` / `collect_batch`
   as the ordinary-message and cursor paths (#474).
 - `daemonseed-core`: `dm::store` conversation records carry `cursor_published`, `awaiting_acceptance`,
-  `own_hello_secret`, `own_hello_kem_ct`, `peer_hello_secret`, `peer_advert_serial` and `own_opening`;
-  `CONV_RECORD_LEN` is 36828 (#474).
+  `own_hello_secret`, `own_hello_kem_ct`, `own_control_key`, `peer_control_key`, `peer_advert_serial` and
+  `own_opening`; `own_hello_secret` is deleted once a first contact's acceptance is recognised or a hello
+  back is persisted, and no correspondent's hello secret is stored; `CONV_RECORD_LEN` is 36861;
+  `channel::seal_control_with_key` / `open_control_with_key` seal and open under a derived `ControlKey`
+  (#474).
 - `daemonseed-core`: `dm::drop` hellos seal `lookup_key ‖ r ‖ carried_tag ‖ carried`, `HELLO_LEN` 1701;
   `seal_rewritten_hello` carries the original hello secret and `Hello::original_secret` returns it (#474).
 - `daemonseed-core`: `dm::channel` openings carry and sign `channel_lookup_key`, `OPENING_LEN` 11419;

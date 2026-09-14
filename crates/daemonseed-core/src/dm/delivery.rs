@@ -274,7 +274,8 @@ mod tests {
             outstanding_hello: None,
             own_hello_secret: None,
             own_hello_kem_ct: None,
-            peer_hello_secret: None,
+            own_control_key: None,
+            peer_control_key: None,
             peer_advert_serial: None,
             own_opening: None,
         };

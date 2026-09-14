@@ -2416,15 +2416,18 @@ modules:
       peer_collected, my_collected, cursor_published, awaiting_acceptance,
       outstanding_hello: Option<OutstandingHello { slot, r, kem_ct, sealed,
       advert_serial }>, own_hello_secret: Option<advert::AdvertSharedSecret>,
-      own_hello_kem_ct, peer_hello_secret: Option<advert::AdvertSharedSecret>,
-      peer_advert_serial, own_opening: Option<[u8; channel::OPENING_LEN]> } as
+      own_hello_kem_ct, own_control_key: Option<channel::ControlKey>,
+      peer_control_key: Option<channel::ControlKey>, peer_advert_serial,
+      own_opening: Option<[u8; channel::OPENING_LEN]> } as
       RecordKind::Conversation. OutstandingHello holds the sealed hello as
       written to the drop slot, so a rewrite after an abort or an eviction is
       byte-identical rather than a fresh encapsulation under a different ss0.
       cursor_published is the cursor already in this side's control subkey and is
       at most my_collected; awaiting_acceptance is true while this side's own
-      first contact has not been accepted. own_hello_secret and
-      peer_hello_secret seal and open control subkeys and never a message body;
+      first contact has not been accepted. own_control_key and peer_control_key
+      seal and open control subkeys and never a message body; own_hello_secret is
+      held only while awaiting acceptance or until a hello back is persisted, and
+      no correspondent's hello secret is stored;
       own_hello_kem_ct is the encapsulation the own hello carries; own_opening is
       the signed opening as published, persisted because the ML-DSA signature is
       randomized; peer_advert_serial is the serial the correspondent's opening
@@ -2453,7 +2456,7 @@ modules:
       width in zeros. A decoder refuses an unknown version, an outbox entry whose
       sequence is not its ring position, a hello slot at or above DROP_SUBKEYS,
       and a peer_collected above send_seq. ADVERT_KEYS_RECORD_LEN (6398),
-      CONV_RECORD_LEN (36828) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
+      CONV_RECORD_LEN (36861) and CONV_OUTBOX_RECORD_LEN (1033040) are the three
       widths and are the RecordKind buckets. StoreError is Store(DmStoreError),
       Corrupt { kind, reason }, OutboxSlotOccupied, CiphertextTooLong,
       MissingConversation, ConversationExists and MissingAdvertKeys.
@@ -2559,18 +2562,19 @@ modules:
       back like any other. recognise_acceptance(store, records, me, peer, lookup_key,
       peer_secret, slot) -> Result<Acceptance { peer, lookup_key, peer_cursor,
       bodies }, FlowError> records the correspondent's channel lookup key and
-      hello secret, reads its cursor and any reply, clears the outstanding hello
-      and awaiting_acceptance, and erases the slot. send_message(store, records,
+      the control key derived from peer_secret, reads its cursor and any reply,
+      clears the outstanding hello, awaiting_acceptance and own_hello_secret, and
+      erases the slot. send_message(store, records,
       peer, body, fill) -> Result<u64, FlowError> persists the ciphertext and
       the advanced send_seq and writes one ring slot; it is
       FlowError::AwaitingAcceptance while awaiting_acceptance is set. collect_batch(store,
       records, peer) -> Result<Batch { bodies, my_collected, cursor_published },
       FlowError> reads the correspondent's ring from this side's cursor and
       publishes the new cursor in one control write where my_collected is above
-      the record's cursor_published, sealed under own_hello_secret and carrying
+      the record's cursor_published, sealed under own_control_key and carrying
       own_opening. peer_cursor(store, records, peer) ->
       Result<Option<u64>, FlowError> reads the correspondent's published cursor
-      under peer_hello_secret. The module opens no socket, reads no clock and
+      under peer_control_key. The module opens no socket, reads no clock and
       draws no entropy of its own.
       Sub-module dm::domain
       declares the daemonseed/dm/… label namespace, one distinct prefix-free label

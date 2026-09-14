@@ -197,6 +197,13 @@ redacted_secret_newtype! {
     boxed pub struct ControlKey([u8; 32]);
 }
 
+impl ControlKey {
+    /// A control key over bytes read back from the profile's at-rest store.
+    pub(crate) fn from_bytes(bytes: &[u8; 32]) -> Self {
+        Self(Box::new(*bytes))
+    }
+}
+
 /// Why a channel operation failed.
 ///
 /// `PartialEq` is implemented by hand rather than derived because neither
@@ -1066,7 +1073,15 @@ pub fn seal_control(
     ss_hello: &advert::AdvertSharedSecret,
     control: &Control,
 ) -> Result<Vec<u8>, ChannelError> {
-    let key = control_key(ss_hello)?;
+    seal_control_with_key(&control_key(ss_hello)?, control)
+}
+
+/// Seal the control subkey under a key [`control_key`] already derived.
+///
+/// A conversation record keeps this key rather than the hello secret it came
+/// from: the key opens nothing but the control subkey, while the initiator's
+/// hello secret also roots its first turn.
+pub fn seal_control_with_key(key: &ControlKey, control: &Control) -> Result<Vec<u8>, ChannelError> {
     let aes = Aes256Key::new(key.as_bytes()).map_err(ChannelError::Module)?;
     let mut plaintext = control.encode();
     let sealed = seal_envelope(&aes, &control_aad(), &plaintext);
@@ -1082,7 +1097,14 @@ pub fn open_control(
     ss_hello: &advert::AdvertSharedSecret,
     bytes: &[u8],
 ) -> Result<Control, ChannelError> {
-    let key = control_key(ss_hello)?;
+    open_control_with_key(&control_key(ss_hello)?, bytes)
+}
+
+/// Open the control subkey under a key [`control_key`] already derived.
+///
+/// A wrong key fails as [`ChannelError::Aead`], uniformly with a tampered
+/// ciphertext.
+pub fn open_control_with_key(key: &ControlKey, bytes: &[u8]) -> Result<Control, ChannelError> {
     let aes = Aes256Key::new(key.as_bytes()).map_err(ChannelError::Module)?;
     let mut plaintext = open_envelope(&aes, &control_aad(), bytes)?;
     let decoded = Control::decode(&plaintext);
