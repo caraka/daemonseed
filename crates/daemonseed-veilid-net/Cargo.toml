@@ -11,6 +11,12 @@ license = "AGPL-3.0-or-later"
 publish = false
 description = "Veilid DHT transport layer for daemonseed."
 
+[features]
+# A constructor for `dm::runner::ContactRequestId`, so a front end's own tests
+# can build the events a runner sends. Off by default: a build without it cannot
+# make an id the runner did not issue. Enable it only from a dev-dependency.
+test-support = []
+
 [dependencies]
 # D4: join the PUBLIC Veilid network (no network_key_password). Private routes
 # (the proven path) need no footgun feature.

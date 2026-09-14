@@ -66,6 +66,8 @@ work lives in the maintainer's own planning notes, not here.
   `RunnerRecords::same_local_refusal` and `RecordFailure` added.
 - `daemonseed-veilid-net`: `VeilidNetError::TimedOut` and `VeilidNetError::Local` added; `RecordsError` gains
   `ChannelNotOpened`, `SubkeyCount` and `OwnerKey`.
+- `daemonseed-veilid-net`: a `test-support` cargo feature, off by default, adds
+  `dm::runner::ContactRequestId::for_test(epoch, serial)` for a front end's tests to build the events a runner sends.
 - `daemonseed-veilid-net`: the runner's advert poll compares the advert bytes this node reads back, its local
   copy, with the current key's advert and republishes where they differ, and records each confirmed
   publication (a rewrite the network took, or matching sequence numbers with the current key's bytes) with

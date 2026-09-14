@@ -489,7 +489,10 @@ types:
     description: >-
       The runner's id for a surfaced hello: a value drawn once per run and a
       serial within the run, so an id from an earlier run is refused. It stays
-      the same while the same identity's hello keeps surfacing.
+      the same while the same identity's hello keeps surfacing. No public
+      constructor, except ContactRequestId::for_test(epoch: u64, serial: u64) ->
+      Self under the crate's `test-support` cargo feature (off by default), for a
+      front end's tests to build ContactRequest and StartedOver events.
   - name: Refusal
     module: daemonseed_veilid_net::dm::runner
     kind: enum

@@ -319,10 +319,39 @@ pub struct CommandToken(pub u64);
 
 /// The id a runner gives a surfaced hello: a value drawn once per run, and a
 /// serial within the run.
+///
+/// No code outside the runner can make one unless the crate's `test-support`
+/// feature is on, which it is not by default:
+#[cfg_attr(
+    not(feature = "test-support"),
+    doc = "```compile_fail\nlet _ = daemonseed_veilid_net::dm::runner::ContactRequestId::for_test(1, 2);\n```"
+)]
+#[cfg_attr(
+    feature = "test-support",
+    doc = "with it on, [`ContactRequestId::for_test`] makes one."
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ContactRequestId {
     epoch: u64,
     serial: u64,
+}
+
+impl ContactRequestId {
+    /// An id made from its two parts, the value drawn for a run and the serial
+    /// within that run, for a front end's own tests to build the events a runner
+    /// sends.
+    ///
+    /// Only with the `test-support` feature, which is off by default. Without it
+    /// no code outside the runner can make an id, so an accept can only name a
+    /// request a runner surfaced.
+    #[cfg_attr(
+        feature = "test-support",
+        doc = "```\nuse daemonseed_veilid_net::dm::runner::ContactRequestId;\n\nassert_eq!(ContactRequestId::for_test(1, 2), ContactRequestId::for_test(1, 2));\nassert_ne!(ContactRequestId::for_test(1, 2), ContactRequestId::for_test(1, 3));\n```"
+    )]
+    #[cfg(feature = "test-support")]
+    pub fn for_test(epoch: u64, serial: u64) -> Self {
+        Self { epoch, serial }
+    }
 }
 
 /// What a front end asks a runner to do.
