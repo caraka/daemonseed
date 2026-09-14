@@ -53,16 +53,22 @@ library:
 # `daemonseed_gui::share_browser` (Slint-free, unit-tested public-share browse-tree
 # model: reconcile-by-share_id listing, lazy per-share manifest load, flatten-with-
 # depth render rows, and fetch-target resolution for right-click download). None is a
-# published API. (#339) `net` additionally carries the DM contract:
-# `NetCommand::Connect{ dm_session_keys: Option<DmSessionKeys> }` moves the full KEM
-# keypair, the doorbell slot secret and the profile at-rest key to the DM driver the
-# actor spawns beside itself (the actor's own state keeps only the public
-# encapsulation key), `NetCommand::Dm(DmCommand)` is forwarded to that driver by
-# `NetHandle::dm`, and `NetEvent::Dm(Arc<DmEvent>)` folds into `GuiState::dm` via
-# `GuiState::on_dm_event`; nothing is rendered from it. A `DmEvent::ChannelLost`,
-# and a `DmEvent::Refused` whose `event` is `Some`, additionally append that
-# carried `TrustEventKey` to `GuiState::trust_log`, the ISC-C28 audit log. This
-# manifest grows only if the GUI ever exposes reusable library components.
+# published API. `net` additionally carries the direct-messaging contract:
+# `NetCommand::Connect{ dm_session_keys: Option<Box<DmSessionKeys>> }` moves the
+# signing keypair, the channel root and the profile at-rest key into a
+# `dm::runner` the actor starts over `VeilidNetHandle::dm_records_parts` once the
+# node has started. `NetCommand::Dm(RunnerCommand)`, sent by `NetHandle::dm`, goes
+# to that runner's queue, and with no runner is answered by
+# `RunnerEvent::Refused { reason: Refusal::ShuttingDown }`. Connect,
+# `NetCommand::StopDm` and `GracefulClose` replace the runner off the actor loop,
+# awaiting the previous runner's task end before the next starts. Each runner they
+# stop, whether running or produced by a start still in flight, is reported by one
+# `NetEvent::DmStopped`; with no runner running or starting they report nothing. A
+# runner that ends on its own is also reported by one `NetEvent::DmStopped`.
+# `NetEvent::Dm(Arc<RunnerEvent>)` reaches `GuiState::on_dm_event`, which draws
+# nothing and, for `RunnerEvent::StartedOver`, appends
+# `TrustEventKey::DmCorrespondentStateLost` to `GuiState::trust_log`, the audit
+# log. This manifest grows only if the GUI ever exposes reusable library components.
 modules: []
 public_types: []
 public_functions: []

@@ -1006,6 +1006,12 @@ work lives in the maintainer's own planning notes, not here.
   `App::dm_thread_drawn`, `ui::RenderReport`, and the DM driver session (`DmDriver`, `DmPersist`
   under `profile_root/dm`).
 
+- `daemonseed-gui`: the key-record publish and reseed, `NetCommand::Connect::stable_kem_encapsulation_key`,
+  `GuiState::stable_kem_encapsulation_key`, `Profile::stable_kem_encapsulation_key`,
+  `GuiState::dm_state`, `DmState`, `DmCorrespondence`, `DmContactRequest`, `DmRefusal`,
+  `DmDoorbellHealth`, `DmChannelHealth`, and the DM driver session (`DmDriver`, `DmPersist` under
+  `profile_root/dm`).
+
 - `daemonseed-core`: `TrustEventKey::ConnectionRateLimited` and
   `TrustEventKey::ConnectionRateLimitedExhausted`, their `class_of` and stable-string entries, and
   the `daemonseed-tui` toast that rendered the first as "server busy — backing off". Neither key has
@@ -1526,6 +1532,15 @@ work lives in the maintainer's own planning notes, not here.
   received time in UTC.
   `RunnerEvent::StartedOver` folds `TrustEventKey::DmCorrespondentStateLost`. `ui::render` returns
   `()`.
+
+- `daemonseed-gui`: direct messaging runs on `dm::runner`. `NetCommand::Dm` carries a `RunnerCommand`
+  and `NetEvent::Dm` an `Arc<RunnerEvent>`; `NetCommand::StopDm` and `NetEvent::DmStopped` are added.
+  `DmSessionKeys` holds `signing`, `dm_channel_root` and `at_rest_key`. A connect with a started node
+  starts a runner over `VeilidNetHandle::dm_records_parts`. Connect, `StopDm` and `GracefulClose`
+  replace the runner in a spawned task that awaits the previous runner's task end before the next
+  starts. A command sent with no runner is answered with `Refusal::ShuttingDown`.
+  `GuiState::on_dm_event` takes a `RunnerEvent`, appends `TrustEventKey::DmCorrespondentStateLost`
+  for `RunnerEvent::StartedOver`, and keeps nothing else.
 
 ### Changed
 

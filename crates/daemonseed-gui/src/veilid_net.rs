@@ -62,10 +62,6 @@ use daemonseed_core::circle::key::{
 use daemonseed_core::circle::message::{open_message, seal_message};
 use daemonseed_core::cot::{AssetAddr, asset_address};
 use daemonseed_core::crypto::suite::CNSA_2_0;
-use daemonseed_core::dm::admission::AdmissionPolicy;
-use daemonseed_core::dm::keyrec::{self as dm_keyrec, KemEncapsulationKey};
-use daemonseed_core::dm::persist::DmPersist;
-use daemonseed_core::dm::pow::PowDifficulty;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::heartbeat::{
     HeartbeatFields, open_heartbeat, seal_circle_heartbeat, seal_public_heartbeat,
@@ -105,9 +101,10 @@ use daemonseed_core::storage::fetched::{
 };
 use daemonseed_core::storage::manifest_digest::ManifestDigestStore;
 use daemonseed_proto::v1 as wire;
-use daemonseed_veilid_net::dm::{
-    DmCommand, DmDht, DmDriver, DmDriverConfig, DmDriverHandle, DmDriverParts, DmEvent, DmIdentity,
-    DmTrySendError, WallClock,
+use daemonseed_veilid_net::dm::VeilidRecords;
+use daemonseed_veilid_net::dm::runner::{
+    CommandToken, Refusal, RunnerCommand, RunnerConfig, RunnerEvent, RunnerHandle, RunnerParts,
+    ShutdownOutcome, spawn_runner,
 };
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::identity::PROJECT_ANNOUNCE_OWNER_PUBKEY;
@@ -434,11 +431,6 @@ struct ShareState {
     /// secret bytes), so a publish derives a receiver-verifiable `share_id` from
     /// the same identity that seals the announcement. `None` until Connect.
     share_root_ikm: Option<Arc<ShareRootIkm>>,
-    /// (#232) The stable identity's ML-KEM-1024 ENCAPSULATION key — the public
-    /// half published in the DM key record (ISC-C40). `None` until Connect, and
-    /// `None` for the whole session on the ephemeral / no-profile path, which is
-    /// the honest state: an identity with no persistent key is not DM-reachable.
-    kem_ek: Option<Arc<KemEncapsulationKey>>,
     lobby: Option<LobbyRendezvous>,
     catalog: ShareCatalog,
     discovered: HashMap<String, DiscoveredRoute>,
@@ -509,7 +501,6 @@ impl ShareState {
         Self {
             signing: None,
             share_root_ikm: None,
-            kem_ek: None,
             lobby: None,
             catalog: ShareCatalog::new(SHARE_CATALOG_TTL),
             discovered: HashMap::new(),
@@ -601,9 +592,13 @@ pub async fn veilid_net_actor(
 ) {
     let mut net: Option<VeilidNetHandle> = None;
     let mut ev_rx: Option<UnboundedReceiver<VeilidNetEvent>> = None;
-    // (#339) The DM driver spawned beside this actor at each connect. `None`
-    // before the first connect, on the ephemeral path, and after the driver ends.
+    // The direct-messaging runner started at each connect with a started node.
+    // `None` before the first such connect, without a profile, and after the
+    // runner ends.
     let mut dm: Option<DmSession> = None;
+    // A runner being stopped and replaced off this loop. `None` while nothing is
+    // being replaced.
+    let mut dm_start: Option<DmStart> = None;
     let mut circles: Vec<VeilidCircle> = Vec::new();
     let mut shares = ShareState::new();
     // The presented display name. Set from a profile's persisted handle on
@@ -627,13 +622,6 @@ pub async fn veilid_net_actor(
     let operator_keepalive = tokio::time::sleep(first_operator_keepalive_interval());
     tokio::pin!(operator_keepalive);
     let mut operator_keepalive_cursor: Option<String> = Some(random_announce_slot_cursor());
-    // (#232) Re-seed the DM key record against eviction. Veilid has no TTL, so the
-    // record survives exactly as long as its owner re-writes it. A jittered sleep
-    // rather than a fixed `interval`: the delay is redrawn per emission (WB-1.2),
-    // so the record has no recognisable cadence signature and no stable phase
-    // relationship with this client's other records (WB-3 I6).
-    let dm_key_reseed = tokio::time::sleep(dm_keyrec::next_reseed_interval());
-    tokio::pin!(dm_key_reseed);
     // Presence keepalive + reap clock (WB-1.2): a jittered [180,220]s keepalive into
     // each joined room's presence record that also reaps the roster on each fire. A
     // self-rescheduling `Sleep` (not a fixed `interval`) so each tick draws a fresh
@@ -719,22 +707,23 @@ pub async fn veilid_net_actor(
                     handle_command(
                         cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles, &mut my_handle,
                         &mut shares, &fetch_outcome_tx, &confirm_outcome_tx,
-                        operator_write, &mut dm,
+                        operator_write, &mut dm, &mut dm_start,
                     ).await;
                 }
             }
-            // (#339) Forward one DM driver event to the UI. The actor folds
-            // nothing: `GuiState` owns the DM state, exactly as it owns every
-            // other event's. A `None` means the driver has ended — its handle
-            // reaches nothing after that, so drop the session rather than
-            // re-polling a closed receiver every loop iteration.
+            // Forward one runner event to the UI; the actor folds nothing. A `None`
+            // means the runner has ended.
             dm_event = recv_dm(&mut dm), if dm.is_some() => {
-                match dm_event {
-                    Some(event) => { let _ = evt_tx.send(NetEvent::Dm(Arc::new(event))); }
-                    None => {
-                        dm = None;
-                        daemonseed_veilid_net::vtrace!("gui dm: driver ended");
-                    }
+                on_dm_event(&mut dm, &evt_tx, dm_event);
+            }
+            // A runner replaced off this loop has ended, and its successor, if one
+            // was started, takes the slot.
+            started = wait_dm_start(&mut dm_start), if dm_start.is_some() => {
+                dm_start = None;
+                match started {
+                    Ok(Some(handle)) => dm = Some(DmSession::new(handle, &evt_tx)),
+                    Ok(None) => {}
+                    Err(e) => daemonseed_veilid_net::vtrace!("gui dm: runner start task failed ({e})"),
                 }
             }
             // (#180 §RS-2, CRSH-ISC-8/19) Fold a spawned fetch's generation-tagged outcome
@@ -958,23 +947,6 @@ pub async fn veilid_net_actor(
             // re-writes (WB-4). The sweep is spawned off the loop (its record-open await
             // must not stall commands/chat, #128 class); the cursor advance is
             // synchronous so the round-robin stays deterministic.
-            // (#232) DM key-record re-seed. Eviction is the only way this record
-            // disappears, and losing it blocks NEW first contacts to this identity
-            // until it returns (established correspondents cache the key). Re-arm
-            // with a freshly drawn delay every time.
-            () = dm_key_reseed.as_mut() => {
-                if let Some(handle) = net.as_ref() {
-                    daemonseed_veilid_net::spawn_dm_key_record_publish(
-                        handle,
-                        "gui",
-                        shares.signing.as_deref(),
-                        shares.kem_ek.as_deref(),
-                    );
-                }
-                dm_key_reseed
-                    .as_mut()
-                    .reset(tokio::time::Instant::now() + dm_keyrec::next_reseed_interval());
-            }
             _ = steady_resweep.tick() => {
                 // (#180 §RS-1.4, CRSH-ISC-6/15) Dispatch parked browse retries on the
                 // consumer's own cursor tick (decorrelated from the sharer's re-announce).
@@ -1077,9 +1049,11 @@ pub async fn veilid_net_actor(
         // iteration (superseded advert + no in-flight fetch), off the loop.
         drain_route_releases(&mut shares, &net);
     }
-    // (#339) The UI side dropped the command channel, so the session is over:
-    // stop the driver rather than leaving it sweeping a doorbell nobody reads.
-    shutdown_dm(&mut dm);
+    // The UI side dropped the command channel, so the session is over. Dropping
+    // the handle stops the runner after the flow call in progress, and a runner
+    // still being replaced ends with the runtime.
+    drop(dm);
+    drop(dm_start);
 }
 
 /// (#180 §RS-3, CRSH-ISC-10) Release, off the loop, every imported route the in-use guard
@@ -1503,122 +1477,244 @@ async fn recv_opt(ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>) -> Opti
     ev_rx.as_mut().unwrap().recv().await
 }
 
-/// (#339) How long the DM driver sleeps when nothing wakes it — also its
-/// doorbell sweep cadence, since an idle tick is when the sweep is planned.
+/// The direct-messaging runner started for the current connection.
 ///
-/// Thirty seconds is the driver's own oracle cadence, and it is the interval a
-/// first contact waits on: a knock lands in a slot, and nothing tells the
-/// recipient it is there except the next sweep.
-const DM_IDLE_TICK: Duration = Duration::from_secs(30);
-
-/// (#339) The DM driver spawned beside this actor for the current connection.
-///
-/// It is a separate task, not part of the actor: the actor forwards commands to
-/// `handle` and drains `events` on its own `select!` arm, and holds none of the
-/// driver's key material. One per connect — a reconnect shuts the old one down
-/// and spawns a fresh driver, because a driver whose `Shutdown` has run has
-/// ended and its handle no longer reaches anything.
+/// A separate task, not part of the actor: the actor drains its events on its
+/// own `select!` arm and hands commands to `commands`, and holds none of its key
+/// material.
 struct DmSession {
-    handle: DmDriverHandle,
-    events: tokio::sync::mpsc::Receiver<DmEvent>,
+    handle: RunnerHandle,
+    /// Commands for the runner, in the order the UI sent them. A task moves them
+    /// onto the runner's bounded queue, so a full queue never parks this loop —
+    /// and with it chat, shares and presence — behind a direct message.
+    commands: UnboundedSender<RunnerCommand>,
 }
 
-/// Await the DM driver's next event. The `if dm.is_some()` guard on the select
-/// arm ensures this is only polled when `Some`, so the `unwrap` holds — the same
-/// shape as [`recv_opt`].
-async fn recv_dm(dm: &mut Option<DmSession>) -> Option<DmEvent> {
-    dm.as_mut().unwrap().events.recv().await
-}
-
-/// (#339) Build the driver's parts from what this session already holds.
-///
-/// Generic over the DHT seam so a construction test can build the parts against
-/// a stand-in: `VeilidNetHandle` cannot be constructed without attaching to the
-/// network, and what this function decides — the store root, the identity halves,
-/// the policy — has nothing to do with which seam it is handed.
-///
-/// `Err` names what was missing, for a trace line — every case is "this session
-/// is not DM-reachable", never a fault: an ephemeral session has no profile root
-/// and no derived keys, and a DM store that will not open is a disk condition the
-/// user finds out about through the shares path first.
-///
-/// `spent_tokens` is `None` because the policy is [`AdmissionPolicy::Open`],
-/// under which the invite-token field is never decoded and there is no consumed
-/// nonce to lose across a restart. The pairing the driver refuses —
-/// `InviteOnly` with no store — is therefore not reachable from here.
-fn dm_driver_parts<D: DmDht>(
-    dht: Arc<D>,
-    keys: DmSessionKeys,
-    profile_root: &std::path::Path,
-) -> Result<DmDriverParts<D>, String> {
-    let persist = DmPersist::open(profile_root.join("dm"), &keys.at_rest_key)
-        .map_err(|e| format!("dm store: {e}"))?;
-    Ok(DmDriverParts {
-        dht,
-        clock: WallClock::system(),
-        identity: DmIdentity {
-            signing: keys.signing,
-            kem: keys.kem,
-            doorbell_slot_secret: keys.doorbell_slot_secret,
-        },
-        persist,
-        cfg: DmDriverConfig {
-            idle_tick: DM_IDLE_TICK,
-            policy: AdmissionPolicy::Open,
-            pow_difficulty: PowDifficulty::PRODUCTION,
-        },
-        spent_tokens: None,
-    })
-}
-
-/// (#339) Shut the current driver down, if there is one, and drop its handle.
-///
-/// Best-effort and non-blocking: a driver that has already ended refuses the
-/// command, which is the state this call was trying to reach, and dropping the
-/// last handle ends one that is merely busy.
-fn shutdown_dm(dm: &mut Option<DmSession>) {
-    if let Some(session) = dm.take() {
-        // Never awaited: a full queue would park the whole actor, and dropping
-        // the handle — which this does — ends the driver anyway. The command is
-        // the polite path, not the only one.
-        let _ = session.handle.try_send(DmCommand::Shutdown);
+impl DmSession {
+    /// Wrap a started runner, with the task that feeds its queue.
+    ///
+    /// A command the runner has stopped before taking is answered on `evt_tx`
+    /// with [`Refusal::ShuttingDown`]. The task ends once this session is
+    /// dropped and every command it holds has been handed on or answered.
+    fn new(handle: RunnerHandle, evt_tx: &UnboundedSender<NetEvent>) -> Self {
+        let queue = handle.commands();
+        let evt_tx = evt_tx.clone();
+        let (commands, mut pending) = tokio::sync::mpsc::unbounded_channel::<RunnerCommand>();
+        tokio::spawn(async move {
+            while let Some(command) = pending.recv().await {
+                if let Err(refused) = queue.send(command).await {
+                    refuse_dm_command(&evt_tx, &refused.0);
+                }
+            }
+        });
+        Self { handle, commands }
     }
 }
 
-/// (#339) Spawn a driver for this connection, replacing any prior one.
-///
-/// Silent when the session has no DM material or no profile root — an ephemeral
-/// session is genuinely not DM-reachable, and there is nothing to tell the user.
-fn spawn_dm_driver<D: DmDht>(
-    dm: &mut Option<DmSession>,
-    dht: Option<Arc<D>>,
-    keys: Option<Box<DmSessionKeys>>,
-    profile_root: Option<&std::path::Path>,
-) {
-    // Unconditional, and BEFORE the early return: a reconnect whose transport
-    // never came up would otherwise leave the previous connection's driver
-    // running, sweeping a doorbell for a session the user has left.
-    shutdown_dm(dm);
-    let (Some(dht), Some(keys), Some(root)) = (dht, keys, profile_root) else {
+/// Await the runner's next event. The `if dm.is_some()` guard on the select arm
+/// ensures this is only polled when `Some`, so the `unwrap` holds — the same
+/// shape as [`recv_opt`].
+async fn recv_dm(dm: &mut Option<DmSession>) -> Option<RunnerEvent> {
+    dm.as_mut().unwrap().handle.next_event().await
+}
+
+/// The token a command's answer carries, where it has one.
+fn dm_command_token(command: &RunnerCommand) -> Option<CommandToken> {
+    match command {
+        RunnerCommand::FirstContact { token, .. }
+        | RunnerCommand::Send { token, .. }
+        | RunnerCommand::Accept { token, .. }
+        | RunnerCommand::DeleteConversation { token, .. } => Some(*token),
+        RunnerCommand::Block { .. } | RunnerCommand::Unblock { .. } | RunnerCommand::Shutdown => {
+            None
+        }
+    }
+}
+
+/// Answer a command no runner will take, the way the runner answers one it
+/// stopped before serving. A shutdown needs no answer.
+fn refuse_dm_command(evt_tx: &UnboundedSender<NetEvent>, command: &RunnerCommand) {
+    if matches!(command, RunnerCommand::Shutdown) {
         return;
+    }
+    let _ = evt_tx.send(NetEvent::Dm(Arc::new(RunnerEvent::Refused {
+        token: dm_command_token(command),
+        reason: Refusal::ShuttingDown,
+    })));
+}
+
+/// Forward runner events to the UI, in order.
+fn forward_dm_events(evt_tx: &UnboundedSender<NetEvent>, events: Vec<RunnerEvent>) {
+    for event in events {
+        let _ = evt_tx.send(NetEvent::Dm(Arc::new(event)));
+    }
+}
+
+/// A runner being replaced off the actor loop: the task that stops the old runner
+/// and starts the next, whose result is the next runner, if one started.
+type DmStart = tokio::task::JoinHandle<Option<RunnerHandle>>;
+
+/// Hand one runner event to the UI, or, where the runner has ended, empty the
+/// slot and say so.
+fn on_dm_event(
+    dm: &mut Option<DmSession>,
+    evt_tx: &UnboundedSender<NetEvent>,
+    event: Option<RunnerEvent>,
+) {
+    match event {
+        Some(event) => {
+            let _ = evt_tx.send(NetEvent::Dm(Arc::new(event)));
+        }
+        None => {
+            *dm = None;
+            let _ = evt_tx.send(NetEvent::DmStopped);
+            daemonseed_veilid_net::vtrace!("gui dm: runner ended");
+        }
+    }
+}
+
+/// Stop a runner and wait for its task to end, forwarding every event it had not
+/// delivered and then [`NetEvent::DmStopped`].
+///
+/// Where the shutdown's grace period runs out with a flow call in progress, the
+/// task is awaited to its end: until it ends it holds the profile's store open.
+async fn stop_runner(handle: RunnerHandle, evt_tx: &UnboundedSender<NetEvent>) {
+    let stop = handle.shutdown().await;
+    forward_dm_events(evt_tx, stop.undelivered);
+    let outcome = match stop.outcome {
+        ShutdownOutcome::TimedOut(end) => {
+            let rest = end.finish().await;
+            forward_dm_events(evt_tx, rest.undelivered);
+            rest.outcome
+        }
+        outcome => outcome,
     };
-    let parts = match dm_driver_parts(dht, *keys, root) {
+    match outcome {
+        ShutdownOutcome::Finished(Err(e)) => {
+            daemonseed_veilid_net::vtrace!("gui dm: runner ended with an error ({e})");
+        }
+        ShutdownOutcome::Panicked => {
+            daemonseed_veilid_net::vtrace!("gui dm: runner panicked");
+        }
+        ShutdownOutcome::Finished(Ok(())) | ShutdownOutcome::TimedOut(_) => {}
+    }
+    let _ = evt_tx.send(NetEvent::DmStopped);
+}
+
+/// Stop what is running or still starting, then start `next`, returning what it
+/// starts.
+///
+/// A start still in flight is awaited first and what it started is stopped, so
+/// no two runners are ever open on one profile's store: `next` is not polled
+/// until every earlier runner's task has ended.
+async fn restart_dm(
+    previous: Option<DmStart>,
+    old: Option<RunnerHandle>,
+    evt_tx: UnboundedSender<NetEvent>,
+    next: impl Future<Output = Option<RunnerHandle>>,
+) -> Option<RunnerHandle> {
+    if let Some(previous) = previous {
+        match previous.await {
+            Ok(Some(started)) => stop_runner(started, &evt_tx).await,
+            Ok(None) => {}
+            Err(e) => daemonseed_veilid_net::vtrace!("gui dm: runner start task failed ({e})"),
+        }
+    }
+    if let Some(old) = old {
+        stop_runner(old, &evt_tx).await;
+    }
+    next.await
+}
+
+/// Replace the running runner with the one `next` starts, off the actor loop.
+///
+/// The slot empties at once, so a command arriving meanwhile is refused as
+/// shutting down, and the actor goes on serving everything else while the old
+/// runner ends. The new runner reaches the slot through [`wait_dm_start`].
+fn begin_dm_restart(
+    dm: &mut Option<DmSession>,
+    dm_start: &mut Option<DmStart>,
+    evt_tx: &UnboundedSender<NetEvent>,
+    next: impl Future<Output = Option<RunnerHandle>> + Send + 'static,
+) {
+    let old = dm.take().map(|session| session.handle);
+    let previous = dm_start.take();
+    *dm_start = Some(tokio::spawn(restart_dm(
+        previous,
+        old,
+        evt_tx.clone(),
+        next,
+    )));
+}
+
+/// Await the runner being replaced off the loop. The `if dm_start.is_some()`
+/// guard on the select arm ensures this is only polled when `Some`.
+async fn wait_dm_start(
+    dm_start: &mut Option<DmStart>,
+) -> Result<Option<RunnerHandle>, tokio::task::JoinError> {
+    dm_start.as_mut().unwrap().await
+}
+
+/// Start the runner a connect calls for, in place of any earlier one: over the
+/// connection's node where it started, and none where it did not, which still
+/// stops the previous connection's runner.
+fn dm_after_connect(
+    net: &Option<VeilidNetHandle>,
+    keys: Option<Box<DmSessionKeys>>,
+    profile_root: Option<PathBuf>,
+    dm: &mut Option<DmSession>,
+    dm_start: &mut Option<DmStart>,
+    evt_tx: &UnboundedSender<NetEvent>,
+) {
+    begin_dm_restart(
+        dm,
+        dm_start,
+        evt_tx,
+        dm_runner_over_veilid(net.clone(), keys, profile_root),
+    );
+}
+
+/// A runner over this connection's Veilid node, where the connection can have
+/// one: a started node, the profile's direct-messaging keys and its profile
+/// root.
+///
+/// `None` without any of the three. A record store that will not build is
+/// traced, and messaging stays off for the connection.
+async fn dm_runner_over_veilid(
+    net: Option<VeilidNetHandle>,
+    keys: Option<Box<DmSessionKeys>>,
+    profile_root: Option<PathBuf>,
+) -> Option<RunnerHandle> {
+    let (Some(net), Some(keys), Some(profile_root)) = (net, keys, profile_root) else {
+        return None;
+    };
+    let parts = match net.dm_records_parts().await {
         Ok(parts) => parts,
-        Err(why) => {
-            daemonseed_veilid_net::vtrace!("gui dm: driver not spawned ({why})");
-            return;
+        Err(e) => {
+            daemonseed_veilid_net::vtrace!("gui dm: runner not started ({e})");
+            return None;
         }
     };
-    // `try_spawn`, never `spawn`: the fallible startup steps run on THIS thread,
-    // and a read-only or full profile directory must cost the DM driver, not the
-    // actor that also serves chat, shares and presence.
-    match DmDriver::try_spawn(parts) {
-        Ok((handle, events)) => {
-            *dm = Some(DmSession { handle, events });
-            daemonseed_veilid_net::vtrace!("gui dm: driver spawned");
+    let DmSessionKeys {
+        signing,
+        dm_channel_root,
+        at_rest_key,
+    } = *keys;
+    match RunnerParts::<VeilidRecords>::over_veilid(
+        parts,
+        signing,
+        dm_channel_root,
+        at_rest_key,
+        profile_root,
+        RunnerConfig::default(),
+    ) {
+        Ok(parts) => {
+            daemonseed_veilid_net::vtrace!("gui dm: runner started");
+            Some(spawn_runner(parts))
         }
-        Err(why) => {
-            daemonseed_veilid_net::vtrace!("gui dm: driver not spawned ({why})");
+        Err(e) => {
+            daemonseed_veilid_net::vtrace!("gui dm: runner not started ({e})");
+            None
         }
     }
 }
@@ -1647,9 +1743,12 @@ async fn handle_command(
     // `cfg!(debug_assertions) || …`, which made those handlers take a different branch in
     // release than in debug and left three tests covering a path that release never runs.
     operator_write: bool,
-    // (#339) The DM driver beside this actor: replaced on each Connect, and the
-    // destination every `NetCommand::Dm` is forwarded to.
+    // The direct-messaging runner: replaced on each Connect, and the destination
+    // every `NetCommand::Dm` is forwarded to.
     dm: &mut Option<DmSession>,
+    // A runner being replaced off the loop. Every Connect, StopDm and
+    // GracefulClose chains onto it, so no two runners open one store.
+    dm_start: &mut Option<DmStart>,
 ) {
     match cmd {
         NetCommand::Connect {
@@ -1658,7 +1757,6 @@ async fn handle_command(
             republish_roots,
             stable_signing_key,
             stable_share_root_ikm,
-            stable_kem_encapsulation_key,
             dm_session_keys,
             profile_root,
             project_announce_seed,
@@ -1682,11 +1780,6 @@ async fn handle_command(
             // (#156) Capture the share-root IKM (Arc — it holds secret bytes) so a
             // publish derives a receiver-verifiable share_id from the same identity.
             shares.share_root_ikm = stable_share_root_ikm.map(Arc::new);
-            // (#232) Capture the KEM encapsulation key so this session can publish
-            // its DM key record. Public material — the decapsulation key goes to
-            // the DM driver spawned beside this actor (#339), never into the
-            // actor's own state.
-            shares.kem_ek = stable_kem_encapsulation_key.map(Arc::new);
             // #188: a STABLE per-profile veilid namespace discriminator from the
             // unlocked identity pubkey — distinct across profiles (co-resident store
             // isolation), stable across a profile's launches (store reuse). `None` on
@@ -1703,18 +1796,6 @@ async fn handle_command(
                 // Subscribe the operator announce/MOTD record (Phase 4 A-c) so MOTD +
                 // announcement items fold in as they arrive.
                 subscribe_operator_space(shares, net).await;
-                // (#232, ISC-C40) Publish this identity's DM key record once the
-                // session is live, so peers can reach it for direct messages
-                // without waiting a full re-seed interval. Spawned, so it never
-                // adds latency to the rest of the connect window.
-                if let Some(handle) = net.as_ref() {
-                    daemonseed_veilid_net::spawn_dm_key_record_publish(
-                        handle,
-                        "gui",
-                        shares.signing.as_deref(),
-                        shares.kem_ek.as_deref(),
-                    );
-                }
                 // Operator content (MOTD/announcements) folds in ASYNC via the
                 // post-connect sweep + watch; each verified fold emits a
                 // `PublicSpaceSnapshot` that drives the #142 unread dot, and the warmup
@@ -1800,41 +1881,38 @@ async fn handle_command(
                     });
                 }
             }
-            // (#339) Spawn the DM driver for this connection. It takes the secret
-            // halves and the profile's DM records; a prior driver (this is a
-            // reconnect) is shut down first — one ended driver cannot serve a new
-            // session. OUTSIDE the connected branch on purpose: a reconnect whose
-            // transport never came up must still stop the previous connection's
-            // driver, and the call is a no-op beyond that when there is no
-            // transport to hand it.
-            spawn_dm_driver(
-                dm,
-                net.as_ref().map(|h| Arc::new(h.clone())),
+            // Start the direct-messaging runner for this connection, off this
+            // loop. A prior runner (this is a reconnect) is stopped, and its task
+            // awaited, before the new one opens the same profile's store. Outside
+            // the connected branch on purpose: a reconnect whose node never started
+            // must still stop the previous connection's runner.
+            dm_after_connect(
+                net,
                 dm_session_keys,
-                shares.profile_root.as_deref(),
+                shares.profile_root.clone(),
+                dm,
+                dm_start,
+                evt_tx,
             );
         }
-        // (#339) Forward one command to the driver. Dropped when no driver is
-        // running: a DM command outside a connection has nowhere to go, and
-        // queueing it would act on a session the user has already left.
-        NetCommand::Dm(dm_cmd) => match dm.as_ref() {
-            // `try_send`, never `send`: the driver's queue is bounded, and
-            // awaiting a full one would park this loop — and with it chat,
-            // shares and presence — behind a DM command.
-            Some(session) => match session.handle.try_send(dm_cmd) {
-                Ok(()) => {}
-                Err(DmTrySendError::Full) => {
-                    daemonseed_veilid_net::vtrace!("gui dm: driver queue full, command dropped");
+        // Forward one command to the runner. With no runner, the command is
+        // answered as the runner answers one it stopped before serving: outside
+        // a connection it has nowhere to go, and queueing it would act on a
+        // session the user has already left.
+        NetCommand::Dm(command) => match dm.as_ref() {
+            Some(session) => {
+                if let Err(unsent) = session.commands.send(command) {
+                    refuse_dm_command(evt_tx, &unsent.0);
                 }
-                Err(DmTrySendError::Stopped) => {
-                    daemonseed_veilid_net::vtrace!("gui dm: driver stopped, command dropped");
-                    *dm = None;
-                }
-            },
+            }
             None => {
-                daemonseed_veilid_net::vtrace!("gui dm: no driver, command dropped");
+                daemonseed_veilid_net::vtrace!("gui dm: no runner, command refused");
+                refuse_dm_command(evt_tx, &command);
             }
         },
+        // Stop messaging: the runner is stopped off this loop, and its task
+        // awaited there before a later connect starts another.
+        NetCommand::StopDm => begin_dm_restart(dm, dm_start, evt_tx, async { None }),
         NetCommand::SetMyHandle { handle } => {
             *my_handle = handle;
         }
@@ -1876,10 +1954,9 @@ async fn handle_command(
             unpublish_share(shares, evt_tx, net, &share_id).await;
         }
         NetCommand::GracefulClose { ack } => {
-            // (#339) The DM driver goes down with the transport it rides. Without
-            // this it would outlive the close, sweeping a doorbell over a
-            // connection the user has ended.
-            shutdown_dm(dm);
+            // The runner goes down with the transport it rides. It is stopped off
+            // this loop, so the close budget never waits on its flow call.
+            begin_dm_restart(dm, dm_start, evt_tx, async { None });
             // Every step below is bounded, and the bounds compose inside
             // GRACEFUL_CLOSE_BUDGET (see its carve-up). Nothing here may await a DHT
             // write unbounded: `main.rs` blocks the UI thread on this ack, so a stalled
@@ -4978,7 +5055,6 @@ mod tests {
     use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
     use daemonseed_core::identity::mnemonic::Mnemonic;
     use daemonseed_core::public_space::ProjectAnnounceSeed;
-    use daemonseed_veilid_net::dm::{DmDhtFuture, DmSpawnError};
     use daemonseed_veilid_net::route_provenance_input;
     use tokio::sync::mpsc::unbounded_channel;
 
@@ -6449,7 +6525,8 @@ mod tests {
             &confirm_outcome_tx,
             // (#274) The operator write-gate; this command's arm never reads it.
             false,
-            // (#339) No DM driver in this fixture.
+            // No direct-messaging runner in this fixture.
+            &mut None,
             &mut None,
         )
         .await;
@@ -6510,7 +6587,8 @@ mod tests {
             &confirm_outcome_tx,
             // (#274) The operator write-gate; this command's arm never reads it.
             false,
-            // (#339) No DM driver in this fixture.
+            // No direct-messaging runner in this fixture.
+            &mut None,
             &mut None,
         )
         .await;
@@ -6581,7 +6659,8 @@ mod tests {
             // test's subject lies BEYOND the gate, so it needs the gate open — and now
             // gets it identically in debug and release.
             true,
-            // (#339) No DM driver in this fixture.
+            // No direct-messaging runner in this fixture.
+            &mut None,
             &mut None,
         )
         .await;
@@ -6627,7 +6706,8 @@ mod tests {
             // test's subject lies BEYOND the gate, so it needs the gate open — and now
             // gets it identically in debug and release.
             true,
-            // (#339) No DM driver in this fixture.
+            // No direct-messaging runner in this fixture.
+            &mut None,
             &mut None,
         )
         .await;
@@ -6671,7 +6751,8 @@ mod tests {
             // test's subject lies BEYOND the gate, so it needs the gate open — and now
             // gets it identically in debug and release.
             true,
-            // (#339) No DM driver in this fixture.
+            // No direct-messaging runner in this fixture.
+            &mut None,
             &mut None,
         )
         .await;
@@ -7647,7 +7728,8 @@ mod tests {
             &confirm_outcome_tx,
             // (#274) The operator write-gate; this command's arm never reads it.
             false,
-            // (#339) No DM driver in this fixture.
+            // No direct-messaging runner in this fixture.
+            &mut None,
             &mut None,
         )
         .await;
@@ -7810,320 +7892,247 @@ mod tests {
         );
     }
 
-    /// A seam that answers nothing. `dm_driver_parts` performs no DHT operation —
-    /// it opens a store and assembles a struct — so a stand-in that refuses every
-    /// call is the honest fixture: if the helper ever grew a network round-trip,
-    /// this would fail rather than quietly succeed against a live handle.
-    struct RefusingDht;
+    // ── The direct-messaging runner, over a record store that holds nothing ──
 
-    impl RefusingDht {
-        fn refuse<T: Send + 'static>() -> daemonseed_veilid_net::dm::DmDhtFuture<T> {
-            Box::pin(async { Err(VeilidNetError::Actor("no dht in this test".into())) })
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use daemonseed_core::dm::advert::AdvertOwnerSeed;
+    use daemonseed_core::dm::channel::ChannelOwnerSeed;
+    use daemonseed_core::dm::drop::{DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
+    use daemonseed_core::dm::flows::{RecordError, Records};
+    use daemonseed_core::storage::dm_store::CorrespondenceLabel;
+    use daemonseed_veilid_net::dm::WriteCountsSnapshot;
+    use daemonseed_veilid_net::dm::runner::{MIN_TICK, RunnerRecords, SubkeyReport};
+
+    /// A record store that holds nothing and takes no writes.
+    ///
+    /// Every read sleeps for `pause` first, so a collection pass over the drop's
+    /// slots can outlast a shutdown's grace period. `reading` turns true at the
+    /// first read, which is how a test knows a flow call is in progress. `alive`
+    /// is dropped with the store, and the store is dropped when the runner's task
+    /// ends, so its count is how a test sees that end.
+    ///
+    /// While `hold` is true a read waits, with `parked` true, until it is cleared.
+    /// While `failing` is true a read fails, which moves the runner's failure
+    /// counters.
+    struct EmptyRecords {
+        pause: Duration,
+        reading: Arc<AtomicBool>,
+        hold: Arc<AtomicBool>,
+        parked: Arc<AtomicBool>,
+        failing: Arc<AtomicBool>,
+        alive: Arc<()>,
+    }
+
+    impl EmptyRecords {
+        fn new(pause: Duration) -> Self {
+            Self {
+                pause,
+                reading: Arc::new(AtomicBool::new(false)),
+                hold: Arc::new(AtomicBool::new(false)),
+                parked: Arc::new(AtomicBool::new(false)),
+                failing: Arc::new(AtomicBool::new(false)),
+                alive: Arc::new(()),
+            }
+        }
+
+        fn read(&self) -> Result<(), RecordError> {
+            self.reading.store(true, Ordering::SeqCst);
+            std::thread::sleep(self.pause);
+            while self.hold.load(Ordering::SeqCst) {
+                self.parked.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if self.failing.load(Ordering::SeqCst) {
+                return Err(RecordError::new("this read fails"));
+            }
+            Ok(())
+        }
+
+        fn refuse<T>() -> Result<T, RecordError> {
+            Err(RecordError::new("this store takes no writes"))
         }
     }
 
-    impl DmDht for RefusingDht {
-        fn fetch_dm_key_record(&self, _: [u8; 32]) -> DmDhtFuture<Option<Vec<u8>>> {
-            Self::refuse()
-        }
-        fn publish_doorbell_entry(
-            &self,
-            _: [u8; 32],
+    impl Records for EmptyRecords {
+        fn read_advert(
+            &mut self,
+            _: &AdvertOwnerSeed,
             _: u16,
-            _: Vec<u8>,
-            _: daemonseed_veilid_net::actor::DoorbellDispatch,
-        ) -> DmDhtFuture<()> {
+        ) -> Result<Option<Vec<u8>>, RecordError> {
+            self.read()?;
+            Ok(None)
+        }
+
+        fn read_drop_slot(
+            &mut self,
+            _: &DropOwnerSeed,
+            _: u16,
+            _: u16,
+        ) -> Result<Option<Vec<u8>>, RecordError> {
+            self.read()?;
+            Ok(None)
+        }
+
+        fn write_drop_slot(
+            &mut self,
+            _: &DropOwnerSeed,
+            _: u16,
+            _: u16,
+            _: &[u8],
+        ) -> Result<(), RecordError> {
             Self::refuse()
         }
-        fn sweep_doorbell(
-            &self,
-            _: [u8; 32],
-        ) -> DmDhtFuture<daemonseed_veilid_net::actor::DoorbellSweep> {
+
+        fn erase_drop_slot(
+            &mut self,
+            _: &DropOwnerSeed,
+            _: u16,
+            _: u16,
+        ) -> Result<(), RecordError> {
             Self::refuse()
         }
-        fn publish_dm_page(
-            &self,
-            _: daemonseed_core::dm::paging::DmPageAddress<daemonseed_core::dm::paging::Sending>,
-            _: Vec<u8>,
-        ) -> DmDhtFuture<()> {
+
+        fn open_channel(
+            &mut self,
+            _: &ChannelOwnerSeed,
+            _: u16,
+        ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
             Self::refuse()
         }
-        fn sweep_dm_page(
-            &self,
-            _: daemonseed_core::dm::paging::DmPageAddress<daemonseed_core::dm::paging::Receiving>,
-        ) -> DmDhtFuture<daemonseed_veilid_net::actor::DmPageSweep> {
-            Self::refuse()
+
+        fn read_channel(
+            &mut self,
+            _: &[u8; HELLO_LOOKUP_KEY_LEN],
+            _: u16,
+        ) -> Result<Option<Vec<u8>>, RecordError> {
+            self.read()?;
+            Ok(None)
         }
-        fn watch_dm_page(
-            &self,
-            _: daemonseed_core::dm::paging::DmPageAddress<daemonseed_core::dm::paging::Receiving>,
-        ) -> DmDhtFuture<daemonseed_veilid_net::actor::DmPageWatch> {
-            Self::refuse()
-        }
-        fn close_dm_page(
-            &self,
-            _: daemonseed_veilid_net::actor::DmPageRecord,
-        ) -> DmDhtFuture<bool> {
-            Self::refuse()
-        }
-        fn pin_dm_pages(
-            &self,
-            _: u64,
-            _: Vec<daemonseed_veilid_net::actor::DmPageRecord>,
-        ) -> DmDhtFuture<()> {
-            Self::refuse()
-        }
-        fn publish_dm_ack(
-            &self,
-            _: daemonseed_core::dm::ack_record::DmAckAddress,
-            _: Vec<u8>,
-        ) -> DmDhtFuture<()> {
-            Self::refuse()
-        }
-        fn fetch_dm_ack(
-            &self,
-            _: daemonseed_core::dm::ack_record::DmAckAddress,
-        ) -> DmDhtFuture<Option<Vec<u8>>> {
+
+        fn write_channel(
+            &mut self,
+            _: &[u8; HELLO_LOOKUP_KEY_LEN],
+            _: u16,
+            _: &[u8],
+        ) -> Result<(), RecordError> {
             Self::refuse()
         }
     }
 
-    /// #339: the DM material a session hands the driver, as a fixture builds it.
-    fn dm_test_keys(identity: daemonseed_core::identity::keys::IdentityKeys) -> DmSessionKeys {
-        DmSessionKeys {
-            signing: Arc::new(identity.signing),
-            kem: identity.kem,
-            doorbell_slot_secret: identity.dm_doorbell_slot_secret,
-            at_rest_key: zeroize::Zeroizing::new([0x5a; 32]),
+    impl RunnerRecords for EmptyRecords {
+        fn inspect_channel(
+            &mut self,
+            _: &[u8; HELLO_LOOKUP_KEY_LEN],
+        ) -> Result<Vec<SubkeyReport>, RecordError> {
+            Ok(Vec::new())
+        }
+
+        fn inspect_advert(
+            &mut self,
+            _: &AdvertOwnerSeed,
+            subkeys: u16,
+        ) -> Result<Vec<SubkeyReport>, RecordError> {
+            Ok(vec![SubkeyReport::default(); usize::from(subkeys)])
+        }
+
+        fn inspect_drop(
+            &mut self,
+            _: &DropOwnerSeed,
+            subkeys: u16,
+        ) -> Result<Vec<SubkeyReport>, RecordError> {
+            Ok(vec![SubkeyReport::default(); usize::from(subkeys)])
+        }
+
+        fn publish_advert(
+            &mut self,
+            _: &AdvertOwnerSeed,
+            _: u16,
+            _: &[u8],
+        ) -> Result<(), RecordError> {
+            Self::refuse()
+        }
+
+        fn erase_channel(&mut self, _: &[u8; HELLO_LOOKUP_KEY_LEN]) -> Result<(), RecordError> {
+            Self::refuse()
+        }
+
+        fn write_counts(&self) -> WriteCountsSnapshot {
+            WriteCountsSnapshot::default()
         }
     }
 
+    /// A fresh identity's direct-messaging keys.
     fn dm_test_identity() -> daemonseed_core::identity::keys::IdentityKeys {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
-        let mnemonic = Mnemonic::generate().expect("mnemonic");
-        derive_identity_keys(&mnemonic, Identity::Primary).expect("identity derives")
+        derive_identity_keys(&Mnemonic::generate().expect("mnemonic"), Identity::Primary)
+            .expect("identity derives")
     }
 
-    /// #339: the parts a connect builds carry THIS identity's signing key and a
-    /// store at EXACTLY this profile's DM root — the two bindings a mis-wired
-    /// connect would break silently, one by driving the driver under the wrong
-    /// identity and the other by writing a second profile's records into this
-    /// one's dir.
-    #[test]
-    fn dm_driver_parts_bind_the_identity_and_the_profile_root() {
+    /// A runner under a fresh identity, over `records`, with its store under
+    /// `profile_root`.
+    fn empty_runner(
+        profile_root: &std::path::Path,
+        records: EmptyRecords,
+        config: RunnerConfig,
+    ) -> RunnerHandle {
         let identity = dm_test_identity();
-        let expected_pk = *identity.signing.public_key();
-
-        let profile = tempfile::tempdir().expect("tempdir");
-        let parts = dm_driver_parts(
-            Arc::new(RefusingDht),
-            dm_test_keys(identity),
-            profile.path(),
-        )
-        .expect("parts build against a fresh profile root");
-
-        assert_eq!(
-            parts.identity.signing.public_key(),
-            &expected_pk,
-            "the driver runs under the profile's own identity"
-        );
-        assert_eq!(
-            parts.persist.store().root(),
-            profile.path().join("dm"),
-            "the DM store is the profile's own dm/ dir, not merely somewhere under it"
-        );
-        assert!(parts.persist.store().root().is_dir());
-        // Open policy: no spent-token store, and none is needed — the driver
-        // would panic at spawn on the InviteOnly pairing instead.
-        assert!(parts.spent_tokens.is_none());
-        assert_eq!(parts.cfg.policy, AdmissionPolicy::Open);
+        spawn_runner(RunnerParts {
+            records,
+            signer: Arc::new(identity.signing),
+            channel_root: identity.dm_channel_root,
+            at_rest_key: zeroize::Zeroizing::new([0x5a; 32]),
+            profile_root: profile_root.to_path_buf(),
+            config,
+        })
     }
 
-    /// #339: the store is opened under the AT-REST KEY the session handed over,
-    /// not under any key at all. Proven the only way a key can be: a record
-    /// written under one key does not read under another.
-    ///
-    /// Without this, `at_rest_key` could be a constant and every other assertion
-    /// in this file would still pass.
-    #[test]
-    fn dm_driver_parts_open_the_store_under_the_given_key() {
-        let identity = dm_test_identity();
-        let profile = tempfile::tempdir().expect("tempdir");
-
-        let mut keys = dm_test_keys(identity);
-        keys.at_rest_key = zeroize::Zeroizing::new([0xa1; 32]);
-        let parts = dm_driver_parts(Arc::new(RefusingDht), keys, profile.path()).expect("parts");
-        parts
-            .persist
-            .provision_block_list()
-            .expect("the block list writes under the session's key");
-        parts
-            .persist
-            .read_block_list()
-            .expect("and reads back under the same key");
-        drop(parts);
-
-        // The same root, a different key: the record is there and will not open.
-        let wrong = DmPersist::open(profile.path().join("dm"), &[0xb2; 32])
-            .expect("the store itself opens — only the records are keyed");
-        assert!(
-            wrong.read_block_list().is_err(),
-            "a record written under the session key must not read under another"
-        );
-    }
-
-    /// #339: a profile whose block-list record cannot be read fails the SPAWN,
-    /// on the caller's thread — and the caller is the net actor. `try_spawn`
-    /// reports it; `spawn` would panic and take chat, shares and presence with it.
-    #[test]
-    fn dm_driver_try_spawn_reports_an_unreadable_block_list() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let identity = dm_test_identity();
-        let profile = tempfile::tempdir().expect("tempdir");
-        let parts = dm_driver_parts(
-            Arc::new(RefusingDht),
-            dm_test_keys(identity),
-            profile.path(),
-        )
-        .expect("parts");
-
-        // Make the block-list record unreadable. Positive control FIRST: without
-        // it a chmod that did nothing (running as root, an exotic filesystem)
-        // would leave this test asserting that a healthy profile spawns, which
-        // it would, and the failure path would go untested.
-        let root = parts.persist.store().root().to_path_buf();
-        let mut sealed = 0usize;
-        for entry in std::fs::read_dir(&root).expect("the store root is readable") {
-            let path = entry.expect("dir entry").path();
-            if path.is_file() {
-                let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
-                perms.set_mode(0o000);
-                std::fs::set_permissions(&path, perms).expect("chmod");
-                sealed += 1;
-            }
-        }
-        assert!(
-            sealed > 0,
-            "the fixture sealed no record, so it proves nothing"
-        );
-        assert!(
-            parts.persist.read_block_list().is_err(),
-            "the fixture did not actually make the record unreadable"
-        );
-
-        match DmDriver::try_spawn(parts) {
-            Err(DmSpawnError::BlockList(_)) => {}
-            Err(other) => panic!("wrong failure: {other}"),
-            Ok(_) => panic!("a driver started against an unreadable block list"),
-        }
-
-        // Restore so the tempdir can be removed.
-        for entry in std::fs::read_dir(&root).expect("read_dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_file() {
-                let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&path, perms);
-            }
+    /// Wait, boundedly, until `flag` is true.
+    async fn wait_for(flag: &AtomicBool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !flag.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "timed out waiting: {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
-    /// #339: the actor's DM slot, over a connection's whole life — spawned once,
-    /// replaced by the next connect, emptied by shutdown, and never spawned at
-    /// all when the transport did not come up.
-    #[tokio::test]
-    async fn dm_session_slot_follows_the_connection() {
-        let profile = tempfile::tempdir().expect("tempdir");
-        let mut dm: Option<DmSession> = None;
-
-        // No transport: nothing spawns, and nothing panics.
-        spawn_dm_driver(
-            &mut dm,
-            None::<Arc<RefusingDht>>,
-            Some(Box::new(dm_test_keys(dm_test_identity()))),
-            Some(profile.path()),
-        );
-        assert!(dm.is_none(), "no transport, no driver");
-
-        // A DM command with no driver is dropped, not panicked on.
-        assert!(dm.is_none());
-
-        // Connect: one driver.
-        spawn_dm_driver(
-            &mut dm,
-            Some(Arc::new(RefusingDht)),
-            Some(Box::new(dm_test_keys(dm_test_identity()))),
-            Some(profile.path()),
-        );
-        assert!(
-            dm.is_some(),
-            "a connect with keys and a root spawns a driver"
-        );
-
-        // A second connect REPLACES it — the old driver has been told to stop,
-        // and a stopped driver's handle reaches nothing.
-        spawn_dm_driver(
-            &mut dm,
-            Some(Arc::new(RefusingDht)),
-            Some(Box::new(dm_test_keys(dm_test_identity()))),
-            Some(profile.path()),
-        );
-        assert!(dm.is_some(), "a reconnect leaves a live driver, not none");
-
-        // A reconnect whose transport never came up still stops the old driver.
-        spawn_dm_driver(
-            &mut dm,
-            None::<Arc<RefusingDht>>,
-            Some(Box::new(dm_test_keys(dm_test_identity()))),
-            Some(profile.path()),
-        );
-        assert!(
-            dm.is_none(),
-            "a failed reconnect must not leave the previous driver running"
-        );
-
-        // And shutdown empties the slot.
-        spawn_dm_driver(
-            &mut dm,
-            Some(Arc::new(RefusingDht)),
-            Some(Box::new(dm_test_keys(dm_test_identity()))),
-            Some(profile.path()),
-        );
-        assert!(dm.is_some());
-        shutdown_dm(&mut dm);
-        assert!(dm.is_none(), "shutdown_dm leaves the slot empty");
+    /// A pass over the drop's slots, each read slowed, from a runner whose grace
+    /// period is shorter than one read.
+    fn slow_config() -> RunnerConfig {
+        RunnerConfig {
+            tick: MIN_TICK,
+            grace: Duration::from_millis(1),
+        }
     }
 
-    /// #339: `GracefulClose` takes the DM driver down with the transport. The
-    /// close already acks with no transport, so the ack is the proof the arm ran
-    /// to completion with the shutdown as its first statement.
-    #[tokio::test]
-    async fn graceful_close_shuts_the_dm_driver_down() {
-        let profile = tempfile::tempdir().expect("tempdir");
-        let mut dm: Option<DmSession> = None;
-        spawn_dm_driver(
-            &mut dm,
-            Some(Arc::new(RefusingDht)),
-            Some(Box::new(dm_test_keys(dm_test_identity()))),
-            Some(profile.path()),
-        );
-        assert!(dm.is_some(), "the fixture must have a driver to shut down");
+    /// Every event waiting on `evt_rx`, in order.
+    fn drain(evt_rx: &mut UnboundedReceiver<NetEvent>) -> Vec<NetEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = evt_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
 
-        let (evt_tx, _evt_rx) = unbounded_channel();
+    /// Run one command through the actor's dispatcher with no transport, no
+    /// circles and no shares.
+    async fn dispatch(
+        command: NetCommand,
+        evt_tx: &UnboundedSender<NetEvent>,
+        dm: &mut Option<DmSession>,
+        dm_start: &mut Option<DmStart>,
+    ) {
         let (fetch_tx, _fetch_rx) = unbounded_channel();
         let (confirm_tx, _confirm_rx) = unbounded_channel();
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+        let (self_tx, _self_rx) = unbounded_channel();
         let mut net = None;
         let mut ev_rx = None;
-        let (self_tx, _self_rx) = unbounded_channel();
         let mut circles = Vec::new();
         let mut my_handle = "guest".to_owned();
         let mut shares = ShareState::new();
-
         handle_command(
-            NetCommand::GracefulClose { ack: ack_tx },
-            &evt_tx,
+            command,
+            evt_tx,
             &self_tx,
             &mut net,
             &mut ev_rx,
@@ -8133,155 +8142,627 @@ mod tests {
             &fetch_tx,
             &confirm_tx,
             false,
-            &mut dm,
+            dm,
+            dm_start,
         )
         .await;
+    }
 
-        assert!(dm.is_none(), "GracefulClose left the driver running");
+    /// The control for the reconnect test below: the fixture really does leave a
+    /// flow call running past a shutdown's grace period, with the store still
+    /// held. Without it the reconnect test could pass because the shutdown
+    /// finished inside its grace period, and the wait it pins would go untested.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_fixture_outlives_a_shutdowns_grace_period() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let records = EmptyRecords::new(Duration::from_millis(5));
+        let (reading, alive) = (records.reading.clone(), records.alive.clone());
+        let handle = empty_runner(profile.path(), records, slow_config());
+        wait_for(&reading, "the runner's first read").await;
+
+        let stop = handle.shutdown().await;
+        let ShutdownOutcome::TimedOut(end) = stop.outcome else {
+            panic!(
+                "the shutdown ended inside its grace period: {:?}",
+                stop.outcome
+            );
+        };
+        assert_eq!(
+            Arc::strong_count(&alive),
+            2,
+            "the task's store must still be held when the grace period ends"
+        );
+        end.finish().await;
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the task's end drops the store"
+        );
+    }
+
+    /// A reconnect starts no runner until the old runner's task has ended, even
+    /// where its shutdown's grace period ran out mid-call: until the task ends it
+    /// holds the profile's store open, and the new runner opens the same store.
+    /// The events the old runner had not delivered are forwarded, and the stop is
+    /// the last word on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconnect_waits_for_the_old_runner_to_end_before_starting_another() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        // Control: an empty slot has nothing to stop and says nothing.
+        let mut dm: Option<DmSession> = None;
+        let mut dm_start: Option<DmStart> = None;
+        begin_dm_restart(&mut dm, &mut dm_start, &evt_tx, async { None });
+        assert!(
+            wait_dm_start(&mut dm_start)
+                .await
+                .expect("the start task")
+                .is_none()
+        );
+        dm_start = None;
+        assert!(
+            drain(&mut evt_rx).is_empty(),
+            "an empty slot reported a stop"
+        );
+
+        let records = EmptyRecords::new(Duration::from_millis(5));
+        let (reading, alive) = (records.reading.clone(), records.alive.clone());
+        // The runner's startup events are left unread, so they are the ones the
+        // stop has to forward.
+        dm = Some(DmSession::new(
+            empty_runner(profile.path(), records, slow_config()),
+            &evt_tx,
+        ));
+        wait_for(&reading, "the runner's first read").await;
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (alive_in_next, seen_in_next) = (alive.clone(), seen.clone());
+        begin_dm_restart(&mut dm, &mut dm_start, &evt_tx, async move {
+            seen_in_next.store(Arc::strong_count(&alive_in_next), Ordering::SeqCst);
+            None
+        });
+        assert!(dm.is_none(), "the old runner is still in the slot");
+        let started = wait_dm_start(&mut dm_start).await.expect("the start task");
+        assert!(started.is_none(), "no next runner was started");
+
+        // This test's handle and the copy the next runner's start held: the old
+        // task's store was already gone.
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "the next runner started while the old task still held the store"
+        );
+
+        let events = drain(&mut evt_rx);
+        let stopped = events
+            .iter()
+            .position(|event| matches!(event, NetEvent::DmStopped))
+            .unwrap_or_else(|| panic!("no stop was reported: {events:?}"));
+        assert_eq!(
+            stopped,
+            events.len() - 1,
+            "the stop is not the last word: {events:?}"
+        );
+        assert!(
+            events[..stopped]
+                .iter()
+                .any(|event| matches!(event, NetEvent::Dm(_))),
+            "the old runner's undelivered events were not forwarded: {events:?}"
+        );
+    }
+
+    /// A second restart waits for the first: what the first started is stopped
+    /// and its task ended before the second's runner starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_restart_waits_for_the_first() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let mut dm: Option<DmSession> = None;
+        let mut dm_start: Option<DmStart> = None;
+
+        let records = EmptyRecords::new(Duration::from_millis(5));
+        let (reading, alive) = (records.reading.clone(), records.alive.clone());
+        let root = profile.path().to_path_buf();
+        begin_dm_restart(&mut dm, &mut dm_start, &evt_tx, async move {
+            Some(empty_runner(&root, records, slow_config()))
+        });
+        wait_for(&reading, "the first restart's runner's first read").await;
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let (alive_in_next, seen_in_next) = (alive.clone(), seen.clone());
+        begin_dm_restart(&mut dm, &mut dm_start, &evt_tx, async move {
+            seen_in_next.store(Arc::strong_count(&alive_in_next), Ordering::SeqCst);
+            None
+        });
+        assert!(
+            wait_dm_start(&mut dm_start)
+                .await
+                .expect("the start task")
+                .is_none()
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            2,
+            "the second restart started while the first restart's runner was open"
+        );
+    }
+
+    /// The actor goes on serving while an old runner ends: a circle command is
+    /// answered before the old runner's task has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_circle_command_is_served_while_the_old_runner_is_still_ending() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let records = EmptyRecords::new(Duration::from_millis(10));
+        let reading = records.reading.clone();
+        let mut dm = Some(DmSession::new(
+            empty_runner(profile.path(), records, slow_config()),
+            &evt_tx,
+        ));
+        let mut dm_start: Option<DmStart> = None;
+        wait_for(&reading, "the runner's first read").await;
+
+        begin_dm_restart(&mut dm, &mut dm_start, &evt_tx, async { None });
+        let _ = drain(&mut evt_rx);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch(
+                NetCommand::SendCircle {
+                    circle_id: 0,
+                    text: "hello".to_owned(),
+                },
+                &evt_tx,
+                &mut dm,
+                &mut dm_start,
+            ),
+        )
+        .await
+        .expect("the circle command waited on the old runner");
+
+        assert!(
+            drain(&mut evt_rx)
+                .iter()
+                .any(|event| matches!(event, NetEvent::CircleError { .. })),
+            "the circle command was not answered"
+        );
+        assert!(
+            dm_start.as_ref().is_some_and(|start| !start.is_finished()),
+            "control: the old runner must still be ending when the command is answered"
+        );
+        assert!(
+            wait_dm_start(&mut dm_start)
+                .await
+                .expect("the start task")
+                .is_none()
+        );
+    }
+
+    /// A connect whose node never started still stops the previous connection's
+    /// runner, and starts none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connect_without_a_node_still_stops_the_old_runner() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let records = EmptyRecords::new(Duration::ZERO);
+        let alive = records.alive.clone();
+        let mut dm = Some(DmSession::new(
+            empty_runner(profile.path(), records, RunnerConfig::default()),
+            &evt_tx,
+        ));
+        let mut dm_start: Option<DmStart> = None;
+        let identity = dm_test_identity();
+        let keys = Box::new(DmSessionKeys {
+            signing: Arc::new(identity.signing),
+            dm_channel_root: identity.dm_channel_root,
+            at_rest_key: zeroize::Zeroizing::new([0x5a; 32]),
+        });
+
+        dm_after_connect(
+            &None,
+            Some(keys),
+            Some(profile.path().to_path_buf()),
+            &mut dm,
+            &mut dm_start,
+            &evt_tx,
+        );
+        assert!(dm.is_none(), "the old runner is still in the slot");
+        let started = wait_dm_start(&mut dm_start).await.expect("the start task");
+        assert!(started.is_none(), "a runner started without a node");
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the old runner's task did not end"
+        );
+        assert!(
+            drain(&mut evt_rx)
+                .iter()
+                .any(|event| matches!(event, NetEvent::DmStopped)),
+            "the old runner's stop was not reported"
+        );
+    }
+
+    /// A runner that ends empties the slot and says so; an event is forwarded and
+    /// leaves the slot alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_that_ends_empties_the_slot_and_says_so() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let mut dm = Some(DmSession::new(
+            empty_runner(
+                profile.path(),
+                EmptyRecords::new(Duration::ZERO),
+                RunnerConfig::default(),
+            ),
+            &evt_tx,
+        ));
+
+        on_dm_event(&mut dm, &evt_tx, Some(RunnerEvent::Roster(Vec::new())));
+        assert!(dm.is_some(), "forwarding an event emptied the slot");
+        assert!(matches!(
+            drain(&mut evt_rx).as_slice(),
+            [NetEvent::Dm(event)] if matches!(**event, RunnerEvent::Roster(_))
+        ));
+
+        on_dm_event(&mut dm, &evt_tx, None);
+        assert!(dm.is_none(), "an ended runner stayed in the slot");
+        assert!(matches!(
+            drain(&mut evt_rx).as_slice(),
+            [NetEvent::DmStopped]
+        ));
+    }
+
+    /// An event the runner emits after its shutdown's grace period has run out,
+    /// while the flow call in progress finishes, is forwarded before the stop is
+    /// reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn events_emitted_after_the_grace_period_are_forwarded() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let records = EmptyRecords::new(Duration::ZERO);
+        let (reading, hold, parked, failing) = (
+            records.reading.clone(),
+            records.hold.clone(),
+            records.parked.clone(),
+            records.failing.clone(),
+        );
+        let mut handle = empty_runner(profile.path(), records, slow_config());
+        wait_for(&reading, "the runner's first read").await;
+
+        hold.store(true, Ordering::SeqCst);
+        wait_for(&parked, "a read held inside a flow call").await;
+        failing.store(true, Ordering::SeqCst);
+        // Every event emitted so far is read here, so an event the stop forwards
+        // was emitted after this point.
+        while handle.try_next_event().is_some() {}
+
+        let stopping = tokio::spawn({
+            let evt_tx = evt_tx.clone();
+            async move { stop_runner(handle, &evt_tx).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !stopping.is_finished(),
+            "control: the stop ended while a read was still held"
+        );
+        assert!(
+            drain(&mut evt_rx).is_empty(),
+            "control: an event reached the UI before the held read ended"
+        );
+
+        hold.store(false, Ordering::SeqCst);
+        stopping.await.expect("the stop task");
+        let events = drain(&mut evt_rx);
+        assert!(
+            matches!(events.last(), Some(NetEvent::DmStopped)),
+            "the stop is not the last word: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                NetEvent::Dm(event) if matches!(**event, RunnerEvent::Health(_))
+            )),
+            "the health report emitted after the grace period was not forwarded: {events:?}"
+        );
+    }
+
+    /// `StopDm` stops the runner off the loop, and its task ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_dm_stops_the_runner() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let records = EmptyRecords::new(Duration::ZERO);
+        let alive = records.alive.clone();
+        let mut dm = Some(DmSession::new(
+            empty_runner(profile.path(), records, RunnerConfig::default()),
+            &evt_tx,
+        ));
+        let mut dm_start: Option<DmStart> = None;
+
+        dispatch(NetCommand::StopDm, &evt_tx, &mut dm, &mut dm_start).await;
+        assert!(dm.is_none(), "StopDm left the runner in the slot");
+        assert!(
+            wait_dm_start(&mut dm_start)
+                .await
+                .expect("the start task")
+                .is_none()
+        );
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the runner's task did not end"
+        );
+        assert!(
+            drain(&mut evt_rx)
+                .iter()
+                .any(|event| matches!(event, NetEvent::DmStopped))
+        );
+    }
+
+    /// `StopDm` arriving while a start is still in flight chains onto it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_dm_stops_a_runner_whose_start_is_still_in_flight() {
+        stop_chains_onto_a_start_in_flight(NetCommand::StopDm, "StopDm").await;
+    }
+
+    /// `GracefulClose` arriving while a start is still in flight chains onto it,
+    /// and still acks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_close_stops_a_runner_whose_start_is_still_in_flight() {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+        stop_chains_onto_a_start_in_flight(
+            NetCommand::GracefulClose { ack: ack_tx },
+            "GracefulClose",
+        )
+        .await;
         assert!(ack_rx.await.is_ok(), "the close must still ack");
     }
 
-    /// #339: a DM command with no driver is dropped, and the command arm returns
-    /// normally rather than panicking or parking.
-    #[tokio::test]
-    async fn a_dm_command_with_no_driver_is_dropped() {
-        let (evt_tx, _evt_rx) = unbounded_channel();
-        let (fetch_tx, _fetch_rx) = unbounded_channel();
-        let (confirm_tx, _confirm_rx) = unbounded_channel();
-        let mut net = None;
-        let mut ev_rx = None;
-        let (self_tx, _self_rx) = unbounded_channel();
-        let mut circles = Vec::new();
-        let mut my_handle = "guest".to_owned();
-        let mut shares = ShareState::new();
+    /// A stop `command` arriving while a start is still in flight chains onto it:
+    /// the actor answers it and goes on serving other commands while the start
+    /// waits, and once the start produces its runner, that runner is stopped,
+    /// its task ended and its stop reported.
+    async fn stop_chains_onto_a_start_in_flight(command: NetCommand, name: &str) {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
         let mut dm: Option<DmSession> = None;
+        let mut dm_start: Option<DmStart> = None;
 
-        handle_command(
-            NetCommand::Dm(DmCommand::Shutdown),
+        let records = EmptyRecords::new(Duration::ZERO);
+        let alive = records.alive.clone();
+        let root = profile.path().to_path_buf();
+        let entered = Arc::new(AtomicBool::new(false));
+        let entered_in_start = entered.clone();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        begin_dm_restart(&mut dm, &mut dm_start, &evt_tx, async move {
+            entered_in_start.store(true, Ordering::SeqCst);
+            let _ = released.await;
+            Some(empty_runner(&root, records, RunnerConfig::default()))
+        });
+        wait_for(&entered, "the start to begin").await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch(command, &evt_tx, &mut dm, &mut dm_start),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} waited on the start in flight"));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch(
+                NetCommand::SendCircle {
+                    circle_id: 0,
+                    text: "hello".to_owned(),
+                },
+                &evt_tx,
+                &mut dm,
+                &mut dm_start,
+            ),
+        )
+        .await
+        .expect("the circle command waited on the start in flight");
+        assert!(
+            drain(&mut evt_rx)
+                .iter()
+                .any(|event| matches!(event, NetEvent::CircleError { .. })),
+            "the circle command was not answered"
+        );
+        assert!(
+            dm_start.as_ref().is_some_and(|start| !start.is_finished()),
+            "{name} did not wait for the start in flight"
+        );
+
+        release.send(()).expect("the start is waiting");
+        assert!(
+            wait_dm_start(&mut dm_start)
+                .await
+                .expect("the start task")
+                .is_none(),
+            "a runner was left in the slot after {name}"
+        );
+        assert!(dm.is_none());
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the runner the start produced is still running"
+        );
+        assert!(
+            drain(&mut evt_rx)
+                .iter()
+                .any(|event| matches!(event, NetEvent::DmStopped)),
+            "the stop of the runner the start produced was not reported"
+        );
+    }
+
+    /// A command the session's queue task cannot hand to the runner, because the
+    /// runner has stopped taking commands, is answered with
+    /// [`Refusal::ShuttingDown`] under its token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_command_the_runner_no_longer_takes_is_refused() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let DmSession { handle, commands } = DmSession::new(
+            empty_runner(
+                profile.path(),
+                EmptyRecords::new(Duration::ZERO),
+                RunnerConfig::default(),
+            ),
             &evt_tx,
-            &self_tx,
-            &mut net,
-            &mut ev_rx,
-            &mut circles,
-            &mut my_handle,
-            &mut shares,
-            &fetch_tx,
-            &confirm_tx,
-            false,
+        );
+        let stop = handle.shutdown().await;
+        if let ShutdownOutcome::TimedOut(end) = stop.outcome {
+            end.finish().await;
+        }
+        assert!(
+            drain(&mut evt_rx).is_empty(),
+            "control: nothing reached the UI before the command"
+        );
+
+        commands
+            .send(RunnerCommand::Send {
+                token: CommandToken(5),
+                peer: CorrespondenceLabel::mint().expect("label"),
+                body: b"late".to_vec(),
+            })
+            .expect("the session's queue is open");
+
+        let answer = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match evt_rx.recv().await {
+                    Some(NetEvent::Dm(event)) => {
+                        if let RunnerEvent::Refused { token, reason } = &*event {
+                            break (*token, *reason);
+                        }
+                    }
+                    Some(_) => continue,
+                    None => panic!("the event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("the refusal was not reported");
+        assert_eq!(answer, (Some(CommandToken(5)), Refusal::ShuttingDown));
+    }
+
+    /// A `NetCommand::Dm` sent to the actor while a runner is up reaches that
+    /// runner through the session's queue, and the runner's answer carries the
+    /// command's token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_command_reaches_the_runner_through_the_session_queue() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let mut dm = Some(DmSession::new(
+            empty_runner(
+                profile.path(),
+                EmptyRecords::new(Duration::ZERO),
+                RunnerConfig::default(),
+            ),
+            &evt_tx,
+        ));
+        let mut dm_start: Option<DmStart> = None;
+
+        dispatch(
+            NetCommand::Dm(RunnerCommand::Send {
+                token: CommandToken(9),
+                peer: CorrespondenceLabel::mint().expect("label"),
+                body: b"hello".to_vec(),
+            }),
+            &evt_tx,
             &mut dm,
+            &mut dm_start,
         )
         .await;
+        let session = dm.as_mut().expect("the runner is still in the slot");
 
+        let answer = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match session.handle.next_event().await {
+                    Some(RunnerEvent::Refused { token, reason }) => break (token, reason),
+                    Some(_) => continue,
+                    None => panic!("the runner ended without answering"),
+                }
+            }
+        })
+        .await
+        .expect("the runner answered");
+        assert_eq!(
+            answer,
+            (Some(CommandToken(9)), Refusal::UnknownConversation)
+        );
+    }
+
+    /// With no runner, a command is answered as the runner answers one it
+    /// stopped before serving, and a shutdown is answered with nothing.
+    #[tokio::test]
+    async fn a_dm_command_with_no_runner_is_refused() {
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let mut dm: Option<DmSession> = None;
+        let mut dm_start: Option<DmStart> = None;
+
+        for command in [
+            RunnerCommand::Send {
+                token: CommandToken(7),
+                peer: CorrespondenceLabel::mint().expect("label"),
+                body: b"hi".to_vec(),
+            },
+            RunnerCommand::Shutdown,
+        ] {
+            dispatch(NetCommand::Dm(command), &evt_tx, &mut dm, &mut dm_start).await;
+        }
+
+        match evt_rx.try_recv() {
+            Ok(NetEvent::Dm(event)) => match &*event {
+                RunnerEvent::Refused { token, reason } => {
+                    assert_eq!(*token, Some(CommandToken(7)));
+                    assert_eq!(*reason, Refusal::ShuttingDown);
+                }
+                other => panic!("expected a refusal, got {other:?}"),
+            },
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            evt_rx.try_recv().is_err(),
+            "a shutdown with no runner was answered"
+        );
         assert!(dm.is_none());
     }
 
-    /// Seal every record file under a profile's DM root so the store's own reads
-    /// fail. Returns the root, for restoring afterwards.
-    fn seal_dm_records(profile_root: &std::path::Path) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let root = profile_root.join("dm");
-        let mut sealed = 0usize;
-        for entry in std::fs::read_dir(&root).expect("the store root is readable") {
-            let path = entry.expect("dir entry").path();
-            if path.is_file() {
-                let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
-                perms.set_mode(0o000);
-                std::fs::set_permissions(&path, perms).expect("chmod");
-                sealed += 1;
-            }
-        }
-        assert!(
-            sealed > 0,
-            "the fixture sealed no record, so it proves nothing"
-        );
-        root
-    }
-
-    fn unseal_dm_records(root: &std::path::Path) {
-        use std::os::unix::fs::PermissionsExt;
-        for entry in std::fs::read_dir(root).expect("read_dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_file() {
-                let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(&path, perms);
-            }
-        }
-    }
-
-    /// #339: the ACTOR's spawn path survives a profile the driver cannot start
-    /// against. The failure runs on the caller's thread, and the caller here also
-    /// serves chat, shares and presence — so `spawn_dm_driver` must trace and
-    /// leave the slot empty, never panic.
-    ///
-    /// Distinct from the `try_spawn` test above, which drives the driver's own
-    /// entry point: this one drives the front end's, which is where a `spawn`
-    /// would actually kill something.
-    #[tokio::test]
-    async fn a_profile_the_driver_cannot_start_against_does_not_kill_the_actor() {
+    /// `GracefulClose` takes the runner down with the transport without waiting
+    /// on it, and still acks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_close_stops_the_runner() {
         let profile = tempfile::tempdir().expect("tempdir");
-
-        // Create the store, then seal its records.
-        let first = dm_driver_parts(
-            Arc::new(RefusingDht),
-            dm_test_keys(dm_test_identity()),
-            profile.path(),
-        )
-        .expect("the first open creates the store");
-        drop(first);
-        let root = seal_dm_records(profile.path());
-
-        // Positive control: the parts still BUILD against the sealed profile, so
-        // the failure this test cares about is the spawn's, not the open's. If
-        // this ever stops holding, the test below would pass for the wrong
-        // reason and this assertion is what says so.
-        let parts = dm_driver_parts(
-            Arc::new(RefusingDht),
-            dm_test_keys(dm_test_identity()),
-            profile.path(),
-        );
-        let parts_built = parts.is_ok();
-        drop(parts);
-        assert!(
-            parts_built,
-            "the fixture no longer reaches the spawn — it now fails at the store open"
-        );
-
-        let mut dm: Option<DmSession> = None;
-        spawn_dm_driver(
-            &mut dm,
-            Some(Arc::new(RefusingDht)),
-            Some(Box::new(dm_test_keys(dm_test_identity()))),
-            Some(profile.path()),
-        );
-        assert!(dm.is_none(), "no driver, as expected");
-
-        // The actor is still here: it went on to handle the next command.
         let (evt_tx, _evt_rx) = unbounded_channel();
-        let (fetch_tx, _fetch_rx) = unbounded_channel();
-        let (confirm_tx, _confirm_rx) = unbounded_channel();
-        let mut net = None;
-        let mut ev_rx = None;
-        let (self_tx, _self_rx) = unbounded_channel();
-        let mut circles = Vec::new();
-        let mut my_handle = "guest".to_owned();
-        let mut shares = ShareState::new();
-        handle_command(
-            NetCommand::Dm(DmCommand::Shutdown),
+        let records = EmptyRecords::new(Duration::ZERO);
+        let alive = records.alive.clone();
+        let mut dm = Some(DmSession::new(
+            empty_runner(profile.path(), records, RunnerConfig::default()),
             &evt_tx,
-            &self_tx,
-            &mut net,
-            &mut ev_rx,
-            &mut circles,
-            &mut my_handle,
-            &mut shares,
-            &fetch_tx,
-            &confirm_tx,
-            false,
+        ));
+        let mut dm_start: Option<DmStart> = None;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+
+        dispatch(
+            NetCommand::GracefulClose { ack: ack_tx },
+            &evt_tx,
             &mut dm,
+            &mut dm_start,
         )
         .await;
 
-        unseal_dm_records(&root);
+        assert!(dm.is_none(), "GracefulClose left the runner in the slot");
+        assert!(ack_rx.await.is_ok(), "the close must still ack");
+        assert!(
+            wait_dm_start(&mut dm_start)
+                .await
+                .expect("the start task")
+                .is_none()
+        );
+        assert_eq!(
+            Arc::strong_count(&alive),
+            1,
+            "the runner's task did not end"
+        );
     }
 }

@@ -1560,7 +1560,6 @@ fn connect_now(
                 republish_roots,
                 stable_signing_key,
                 stable_share_root_ikm,
-                stable_kem_encapsulation_key,
                 dm_session_keys,
                 profile_root,
                 project_announce_seed,
@@ -1579,14 +1578,9 @@ fn connect_now(
                     // (#156) Derive the share-root IKM ONCE per connect (same
                     // derivation) so a publish yields a receiver-verifiable share_id.
                     st.stable_share_root_ikm(),
-                    // (#232) Derive the stable KEM encapsulation key ONCE per connect
-                    // so the actor can publish the DM key record that makes this
-                    // identity reachable for direct messages. Public half only.
-                    st.stable_kem_encapsulation_key(),
-                    // (#339) Derive the DM driver's own halves — the FULL KEM
-                    // keypair, the doorbell slot secret and the profile at-rest
-                    // key — for the driver the actor spawns beside itself. `None`
-                    // on the ephemeral path, where no driver is spawned.
+                    // The direct-messaging runner's halves: the signing keypair,
+                    // the channel root and the profile at-rest key. `None` on the
+                    // ephemeral path, where no runner is started.
                     st.dm_session_keys(),
                     // (step 8b / DL-ISC-20) Hand the profile root to the actor so a
                     // verified resume anchors each fetch's manifest digest in the
@@ -1604,7 +1598,6 @@ fn connect_now(
                 republish_roots,
                 stable_signing_key,
                 stable_share_root_ikm,
-                stable_kem_encapsulation_key,
                 dm_session_keys,
                 profile_root,
                 project_announce_seed,
@@ -1653,10 +1646,13 @@ fn apply_net_event(
     evt: NetEvent,
 ) {
     match evt {
-        // (#339) DM driver events fold into `GuiState.dm` and touch no other
-        // state. No interface renders them yet, so
-        // no Slint property changes when one is folded.
+        // Direct-messaging runner events reach `GuiState::on_dm_event`, which
+        // keeps only the trust-log entry. No interface draws direct messages, so
+        // no Slint property changes.
         NetEvent::Dm(ref event) => state.borrow_mut().on_dm_event(event),
+        // No interface draws direct messages, so a stopped runner changes nothing
+        // on screen.
+        NetEvent::DmStopped => {}
         NetEvent::Connected => {
             // #182: transport-level status — a client attaches to the Veilid network,
             // not to a room. Room-scoped phrasing ("connected · lobby") was relay-era
