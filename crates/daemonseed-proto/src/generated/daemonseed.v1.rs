@@ -1140,8 +1140,8 @@ pub struct DmChannelSlot {
 /// than an additive proto bump: a future client could name a prekey and fall back
 /// to `STATIC` against an older peer. Prekeys were dropped for alpha (and are
 /// expected to stay dropped), which is why the opening burst before the
-/// recipient's first reply has no forward secrecy — see ISC-C45's hello-grade
-/// labeling requirement, which is the mitigation.
+/// recipient's first reply has no forward secrecy beyond the advert key's
+/// rotation — see the direct-messaging design, § Keys and forward secrecy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum KeySelector {

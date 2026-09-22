@@ -197,9 +197,9 @@ const STEADY_RESWEEP_WARMUP_HANDOFF: Duration = Duration::from_secs(70);
 /// content feeds the #93 landing), then lobby chat. These are re-swept every round;
 /// circle records are handled separately (early rounds only — see
 /// [`WARMUP_CIRCLE_RESWEEP_ROUNDS`]). Presence records are excluded (they self-heal via
-/// the heartbeat emit/reap cycle). Order is issue-order and load-bearing: a round's
-/// sweeps are issued together in this order, so the actor opens the operator record
-/// first, and their backlog reads then overlap until the last one finishes.
+/// the heartbeat emit/reap cycle). Order is issue-order and load-bearing: within a round
+/// each `resweep_rendezvous` awaits its record open before the next is issued, so the
+/// operator sweep is dispatched first (the spawned backlog reads then overlap).
 ///
 /// Takes the session state and derives the three records itself, rather than taking
 /// them as arguments the caller builds. A test can then assert over the SAME derivation
@@ -1189,13 +1189,9 @@ async fn handle_refresh_shares(
     let handle = handle.clone();
     let busy = resweep_busy.clone();
     tokio::spawn(async move {
-        // The wave's sweeps run together; the guard is held until the last one ends.
-        futures_util::future::join_all(
-            records
-                .into_iter()
-                .map(|(_, owner)| handle.resweep_rendezvous(owner)),
-        )
-        .await;
+        for (_, owner) in records {
+            let _ = handle.resweep_rendezvous(owner).await;
+        }
         busy.store(false, std::sync::atomic::Ordering::Release);
     });
 }
@@ -1903,22 +1899,16 @@ async fn handle_command(
                         for (round, &at) in WARMUP_RESWEEP_SCHEDULE.iter().enumerate() {
                             tokio::time::sleep_until(start + at).await;
                             // Operator + lobby every round (top priority + #93 landing feed).
+                            for owner in &priority {
+                                let _ = handle.resweep_rendezvous(owner.clone()).await;
+                            }
                             // Circles only in the early rounds — bounds the fan-out for a
-                            // heavily-joined user (#140 review). A round's sweeps run
-                            // together, and the round ends when the last one does.
-                            let circles_this_round: &[RendezvousOwner] =
-                                if round < WARMUP_CIRCLE_RESWEEP_ROUNDS {
-                                    &circle_owners
-                                } else {
-                                    &[]
-                                };
-                            futures_util::future::join_all(
-                                priority
-                                    .iter()
-                                    .chain(circles_this_round)
-                                    .map(|owner| handle.resweep_rendezvous(owner.clone())),
-                            )
-                            .await;
+                            // heavily-joined user (#140 review).
+                            if round < WARMUP_CIRCLE_RESWEEP_ROUNDS {
+                                for owner in &circle_owners {
+                                    let _ = handle.resweep_rendezvous(owner.clone()).await;
+                                }
+                            }
                         }
                     });
                 }

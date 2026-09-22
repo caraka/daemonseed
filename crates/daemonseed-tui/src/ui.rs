@@ -20,12 +20,12 @@ use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 use daemonseed_veilid_net::dm::runner::{ConversationState, HealthCounters};
+use daemonseed_veilid_net::dm::view::{DmThreadRow, dm_fingerprint};
 
 use crate::app::{
     App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, DM_ACCEPT_KEY, DM_BLOCK_KEY,
-    DM_BLOCK_LIST_UNREADABLE, DM_DECLINE_KEY, DM_HELLO_GRADE, DM_PANE_KEY, DirSelection,
-    DmThreadRow, FetchStatus, FetchUi, IndexerStatus, MainFocus, PreviewKind, Screen, Surface,
-    TrustItem, dm_fingerprint, dm_refusal_phrase,
+    DM_BLOCK_LIST_UNREADABLE, DM_DECLINE_KEY, DM_PANE_KEY, DirSelection, FetchStatus, FetchUi,
+    IndexerStatus, MainFocus, PreviewKind, Screen, Surface, TrustItem, dm_refusal_phrase,
 };
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
@@ -1465,10 +1465,9 @@ fn wrap_row(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// One conversation's thread: the hello-grade label where the conversation is
-/// not established, the messages in the order this session heard of them, the
-/// messages composed and not yet answered, and the refusal that stopped the last
-/// send.
+/// One conversation's thread: the messages in the order this session heard of
+/// them, the messages composed and not yet answered, and the refusal that
+/// stopped the last send.
 ///
 /// A received message carries the time this side collected it, labelled as the
 /// received time. A sent message carries the word for how far it got:
@@ -1490,18 +1489,6 @@ fn render_dm_thread(app: &App, frame: &mut Frame, area: Rect) {
             style,
         });
     };
-
-    // Drawn on anything the roster has not called established, so a state it
-    // has not stated warns rather than stays quiet. Not on a blocked
-    // conversation, which is no longer collected.
-    let labelled = !app.dm_is_blocked(pk)
-        && correspondence.and_then(|c| c.state) != Some(ConversationState::Established);
-    if labelled {
-        push(
-            DM_HELLO_GRADE.to_owned(),
-            Style::default().fg(Color::Yellow).bold(),
-        );
-    }
 
     if composed.is_empty() && correspondence.is_none_or(|c| c.thread.is_empty()) {
         push(

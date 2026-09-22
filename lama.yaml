@@ -324,11 +324,12 @@ capabilities:
       records, reading through the DHT gate and writing through the write
       scheduler. `runner` is the task a front end spawns to drive one
       identity's conversations over that record store: `RunnerCommand` in,
-      `RunnerEvent` out.
+      `RunnerEvent` out. `view` is the view model a front end renders.
     crate: daemonseed-veilid-net
     modules:
       - daemonseed_veilid_net::dm::records
       - daemonseed_veilid_net::dm::runner
+      - daemonseed_veilid_net::dm::view
     iscs: [C39, C40, C41, C42, C43, C45, A-C21, A-C24]
 
   - category: "Wire schema (proto)"

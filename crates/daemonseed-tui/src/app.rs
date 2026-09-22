@@ -4,25 +4,22 @@
 //! [`App::on_key`]. It performs no terminal I/O, so it is fully unit-testable
 //! and deterministically driveable by the PTY gate harness.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use daemonseed_core::backoff::CloseCause;
 use daemonseed_core::crypto::suite::SuiteId;
-use daemonseed_core::dm::drop::DROP_SUBKEYS;
 use daemonseed_core::first_start::SessionMaterials;
 use daemonseed_core::handle::{DisplayMode, Handle};
 use daemonseed_core::identity::keys::SignKeypair;
 use daemonseed_core::passphrase::strength::{self, CircleStrength};
 use daemonseed_core::profile::config::ArgonParams;
 use daemonseed_core::share_catalog::ShareListing;
-use daemonseed_core::storage::dm_store::{CorrespondenceLabel, RecordKind};
+use daemonseed_core::storage::dm_store::RecordKind;
 use daemonseed_core::storage::seeds::{SealingKey, Seeds};
 use daemonseed_core::trust_events::{
     DismissalScope, TrustEventClass, TrustEventKey, TrustEventLog, TrustEventScope, class_of,
 };
-use daemonseed_veilid_net::dm::runner::{
-    CommandToken, ContactRequestId, ConversationState, HealthCounters, IdentityPk, Refusal,
-    RunnerCommand, RunnerEvent,
+use daemonseed_veilid_net::dm::runner::{IdentityPk, Refusal, RunnerCommand, RunnerEvent};
+use daemonseed_veilid_net::dm::view::{
+    DmAcceptDraft, DmContactRequest, DmCorrespondence, DmOutstanding, DmState,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
@@ -234,23 +231,13 @@ pub const DM_BLOCK_KEY: char = 'b';
 
 /// The reply an accept starts from. An acceptance always carries a first
 /// message, so the composer opens with one the user can edit or send as it is.
-pub const DM_ACCEPT_REPLY: &str = "hello";
+pub const DM_ACCEPT_REPLY: &str = "message accepted";
 
 /// What the direct-message pane and the status line say while the runner cannot
 /// read its block list: who is blocked is unknown, so no request is surfaced and
 /// no conversation is collected until the list reads again.
 pub const DM_BLOCK_LIST_UNREADABLE: &str =
     "messaging: block list unreadable — requests and conversations paused";
-
-/// The label a thread carries while the conversation is not established.
-///
-/// A message written before the correspondent has answered is read under less
-/// protection than one in an established conversation, so the property the user
-/// has to act on is that this message is hello-grade.
-///
-/// Drawn wherever the runner's roster has not called the conversation
-/// established, and not on a blocked one, which is no longer collected.
-pub const DM_HELLO_GRADE: &str = "not yet secured; say hello, not secrets";
 
 /// [`DM_PANE_KEY`] with Shift held. Derived rather than written out, so the two
 /// cases of one key cannot drift apart.
@@ -1207,247 +1194,6 @@ pub struct App {
     pending_dm_stop: bool,
 }
 
-/// A reply to a contact request, being written.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DmAcceptDraft {
-    /// The request the reply accepts.
-    pub request: ContactRequestId,
-    /// The identity that sent it.
-    pub from: IdentityPk,
-    /// The reply as edited so far.
-    pub reply: String,
-}
-
-impl std::fmt::Debug for DmAcceptDraft {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DmAcceptDraft {{ request: {:?}, from: ", self.request)?;
-        redacted_pk(f)?;
-        write!(f, ", reply_len: {} }}", self.reply.len())
-    }
-}
-
-/// One conversation, as the runner has reported it.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct DmCorrespondence {
-    /// The label the runner names this conversation by, once one is known.
-    pub label: Option<CorrespondenceLabel>,
-    /// What the runner's roster last said about this conversation, or `None`
-    /// before a roster has named it.
-    pub state: Option<ConversationState>,
-    /// The correspondent's cursor over this side's messages, from the roster:
-    /// every sequence below it has been collected.
-    pub peer_collected: u64,
-    /// The highest sequence of this side's the correspondent has collected, from
-    /// the last delivery report.
-    pub delivered_through: Option<u64>,
-    /// The conversation's messages, in the order this session heard of them.
-    pub thread: Vec<DmThreadRow>,
-    /// The refusal that stopped the last send, held until a send goes through.
-    pub refusal: Option<Refusal>,
-    /// The value [`DmState::activity_seq`] had when an event last named this
-    /// conversation: the key the roster is drawn by, newest first.
-    ///
-    /// A counter rather than a clock, because the order statements arrived in
-    /// is the only recency this state has.
-    pub last_activity: u64,
-}
-
-impl std::fmt::Debug for DmCorrespondence {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The label is left out: it names the conversation on disk.
-        f.debug_struct("DmCorrespondence")
-            .field("state", &self.state)
-            .field("peer_collected", &self.peer_collected)
-            .field("delivered_through", &self.delivered_through)
-            .field("thread", &self.thread)
-            .field("refusal", &self.refusal)
-            .field("last_activity", &self.last_activity)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DmCorrespondence {
-    /// Whether the correspondent has collected this side's message `seq`, by
-    /// the roster's cursor or by a later delivery report.
-    pub fn delivered(&self, seq: u64) -> bool {
-        seq < self.peer_collected || self.delivered_through.is_some_and(|through| seq <= through)
-    }
-
-    /// Record a thread row, replacing the row held at the same position.
-    ///
-    /// A sent row without a body never replaces one with a body: the body is
-    /// what this session composed, and a later report of the same message does
-    /// not carry it.
-    fn record(&mut self, row: DmThreadRow) {
-        match self.thread.iter_mut().find(|held| held.same_position(&row)) {
-            Some(DmThreadRow::Sent { body: Some(_), .. })
-                if matches!(row, DmThreadRow::Sent { body: None, .. }) => {}
-            Some(held) => *held = row,
-            None => self.thread.push(row),
-        }
-    }
-}
-
-/// One row of a conversation's thread.
-#[derive(Clone, PartialEq, Eq)]
-pub enum DmThreadRow {
-    /// A message the correspondent wrote.
-    Received {
-        /// Its sequence number in the correspondent's direction.
-        seq: u64,
-        /// The message body.
-        body: String,
-        /// When this side collected it, in Unix milliseconds.
-        received_at_ms: u64,
-    },
-    /// A message this side wrote, in the store and in its slot.
-    Sent {
-        /// Its sequence number in this side's direction.
-        seq: u64,
-        /// The body, or `None` for a message this session did not compose.
-        body: Option<String>,
-    },
-}
-
-impl DmThreadRow {
-    /// Whether two rows stand for the same message: the same direction and the
-    /// same sequence number.
-    fn same_position(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Received { seq: a, .. }, Self::Received { seq: b, .. })
-            | (Self::Sent { seq: a, .. }, Self::Sent { seq: b, .. }) => a == b,
-            _ => false,
-        }
-    }
-}
-
-impl std::fmt::Debug for DmThreadRow {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // A body is plaintext a person wrote. Length only.
-        match self {
-            Self::Received {
-                seq,
-                body,
-                received_at_ms,
-            } => write!(
-                f,
-                "Received {{ seq: {seq}, body_len: {}, received_at_ms: {received_at_ms} }}",
-                body.len()
-            ),
-            Self::Sent { seq, body } => write!(
-                f,
-                "Sent {{ seq: {seq}, body_len: {:?} }}",
-                body.as_ref().map(String::len)
-            ),
-        }
-    }
-}
-
-/// The most contact requests the pane holds: one per drop slot, which is the
-/// most the runner holds at once. The oldest row is dropped to make room.
-pub const DM_REQUEST_CAP: usize = DROP_SUBKEYS as usize;
-
-/// The most collected messages held for labels no event has named yet. The
-/// oldest is dropped to make room.
-const DM_UNMAPPED_CAP: usize = 256;
-
-/// The direct-messaging state one session has accumulated from runner events.
-///
-/// A record of what was said, not a model of the conversation: the runner owns
-/// every decision, and this holds what the pane draws. Nothing here is
-/// persisted, and a restart re-derives it from a fresh runner's events.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct DmState {
-    /// Whether a runner is reporting: false until one starts on a node, and
-    /// again after it stops.
-    pub running: bool,
-    /// Contact requests awaiting an answer, one row per identity, oldest first.
-    pub requests: Vec<DmContactRequest>,
-    /// Conversations, keyed by the correspondent's identity public key.
-    pub correspondences: BTreeMap<IdentityPk, DmCorrespondence>,
-    /// The identity each label the runner has named belongs to.
-    pub labels: BTreeMap<CorrespondenceLabel, IdentityPk>,
-    /// Commands sent and not yet answered, by the token each carries.
-    pub outstanding: BTreeMap<CommandToken, DmOutstanding>,
-    /// Identities the runner has blocked.
-    pub blocked: BTreeSet<IdentityPk>,
-    /// Whether the runner could not read its block list since it last reported
-    /// one. While true, who is blocked is unknown, no request arrives and no
-    /// conversation is collected, and `blocked` holds only the last list read.
-    pub block_list_unknown: bool,
-    /// Identities this session has asked the runner to block that nothing has
-    /// yet confirmed or refused. Their requests are held back meanwhile.
-    pub blocking: BTreeSet<IdentityPk>,
-    /// Identities whose requests this session has hidden.
-    pub declined: BTreeSet<IdentityPk>,
-    /// The last refusal of any command.
-    pub last_refusal: Option<Refusal>,
-    /// The runner's last health report.
-    pub health: Option<HealthCounters>,
-    /// A monotonic count of the events that named a conversation, stamped onto
-    /// [`DmCorrespondence::last_activity`].
-    pub activity_seq: u64,
-    /// Collected messages whose label no event has named yet, held until one
-    /// does. An accepted request's messages arrive before the answer that names
-    /// their conversation.
-    unmapped: Vec<(CorrespondenceLabel, DmThreadRow)>,
-    /// The last command token handed out.
-    last_token: u64,
-}
-
-/// A command sent to the runner and not yet answered.
-#[derive(Clone, PartialEq, Eq)]
-pub enum DmOutstanding {
-    /// A message on an established conversation.
-    Send {
-        /// The correspondent.
-        peer: IdentityPk,
-        /// The body.
-        body: String,
-    },
-    /// An acceptance of a contact request.
-    Accept {
-        /// The request.
-        request: ContactRequestId,
-        /// The identity that sent it.
-        from: IdentityPk,
-        /// The reply.
-        reply: String,
-    },
-}
-
-impl std::fmt::Debug for DmOutstanding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Send { body, .. } => {
-                f.write_str("Send { peer: ")?;
-                redacted_pk(f)?;
-                write!(f, ", body_len: {} }}", body.len())
-            }
-            Self::Accept { request, reply, .. } => {
-                write!(f, "Accept {{ request: {request:?}, from: ")?;
-                redacted_pk(f)?;
-                write!(f, ", reply_len: {} }}", reply.len())
-            }
-        }
-    }
-}
-
-/// A correspondent's identity key, as a trace line may show it: the marker only.
-/// The key itself is 2592 bytes and names a person.
-fn redacted_pk(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str("IdentityPk(..)")
-}
-
-/// A correspondent's identity key as the direct-message pane names it: the
-/// first four bytes, hex.
-///
-/// Four bytes tell apart the handful of rows a roster holds and leave room on
-/// an 80-column row. It is a label for a list, not a verification string.
-pub fn dm_fingerprint(pk: &IdentityPk) -> String {
-    pk.iter().take(4).map(|b| format!("{b:02x}")).collect()
-}
-
 /// What a refusal is said as: why the command did not go and, where the reason
 /// implies one, what to do next.
 ///
@@ -1473,339 +1219,6 @@ pub fn dm_refusal_phrase(reason: Refusal) -> &'static str {
         Refusal::Network => "the network would not read or write",
         Refusal::Flow => "the message could not be composed",
         Refusal::ShuttingDown => "messaging stopped before it went",
-    }
-}
-
-impl std::fmt::Debug for DmState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Hand-written because the derive would print every identity key in full.
-        f.debug_struct("DmState")
-            .field("running", &self.running)
-            .field("requests", &self.requests)
-            .field("correspondences", &self.correspondences.len())
-            .field(
-                "outstanding",
-                &self.outstanding.values().collect::<Vec<_>>(),
-            )
-            .field("blocked", &self.blocked.len())
-            .field("declined", &self.declined.len())
-            .field("last_refusal", &self.last_refusal)
-            .field("health", &self.health)
-            .finish_non_exhaustive()
-    }
-}
-
-/// A contact request as the pane draws it.
-#[derive(Clone, PartialEq, Eq)]
-pub struct DmContactRequest {
-    /// The id the runner holds the request under.
-    pub request: ContactRequestId,
-    /// The identity that signed its channel opening.
-    pub from: IdentityPk,
-    /// Whether the sender has an established conversation here and started
-    /// over. Such a request cannot be accepted while that conversation remains.
-    pub started_over: bool,
-    /// When this session first held a request from this identity, in Unix
-    /// milliseconds.
-    pub held_at_ms: i64,
-}
-
-impl std::fmt::Debug for DmContactRequest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "DmContactRequest {{ request: {:?}, from: ", self.request)?;
-        redacted_pk(f)?;
-        write!(
-            f,
-            ", started_over: {}, held_at_ms: {} }}",
-            self.started_over, self.held_at_ms
-        )
-    }
-}
-
-/// What folding one runner event leaves the caller to act on.
-struct DmFold {
-    /// Whether the oldest pending request was dropped to make room, which moves
-    /// every row below it up by one. `DmState` does not hold the cursor.
-    evicted_oldest: bool,
-    /// The reply of an acceptance the runner refused, with the reason.
-    refused_accept: Option<(DmAcceptDraft, Refusal)>,
-}
-
-impl DmState {
-    /// Advance [`Self::activity_seq`] and return its new value.
-    fn next_activity(&mut self) -> u64 {
-        self.activity_seq = self.activity_seq.saturating_add(1);
-        self.activity_seq
-    }
-
-    /// A token no command of this session has carried.
-    fn next_token(&mut self) -> CommandToken {
-        self.last_token = self.last_token.wrapping_add(1);
-        CommandToken(self.last_token)
-    }
-
-    /// The bodies sent to `peer` that the runner has not answered, oldest first.
-    pub fn composed_to(&self, peer: &IdentityPk) -> Vec<&str> {
-        self.outstanding
-            .values()
-            .filter_map(|outstanding| match outstanding {
-                DmOutstanding::Send { peer: to, body } if to == peer => Some(body.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Whether an acceptance of `request` has been sent and not answered.
-    pub fn accepting(&self, request: &ContactRequestId) -> bool {
-        self.outstanding.values().any(|outstanding| {
-            matches!(outstanding, DmOutstanding::Accept { request: r, .. } if r == request)
-        })
-    }
-
-    /// Record that `label` names `peer`'s conversation, and move every message
-    /// held for the label into its thread.
-    fn map_label(&mut self, label: CorrespondenceLabel, peer: &IdentityPk) {
-        self.labels.insert(label, peer.clone());
-        let held = std::mem::take(&mut self.unmapped);
-        let (mine, rest): (Vec<_>, Vec<_>) = held.into_iter().partition(|(l, _)| *l == label);
-        self.unmapped = rest;
-        let activity = if mine.is_empty() {
-            None
-        } else {
-            Some(self.next_activity())
-        };
-        let entry = self.correspondences.entry(peer.clone()).or_default();
-        entry.label = Some(label);
-        if let Some(activity) = activity {
-            entry.last_activity = activity;
-        }
-        for (_, row) in mine {
-            entry.record(row);
-        }
-    }
-
-    /// Hold a request, one row per identity. Returns whether the oldest row was
-    /// dropped to make room.
-    fn hold_request(
-        &mut self,
-        request: ContactRequestId,
-        from: &IdentityPk,
-        started_over: bool,
-        now_ms: i64,
-    ) -> bool {
-        if self.declined.contains(from)
-            || self.blocked.contains(from)
-            || self.blocking.contains(from)
-        {
-            return false;
-        }
-        if let Some(row) = self.requests.iter_mut().find(|row| row.from == *from) {
-            row.request = request;
-            row.started_over = started_over;
-            return false;
-        }
-        let evicted = self.requests.len() >= DM_REQUEST_CAP;
-        if evicted {
-            self.requests.remove(0);
-        }
-        self.requests.push(DmContactRequest {
-            request,
-            from: from.clone(),
-            started_over,
-            held_at_ms: now_ms,
-        });
-        evicted
-    }
-
-    /// The runner stopped: nothing is reporting, the requests it held are gone
-    /// with it, and no command sent to it will be answered. Every message sent
-    /// and not answered is marked not sent, and their count returned.
-    fn stop(&mut self) -> usize {
-        self.running = false;
-        self.requests.clear();
-        self.unmapped.clear();
-        self.blocking.clear();
-        let mut unsent = 0;
-        for outstanding in std::mem::take(&mut self.outstanding).into_values() {
-            if let DmOutstanding::Send { peer, .. } = outstanding {
-                unsent += 1;
-                if let Some(entry) = self.correspondences.get_mut(&peer) {
-                    entry.refusal = Some(Refusal::ShuttingDown);
-                }
-            }
-        }
-        unsent
-    }
-
-    /// Fold one runner event at `now_ms`, returning what the caller has to act
-    /// on.
-    fn fold(&mut self, event: &RunnerEvent, now_ms: i64) -> DmFold {
-        let mut evicted_oldest = false;
-        let mut refused_accept = None;
-        match event {
-            RunnerEvent::Roster(rows) => {
-                self.running = true;
-                let named: BTreeSet<IdentityPk> = rows
-                    .iter()
-                    .map(|row| row.peer_identity_pk.clone())
-                    .collect();
-                self.correspondences.retain(|pk, _| named.contains(pk));
-                self.labels.retain(|_, pk| named.contains(pk));
-                for row in rows {
-                    let known = self.correspondences.get(&row.peer_identity_pk);
-                    let changed = known.is_none_or(|entry| entry.state != Some(row.state));
-                    let activity = if changed {
-                        Some(self.next_activity())
-                    } else {
-                        None
-                    };
-                    self.map_label(row.peer, &row.peer_identity_pk);
-                    let entry = self
-                        .correspondences
-                        .entry(row.peer_identity_pk.clone())
-                        .or_default();
-                    entry.state = Some(row.state);
-                    entry.peer_collected = row.peer_collected;
-                    if let Some(activity) = activity {
-                        entry.last_activity = activity;
-                    }
-                }
-                // A plain request from an identity the roster now names has been
-                // answered by an acceptance.
-                self.requests
-                    .retain(|request| request.started_over || !named.contains(&request.from));
-            }
-            RunnerEvent::ContactRequest { request, from } => {
-                evicted_oldest = self.hold_request(*request, from, false, now_ms);
-            }
-            RunnerEvent::StartedOver { request, from } => {
-                evicted_oldest = self.hold_request(*request, from, true, now_ms);
-            }
-            RunnerEvent::Message {
-                from,
-                seq,
-                body,
-                received_at,
-            } => {
-                let row = DmThreadRow::Received {
-                    seq: *seq,
-                    body: String::from_utf8_lossy(body).into_owned(),
-                    received_at_ms: *received_at,
-                };
-                match self.labels.get(from).cloned() {
-                    Some(peer) => {
-                        let activity = self.next_activity();
-                        let entry = self.correspondences.entry(peer).or_default();
-                        entry.last_activity = activity;
-                        entry.record(row);
-                    }
-                    None => {
-                        if self.unmapped.len() >= DM_UNMAPPED_CAP {
-                            self.unmapped.remove(0);
-                        }
-                        self.unmapped.push((*from, row));
-                    }
-                }
-            }
-            RunnerEvent::Sent { token, peer, seq } => {
-                let (identity, body) = match self.outstanding.remove(token) {
-                    Some(DmOutstanding::Send {
-                        peer: identity,
-                        body,
-                    }) => (Some(identity), Some(body)),
-                    Some(DmOutstanding::Accept { from, reply, .. }) => {
-                        self.requests.retain(|request| request.from != from);
-                        (Some(from), Some(reply))
-                    }
-                    None => (self.labels.get(peer).cloned(), None),
-                };
-                if let Some(identity) = identity {
-                    self.map_label(*peer, &identity);
-                    let activity = self.next_activity();
-                    let entry = self.correspondences.entry(identity).or_default();
-                    entry.last_activity = activity;
-                    if body.is_some() {
-                        entry.refusal = None;
-                    }
-                    entry.record(DmThreadRow::Sent { seq: *seq, body });
-                }
-            }
-            RunnerEvent::Deleted { token, peer } => {
-                self.outstanding.remove(token);
-                if let Some(identity) = self.labels.remove(peer) {
-                    self.correspondences.remove(&identity);
-                }
-            }
-            RunnerEvent::Delivered { peer, through_seq } => {
-                if let Some(entry) = self
-                    .labels
-                    .get(peer)
-                    .and_then(|identity| self.correspondences.get_mut(identity))
-                {
-                    entry.delivered_through = Some(
-                        entry
-                            .delivered_through
-                            .map_or(*through_seq, |through| through.max(*through_seq)),
-                    );
-                }
-            }
-            RunnerEvent::Accepted { peer } => {
-                if let Some(identity) = self.labels.get(peer).cloned() {
-                    let activity = self.next_activity();
-                    let entry = self.correspondences.entry(identity).or_default();
-                    entry.state = Some(ConversationState::Established);
-                    entry.last_activity = activity;
-                }
-            }
-            RunnerEvent::Refused { token, reason } => {
-                self.last_refusal = Some(*reason);
-                match token.and_then(|token| self.outstanding.remove(&token)) {
-                    Some(DmOutstanding::Send { peer, .. }) => {
-                        if let Some(entry) = self.correspondences.get_mut(&peer) {
-                            entry.refusal = Some(*reason);
-                        }
-                    }
-                    // A refused acceptance leaves its request listed, and its
-                    // reply goes back to the caller so it can be sent again.
-                    Some(DmOutstanding::Accept {
-                        request,
-                        from,
-                        reply,
-                    }) => {
-                        refused_accept = Some((
-                            DmAcceptDraft {
-                                request,
-                                from,
-                                reply,
-                            },
-                            *reason,
-                        ));
-                    }
-                    // A refusal without a token answers a block, which did not
-                    // take effect.
-                    None if token.is_none() => self.blocking.clear(),
-                    None => {}
-                }
-            }
-            RunnerEvent::BlockListUnreadable => self.block_list_unknown = true,
-            RunnerEvent::BlockList(identities) => {
-                self.block_list_unknown = false;
-                self.blocked = identities.iter().cloned().collect();
-                // A block the store accepted is now listed, so it is no longer
-                // pending; one still unlisted stays pending until refused.
-                self.blocking.retain(|pk| !self.blocked.contains(pk));
-                self.requests
-                    .retain(|request| !self.blocked.contains(&request.from));
-            }
-            RunnerEvent::Health(counters) => {
-                self.running = true;
-                self.health = Some(*counters);
-            }
-        }
-        DmFold {
-            evicted_oldest,
-            refused_accept,
-        }
     }
 }
 
@@ -3142,12 +2555,7 @@ impl App {
     /// Ties break on the identity key, which is total and stable, so the pane's
     /// row order is a function of the state alone.
     pub fn dm_correspondences(&self) -> Vec<(&IdentityPk, &DmCorrespondence)> {
-        let mut rows: Vec<(&IdentityPk, &DmCorrespondence)> =
-            self.dm.correspondences.iter().collect();
-        rows.sort_by(|(a_pk, a), (b_pk, b)| {
-            b.last_activity.cmp(&a.last_activity).then(a_pk.cmp(b_pk))
-        });
-        rows
+        self.dm.correspondences_newest_first()
     }
 
     /// The conversation whose thread is open, or `None` while the pane shows
@@ -3173,9 +2581,6 @@ impl App {
     }
 
     /// Whether the runner has blocked `pk`.
-    ///
-    /// The one place the pane asks, so the blocked label and the thread's
-    /// hello-grade gate read the same answer.
     pub fn dm_is_blocked(&self, pk: &IdentityPk) -> bool {
         self.dm.blocked.contains(pk)
     }
@@ -4919,6 +4324,11 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daemonseed_core::storage::dm_store::CorrespondenceLabel;
+    use daemonseed_veilid_net::dm::runner::{
+        CommandToken, ContactRequestId, ConversationState, HealthCounters,
+    };
+    use daemonseed_veilid_net::dm::view::{DM_REQUEST_CAP, DmThreadRow};
     use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -10611,32 +10021,9 @@ mod tests {
         );
     }
 
-    /// A thread not yet established carries the hello-grade label, and loses it
-    /// once the runner reports the conversation accepted. The label is the
-    /// control for itself: absent after, present before.
+    /// A blocked conversation draws as blocked, from the one set the pane asks.
     #[test]
-    fn acceptance_retires_the_hello_grade_label() {
-        let (mut app, label) = dm_thread_app(6, ConversationState::Pending);
-        assert!(
-            dm_pane_rows(&app)
-                .iter()
-                .any(|row| row.contains(DM_HELLO_GRADE)),
-            "a pending conversation drew no hello-grade label; drew:\n{}",
-            dm_pane_rows(&app).join("\n")
-        );
-        dm_event(&mut app, RunnerEvent::Accepted { peer: label });
-        assert!(
-            !dm_pane_rows(&app)
-                .iter()
-                .any(|row| row.contains(DM_HELLO_GRADE)),
-            "an accepted conversation still carries the label"
-        );
-    }
-
-    /// A blocked conversation draws as blocked and carries no hello-grade label,
-    /// from the one set the pane asks.
-    #[test]
-    fn a_blocked_conversation_draws_blocked_and_no_label() {
+    fn a_blocked_conversation_draws_blocked() {
         let mut app = dm_pane_app();
         let label = mint_label();
         dm_event(
@@ -10659,11 +10046,53 @@ mod tests {
             dm_pane_rows(&app).join("\n")
         );
         app.on_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.dm_thread(),
+            Some(&dm_pk(3)),
+            "the blocked thread did not open"
+        );
         assert!(
-            !dm_pane_rows(&app)
+            dm_pane_rows(&app)
                 .iter()
-                .any(|row| row.contains(DM_HELLO_GRADE)),
-            "a blocked conversation carries the hello-grade label"
+                .any(|row| row.contains("(no messages in this correspondence)")),
+            "drew:\n{}",
+            dm_pane_rows(&app).join("\n")
+        );
+    }
+
+    /// A conversation accepted while its thread is open keeps drawing that
+    /// thread, and the roster it returns to reads established.
+    #[test]
+    fn acceptance_reaches_an_open_pending_thread() {
+        let (mut app, label) = dm_thread_app(6, ConversationState::Pending);
+        dm_event(
+            &mut app,
+            RunnerEvent::Message {
+                from: label,
+                seq: 0,
+                body: b"hi from six".to_vec(),
+                received_at: 1,
+            },
+        );
+        let drawn =
+            |app: &App, needle: &str| dm_pane_rows(app).iter().any(|row| row.contains(needle));
+        assert!(drawn(&app, "hi from six"), "control: the thread draws");
+        app.on_key(press(KeyCode::Esc));
+        assert!(drawn(&app, "06060606 · pending acceptance"), "control");
+        app.on_key(press(KeyCode::Enter));
+
+        dm_event(&mut app, RunnerEvent::Accepted { peer: label });
+        assert_eq!(app.dm_thread(), Some(&dm_pk(6)));
+        assert!(
+            drawn(&app, "hi from six"),
+            "drew:\n{}",
+            dm_pane_rows(&app).join("\n")
+        );
+        app.on_key(press(KeyCode::Esc));
+        assert!(
+            drawn(&app, "06060606 · established"),
+            "drew:\n{}",
+            dm_pane_rows(&app).join("\n")
         );
     }
 

@@ -362,14 +362,14 @@ impl ContactRequestId {
     /// within that run, for a front end's own tests to build the events a runner
     /// sends.
     ///
-    /// Only with the `test-support` feature, which is off by default. Without it
-    /// no code outside the runner can make an id, so an accept can only name a
-    /// request a runner surfaced.
+    /// Only with the `test-support` feature, which is off by default, and in this
+    /// crate's own tests. Without either no code outside the runner can make an
+    /// id, so an accept can only name a request a runner surfaced.
     #[cfg_attr(
         feature = "test-support",
         doc = "```\nuse daemonseed_veilid_net::dm::runner::ContactRequestId;\n\nassert_eq!(ContactRequestId::for_test(1, 2), ContactRequestId::for_test(1, 2));\nassert_ne!(ContactRequestId::for_test(1, 2), ContactRequestId::for_test(1, 3));\n```"
     )]
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(epoch: u64, serial: u64) -> Self {
         Self { epoch, serial }
     }

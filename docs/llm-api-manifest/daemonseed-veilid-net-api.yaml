@@ -162,6 +162,15 @@ modules:
     no_std: false
     depends_on:
       - daemonseed_veilid_net::dm
+  - name: daemonseed_veilid_net::dm::view
+    description: >-
+      The direct-message view model a front end draws from: DmState folds each
+      RunnerEvent into pending contact requests, conversations with their
+      threads, and the commands sent and not yet answered. Holds no decisions;
+      the runner owns every one. RAM-only.
+    no_std: false
+    depends_on:
+      - daemonseed_veilid_net::dm::runner
   - name: daemonseed_veilid_net::schedule
     description: >-
       The WB-3 write scheduler — the single funnel every DHT write enters, ordering
@@ -826,11 +835,93 @@ types:
         type: Duration
         description: The delay between requesting the permit and holding it. Telemetry only — no scheduler, gate or window logic consumes it.
 
+  - name: DmState
+    module: daemonseed_veilid_net::dm::view
+    kind: struct
+    description: >-
+      The direct-messaging state one session has accumulated from runner events:
+      running (bool — a runner is reporting), requests (Vec<DmContactRequest>, one
+      per identity, oldest first, at most DM_REQUEST_CAP), correspondences
+      (BTreeMap<IdentityPk, DmCorrespondence>), labels (BTreeMap<CorrespondenceLabel,
+      IdentityPk>), outstanding (BTreeMap<CommandToken, DmOutstanding>), blocked
+      (BTreeSet<IdentityPk> — replaced by each RunnerEvent::BlockList), block_list_unknown
+      (bool — set by BlockListUnreadable, cleared by the next BlockList), blocking
+      (BTreeSet<IdentityPk> — blocks asked for and not yet listed or refused; a refusal
+      without a token clears it), declined (BTreeSet<IdentityPk>), last_refusal
+      (Option<Refusal>), health (Option<HealthCounters>), activity_seq (u64). Messages
+      collected under a label no event has named are held, up to 256, until one does.
+      fold(&RunnerEvent, now_ms: i64) -> DmFold applies one event; first_contact(peer,
+      body) -> Result<RunnerCommand, FirstContactBlocked> records and returns a
+      RunnerCommand::FirstContact; next_token() -> CommandToken;
+      correspondences_newest_first(); composed_to(&IdentityPk) -> Vec<&str> lists
+      outstanding bodies oldest first; accepting(&ContactRequestId) -> bool; stop() ->
+      usize clears what the runner held and returns how many messages went unanswered.
+      Debug prints no body and no identity key.
+  - name: DmCorrespondence
+    module: daemonseed_veilid_net::dm::view
+    kind: struct
+    description: >-
+      One conversation as the runner has reported it: label (Option<CorrespondenceLabel>),
+      state (Option<ConversationState>), peer_collected (u64 — the roster's cursor),
+      delivered_through (Option<u64>), thread (Vec<DmThreadRow>), refusal (Option<Refusal>
+      — cleared by a send that goes through), last_activity (u64). delivered(seq) -> bool
+      is true below peer_collected or at or below delivered_through.
+  - name: DmThreadRow
+    module: daemonseed_veilid_net::dm::view
+    kind: enum
+    description: >-
+      One row of a conversation's thread: Received { seq, body, received_at_ms } or
+      Sent { seq, body: Option<String> }, body None for a message this session did not
+      compose.
+    variants: ["Received { seq, body, received_at_ms }", "Sent { seq, body }"]
+  - name: DmContactRequest
+    module: daemonseed_veilid_net::dm::view
+    kind: struct
+    description: >-
+      A contact request as a front end draws it: request (ContactRequestId), from
+      (IdentityPk), started_over (bool — the sender has an established conversation
+      here), held_at_ms (i64 — when this session first held a request from the identity).
+  - name: DmOutstanding
+    module: daemonseed_veilid_net::dm::view
+    kind: enum
+    description: A command sent to the runner and not yet answered, keyed in DmState::outstanding by its token.
+    variants: ["FirstContact { peer, body }", "Send { peer, body }", "Accept { request, from, reply }"]
+  - name: DmAcceptDraft
+    module: daemonseed_veilid_net::dm::view
+    kind: struct
+    description: "A reply to a contact request: request (ContactRequestId), from (IdentityPk), reply (String)."
+  - name: DmFold
+    module: daemonseed_veilid_net::dm::view
+    kind: struct
+    description: >-
+      What folding one event leaves the caller to act on: evicted_oldest (bool — the
+      oldest request was dropped to make room) and refused_accept
+      (Option<(DmAcceptDraft, Refusal)> — the reply of a refused acceptance).
+  - name: FirstContactBlocked
+    module: daemonseed_veilid_net::dm::view
+    kind: enum
+    description: Why DmState::first_contact issued no command.
+    variants: [ExistingConversation, "PendingRequest(ContactRequestId)", InFlight]
+
 # ─────────────────────────────────────────────────────────────────────
 # Functions
 # ─────────────────────────────────────────────────────────────────────
 
 functions:
+  # ── dm::view ─────────────────────────────────────────────────────────
+  - name: dm_fingerprint
+    module: daemonseed_veilid_net::dm::view
+    description: A correspondent's identity key as a direct-message list names it — the first four bytes, hex. A label, not a verification string.
+    signature: "pub fn dm_fingerprint(pk: &IdentityPk) -> String"
+    parameters:
+      - name: pk
+        type: "&IdentityPk"
+        direction: in
+        description: The correspondent's identity public key.
+    returns:
+      type: String
+      description: Eight lowercase hex characters.
+
   # ── actor: bring-up ──────────────────────────────────────────────────
   - name: VeilidNet::start
     module: daemonseed_veilid_net::actor
@@ -984,9 +1075,9 @@ functions:
     returns:
       type: "Result<()>"
       description: >-
-        Ok once the re-sweep has finished; the sweep runs off the actor loop, re-swept
-        items arrive as Inbound and are deduped downstream. A PublicOnly owner whose
-        record is absent is Ok at once with nothing swept.
+        Ok once the re-sweep is dispatched; re-swept items arrive as Inbound and are
+        deduped downstream. A PublicOnly owner whose record is absent is Ok with nothing
+        swept.
   - name: VeilidNetHandle::repair_rendezvous
     module: daemonseed_veilid_net::actor
     description: Re-establish a rendezvous record's session under its record_lock — invalidate the open-cache entry, re-open, re-watch, and full re-sweep. Re-swept backlog arrives as VeilidNetEvent::Inbound.
@@ -1864,6 +1955,11 @@ error_types:
 # ─────────────────────────────────────────────────────────────────────
 
 constants:
+  - name: DM_REQUEST_CAP
+    module: daemonseed_veilid_net::dm::view
+    type: usize
+    value: "DROP_SUBKEYS"
+    description: The most contact requests DmState holds; the oldest is dropped to make room.
   - name: DirectMessageWrite::ALL
     module: daemonseed_veilid_net::schedule
     type: "[DirectMessageWrite; 9]"

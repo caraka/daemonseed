@@ -66,13 +66,13 @@ modules:
       surfaces introducer-discovered candidates under a read-only "Discovered
       (introducer)" sub-section — RAM-only, never auto-trusted (ISC-S6 / ISC-C22 /
       ISC-A-C19). Tab cycles focus across all Main-view panes (see MainFocus).
-      The direct-message pane is a view over DmState opened with [c], outside
+      The direct-message pane is a view over DmState
+      (daemonseed_veilid_net::dm::view) opened with [c], outside
       the Tab cycle and not a MainFocus station. While no runner is reporting it
       lists nothing and says messaging needs the node running. Enter on a
       conversation row opens that conversation's thread in the same area, which
       draws its received messages with their received time, a delivery word
-      (composed, sent, delivered) beside each sent one, its latest refusal and,
-      where it is not established and not blocked, DM_HELLO_GRADE. While the
+      (composed, sent, delivered) beside each sent one, and its latest refusal. While the
       runner's HealthCounters hold a failure, timeout or local refusal, the
       roster's first line reads "messaging: " followed by the non-zero groups
       among "N store failure(s)", "N network failure(s)", "N timeout(s)",
@@ -378,7 +378,7 @@ public_types:
       - "fn dm_thread_correspondence(&self) -> Option<&DmCorrespondence>  # the open thread's conversation; None unless a thread is open"
       - "fn dm_compose(&self) -> &str  # the open thread's composer buffer. Enter queues one RunnerCommand::Send naming the conversation's label with a fresh CommandToken, records the body as outstanding, and clears the buffer"
       - "fn dm_accept_draft(&self) -> Option<&DmAcceptDraft>  # the reply being written to accept a request, while one is open"
-      - "fn dm_is_blocked(&self, pk: &IdentityPk) -> bool  # whether the runner has blocked pk; the blocked row label and the thread's hello-grade gate read it"
+      - "fn dm_is_blocked(&self, pk: &IdentityPk) -> bool  # whether the runner has blocked pk; the blocked row label reads it"
       - "fn dm_is_blocking(&self, pk: &IdentityPk) -> bool  # whether this session asked the runner to block pk and nothing confirmed or refused it; the row reads blocking…"
       - "fn take_pending_dm_stop(&mut self) -> bool  # set by the logged-in menu's disconnect, drained once by the binary into NetCommand::StopDm"
       - "fn on_key(&mut self, key: KeyEvent)"
@@ -419,27 +419,6 @@ public_types:
     kind: enum
     description: "Indexer state as seen by the TUI (ISC-20 / A-C7): Idle (no share root configured), Indexing { seen, total: Option<u64> } (cold/incremental scan running), Ready { entries }. The status line at the top of the My-shares pane reflects this; transitions never gate user input."
     variants: [Idle, "Indexing { seen, total }", "Ready { entries }"]
-  - name: daemonseed_tui::app::DmState
-    kind: struct
-    description: "The direct-messaging state one session has accumulated from runner events: running (bool — a runner is reporting), requests (Vec<DmContactRequest>), correspondences (BTreeMap<IdentityPk, DmCorrespondence>), labels (BTreeMap<CorrespondenceLabel, IdentityPk> — from the roster and from answered commands), outstanding (BTreeMap<CommandToken, DmOutstanding> — commands sent and not yet answered), blocked (BTreeSet<IdentityPk> — the runner's block list, replaced by each RunnerEvent::BlockList, which also retires listed identities from blocking and from requests), block_list_unknown (bool — set by RunnerEvent::BlockListUnreadable, cleared by the next BlockList), blocking (BTreeSet<IdentityPk> — blocks this session asked for that no BlockList has listed and no refusal has cleared), declined (BTreeSet<IdentityPk> — from this session's decline key), last_refusal (Option<Refusal>), health (Option<HealthCounters>), activity_seq (u64). Messages collected under a label no event has named are held, up to 256, until one does. composed_to(&IdentityPk) -> Vec<&str> lists outstanding send bodies oldest first; accepting(&ContactRequestId) -> bool reports an outstanding acceptance. RAM-only; Debug prints no body and no identity key."
-  - name: daemonseed_tui::app::DmContactRequest
-    kind: struct
-    description: "A contact request as the pane draws it: request (ContactRequestId), from (IdentityPk), started_over (bool — the sender has an established conversation here), held_at_ms (i64 — when this session first held a request from the identity). The row shows the sender's fingerprint and the held time in UTC."
-  - name: daemonseed_tui::app::DmCorrespondence
-    kind: struct
-    description: "One conversation as the runner has reported it: label (Option<CorrespondenceLabel>), state (Option<ConversationState> — None before a roster names it), peer_collected (u64 — the roster's cursor), delivered_through (Option<u64> — the highest sequence a RunnerEvent::Delivered reported), thread (Vec<DmThreadRow>), refusal (Option<Refusal> — cleared by a send that goes through), last_activity (u64). delivered(seq) -> bool is true below peer_collected or at or below delivered_through."
-  - name: daemonseed_tui::app::DmThreadRow
-    kind: enum
-    description: "One row of a conversation's thread: Received { seq, body, received_at_ms } for a message the correspondent wrote, drawn with its received time in UTC; Sent { seq, body: Option<String> } for one this side wrote, drawn as sent or delivered — body is None for a message this session did not compose."
-    variants: ["Received { seq, body, received_at_ms }", "Sent { seq, body }"]
-  - name: daemonseed_tui::app::DmOutstanding
-    kind: enum
-    description: "A command sent to the runner and not yet answered: Send { peer: IdentityPk, body }, drawn as composed until a RunnerEvent::Sent or Refused carries its token; Accept { request, from, reply }, whose Sent maps the conversation's label to the sender and retires the request row."
-    variants: ["Send { peer, body }", "Accept { request, from, reply }"]
-  - name: daemonseed_tui::app::DmAcceptDraft
-    kind: struct
-    description: "A reply to a contact request being written: request (ContactRequestId), from (IdentityPk), reply (String — starts as DM_ACCEPT_REPLY). Enter with a non-empty reply sends it; Esc discards it."
-
   - name: daemonseed_tui::net::DmSessionKeys
     kind: struct
     description: "The secret halves NetCommand::Connect carries to the direct-messaging runner: signing (Arc<SignKeypair>), dm_channel_root (DmChannelRootSecret), at_rest_key (Zeroizing<[u8; AEAD_KEY_LEN]> — the key the runner's store opens under). Debug prints no field. Not Clone, which is why NetCommand is Debug-only."

@@ -209,7 +209,6 @@ enum Command {
     /// Re-run the one-shot backlog sweep on an already-subscribed rendezvous
     /// record WITHOUT registering another watch — the recovery primitive for an
     /// item published during the post-(re)connect watch-warmup window (#132/#133).
-    /// The reply is sent when the sweep has finished, not when the record opens.
     ResweepRendezvous {
         owner: RendezvousOwner,
         reply: oneshot::Sender<Result<()>>,
@@ -506,10 +505,6 @@ impl VeilidNetHandle {
     ///
     /// A [`RendezvousOwner::PublicOnly`] owner opens the record read-only; an absent
     /// record is a clean `Ok` with nothing swept.
-    ///
-    /// Resolves when the sweep's last read has finished, so a caller that allows one
-    /// resweep at a time can hold its guard across this await. The sweep itself runs off
-    /// the actor loop, so other commands are served while it is in flight.
     pub async fn resweep_rendezvous(&self, owner: RendezvousOwner) -> Result<()> {
         self.send(|reply| Command::ResweepRendezvous { owner, reply })
             .await?
@@ -830,56 +825,41 @@ impl VeilidNet {
         let ev_tx_cb = ev_tx.clone();
         let cmd_tx_cb = cmd_tx.clone();
         let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> = Arc::new(
-            move |u: VeilidUpdate| {
-                // Every watch delivery is traced before it is routed, so a log can tell a
-                // change pushed by a watch from the same bytes read back by a sweep.
-                if let VeilidUpdate::ValueChange(vc) = &u {
-                    crate::vtrace!(
-                        "{}",
-                        value_change_line(
-                            &vc.key,
-                            &vc.subkeys,
-                            vc.count,
-                            vc.value.as_ref().map(|v| v.data().len()),
-                        )
+            move |u: VeilidUpdate| match u {
+                VeilidUpdate::AppCall(call) => {
+                    let entry = (
+                        call.id(),
+                        call.message().to_vec(),
+                        std::time::Instant::now(),
                     );
+                    match serve_tx.try_send(entry) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => crate::vtrace!(
+                            "serve: inbound queue full ({SERVE_QUEUE_CAP} cap), shedding a fetch request (fetcher retries)"
+                        ),
+                        Err(mpsc::error::TrySendError::Closed(_)) => {} // actor gone
+                    }
                 }
-                match u {
-                    VeilidUpdate::AppCall(call) => {
-                        let entry = (
-                            call.id(),
-                            call.message().to_vec(),
-                            std::time::Instant::now(),
-                        );
-                        match serve_tx.try_send(entry) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => crate::vtrace!(
-                                "serve: inbound queue full ({SERVE_QUEUE_CAP} cap), shedding a fetch request (fetcher retries)"
-                            ),
-                            Err(mpsc::error::TrySendError::Closed(_)) => {} // actor gone
-                        }
+                // A private route died/rotated: hand the dead-route list to the
+                // actor (which knows which routes it currently advertises) AND
+                // surface the event. Under the relevance filter a genuine death
+                // is a ONE-SHOT event, so a full FIFO must not eat it — on Full,
+                // deliver on a spawned awaited send once a slot frees.
+                VeilidUpdate::RouteChange(chg) => {
+                    let cmd = Command::RouteMaintenance {
+                        dead_routes: chg.dead_routes.clone(),
+                    };
+                    if let Err(mpsc::error::TrySendError::Full(cmd)) = cmd_tx_cb.try_send(cmd) {
+                        let tx = cmd_tx_cb.clone();
+                        tokio::spawn(async move {
+                            let _ = tx.send(cmd).await;
+                        });
                     }
-                    // A private route died/rotated: hand the dead-route list to the
-                    // actor (which knows which routes it currently advertises) AND
-                    // surface the event. Under the relevance filter a genuine death
-                    // is a ONE-SHOT event, so a full FIFO must not eat it — on Full,
-                    // deliver on a spawned awaited send once a slot frees.
-                    VeilidUpdate::RouteChange(chg) => {
-                        let cmd = Command::RouteMaintenance {
-                            dead_routes: chg.dead_routes.clone(),
-                        };
-                        if let Err(mpsc::error::TrySendError::Full(cmd)) = cmd_tx_cb.try_send(cmd) {
-                            let tx = cmd_tx_cb.clone();
-                            tokio::spawn(async move {
-                                let _ = tx.send(cmd).await;
-                            });
-                        }
-                        let _ = ev_tx_cb.send(VeilidNetEvent::RouteChanged);
-                    }
-                    other => {
-                        if let Some(ev) = map_update(other) {
-                            let _ = ev_tx_cb.send(ev);
-                        }
+                    let _ = ev_tx_cb.send(VeilidNetEvent::RouteChanged);
+                }
+                other => {
+                    if let Some(ev) = map_update(other) {
+                        let _ = ev_tx_cb.send(ev);
                     }
                 }
             },
@@ -1172,13 +1152,18 @@ async fn actor_loop(
                 });
             }
             Command::ResweepRendezvous { owner, reply } => {
-                let (gate, rc_sweep, ev_tx_sweep) = (dht_gate.clone(), rc.clone(), ev_tx.clone());
-                resweep_then_reply(
-                    open_for_resweep(&api, &rc, &opened, &record_locks, &dht_gate, &owner),
-                    move |handle| rendezvous::sweep(gate, rc_sweep, handle, ev_tx_sweep),
-                    reply,
-                )
-                .await;
+                let _ = reply.send(
+                    resweep_rendezvous(
+                        &api,
+                        &rc,
+                        &ev_tx,
+                        &opened,
+                        &record_locks,
+                        &dht_gate,
+                        &owner,
+                    )
+                    .await,
+                );
             }
             Command::RepairRendezvous { owner, reply } => {
                 // The owner's public key is taken once, up front: it keys the in-flight
@@ -2096,54 +2081,21 @@ fn spawn_gated_sweep(
     });
 }
 
-/// Serve one `ResweepRendezvous`: await `open` here, on the actor loop, then run
-/// `sweep` on the opened record on its own task and reply when it has finished. An
-/// absent record or a failed open is answered at once. The reply is what a front end's
-/// one-sweep-at-a-time guard waits on, so it must not go out while the reads still run.
-async fn resweep_then_reply<H, O, S, F>(open: O, sweep: S, reply: oneshot::Sender<Result<()>>)
-where
-    O: std::future::Future<Output = Result<Option<H>>>,
-    S: FnOnce(H) -> F,
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    match open.await {
-        Ok(Some(handle)) => spawn_then_reply(sweep(handle), reply),
-        Ok(None) => {
-            let _ = reply.send(Ok(()));
-        }
-        Err(e) => {
-            let _ = reply.send(Err(e));
-        }
-    }
-}
-
-/// Run `work` on its own task and send `Ok` on `reply` once it has finished. Returns at
-/// once, so the caller (the actor loop) is free while `work` runs. A panic in `work`
-/// drops `reply` unsent, which the waiting caller receives as an error.
-fn spawn_then_reply<F>(work: F, reply: oneshot::Sender<Result<()>>)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    tokio::spawn(async move {
-        work.await;
-        let _ = reply.send(Ok(()));
-    });
-}
-
-/// Re-open an already-known rendezvous record for a fresh one-shot sweep, WITHOUT
-/// registering a watch — the recovery primitive for a backlog item published during the
-/// post-(re)connect watch-warmup window (#132/#133). The open block is identical to
-/// [`subscribe_rendezvous`], including its two owner arms; a read-only record that is
-/// absent yields `None` (nothing to sweep). The caller runs the sweep, whose found items
-/// flow out as [`VeilidNetEvent::Inbound`] and are deduped downstream.
-async fn open_for_resweep(
+/// Re-open an already-known rendezvous record and kick off a fresh one-shot sweep,
+/// WITHOUT registering a watch — the recovery primitive for a backlog item published
+/// during the post-(re)connect watch-warmup window (#132/#133). The open block is
+/// identical to [`subscribe_rendezvous`], including its two owner arms and its
+/// clean `Ok` on a read-only record that is absent; found items flow out as
+/// [`VeilidNetEvent::Inbound`] and are deduped downstream.
+async fn resweep_rendezvous(
     api: &VeilidAPI,
     rc: &RoutingContext,
+    ev_tx: &mpsc::UnboundedSender<VeilidNetEvent>,
     opened: &rendezvous::OpenCache,
     record_locks: &rendezvous::RecordLocks,
     gate: &Arc<DhtGate>,
     owner: &RendezvousOwner,
-) -> Result<Option<rendezvous::RendezvousHandle>> {
+) -> Result<()> {
     crate::vtrace!("resweep_rendezvous: open (cached) rendezvous");
     let resolved = owner.resolve()?;
     let owner_key = resolved.public_key();
@@ -2156,13 +2108,15 @@ async fn open_for_resweep(
     };
     let Some(handle) = opened_handle else {
         crate::vtrace!("resweep_rendezvous: read-only record absent -> Ok (nothing to sweep)");
-        return Ok(None);
+        return Ok(());
     };
     crate::vtrace!(
-        "resweep_rendezvous: record open key={:?}; sweeping, reply when done",
+        "resweep_rendezvous: record open key={:?}; spawning backlog sweep -> Ok",
         handle.key()
     );
-    Ok(Some(handle))
+    // Read lane (WB-5 / I5′.1): hold a shared-accountant read permit for the sweep.
+    spawn_gated_sweep(gate, rc, handle, ev_tx);
+    Ok(())
 }
 
 /// **Repair** a dead rendezvous record session (consumer-route self-heal §RS-1.2, step
@@ -2692,22 +2646,6 @@ async fn send_sealed(rc: &RoutingContext, route: RouteId, sealed: Vec<u8>) -> Re
         .map_err(|e| VeilidNetError::Send(e.to_string()))
 }
 
-/// The trace line for one `VeilidUpdate::ValueChange`: the record, the changed subkeys,
-/// the count left on the watch that raised it, and the size of the value it carries
-/// (`none` when it carries no value).
-fn value_change_line(
-    key: &impl std::fmt::Debug,
-    subkeys: &impl std::fmt::Display,
-    count: u32,
-    value_len: Option<usize>,
-) -> String {
-    let value = match value_len {
-        Some(n) => format!("{n} bytes"),
-        None => "none".to_owned(),
-    };
-    format!("value change: key={key:?} subkeys={subkeys} count={count} value={value}")
-}
-
 /// Map a raw `VeilidUpdate` to a typed event (`None` = ignored).
 fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
     match u {
@@ -2740,113 +2678,6 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The resweep reply is what a front end's one-sweep-at-a-time guard waits on. If it
-    // is sent before the sweep ends, the guard clears while the reads are still running,
-    // and a steady tick starts a new sweep on top of the old one every time.
-    #[tokio::test]
-    async fn a_resweep_reply_is_sent_only_after_its_sweep_finishes() {
-        let (release_tx, release_rx) = oneshot::channel::<()>();
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        // Returns while the sweep is still held, so the actor loop is free meanwhile.
-        spawn_then_reply(
-            async move {
-                let _ = release_rx.await;
-            },
-            reply_tx,
-        );
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            matches!(
-                reply_rx.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "the reply must not arrive while the sweep is still running"
-        );
-        release_tx.send(()).expect("the sweep is still waiting");
-        let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx)
-            .await
-            .expect("the reply arrives once the sweep ends")
-            .expect("the reply was sent");
-        assert!(reply.is_ok());
-    }
-
-    // The ResweepRendezvous arm itself: an opened record is answered only after its
-    // sweep ends, while an absent record and a failed open are answered at once.
-    #[tokio::test]
-    async fn the_resweep_arm_replies_after_the_sweep_and_answers_misses_at_once() {
-        let (release_tx, release_rx) = oneshot::channel::<()>();
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        resweep_then_reply(
-            async { Ok(Some(7u8)) },
-            move |opened: u8| async move {
-                assert_eq!(opened, 7);
-                let _ = release_rx.await;
-            },
-            reply_tx,
-        )
-        .await;
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            matches!(
-                reply_rx.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ),
-            "an opened record must not be answered before its sweep ends"
-        );
-        release_tx.send(()).expect("the sweep is still waiting");
-        let reply = tokio::time::timeout(Duration::from_secs(5), reply_rx)
-            .await
-            .expect("the reply arrives once the sweep ends")
-            .expect("the reply was sent");
-        assert!(reply.is_ok());
-
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        resweep_then_reply(
-            async { Ok(None::<u8>) },
-            |_: u8| async { panic!("an absent record is not swept") },
-            reply_tx,
-        )
-        .await;
-        assert!(matches!(reply_rx.try_recv(), Ok(Ok(()))));
-
-        let (reply_tx, mut reply_rx) = oneshot::channel();
-        resweep_then_reply(
-            async { Err::<Option<u8>, _>(VeilidNetError::Actor("open failed".into())) },
-            |_: u8| async { panic!("a failed open is not swept") },
-            reply_tx,
-        )
-        .await;
-        assert!(matches!(reply_rx.try_recv(), Ok(Err(_))));
-    }
-
-    // A sweep that panics must still release the caller's guard: the reply is dropped
-    // unsent and the caller's await ends in an error rather than waiting for ever.
-    #[tokio::test]
-    async fn a_resweep_whose_sweep_panics_ends_the_callers_wait() {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        spawn_then_reply(async { panic!("sweep failed") }, reply_tx);
-        let outcome = tokio::time::timeout(Duration::from_secs(5), reply_rx)
-            .await
-            .expect("the caller's wait ends");
-        assert!(outcome.is_err(), "a dropped reply reads as an error");
-    }
-
-    #[test]
-    fn a_value_change_line_names_the_record_subkeys_count_and_size() {
-        assert_eq!(
-            value_change_line(&"rec", &"[3..=3]", 7, Some(120)),
-            "value change: key=\"rec\" subkeys=[3..=3] count=7 value=120 bytes"
-        );
-        assert_eq!(
-            value_change_line(&"rec", &"[]", 0, None),
-            "value change: key=\"rec\" subkeys=[] count=0 value=none"
-        );
-    }
 
     // #161: the graceful-close budgets must compose. The whole no-hang argument is
     // arithmetic — a front-end blocks a UI thread for GRACEFUL_CLOSE_BUDGET, and the

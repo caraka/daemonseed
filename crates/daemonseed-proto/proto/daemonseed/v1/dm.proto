@@ -24,8 +24,8 @@ package daemonseed.v1;
 // than an additive proto bump: a future client could name a prekey and fall back
 // to `STATIC` against an older peer. Prekeys were dropped for alpha (and are
 // expected to stay dropped), which is why the opening burst before the
-// recipient's first reply has no forward secrecy — see ISC-C45's hello-grade
-// labeling requirement, which is the mitigation.
+// recipient's first reply has no forward secrecy beyond the advert key's
+// rotation — see the direct-messaging design, § Keys and forward secrecy.
 enum KeySelector {
   // Never written. Proto3 requires a zero default; treat it as `STATIC` on read
   // so an unset field from a future client is not silently a different key.
