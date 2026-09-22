@@ -37,7 +37,7 @@ use daemonseed_core::identity::keys::{DmChannelRootSecret, ShareRootIkm, SignKey
 use daemonseed_core::presence::{LiveMember, PresenceChange};
 use daemonseed_core::share_catalog::ShareListing;
 use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
-use daemonseed_veilid_net::dm::runner::{RunnerCommand, RunnerEvent};
+use daemonseed_veilid_net::dm::runner::{IdentityPk, RunnerCommand, RunnerEvent};
 use tokio::sync::mpsc;
 
 /// The wire-facing name for an auto-republished share (#41):
@@ -502,6 +502,18 @@ pub struct ShareManifestEntry {
 pub struct RosterEntry {
     pub handle: String,
     pub fingerprint: String,
+    /// The member's verified long-term public key, as the presence tracker holds
+    /// it. Read it through [`RosterEntry::identity_pk`], which checks the length.
+    pub pubkey: Vec<u8>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RosterEntry {
+    /// The member's identity key, or `None` when the stored key is not exactly
+    /// [`daemonseed_core::identity::keys::IDENTITY_PK_LEN`] bytes.
+    pub fn identity_pk(&self) -> Option<IdentityPk> {
+        Box::<[u8]>::from(self.pubkey.as_slice()).try_into().ok()
+    }
 }
 
 /// The UI-side handle: owns the channels and the net thread. Held for the app's
@@ -694,6 +706,7 @@ pub(crate) fn roster_from_members(members: &[LiveMember]) -> Vec<RosterEntry> {
         .map(|m| RosterEntry {
             handle: m.handle.clone(),
             fingerprint: member_fingerprint(&m.pubkey),
+            pubkey: m.pubkey.clone(),
         })
         .collect()
 }
@@ -937,6 +950,44 @@ mod tests {
             assert_eq!(fp, expected);
             assert!(fp.starts_with('#'), "floor form is #<12hex>: {fp}");
             assert_eq!(fp.len(), 1 + 12, "12 hex chars after the #: {fp}");
+        }
+
+        /// Each roster row carries its member's identity key, in the same order as
+        /// the rows, so a row picked in the people column resolves to that member.
+        #[test]
+        fn roster_rows_carry_each_members_identity_key() {
+            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let a = SignKeypair::from_ml_dsa_seed(&[1u8; 32]).unwrap();
+            let b = SignKeypair::from_ml_dsa_seed(&[2u8; 32]).unwrap();
+            let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
+            let now = Instant::now();
+            t.apply(&heartbeat(a.public_key(), "anna#aaaa", 100), now);
+            t.apply(&heartbeat(b.public_key(), "bert#bbbb", 100), now);
+            let rows = roster_from_members(&t.members());
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].handle, "anna#aaaa");
+            assert_eq!(rows[0].identity_pk(), Some(Box::new(*a.public_key())));
+            assert_eq!(rows[1].handle, "bert#bbbb");
+            assert_eq!(rows[1].identity_pk(), Some(Box::new(*b.public_key())));
+        }
+
+        /// A stored key one byte short or one byte long yields no identity key;
+        /// an exact-length one does.
+        #[test]
+        fn a_wrong_length_key_yields_no_identity_key() {
+            use daemonseed_core::identity::keys::IDENTITY_PK_LEN;
+            let entry = |len: usize| RosterEntry {
+                handle: "m".into(),
+                fingerprint: "#000000000000".into(),
+                pubkey: vec![7u8; len],
+            };
+            assert_eq!(entry(IDENTITY_PK_LEN - 1).identity_pk(), None);
+            assert_eq!(entry(IDENTITY_PK_LEN + 1).identity_pk(), None);
+            assert_eq!(entry(0).identity_pk(), None);
+            assert_eq!(
+                entry(IDENTITY_PK_LEN).identity_pk(),
+                Some(Box::new([7u8; IDENTITY_PK_LEN]))
+            );
         }
 
         /// A sealed beacon, opened under the lobby key and applied, appears in the

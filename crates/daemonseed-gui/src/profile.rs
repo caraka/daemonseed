@@ -315,6 +315,41 @@ mod tests {
     use daemonseed_core::first_start::FirstStart;
     use daemonseed_core::profile::config::ArgonParams;
 
+    /// The key heartbeats are signed with and the key the direct-messaging
+    /// runner signs with are the same identity, so a member's roster key is the
+    /// key a DM to that member is addressed to.
+    #[test]
+    fn heartbeat_signing_key_and_dm_signing_key_are_one_identity() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let sealed = FirstStart::new()
+            .initialize("correct horse battery staple table mountain", fast)
+            .expect("first start");
+        let phrase = sealed.display_phrase();
+        let materials = sealed
+            .verify_round_trip(&phrase)
+            .expect("round trip")
+            .finalize(
+                Some("alice".to_owned()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_owned(),
+                    address: "127.0.0.1:443".to_owned(),
+                },
+            )
+            .expect("finalize")
+            .into_session_materials();
+        let profile =
+            Profile::from_materials(materials, PathBuf::from("/nonexistent-in-this-test"));
+
+        let heartbeat = profile.stable_signing_key().expect("heartbeat key");
+        let dm = profile.dm_session_keys().expect("DM keys");
+        assert_eq!(heartbeat.public_key(), dm.signing.public_key());
+    }
+
     /// The material handed to the runner is THIS profile's — the same identity
     /// behind the signing key, the channel root from the same derivation, and
     /// the profile's own at-rest key.

@@ -19,9 +19,9 @@ use std::collections::BTreeSet;
 use daemonseed_core::circle::key::{CircleKey, CircleKeyError, circle_fingerprint, derive_cot_key};
 use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
-use daemonseed_core::identity::keys::{ShareRootIkm, SignKeypair};
+use daemonseed_core::identity::keys::{IDENTITY_PK_LEN, ShareRootIkm, SignKeypair};
 use daemonseed_core::trust_events::{TrustEventKey, TrustEventLog, TrustEventScope};
-use daemonseed_veilid_net::dm::runner::RunnerEvent;
+use daemonseed_veilid_net::dm::runner::{IdentityPk, RunnerEvent};
 
 use crate::net::{DmSessionKeys, RosterEntry};
 use daemonseed_core::passphrase::strength::{self, DicewareError};
@@ -1049,6 +1049,26 @@ impl GuiState {
     /// column on every rail switch so the pane follows the switch.
     pub fn active_roster(&self) -> &[RosterEntry] {
         &self.circles[self.active].roster
+    }
+
+    /// The identity key of the member shown at `row` of the active room's people
+    /// column. `None` when `row` is out of range or the member's stored key is
+    /// not an identity key.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn active_roster_key(&self, row: usize) -> Option<IdentityPk> {
+        self.active_roster().get(row)?.identity_pk()
+    }
+
+    /// The handle of the member holding `key`, searched across every room's
+    /// cached roster in rail order (the Lobby first). `None` when no cached
+    /// roster lists that key.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn roster_handle_for_key(&self, key: &[u8; IDENTITY_PK_LEN]) -> Option<&str> {
+        self.circles
+            .iter()
+            .flat_map(|c| c.roster.iter())
+            .find(|e| e.pubkey.as_slice() == key.as_slice())
+            .map(|e| e.handle.as_str())
     }
 
     /// The currently active circle's state.
@@ -3077,6 +3097,7 @@ mod tests {
         let roster = vec![crate::net::RosterEntry {
             handle: "alice#aabbccddeeff".into(),
             fingerprint: "#aabbccddeeff".into(),
+            pubkey: Vec::new(),
         }];
         st.set_room_roster(None, roster.clone());
         assert_eq!(st.active_roster(), roster.as_slice());
@@ -3094,6 +3115,7 @@ mod tests {
         let roster = vec![crate::net::RosterEntry {
             handle: "bob".into(),
             fingerprint: "#001122334455".into(),
+            pubkey: Vec::new(),
         }];
         st.set_room_roster(Some(cid), roster.clone());
         // Active room is the circle → its cached roster is returned.
@@ -3112,9 +3134,52 @@ mod tests {
             vec![crate::net::RosterEntry {
                 handle: "ghost".into(),
                 fingerprint: "#ffeeddccbbaa".into(),
+                pubkey: Vec::new(),
             }],
         );
         assert!(st.active_roster().is_empty());
+    }
+
+    /// A roster row holding a full-length identity key `[tag; IDENTITY_PK_LEN]`.
+    fn keyed_row(handle: &str, tag: u8) -> crate::net::RosterEntry {
+        crate::net::RosterEntry {
+            handle: handle.into(),
+            fingerprint: "#000000000000".into(),
+            pubkey: vec![tag; IDENTITY_PK_LEN],
+        }
+    }
+
+    #[test]
+    fn active_roster_key_resolves_a_row_to_its_members_key() {
+        let mut st = GuiState::lobby_only();
+        st.set_room_roster(None, vec![keyed_row("anna", 1), keyed_row("bert", 2)]);
+        assert_eq!(st.active_roster_key(0), Some(dm_pk(1)));
+        assert_eq!(st.active_roster_key(1), Some(dm_pk(2)));
+        assert_eq!(st.active_roster_key(2), None, "past the last row");
+    }
+
+    #[test]
+    fn active_roster_key_is_none_for_a_wrong_length_key() {
+        let mut st = GuiState::lobby_only();
+        let mut short = keyed_row("anna", 1);
+        short.pubkey.pop();
+        st.set_room_roster(None, vec![short]);
+        assert_eq!(st.active_roster_key(0), None);
+    }
+
+    #[test]
+    fn roster_handle_for_key_searches_rooms_other_than_the_active_one() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let mut st = GuiState::lobby_only();
+        st.set_room_roster(None, vec![keyed_row("anna", 1)]);
+        let idx = st.materialize_from_phrase(STRONG).expect("materialize");
+        st.switch_to(idx, String::new(), 0.0);
+        let cid = st.active_circle_id().expect("a circle has a net id");
+        st.set_room_roster(Some(cid), vec![keyed_row("bert", 2)]);
+        st.switch_to(0, String::new(), 0.0);
+        assert_eq!(st.roster_handle_for_key(&dm_pk(1)), Some("anna"));
+        assert_eq!(st.roster_handle_for_key(&dm_pk(2)), Some("bert"));
+        assert_eq!(st.roster_handle_for_key(&dm_pk(3)), None);
     }
 
     // ── Direct-messaging runner events: only a correspondent starting over is kept ──
