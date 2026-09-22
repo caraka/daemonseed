@@ -397,8 +397,7 @@ work lives in the maintainer's own planning notes, not here.
   state. `Enter` on a conversation opens its thread and `Esc` leaves it. The thread draws sent messages
   as composed, sent or delivered, and not sent when the runner stops; received messages with their
   received time in UTC; and the refusal that stopped the last send, one phrase per reason. Its composer
-  sends one `RunnerCommand::Send`. A conversation the roster has not called established, and that is not
-  blocked, carries `DM_HELLO_GRADE`. `RunnerEvent::StartedOver` folds
+  sends one `RunnerCommand::Send`. `RunnerEvent::StartedOver` folds
   `TrustEventKey::DmCorrespondentStateLost`. `App::dm_state`, `App::dm_pane_open`, `App::dm_sel`,
   `App::dm_requests`, `App::dm_correspondences`, `App::dm_thread`, `App::dm_thread_correspondence`,
   `App::dm_compose`, `App::take_pending_dm`, `MainFocus::consumes_text`, `app::dm_fingerprint`,
@@ -415,6 +414,20 @@ work lives in the maintainer's own planning notes, not here.
   before its transport steps and its ack, capped at `net::DM_CLOSE_CAP` (30 s); a stop still running
   after `net::DM_CLOSE_NOTICE_AFTER` (500 ms) sends `NetEvent::DmCloseSlow`, and the window shows
   `net::DM_CLOSE_MESSAGE` in the connection status and stays open and drawing until the ack (#339).
+- `daemonseed-gui`: the rail has two collapsible sections, Chats and Direct messages, each with an unread
+  dot; a chevron folds or unfolds its own section only, and the label opens it and folds the other.
+  Folding Direct messages forgets the chosen thread. A line under the Direct messages header says when
+  the block list cannot be read, how many messages did not go when messaging stopped, why a block did not
+  take effect, or why a first message opened another item. A request stays listed as blocking until the
+  block is confirmed. Sent, pending and refused messages keep the order they were written in. The circle
+  details sheet and the download meter show only with the chat. Direct messages lists
+  requests, then conversations newest first, by label and age only. The main pane shows the room, "Choose
+  a chat", "Choose a conversation", or the selected thread: messages with their send status, Accept,
+  Decline and Block on a request, a reply box, and the refusal in words. Accept turns the request into its
+  conversation at once, with the reply "message accepted" shown as a message being sent until the runner
+  reports it sent or refused; a refused acceptance leaves the request, its thread showing the reply not
+  sent. A roster row's right-click menu starts a direct message with that member. Ctrl+D
+  opens Direct messages.
 
 ### Fixed
 
@@ -562,6 +575,10 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-veilid-net`: `dm::view` holds the direct-message view model the terminal and desktop clients
+  share: `DmState`, `DmCorrespondence`, `DmThreadRow`, `DmContactRequest`, `DmOutstanding`,
+  `DmAcceptDraft`, `DmFold`, `FirstContactBlocked`, `dm_fingerprint` and `DM_REQUEST_CAP`.
+  `daemonseed-tui` uses it in place of its own `app::DmState` types.
 - `daemonseed-core`: `flows::Surfaced::StartedOver` gains `request: ContactRequest`, which `flows::accept`
   refuses while the correspondent's old conversation record remains and accepts once it is deleted. Patterns
   naming the variant's fields need `..`.

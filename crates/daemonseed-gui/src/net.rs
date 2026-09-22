@@ -584,7 +584,6 @@ impl NetHandle {
     /// `result_large_err` allowance for the same reason: the payload is never
     /// inspected, so boxing it buys nothing.
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dm(&self, cmd: RunnerCommand) -> Result<(), NetCommand> {
         self.send(NetCommand::Dm(cmd))
     }

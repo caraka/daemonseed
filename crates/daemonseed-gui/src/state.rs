@@ -21,12 +21,14 @@ use daemonseed_core::cot::AssetAddr;
 use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::identity::keys::{IDENTITY_PK_LEN, ShareRootIkm, SignKeypair};
 use daemonseed_core::trust_events::{TrustEventKey, TrustEventLog, TrustEventScope};
-use daemonseed_veilid_net::dm::runner::{IdentityPk, RunnerEvent};
+use daemonseed_veilid_net::dm::runner::IdentityPk;
 
 use crate::net::{DmSessionKeys, RosterEntry};
 use daemonseed_core::passphrase::strength::{self, DicewareError};
 
 use crate::profile::Profile;
+
+pub mod dm;
 
 /// Generate a circle phrase that clears the SAME `is_circle_green` floor the join
 /// gate enforces (D3). Thin delegate to the canonical home,
@@ -472,6 +474,9 @@ pub struct GuiState {
     /// from it (or from the seed file under the profile root). `None` on every
     /// instance that is not the operator.
     project_announce_seed: Option<daemonseed_core::public_space::ProjectAnnounceSeedText>,
+    /// Direct messaging: what the runner has reported, the commands queued for
+    /// it, and the rail's sections and selection. See [`dm`].
+    dm: dm::GuiDm,
 }
 
 impl GuiState {
@@ -505,6 +510,7 @@ impl GuiState {
             announcements_on_screen: AnnouncementsView::default(),
             trust_log: TrustEventLog::default(),
             project_announce_seed: None,
+            dm: dm::GuiDm::default(),
         }
     }
 
@@ -621,22 +627,17 @@ impl GuiState {
         &self.trust_log
     }
 
-    /// Take one direct-messaging runner event. No interface draws direct
-    /// messages, so nothing here is kept for display.
-    ///
-    /// A correspondent starting over is the one event that leaves a record: it
-    /// appends [`TrustEventKey::DmCorrespondentStateLost`] to the trust log.
-    pub fn on_dm_event(&mut self, event: &RunnerEvent) {
-        // No surface draws direct messages, so every other event is dropped.
-        if let RunnerEvent::StartedOver { .. } = event {
-            self.trust_log.append(
-                TrustEventScope::bare(TrustEventKey::DmCorrespondentStateLost).observed_at(
-                    now_unix_ms(),
-                    None,
-                    None,
-                ),
-            );
-        }
+    /// Append a correspondent's start-over to the trust log: the one runner
+    /// event that leaves a record, keyed
+    /// [`TrustEventKey::DmCorrespondentStateLost`] and naming no one.
+    fn log_dm_started_over(&mut self) {
+        self.trust_log.append(
+            TrustEventScope::bare(TrustEventKey::DmCorrespondentStateLost).observed_at(
+                now_unix_ms(),
+                None,
+                None,
+            ),
+        );
     }
 
     /// (#229) Record the announcements/MOTD view now rendered in the pane.
@@ -1054,7 +1055,6 @@ impl GuiState {
     /// The identity key of the member shown at `row` of the active room's people
     /// column. `None` when `row` is out of range or the member's stored key is
     /// not an identity key.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn active_roster_key(&self, row: usize) -> Option<IdentityPk> {
         self.active_roster().get(row)?.identity_pk()
     }
@@ -1062,7 +1062,6 @@ impl GuiState {
     /// The handle of the member holding `key`, searched across every room's
     /// cached roster in rail order (the Lobby first). `None` when no cached
     /// roster lists that key.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn roster_handle_for_key(&self, key: &[u8; IDENTITY_PK_LEN]) -> Option<&str> {
         self.circles
             .iter()
@@ -1087,8 +1086,9 @@ impl GuiState {
     /// Returns a [`PushOutcome`]: `inserted` is false on a dedup no-op (so the caller
     /// skips re-render + scroll — #143 scroll-yank), true on a genuine insert;
     /// `unread_raised` is true only when this newly raised circle `idx`'s unread dot
-    /// (#64) — a non-own message, into a non-active room, newer than the read
-    /// high-water. Own echoes (`mine`) and messages into the active room never raise it.
+    /// (#64) — a non-own message, into a room not on screen, newer than the read
+    /// high-water. Own echoes (`mine`) and messages into the active room while the
+    /// main pane shows its chat never raise it.
     pub fn push_message(
         &mut self,
         idx: usize,
@@ -1098,6 +1098,7 @@ impl GuiState {
         sent_unix_ms: i64,
     ) -> PushOutcome {
         let active = self.active;
+        let chat_on_screen = self.main_pane() == dm::MainPane::Chat;
         // #131: order + high-water on the CLAMPED timestamp, never the raw untrusted
         // one. Real backlog is inside the window so it is unclamped and orders exactly;
         // only a forged/broken stamp is pulled to a window edge (bounded influence).
@@ -1137,7 +1138,7 @@ impl GuiState {
             // so a far-future forged stamp cannot push the mark ahead and suppress
             // genuine unreads.
             let hw_input = order.min(now);
-            let unread_raised = if idx == active {
+            let unread_raised = if idx == active && chat_on_screen {
                 // The user is looking at this room, so every message here is seen:
                 // keep the read high-water current so a later reconnect re-delivering
                 // these same messages cannot re-trip the unread dot (#107).
@@ -1189,6 +1190,16 @@ impl GuiState {
         cur.scroll_y = live_scroll;
         if target < self.circles.len() {
             self.active = target;
+            // A room chosen is a room shown: the Chats section owns the main pane.
+            self.dm.show_chats();
+            self.mark_active_room_seen();
+        }
+    }
+
+    /// The active room's chat is on screen: clear its unread dot and advance
+    /// its read high-water to the newest message it holds.
+    fn mark_active_room_seen(&mut self) {
+        {
             // #64: focusing a room clears its unread dot.
             let c = &mut self.circles[self.active];
             c.unread = false;
@@ -1313,6 +1324,7 @@ impl GuiState {
             announcements_on_screen: AnnouncementsView::default(),
             trust_log: TrustEventLog::default(),
             project_announce_seed: None,
+            dm: dm::GuiDm::default(),
         }
     }
 }
@@ -1320,6 +1332,7 @@ impl GuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daemonseed_veilid_net::dm::runner::RunnerEvent;
     use std::time::Instant;
 
     // ── #93 unread-gated landing (ISC-C93) ───────────────────────────────────
@@ -3182,6 +3195,34 @@ mod tests {
         assert_eq!(st.roster_handle_for_key(&dm_pk(3)), None);
     }
 
+    /// One key listed in the Lobby and in a circle under two handles resolves to
+    /// the Lobby's: the search runs in rail order.
+    #[test]
+    fn roster_handle_for_key_prefers_the_lobby_over_a_circle() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let mut st = GuiState::lobby_only();
+        st.set_room_roster(None, vec![keyed_row("anna", 1)]);
+        let idx = st.materialize_from_phrase(STRONG).expect("materialize");
+        st.switch_to(idx, String::new(), 0.0);
+        let cid = st.active_circle_id().expect("a circle has a net id");
+        st.set_room_roster(Some(cid), vec![keyed_row("anna-in-circle", 1)]);
+        assert_eq!(st.roster_handle_for_key(&dm_pk(1)), Some("anna"));
+    }
+
+    /// With a circle active, a row index reads the circle's roster, not the
+    /// Lobby's.
+    #[test]
+    fn active_roster_key_reads_the_active_circle() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let mut st = GuiState::lobby_only();
+        st.set_room_roster(None, vec![keyed_row("anna", 1)]);
+        let idx = st.materialize_from_phrase(STRONG).expect("materialize");
+        st.switch_to(idx, String::new(), 0.0);
+        let cid = st.active_circle_id().expect("a circle has a net id");
+        st.set_room_roster(Some(cid), vec![keyed_row("bert", 2)]);
+        assert_eq!(st.active_roster_key(0), Some(dm_pk(2)));
+    }
+
     // ── Direct-messaging runner events: only a correspondent starting over is kept ──
 
     /// A distinct identity key, so two correspondents are separable.
@@ -3249,8 +3290,9 @@ mod tests {
         }
     }
 
-    /// No UI: runner events change nothing the view layer reads. The trust log is
-    /// the control that proves the events were taken.
+    /// Runner events leave the rooms, the active room, its roster and the
+    /// announcements alone. The trust log is the control that proves the events
+    /// were taken.
     #[test]
     fn dm_events_change_no_visible_state() {
         let mut st = GuiState::demo();

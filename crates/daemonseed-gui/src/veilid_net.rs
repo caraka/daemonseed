@@ -1519,7 +1519,7 @@ async fn recv_dm(dm: &mut Option<DmSession>) -> Option<RunnerEvent> {
 }
 
 /// The token a command's answer carries, where it has one.
-fn dm_command_token(command: &RunnerCommand) -> Option<CommandToken> {
+pub(crate) fn dm_command_token(command: &RunnerCommand) -> Option<CommandToken> {
     match command {
         RunnerCommand::FirstContact { token, .. }
         | RunnerCommand::Send { token, .. }

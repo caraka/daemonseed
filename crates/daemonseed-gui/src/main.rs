@@ -34,6 +34,7 @@
 #![cfg_attr(feature = "desktop", windows_subsystem = "windows")]
 
 mod desktop_integration;
+mod dm_ui;
 mod net;
 mod profile;
 mod share_browser;
@@ -411,6 +412,42 @@ fn rebuild_rail(ui: &AppWindow, st: &GuiState) {
         .collect();
     ui.set_circles(ModelRc::from(Rc::new(VecModel::from(circles))));
     ui.set_only_lobby(st.only_lobby());
+    // A room's unread dot is also the Chats header's.
+    dm_ui::apply_rail_sections(ui, st);
+}
+
+/// Show the active room after it was chosen: the rail, the room's view and
+/// details, its roster, and the sections and main pane choosing it changed.
+/// Returns whether the Public Shares tab is now showing and should refresh.
+///
+/// Called with the state already switched, by a rail click and by opening the
+/// Chats section by its header.
+fn refresh_active_room(ui: &AppWindow, st: &GuiState) -> bool {
+    let active = st.active();
+    // #64: switch_to cleared the focused room's unread; reflect it.
+    rebuild_rail(ui, st);
+    apply_view(ui, st.current(), active as i32);
+    apply_circle_detail(ui, st, active);
+    // Repaint from the destination room's cached roster so the people column
+    // follows the switch. A beacon-driven repaint fires only on a change to the
+    // active room's roster.
+    ui.set_roster(roster_model(st.active_roster()));
+    dm_ui::apply_dm(ui, st);
+    // Tidiness: keep the shares view coherent with the room. If already
+    // on a shares tab, show the one that matches the destination — a
+    // circle's "Circle shares" (tab 2) or the Lobby's public "Shares"
+    // (tab 1) — so public shares never look available inside a circle
+    // (or vice versa). Chat (tab 0) is left alone.
+    let tab = ui.get_active_tab();
+    if tab == 1 || tab == 2 {
+        if st.current().net.is_some() {
+            ui.set_active_tab(2);
+        } else {
+            ui.set_active_tab(1);
+            return true;
+        }
+    }
+    false
 }
 
 /// Materialize a circle from `phrase`, rebuild the rail, switch to it, and
@@ -529,35 +566,11 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
             ui.set_rename_open(false);
             let live_draft = ui.get_draft().to_string();
             let live_scroll = ui.get_scroll_y();
-            let mut refresh_public_shares = false;
-            {
+            let refresh_public_shares = {
                 let mut st = state.borrow_mut();
                 st.switch_to(target as usize, live_draft, live_scroll);
-                let active = st.active();
-                // #64: switch_to cleared the focused room's unread; reflect it.
-                rebuild_rail(&ui, &st);
-                apply_view(&ui, st.current(), active as i32);
-                apply_circle_detail(&ui, &st, active);
-                // Option A (#77 follow-up): repaint HERE NOW from the destination room's
-                // cached roster so the people column follows the switch. A beacon-driven
-                // repaint only fires on a roster CONTENT change for the active room, so a
-                // switch alone previously left the pane showing the prior room's roster.
-                ui.set_roster(roster_model(st.active_roster()));
-                // Tidiness: keep the shares view coherent with the room. If already
-                // on a shares tab, show the one that matches the destination — a
-                // circle's "Circle shares" (tab 2) or the Lobby's public "Shares"
-                // (tab 1) — so public shares never look available inside a circle
-                // (or vice versa). Chat (tab 0) is left alone.
-                let tab = ui.get_active_tab();
-                if tab == 1 || tab == 2 {
-                    if st.current().net.is_some() {
-                        ui.set_active_tab(2);
-                    } else {
-                        ui.set_active_tab(1);
-                        refresh_public_shares = true;
-                    }
-                }
-            }
+                refresh_active_room(&ui, &st)
+            };
             // Deferred: focusing during a (possibly key-triggered, e.g. Ctrl+L) callback
             // is re-entrant and breaks the next key's routing. The public-shares
             // refresh is deferred for the same reason (its handler re-borrows state).
@@ -919,6 +932,9 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
         apply_view(&ui, st.current(), active as i32);
         apply_circle_detail(&ui, &st, active);
     }
+
+    // The rail's two sections, direct messages and the roster's right-click menu.
+    dm_ui::wire_dm(&ui, &state);
 
     // ── Shares tab: browse-tree callbacks (commit 1) ──
     // Refresh re-lists the relay catalog (Rust reconciles by share_id so open folders
@@ -1467,6 +1483,9 @@ fn start_drain(
         // transcript's age captions ("2m ago" → "3m ago") even when no new message
         // arrives, without the churn of a per-tick rebuild.
         let mut age_tick: u32 = 0;
+        // Whether the network thread has been found gone, so its loss is folded
+        // into direct messaging once.
+        let mut net_gone = false;
         timer.start(TimerMode::Repeated, Duration::from_millis(33), move || {
             let Some(ui) = weak.upgrade() else { return };
             let mut n = 0u32;
@@ -1477,6 +1496,12 @@ fn start_drain(
                     Err(()) => {
                         set_status_unless_closing(&ui, SharedString::from("offline"));
                         ui.set_connected(false);
+                        // The runner went with the network thread: once, show
+                        // what it left unanswered as not sent.
+                        if !net_gone {
+                            net_gone = true;
+                            dm_ui::on_net_gone(&ui, &state);
+                        }
                         break;
                     }
                 };
@@ -1486,6 +1511,12 @@ fn start_drain(
                     break;
                 }
             }
+            // Commands the direct-message actions queued since the last tick go
+            // to the runner, oldest first.
+            dm_ui::forward_pending_dm(&ui, &state, |cmd| match net.borrow().dm(cmd) {
+                Err(NetCommand::Dm(cmd)) => Some(cmd),
+                _ => None,
+            });
             // Auto-poll the catalog only while the Shares tab is open AND connected —
             // off-tab / offline is silent (no chatter, no battery cost). The reconcile
             // in `set_shares` keeps the user's open folders across each refresh.
@@ -1513,6 +1544,8 @@ fn start_drain(
                 age_tick = 0;
                 let st = state.borrow();
                 ui.set_messages(messages_model(&st.current().messages));
+                // The Direct messages rail's ages advance on the same cadence.
+                dm_ui::apply_dm_rows(&ui, &st);
             }
         });
     }
@@ -1679,13 +1712,19 @@ fn apply_net_event(
     evt: NetEvent,
 ) {
     match evt {
-        // Direct-messaging runner events reach `GuiState::on_dm_event`, which
-        // keeps only the trust-log entry. No interface draws direct messages, so
-        // no Slint property changes.
-        NetEvent::Dm(ref event) => state.borrow_mut().on_dm_event(event),
-        // No interface draws direct messages, so a stopped runner changes nothing
-        // on screen.
-        NetEvent::DmStopped => {}
+        // Direct-messaging runner events fold into `GuiState`, which also
+        // appends a correspondent's start-over to the trust log.
+        NetEvent::Dm(ref event) => {
+            let mut st = state.borrow_mut();
+            st.on_dm_event(event);
+            dm_ui::apply_dm(ui, &st);
+        }
+        // Every message the stopped runner had not answered is shown refused.
+        NetEvent::DmStopped => {
+            let mut st = state.borrow_mut();
+            st.on_dm_stopped();
+            dm_ui::apply_dm(ui, &st);
+        }
         // A close still waiting on the runner says so where "connecting…" is shown.
         NetEvent::DmCloseSlow => {
             ui.set_connection_status(SharedString::from(net::DM_CLOSE_MESSAGE));
@@ -1767,8 +1806,9 @@ fn apply_net_event(
                     st.set_scroll(LOBBY, if stick { STICK_BOTTOM } else { live });
                     apply_view_preserving_draft(ui, st.current(), active as i32);
                 }
-            } else if out.unread_raised {
-                // #64: the Lobby got a message while unfocused — show its dot.
+            }
+            // #64: the Lobby got a message while not on screen — show its dot.
+            if out.unread_raised {
                 rebuild_rail(ui, &st);
             }
         }
@@ -1827,8 +1867,9 @@ fn apply_net_event(
                         st.set_scroll(idx, if stick { STICK_BOTTOM } else { live });
                         apply_view_preserving_draft(ui, st.current(), active as i32);
                     }
-                } else if out.unread_raised {
-                    // #64: a circle got a message while unfocused — show its dot.
+                }
+                // #64: a circle got a message while not on screen — show its dot.
+                if out.unread_raised {
                     rebuild_rail(ui, &st);
                 }
             }
@@ -2116,6 +2157,8 @@ fn apply_net_event(
             if is_active {
                 ui.set_roster(roster_model(st.active_roster()));
             }
+            // A direct message is labelled by the handle any roster lists for it.
+            dm_ui::apply_dm(ui, &st);
         }
     }
 }

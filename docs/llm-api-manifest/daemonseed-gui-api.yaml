@@ -71,10 +71,15 @@ library:
 # sets the connection status to `net::DM_CLOSE_MESSAGE`. On window close the binary
 # keeps the window open and drawing until the ack, or until the cap plus the close
 # budget has passed.
-# `NetEvent::Dm(Arc<RunnerEvent>)` reaches `GuiState::on_dm_event`, which draws
-# nothing and, for `RunnerEvent::StartedOver`, appends
+# `NetEvent::Dm(Arc<RunnerEvent>)` reaches `GuiState::on_dm_event`, and the
+# binary then redraws the rail's Chats and Direct messages sections, the main pane
+# and the selected thread. For `RunnerEvent::StartedOver`, `on_dm_event` appends
 # `TrustEventKey::DmCorrespondentStateLost` to `GuiState::trust_log`, the audit
-# log. This manifest grows only if the GUI ever exposes reusable library components.
+# log. A queued command `NetHandle::dm` cannot hand over, because the network
+# thread is gone, is folded back as `RunnerEvent::Refused { reason:
+# Refusal::ShuttingDown }`, and losing the network thread folds as
+# `NetEvent::DmStopped` does, once.
+# This manifest grows only if the GUI ever exposes reusable library components.
 modules: []
 public_types: []
 public_functions: []

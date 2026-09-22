@@ -79,6 +79,25 @@ struct RosterRow {
     fingerprint: string,
 }
 
+// One Direct messages rail row. `slot` is the text key Rust resolves back to the
+// item on click. A row carries a label and an age, never a message body.
+struct DmRailRowData {
+    slot: string,
+    label: string,
+    age: string,
+    unread: bool,
+    selected: bool,
+}
+
+// One message of the selected direct-message thread. `status` is empty on a
+// received message.
+struct DmMessageData {
+    outgoing: bool,
+    body: string,
+    status: string,
+    refused: bool,
+}
+
 // One verified announcement row (#91, ISC-S7). `topic`/`body` are the inert
 // decoded post fields, rendered verbatim; `ts` is the signing wall-clock formatted
 // to a short UTC caption by Rust. Rust replaces the whole `announcements` model on
@@ -198,13 +217,31 @@ component MsgBubble inherits Rectangle {
 component RosterRowView inherits Rectangle {
     in property <string> name;
     in property <string> fingerprint;
+    // Right-click: `menu-opened` fires first, so the member is read while the
+    // menu opens (the roster can re-sort before an item is chosen), then the
+    // menu shows. `start-dm` is the menu's one item.
+    callback menu-opened();
+    callback start-dm();
     // Tall enough to hold the name AND the on-hover fingerprint line WITHIN the
     // row's own bounds, so the hex can never overlap the next member's name.
     // Accessibility pass: larger, higher-contrast
     // text for low-vision readability.
     height: 46px; border-radius: 6px;
     background: touch.has-hover ? #1b1d20 : transparent;
-    touch := TouchArea { }
+    row_menu := ContextMenuArea {
+        Menu {
+            MenuItem { title: "Start a direct message"; activated => { root.start-dm(); } }
+        }
+    }
+    // Above the menu area, so it takes the right-press and opens the menu itself.
+    touch := TouchArea {
+        pointer-event(e) => {
+            if (e.button == PointerEventButton.right && e.kind == PointerEventKind.down) {
+                root.menu-opened();
+                row_menu.show({ x: self.mouse-x, y: self.mouse-y });
+            }
+        }
+    }
     HorizontalLayout {
         padding-left: 10px; padding-right: 10px; spacing: 6px;
         VerticalLayout {
@@ -216,6 +253,104 @@ component RosterRowView inherits Rectangle {
             Text { text: touch.has-hover ? root.fingerprint : ""; color: #9aa3b0; font-size: 12px; }
         }
         Rectangle { }
+    }
+}
+
+// A rail section header: the chevron on the left only folds or unfolds this
+// section (`toggled`); the label opens this section and folds the other
+// (`opened`). The dot shows while anything inside is unread, open or not.
+component RailSectionHeader inherits Rectangle {
+    in property <string> label;
+    in property <bool> open;
+    in property <bool> unread;
+    callback toggled();
+    callback opened();
+    height: 34px; border-radius: 8px;
+    HorizontalLayout {
+        padding-left: 2px; padding-right: 10px; spacing: 2px;
+        chevron := TouchArea {
+            width: 28px;
+            clicked => { root.toggled(); }
+            Rectangle {
+                border-radius: 6px;
+                background: chevron.has-hover ? #141517 : transparent;
+                Text {
+                    text: root.open ? "▾" : "▸";
+                    color: #8b93a1; font-size: 14px;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+        heading := TouchArea {
+            clicked => { root.opened(); }
+            Rectangle {
+                border-radius: 6px;
+                background: heading.has-hover ? #141517 : transparent;
+                HorizontalLayout {
+                    padding-left: 6px; padding-right: 6px; spacing: 8px;
+                    Text { text: root.label; color: #c8ced6; font-size: 14px; font-weight: 600; vertical-alignment: center; }
+                    Rectangle { }
+                    VerticalLayout {
+                        alignment: center;
+                        if root.unread : Rectangle { width: 8px; height: 8px; border-radius: 4px; background: #4a9d8e; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// One Direct messages rail row: the correspondent's label and the item's age,
+// plus the unread dot. Never a message body.
+component DmRailRowView inherits Rectangle {
+    in property <DmRailRowData> item;
+    callback clicked();
+    height: 40px; border-radius: 8px;
+    background: root.item.selected ? #141517 : touch.has-hover ? #101113 : transparent;
+    touch := TouchArea { clicked => { root.clicked(); } }
+    HorizontalLayout {
+        padding-left: 12px; padding-right: 10px; spacing: 8px;
+        Text {
+            horizontal-stretch: 1;
+            text: root.item.label; color: #d6dae1; font-size: 14px;
+            overflow: elide; vertical-alignment: center;
+        }
+        Text { text: root.item.age; color: #5b6472; font-size: 12px; vertical-alignment: center; }
+        // A fixed column, so the age sits in the same place with or without the dot.
+        VerticalLayout {
+            width: 8px;
+            alignment: center;
+            // Never on the selected row, mirroring the room dot.
+            if root.item.unread && !root.item.selected : Rectangle {
+                width: 8px; height: 8px; border-radius: 4px; background: #4a9d8e;
+            }
+        }
+    }
+}
+
+// One direct message, in the chat bubbles' colours: a received message on the
+// green bubble, one written here on the dark bubble with its status below it in
+// the muted caption tone (the error tone when it did not go).
+component DmBubble inherits Rectangle {
+    in property <DmMessageData> msg;
+    HorizontalLayout {
+        alignment: root.msg.outgoing ? end : start;
+        Rectangle {
+            max-width: root.width * 0.72;
+            border-radius: 10px;
+            background: root.msg.outgoing ? #141517 : #15302b;
+            border-width: 1px;
+            border-color: root.msg.outgoing ? #ffffff10 : #1f4d45;
+            VerticalLayout {
+                padding: 8px; spacing: 3px;
+                Text { text: root.msg.body; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
+                if root.msg.status != "" : Text {
+                    text: root.msg.status;
+                    color: root.msg.refused ? #c2785b : #5b6472;
+                    font-size: 11px; horizontal-alignment: right;
+                }
+            }
+        }
     }
 }
 
@@ -362,6 +497,7 @@ component MenuTextInput inherits Rectangle {
     in property <TextWrap> wrap: TextWrap.no-wrap;
     in property <InputType> input-type: InputType.text;
     in property <bool> custom-paste: false;
+    in property <bool> enabled: true;
     callback accepted();
     callback edited();
     callback paste-requested();
@@ -414,6 +550,7 @@ component MenuTextInput inherits Rectangle {
             height: 100%;
             text <=> root.text;
             single-line: root.single-line;
+            enabled: root.enabled;
             font-size: root.font-size;
             color: #d6dae1;
             wrap: root.wrap;
@@ -465,6 +602,45 @@ export component AppWindow inherits Window {
     // "No one else here yet" empty-state. Bound to the Lobby for this increment;
     // circle presence is #77.
     in property <[RosterRow]> roster;
+
+    // ── Rail sections + direct messages ── all written by Rust after every state
+    // change. Section codes: 0 = Chats, 1 = Direct messages. `main-pane`: 0 = the
+    // active room's chat with its tabs, 1 = "Choose a chat", 2 = "Choose a
+    // conversation", 3 = the selected direct-message thread.
+    in property <bool> chats-open: true;
+    in property <bool> chats-unread;
+    in property <bool> dms-open;
+    in property <bool> dms-unread;
+    in property <int> main-pane: 0;
+    in property <[DmRailRowData]> dm-rows;
+    // How far the rooms list and the Direct messages list are scrolled: each
+    // list's viewport-y, 0 at the top and negative once scrolled down.
+    out property <length> chats-list-offset;
+    out property <length> dm-list-offset;
+    in property <string> dm-header-label;
+    in property <string> dm-fingerprint;
+    in property <bool> dm-is-request;
+    in property <[DmMessageData]> dm-messages;
+    in property <bool> dm-can-send;
+    in property <string> dm-refusal;
+    // A request whose block is on its way: its answers give way to "Blocking…".
+    in property <bool> dm-blocking;
+    // One line under the Direct messages header: the block list being unreadable,
+    // messages that did not go when messaging stopped, a refused block, or why a
+    // first message opened another item. Empty = hidden.
+    in property <string> dm-notice;
+    in-out property <string> dm-draft;
+    callback toggle-section(int);
+    callback open-section(int);
+    callback select-dm(string);
+    callback send-dm(string);
+    callback accept-dm();
+    callback decline-dm();
+    callback block-dm();
+    // Roster right-click: `roster-menu-opened(row)` as the menu opens, then
+    // `roster-start-dm()` when its item is chosen.
+    callback roster-menu-opened(int);
+    callback roster-start-dm();
 
     // ── Announcements + MOTD pane (#91) — display-only, scoped to the connected
     // relay. `motd` is the inert verbatim MOTD ("" ⇒ hide the MOTD area, ISC-S9);
@@ -639,7 +815,10 @@ export component AppWindow inherits Window {
     // Autofocus the composer after a rail switch so the user can type immediately.
     // Guarded to the Chat tab; Rust invokes it on switch.
     callback focus-composer();
-    focus-composer => { if (root.active-tab == 0) { composer.focus-input(); } }
+    focus-composer => { if (root.main-pane == 0 && root.active-tab == 0) { composer.focus-input(); } }
+    // The reply box of the thread on screen.
+    callback focus-dm-composer();
+    focus-dm-composer => { if (root.main-pane == 3 && root.dm-can-send) { dm-composer.focus-input(); } }
     // Any switch INTO the Chat tab (TabLabel click, post-join, or a programmatic
     // Rust set) refocuses the composer. composer is always-instantiated (visible-
     // gated, not `if`-gated), so focusing here is timing-safe.
@@ -732,6 +911,10 @@ export component AppWindow inherits Window {
                 root.switch-circle(0);
                 return accept;
             }
+            if (event.modifiers.control && event.text == "d") {
+                root.open-section(1);
+                return accept;
+            }
             // Enter advances the "I've saved it" recovery-phrase step. Step 1 (mnemonic
             // display) has no input field to carry an `accepted`, so nothing is focused
             // and the keypress bubbles up here — mirror the per-field Enter-submit.
@@ -740,6 +923,10 @@ export component AppWindow inherits Window {
                 return accept;
             }
             if (event.text == Key.Escape) {
+                if (root.sheet-open) {
+                    root.sheet-open = false;
+                    root.hide-phrase();
+                }
                 root.palette-open = false;
                 root.join-open = false;
                 root.new-open = false;
@@ -765,16 +952,36 @@ export component AppWindow inherits Window {
                         Text { text: root.my-handle; visible: root.my-handle != ""; color: #5b6472; font-size: 11px; }
                     }
                 }
-                for c[i] in root.circles : RailRow {
-                    name: c.name; sub: c.sub; initial: c.initial; pinned: c.pinned;
-                    unread: c.unread;
-                    selected: i == root.active;
-                    clicked => { root.switch-circle(i); }
+                RailSectionHeader {
+                    label: "Chats"; open: root.chats-open; unread: root.chats-unread;
+                    toggled => { root.toggle-section(0); }
+                    opened => { root.open-section(0); }
+                }
+                // The rooms scroll once they overflow. The list is capped at its own
+                // height, so spare rail space goes to the spacer below, not here, and
+                // the circle controls stay directly under the last room.
+                if root.chats-open : Flickable {
+                    min-height: 54px;
+                    preferred-height: chats-list.preferred-height;
+                    max-height: chats-list.preferred-height;
+                    viewport-width: self.width;
+                    viewport-height: chats-list.preferred-height;
+                    changed viewport-y => { root.chats-list-offset = self.viewport-y; }
+                    chats-list := VerticalLayout {
+                        spacing: 4px; alignment: start;
+                        for c[i] in root.circles : RailRow {
+                            name: c.name; sub: c.sub; initial: c.initial; pinned: c.pinned;
+                            unread: c.unread;
+                            selected: i == root.active;
+                            clicked => { root.switch-circle(i); }
+                        }
+                    }
                 }
 
                 // Empty-state: only the pinned Lobby exists (brief lean, ISC-31).
-                // Mouse-home launch surfaces, mirrored by the palette rows.
-                if root.only-lobby : Rectangle {
+                // Mouse-home launch surfaces, mirrored by the palette rows. Outside the
+                // scrolling list, so always in view while Chats is open.
+                if root.chats-open && root.only-lobby : Rectangle {
                     height: 96px;
                     VerticalLayout {
                         padding: 8px; spacing: 8px; alignment: start;
@@ -791,17 +998,51 @@ export component AppWindow inherits Window {
                 // Persistent entry once circles exist — the empty-state's buttons
                 // vanish with `only-lobby`, so adding a SECOND circle needs an
                 // always-present surface (manual test gap).
-                if !root.only-lobby : HorizontalLayout {
+                if root.chats-open && !root.only-lobby : HorizontalLayout {
                     padding: 4px; spacing: 8px;
                     PillButton { label: "+ New circle"; primary: true; w: 120px; clicked => { root.open-new(); } }
                     PillButton { label: "Join"; w: 64px; clicked => { root.open-join(); } }
+                }
+
+                RailSectionHeader {
+                    label: "Direct messages"; open: root.dms-open; unread: root.dms-unread;
+                    toggled => { root.toggle-section(1); }
+                    opened => { root.open-section(1); }
+                }
+                if root.dm-notice != "" : HorizontalLayout {
+                    padding-left: 12px; padding-right: 12px;
+                    Text { text: root.dm-notice; color: #c2785b; font-size: 12px; wrap: word-wrap; }
+                }
+                // Requests first, then conversations newest first, as Rust orders them.
+                // Capped at its own height like the rooms list.
+                if root.dms-open : Flickable {
+                    preferred-height: max(dm-list.preferred-height, 40px);
+                    max-height: max(dm-list.preferred-height, 40px);
+                    viewport-width: self.width;
+                    viewport-height: dm-list.preferred-height;
+                    changed viewport-y => { root.dm-list-offset = self.viewport-y; }
+                    dm-list := VerticalLayout {
+                        spacing: 2px; alignment: start;
+                        for r in root.dm-rows : DmRailRowView {
+                            item: r;
+                            clicked => { root.select-dm(r.slot); }
+                        }
+                    }
+                    Text {
+                        x: 12px; y: 10px;
+                        text: "No conversations yet";
+                        visible: root.dm-rows.length == 0;
+                        color: #5b6472; font-size: 13px;
+                    }
                 }
 
                 Rectangle { }
                 // Download meter (commit 2): a label + fraction bar, shown only while
                 // a download is in flight / just finished (`download-label` non-empty).
                 // Lives in the rail so it survives a return to Chat. Simple by design.
-                if root.download-label != "" : Rectangle {
+                // Shown with the chat only: a circle share's name stays out of the
+                // Direct messages view.
+                if root.download-label != "" && root.main-pane == 0 : Rectangle {
                     height: 36px;
                     VerticalLayout {
                         padding: 6px; spacing: 4px; alignment: center;
@@ -845,9 +1086,20 @@ export component AppWindow inherits Window {
                     height: 58px; background: #101113;
                     HorizontalLayout {
                         padding: 14px; spacing: 10px;
+                        // The room's name, or the selected conversation's label and
+                        // fingerprint, or the section a placeholder stands for.
                         VerticalLayout { alignment: center; spacing: 2px;
-                            Text { text: root.header-name; color: #e4e8ee; font-size: 16px; }
-                            Text { text: root.header-sub; color: #5b6472; font-size: 12px; } }
+                            Text {
+                                text: root.main-pane == 0 ? root.header-name
+                                    : root.main-pane == 3 ? root.dm-header-label
+                                    : root.main-pane == 1 ? "Chats" : "Direct messages";
+                                color: #e4e8ee; font-size: 16px;
+                            }
+                            Text {
+                                text: root.main-pane == 0 ? root.header-sub
+                                    : root.main-pane == 3 ? root.dm-fingerprint : "";
+                                color: #5b6472; font-size: 12px;
+                            } }
                         Rectangle { }
                         Text {
                             text: root.connection-status;
@@ -858,16 +1110,20 @@ export component AppWindow inherits Window {
                         // #35: open the Circle-details sheet — per-circle only
                         // (hidden on the Lobby, which has no phrase/fingerprint).
                         // `if` (not `visible:`) leaves no layout gap on the Lobby.
-                        if root.active != 0 : PillButton {
+                        if root.active != 0 && root.main-pane == 0 : PillButton {
                             label: "Details"; w: 88px;
                             clicked => { root.sheet-open = true; }
                         }
-                        SealedPill { }
+                        // The room's seal, shown with the chat only.
+                        if root.main-pane == 0 : SealedPill { }
                     }
                 }
-                // tab strip
+                // tab strip — the active room's only; hidden while the pane shows
+                // a placeholder or a direct-message thread.
                 Rectangle {
-                    height: 38px; background: #0b0c0e;
+                    height: root.main-pane == 0 ? 38px : 0px;
+                    visible: root.main-pane == 0;
+                    background: #0b0c0e;
                     HorizontalLayout {
                         padding-left: 16px; spacing: 20px;
                         TabLabel { label: "Chat"; active: root.active-tab == 0; clicked => { root.active-tab = 0; } }
@@ -905,7 +1161,7 @@ export component AppWindow inherits Window {
                         // content region (one tab visible at a time)
                         chat-area := Rectangle {
                             // CHAT — message list
-                            if root.active-tab == 0 : Flickable {
+                            if root.main-pane == 0 && root.active-tab == 0 : Flickable {
                                 viewport-width: self.width;
                                 // #86: real laid-out content height (variable-height bubbles),
                                 // not a fixed per-message stride. Mirrored into root.chat-content-h
@@ -927,7 +1183,7 @@ export component AppWindow inherits Window {
                             // scrollable, OS-style tree. Each relay share is a root
                             // node; expanding lazily previews its files. Download
                             // (right-click) + publish (overlay) are commits 2 & 3.
-                            if root.active-tab == 1 : VerticalLayout {
+                            if root.main-pane == 0 && root.active-tab == 1 : VerticalLayout {
                                 // No `alignment: start` — that packs children to their
                                 // preferred height and would zero out the tree's
                                 // `vertical-stretch`. Default fill lets the tree expand.
@@ -972,7 +1228,7 @@ export component AppWindow inherits Window {
                             }
 
                             // CIRCLE SHARES — placeholder so nav feels complete (not built)
-                            if root.active-tab == 2 : VerticalLayout {
+                            if root.main-pane == 0 && root.active-tab == 2 : VerticalLayout {
                                 alignment: center;
                                 HorizontalLayout {
                                     alignment: center;
@@ -989,7 +1245,7 @@ export component AppWindow inherits Window {
                             // relay's verbatim MOTD over its client-re-verified
                             // announcement posts. The MOTD area hides when unset
                             // (ISC-S9); the posts list shows an empty-state otherwise.
-                            if root.active-tab == 3 : VerticalLayout {
+                            if root.main-pane == 0 && root.active-tab == 3 : VerticalLayout {
                                 padding: 14px; spacing: 10px;
                                 HorizontalLayout {
                                     height: 28px; spacing: 10px;
@@ -1088,12 +1344,100 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
+
+                            // "Choose a chat" / "Choose a conversation": the owning
+                            // section is folded, or Direct messages has nothing chosen.
+                            if root.main-pane == 1 || root.main-pane == 2 : Text {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                text: root.main-pane == 1 ? "Choose a chat" : "Choose a conversation";
+                                color: #8b93a1; font-size: 16px; horizontal-alignment: center;
+                            }
+
+                            // The selected direct-message thread, oldest first. It follows
+                            // the newest message whenever the thread grows.
+                            if root.main-pane == 3 : Flickable {
+                                viewport-width: self.width;
+                                viewport-height: dm-thread.preferred-height;
+                                init => { self.viewport-y = min(0px, self.height - self.viewport-height); }
+                                changed viewport-height => { self.viewport-y = min(0px, self.height - self.viewport-height); }
+                                dm-thread := VerticalLayout {
+                                    padding: 16px; spacing: 8px; alignment: start;
+                                    for m in root.dm-messages : DmBubble { msg: m; }
+                                }
+                            }
+                            if root.main-pane == 3 && !root.dm-is-request && root.dm-messages.length == 0 : Text {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                text: "Nothing is sent until your first message.";
+                                color: #5b6472; font-size: 13px; horizontal-alignment: center;
+                            }
+                        }
+
+                        // Direct-message bar: a request's answer, a refusal, the reply box.
+                        // Always instantiated and shown only with a thread, so answering a
+                        // request never tears down the button being pressed.
+                        Rectangle {
+                            height: root.main-pane == 3 ? dm-bar.preferred-height : 0px;
+                            visible: root.main-pane == 3;
+                            background: #0d0e10;
+                            dm-bar := VerticalLayout {
+                                padding: 12px; spacing: 10px;
+                                Rectangle {
+                                    height: root.dm-is-request ? 38px : 0px;
+                                    visible: root.dm-is-request;
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        Text {
+                                            text: root.dm-header-label + " wants to message you.";
+                                            color: #d6dae1; font-size: 13px; vertical-alignment: center;
+                                            horizontal-stretch: 1; overflow: elide;
+                                        }
+                                        if !root.dm-blocking : PillButton { label: "Accept"; primary: true; w: 96px; clicked => { root.accept-dm(); } }
+                                        if !root.dm-blocking : PillButton { label: "Decline"; w: 96px; clicked => { root.decline-dm(); } }
+                                        if !root.dm-blocking : PillButton { label: "Block"; w: 84px; clicked => { root.block-dm(); } }
+                                        if root.dm-blocking : Text { text: "Blocking…"; color: #8b93a1; font-size: 13px; vertical-alignment: center; }
+                                    }
+                                }
+                                Text {
+                                    height: root.dm-refusal != "" ? self.preferred-height : 0px;
+                                    visible: root.dm-refusal != "";
+                                    text: root.dm-refusal;
+                                    color: #c2785b; font-size: 12px; wrap: word-wrap;
+                                }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    Rectangle {
+                                        horizontal-stretch: 1; height: 30px;
+                                        clip: true;
+                                        border-radius: 9px; background: #141517; border-width: 1px; border-color: #ffffff12;
+                                        Text {
+                                            x: 12px; width: parent.width - 24px; height: 100%;
+                                            text: root.dm-can-send ? "Write a message…" : "You can't write here yet.";
+                                            visible: root.dm-draft == "";
+                                            color: #4d5560;
+                                            font-size: 13px; vertical-alignment: center;
+                                        }
+                                        dm-composer := MenuTextInput {
+                                            x: 12px; width: parent.width - 24px; height: 100%;
+                                            // Takes keys only while its thread is on screen.
+                                            enabled: root.dm-can-send && root.main-pane == 3;
+                                            text <=> root.dm-draft;
+                                            accepted => { root.send-dm(root.dm-draft); }
+                                        }
+                                    }
+                                    Rectangle { width: 84px; height: 30px; border-radius: 9px;
+                                        background: root.dm-can-send ? #4a9d8e : #141517;
+                                        TouchArea { enabled: root.dm-can-send; clicked => { root.send-dm(root.dm-draft); } }
+                                        Text { text: "Send"; color: root.dm-can-send ? #06120f : #4d5560; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
+                                }
+                            }
                         }
 
                         // composer bar — stable autofocus target; shown on Chat only.
                         Rectangle {
-                            height: root.active-tab == 0 ? 54px : 0px;
-                            visible: root.active-tab == 0;
+                            height: root.main-pane == 0 && root.active-tab == 0 ? 54px : 0px;
+                            visible: root.main-pane == 0 && root.active-tab == 0;
                             background: #0d0e10;
                             HorizontalLayout {
                                 padding: 12px; spacing: 10px;
@@ -1120,6 +1464,9 @@ export component AppWindow inherits Window {
                                     }
                                     composer := MenuTextInput {
                                         x: 12px; width: parent.width - 24px; height: 100%;
+                                        // Takes keys only while the chat is on screen, so a
+                                        // keystroke meant for a direct message never posts here.
+                                        enabled: root.main-pane == 0 && root.active-tab == 0;
                                         text <=> root.draft;
                                         accepted => { root.send-message(root.draft); }
                                     }
@@ -1142,12 +1489,12 @@ export component AppWindow inherits Window {
         // Rust side sets `root.roster` to the ACTIVE room's roster, so this pane always
         // shows the current room's HERE NOW. Demonsaw's full-height roster pane.
         Rectangle {
-            width: (root.active-tab == 0) ? 1px : 0px;
+            width: (root.main-pane == 0 && root.active-tab == 0) ? 1px : 0px;
             background: #ffffff12;
         }
         Rectangle {
-            width: (root.active-tab == 0) ? 240px : 0px;
-            visible: root.active-tab == 0;
+            width: (root.main-pane == 0 && root.active-tab == 0) ? 240px : 0px;
+            visible: root.main-pane == 0 && root.active-tab == 0;
             background: #0d0e10;
             VerticalLayout {
                 padding: 12px; spacing: 8px;
@@ -1162,7 +1509,11 @@ export component AppWindow inherits Window {
                         viewport-height: root.roster.length * 46px + 8px;
                         VerticalLayout {
                             padding: 2px; spacing: 2px; alignment: start;
-                            for r in root.roster : RosterRowView { name: r.name; fingerprint: r.fingerprint; }
+                            for r[i] in root.roster : RosterRowView {
+                                name: r.name; fingerprint: r.fingerprint;
+                                menu-opened => { root.roster-menu-opened(i); }
+                                start-dm => { root.roster-start-dm(); }
+                            }
                         }
                     }
                     // empty-state — computed visibility (never an `if`), centered; brighter/larger.
