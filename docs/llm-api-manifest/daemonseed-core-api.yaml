@@ -1209,7 +1209,13 @@ modules:
       open_channel(&ChannelOwnerSeed, subkeys) -> [u8; HELLO_LOOKUP_KEY_LEN],
       and read_channel / write_channel(lookup_key, subkey). Each write method
       performs exactly one write; open_channel writes none and reports the
-      record's lookup key. subkeys is the record's subkey count, part of the
+      record's lookup key. write_batch(&[BatchWrite]) -> Vec<Result<(),
+      RecordError>> performs writes none of which depends on another reaching
+      the network, one result per write attempted in order; the default performs
+      them in order and stops at the first failure. BatchWrite is Channel {
+      lookup_key, subkey, bytes } or EraseDropSlot { owner, subkeys, slot }.
+      first_contact batches its opening and sequence-0 slot; accept batches the
+      collected slot's erase, its opening and the reply slot. subkeys is the record's subkey count, part of the
       record's identity and so of its address. RecordError wraps a transport's
       own error; FlowError is Advert, Drop, Channel, Chain, Store, Records,
       NoAdvert, NoOpening, NotOutstanding, AlreadyEstablished,

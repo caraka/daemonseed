@@ -578,6 +578,9 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-core`: `dm::flows::Records::write_batch` and `BatchWrite`; first contact writes its channel opening and first slot as one batch, and an acceptance its hello-slot erase, opening and reply slot.
+- `daemonseed-veilid-net`: `VeilidRecords::write_batch` submits every write of a batch before confirming any; the DM runner collects every 12 s (±20 %) while a first contact awaits acceptance or an acceptance awaits the peer's first read, for up to 15 minutes after start, first contact or accept; a drop scan that does not answer is retried three times and defers up to two passes over this side's own drop before every slot is read; a hello awaiting acceptance is not rewritten after a partial drop scan; runner steps are traced.
+
 - `daemonseed-veilid-net`: `dm::view` holds the direct-message view model the terminal and desktop clients
   share: `DmState`, `DmCorrespondence`, `DmThreadRow`, `DmContactRequest`, `DmOutstanding`,
   `DmAcceptDraft`, `DmFold`, `FirstContactBlocked`, `dm_fingerprint` and `DM_REQUEST_CAP`.

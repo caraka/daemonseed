@@ -137,6 +137,8 @@ struct Node {
 #[derive(Debug, Default, Clone, Copy)]
 struct Calls {
     drop_reads: usize,
+    /// Drop reads of slot 0, where a pass over the drop starts.
+    drop_passes: usize,
     hello_writes: usize,
     ring_writes: usize,
     control_writes: usize,
@@ -226,6 +228,9 @@ struct Faults {
     open_under_other_key: bool,
     /// Refuse every drop slot write.
     fail_drop_writes: bool,
+    /// Refuse every read of slot 0 of this drop, as a pass whose scan the
+    /// record store deferred does.
+    fail_slot_zero_of: Option<[u8; 32]>,
     /// Fail every inspect, as a node that cannot ask the network does.
     unreachable: bool,
     /// Answer every inspect with no network number, as a node whose routing
@@ -420,7 +425,11 @@ impl Records for Fake {
             tokio::task::block_in_place(|| gate.hold());
         }
         self.count(|calls| calls.drop_reads += 1);
+        if slot == 0 && self.faults().fail_slot_zero_of == Some(*owner.as_bytes()) {
+            return Err(RecordError::new(TimedOut));
+        }
         if slot == 0 {
+            self.count(|calls| calls.drop_passes += 1);
             if let Err(failure) = self.inject(DROP, Op::Scan) {
                 self.faults().scan_failure = Some(failure);
             }
@@ -944,6 +953,369 @@ async fn establish(config: RunnerConfig) -> Scene {
         a_peer,
         b_peer,
     }
+}
+
+/// Passes over the drop `fake` takes in `wait` from now.
+async fn passes_in(fake: &Fake, wait: Duration) -> usize {
+    let before = fake.calls().drop_passes;
+    tokio::time::sleep(wait).await;
+    fake.calls().drop_passes - before
+}
+
+/// A first contact awaiting acceptance is collected on the waiting interval,
+/// for the waiting window, and on the ordinary tick after it; a conversation
+/// waiting on nobody is collected on the ordinary tick.
+#[tokio::test(start_paused = true)]
+async fn collection_runs_sooner_while_a_first_contact_awaits_acceptance() {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let mut bw = b.spawn(&Fake::on(&dht), RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    assert!(finished(&bw.stop().await), "B is away from here on");
+
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+
+    let waiting = passes_in(&a_fake, DEFAULT_TICK).await;
+    assert!(
+        waiting >= 4,
+        "a minute of waiting on acceptance is at least four passes, took {waiting}"
+    );
+    tokio::time::sleep(WAITING_WINDOW).await;
+    let after = passes_in(&a_fake, DEFAULT_TICK * 3).await;
+    assert!(
+        (2..=4).contains(&after),
+        "past the window three ticks are two to four passes, took {after}"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// Once both sides have seen the other's first message, neither waits on the
+/// other, and collection is back on the ordinary tick inside the window.
+#[tokio::test(start_paused = true)]
+async fn collection_returns_to_the_tick_once_nothing_waits() {
+    let started = tokio::time::Instant::now();
+    let Scene {
+        a: _a,
+        b: _b,
+        a_fake,
+        aw,
+        mut bw,
+        b_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    bw.wait_for("delivery of B's reply", delivered(b_peer, 0))
+        .await;
+    let settled = passes_in(&a_fake, DEFAULT_TICK * 3).await;
+    assert!(
+        (2..=4).contains(&settled),
+        "three ticks with nothing waiting are two to four passes, took {settled}"
+    );
+    assert!(
+        started.elapsed() < WAITING_WINDOW,
+        "measured inside the window, where waiting would still have been fast"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+}
+
+/// An acceptor whose hello back the correspondent has not yet shown it read
+/// collects on the waiting interval, and accepting restarts the window: here
+/// the accept comes after the window that started with the runner has closed.
+#[tokio::test(start_paused = true)]
+async fn collection_runs_sooner_after_an_accept_until_the_hello_back_is_read() {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let b_fake = Fake::on(&dht);
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut aw = a.spawn(&Fake::on(&dht), RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    assert!(finished(&aw.stop().await), "A is away from here on");
+
+    bw.wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    tokio::time::sleep(WAITING_WINDOW).await;
+    bw.drain();
+    let at = bw
+        .seen
+        .iter()
+        .rposition(request_from(&a.pk))
+        .expect("the request is held");
+    let request = request_id(&bw.seen[at]);
+    let idle = passes_in(&b_fake, DEFAULT_TICK).await;
+    assert!(idle <= 2, "before the accept B is on the tick, took {idle}");
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's acceptance", sent(2)).await;
+    let waiting = passes_in(&b_fake, DEFAULT_TICK).await;
+    assert!(
+        waiting >= 4,
+        "a minute waiting on the hello back is at least four passes, took {waiting}"
+    );
+    assert!(finished(&bw.stop().await));
+}
+
+/// A first contact whose acceptance may sit in a slot the last scan could not
+/// read is not rewritten; once a scan reads every slot, it is.
+#[tokio::test(start_paused = true)]
+async fn a_hello_is_not_rewritten_after_a_partial_scan() {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let mut bw = b.spawn(&Fake::on(&dht), RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    assert!(finished(&bw.stop().await));
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    assert!(finished(&aw.stop().await));
+
+    let drop_name = b.drop_name();
+    {
+        let mut net = dht.lock().expect("the network lock");
+        let hello = *net
+            .records
+            .keys()
+            .find(|(kind, name, _)| *kind == DROP && *name == drop_name)
+            .expect("A's hello is in B's drop");
+        net.evict(hello);
+    }
+    let deferred = a_fake.restart();
+    deferred.faults().fail_slot_zero_of = Some(a.drop_name());
+    let mut aw = a.spawn(&deferred, RunnerConfig::default());
+    aw.wait_for("A's restart over a deferred scan", is_health)
+        .await;
+    assert_eq!(
+        deferred.calls().hello_writes,
+        0,
+        "a lost hello is not rewritten after a partial scan"
+    );
+    assert!(finished(&aw.stop().await));
+
+    let read = a_fake.restart();
+    let mut aw = a.spawn(&read, RunnerConfig::default());
+    aw.wait_for("A's restart over a full scan", is_health).await;
+    assert_eq!(
+        read.calls().hello_writes,
+        1,
+        "the control: a full scan lets the lost hello be rewritten"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A batched write that fails is counted as the single write it is: the erase
+/// of an accept as a drop write, a first contact's opening as a channel write.
+#[tokio::test(start_paused = true)]
+async fn a_failed_batched_write_is_counted_as_its_own_kind() {
+    let dht = network();
+    let (a, b, c) = (Profile::new(), Profile::new(), Profile::new());
+    let b_fake = Fake::on(&dht);
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut aw = a.spawn(&Fake::on(&dht), RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    assert!(finished(&aw.stop().await));
+
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+    b_fake.faults().plan.push((DROP, Op::Write, Fault::Refused));
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    let at = bw.wait_for("B's refused accept", refused(2)).await;
+    let at = bw.wait_from(at, "B's health", is_health).await;
+    let counted = health(&bw.seen[at]);
+    assert_eq!(counted.drop_write_failures, 1, "the erase is a drop write");
+    assert_eq!(counted.channel_write_failures, 0);
+    assert!(finished(&bw.stop().await));
+
+    let c_fake = Fake::on(&dht);
+    let mut cw = c.spawn(&c_fake, RunnerConfig::default());
+    cw.wait_for("C's startup", is_health).await;
+    c_fake
+        .faults()
+        .plan
+        .push((CHANNEL, Op::Write, Fault::Refused));
+    cw.send(RunnerCommand::FirstContact {
+        token: CommandToken(3),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    let at = cw.wait_for("C's refused first contact", refused(3)).await;
+    let at = cw.wait_from(at, "C's health", is_health).await;
+    let counted = health(&cw.seen[at]);
+    assert_eq!(
+        counted.channel_write_failures, 1,
+        "the opening is a channel write"
+    );
+    assert_eq!(counted.drop_write_failures, 0);
+    assert!(finished(&cw.stop().await));
+}
+
+/// What a trace must never format: a message body or the bytes of a record,
+/// a key or seed, an identity public key, or a conversation's label other
+/// than through [`tag`]. A count of any of them, `x.len()`, is allowed.
+const UNTRACEABLE: &[&str] = &[
+    "body",
+    "bodies",
+    "bytes",
+    "reply",
+    "slot_bytes",
+    "control",
+    "sealed",
+    "written",
+    "lookup_key",
+    "outgoing_lookup_key",
+    "owner",
+    "owner_seed",
+    "identity",
+    "peer_identity_pk",
+    "pk",
+    "secret",
+    "signer",
+    "keypair",
+    "seed",
+    "peer",
+    "label",
+];
+
+/// Every `vtrace!` call in `source` that names something in [`UNTRACEABLE`],
+/// as `(line, name)`: in its format string's inline arguments or in its
+/// argument list, a `tag(..)` call and anything followed by `.len()` aside.
+fn untraceable_in(source: &str) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    let bytes = source.as_bytes();
+    for (start, _) in source.match_indices("vtrace!(") {
+        let open = start + "vtrace!(".len();
+        let (mut depth, mut at, mut in_str) = (1usize, open, false);
+        let mut outside = String::new();
+        let mut inside = String::new();
+        while depth > 0 {
+            let c = bytes[at] as char;
+            if in_str {
+                if c == '\\' {
+                    at += 1;
+                } else if c == '"' {
+                    in_str = false;
+                    outside.push(' ');
+                } else {
+                    inside.push(c);
+                }
+            } else if c == '"' {
+                in_str = true;
+            } else {
+                depth = match c {
+                    '(' => depth + 1,
+                    ')' => depth - 1,
+                    _ => depth,
+                };
+                outside.push(c);
+            }
+            at += 1;
+        }
+        // Strip every `tag(..)` call, which renders only a short form.
+        while let Some(t) = outside.find("tag(") {
+            let end = outside[t..].find(')').map_or(outside.len(), |e| t + e + 1);
+            outside.replace_range(t..end, " ");
+        }
+        let captures = inside
+            .split('{')
+            .skip(1)
+            .map(|rest| rest.split(['}', ':']).next().unwrap_or(""));
+        let named: Vec<String> = captures
+            .map(str::to_owned)
+            .chain(names_outside(&outside))
+            .collect();
+        let line = source[..start].matches('\n').count() + 1;
+        for name in named {
+            if name.split('.').any(|part| UNTRACEABLE.contains(&part)) {
+                found.push((line, name));
+            }
+        }
+    }
+    found
+}
+
+/// The identifiers in an argument list, a name followed by `.len()` aside.
+fn names_outside(args: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = args;
+    while let Some(i) = rest.find(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        let tail = &rest[i..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        if !tail[end..].starts_with(".len()") {
+            names.push(tail[..end].to_owned());
+        }
+        rest = &tail[end..];
+    }
+    names
+}
+
+/// No trace in the runner or the record store formats a body, a key, an
+/// identity public key or a full label, and a conversation's tag is two bytes.
+#[test]
+fn no_trace_formats_a_body_a_key_or_a_label() {
+    assert_eq!(
+        untraceable_in("crate::vtrace!(\"x {body:?} {}\", tag(&peer)); crate::vtrace!(\"y {}\", lookup_key); crate::vtrace!(\"z {}\", bodies.len());"),
+        vec![(1, "body".to_owned()), (1, "lookup_key".to_owned())],
+        "the probe finds what it must, and passes a tag and a count"
+    );
+    for (file, source) in [
+        ("runner.rs", include_str!("../runner.rs")),
+        ("records.rs", include_str!("../records.rs")),
+    ] {
+        assert!(
+            source.matches("vtrace!(").count() >= 5,
+            "{file} is read and holds its traces"
+        );
+        assert_eq!(untraceable_in(source), Vec::new(), "{file}");
+    }
+    let label = CorrespondenceLabel::mint().expect("a label");
+    let short = tag(&label);
+    assert_eq!(short.len(), 4, "two bytes, in hex");
+    let [x, y, ..] = *label.as_bytes();
+    assert_eq!(short, format!("{x:02x}{y:02x}"));
 }
 
 /// Startup reports the roster the store holds and reopens the channel this

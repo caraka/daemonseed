@@ -10,7 +10,8 @@
 //!
 //! [`Records`] is the whole of this module's contact with the network: seven
 //! methods over the three distributed-hash-table record kinds the flow
-//! touches. Nothing here opens a socket, reads a clock or draws entropy of its
+//! touches, and [`Records::write_batch`] for writes one step makes that do not
+//! wait on each other. Nothing here opens a socket, reads a clock or draws entropy of its
 //! own — the current time is a parameter and entropy arrives as a fill
 //! function — so the flow runs identically against a transport and against a
 //! counting fake.
@@ -152,6 +153,67 @@ pub trait Records {
         subkey: u16,
         bytes: &[u8],
     ) -> Result<(), RecordError>;
+
+    /// Perform `writes`, none of which depends on another of them having
+    /// reached the network. One write each.
+    ///
+    /// Returns one result per write attempted, in the order of `writes`; a
+    /// store that stops at a failure returns fewer. Every write whose result is
+    /// `Ok` is done, as each single-write method means it. A store may start
+    /// them all before any is done; the default performs them in order and
+    /// stops at the first failure.
+    fn write_batch(&mut self, writes: &[BatchWrite<'_>]) -> Vec<Result<(), RecordError>> {
+        let mut results = Vec::with_capacity(writes.len());
+        for write in writes {
+            let result = match *write {
+                BatchWrite::Channel {
+                    lookup_key,
+                    subkey,
+                    bytes,
+                } => self.write_channel(lookup_key, subkey, bytes),
+                BatchWrite::EraseDropSlot {
+                    owner,
+                    subkeys,
+                    slot,
+                } => self.erase_drop_slot(owner, subkeys, slot),
+            };
+            let failed = result.is_err();
+            results.push(result);
+            if failed {
+                break;
+            }
+        }
+        results
+    }
+}
+
+/// One write of a [`Records::write_batch`].
+#[derive(Debug, Clone, Copy)]
+pub enum BatchWrite<'a> {
+    /// [`Records::write_channel`].
+    Channel {
+        /// The channel written.
+        lookup_key: &'a [u8; HELLO_LOOKUP_KEY_LEN],
+        /// The subkey written.
+        subkey: u16,
+        /// The bytes written.
+        bytes: &'a [u8],
+    },
+    /// [`Records::erase_drop_slot`].
+    EraseDropSlot {
+        /// The drop the slot belongs to.
+        owner: &'a DropOwnerSeed,
+        /// The drop's subkey count.
+        subkeys: u16,
+        /// The slot erased.
+        slot: u16,
+    },
+}
+
+/// Perform `writes` through [`Records::write_batch`], returning the first
+/// failure in their order.
+fn write_all<R: Records>(records: &mut R, writes: &[BatchWrite<'_>]) -> Result<(), RecordError> {
+    records.write_batch(writes).into_iter().collect()
 }
 
 /// Why a flow stopped.
@@ -508,8 +570,24 @@ fn finish_first_contact<R: Records>(
             closed: false,
         },
     )?;
-    records.write_channel(&outgoing_lookup_key, channel::CONTROL_SUBKEY, &control)?;
-    records.write_channel(&outgoing_lookup_key, channel::slot_for(0), &slot_bytes)?;
+    // The opening and sequence 0 are one step, and neither needs the other on
+    // the network first; the hello waits for both, because a correspondent
+    // that finds it reads the opening next.
+    write_all(
+        records,
+        &[
+            BatchWrite::Channel {
+                lookup_key: &outgoing_lookup_key,
+                subkey: channel::CONTROL_SUBKEY,
+                bytes: &control,
+            },
+            BatchWrite::Channel {
+                lookup_key: &outgoing_lookup_key,
+                subkey: channel::slot_for(0),
+                bytes: &slot_bytes,
+            },
+        ],
+    )?;
 
     // 4. The hello.
     let attempt = place_hello(
@@ -1425,10 +1503,12 @@ fn finish_accept<R: Records>(
         &incoming,
         state.my_collected,
     )?;
-    if let Some(slot) = slot {
-        let my_drop = drop_plane::derive_owner_seed(me.signer.public_key())?;
-        records.erase_drop_slot(&my_drop, drop_plane::DROP_SUBKEYS, slot)?;
-    }
+    // The collected hello's slot is erased with the first writes below: the
+    // erase is hygiene, and nothing the acceptance writes waits on it.
+    let my_drop = match slot {
+        Some(_) => Some(drop_plane::derive_owner_seed(me.signer.public_key())?),
+        None => None,
+    };
 
     // This side's opening and cursor, sealed under the key derived from the
     // secret this side's hello establishes, then the reply's slot.
@@ -1456,12 +1536,27 @@ fn finish_accept<R: Records>(
             closed: false,
         },
     )?;
-    records.write_channel(&outgoing_lookup_key, channel::CONTROL_SUBKEY, &control)?;
-    records.write_channel(
-        &outgoing_lookup_key,
-        channel::slot_for(reply_seq),
-        &slot_bytes,
-    )?;
+    let mut writes = Vec::with_capacity(3);
+    if let (Some(owner), Some(slot)) = (&my_drop, slot) {
+        writes.push(BatchWrite::EraseDropSlot {
+            owner,
+            subkeys: drop_plane::DROP_SUBKEYS,
+            slot,
+        });
+    }
+    writes.push(BatchWrite::Channel {
+        lookup_key: &outgoing_lookup_key,
+        subkey: channel::CONTROL_SUBKEY,
+        bytes: &control,
+    });
+    writes.push(BatchWrite::Channel {
+        lookup_key: &outgoing_lookup_key,
+        subkey: channel::slot_for(reply_seq),
+        bytes: &slot_bytes,
+    });
+    // The hello back waits for all three, as a first contact's hello waits for
+    // its channel.
+    write_all(records, &writes)?;
 
     // The hello back: the persisted bytes where a previous run placed it, and
     // a fresh placement otherwise.
@@ -1999,6 +2094,27 @@ mod tests {
         before_message_read: Option<Box<dyn FnOnce()>>,
         /// Every channel subkey read, control and message alike.
         channel_reads: usize,
+        /// Every write, as the flow asked for it: a batch as one entry naming
+        /// its writes in order, a single write as its own.
+        write_calls: Vec<WriteCall>,
+        /// Inside a batch, whose writes are logged with it.
+        in_batch: bool,
+    }
+
+    /// One write request a flow made, as [`Net::write_calls`] logs it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum WriteCall {
+        Batch(Vec<&'static str>),
+        Single(&'static str),
+    }
+
+    impl Net {
+        /// Log a single write, unless it is part of a batch.
+        fn log_single(&mut self, what: &'static str) {
+            if !self.in_batch {
+                self.write_calls.push(WriteCall::Single(what));
+            }
+        }
     }
 
     impl Net {
@@ -2104,6 +2220,7 @@ mod tests {
             bytes: &[u8],
         ) -> Result<(), RecordError> {
             self.shapes.push(("drop", subkeys));
+            self.log_single("hello");
             self.charge(bytes.len())?;
             self.drop_log
                 .push((*owner.as_bytes(), slot, bytes.to_vec()));
@@ -2129,6 +2246,7 @@ mod tests {
             slot: u16,
         ) -> Result<(), RecordError> {
             self.shapes.push(("drop", subkeys));
+            self.log_single("erase");
             self.charge(0)?;
             self.writes.erase += if self.double { 2 } else { 1 };
             self.drops.remove(&(*owner.as_bytes(), slot));
@@ -2173,6 +2291,11 @@ mod tests {
             subkey: u16,
             bytes: &[u8],
         ) -> Result<(), RecordError> {
+            self.log_single(if subkey == channel::CONTROL_SUBKEY {
+                "control"
+            } else {
+                "ring"
+            });
             // Written as the owner the record was opened under, so a record no
             // owner has opened takes no write.
             let owner = self
@@ -2181,6 +2304,47 @@ mod tests {
                 .copied()
                 .ok_or_else(|| RecordError::new(Refused))?;
             self.write_owned(&owner, lookup_key, subkey, bytes)
+        }
+
+        /// Logged as one batch, then performed as the default performs it.
+        fn write_batch(&mut self, writes: &[BatchWrite<'_>]) -> Vec<Result<(), RecordError>> {
+            self.write_calls.push(WriteCall::Batch(
+                writes
+                    .iter()
+                    .map(|write| match write {
+                        BatchWrite::Channel { subkey, .. }
+                            if *subkey == channel::CONTROL_SUBKEY =>
+                        {
+                            "control"
+                        }
+                        BatchWrite::Channel { .. } => "ring",
+                        BatchWrite::EraseDropSlot { .. } => "erase",
+                    })
+                    .collect(),
+            ));
+            self.in_batch = true;
+            let mut results = Vec::new();
+            for write in writes {
+                let result = match *write {
+                    BatchWrite::Channel {
+                        lookup_key,
+                        subkey,
+                        bytes,
+                    } => self.write_channel(lookup_key, subkey, bytes),
+                    BatchWrite::EraseDropSlot {
+                        owner,
+                        subkeys,
+                        slot,
+                    } => self.erase_drop_slot(owner, subkeys, slot),
+                };
+                let failed = result.is_err();
+                results.push(result);
+                if failed {
+                    break;
+                }
+            }
+            self.in_batch = false;
+            results
         }
     }
 
@@ -2338,6 +2502,60 @@ mod tests {
             net.writes.total()
         );
         assert!(matches!(outcome, FirstContact::Opened { repicks: 0, .. }));
+    }
+
+    /// The writes of one step that do not wait on each other go as one batch:
+    /// first contact's opening and first slot, an acceptance's erase, opening
+    /// and reply. The hello is never in a batch, and an ordinary message and a
+    /// hello rewrite are single writes.
+    #[test]
+    fn the_writes_of_one_step_are_batched_and_the_hello_never_is() {
+        use WriteCall::{Batch, Single};
+        let (a, b, mut net) = scene();
+        net.write_calls.clear();
+        let outcome = a_opens(&a, &b, &mut net, b"the first message");
+        assert_eq!(
+            net.write_calls,
+            [Batch(vec!["control", "ring"]), Single("hello")],
+            "first contact"
+        );
+
+        let request = only_request(b_collects(&b, &mut net));
+        net.write_calls.clear();
+        let mut entropy = Seeded::at(909);
+        let accepted = accept(
+            &b.store(),
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B accepts");
+        assert_eq!(
+            net.write_calls,
+            [Batch(vec!["erase", "control", "ring"]), Single("hello")],
+            "an acceptance"
+        );
+
+        net.write_calls.clear();
+        let mut entropy = Seeded::at(910);
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            b"a message",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B sends");
+        assert_eq!(net.write_calls, [Single("ring")], "an ordinary message");
+
+        net.write_calls.clear();
+        resume_first_contact(&a.store(), &mut net, &opened_peer(&outcome))
+            .expect("A rewrites its hello");
+        assert_eq!(net.write_calls, [Single("hello")], "a hello rewrite");
     }
 
     /// A clobbered read-back costs the one extra write the budget allows, and

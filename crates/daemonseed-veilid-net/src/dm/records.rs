@@ -125,8 +125,10 @@ use std::time::Duration;
 
 use daemonseed_core::dm::advert::{AdvertOwnerSeed, ADVERT_SUBKEY};
 use daemonseed_core::dm::channel::{ChannelOwnerSeed, CHANNEL_SUBKEYS, CONTROL_SUBKEY};
-use daemonseed_core::dm::drop::{DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
-use daemonseed_core::dm::flows::{RecordError, Records};
+use daemonseed_core::dm::drop::{
+    derive_owner_seed as derive_drop_owner_seed, DropOwnerSeed, HELLO_LOOKUP_KEY_LEN,
+};
+use daemonseed_core::dm::flows::{BatchWrite, RecordError, Records};
 use daemonseed_core::identity::keys::{DmChannelRootSecret, SignKeypair};
 use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -352,12 +354,96 @@ impl Writer {
 /// one: the scheduler may have dispatched the write before it went, so the
 /// write may have been sent.
 fn wait_for_reply(replied: oneshot::Receiver<Result<()>>) -> core::result::Result<(), RecordError> {
-    block(async move {
-        replied
-            .await
-            .map_err(|_| VeilidNetError::Actor("the write scheduler dropped the reply".into()))?
-    })
-    .map_err(RecordError::new)
+    block(reply_of(replied)).map_err(RecordError::new)
+}
+
+/// A submitted write's reply, where a reply the scheduler dropped unsent is a
+/// refusal ([`wait_for_reply`] says why).
+async fn reply_of(replied: oneshot::Receiver<Result<()>>) -> Result<()> {
+    replied
+        .await
+        .map_err(|_| VeilidNetError::Actor("the write scheduler dropped the reply".into()))?
+}
+
+/// Hand every write in `shaped` to the funnel, then wait for each one's reply
+/// and, where it has one, its confirmation, all at once.
+///
+/// Every write is enqueued before any is waited on, so a later write is on the
+/// funnel while an earlier one is still being confirmed, and the confirmations
+/// run side by side. One result per write, in the order given.
+async fn submit_all_then_confirm<C, Fut>(
+    writer: &Writer,
+    shaped: Vec<Shaped>,
+    confirm: C,
+) -> Vec<Result<()>>
+where
+    C: Fn(DirectMessageWrite, ConfirmTarget) -> Fut,
+    Fut: core::future::Future<Output = Result<()>>,
+{
+    let sent: Vec<_> = shaped
+        .into_iter()
+        .map(|(record, kind, write)| {
+            let target = write.confirm_target();
+            (kind, target, writer.send(record, kind, write))
+        })
+        .collect();
+    let confirm = &confirm;
+    futures_util::future::join_all(sent.into_iter().map(|(kind, target, replied)| async move {
+        reply_of(replied).await?;
+        match target {
+            Some(target) => confirm(kind, target).await,
+            None => Ok(()),
+        }
+    }))
+    .await
+}
+
+/// A write shaped for the funnel: the record it addresses, its kind and the
+/// write.
+type Shaped = ([u8; 32], DirectMessageWrite, RecordWrite);
+
+/// Perform a batch of writes as `shaped` yields them, in order.
+///
+/// Every write is handed to the funnel before any is confirmed, and the
+/// confirmations run together, so a batch costs about one confirmation's wait
+/// rather than one per write. A write that would not shape ends the batch
+/// there: nothing after it is shaped or submitted, the writes before it are
+/// performed, and its refusal is the last result.
+fn write_shaped<C, Fut>(
+    writer: &Writer,
+    shaped: impl IntoIterator<Item = core::result::Result<Shaped, RecordError>>,
+    confirm: C,
+) -> Vec<core::result::Result<(), RecordError>>
+where
+    C: Fn(DirectMessageWrite, ConfirmTarget) -> Fut,
+    Fut: core::future::Future<Output = Result<()>>,
+{
+    let mut ready = Vec::new();
+    let mut refused = None;
+    for one in shaped {
+        match one {
+            Ok(one) => ready.push(one),
+            Err(e) => {
+                refused = Some(e);
+                break;
+            }
+        }
+    }
+    let count = ready.len();
+    crate::vtrace!("dm records: {count} writes started together");
+    let mut results: Vec<_> =
+        match block(async { Ok(submit_all_then_confirm(writer, ready, confirm).await) }) {
+            Ok(outcomes) => outcomes
+                .into_iter()
+                .map(|outcome| outcome.map_err(RecordError::new))
+                .collect(),
+            // The bridge refused before anything was handed to the funnel.
+            Err(e) => (0..count)
+                .map(|_| Err(RecordError::new(VeilidNetError::Local(e.to_string()))))
+                .collect(),
+        };
+    results.extend(refused.map(Err));
+    results
 }
 
 /// A channel record this side owns, as [`Records::open_channel`] left it.
@@ -424,11 +510,8 @@ pub struct VeilidRecords {
     /// channels' owner seeds from the identity, the correspondent and the
     /// generation its store holds, and opens them again before it writes.
     own_channels: HashMap<[u8; HELLO_LOOKUP_KEY_LEN], OwnChannel>,
-    /// What the current scan of a drop found, where one is in progress.
-    drop_scan: Option<DropScan>,
-    /// The failure of the last scan a slot read took, until the runner takes
-    /// it through [`RunnerRecords::take_scan_failure`].
-    scan_failure: Option<RecordError>,
+    /// The scans the slot reads of each pass over a drop are answered from.
+    drop_pass: DropPass,
 }
 
 impl core::fmt::Debug for VeilidRecords {
@@ -452,8 +535,7 @@ impl VeilidRecords {
             transport: parts.transport,
             writer: Writer::new(parts.sched),
             own_channels: HashMap::new(),
-            drop_scan: None,
-            scan_failure: None,
+            drop_pass: DropPass::default(),
         })
     }
 
@@ -526,9 +608,15 @@ impl VeilidRecords {
         kind: DirectMessageWrite,
         target: ConfirmTarget,
     ) -> core::result::Result<(), RecordError> {
+        block(self.confirming(kind, target)).map_err(RecordError::new)
+    }
+
+    /// [`Self::confirm`] as a future, for a caller confirming several writes
+    /// at once.
+    async fn confirming(&self, kind: DirectMessageWrite, target: ConfirmTarget) -> Result<()> {
         let transport = &self.transport;
         let what = format!("{kind:?} write to subkey {}", target.subkey);
-        block(confirm_on_network(
+        confirm_on_network(
             &what,
             CONFIRM_BUDGET,
             (CONFIRM_POLL_FIRST, CONFIRM_POLL_MAX),
@@ -559,8 +647,48 @@ impl VeilidRecords {
                     .await
                 }
             },
-        ))
-        .map_err(RecordError::new)
+        )
+        .await
+    }
+
+    /// One write of a batch, shaped for the funnel: the record it addresses,
+    /// its kind and the write.
+    fn shape(&self, write: &BatchWrite<'_>) -> core::result::Result<Shaped, RecordError> {
+        match *write {
+            BatchWrite::Channel {
+                lookup_key,
+                subkey,
+                bytes,
+            } => self.channel_write(lookup_key, subkey, bytes),
+            BatchWrite::EraseDropSlot {
+                owner,
+                subkeys,
+                slot,
+            } => {
+                let (kind, record, write) = drop_slot_write(owner.as_bytes(), subkeys, slot, None)?;
+                Ok((record, kind, write))
+            }
+        }
+    }
+
+    /// A write of one subkey of the channel at `lookup_key`, which this process
+    /// must have opened.
+    fn channel_write(
+        &self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        subkey: u16,
+        bytes: &[u8],
+    ) -> core::result::Result<Shaped, RecordError> {
+        let own = self.own(lookup_key)?;
+        let write = RecordWrite {
+            owner: own.owner.clone(),
+            shape: own.shape,
+            what: What::Subkey {
+                subkey: u32::from(subkey),
+                value: bytes.to_vec(),
+            },
+        };
+        Ok((*lookup_key, channel_write_kind(subkey), write))
     }
 
     /// Publish this identity's advert to subkey 0 of its advert record —
@@ -715,88 +843,87 @@ impl VeilidRecords {
             .get(lookup_key)
             .ok_or_else(|| RecordError::new(RecordsError::ChannelNotOpened))
     }
+}
 
-    /// Read one subkey of the record `owner_seed` owns, under `subkeys`.
-    ///
-    /// `Ok(None)` is an empty or absent subkey — the ordinary state of a record
-    /// nobody has written yet, and of one a storage node has evicted — and is
-    /// deliberately distinct from `Err`, which is the transport failing to
-    /// answer. The open does not create: a read that materialized the record it
-    /// was reading would turn "not written" into "written empty by me".
-    fn read_subkey(
-        &mut self,
-        owner_seed: &[u8; 32],
-        subkeys: u16,
-        subkey: u32,
-    ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
-        let shape = shape_of(subkeys)?;
-        let owner = &owner_keypair(owner_seed)?;
-        let transport = &self.transport;
-        block(retry_transient("dm records read", || async move {
-            let Some(handle) = open_for_read(transport, owner, shape).await? else {
-                return Ok(None);
-            };
-            get_subkey(&transport.gate, &transport.rc, &handle, subkey).await
-        }))
-        .map_err(RecordError::new)
-    }
+/// Read one subkey of the record `owner_seed` owns, under `subkeys`.
+///
+/// `Ok(None)` is an empty or absent subkey — the ordinary state of a record
+/// nobody has written yet, and of one a storage node has evicted — and is
+/// deliberately distinct from `Err`, which is the transport failing to answer.
+/// The open does not create: a read that materialized the record it was
+/// reading would turn "not written" into "written empty by me".
+fn read_subkey(
+    transport: &Transport,
+    owner_seed: &[u8; 32],
+    subkeys: u16,
+    subkey: u32,
+) -> core::result::Result<Option<Vec<u8>>, RecordError> {
+    let shape = shape_of(subkeys)?;
+    let owner = &owner_keypair(owner_seed)?;
+    block(retry_transient("dm records read", || async move {
+        let Some(handle) = open_for_read(transport, owner, shape).await? else {
+            return Ok(None);
+        };
+        get_subkey(&transport.gate, &transport.rc, &handle, subkey).await
+    }))
+    .map_err(RecordError::new)
+}
 
-    /// Drop the scan of `owner_seed`'s drop, if it is the current one.
-    ///
-    /// **A write to a drop makes this process's snapshot of it wrong about the
-    /// slot it just wrote.** A hello's read-back reads the slot it was placed
-    /// in, and a scan taken before the write says that slot holds nothing — so
-    /// the read-back would come back empty, the flow would read that as a
-    /// clobbered slot, and it would re-pick and write a second time. The scan
-    /// exists to save reads; it must never cost a write.
-    fn forget_scan_of(&mut self, owner_seed: &[u8; 32]) {
-        if self
-            .drop_scan
-            .as_ref()
-            .is_some_and(|scan| scan.covers(owner_seed))
-        {
-            self.drop_scan = None;
-        }
-    }
+/// Take a scan of the drop `owner_seed` owns, for the pass beginning now.
+///
+/// An error means the scan could not be taken and every slot is to be read —
+/// a transport that will not answer an inspect must never be read as a drop
+/// that holds nothing, because that would silently discard every hello in it.
+/// An absent record is the opposite case and is an answer: it has no slots at
+/// all, so the scan says so and the pass costs nothing.
+///
+/// The inspect is retried on [`SCAN_ATTEMPTS`], not the longer ladder every
+/// other call uses, and a call that ran out of time is retried as well as a
+/// transient refusal: a pass has a cheaper answer to a scan that will not
+/// come than two minutes of waiting, which is to be deferred (see
+/// [`DropPass`]).
+fn scan_drop(
+    transport: &Transport,
+    owner_seed: &[u8; 32],
+    subkeys: u16,
+) -> core::result::Result<DropScan, RecordError> {
+    let shape = shape_of(subkeys)?;
+    let owner = &owner_keypair(owner_seed)?;
+    let scanned = block(scan_inspect(|| async move {
+        let Some(handle) = open_for_read(transport, owner, shape).await? else {
+            return Ok(None);
+        };
+        rendezvous::inspect_sync_set(&transport.gate, &transport.rc, &handle)
+            .await
+            .map(Some)
+    }))
+    .map_err(RecordError::new)?;
+    Ok(match scanned {
+        Some(seqs) => DropScan {
+            owner: *owner_seed,
+            populated: populated_subkeys(&seqs, subkeys),
+        },
+        None => DropScan {
+            owner: *owner_seed,
+            populated: vec![false; usize::from(subkeys)],
+        },
+    })
+}
 
-    /// Take a scan of the drop `owner_seed` owns, for the pass beginning now.
-    ///
-    /// An error means the scan could not be taken and every slot is to be read —
-    /// a transport that will not answer an inspect must never be read as a drop
-    /// that holds nothing, because that would silently discard every hello in
-    /// it. An absent record is the opposite case and is an answer: it has no
-    /// slots at all, so the scan says so and the pass costs nothing.
-    fn scan_drop(
-        &self,
-        owner_seed: &[u8; 32],
-        subkeys: u16,
-    ) -> core::result::Result<DropScan, RecordError> {
-        let shape = shape_of(subkeys)?;
-        let owner = &owner_keypair(owner_seed)?;
-        let transport = &self.transport;
-        let scanned = block(retry_transient("dm records drop inspect", || async move {
-            let Some(handle) = open_for_read(transport, owner, shape).await? else {
-                return Ok(None);
-            };
-            rendezvous::inspect_sync_set(&transport.gate, &transport.rc, &handle)
-                .await
-                .map(Some)
-        }));
-        match scanned {
-            Ok(Some(seqs)) => Ok(DropScan {
-                owner: *owner_seed,
-                populated: populated_subkeys(&seqs, subkeys),
-            }),
-            Ok(None) => Ok(DropScan {
-                owner: *owner_seed,
-                populated: vec![false; usize::from(subkeys)],
-            }),
-            Err(e) => {
-                crate::vtrace!("dm records: drop inspect failed ({e}); reading every slot");
-                Err(RecordError::new(e))
-            }
-        }
-    }
+/// A drop scan's inspect, made by `make`, on the scan's own ladder: at most
+/// [`SCAN_ATTEMPTS`], retried while [`scan_retryable`] says so.
+async fn scan_inspect<T, F, Fut>(make: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: core::future::Future<Output = Result<T>>,
+{
+    retry_while(
+        "dm records drop inspect",
+        SCAN_ATTEMPTS,
+        scan_retryable,
+        make,
+    )
+    .await
 }
 
 impl Records for VeilidRecords {
@@ -805,19 +932,17 @@ impl Records for VeilidRecords {
         owner: &AdvertOwnerSeed,
         subkeys: u16,
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
-        self.read_subkey(owner.as_bytes(), subkeys, ADVERT_SUBKEY)
+        read_subkey(&self.transport, owner.as_bytes(), subkeys, ADVERT_SUBKEY)
     }
 
     /// Read one drop slot, skipping the read where the network says the slot
     /// holds nothing.
     ///
-    /// Slot 0 is the start of a pass over the whole drop, so it is where the
-    /// scan is taken; every later slot of that pass is answered from it. A
-    /// caller reading a single slot rather than scanning — a hello's read-back
-    /// — reads through whatever scan is current, which either says the slot
-    /// holds something and it is fetched, or is of another drop and ignored. A
-    /// scan that fails leaves every slot to be read, and its failure is kept for
-    /// [`RunnerRecords::take_scan_failure`], since the read itself goes on.
+    /// Slot 0 starts a pass and takes a scan of the drop; later slots of the
+    /// pass are answered from it. A pass over this side's own drop whose scan
+    /// does not answer is deferred: slot 0 fails with the scan's failure and
+    /// every later slot answers empty without a read, up to two passes in a
+    /// row, after which every slot is read.
     fn read_drop_slot(
         &mut self,
         owner: &DropOwnerSeed,
@@ -825,21 +950,13 @@ impl Records for VeilidRecords {
         slot: u16,
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
         let owner_seed = *owner.as_bytes();
-        if slot == 0 {
-            self.drop_scan = match self.scan_drop(&owner_seed, subkeys) {
-                Ok(scan) => Some(scan),
-                Err(failure) => {
-                    self.scan_failure = Some(failure);
-                    None
-                }
-            };
-        }
-        if let Some(scan) = &self.drop_scan {
-            if scan.covers(&owner_seed) && !scan.needs_get(slot) {
-                return Ok(None);
-            }
-        }
-        self.read_subkey(&owner_seed, subkeys, u32::from(slot))
+        let transport = &self.transport;
+        self.drop_pass.read(
+            owner_seed,
+            slot,
+            || scan_drop(transport, &owner_seed, subkeys),
+            || read_subkey(transport, &owner_seed, subkeys, u32::from(slot)),
+        )
     }
 
     fn write_drop_slot(
@@ -850,7 +967,7 @@ impl Records for VeilidRecords {
         bytes: &[u8],
     ) -> core::result::Result<(), RecordError> {
         let (kind, record, write) = drop_slot_write(owner.as_bytes(), subkeys, slot, Some(bytes))?;
-        self.forget_scan_of(owner.as_bytes());
+        self.drop_pass.forget(owner.as_bytes());
         self.write(record, kind, write)
     }
 
@@ -984,16 +1101,24 @@ impl Records for VeilidRecords {
         subkey: u16,
         bytes: &[u8],
     ) -> core::result::Result<(), RecordError> {
-        let own = self.own(lookup_key)?;
-        let write = RecordWrite {
-            owner: own.owner.clone(),
-            shape: own.shape,
-            what: What::Subkey {
-                subkey: u32::from(subkey),
-                value: bytes.to_vec(),
-            },
-        };
-        self.write(*lookup_key, channel_write_kind(subkey), write)
+        let (record, kind, write) = self.channel_write(lookup_key, subkey, bytes)?;
+        self.write(record, kind, write)
+    }
+
+    /// Every write is handed to the funnel before any is confirmed, and each
+    /// is confirmed as [`Records::write_channel`] and
+    /// [`Records::erase_drop_slot`] confirm theirs, all at once. A write that
+    /// would not shape ends the batch and is the last result.
+    fn write_batch(
+        &mut self,
+        writes: &[BatchWrite<'_>],
+    ) -> Vec<core::result::Result<(), RecordError>> {
+        let this = &*self;
+        write_shaped(
+            &this.writer,
+            writes.iter().map(|write| this.shape(write)),
+            |kind, target| this.confirming(kind, target),
+        )
     }
 }
 
@@ -1023,7 +1148,7 @@ impl RunnerRecords for VeilidRecords {
     }
 
     fn take_scan_failure(&mut self) -> Option<RecordError> {
-        self.scan_failure.take()
+        self.drop_pass.failure.take()
     }
 
     /// The same [`RecordsError`], or a [`VeilidNetError::Local`] naming the same
@@ -1153,8 +1278,12 @@ impl RunnerParts<VeilidRecords> {
         profile_root: PathBuf,
         config: RunnerConfig,
     ) -> core::result::Result<Self, RecordsError> {
+        let mut records = VeilidRecords::new(parts)?;
+        records.drop_pass.own_drop = derive_drop_owner_seed(signer.public_key())
+            .ok()
+            .map(|seed| *seed.as_bytes());
         Ok(Self {
-            records: VeilidRecords::new(parts)?,
+            records,
             signer,
             channel_root,
             at_rest_key,
@@ -1534,18 +1663,35 @@ fn is_transient(error: &VeilidNetError) -> bool {
 /// being awaited: a retry is a new call, not a second poll of the old one. The
 /// last error is returned where every attempt refused, so a caller sees what
 /// the transport actually said rather than a count.
-async fn retry_transient<T, F, Fut>(what: &str, mut make: F) -> Result<T>
+async fn retry_transient<T, F, Fut>(what: &str, make: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: core::future::Future<Output = Result<T>>,
+{
+    retry_while(what, TRANSIENT_ATTEMPTS, is_transient, make).await
+}
+
+/// Run `make`'s future up to `attempts` times, retrying while `retryable` says
+/// its failure is worth another, on [`TRANSIENT_BACKOFF`] doubling to
+/// [`TRANSIENT_BACKOFF_MAX`]. [`retry_transient`] is the ladder every call
+/// uses; the drop scan takes a shorter one.
+async fn retry_while<T, F, Fut>(
+    what: &str,
+    attempts: u32,
+    retryable: fn(&VeilidNetError) -> bool,
+    mut make: F,
+) -> Result<T>
 where
     F: FnMut() -> Fut,
     Fut: core::future::Future<Output = Result<T>>,
 {
     let mut wait = TRANSIENT_BACKOFF;
-    for attempt in 1..=TRANSIENT_ATTEMPTS {
+    for attempt in 1..=attempts {
         match make().await {
             Ok(value) => return Ok(value),
-            Err(e) if is_transient(&e) && attempt < TRANSIENT_ATTEMPTS => {
+            Err(e) if retryable(&e) && attempt < attempts => {
                 crate::vtrace!(
-                    "{what}: {e} (attempt {attempt} of {TRANSIENT_ATTEMPTS}); retrying in {wait:?}"
+                    "{what}: {e} (attempt {attempt} of {attempts}); retrying in {wait:?}"
                 );
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(TRANSIENT_BACKOFF_MAX);
@@ -1554,6 +1700,162 @@ where
         }
     }
     unreachable!("the loop returns on its last attempt")
+}
+
+/// How many times a drop scan's inspect is attempted in one pass.
+///
+/// Three: [`TRANSIENT_BACKOFF`] then twice it, six seconds of waiting, which
+/// covers the seconds a node spends unroutable after an attach as
+/// [`TRANSIENT_ATTEMPTS`] does, and with each inspect bounded at
+/// [`rendezvous::SWEEP_GET_TIMEOUT`] keeps a pass whose scan never answers
+/// under a minute, inside one collection interval.
+const SCAN_ATTEMPTS: u32 = 3;
+
+/// How many passes in a row a drop scan that does not answer defers before a
+/// pass reads every slot.
+///
+/// Two: the third pass in a row whose scan will not answer reads all 256
+/// slots, so a drop whose inspect alone is broken is still read, a collection
+/// interval or two later, while a node that is briefly offline or on a lossy
+/// link, whose slot reads would be refused or time out one by one as the
+/// inspect did, waits for a scan instead.
+const SCAN_DEFERRALS: u32 = 2;
+
+/// Whether a drop scan's failure is worth another attempt in the same pass: a
+/// transient refusal, or an inspect that ran out of time.
+fn scan_retryable(error: &VeilidNetError) -> bool {
+    is_transient(error) || is_unanswered(error)
+}
+
+/// The passes in a row whose drop scan did not answer, per drop.
+#[derive(Debug, Default)]
+struct ScanDeferrals {
+    in_a_row: HashMap<[u8; 32], u32>,
+}
+
+impl ScanDeferrals {
+    /// A scan of `owner`'s drop answered: its next failure starts a new run.
+    fn answered(&mut self, owner: &[u8; 32]) {
+        self.in_a_row.remove(owner);
+    }
+
+    /// How many passes over `owner`'s drop have been deferred in a row.
+    fn count(&self, owner: &[u8; 32]) -> u32 {
+        self.in_a_row.get(owner).copied().unwrap_or(0)
+    }
+
+    /// Whether the pass over `owner`'s drop whose scan failed with `failure`
+    /// is deferred. Only a scan that did not answer is, and only
+    /// [`SCAN_DEFERRALS`] passes in a row; the pass after them reads every
+    /// slot and starts the count again.
+    fn defer(&mut self, owner: &[u8; 32], failure: &RecordError) -> bool {
+        let unanswered = failure
+            .inner()
+            .downcast_ref::<VeilidNetError>()
+            .is_some_and(scan_retryable);
+        if !unanswered || self.count(owner) >= SCAN_DEFERRALS {
+            self.in_a_row.remove(owner);
+            return false;
+        }
+        *self.in_a_row.entry(*owner).or_insert(0) += 1;
+        true
+    }
+}
+
+/// The scans slot reads are answered from, and which pass is deferred.
+///
+/// Slot 0 is the start of a pass over the whole drop, so it is where the scan
+/// is taken; every later slot of that pass is answered from it. A caller
+/// reading a single slot rather than scanning — a hello's read-back — reads
+/// through whatever scan is current, which either says the slot holds
+/// something and it is fetched, or is of another drop and ignored.
+///
+/// A scan of this side's own drop, which only collection passes over, that
+/// does not answer — refused transiently or out of time, after
+/// [`SCAN_ATTEMPTS`] — defers the pass: slot 0's read fails with the scan's
+/// failure, so the pass is known to be partial and holds nothing it did not
+/// read, and every later slot of it answers empty without a read. The next
+/// pass scans again. After [`SCAN_DEFERRALS`] deferred passes in a row, at once
+/// for a scan refused any other way, and always for any other drop, the scan's
+/// failure is kept for [`RunnerRecords::take_scan_failure`] and the slot is
+/// read, since the read itself goes on.
+#[derive(Default)]
+struct DropPass {
+    /// This side's own drop, where known. Without it no pass is deferred.
+    own_drop: Option<[u8; 32]>,
+    /// What the current scan of a drop found, where one is in progress.
+    scan: Option<DropScan>,
+    /// The failure of the last scan a slot read took, until the runner takes
+    /// it through [`RunnerRecords::take_scan_failure`].
+    failure: Option<RecordError>,
+    /// The drop whose current pass was deferred.
+    deferred: Option<[u8; 32]>,
+    deferrals: ScanDeferrals,
+}
+
+impl DropPass {
+    /// Read `slot` of `owner`'s drop through `read`, taking a scan through
+    /// `scan` where the slot starts a pass.
+    fn read(
+        &mut self,
+        owner: [u8; 32],
+        slot: u16,
+        scan: impl FnOnce() -> core::result::Result<DropScan, RecordError>,
+        read: impl FnOnce() -> core::result::Result<Option<Vec<u8>>, RecordError>,
+    ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
+        if slot == 0 {
+            self.deferred = None;
+            self.scan = match scan() {
+                Ok(found) => {
+                    self.deferrals.answered(&owner);
+                    Some(found)
+                }
+                Err(failure)
+                    if self.own_drop == Some(owner) && self.deferrals.defer(&owner, &failure) =>
+                {
+                    let in_a_row = self.deferrals.count(&owner);
+                    crate::vtrace!(
+                        "dm records: drop inspect did not answer ({failure}); pass deferred \
+                         ({in_a_row} of {SCAN_DEFERRALS} in a row)"
+                    );
+                    self.deferred = Some(owner);
+                    return Err(failure);
+                }
+                Err(failure) => {
+                    crate::vtrace!("dm records: drop inspect failed ({failure}); reading the slot");
+                    self.failure = Some(failure);
+                    None
+                }
+            };
+        }
+        if self.deferred == Some(owner) {
+            return Ok(None);
+        }
+        if let Some(found) = &self.scan {
+            if found.covers(&owner) && !found.needs_get(slot) {
+                return Ok(None);
+            }
+        }
+        read()
+    }
+
+    /// Drop the scan and the deferral of `owner`'s drop, where they are the
+    /// current ones.
+    ///
+    /// **A write to a drop makes this process's snapshot of it wrong about the
+    /// slot it just wrote.** A hello's read-back reads the slot it was placed
+    /// in, and a scan taken before the write says that slot holds nothing — so
+    /// the read-back would come back empty, the flow would read that as a
+    /// clobbered slot, and it would re-pick and write a second time. The scan
+    /// exists to save reads; it must never cost a write.
+    fn forget(&mut self, owner: &[u8; 32]) {
+        if self.scan.as_ref().is_some_and(|scan| scan.covers(owner)) {
+            self.scan = None;
+        }
+        if self.deferred.as_ref() == Some(owner) {
+            self.deferred = None;
+        }
+    }
 }
 
 /// How soon a confirmation looks again after finding the write still queued.
@@ -1701,6 +2003,7 @@ where
             Ok(Err(e)) => return Err(e),
         }
         if started.elapsed() >= budget {
+            crate::vtrace!("{what}: not confirmed within {}s", budget.as_secs());
             // Only a probe that answered said anything about the network; one
             // that never did leaves the write unchecked, not absent.
             return Err(VeilidNetError::TimedOut(if answered {
@@ -2229,6 +2532,256 @@ mod tests {
             4,
             "three refusals cost three retries and no more"
         );
+    }
+
+    /// A drop scan's inspect is retried on its own short ladder, for a call
+    /// that ran out of time as well as for a transient refusal, and gives up
+    /// after [`SCAN_ATTEMPTS`] with six seconds spent waiting.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_drop_scan_retries_an_unanswered_inspect_briefly() {
+        let attempts = AtomicU64::new(0);
+        let answered = scan_inspect(|| async {
+            match attempts.fetch_add(1, Ordering::Relaxed) {
+                0 => Err(VeilidNetError::TimedOut("GET exceeded 15s".to_owned())),
+                1 => Err(VeilidNetError::Routing("TryAgain: offline".to_owned())),
+                n => Ok(n),
+            }
+        })
+        .await
+        .expect("the third attempt answers");
+        assert_eq!(answered, 2);
+
+        let attempts = AtomicU64::new(0);
+        let started = tokio::time::Instant::now();
+        let failure = scan_inspect(|| async {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            Err::<(), _>(VeilidNetError::TimedOut("GET exceeded 15s".to_owned()))
+        })
+        .await
+        .expect_err("an inspect that never answers");
+        assert!(matches!(failure, VeilidNetError::TimedOut(_)), "{failure}");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            u64::from(SCAN_ATTEMPTS),
+            "three attempts, not the eight every other call gets"
+        );
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(6),
+            "two waits, two seconds and four"
+        );
+    }
+
+    const OWN: [u8; 32] = [0x11; 32];
+    const PEER: [u8; 32] = [0x22; 32];
+
+    fn unanswered() -> RecordError {
+        RecordError::new(VeilidNetError::TimedOut("GET exceeded 15s".into()))
+    }
+
+    fn an_empty_scan(owner: [u8; 32]) -> DropScan {
+        DropScan {
+            owner,
+            populated: vec![false; usize::from(DROP_SUBKEYS)],
+        }
+    }
+
+    /// A drop pass read through [`DropPass::read`] as the record store drives
+    /// it, counting the slot reads that reached the network.
+    struct Pass {
+        pass: DropPass,
+        reads: usize,
+    }
+
+    impl Pass {
+        fn new() -> Self {
+            Self {
+                pass: DropPass {
+                    own_drop: Some(OWN),
+                    ..DropPass::default()
+                },
+                reads: 0,
+            }
+        }
+
+        /// Read `slot` of `owner`'s drop, the scan answering as `scan` says.
+        fn read(
+            &mut self,
+            owner: [u8; 32],
+            slot: u16,
+            scan: core::result::Result<DropScan, RecordError>,
+        ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
+            let reads = &mut self.reads;
+            self.pass.read(
+                owner,
+                slot,
+                || scan,
+                || {
+                    *reads += 1;
+                    Ok(Some(vec![slot as u8]))
+                },
+            )
+        }
+
+        /// Pass over the whole of `owner`'s drop, returning slot 0's result.
+        fn pass_over(
+            &mut self,
+            owner: [u8; 32],
+            scan: core::result::Result<DropScan, RecordError>,
+        ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
+            let first = self.read(owner, 0, scan);
+            for slot in 1..DROP_SUBKEYS {
+                let _ = self.read(owner, slot, Ok(an_empty_scan(owner)));
+            }
+            first
+        }
+    }
+
+    /// A pass over this side's own drop whose scan does not answer reads
+    /// nothing and fails at slot 0, [`SCAN_DEFERRALS`] passes in a row; the
+    /// next reads every slot. An answer restarts the count, and so does
+    /// nothing that happens to another drop.
+    #[test]
+    fn an_own_drop_pass_whose_scan_does_not_answer_is_deferred_then_read() {
+        let mut p = Pass::new();
+        let first = p.pass_over(OWN, Err(unanswered()));
+        assert!(first.is_err(), "a deferred pass fails at slot 0");
+        assert_eq!(p.reads, 0, "and reads no slot");
+        assert!(p.pass.failure.is_none(), "counted once, as the read");
+
+        // Another drop's scan answering does not end this drop's run.
+        let _ = p.read(PEER, 0, Ok(an_empty_scan(PEER)));
+        assert!(p.pass_over(OWN, Err(unanswered())).is_err());
+        assert_eq!(p.reads, 0, "the second pass is deferred too");
+
+        let third = p.pass_over(OWN, Err(unanswered()));
+        assert!(third.is_ok(), "the third reads slot 0: {third:?}");
+        assert_eq!(p.reads, usize::from(DROP_SUBKEYS), "and every slot");
+        assert!(p.pass.failure.take().is_some(), "its scan failure is kept");
+
+        p.reads = 0;
+        assert!(p.pass_over(OWN, Err(unanswered())).is_err());
+        assert_eq!(p.reads, 0, "the count started again");
+        assert!(p.pass_over(OWN, Ok(an_empty_scan(OWN))).is_ok());
+        assert!(p.pass_over(OWN, Err(unanswered())).is_err());
+        assert!(
+            p.pass_over(OWN, Err(unanswered())).is_err(),
+            "an answer restarted the run, so two more defer"
+        );
+        assert_eq!(p.reads, 0);
+    }
+
+    /// Only a scan that did not answer defers, and only over this side's own
+    /// drop: a refusal, and any scan of another drop, read the slot at once.
+    #[test]
+    fn a_refused_scan_or_another_drop_reads_the_slot() {
+        let mut p = Pass::new();
+        let refused = RecordError::new(VeilidNetError::Send("KeyNotFound".into()));
+        assert!(p.pass_over(OWN, Err(refused)).is_ok());
+        assert_eq!(
+            p.reads,
+            usize::from(DROP_SUBKEYS),
+            "a refusal reads every slot"
+        );
+
+        let mut p = Pass::new();
+        let back = p.read(PEER, 0, Err(unanswered()));
+        assert_eq!(
+            back.ok().flatten(),
+            Some(vec![0]),
+            "a read-back of slot 0 is read"
+        );
+        assert_eq!(p.reads, 1);
+        assert!(p.pass.failure.take().is_some());
+
+        let mut p = Pass {
+            pass: DropPass::default(),
+            reads: 0,
+        };
+        assert!(
+            p.pass_over(OWN, Err(unanswered())).is_ok(),
+            "a store that does not know its own drop defers nothing"
+        );
+    }
+
+    /// A write to a deferred drop ends the deferral, so a read-back of it
+    /// reads the slot.
+    #[test]
+    fn a_write_to_a_deferred_drop_ends_its_deferral() {
+        let mut p = Pass::new();
+        assert!(p.read(OWN, 0, Err(unanswered())).is_err());
+        assert_eq!(p.read(OWN, 5, Ok(an_empty_scan(OWN))).ok().flatten(), None);
+        assert_eq!(p.reads, 0);
+        p.pass.forget(&OWN);
+        assert_eq!(
+            p.read(OWN, 5, Ok(an_empty_scan(OWN))).ok().flatten(),
+            Some(vec![5])
+        );
+        assert_eq!(p.reads, 1);
+    }
+
+    /// A batch hands every write to the funnel before confirming any, stops
+    /// at the first write that would not shape, and answers in order: the
+    /// first write's confirmation waits for the second to be dispatched, which
+    /// a store confirming each write before submitting the next never reaches.
+    #[test]
+    fn a_batch_hands_every_write_to_the_funnel_before_confirming_any() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a multi-thread runtime builds");
+        runtime.block_on(async {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let writer = Writer::new(WriteScheduler::spawn(
+                Arc::new(Recording {
+                    seen: Arc::clone(&seen),
+                    kind: DirectMessageWrite::MessageSlot,
+                }),
+                SchedulerConfig::default(),
+            ));
+            let hello = |slot| {
+                let (kind, record, write) =
+                    drop_slot_write(&SEED, DROP_SUBKEYS, slot, Some(&[7, 7]))
+                        .expect("the hello shapes");
+                Ok((record, kind, write))
+            };
+            let shaped = vec![
+                hello(5),
+                hello(6),
+                Err(RecordError::new(RecordsError::ChannelNotOpened)),
+                hello(7),
+            ];
+            let dispatched = || seen.lock().unwrap_or_else(|e| e.into_inner()).len();
+            let results = write_shaped(&writer, shaped, |_kind, target| {
+                let dispatched = &dispatched;
+                async move {
+                    if target.subkey != 5 {
+                        return Ok(());
+                    }
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    while dispatched() < 2 {
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(VeilidNetError::TimedOut(
+                                "the second write was never dispatched".into(),
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Ok(())
+                }
+            });
+            assert_eq!(results.len(), 3, "two writes and the refusal: {results:?}");
+            assert!(results[0].is_ok(), "{:?}", results[0]);
+            assert!(results[1].is_ok(), "{:?}", results[1]);
+            let refused = results[2].as_ref().expect_err("the refusal is last");
+            assert_eq!(
+                <VeilidRecords as RunnerRecords>::classify(refused),
+                RecordFailure::Local
+            );
+            assert_eq!(dispatched(), 2, "nothing after the refusal is submitted");
+            assert_eq!(writer.counts.snapshot().hello, 2, "and each charged once");
+        });
     }
 
     fn seq(n: u32) -> ValueSeqNum {

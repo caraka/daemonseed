@@ -35,7 +35,12 @@
 //! - **Collection**, every [`RunnerConfig::tick`] jittered by ±20 %: the drop
 //!   scan, every established conversation's ring, the correspondent's published
 //!   cursor where messages are outstanding, and the delivery reports those
-//!   produce.
+//!   produce. While a conversation waits on the correspondent — a first contact
+//!   awaiting acceptance, or an acceptance whose hello back the correspondent
+//!   has not yet shown it read — and for at most a quarter of an hour after
+//!   this runner started, sent a first contact or accepted one, collection runs
+//!   every twelve seconds instead, jittered the same way, or on the tick where
+//!   that is shorter. Collection only reads.
 //! - **Repair**, per conversation with anything outstanding, on § Delivery's
 //!   interval (40 to 60 minutes, daily after seven days): the same look at
 //!   what is left undone that startup takes, preceded by a drop scan for a
@@ -136,7 +141,7 @@ use daemonseed_core::dm::channel::{self, ChannelError, ChannelOpening, ChannelOw
 use daemonseed_core::dm::delivery::{self, ClosedMarker};
 use daemonseed_core::dm::drop::{self as drop_plane, DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
 use daemonseed_core::dm::flows::{
-    self, FirstContact, FlowError, Me, RecordError, Records, Surfaced,
+    self, BatchWrite, FirstContact, FlowError, Me, RecordError, Records, Surfaced,
 };
 use daemonseed_core::dm::store::{
     ConvState, LoadedConv, OutboxEntry, OutstandingHello, Store, StoreError,
@@ -153,6 +158,19 @@ use crate::dm::records::WriteCountsSnapshot;
 
 /// How often collection runs, before jitter.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(60);
+
+/// How often collection runs while a conversation waits on the correspondent,
+/// before jitter.
+///
+/// A pass is a drop inspect plus the slot reads it says are worth making, and a
+/// ring read and at most one control read per established conversation, so this
+/// adds at most four passes a minute over [`DEFAULT_TICK`]'s one, and no write.
+const WAITING_TICK: Duration = Duration::from_secs(12);
+
+/// How long after this runner starts, sends a first contact or accepts one that
+/// [`WAITING_TICK`] can apply. A correspondent who has not answered by then may
+/// be away for days, and is collected on the ordinary tick.
+const WAITING_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// How long [`RunnerHandle::shutdown`] waits for the flow call in progress.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(10);
@@ -1142,9 +1160,10 @@ struct Tracked<R> {
     health: HealthCounters,
     /// Drop slot reads that failed, however they failed, since the runner
     /// started. A scan during which this rose left a slot unread, so it is
-    /// partial and must not drop the requests it did not see. The drop inspect a
-    /// scan takes is not a slot read and is not counted here: a scan whose
-    /// inspect failed reads every slot.
+    /// partial and must not drop the requests it did not see. A pass the record
+    /// store deferred because its drop inspect did not answer fails its slot-0
+    /// read and so counts here once; an inspect failure the store answers by
+    /// reading every slot is not a slot read and is not counted here.
     failed_drop_reads: u64,
 }
 
@@ -1228,6 +1247,10 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         bytes: &[u8],
     ) -> Result<(), RecordError> {
         let result = self.inner.write_drop_slot(owner, subkeys, slot, bytes);
+        crate::vtrace!(
+            "dm runner: hello write to slot {slot}: {}",
+            outcome(&result, R::classify)
+        );
         tally(
             result,
             R::classify,
@@ -1244,6 +1267,10 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         slot: u16,
     ) -> Result<(), RecordError> {
         let result = self.inner.erase_drop_slot(owner, subkeys, slot);
+        crate::vtrace!(
+            "dm runner: erase of slot {slot}: {}",
+            outcome(&result, R::classify)
+        );
         tally(
             result,
             R::classify,
@@ -1290,6 +1317,10 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         bytes: &[u8],
     ) -> Result<(), RecordError> {
         let result = self.inner.write_channel(lookup_key, subkey, bytes);
+        crate::vtrace!(
+            "dm runner: channel write to subkey {subkey}: {}",
+            outcome(&result, R::classify)
+        );
         tally(
             result,
             R::classify,
@@ -1297,6 +1328,45 @@ impl<R: RunnerRecords> Records for Tracked<R> {
             |h| &mut h.channel_write_failures,
             |h| &mut h.channel_write_timeouts,
         )
+    }
+
+    /// Passed to the store whole, so a store that starts the writes together
+    /// does, and each result counted as its own single write would be.
+    fn write_batch(&mut self, writes: &[BatchWrite<'_>]) -> Vec<Result<(), RecordError>> {
+        crate::vtrace!("dm runner: {} writes started together", writes.len());
+        let results = self.inner.write_batch(writes);
+        let mut counted = Vec::with_capacity(results.len());
+        for (result, write) in results.into_iter().zip(writes) {
+            counted.push(match *write {
+                BatchWrite::Channel { subkey, .. } => {
+                    crate::vtrace!(
+                        "dm runner: channel write to subkey {subkey}: {}",
+                        outcome(&result, R::classify)
+                    );
+                    tally(
+                        result,
+                        R::classify,
+                        &mut self.health,
+                        |h| &mut h.channel_write_failures,
+                        |h| &mut h.channel_write_timeouts,
+                    )
+                }
+                BatchWrite::EraseDropSlot { slot, .. } => {
+                    crate::vtrace!(
+                        "dm runner: erase of slot {slot}: {}",
+                        outcome(&result, R::classify)
+                    );
+                    tally(
+                        result,
+                        R::classify,
+                        &mut self.health,
+                        |h| &mut h.drop_write_failures,
+                        |h| &mut h.drop_write_timeouts,
+                    )
+                }
+            });
+        }
+        counted
     }
 }
 
@@ -1450,6 +1520,34 @@ fn provision_block_list(store: &Store) -> Result<BlockList, BlockListFailure> {
             guard.replace(RecordKind::BlockList, &encoded)?;
             Ok(list)
         })
+}
+
+/// A record call's outcome as a trace shows it: `ok`, or how it failed.
+fn outcome<T>(
+    result: &Result<T, RecordError>,
+    classify: fn(&RecordError) -> RecordFailure,
+) -> String {
+    match result {
+        Ok(_) => "ok".to_owned(),
+        Err(error) => format!("failed, {:?}", classify(error)),
+    }
+}
+
+/// A short tag naming a conversation in a trace: the first two bytes of its
+/// local label, which is a random name for the conversation's directory and
+/// says nothing about the correspondent.
+fn tag(peer: &CorrespondenceLabel) -> String {
+    let [a, b, ..] = *peer.as_bytes();
+    format!("{a:02x}{b:02x}")
+}
+
+/// Whether a conversation waits on the correspondent to do something a
+/// collection pass would see: its own first contact awaiting acceptance, or an
+/// acceptance whose hello back the correspondent has not yet shown it read.
+fn waiting_on_peer(state: &ConvState) -> bool {
+    !state.delete_pending
+        && (state.awaiting_acceptance
+            || (state.outstanding_hello.is_some() && state.peer_collected == 0))
 }
 
 /// Entropy from the operating system, in the shape the flows take it.
@@ -1635,8 +1733,13 @@ struct Runner<R> {
     delivered: HashMap<CorrespondenceLabel, u64>,
     repairs: HashMap<CorrespondenceLabel, Repair>,
     next_tick: Instant,
+    /// Until when [`WAITING_TICK`] may apply.
+    waiting_until: Instant,
     next_advert_poll: Instant,
     last_scan: Option<Instant>,
+    /// Whether the last drop scan left a slot unread, so a first contact's
+    /// acceptance may be in the drop unseen.
+    last_scan_partial: bool,
     /// Whether the network answers in the current pass, once asked.
     answering: Option<bool>,
     health_reported: HealthCounters,
@@ -1719,8 +1822,10 @@ impl<R: RunnerRecords> Runner<R> {
                 .collect(),
             repairs: HashMap::new(),
             next_tick: now + jittered(config.tick),
+            waiting_until: now + WAITING_WINDOW,
             next_advert_poll: now + advert::next_poll_interval_os(),
             last_scan: None,
+            last_scan_partial: false,
             answering: None,
             health_reported: HealthCounters::default(),
             block_list_known: true,
@@ -1753,6 +1858,9 @@ impl<R: RunnerRecords> Runner<R> {
             runner.rewrite_evicted(&conv.state, &conv.outstanding_outbox);
             runner.reschedule(&conv);
         }
+        runner.next_tick = runner
+            .next_tick
+            .min(Instant::now() + runner.collection_interval());
         let health = runner.records.health;
         runner.health_reported = health;
         runner.emit(RunnerEvent::Health(health)).await?;
@@ -1912,6 +2020,40 @@ impl<R: RunnerRecords> Runner<R> {
             .load_convs()?
             .into_iter()
             .find(|conv| conv.state.peer_identity_pk.as_slice() == identity.as_slice()))
+    }
+
+    /// The jittered wait before the next collection: [`WAITING_TICK`] while a
+    /// conversation waits on the correspondent inside [`WAITING_WINDOW`], and
+    /// [`RunnerConfig::tick`] otherwise or where that is shorter.
+    fn collection_interval(&mut self) -> Duration {
+        let tick = self.config.tick;
+        if Instant::now() >= self.waiting_until || tick <= WAITING_TICK {
+            return jittered(tick);
+        }
+        let waiting = match self.load_convs() {
+            Ok(convs) => convs
+                .iter()
+                .filter(|conv| waiting_on_peer(&conv.state))
+                .count(),
+            Err(()) => 0,
+        };
+        if waiting == 0 {
+            return jittered(tick);
+        }
+        let interval = jittered(WAITING_TICK);
+        crate::vtrace!(
+            "dm runner: {waiting} conversation(s) wait on the correspondent; next collection in {:.1}s",
+            interval.as_secs_f64()
+        );
+        interval
+    }
+
+    /// Collect on [`WAITING_TICK`] from now, for [`WAITING_WINDOW`], after this
+    /// side did something the correspondent answers.
+    fn collect_sooner(&mut self) {
+        let now = Instant::now();
+        self.waiting_until = now + WAITING_WINDOW;
+        self.next_tick = self.next_tick.min(now + self.collection_interval());
     }
 
     /// The earliest moment anything on the schedule is due.
@@ -2103,6 +2245,15 @@ impl<R: RunnerRecords> Runner<R> {
         );
         self.last_scan = Some(Instant::now());
         let partial = self.records.failed_drop_reads > unread_before;
+        self.last_scan_partial = partial;
+        match &collected {
+            Ok(surfaced) => crate::vtrace!(
+                "dm runner: drop scanned, {} hello(s) settled, {} slot read(s) failed",
+                surfaced.len(),
+                self.records.failed_drop_reads - unread_before
+            ),
+            Err(e) => crate::vtrace!("dm runner: drop scan stopped, {:?}", refusal_for(e)),
+        }
         match collected {
             Ok(surfaced) => self.surface(surfaced, partial).await?,
             Err(e) => note_failure(&mut self.records.health, &e),
@@ -2244,10 +2395,21 @@ impl<R: RunnerRecords> Runner<R> {
     /// the drop inspect fails.
     ///
     /// Called only after a drop scan, so a hello the correspondent has already
-    /// accepted has been recognised and is no longer awaiting acceptance.
-    /// Nothing is looked at for a conversation whose delete is under way.
+    /// accepted has been recognised and is no longer awaiting acceptance. Where
+    /// that scan left a slot unread, a hello still awaiting acceptance is left
+    /// alone until a scan reads every slot. Nothing is looked at for a
+    /// conversation whose delete is under way.
     fn rewrite_hello(&mut self, peer: &CorrespondenceLabel, state: &ConvState) {
         if state.outstanding_hello.is_none() || state.delete_pending || self.stopping() {
+            return;
+        }
+        // A scan that left a slot unread may have missed the acceptance, and a
+        // rewrite would put back a hello the correspondent has already answered.
+        if state.awaiting_acceptance && self.last_scan_partial {
+            crate::vtrace!(
+                "dm runner: hello of {} not rewritten, the last drop scan was partial",
+                tag(peer)
+            );
             return;
         }
         // An acceptor learns its hello back was read only from the
@@ -2472,6 +2634,7 @@ impl<R: RunnerRecords> Runner<R> {
         peer_identity_pk: &[u8; IDENTITY_PK_LEN],
         body: &[u8],
     ) -> Result<(), Halt> {
+        crate::vtrace!("dm runner: first contact starts");
         let now = self.clock.now_secs();
         let me = Me {
             signer: &self.signer,
@@ -2488,8 +2651,23 @@ impl<R: RunnerRecords> Runner<R> {
         );
         match outcome {
             Ok(FirstContact::Opened { peer, .. } | FirstContact::Rewrote { peer, .. }) => {
+                match &outcome {
+                    Ok(FirstContact::Opened {
+                        hello_slot,
+                        repicks,
+                        ..
+                    }) => crate::vtrace!(
+                        "dm runner: first contact {} done, hello in slot {hello_slot} after {repicks} re-pick(s)",
+                        tag(&peer)
+                    ),
+                    _ => crate::vtrace!(
+                        "dm runner: first contact {} done, outstanding hello rewritten",
+                        tag(&peer)
+                    ),
+                }
                 self.delivered.entry(peer).or_insert(0);
                 self.ensure_repair(peer);
+                self.collect_sooner();
                 self.emit(RunnerEvent::Sent {
                     token,
                     peer,
@@ -2499,6 +2677,7 @@ impl<R: RunnerRecords> Runner<R> {
                 self.emit_roster().await
             }
             Err(e) => {
+                crate::vtrace!("dm runner: first contact refused, {:?}", refusal_for(&e));
                 self.refuse(Some(token), refusal_for(&e)).await?;
                 // A refusal part way leaves a pending conversation behind; the
                 // repair poll carries it on.
@@ -2519,14 +2698,24 @@ impl<R: RunnerRecords> Runner<R> {
         peer: CorrespondenceLabel,
         body: &[u8],
     ) -> Result<(), Halt> {
-        match flows::send_message(
+        crate::vtrace!("dm runner: send on {} starts", tag(&peer));
+        let sent = flows::send_message(
             &self.store,
             &mut self.records,
             &peer,
             body,
             os_fill,
             self.clock.now_secs(),
-        ) {
+        );
+        match &sent {
+            Ok(seq) => crate::vtrace!("dm runner: send on {} done, seq {seq}", tag(&peer)),
+            Err(e) => crate::vtrace!(
+                "dm runner: send on {} refused, {:?}",
+                tag(&peer),
+                refusal_for(e)
+            ),
+        }
+        match sent {
             Ok(seq) => {
                 self.ensure_repair(peer);
                 self.emit(RunnerEvent::Sent { token, peer, seq }).await
@@ -2569,6 +2758,7 @@ impl<R: RunnerRecords> Runner<R> {
             Ok(Some(conv)) => conv.state.my_collected,
             Ok(None) | Err(()) => 0,
         };
+        crate::vtrace!("dm runner: accept starts");
         let now = self.clock.now_secs();
         let outcome = match self.requests.get(&request).map(|entry| &entry.held) {
             Some(Held::Request(held)) => {
@@ -2592,6 +2782,14 @@ impl<R: RunnerRecords> Runner<R> {
         };
         match outcome {
             Ok(accepted) => {
+                crate::vtrace!(
+                    "dm runner: accept {} done, {} message(s) read, hello back in slot {} after {} re-pick(s)",
+                    tag(&accepted.peer),
+                    accepted.bodies.len(),
+                    accepted.hello_slot,
+                    accepted.repicks
+                );
+                self.collect_sooner();
                 self.requests.remove(&request);
                 let peer = accepted.peer;
                 self.delivered.entry(peer).or_insert(0);
@@ -2609,6 +2807,7 @@ impl<R: RunnerRecords> Runner<R> {
             }
             Err(e) => {
                 let reason = refusal_for(&e);
+                crate::vtrace!("dm runner: accept refused, {reason:?}");
                 self.refuse(Some(token), reason).await?;
                 // A refusal after the conversation record was created leaves an
                 // acceptance the record alone can finish: the repair poll does,
@@ -2634,6 +2833,11 @@ impl<R: RunnerRecords> Runner<R> {
                 list.unblock(identity);
             }
         });
+        crate::vtrace!(
+            "dm runner: {} {}",
+            if block { "block" } else { "unblock" },
+            if updated.is_ok() { "done" } else { "refused" }
+        );
         match updated {
             Ok(list) => {
                 if block {
@@ -2765,7 +2969,7 @@ impl<R: RunnerRecords> Runner<R> {
         self.answering = None;
         if Instant::now() >= self.next_tick {
             self.collect_tick().await?;
-            self.next_tick = Instant::now() + jittered(self.config.tick);
+            self.next_tick = Instant::now() + self.collection_interval();
         }
         if Instant::now() >= self.next_advert_poll {
             self.check_stop()?;
@@ -2866,12 +3070,16 @@ impl<R: RunnerRecords> Runner<R> {
     /// One collection pass: the drop, then every established conversation whose
     /// delete is not under way.
     async fn collect_tick(&mut self) -> Result<(), Halt> {
+        crate::vtrace!("dm runner: collection starts");
         let Some(blocked) = self.scan_drop().await? else {
+            crate::vtrace!("dm runner: collection done, block list unreadable, drop not scanned");
             return Ok(());
         };
         let Ok(convs) = self.load_convs() else {
+            crate::vtrace!("dm runner: collection done, drop only, the store would not load");
             return Ok(());
         };
+        let mut collected = 0usize;
         for conv in &convs {
             self.check_stop()?;
             if conv.state.awaiting_acceptance
@@ -2882,7 +3090,12 @@ impl<R: RunnerRecords> Runner<R> {
                 continue;
             }
             self.collect_conversation(conv).await?;
+            collected += 1;
         }
+        crate::vtrace!(
+            "dm runner: collection done, {collected} of {} conversation(s) collected",
+            convs.len()
+        );
         Ok(())
     }
 
@@ -2892,6 +3105,17 @@ impl<R: RunnerRecords> Runner<R> {
         let peer = conv.peer;
         match flows::collect_batch(&self.store, &mut self.records, &peer) {
             Ok(batch) => {
+                crate::vtrace!(
+                    "dm runner: collected {} message(s) on {}, cursor {}{}",
+                    batch.bodies.len(),
+                    tag(&peer),
+                    batch.my_collected,
+                    if batch.cursor_published {
+                        ", published"
+                    } else {
+                        ""
+                    }
+                );
                 let first = batch.my_collected.saturating_sub(batch.bodies.len() as u64);
                 self.emit_bodies(peer, first, batch.bodies).await?;
             }
