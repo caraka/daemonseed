@@ -1416,7 +1416,7 @@ async fn b_collects_accepts_and_replies(
     .expect("B accepts the contact request");
     // The knock is message 0 of A's direction, and opening it is what B has to
     // show for FC1.
-    for (seq, body) in accepted.bodies.iter().enumerate() {
+    for (seq, body) in accepted.messages.iter().map(|m| &m.body).enumerate() {
         result.opened.push((seq as u64, body_text(body)));
     }
     assert!(
@@ -1454,7 +1454,7 @@ async fn a_collects_and_replies(
     })
     .await;
 
-    for (seq, body) in acceptance.bodies.iter().enumerate() {
+    for (seq, body) in acceptance.messages.iter().map(|m| &m.body).enumerate() {
         result.opened.push((seq as u64, body_text(body)));
     }
     assert!(
@@ -1485,22 +1485,22 @@ async fn b_collects_the_reply(store: &Store, records: &mut VeilidRecords, result
     let peer = only_correspondence(store);
     let batch = until("A's reply arrives in its channel", HOP, || {
         let batch = flows::collect_batch(store, records, &peer).expect("B's own store answers");
-        (!batch.bodies.is_empty()).then_some(batch)
+        (!batch.messages.is_empty()).then_some(batch)
     })
     .await;
     assert_eq!(
-        batch.bodies.len(),
+        batch.messages.len(),
         1,
         "A wrote one message since B's cursor"
     );
     assert_eq!(
-        body_text(&batch.bodies[0]),
+        body_text(&batch.messages[0].body),
         A_REPLY,
         "B must recover the exact body A sent"
     );
     result
         .opened
-        .push((batch.my_collected - 1, body_text(&batch.bodies[0])));
+        .push((batch.my_collected - 1, body_text(&batch.messages[0].body)));
 }
 
 /// A reads B's published cursor, so A's own reply shows as collected.

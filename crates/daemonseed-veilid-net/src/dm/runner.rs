@@ -106,7 +106,8 @@
 //! hello and a rewrite of a hello already collected only move a
 //! [`HealthCounters`] field, and so does a verified hello the scan could not
 //! settle. A message's sequence number is derived from the collection cursor
-//! and its `received_at` is stamped here: nothing is added to the wire. Every
+//! and its `received_at` is stamped here; its `sent_at` is the correspondent's
+//! clock, read from inside the message's encryption. Every
 //! command that carries a [`CommandToken`] is answered by an event carrying it.
 //!
 //! ## Stopping
@@ -141,7 +142,7 @@ use daemonseed_core::dm::channel::{self, ChannelError, ChannelOpening, ChannelOw
 use daemonseed_core::dm::delivery::{self, ClosedMarker};
 use daemonseed_core::dm::drop::{self as drop_plane, DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
 use daemonseed_core::dm::flows::{
-    self, BatchWrite, FirstContact, FlowError, Me, RecordError, Records, Surfaced,
+    self, BatchWrite, FirstContact, FlowError, Me, ReceivedMessage, RecordError, Records, Surfaced,
 };
 use daemonseed_core::dm::store::{
     ConvState, LoadedConv, OutboxEntry, OutstandingHello, Store, StoreError,
@@ -551,6 +552,10 @@ pub enum Refusal {
     Flow,
     /// The runner stopped before serving the command.
     ShuttingDown,
+    /// The body is longer than
+    /// [`daemonseed_core::dm::channel::MESSAGE_BODY_MAX_LEN`] bytes; nothing
+    /// was sealed or written.
+    TooLong,
 }
 
 /// Named failure and drop counters, since the runner started.
@@ -663,6 +668,9 @@ pub enum RunnerEvent {
         seq: u64,
         /// The opened body.
         body: Vec<u8>,
+        /// When the correspondent sealed it, by the correspondent's clock, in
+        /// Unix milliseconds. It travels inside the message's encryption.
+        sent_at: u64,
         /// When this runner collected it, in Unix milliseconds.
         received_at: u64,
     },
@@ -1654,6 +1662,7 @@ fn refusal_for(error: &FlowError) -> Refusal {
         FlowError::AlreadyEstablished => Refusal::AlreadyEstablished,
         FlowError::NoAdvert => Refusal::NoAdvert,
         FlowError::DropFull => Refusal::DropFull,
+        FlowError::BodyTooLong { .. } => Refusal::TooLong,
         FlowError::Records(_) => Refusal::Network,
         _ => Refusal::Flow,
     }
@@ -1975,19 +1984,20 @@ impl<R: RunnerRecords> Runner<R> {
         }
     }
 
-    /// One [`RunnerEvent::Message`] per body, numbered from `first`.
+    /// One [`RunnerEvent::Message`] per message, numbered from `first`.
     async fn emit_bodies(
         &mut self,
         from: CorrespondenceLabel,
         first: u64,
-        bodies: Vec<Vec<u8>>,
+        messages: Vec<ReceivedMessage>,
     ) -> Result<(), Halt> {
-        for (seq, body) in (first..).zip(bodies) {
+        for (seq, message) in (first..).zip(messages) {
             let received_at = self.clock.now_ms();
             self.emit(RunnerEvent::Message {
                 from,
                 seq,
-                body,
+                body: message.body,
+                sent_at: message.sent_at_ms,
                 received_at,
             })
             .await?;
@@ -2352,8 +2362,8 @@ impl<R: RunnerRecords> Runner<R> {
                     Ok(Some(finished)) => {
                         let first = finished
                             .my_collected
-                            .saturating_sub(accepted.bodies.len() as u64);
-                        self.emit_bodies(peer, first, accepted.bodies).await?;
+                            .saturating_sub(accepted.messages.len() as u64);
+                        self.emit_bodies(peer, first, accepted.messages).await?;
                     }
                     Ok(None) | Err(_) => self.records.health.store_failures += 1,
                 }
@@ -2785,7 +2795,7 @@ impl<R: RunnerRecords> Runner<R> {
                 crate::vtrace!(
                     "dm runner: accept {} done, {} message(s) read, hello back in slot {} after {} re-pick(s)",
                     tag(&accepted.peer),
-                    accepted.bodies.len(),
+                    accepted.messages.len(),
                     accepted.hello_slot,
                     accepted.repicks
                 );
@@ -2793,7 +2803,7 @@ impl<R: RunnerRecords> Runner<R> {
                 self.requests.remove(&request);
                 let peer = accepted.peer;
                 self.delivered.entry(peer).or_insert(0);
-                self.emit_bodies(peer, first, accepted.bodies).await?;
+                self.emit_bodies(peer, first, accepted.messages).await?;
                 // The reply is sequence 0 of this side's direction on every
                 // path through an acceptance.
                 self.emit(RunnerEvent::Sent {
@@ -3107,7 +3117,7 @@ impl<R: RunnerRecords> Runner<R> {
             Ok(batch) => {
                 crate::vtrace!(
                     "dm runner: collected {} message(s) on {}, cursor {}{}",
-                    batch.bodies.len(),
+                    batch.messages.len(),
                     tag(&peer),
                     batch.my_collected,
                     if batch.cursor_published {
@@ -3116,8 +3126,10 @@ impl<R: RunnerRecords> Runner<R> {
                         ""
                     }
                 );
-                let first = batch.my_collected.saturating_sub(batch.bodies.len() as u64);
-                self.emit_bodies(peer, first, batch.bodies).await?;
+                let first = batch
+                    .my_collected
+                    .saturating_sub(batch.messages.len() as u64);
+                self.emit_bodies(peer, first, batch.messages).await?;
             }
             Err(e) => note_failure(&mut self.records.health, &e),
         }
@@ -3254,8 +3266,8 @@ impl<R: RunnerRecords> Runner<R> {
                 Ok(Some(state)) => {
                     let first = state
                         .my_collected
-                        .saturating_sub(acceptance.bodies.len() as u64);
-                    self.emit_bodies(peer, first, acceptance.bodies).await?;
+                        .saturating_sub(acceptance.messages.len() as u64);
+                    self.emit_bodies(peer, first, acceptance.messages).await?;
                 }
                 Ok(None) | Err(_) => self.records.health.store_failures += 1,
             }

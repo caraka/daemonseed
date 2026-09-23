@@ -136,14 +136,22 @@ pub const MESSAGE_HEADER_MAX_LEN: usize =
 /// and the tag it appends.
 const ENVELOPE_OVERHEAD: usize = NONCE_LEN + TAG_LEN;
 
+/// The version byte that opens every message plaintext this release writes.
+pub const MESSAGE_PLAINTEXT_VERSION: u8 = 1;
+
+/// Bytes the message plaintext spends ahead of the body: the version byte and
+/// the sender's time.
+pub const MESSAGE_PLAINTEXT_PREFIX_LEN: usize = 1 + 8;
+
 /// Bytes a message body may occupy, derived rather than chosen: one subkey
-/// less the largest header that can head it and the envelope's own overhead.
+/// less the largest header that can head it, the envelope's own overhead and
+/// the plaintext's prefix.
 ///
 /// A sender that exceeds this writes a slot the network refuses, so the figure
 /// belongs to whoever seals the body; it is exported here because only this
 /// module knows the header's maximum.
 pub const MESSAGE_BODY_MAX_LEN: usize =
-    CHANNEL_SUBKEY_LEN - MESSAGE_HEADER_MAX_LEN - ENVELOPE_OVERHEAD;
+    CHANNEL_SUBKEY_LEN - MESSAGE_HEADER_MAX_LEN - ENVELOPE_OVERHEAD - MESSAGE_PLAINTEXT_PREFIX_LEN;
 
 const _: () = assert!(
     MESSAGE_BODY_MAX_LEN > 0,
@@ -280,6 +288,10 @@ pub enum ChannelError {
     /// The control subkey did not open: a wrong `ss_hello`, a tampered
     /// ciphertext, or an associated-data mismatch. Uniform by design.
     Aead,
+    /// An opened message plaintext is shorter than
+    /// [`MESSAGE_PLAINTEXT_PREFIX_LEN`] or opens with a version other than
+    /// [`MESSAGE_PLAINTEXT_VERSION`], so its sender's time cannot be read.
+    MessagePlaintext,
     /// A local signing operation failed while building an opening — the
     /// crypto module is not operational, or the active profile disallows
     /// ML-DSA signing. Carries the cause: there is no adversary on this path.
@@ -348,6 +360,7 @@ impl PartialEq for ChannelError {
                 },
             ) => ea == eb && fa == fb,
             (Self::Aead, Self::Aead) => true,
+            (Self::MessagePlaintext, Self::MessagePlaintext) => true,
             // Compared on the variant: the wrapped cause is diagnostic and is
             // not itself comparable.
             (Self::Signing(_), Self::Signing(_)) => true,
@@ -404,6 +417,10 @@ impl std::fmt::Display for ChannelError {
                 "channel opening names advert serial {found}, not {expected}"
             ),
             Self::Aead => write!(f, "channel control subkey did not open"),
+            Self::MessagePlaintext => write!(
+                f,
+                "channel message: the plaintext is too short or of an unknown version"
+            ),
             Self::Signing(e) => write!(f, "channel opening could not be signed locally: {e:?}"),
             Self::Module(e) => write!(f, "channel: the crypto module refused: {e:?}"),
         }
@@ -744,6 +761,41 @@ pub fn message_aad(header: &MessageHeader) -> Vec<u8> {
     buf.extend_from_slice(domain::DM_CHANNEL_MSG_AAD);
     buf.extend_from_slice(&header.encode());
     buf
+}
+
+/// The plaintext a message body is sealed as: `version (1) ‖
+/// BE64(sent_at_ms) ‖ body`, where `version` is [`MESSAGE_PLAINTEXT_VERSION`]
+/// and `sent_at_ms` is the sender's wall clock when it sealed the message, in
+/// Unix milliseconds.
+///
+/// The time travels inside the seal, so a storage node holding the slot learns
+/// nothing it did not learn before. The caller zeroizes the result once it is
+/// sealed.
+pub fn encode_message_plaintext(sent_at_ms: u64, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MESSAGE_PLAINTEXT_PREFIX_LEN + body.len());
+    out.push(MESSAGE_PLAINTEXT_VERSION);
+    out.extend_from_slice(&sent_at_ms.to_be_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// Read an opened message plaintext back into the sender's time and the body.
+///
+/// Fails closed with [`ChannelError::MessagePlaintext`] on a plaintext shorter
+/// than [`MESSAGE_PLAINTEXT_PREFIX_LEN`] or opening with any other version, so
+/// no plaintext is read under a layout it was not written in.
+pub fn decode_message_plaintext(plaintext: &[u8]) -> Result<(u64, &[u8]), ChannelError> {
+    let (prefix, body) = plaintext
+        .split_at_checked(MESSAGE_PLAINTEXT_PREFIX_LEN)
+        .ok_or(ChannelError::MessagePlaintext)?;
+    let (version, sent_at) = prefix.split_first().ok_or(ChannelError::MessagePlaintext)?;
+    if *version != MESSAGE_PLAINTEXT_VERSION {
+        return Err(ChannelError::MessagePlaintext);
+    }
+    let sent_at: [u8; 8] = sent_at
+        .try_into()
+        .map_err(|_| ChannelError::MessagePlaintext)?;
+    Ok((u64::from_be_bytes(sent_at), body))
 }
 
 /// An absent-or-exact-width optional field: empty is absent, the exact width
@@ -1486,8 +1538,52 @@ mod tests {
         assert_eq!(full.encode().len(), MESSAGE_HEADER_MAX_LEN);
         assert_eq!(
             MESSAGE_BODY_MAX_LEN,
-            CHANNEL_SUBKEY_LEN - MESSAGE_HEADER_MAX_LEN - NONCE_LEN - TAG_LEN
+            CHANNEL_SUBKEY_LEN - MESSAGE_HEADER_MAX_LEN - NONCE_LEN - TAG_LEN - 9
         );
+    }
+
+    // ── the message plaintext ───────────────────────────────────────────────
+
+    /// The sender's time and the body come back exactly as written, and the
+    /// layout is the version byte, the big-endian time, then the body.
+    #[test]
+    fn a_message_plaintext_round_trips_its_sender_time() {
+        let encoded = encode_message_plaintext(1_700_000_123_456, b"hi there");
+        assert_eq!(encoded[0], MESSAGE_PLAINTEXT_VERSION);
+        assert_eq!(&encoded[1..9], &1_700_000_123_456u64.to_be_bytes());
+        assert_eq!(&encoded[9..], b"hi there");
+        let (sent_at_ms, body) = decode_message_plaintext(&encoded).unwrap();
+        assert_eq!(sent_at_ms, 1_700_000_123_456);
+        assert_eq!(body, b"hi there");
+        // An empty body is a whole plaintext.
+        let empty = encode_message_plaintext(7, b"");
+        assert_eq!(decode_message_plaintext(&empty).unwrap(), (7, &b""[..]));
+    }
+
+    /// A plaintext too short to hold the prefix, or opening with another
+    /// version, is refused rather than read under the wrong layout.
+    #[test]
+    fn a_malformed_message_plaintext_is_refused() {
+        let good = encode_message_plaintext(42, b"body");
+        for len in 0..MESSAGE_PLAINTEXT_PREFIX_LEN {
+            assert_eq!(
+                decode_message_plaintext(&good[..len]),
+                Err(ChannelError::MessagePlaintext),
+                "a {len}-byte plaintext was read"
+            );
+        }
+        for version in [0u8, 2, 0xff] {
+            let mut other = good.clone();
+            other[0] = version;
+            assert_eq!(
+                decode_message_plaintext(&other),
+                Err(ChannelError::MessagePlaintext),
+                "version {version} was read"
+            );
+        }
+        // Control: the unaltered plaintext and the bare prefix both decode.
+        assert!(decode_message_plaintext(&good).is_ok());
+        assert!(decode_message_plaintext(&good[..MESSAGE_PLAINTEXT_PREFIX_LEN]).is_ok());
     }
 
     // ── the opening ─────────────────────────────────────────────────────────

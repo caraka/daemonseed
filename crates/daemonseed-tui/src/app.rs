@@ -1219,6 +1219,7 @@ pub fn dm_refusal_phrase(reason: Refusal) -> &'static str {
         Refusal::Network => "the network would not read or write",
         Refusal::Flow => "the message could not be composed",
         Refusal::ShuttingDown => "messaging stopped before it went",
+        Refusal::TooLong => "that message is too long to send",
     }
 }
 
@@ -9842,6 +9843,7 @@ mod tests {
             Refusal::Network,
             Refusal::Flow,
             Refusal::ShuttingDown,
+            Refusal::TooLong,
         ];
         // The match names every variant, so a reason added to the enum breaks
         // this list rather than arriving on screen as nothing.
@@ -9860,7 +9862,8 @@ mod tests {
                 | Refusal::Store
                 | Refusal::Network
                 | Refusal::Flow
-                | Refusal::ShuttingDown => {}
+                | Refusal::ShuttingDown
+                | Refusal::TooLong => {}
             }
         }
 
@@ -9902,24 +9905,25 @@ mod tests {
         assert_eq!(drawn.len(), reasons.len());
     }
 
-    /// A received message draws its body with the time this side collected it,
-    /// labelled as the received time.
+    /// A received message draws its body with the time its sender sent it, by
+    /// the sender's clock, labelled as the sent time.
     #[test]
-    fn a_received_message_draws_its_received_time() {
+    fn a_received_message_draws_its_senders_time() {
         let (mut app, label) = dm_thread_app(5, ConversationState::Established);
-        // 12:30 UTC on the epoch day.
-        let received_at = 12 * 3_600_000 + 30 * 60_000;
+        // Sent 12:30 UTC on the epoch day, collected at 12:45: not today, so
+        // the date is drawn too.
         dm_event(
             &mut app,
             RunnerEvent::Message {
                 from: label,
                 seq: 0,
                 body: b"theirs".to_vec(),
-                received_at,
+                sent_at: 12 * 3_600_000 + 30 * 60_000,
+                received_at: 12 * 3_600_000 + 45 * 60_000,
             },
         );
         assert!(
-            dm_pane_rows(&app).contains(&"← theirs · received 12:30 UTC".to_owned()),
+            dm_pane_rows(&app).contains(&"← theirs · sent 1970-01-01 12:30 UTC".to_owned()),
             "drew:\n{}",
             dm_pane_rows(&app).join("\n")
         );
@@ -9938,6 +9942,7 @@ mod tests {
                 from: label,
                 seq: 0,
                 body: b"early".to_vec(),
+                sent_at: 0,
                 received_at: 0,
             },
         );
@@ -9984,6 +9989,7 @@ mod tests {
                 from: labels[0],
                 seq: 0,
                 body: b"hello".to_vec(),
+                sent_at: 0,
                 received_at: 0,
             },
         );
@@ -10071,6 +10077,7 @@ mod tests {
                 from: label,
                 seq: 0,
                 body: b"hi from six".to_vec(),
+                sent_at: 1,
                 received_at: 1,
             },
         );
@@ -10144,6 +10151,7 @@ mod tests {
                 from: label,
                 seq: 0,
                 body: b"bring the map".to_vec(),
+                sent_at: 0,
                 received_at: 0,
             },
         );
@@ -10734,6 +10742,7 @@ mod tests {
                 from: label,
                 seq: 0,
                 body: b"first".to_vec(),
+                sent_at: 0,
                 received_at: 0,
             },
         );
@@ -10767,7 +10776,7 @@ mod tests {
         );
         let rows = dm_pane_rows(&app);
         assert!(
-            rows.contains(&"← first · received 00:00 UTC".to_owned()),
+            rows.contains(&"← first · sent 1970-01-01 00:00 UTC".to_owned()),
             "the message collected before the answer is missing; drew:\n{}",
             rows.join("\n")
         );
@@ -11287,6 +11296,7 @@ mod tests {
                 from: unnamed,
                 seq: 0,
                 body: b"orphan".to_vec(),
+                sent_at: 0,
                 received_at: 0,
             },
         );

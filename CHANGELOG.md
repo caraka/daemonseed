@@ -426,7 +426,8 @@ work lives in the maintainer's own planning notes, not here.
   Decline and Block on a request, a reply box, and the refusal in words. Accept turns the request into its
   conversation at once, with the reply "message accepted" shown as a message being sent until the runner
   reports it sent or refused; a refused acceptance leaves the request, its thread showing the reply not
-  sent. A roster row's right-click menu starts a direct message with that member. Ctrl+D
+  sent. An accepted request's `Sent` also answers a plain request the same identity sent again, and leaves a
+  start-over listed. A roster row's right-click menu starts a direct message with that member. Ctrl+D
   opens Direct messages.
 
 ### Fixed
@@ -578,6 +579,11 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Changed
 
+- `daemonseed-core`: a direct message's sealed plaintext is `version (1) ‖ sent_at (u64 Unix ms) ‖ body`; `dm::channel::encode_message_plaintext`, `decode_message_plaintext`, `MESSAGE_PLAINTEXT_VERSION`, `MESSAGE_PLAINTEXT_PREFIX_LEN` and `ChannelError::MessagePlaintext` added; `MESSAGE_BODY_MAX_LEN` is 9 bytes smaller; `dm::flows::Accepted`, `Acceptance` and `Batch` carry `messages: Vec<ReceivedMessage>` (`sent_at_ms`, `body`) in place of `bodies`.
+- `daemonseed-core`: a body over `MESSAGE_BODY_MAX_LEN` is refused before it is sealed with `FlowError::BodyTooLong { len }`; `daemonseed-veilid-net`: `Refusal::TooLong` reports it.
+- `daemonseed-veilid-net`: `RunnerEvent::Message` carries `sent_at`, the sender's time; `DmThreadRow::Received` carries `sent_at_ms`, held at `received_at_ms` when ahead of it.
+- `daemonseed-gui`: a received direct message's thread and rail age read from its sender's time; thread rows show an age, refreshed with the rail's on the age timer, and none where the time is not known; past 30 days an age is the UTC date; `DmMessageRow::at_ms` added.
+- `daemonseed-tui`: a received direct message shows its sender's time, with its UTC date when not today.
 - `daemonseed-core`: `dm::flows::Records::write_batch` and `BatchWrite`; first contact writes its channel opening and first slot as one batch, and an acceptance its hello-slot erase, opening and reply slot.
 - `daemonseed-veilid-net`: `VeilidRecords::write_batch` submits every write of a batch before confirming any; the DM runner collects every 12 s (±20 %) while a first contact awaits acceptance or an acceptance awaits the peer's first read, for up to 15 minutes after start, first contact or accept; a drop scan that does not answer is retried three times and defers up to two passes over this side's own drop before every slot is read; a hello awaiting acceptance is not rewritten after a partial drop scan; runner steps are traced.
 

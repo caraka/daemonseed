@@ -12,11 +12,12 @@ use std::rc::Rc;
 
 use daemonseed_core::handle::strip_handle_hash;
 use daemonseed_veilid_net::dm::runner::{IdentityPk, Refusal, RunnerCommand, RunnerEvent};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::state::GuiState;
 use crate::state::dm::{
     DmMessageRow, DmMessageStatus, DmNotice, DmRailRow, DmThreadView, MainPane, RailSection,
+    dm_age_text,
 };
 use crate::{AppWindow, DmMessageData, DmRailRowData, defer, now_unix_ms, refresh_active_room};
 
@@ -70,6 +71,7 @@ pub fn refusal_text(refusal: Refusal) -> &'static str {
         Refusal::Network => "The network didn't take it. Try again.",
         Refusal::Flow => "It couldn't be sent.",
         Refusal::ShuttingDown => "Messaging stopped before it went.",
+        Refusal::TooLong => "That message is too long to send.",
     }
 }
 
@@ -133,8 +135,8 @@ fn dm_rows_model(rows: &[DmRailRow]) -> ModelRc<DmRailRowData> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
-/// The selected thread's message model.
-fn dm_messages_model(rows: &[DmMessageRow]) -> ModelRc<DmMessageData> {
+/// The selected thread's message model, each age read against `now_ms`.
+fn dm_messages_model(rows: &[DmMessageRow], now_ms: i64) -> ModelRc<DmMessageData> {
     let rows: Vec<DmMessageData> = rows
         .iter()
         .map(|row| DmMessageData {
@@ -142,9 +144,24 @@ fn dm_messages_model(rows: &[DmMessageRow]) -> ModelRc<DmMessageData> {
             body: SharedString::from(row.body.as_str()),
             status: SharedString::from(row.status.map_or("", status_text)),
             refused: row.status == Some(DmMessageStatus::Refused),
+            caption: SharedString::from(message_caption(row, now_ms)),
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(rows)))
+}
+
+/// The line under a message at `now_ms`: its age, then its status, joined by
+/// " · ", either left out when there is none. A message whose time is not
+/// known here has no age.
+fn message_caption(row: &DmMessageRow, now_ms: i64) -> String {
+    let age = row.at_ms.map(|at| dm_age_text(at, now_ms));
+    let status = row.status.map(status_text);
+    match (age, status) {
+        (Some(age), Some(status)) => format!("{age} · {status}"),
+        (Some(age), None) => age,
+        (None, Some(status)) => status.to_owned(),
+        (None, None) => String::new(),
+    }
 }
 
 /// Push the section flags, the main pane mode and the Direct messages notice.
@@ -171,6 +188,30 @@ pub fn apply_dm_rows(ui: &AppWindow, st: &GuiState) {
     ui.set_dm_rows(dm_rows_model(&st.dm_rail_rows(now_unix_ms())));
 }
 
+/// Read every age direct messaging shows again at `now_ms`, with no event: the
+/// rail rows, and the captions of the open thread's messages. The thread's
+/// rows are updated in place where a caption changed, so its scroll stays.
+pub fn refresh_dm_ages(ui: &AppWindow, st: &GuiState, now_ms: i64) {
+    ui.set_dm_rows(dm_rows_model(&st.dm_rail_rows(now_ms)));
+    let Some(thread) = st.dm_thread_view() else {
+        return;
+    };
+    let shown = ui.get_dm_messages();
+    if shown.row_count() != thread.rows.len() {
+        ui.set_dm_messages(dm_messages_model(&thread.rows, now_ms));
+        return;
+    }
+    for (i, row) in thread.rows.iter().enumerate() {
+        let caption = SharedString::from(message_caption(row, now_ms));
+        if let Some(mut data) = shown.row_data(i)
+            && data.caption != caption
+        {
+            data.caption = caption;
+            shown.set_row_data(i, data);
+        }
+    }
+}
+
 /// Push everything direct messaging shows: the sections, the main pane, the
 /// rail rows and the selected thread.
 pub fn apply_dm(ui: &AppWindow, st: &GuiState) {
@@ -181,7 +222,7 @@ pub fn apply_dm(ui: &AppWindow, st: &GuiState) {
             ui.set_dm_header_label(display_label(&thread.header_label));
             ui.set_dm_fingerprint(SharedString::from(thread.fingerprint.as_str()));
             ui.set_dm_is_request(thread.is_request);
-            ui.set_dm_messages(dm_messages_model(&thread.rows));
+            ui.set_dm_messages(dm_messages_model(&thread.rows, now_unix_ms()));
             ui.set_dm_can_send(thread.can_send);
             ui.set_dm_refusal(SharedString::from(thread_note(&thread)));
             ui.set_dm_blocking(thread.blocking);
@@ -190,7 +231,7 @@ pub fn apply_dm(ui: &AppWindow, st: &GuiState) {
             ui.set_dm_header_label(SharedString::new());
             ui.set_dm_fingerprint(SharedString::new());
             ui.set_dm_is_request(false);
-            ui.set_dm_messages(dm_messages_model(&[]));
+            ui.set_dm_messages(dm_messages_model(&[], now_unix_ms()));
             ui.set_dm_can_send(false);
             ui.set_dm_refusal(SharedString::new());
             ui.set_dm_blocking(false);
@@ -553,12 +594,15 @@ mod tests {
         }])
     }
 
+    /// A message sent five minutes ago and collected now.
     fn message(from: CorrespondenceLabel, seq: u64, body: &str) -> RunnerEvent {
+        let now = u64::try_from(now_unix_ms()).expect("a clock after 1970");
         RunnerEvent::Message {
             from,
             seq,
             body: body.as_bytes().to_vec(),
-            received_at: 1,
+            sent_at: now - 300_000,
+            received_at: now,
         }
     }
 
@@ -707,10 +751,75 @@ mod tests {
                 .map(|m| (m.body, m.status))
                 .collect();
             assert_eq!(messages, [("message accepted".into(), "sending…".into())]);
-            assert!(matches!(
-                app.state.borrow_mut().take_pending_dm().as_slice(),
-                [RunnerCommand::Accept { .. }]
-            ));
+            let token = match app.state.borrow_mut().take_pending_dm().as_slice() {
+                [RunnerCommand::Accept { token, .. }] => *token,
+                other => panic!("expected one accept, got {other:?}"),
+            };
+
+            // Refused: the window shows the request again, its reply not sent,
+            // and why.
+            app.dm_event(RunnerEvent::Refused {
+                token: Some(token),
+                reason: Refusal::Network,
+            });
+            assert!(app.ui.get_dm_is_request(), "the request is not shown");
+            assert_eq!(app.ui.get_dm_refusal(), refusal_text(Refusal::Network));
+            assert_eq!(app.ui.get_dm_rows().row_count(), 1);
+            let messages: Vec<(SharedString, SharedString)> = app
+                .ui
+                .get_dm_messages()
+                .iter()
+                .map(|m| (m.body, m.status))
+                .collect();
+            assert_eq!(messages, [("message accepted".into(), "not sent".into())]);
+        });
+    }
+
+    /// The window's message model carries each message's caption: its age by
+    /// its sender's clock and its status. The captions age with time alone,
+    /// with no new event, and a row whose time is unknown has only its status.
+    #[test]
+    fn thread_captions_show_ages_and_advance_with_time() {
+        with_app(|app| {
+            let peer = label();
+            app.dm_event(established(peer, 3));
+            let now = now_unix_ms();
+            app.dm_event(RunnerEvent::Message {
+                from: peer,
+                seq: 0,
+                body: b"from three hours ago".to_vec(),
+                sent_at: u64::try_from(now - 3 * 3_600_000).unwrap(),
+                received_at: u64::try_from(now).unwrap(),
+            });
+            app.ui.invoke_open_section(1);
+            app.ui.invoke_select_dm(app.slot_of(&dm_fingerprint(3)));
+            app.ui.invoke_send_dm("mine".into());
+            let captions = |app: &App| -> Vec<SharedString> {
+                app.ui.get_dm_messages().iter().map(|m| m.caption).collect()
+            };
+            assert_eq!(captions(app), ["3h", "now · sending…"]);
+
+            let token = match app.state.borrow_mut().take_pending_dm().as_slice() {
+                [RunnerCommand::Send { token, .. }] => *token,
+                other => panic!("expected one send, got {other:?}"),
+            };
+            app.dm_event(RunnerEvent::Sent {
+                token,
+                peer,
+                seq: 1,
+            });
+            // Sent from another session: no time is known here.
+            app.dm_event(RunnerEvent::Sent {
+                token: daemonseed_veilid_net::dm::runner::CommandToken(999),
+                peer,
+                seq: 7,
+            });
+            assert_eq!(captions(app), ["3h", "now · sent", "sent"]);
+
+            refresh_dm_ages(&app.ui, &app.state.borrow(), now + 2 * 3_600_000 + 60_000);
+            assert_eq!(captions(app), ["5h", "2h · sent", "sent"]);
+            let rail: Vec<SharedString> = app.ui.get_dm_rows().iter().map(|r| r.age).collect();
+            assert_eq!(rail, ["2h"]);
         });
     }
 

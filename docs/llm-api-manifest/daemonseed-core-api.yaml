@@ -961,8 +961,8 @@ modules:
       mod RING_SLOTS). CHANNEL_SUBKEY_LEN (16384) is one subkey,
       MESSAGE_HEADER_MAX_LEN (3188) a header carrying both turn fields,
       SEALED_CONTROL_MAX_LEN (11464) a sealed control record, and MESSAGE_BODY_MAX_LEN
-      (13168) is derived as CHANNEL_SUBKEY_LEN less the header maximum and the AEAD
-      envelope overhead. derive_owner_seed(channel_root, peer_identity_pk, generation)
+      (13159) is derived as CHANNEL_SUBKEY_LEN less the header maximum, the AEAD
+      envelope overhead and MESSAGE_PLAINTEXT_PREFIX_LEN (9). derive_owner_seed(channel_root, peer_identity_pk, generation)
       -> Result<ChannelOwnerSeed, ChannelError> is HKDF-SHA384(salt=
       daemonseed/dm/channel/salt/v1, ikm=DmChannelRootSecret, info=
       daemonseed/dm/channel/owner/v1 || lp(peer pubkey) || lp(BE64(generation))); the
@@ -985,7 +985,12 @@ modules:
       subkey is written only when there is no reply. message_aad(header) is
       daemonseed/dm/channel/msg-aad/v1 || the encoded header, and is the associated
       data a message body is sealed under, so a rewritten clear field leaves a body
-      that does not open.
+      that does not open. encode_message_plaintext(sent_at_ms, body) -> Vec<u8> is
+      the plaintext a message is sealed as, MESSAGE_PLAINTEXT_VERSION (1) ||
+      BE64(sent_at_ms) || body, sent_at_ms the sender's clock in Unix milliseconds;
+      decode_message_plaintext(plaintext) -> Result<(u64, &[u8]), ChannelError>
+      returns the time and the body, refusing ChannelError::MessagePlaintext on
+      fewer than MESSAGE_PLAINTEXT_PREFIX_LEN (9) bytes or another version.
       decode(bytes) -> Result<(MessageHeader, &[u8]), ChannelError> returns the header
       and the sealed body after it, refusing Malformed on bytes that run out,
       FieldLength { expected, actual } on a turn field of the wrong width and
@@ -1220,7 +1225,11 @@ modules:
       own error; FlowError is Advert, Drop, Channel, Chain, Store, Records,
       NoAdvert, NoOpening, NotOutstanding, AlreadyEstablished,
       AwaitingAcceptance, AlreadyAccepted, OpeningWriter, OpeningRatchetKey, DropFull,
-      Incomplete, HelloLength and DeletePending. Me { signer, channel_root } is this side's
+      Incomplete, HelloLength, DeletePending and BodyTooLong { len } (a body over
+      channel::MESSAGE_BODY_MAX_LEN, refused before it is sealed, so nothing is
+      persisted or written). ReceivedMessage { sent_at_ms, body } is one message
+      read from a correspondent's ring, sent_at_ms the sender's clock in Unix
+      milliseconds; its Debug shows the body's length only. Me { signer, channel_root } is this side's
       identity, FIRST_GENERATION is 0 and MAX_REPICKS is 1.
       first_contact(store, records, me, peer_identity_pk, body, fill, now) ->
       Result<FirstContact, FlowError> holds one conversation per correspondent
@@ -1278,7 +1287,8 @@ modules:
       identity, error } where settling that one correspondent failed — the scan
       carries on past it, and only a failure of this side's own store returns.
       accept(store, records, me, request, reply, fill, now) -> Result<Accepted {
-      peer, outgoing_lookup_key, bodies, hello_slot, repicks }, FlowError>
+      peer, outgoing_lookup_key, messages: Vec<ReceivedMessage>, hello_slot, repicks },
+      FlowError>
       holds one conversation per correspondent identity: a record with
       acceptance_pending set is carried on, and any other record is
       FlowError::AlreadyEstablished. It names this side's channel, seals the reply
@@ -1296,7 +1306,7 @@ modules:
       re-sealing it; FlowError::AlreadyEstablished where acceptance_pending is
       clear. recognise_acceptance(store, records, me, peer, lookup_key,
       peer_secret, slot) -> Result<Acceptance { peer, lookup_key, peer_cursor,
-      bodies }, FlowError> records the correspondent's channel lookup key and
+      messages: Vec<ReceivedMessage> }, FlowError> records the correspondent's channel lookup key and
       the control key derived from peer_secret, reads its cursor and any reply,
       clears the outstanding hello, awaiting_acceptance and own_hello_secret, and
       erases the slot. send_message(store, records,
@@ -1307,8 +1317,8 @@ modules:
       FlowError::DeletePending while delete_pending is set, and
       FlowError::AwaitingAcceptance while awaiting_acceptance or acceptance_pending is
       set. collect_batch(store,
-      records, peer) -> Result<Batch { bodies, my_collected, cursor_published },
-      FlowError> is FlowError::DeletePending while delete_pending is set,
+      records, peer) -> Result<Batch { messages: Vec<ReceivedMessage>, my_collected,
+      cursor_published }, FlowError> is FlowError::DeletePending while delete_pending is set,
       FlowError::AwaitingAcceptance while acceptance_pending is set, and
       otherwise reads the correspondent's ring from this side's cursor and
       publishes the new cursor in one control write where my_collected is above
@@ -8345,6 +8355,36 @@ functions:
     returns:
       type: "Vec<u8>"
       description: The associated data for the body seal.
+  - name: "channel::encode_message_plaintext"
+    module: daemonseed_core::dm::channel
+    description: >-
+      The plaintext a message is sealed as, version (1) || BE64(sent_at_ms) || body.
+    signature: "pub fn encode_message_plaintext(sent_at_ms: u64, body: &[u8]) -> Vec<u8>"
+    parameters:
+      - name: sent_at_ms
+        type: u64
+        direction: in
+        description: The sender's wall clock when it seals the message, in Unix milliseconds.
+      - name: body
+        type: "&[u8]"
+        direction: in
+        description: The message body.
+    returns:
+      type: "Vec<u8>"
+      description: The plaintext, for the caller to seal and zeroize.
+  - name: "channel::decode_message_plaintext"
+    module: daemonseed_core::dm::channel
+    description: >-
+      Reads an opened message plaintext back into the sender's time and the body.
+    signature: "pub fn decode_message_plaintext(plaintext: &[u8]) -> Result<(u64, &[u8]), ChannelError>"
+    parameters:
+      - name: plaintext
+        type: "&[u8]"
+        direction: in
+        description: The opened plaintext.
+    returns:
+      type: "Result<(u64, &[u8]), ChannelError>"
+      description: The sender's time in Unix milliseconds and the body, or MessagePlaintext on fewer than 9 bytes or a version other than 1.
   - name: "channel::opening_signing_input"
     module: daemonseed_core::dm::channel
     description: >-
@@ -9451,8 +9491,18 @@ constants:
   - name: MESSAGE_BODY_MAX_LEN
     module: daemonseed_core::dm::channel
     type: usize
-    value: "13168"
-    description: Bytes a message body may occupy, CHANNEL_SUBKEY_LEN less the largest header and the AEAD envelope overhead.
+    value: "13159"
+    description: Bytes a message body may occupy, CHANNEL_SUBKEY_LEN less the largest header, the AEAD envelope overhead and MESSAGE_PLAINTEXT_PREFIX_LEN.
+  - name: MESSAGE_PLAINTEXT_VERSION
+    module: daemonseed_core::dm::channel
+    type: u8
+    value: "1"
+    description: The version byte that opens every message plaintext.
+  - name: MESSAGE_PLAINTEXT_PREFIX_LEN
+    module: daemonseed_core::dm::channel
+    type: usize
+    value: "9"
+    description: Bytes a message plaintext spends ahead of the body, the version byte and the sender's time.
   - name: OPENING_LEN
     module: daemonseed_core::dm::channel
     type: usize

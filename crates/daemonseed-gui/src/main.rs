@@ -1544,8 +1544,9 @@ fn start_drain(
                 age_tick = 0;
                 let st = state.borrow();
                 ui.set_messages(messages_model(&st.current().messages));
-                // The Direct messages rail's ages advance on the same cadence.
-                dm_ui::apply_dm_rows(&ui, &st);
+                // Direct messaging's ages, in the rail and the open thread,
+                // advance on the same cadence.
+                dm_ui::refresh_dm_ages(&ui, &st, now_unix_ms());
             }
         });
     }

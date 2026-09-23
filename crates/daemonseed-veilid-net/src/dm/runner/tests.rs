@@ -938,6 +938,21 @@ async fn establish(config: RunnerConfig) -> Scene {
         accepted_at < reply_at,
         "the acceptance precedes the reply it carried"
     );
+    let RunnerEvent::Message {
+        sent_at,
+        received_at,
+        ..
+    } = &aw.seen[reply_at]
+    else {
+        panic!("expected the reply, got {:?}", aw.seen[reply_at]);
+    };
+    // The sender's clock is sealed in whole seconds, so a time stamped by the
+    // reader instead of carried from the sender is visible.
+    assert_eq!(sent_at % 1000, 0, "the reply carries its sender's time");
+    assert!(
+        sent_at <= received_at && received_at - sent_at < 3_600_000,
+        "the reply was sent at {sent_at} and collected at {received_at}"
+    );
     bw.wait_for("A's first body at B", message(b_peer, 0, b"the first body"))
         .await;
     aw.wait_for("delivery of A's first body", delivered(a_peer, 0))
@@ -1505,6 +1520,15 @@ async fn refusals_carry_the_token_and_name_backpressure_apart() {
         .await;
     assert_eq!(refusal(&bw.seen[at]), Refusal::UnknownRequest);
 
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(12),
+        peer: a_peer,
+        body: vec![0x61; channel::MESSAGE_BODY_MAX_LEN + 1],
+    })
+    .await;
+    let at = aw.wait_for("the too-long refusal", refused(12)).await;
+    assert_eq!(refusal(&aw.seen[at]), Refusal::TooLong);
+
     // B stops collecting, so A's ring fills: sequence 0 is collected and 63
     // more fit.
     assert!(finished(&bw.stop().await));
@@ -1546,6 +1570,101 @@ async fn refusals_carry_the_token_and_name_backpressure_apart() {
         "63 messages fit before the ring is full: {answers:?}"
     );
     assert!(finished(&aw.stop().await));
+}
+
+/// The sender's time of a received message event.
+fn sent_at_of(event: &RunnerEvent) -> u64 {
+    match event {
+        RunnerEvent::Message { sent_at, .. } => *sent_at,
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+/// A message written at a time no runner's clock reads reaches B with that
+/// time through B's acceptance and through B's collection batch, including a
+/// stamp ahead of B's clock. A writes through the flows directly, so its
+/// stamps are chosen rather than read from a clock. An acceptance whose reply
+/// is too long is refused and leaves the request held for another answer.
+#[tokio::test(start_paused = true)]
+async fn a_senders_stamp_reaches_b_through_its_acceptance_and_its_batch() {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    assert!(finished(&aw.stop().await));
+    let mut bw = b.spawn(&Fake::on(&dht), RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+
+    // Half an hour before the clock B reads, inside the hour before B's
+    // advert comes into force; and a day after it, so a runner that held a
+    // stamp at its own clock would not report it.
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_secs();
+    let (t_first, t_later) = (now - 1_800, now + 86_400);
+    let keys = a.keys();
+    let me = Me {
+        signer: &keys.signing,
+        channel_root: &keys.dm_channel_root,
+    };
+    let store =
+        Store::open(a.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).expect("A's store opens");
+    let mut records = a_fake.restart();
+    flows::first_contact(&store, &mut records, &me, &b.pk, b"early", os_fill, t_first)
+        .expect("A's first contact");
+
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(3),
+        request,
+        reply: vec![0x61; channel::MESSAGE_BODY_MAX_LEN + 1],
+    })
+    .await;
+    let at = bw
+        .wait_for("the too-long reply's refusal", refused(3))
+        .await;
+    assert_eq!(refusal(&bw.seen[at]), Refusal::TooLong);
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    bw.wait_for("the acceptance of the same request", sent(2))
+        .await;
+    let at = bw
+        .wait_for("A's first message through B's acceptance", |event| {
+            matches!(event, RunnerEvent::Message { seq: 0, body, .. } if body.as_slice() == b"early")
+        })
+        .await;
+    assert_eq!(sent_at_of(&bw.seen[at]), t_first * 1000);
+
+    let advert_keys = AdvertKeys::restore(
+        store
+            .load_advert_keys()
+            .expect("A's advert keys read")
+            .expect("A's advert keys exist"),
+    );
+    let surfaced =
+        flows::collect(&store, &mut records, &me, &advert_keys, |_| false).expect("A collects");
+    let peer_a = match surfaced.as_slice() {
+        [Surfaced::Accepted(acceptance)] => acceptance.peer,
+        other => panic!("expected the acceptance, got {other:?}"),
+    };
+    flows::send_message(&store, &mut records, &peer_a, b"later", os_fill, t_later)
+        .expect("A sends");
+    let at = bw
+        .wait_for("A's later message through B's batch", |event| {
+            matches!(event, RunnerEvent::Message { seq: 1, body, .. } if body.as_slice() == b"later")
+        })
+        .await;
+    assert_eq!(sent_at_of(&bw.seen[at]), t_later * 1000);
+    assert!(finished(&bw.stop().await));
 }
 
 /// A request id names the run that issued it: a relaunch surfaces the same

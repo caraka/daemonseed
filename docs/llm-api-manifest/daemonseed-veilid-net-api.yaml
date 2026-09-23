@@ -458,8 +458,9 @@ types:
     kind: enum
     description: >-
       Roster(Vec<ConversationSummary>), ContactRequest{request, from},
-      StartedOver{request, from}, Message{from, seq, body, received_at (Unix ms,
-      stamped by the runner)}, Sent{token, peer, seq}, Deleted{token, peer},
+      StartedOver{request, from}, Message{from, seq, body, sent_at (Unix ms, the
+      sender's clock, carried inside the message's encryption), received_at (Unix
+      ms, stamped by the runner)}, Sent{token, peer, seq}, Deleted{token, peer},
       Delivered{peer, through_seq}, Accepted{peer}, Refused{token:
       Option<CommandToken>, reason: Refusal}, Health(HealthCounters),
       BlockList(Vec<IdentityPk>), BlockListUnreadable. Every command with a token
@@ -512,7 +513,8 @@ types:
       DropFull, BlockListFull (a Block past the maximum), Store (also a stored
       block list that is absent or does not decode, and an Accept while it will
       not read), Network, Flow, ShuttingDown (the runner stopped with the command
-      still queued). An Accept of a request whose identity the block list holds
+      still queued), TooLong (a body over MESSAGE_BODY_MAX_LEN bytes; nothing was
+      sealed or written). An Accept of a request whose identity the block list holds
       is UnknownRequest.
   - name: HealthCounters
     module: daemonseed_veilid_net::dm::runner
@@ -870,10 +872,11 @@ types:
     module: daemonseed_veilid_net::dm::view
     kind: enum
     description: >-
-      One row of a conversation's thread: Received { seq, body, received_at_ms } or
-      Sent { seq, body: Option<String> }, body None for a message this session did not
-      compose.
-    variants: ["Received { seq, body, received_at_ms }", "Sent { seq, body }"]
+      One row of a conversation's thread: Received { seq, body, sent_at_ms,
+      received_at_ms } or Sent { seq, body: Option<String> }, body None for a message
+      this session did not compose. sent_at_ms is the sender's time, held at
+      received_at_ms when the sender's clock put it later.
+    variants: ["Received { seq, body, sent_at_ms, received_at_ms }", "Sent { seq, body }"]
   - name: DmContactRequest
     module: daemonseed_veilid_net::dm::view
     kind: struct

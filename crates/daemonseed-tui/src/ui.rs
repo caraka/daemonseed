@@ -1286,7 +1286,10 @@ fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
     let mut row = 0usize;
     for request in requests {
         let marker = if row == app.dm_sel() { "▶ " } else { "  " };
-        let held = utc_clock(u64::try_from(request.held_at_ms).unwrap_or(0));
+        let held = utc_clock(
+            u64::try_from(request.held_at_ms).unwrap_or(0),
+            now_unix_ms(),
+        );
         // What a request shows is who sent it and when it was held: nothing a
         // stranger wrote is read before the user accepts.
         let text = if request.started_over {
@@ -1407,13 +1410,36 @@ fn dm_health_line(h: &HealthCounters) -> Option<String> {
     (!parts.is_empty()).then(|| format!("messaging: {}", parts.join(" · ")))
 }
 
-/// A Unix-millisecond time as `HH:MM UTC`.
+/// The wall clock now, in Unix milliseconds; 0 if the clock reads before 1970.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// A Unix-millisecond time as `HH:MM UTC`, preceded by its date
+/// (`YYYY-MM-DD HH:MM UTC`) when it is not the same UTC day as `now_ms`.
 ///
 /// UTC because the terminal's own zone is not known here, and the suffix says
 /// so, so the time is not read as local.
-fn utc_clock(unix_ms: u64) -> String {
+fn utc_clock(unix_ms: u64, now_ms: u64) -> String {
     let minutes = unix_ms / 60_000;
-    format!("{:02}:{:02} UTC", (minutes / 60) % 24, minutes % 60)
+    let clock = format!("{:02}:{:02} UTC", (minutes / 60) % 24, minutes % 60);
+    let day = unix_ms / 86_400_000;
+    if day == now_ms / 86_400_000 {
+        return clock;
+    }
+    // Days since 1970-01-01 to a civil date (Hinnant's algorithm).
+    let z = day + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + u64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {clock}")
 }
 
 /// One row of a thread, wrapped to the rows it occupies on screen.
@@ -1501,11 +1527,9 @@ fn render_dm_thread(app: &App, frame: &mut Frame, area: Rect) {
         for row in &correspondence.thread {
             match row {
                 DmThreadRow::Received {
-                    body,
-                    received_at_ms,
-                    ..
+                    body, sent_at_ms, ..
                 } => push(
-                    format!("← {body} · received {}", utc_clock(*received_at_ms)),
+                    format!("← {body} · sent {}", utc_clock(*sent_at_ms, now_unix_ms())),
                     Style::default(),
                 ),
                 DmThreadRow::Sent { seq, body } => {
@@ -2383,7 +2407,19 @@ fn render_first_start_body(fs: &FirstStartUi, frame: &mut Frame, area: Rect) {
 mod tests {
     use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 
-    use super::{ellipsize, fit_row, scroll_window_start, trust_persistent_text};
+    use super::{ellipsize, fit_row, scroll_window_start, trust_persistent_text, utc_clock};
+
+    /// A time on the same UTC day as now shows the clock alone; any other day
+    /// shows its date first.
+    #[test]
+    fn a_time_not_today_shows_its_date() {
+        let now: u64 = 1_789_000_000_000; // 2026-09-10 00:26 UTC
+        assert_eq!(utc_clock(now, now), "00:26 UTC");
+        assert_eq!(utc_clock(now - 60_000 * 20, now), "00:06 UTC");
+        assert_eq!(utc_clock(now - 60_000 * 30, now), "2026-09-09 23:56 UTC");
+        assert_eq!(utc_clock(12 * 3_600_000, now), "1970-01-01 12:00 UTC");
+        assert_eq!(utc_clock(951_782_400_000, now), "2000-02-29 00:00 UTC");
+    }
 
     /// The window always contains the cursor, never starts past the last page,
     /// and is page-aligned — checked at every boundary the render can hit,

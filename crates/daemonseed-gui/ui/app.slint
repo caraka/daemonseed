@@ -90,12 +90,15 @@ struct DmRailRowData {
 }
 
 // One message of the selected direct-message thread. `status` is empty on a
-// received message.
+// received message. `caption` is the line under it, composed by Rust: its age
+// by its sender's clock, then its status, joined by " · ", either part left out
+// when empty.
 struct DmMessageData {
     outgoing: bool,
     body: string,
     status: string,
     refused: bool,
+    caption: string,
 }
 
 // One verified announcement row (#91, ISC-S7). `topic`/`body` are the inert
@@ -329,8 +332,9 @@ component DmRailRowView inherits Rectangle {
 }
 
 // One direct message, in the chat bubbles' colours: a received message on the
-// green bubble, one written here on the dark bubble with its status below it in
-// the muted caption tone (the error tone when it did not go).
+// green bubble, one written here on the dark bubble. Its age, and on one written
+// here its status, sit below it in the muted caption tone (the error tone when
+// it did not go).
 component DmBubble inherits Rectangle {
     in property <DmMessageData> msg;
     HorizontalLayout {
@@ -344,10 +348,11 @@ component DmBubble inherits Rectangle {
             VerticalLayout {
                 padding: 8px; spacing: 3px;
                 Text { text: root.msg.body; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
-                if root.msg.status != "" : Text {
-                    text: root.msg.status;
+                if root.msg.caption != "" : Text {
+                    text: root.msg.caption;
                     color: root.msg.refused ? #c2785b : #5b6472;
-                    font-size: 11px; horizontal-alignment: right;
+                    font-size: 11px;
+                    horizontal-alignment: root.msg.outgoing ? right : left;
                 }
             }
         }

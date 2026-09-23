@@ -16,7 +16,7 @@ use daemonseed_veilid_net::dm::runner::{
     CommandToken, IdentityPk, Refusal, RunnerCommand, RunnerEvent,
 };
 use daemonseed_veilid_net::dm::view::{
-    DmOutstanding, DmState, DmThreadRow, FirstContactBlocked, dm_fingerprint,
+    DmCorrespondence, DmOutstanding, DmState, DmThreadRow, FirstContactBlocked, dm_fingerprint,
 };
 
 use super::{GuiState, now_unix_ms};
@@ -162,6 +162,11 @@ pub struct DmMessageRow {
     pub body: String,
     /// How far an outgoing message got; `None` on a received one.
     pub status: Option<DmMessageStatus>,
+    /// The time the row's age is read from, in Unix milliseconds: the
+    /// correspondent's send time on a received message, the time it was
+    /// composed on one composed here, and `None` on a message this session
+    /// did not compose.
+    pub at_ms: Option<i64>,
 }
 
 impl std::fmt::Debug for DmMessageRow {
@@ -171,6 +176,7 @@ impl std::fmt::Debug for DmMessageRow {
             .field("outgoing", &self.outgoing)
             .field("body_len", &self.body.len())
             .field("status", &self.status)
+            .field("at_ms", &self.at_ms)
             .finish()
     }
 }
@@ -226,6 +232,8 @@ struct Composed {
     seq: Option<u64>,
     /// Why it did not go.
     refusal: Option<Refusal>,
+    /// When it was composed, by this side's clock (Unix ms).
+    composed_at_ms: i64,
 }
 
 impl Composed {
@@ -255,8 +263,9 @@ pub(super) struct GuiDm {
     unread_requests: BTreeSet<IdentityPk>,
     /// Conversations with a message the user has not viewed.
     unread_conversations: BTreeSet<IdentityPk>,
-    /// When each conversation last changed, by the wall clock (Unix ms). The
-    /// view model orders by a counter and holds no time.
+    /// When each conversation last changed (Unix ms): the correspondent's
+    /// send time of a message received, or this side's clock for any other
+    /// change. The view model orders by a counter.
     active_at: BTreeMap<IdentityPk, i64>,
     /// Every message composed to each correspondent, in the order composed.
     composed: BTreeMap<IdentityPk, Vec<Composed>>,
@@ -389,21 +398,28 @@ impl GuiDm {
     }
 
     /// Record a composed message, queued under `token`.
+    ///
+    /// A first contact can open the conversation itself, so an acceptance reply
+    /// to that person no longer [`Composed::opens_conversation`].
     fn compose(&mut self, peer: &IdentityPk, token: CommandToken, body: &str, first_contact: bool) {
         let after = self.foreign_rows(peer);
-        self.composed
-            .entry(peer.clone())
-            .or_default()
-            .push(Composed {
-                token,
-                body: body.to_owned(),
-                first_contact,
-                accept: false,
-                opens_conversation: false,
-                after,
-                seq: None,
-                refusal: None,
-            });
+        let messages = self.composed.entry(peer.clone()).or_default();
+        if first_contact {
+            for m in messages.iter_mut() {
+                m.opens_conversation = false;
+            }
+        }
+        messages.push(Composed {
+            token,
+            body: body.to_owned(),
+            first_contact,
+            accept: false,
+            opens_conversation: false,
+            after,
+            seq: None,
+            refusal: None,
+            composed_at_ms: now_unix_ms(),
+        });
     }
 
     /// A refused first contact whose conversation the runner then listed holds
@@ -449,7 +465,10 @@ impl GuiDm {
     ///
     /// A refused reply whose conversation the runner then lists was written:
     /// the runner creates the conversation with the reply as sequence 0 and
-    /// finishes the acceptance from that record without reporting `Sent`.
+    /// finishes the acceptance from that record without reporting `Sent`. Only
+    /// a reply that alone could have opened it is taken as written: one sent
+    /// with no conversation and no first contact to that person, while no
+    /// other message of theirs here holds sequence 0.
     /// Until a reply is delivered it is drawn after every message the
     /// correspondent's side holds, since they cannot write again before
     /// collecting it.
@@ -459,13 +478,16 @@ impl GuiDm {
             let Some(c) = self.state.correspondences.get(&peer) else {
                 continue;
             };
-            let listed = c.label.is_some();
+            let zero_held = self
+                .composed
+                .get(&peer)
+                .is_some_and(|ms| ms.iter().any(|m| m.seq == Some(0)));
             let mut open = false;
             for m in self.composed.get_mut(&peer).into_iter().flatten() {
                 if !m.accept {
                     continue;
                 }
-                if listed && m.opens_conversation && m.seq.is_none() && m.refusal.is_some() {
+                if !zero_held && m.opens_conversation && m.seq.is_none() && m.refusal.is_some() {
                     m.seq = Some(0);
                     m.refusal = None;
                 }
@@ -564,17 +586,39 @@ impl GuiDm {
     }
 }
 
+/// Past this many days an age is shown as the date instead.
+const DM_AGE_DAYS_MAX: i64 = 30;
+
 /// How long ago `then_ms` was at `now_ms`, as a rail row's age: "now" under a
-/// minute, then whole minutes, hours or days ("2m", "1h", "3d"). A time in the
-/// future reads as "now".
+/// minute, then whole minutes, hours or days ("2m", "1h", "3d"), and past
+/// [`DM_AGE_DAYS_MAX`] days the UTC date ("2026-03-14"). A time in the future
+/// reads as "now".
 pub fn dm_age_text(then_ms: i64, now_ms: i64) -> String {
     let secs = now_ms.saturating_sub(then_ms).max(0) / 1000;
     match secs {
         0..60 => "now".to_owned(),
         60..3600 => format!("{}m", secs / 60),
         3600..86_400 => format!("{}h", secs / 3600),
-        _ => format!("{}d", secs / 86_400),
+        _ if secs / 86_400 <= DM_AGE_DAYS_MAX => format!("{}d", secs / 86_400),
+        _ => crate::format_unix_ms(then_ms.max(1))
+            .get(..10)
+            .unwrap_or_default()
+            .to_owned(),
     }
+}
+
+/// A Unix-millisecond time from the view model as the GUI's signed clock value,
+/// saturating at the far future.
+fn unix_ms_i64(ms: u64) -> i64 {
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
+/// The correspondent's send time of the last message received in `c`, if any.
+fn last_sent_at(c: &DmCorrespondence) -> Option<i64> {
+    c.thread.iter().rev().find_map(|row| match row {
+        DmThreadRow::Received { sent_at_ms, .. } => Some(unix_ms_i64(*sent_at_ms)),
+        DmThreadRow::Sent { .. } => None,
+    })
 }
 
 /// Received-message counts and activity stamps per conversation, to tell what
@@ -609,7 +653,9 @@ impl GuiState {
     ///
     /// A correspondent starting over is also appended to the trust log. A
     /// request or message arriving in an item the user is not viewing marks it
-    /// unread, and a conversation's age restarts whenever the event names it.
+    /// unread, and a conversation's age restarts whenever the event names it:
+    /// from the correspondent's send time where a message was received, and
+    /// from this side's clock otherwise.
     pub fn on_dm_event(&mut self, event: &RunnerEvent) {
         if let RunnerEvent::StartedOver { .. } = event {
             self.log_dm_started_over();
@@ -636,9 +682,15 @@ impl GuiState {
                 }
                 // A refused acceptance leaves the request as the one item for
                 // that person, its thread holding the reply not sent.
+                // A draft that also holds a first contact stays: that message
+                // is still on its way.
                 if accept
                     && let Some(peer) = dm.peer_of(*token)
                     && dm.state.requests.iter().any(|r| r.from == peer)
+                    && !dm
+                        .composed
+                        .get(&peer)
+                        .is_some_and(|ms| ms.iter().any(|m| m.first_contact))
                 {
                     dm.drafts.remove(&peer);
                     let draft = DmItemKey::new(DmItemKind::Draft, &peer);
@@ -696,7 +748,16 @@ impl GuiState {
         for (pk, (received, activity)) in activity_marks(&dm.state) {
             let (was_received, was_activity) = before.get(&pk).copied().unwrap_or((0, 0));
             if activity != was_activity || !before.contains_key(&pk) {
-                dm.active_at.insert(pk.clone(), now);
+                let at = if received > was_received {
+                    dm.state
+                        .correspondences
+                        .get(&pk)
+                        .and_then(last_sent_at)
+                        .unwrap_or(now)
+                } else {
+                    now
+                };
+                dm.active_at.insert(pk.clone(), at);
             }
             if received > was_received
                 && !dm.viewing(&DmItemKey::new(DmItemKind::Conversation, &pk))
@@ -898,7 +959,13 @@ impl GuiState {
         if dm.accepting_from(&from) {
             return false;
         }
-        let opens_conversation = !dm.state.correspondences.contains_key(&from);
+        // A first contact already sent to them may be what opens the
+        // conversation instead.
+        let opens_conversation = !dm.state.correspondences.contains_key(&from)
+            && !dm
+                .composed
+                .get(&from)
+                .is_some_and(|ms| ms.iter().any(|m| m.first_contact));
         let token = dm.state.next_token();
         dm.pending.push(RunnerCommand::Accept {
             token,
@@ -1134,6 +1201,7 @@ impl GuiState {
                         outgoing: true,
                         body: m.body.clone(),
                         status: Some(DmMessageStatus::Refused),
+                        at_ms: Some(m.composed_at_ms),
                     })
                     .collect()
             };
@@ -1161,6 +1229,7 @@ impl GuiState {
             outgoing: true,
             body: m.body.clone(),
             status: Some(composed_status(m, delivered)),
+            at_ms: Some(m.composed_at_ms),
         };
         let mut rows = Vec::new();
         let mut next = composed.iter().peekable();
@@ -1175,10 +1244,13 @@ impl GuiState {
                 rows.push(composed_row(m));
             }
             rows.push(match row {
-                DmThreadRow::Received { body, .. } => DmMessageRow {
+                DmThreadRow::Received {
+                    body, sent_at_ms, ..
+                } => DmMessageRow {
                     outgoing: false,
                     body: body.clone(),
                     status: None,
+                    at_ms: Some(unix_ms_i64(*sent_at_ms)),
                 },
                 DmThreadRow::Sent { seq, body } => DmMessageRow {
                     outgoing: true,
@@ -1188,6 +1260,7 @@ impl GuiState {
                     } else {
                         DmMessageStatus::Sent
                     }),
+                    at_ms: None,
                 },
             });
             foreign += 1;
@@ -1454,6 +1527,7 @@ mod tests {
             from: peer,
             seq: 0,
             body: b"hi, it's cora".to_vec(),
+            sent_at: 1,
             received_at: 1,
         });
         st.on_dm_event(&RunnerEvent::Sent {
@@ -1482,6 +1556,78 @@ mod tests {
         });
         let thread = st.dm_thread_view().expect("the conversation is selected");
         assert_eq!(thread.rows[1].status, Some(DmMessageStatus::Delivered));
+    }
+
+    /// A received message's age, in its thread and on its conversation's rail
+    /// row, is read from the correspondent's send time, not from when it
+    /// arrived; a message composed here is aged from its composition, and a
+    /// contact request from its arrival.
+    #[test]
+    fn a_received_message_is_aged_by_its_senders_time() {
+        let (mut st, peer) = with_conversation(4);
+        st.select_dm_item(&conversation(4));
+        let now = now_unix_ms();
+        let sent_at = now - 3 * 3_600_000;
+        st.on_dm_event(&RunnerEvent::Message {
+            from: peer,
+            seq: 0,
+            body: b"from three hours ago".to_vec(),
+            sent_at: u64::try_from(sent_at).expect("a positive time"),
+            received_at: u64::try_from(now).expect("a positive time"),
+        });
+
+        let thread = st.dm_thread_view().expect("the conversation is selected");
+        assert_eq!(thread.rows.len(), 1);
+        assert_eq!(thread.rows[0].at_ms, Some(sent_at));
+        assert_eq!(dm_age_text(thread.rows[0].at_ms.unwrap(), now), "3h");
+        let rail = st.dm_rail_rows(now);
+        assert_eq!(rail.len(), 1);
+        assert_eq!(rail[0].key, conversation(4));
+        assert_eq!(
+            rail[0].age, "3h",
+            "the rail did not age it from the sender's time"
+        );
+
+        // A message composed here is aged from when it was composed.
+        let before = now_unix_ms();
+        assert!(st.send_dm("mine"), "the send was not queued");
+        let after = now_unix_ms();
+        let thread = st.dm_thread_view().expect("the conversation is selected");
+        let mine = thread.rows[1].at_ms.expect("a composed row has a time");
+        assert!(thread.rows[1].outgoing);
+        assert!((before..=after).contains(&mine));
+
+        // A contact request, which carries no message, keeps its arrival age.
+        st.on_dm_event(&RunnerEvent::ContactRequest {
+            request: request_id(1),
+            from: pk(5),
+        });
+        let rail = st.dm_rail_rows(now_unix_ms());
+        let request_row = rail
+            .iter()
+            .find(|row| row.key == request(5))
+            .expect("the request is listed");
+        assert_eq!(request_row.age, "now");
+    }
+
+    /// A send time ahead of the arrival, from a correspondent whose clock runs
+    /// fast, is held at the arrival rather than shown in the future.
+    #[test]
+    fn a_send_time_in_the_future_is_held_at_the_arrival() {
+        let (mut st, peer) = with_conversation(4);
+        st.select_dm_item(&conversation(4));
+        let now = now_unix_ms();
+        let received_at = now - 2 * 3_600_000;
+        st.on_dm_event(&RunnerEvent::Message {
+            from: peer,
+            seq: 0,
+            body: b"from tomorrow".to_vec(),
+            sent_at: u64::try_from(now + 86_400_000).expect("a positive time"),
+            received_at: u64::try_from(received_at).expect("a positive time"),
+        });
+        let thread = st.dm_thread_view().expect("the conversation is selected");
+        assert_eq!(thread.rows[0].at_ms, Some(received_at));
+        assert_eq!(st.dm_rail_rows(now)[0].age, "2h");
     }
 
     /// The request 3 sent, selected and accepted; the Accept's token.
@@ -1515,6 +1661,7 @@ mod tests {
             from: peer,
             seq: 0,
             body: b"hi, it's cora".to_vec(),
+            sent_at: 1,
             received_at: 1,
         });
         let rows = st.dm_rail_rows(now_unix_ms());
@@ -1597,6 +1744,104 @@ mod tests {
         let thread = st.dm_thread_view().expect("the conversation is selected");
         let statuses: Vec<_> = thread.rows.iter().map(|row| row.status).collect();
         assert_eq!(statuses, [Some(DmMessageStatus::Refused)]);
+    }
+
+    /// Our first contact crosses their request: the acceptance is refused and
+    /// the conversation our first contact opened is listed and delivered. The
+    /// reply was never written, so it stays not sent.
+    #[test]
+    fn a_crossing_first_contact_does_not_make_a_refused_reply_sent() {
+        let mut st = GuiState::lobby_only();
+        st.start_dm_with(pk(3));
+        assert!(st.send_dm("hi cora"));
+        let [RunnerCommand::FirstContact { token: first, .. }] = st.take_pending_dm()[..] else {
+            panic!("expected one first contact");
+        };
+        st.on_dm_event(&RunnerEvent::ContactRequest {
+            request: request_id(7),
+            from: pk(3),
+        });
+        assert!(st.select_dm_item(&request(3)));
+        assert!(st.accept_dm_request());
+        let [RunnerCommand::Accept { token, .. }] = st.take_pending_dm()[..] else {
+            panic!("expected one accept");
+        };
+        st.on_dm_event(&RunnerEvent::Refused {
+            token: Some(token),
+            reason: Refusal::AlreadyEstablished,
+        });
+        // The draft holding the first contact still on its way stays.
+        assert!(st.select_dm_item(&DmItemKey::new(DmItemKind::Draft, &pk(3))));
+        assert_eq!(
+            thread_rows(&st)[0],
+            ("hi cora".to_owned(), Some(DmMessageStatus::Pending))
+        );
+        let peer = label();
+        st.on_dm_event(&roster(&[(peer, 3, ConversationState::Pending)]));
+        st.on_dm_event(&RunnerEvent::Sent {
+            token: first,
+            peer,
+            seq: 0,
+        });
+        st.on_dm_event(&RunnerEvent::Delivered {
+            peer,
+            through_seq: 0,
+        });
+        assert!(st.select_dm_item(&conversation(3)));
+        assert_eq!(
+            thread_rows(&st),
+            [
+                ("hi cora".to_owned(), Some(DmMessageStatus::Delivered)),
+                (DM_ACCEPT_REPLY.to_owned(), Some(DmMessageStatus::Refused)),
+            ]
+        );
+    }
+
+    /// Messaging stops while an acceptance is on its way, leaving one item for
+    /// that person; a first message from it then opens the conversation, and
+    /// the reply that never went stays not sent.
+    #[test]
+    fn a_first_contact_after_a_stopped_acceptance_leaves_the_reply_not_sent() {
+        let (mut st, _) = accepted_request();
+        st.on_dm_stopped();
+        let rows = st.dm_rail_rows(now_unix_ms());
+        assert_eq!(rows.len(), 1, "listed twice: {rows:?}");
+        assert_eq!(rows[0].key.peer, pk(3));
+
+        assert!(st.send_dm("trying again"));
+        let [RunnerCommand::FirstContact { token, .. }] = st.take_pending_dm()[..] else {
+            panic!("expected one first contact");
+        };
+        let peer = label();
+        st.on_dm_event(&roster(&[(peer, 3, ConversationState::Pending)]));
+        st.on_dm_event(&RunnerEvent::Sent {
+            token,
+            peer,
+            seq: 0,
+        });
+        st.on_dm_event(&RunnerEvent::Delivered {
+            peer,
+            through_seq: 0,
+        });
+        assert_eq!(
+            thread_rows(&st),
+            [
+                (DM_ACCEPT_REPLY.to_owned(), Some(DmMessageStatus::Refused)),
+                ("trying again".to_owned(), Some(DmMessageStatus::Delivered)),
+            ]
+        );
+    }
+
+    /// A roster that lists the conversation while the acceptance is still
+    /// unanswered does not make its reply sent: only the runner's answer does.
+    #[test]
+    fn a_listed_conversation_leaves_an_unanswered_reply_sending() {
+        let (mut st, _) = accepted_request();
+        st.on_dm_event(&roster(&[(label(), 3, ConversationState::Pending)]));
+        assert_eq!(
+            thread_rows(&st),
+            [(DM_ACCEPT_REPLY.to_owned(), Some(DmMessageStatus::Pending))]
+        );
     }
 
     /// Messaging stopping with an acceptance on its way counts its reply among
@@ -1739,6 +1984,7 @@ mod tests {
                 from: peer,
                 seq: 0,
                 body: b"hi".to_vec(),
+                sent_at: 1,
                 received_at: 1,
             },
             RunnerEvent::Sent {
@@ -1793,6 +2039,7 @@ mod tests {
             from: peer,
             seq: 0,
             body: b"incoming secret words".to_vec(),
+            sent_at: 1,
             received_at: 1,
         });
         st.select_dm_item(&conversation(3));
@@ -1904,6 +2151,7 @@ mod tests {
             from: peer,
             seq,
             body: b"x".to_vec(),
+            sent_at: 1,
             received_at: 1,
         };
         assert!(!st.rail_section_unread(RailSection::DirectMessages));
@@ -1950,6 +2198,41 @@ mod tests {
         assert_eq!(dm_age_text(now - 125_000, now), "2m");
         assert_eq!(dm_age_text(now - 3_600_000, now), "1h");
         assert_eq!(dm_age_text(now - 3 * 86_400_000, now), "3d");
+    }
+
+    /// Past thirty days an age is the date it was sent, so a sender's clock
+    /// near the epoch reads as a date rather than tens of thousands of days.
+    #[test]
+    fn an_age_past_thirty_days_is_a_date() {
+        let now: i64 = 1_789_000_000_000; // 2026-09-10 UTC
+        assert_eq!(dm_age_text(now - 30 * 86_400_000, now), "30d");
+        assert_eq!(dm_age_text(now - 31 * 86_400_000, now), "2026-08-10");
+        assert_eq!(dm_age_text(1_000, now), "1970-01-01");
+        assert_eq!(dm_age_text(0, now), "1970-01-01");
+    }
+
+    /// A message this side sent that this session did not compose has no known
+    /// time, so it carries no age, while a received one does.
+    #[test]
+    fn a_sent_message_not_composed_here_has_no_age() {
+        let (mut st, peer) = with_conversation(4);
+        st.select_dm_item(&conversation(4));
+        st.on_dm_event(&RunnerEvent::Sent {
+            token: CommandToken(999),
+            peer,
+            seq: 0,
+        });
+        st.on_dm_event(&RunnerEvent::Message {
+            from: peer,
+            seq: 0,
+            body: b"hello".to_vec(),
+            sent_at: 1_000,
+            received_at: 2_000,
+        });
+        let thread = st.dm_thread_view().expect("the conversation is selected");
+        let times: Vec<(bool, Option<i64>)> =
+            thread.rows.iter().map(|r| (r.outgoing, r.at_ms)).collect();
+        assert_eq!(times, [(true, None), (false, Some(1_000))]);
     }
 
     /// The token and body of the one command `st` queued.
@@ -2069,6 +2352,7 @@ mod tests {
             from: peer,
             seq: 0,
             body: b"x".to_vec(),
+            sent_at: 1,
             received_at: 1,
         });
         assert!(
@@ -2125,6 +2409,7 @@ mod tests {
             from: peer,
             seq: 0,
             body: b"b".to_vec(),
+            sent_at: 1,
             received_at: 1,
         });
         assert!(st.send_dm("c"));

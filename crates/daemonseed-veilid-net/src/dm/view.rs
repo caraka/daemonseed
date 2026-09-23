@@ -107,6 +107,12 @@ pub enum DmThreadRow {
         seq: u64,
         /// The message body.
         body: String,
+        /// When the correspondent sent it, by the correspondent's clock, in
+        /// Unix milliseconds — the time a person reads a message's age from.
+        /// A clock ahead of this side's is held at [`Self::Received`]'s
+        /// `received_at_ms`: a message is never shown as sent after it
+        /// arrived.
+        sent_at_ms: u64,
         /// When this side collected it, in Unix milliseconds.
         received_at_ms: u64,
     },
@@ -138,10 +144,12 @@ impl std::fmt::Debug for DmThreadRow {
             Self::Received {
                 seq,
                 body,
+                sent_at_ms,
                 received_at_ms,
             } => write!(
                 f,
-                "Received {{ seq: {seq}, body_len: {}, received_at_ms: {received_at_ms} }}",
+                "Received {{ seq: {seq}, body_len: {}, sent_at_ms: {sent_at_ms}, \
+                 received_at_ms: {received_at_ms} }}",
                 body.len()
             ),
             Self::Sent { seq, body } => write!(
@@ -573,11 +581,13 @@ impl DmState {
                 from,
                 seq,
                 body,
+                sent_at,
                 received_at,
             } => {
                 let row = DmThreadRow::Received {
                     seq: *seq,
                     body: String::from_utf8_lossy(body).into_owned(),
+                    sent_at_ms: (*sent_at).min(*received_at),
                     received_at_ms: *received_at,
                 };
                 match self.labels.get(from).cloned() {
@@ -614,15 +624,18 @@ impl DmState {
                         peer: identity,
                         body,
                     }) => (Some(identity), Some(body)),
-                    // Only the request accepted is answered: a start-over the
-                    // same identity sent meanwhile replaced its id and still
-                    // waits for its own answer.
+                    // The request accepted is answered, and so is a plain
+                    // request the same identity sent again meanwhile. A
+                    // start-over sent meanwhile replaced its id and still waits
+                    // for its own answer.
                     Some(DmOutstanding::Accept {
                         request,
                         from,
                         reply,
                     }) => {
-                        self.requests.retain(|held| held.request != request);
+                        self.requests.retain(|held| {
+                            held.request != request && (held.started_over || held.from != from)
+                        });
                         (Some(from), Some(reply))
                     }
                     None => (self.labels.get(peer).cloned(), None),
@@ -752,6 +765,73 @@ mod tests {
         }])
     }
 
+    /// An acceptance of `request` from `from` recorded as sent, the way a front
+    /// end records one; its token.
+    fn accept(dm: &mut DmState, request: ContactRequestId, from: &IdentityPk) -> CommandToken {
+        let token = dm.next_token();
+        dm.outstanding.insert(
+            token,
+            DmOutstanding::Accept {
+                request,
+                from: from.clone(),
+                reply: "message accepted".to_owned(),
+            },
+        );
+        token
+    }
+
+    /// An accepted request's `Sent` answers it and a plain request the same
+    /// identity sent again meanwhile, and leaves a start-over sent meanwhile
+    /// listed for its own answer.
+    #[test]
+    fn an_answered_acceptance_leaves_only_a_start_over_listed() {
+        for (again, listed) in [
+            (
+                RunnerEvent::ContactRequest {
+                    request: ContactRequestId::for_test(1, 9),
+                    from: pk(3),
+                },
+                false,
+            ),
+            (
+                RunnerEvent::StartedOver {
+                    request: ContactRequestId::for_test(1, 9),
+                    from: pk(3),
+                },
+                true,
+            ),
+        ] {
+            let mut dm = DmState::default();
+            dm.fold(
+                &RunnerEvent::ContactRequest {
+                    request: ContactRequestId::for_test(1, 7),
+                    from: pk(3),
+                },
+                0,
+            );
+            let token = accept(&mut dm, ContactRequestId::for_test(1, 7), &pk(3));
+            dm.fold(&again, 0);
+            assert_eq!(dm.requests.len(), 1, "control: one row per identity");
+            assert_eq!(dm.requests[0].request, ContactRequestId::for_test(1, 9));
+            dm.fold(
+                &RunnerEvent::Sent {
+                    token,
+                    peer: label(),
+                    seq: 0,
+                },
+                0,
+            );
+            assert_eq!(
+                dm.requests
+                    .iter()
+                    .map(|r| r.started_over)
+                    .collect::<Vec<_>>(),
+                if listed { vec![true] } else { vec![] },
+                "after {again:?}"
+            );
+        }
+    }
+
     /// The token a first contact carries.
     fn token_of(command: &Result<RunnerCommand, FirstContactBlocked>) -> CommandToken {
         match command {
@@ -876,6 +956,40 @@ mod tests {
         );
     }
 
+    /// A received row keeps the correspondent's send time, and a send time
+    /// ahead of the arrival is held at the arrival.
+    #[test]
+    fn a_received_row_carries_the_senders_time() {
+        let mut dm = DmState::default();
+        let from = label();
+        dm.fold(&roster(from, &pk(1)), 0);
+        for (seq, sent_at) in [(0, 1_000), (1, 9_000)] {
+            dm.fold(
+                &RunnerEvent::Message {
+                    from,
+                    seq,
+                    body: b"hi".to_vec(),
+                    sent_at,
+                    received_at: 5_000,
+                },
+                0,
+            );
+        }
+        let times: Vec<(u64, u64)> = dm.correspondences[&pk(1)]
+            .thread
+            .iter()
+            .map(|row| match row {
+                DmThreadRow::Received {
+                    sent_at_ms,
+                    received_at_ms,
+                    ..
+                } => (*sent_at_ms, *received_at_ms),
+                DmThreadRow::Sent { .. } => panic!("no row was sent"),
+            })
+            .collect();
+        assert_eq!(times, vec![(1_000, 5_000), (5_000, 5_000)]);
+    }
+
     #[test]
     fn newest_first_puts_the_latest_activity_first() {
         let mut dm = DmState::default();
@@ -903,6 +1017,7 @@ mod tests {
                 from: older,
                 seq: 0,
                 body: b"back".to_vec(),
+                sent_at: 5,
                 received_at: 5,
             },
             0,

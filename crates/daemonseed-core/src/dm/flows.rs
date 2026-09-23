@@ -272,6 +272,12 @@ pub enum FlowError {
     /// [`first_contact`] to a marked identity, [`resume_first_contact`] and
     /// [`refresh_first_contact`] refuse it.
     DeletePending,
+    /// A body longer than [`channel::MESSAGE_BODY_MAX_LEN`], refused before it
+    /// is sealed, so nothing is persisted or written for it.
+    BodyTooLong {
+        /// The body's length in bytes.
+        len: usize,
+    },
 }
 
 impl core::fmt::Display for FlowError {
@@ -305,6 +311,11 @@ impl core::fmt::Display for FlowError {
             Self::Incomplete(what) => write!(f, "the conversation record holds no {what}"),
             Self::HelloLength(n) => write!(f, "a hello sealed to {n} bytes"),
             Self::DeletePending => f.write_str("a delete of this conversation is under way"),
+            Self::BodyTooLong { len } => write!(
+                f,
+                "a {len}-byte body is longer than the {} bytes a message holds",
+                channel::MESSAGE_BODY_MAX_LEN
+            ),
         }
     }
 }
@@ -419,6 +430,7 @@ pub fn first_contact<R: Records>(
         // The record already holds sequence 0, so `body` is not sealed again.
         return continue_first_contact(store, records, &peer, fill);
     }
+    fits_a_message(body)?;
 
     // 1. The advert, verified under the identity the caller named.
     let advert_owner = advert::derive_owner_seed(peer_identity_pk)?;
@@ -456,9 +468,7 @@ pub fn first_contact<R: Records>(
     let mut conversation = opened.conversation;
     let mut ring = Ring::new();
     let seq = ring.reserve()?;
-    let (header, sealed) = conversation.seal(body, channel::DEVICE_ID_SINGLE_DEVICE, &mut fill)?;
-    let mut slot_bytes = header.encode();
-    slot_bytes.extend_from_slice(&sealed);
+    let slot_bytes = seal_slot(&mut conversation, body, now, &mut fill)?;
     store.persist_outbox(&peer, seq, &slot_bytes, now)?;
 
     store.create_conv(
@@ -1210,8 +1220,8 @@ pub struct Accepted {
     pub peer: CorrespondenceLabel,
     /// The lookup key of the channel this side writes.
     pub outgoing_lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
-    /// The bodies read from the correspondent's ring.
-    pub bodies: Vec<Vec<u8>>,
+    /// The messages read from the correspondent's ring, in sequence order.
+    pub messages: Vec<ReceivedMessage>,
     /// The drop slot the hello back landed in.
     pub hello_slot: u16,
     /// How many times that hello re-picked its slot.
@@ -1280,6 +1290,7 @@ pub fn accept<R: Records>(
         );
     }
 
+    fits_a_message(reply)?;
     let channel_owner =
         channel::derive_owner_seed(me.channel_root, &request.identity, FIRST_GENERATION)?;
     let outgoing_lookup_key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
@@ -1290,9 +1301,7 @@ pub fn accept<R: Records>(
     let mut conversation = chain::accept(&request.shared_secret, &request.first_ratchet_pk)?;
     let mut ring = Ring::new();
     let seq = ring.reserve()?;
-    let (header, sealed) = conversation.seal(reply, channel::DEVICE_ID_SINGLE_DEVICE, &mut fill)?;
-    let mut slot_bytes = header.encode();
-    slot_bytes.extend_from_slice(&sealed);
+    let slot_bytes = seal_slot(&mut conversation, reply, now, &mut fill)?;
     store.persist_outbox(&peer, seq, &slot_bytes, now)?;
 
     store.create_conv(
@@ -1611,7 +1620,7 @@ fn finish_accept<R: Records>(
     Ok(Accepted {
         peer,
         outgoing_lookup_key,
-        bodies: read.bodies,
+        messages: read.messages,
         hello_slot,
         repicks,
     })
@@ -1627,8 +1636,8 @@ pub struct Acceptance {
     /// The correspondent's published cursor, where its control subkey carried
     /// one.
     pub peer_cursor: Option<u64>,
-    /// Any reply already in the correspondent's ring.
-    pub bodies: Vec<Vec<u8>>,
+    /// Any reply already in the correspondent's ring, in sequence order.
+    pub messages: Vec<ReceivedMessage>,
 }
 
 /// Complete this side's own first contact — § Flows, *A hello from a known
@@ -1693,13 +1702,33 @@ pub fn recognise_acceptance<R: Records>(
         peer: *peer,
         lookup_key: *lookup_key,
         peer_cursor: cursor,
-        bodies: read.bodies,
+        messages: read.messages,
     })
+}
+
+/// One message read from a correspondent's ring: its body and the time its
+/// sender sealed it, by the sender's clock, in Unix milliseconds.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReceivedMessage {
+    /// When the sender sealed it, in Unix milliseconds.
+    pub sent_at_ms: u64,
+    /// The opened body.
+    pub body: Vec<u8>,
+}
+
+impl core::fmt::Debug for ReceivedMessage {
+    /// The body is plaintext a person wrote: its length only.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReceivedMessage")
+            .field("sent_at_ms", &self.sent_at_ms)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// What one pass over a correspondent's ring read.
 struct RingRead {
-    bodies: Vec<Vec<u8>>,
+    messages: Vec<ReceivedMessage>,
     collected: u64,
 }
 
@@ -1712,7 +1741,7 @@ fn read_ring<R: Records>(
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     from: u64,
 ) -> Result<RingRead, FlowError> {
-    let mut bodies = Vec::new();
+    let mut messages = Vec::new();
     let mut collected = from;
     loop {
         let Some(raw) = records.read_channel(lookup_key, channel::slot_for(collected))? else {
@@ -1724,12 +1753,54 @@ fn read_ring<R: Records>(
         if header.seq != collected {
             break;
         }
-        let body = conversation.open(&header, sealed)?;
+        let plaintext = Zeroizing::new(conversation.open(&header, sealed)?);
+        let (sent_at, body) = channel::decode_message_plaintext(&plaintext)?;
         ring.advance_peer_collected(header.cursor);
-        bodies.push(body);
+        messages.push(ReceivedMessage {
+            sent_at_ms: sent_at,
+            body: body.to_vec(),
+        });
         collected += 1;
     }
-    Ok(RingRead { bodies, collected })
+    Ok(RingRead {
+        messages,
+        collected,
+    })
+}
+
+/// Refuse a body longer than [`channel::MESSAGE_BODY_MAX_LEN`] with
+/// [`FlowError::BodyTooLong`]. A fresh first contact and a fresh acceptance
+/// check on entry, before any read or record, and [`seal_slot`] checks again.
+fn fits_a_message(body: &[u8]) -> Result<(), FlowError> {
+    if body.len() > channel::MESSAGE_BODY_MAX_LEN {
+        return Err(FlowError::BodyTooLong { len: body.len() });
+    }
+    Ok(())
+}
+
+/// Seal `body` as the next message of `conversation` and return the slot's
+/// bytes, `header ‖ AEAD_{mk}(plaintext)`, where the plaintext carries the
+/// sender's time `now` (Unix seconds) in milliseconds ahead of the body
+/// ([`channel::encode_message_plaintext`]).
+///
+/// A body longer than [`channel::MESSAGE_BODY_MAX_LEN`] is
+/// [`FlowError::BodyTooLong`], refused before the key schedule moves: every
+/// flow seals before it persists or writes anything the body enables.
+fn seal_slot(
+    conversation: &mut Conversation,
+    body: &[u8],
+    now: u64,
+    fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+) -> Result<Vec<u8>, FlowError> {
+    fits_a_message(body)?;
+    let plaintext = Zeroizing::new(channel::encode_message_plaintext(
+        now.saturating_mul(1000),
+        body,
+    ));
+    let (header, sealed) = conversation.seal(&plaintext, channel::DEVICE_ID_SINGLE_DEVICE, fill)?;
+    let mut slot_bytes = header.encode();
+    slot_bytes.extend_from_slice(&sealed);
+    Ok(slot_bytes)
 }
 
 /// Reset every conversation — § Keys and forward secrecy, *Reset,
@@ -1856,9 +1927,7 @@ pub fn send_message<R: Records>(
     let mut conversation = Conversation::restore(state.conversation);
     let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
     let seq = ring.reserve()?;
-    let (header, sealed) = conversation.seal(body, channel::DEVICE_ID_SINGLE_DEVICE, fill)?;
-    let mut slot_bytes = header.encode();
-    slot_bytes.extend_from_slice(&sealed);
+    let slot_bytes = seal_slot(&mut conversation, body, now, fill)?;
     store.persist_outbox(peer, seq, &slot_bytes, now)?;
     #[cfg(test)]
     if let Some(hook) = BETWEEN_SEND_LOAD_AND_WRITE.with(|hook| hook.borrow_mut().take()) {
@@ -1877,8 +1946,8 @@ pub fn send_message<R: Records>(
 /// What one collection batch read and published.
 #[derive(Debug)]
 pub struct Batch {
-    /// The bodies read, in sequence order.
-    pub bodies: Vec<Vec<u8>>,
+    /// The messages read, in sequence order.
+    pub messages: Vec<ReceivedMessage>,
     /// This side's cursor after the batch.
     pub my_collected: u64,
     /// Whether the cursor was published to this side's control subkey.
@@ -1939,7 +2008,7 @@ pub fn collect_batch<R: Records>(
 
     if read.collected <= state.cursor_published {
         return Ok(Batch {
-            bodies: read.bodies,
+            messages: read.messages,
             my_collected: read.collected,
             cursor_published: false,
         });
@@ -1965,7 +2034,7 @@ pub fn collect_batch<R: Records>(
         state.cursor_published = read.collected;
     })?;
     Ok(Batch {
-        bodies: read.bodies,
+        messages: read.messages,
         my_collected: read.collected,
         cursor_published: true,
     })
@@ -2409,6 +2478,37 @@ mod tests {
         }
     }
 
+    /// The bodies and the sender times a flow read, each in sequence order.
+    trait ReadMessages {
+        fn messages(&self) -> &[ReceivedMessage];
+
+        fn bodies(&self) -> Vec<Vec<u8>> {
+            self.messages().iter().map(|m| m.body.clone()).collect()
+        }
+
+        fn sent_times(&self) -> Vec<u64> {
+            self.messages().iter().map(|m| m.sent_at_ms).collect()
+        }
+    }
+
+    impl ReadMessages for Accepted {
+        fn messages(&self) -> &[ReceivedMessage] {
+            &self.messages
+        }
+    }
+
+    impl ReadMessages for Acceptance {
+        fn messages(&self) -> &[ReceivedMessage] {
+            &self.messages
+        }
+    }
+
+    impl ReadMessages for Batch {
+        fn messages(&self) -> &[ReceivedMessage] {
+            &self.messages
+        }
+    }
+
     /// Both parties, their adverts published, and the network between them.
     fn scene() -> (Party, Party, Net) {
         let a = Party::new(0xa1);
@@ -2628,7 +2728,7 @@ mod tests {
         )
         .expect("B accepts");
 
-        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
+        assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
         assert_eq!(accepted.repicks, 0);
         assert!(net.writes.bytes > 0, "the writes carried bytes");
         assert!(
@@ -2719,7 +2819,7 @@ mod tests {
         let store_a = a.store();
         let batch = collect_batch(&store_a, &mut net, &peer_a).expect("A collects a batch");
 
-        assert!(!batch.bodies.is_empty(), "the batch read something");
+        assert!(!batch.bodies().is_empty(), "the batch read something");
         assert!(batch.cursor_published, "the cursor was published");
         assert!(net.writes.bytes > 0, "the write carried bytes");
         assert_eq!(
@@ -2731,7 +2831,7 @@ mod tests {
 
         net.reset_writes();
         let batch = collect_batch(&store_a, &mut net, &peer_a).expect("A collects an empty batch");
-        assert!(batch.bodies.is_empty());
+        assert!(batch.bodies().is_empty());
         assert!(!batch.cursor_published);
         assert_eq!(net.writes.total(), 0, "an empty batch writes nothing");
     }
@@ -2768,7 +2868,7 @@ mod tests {
         net.fail_after = None;
         net.reset_writes();
         let batch = collect_batch(&store_a, &mut net, &peer_a).expect("A collects");
-        assert!(batch.bodies.is_empty(), "nothing new was read");
+        assert!(batch.bodies().is_empty(), "nothing new was read");
         assert!(batch.cursor_published, "the owed cursor was published");
         assert_eq!(net.writes.control, 1);
         assert_eq!(
@@ -2973,6 +3073,346 @@ mod tests {
     fn opens(reader: &mut Conversation, bytes: &[u8]) -> bool {
         let (header, sealed) = channel::MessageHeader::decode(bytes).expect("a message header");
         reader.open(&header, sealed).is_ok()
+    }
+
+    /// Three sender times, distinct from each other and from `NOW`, so a
+    /// message read back with another step's time is visible.
+    const T_FIRST: u64 = NOW + 11;
+    const T_REPLY: u64 = NOW + 222;
+    const T_LATER: u64 = NOW + 3_333;
+
+    /// A's first message, B's acceptance reply and A's later message, each
+    /// written at its own time; returns B's acceptance, A's recognition of it
+    /// and B's batch over the later message.
+    fn timed_conversation(
+        a: &Party,
+        b: &Party,
+        net: &mut Net,
+    ) -> (CorrespondenceLabel, Accepted, Acceptance, Batch) {
+        let mut entropy = Seeded::at(4_242);
+        let outcome = first_contact(
+            &a.store(),
+            net,
+            &a.me(),
+            b.pk(),
+            b"the first message",
+            |x| entropy.fill(x),
+            T_FIRST,
+        )
+        .expect("A's first contact");
+        let peer_a = opened_peer(&outcome);
+        let request = only_request(b_collects(b, net));
+        let mut entropy = Seeded::at(909);
+        let accepted = accept(
+            &b.store(),
+            net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            T_REPLY,
+        )
+        .expect("B accepts");
+        let surfaced =
+            collect(&a.store(), net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        assert_eq!(surfaced.len(), 1, "one acceptance, one surfaced result");
+        let acceptance = match surfaced.into_iter().next() {
+            Some(Surfaced::Accepted(acceptance)) => acceptance,
+            other => panic!("expected the acceptance, got {other:?}"),
+        };
+        let mut entropy = Seeded::at(31);
+        send_message(
+            &a.store(),
+            net,
+            &peer_a,
+            b"later",
+            |x| entropy.fill(x),
+            T_LATER,
+        )
+        .expect("A sends");
+        let batch = collect_batch(&b.store(), net, &accepted.peer).expect("B collects a batch");
+        (peer_a, accepted, acceptance, batch)
+    }
+
+    /// The recipient of every kind of message — a first message, an
+    /// acceptance reply, a later message — reads exactly the time its sender
+    /// wrote it, in Unix milliseconds.
+    #[test]
+    fn every_message_read_carries_its_senders_time() {
+        let (a, b, mut net) = scene();
+        let (_, accepted, acceptance, batch) = timed_conversation(&a, &b, &mut net);
+
+        assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
+        assert_eq!(accepted.sent_times(), vec![T_FIRST * 1000]);
+        assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
+        assert_eq!(acceptance.sent_times(), vec![T_REPLY * 1000]);
+        assert_eq!(batch.bodies(), vec![b"later".to_vec()]);
+        assert_eq!(batch.sent_times(), vec![T_LATER * 1000]);
+    }
+
+    /// The sender's time is sealed: no channel or drop record holds it in any
+    /// fixed-width encoding, in milliseconds or in seconds.
+    #[test]
+    fn no_record_carries_a_senders_time_in_the_clear() {
+        let (a, b, mut net) = scene();
+        let (_, _, _, batch) = timed_conversation(&a, &b, &mut net);
+        assert_eq!(
+            batch.sent_times(),
+            vec![T_LATER * 1000],
+            "the times were written"
+        );
+
+        let records: Vec<&Vec<u8>> = net.channels.values().chain(net.drops.values()).collect();
+        let message_slots = net
+            .channels
+            .iter()
+            .filter(|((_, subkey), _)| *subkey != channel::CONTROL_SUBKEY)
+            .count();
+        assert_eq!(message_slots, 3, "the scan covers every message slot");
+        for t in [T_FIRST, T_REPLY, T_LATER] {
+            let needles = [
+                (t * 1000).to_be_bytes(),
+                (t * 1000).to_le_bytes(),
+                t.to_be_bytes(),
+                t.to_le_bytes(),
+            ];
+            // Control: the needle is exactly what the sealed plaintext holds.
+            let plaintext = channel::encode_message_plaintext(t * 1000, b"x");
+            assert!(plaintext.windows(8).any(|w| w == needles[0]));
+            for needle in needles {
+                for record in &records {
+                    assert!(
+                        !record.windows(8).any(|w| w == needle),
+                        "a record carries a sender's time in the clear"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A message whose plaintext does not carry the sender's time — sealed
+    /// without the prefix — is refused, not read as a body; the same message
+    /// sealed with it is read.
+    #[test]
+    fn a_message_without_the_time_prefix_is_refused() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let state = load(&b.store(), &accepted.peer).expect("B's record");
+        let slot = channel::slot_for(state.send_seq);
+
+        let mut unframed = Conversation::restore(
+            load(&b.store(), &accepted.peer)
+                .expect("B's record")
+                .conversation,
+        );
+        let mut entropy = Seeded::at(77);
+        let (header, sealed) = unframed
+            .seal(b"unframed", channel::DEVICE_ID_SINGLE_DEVICE, |x| {
+                entropy.fill(x)
+            })
+            .expect("seal without the prefix");
+        let mut bytes = header.encode();
+        bytes.extend_from_slice(&sealed);
+        net.write_channel(&state.outgoing_lookup_key, slot, &bytes)
+            .expect("write the slot");
+        let refused = collect_batch(&a.store(), &mut net, &peer_a);
+        assert!(
+            matches!(
+                refused,
+                Err(FlowError::Channel(ChannelError::MessagePlaintext))
+            ),
+            "an unframed plaintext was not refused: {refused:?}"
+        );
+
+        // Control: the same position sealed with the prefix is read.
+        let mut framed = Conversation::restore(state.conversation);
+        let mut entropy = Seeded::at(77);
+        let bytes = seal_slot(&mut framed, b"framed", T_LATER, |x| entropy.fill(x))
+            .expect("seal with the prefix");
+        net.write_channel(&state.outgoing_lookup_key, slot, &bytes)
+            .expect("write the slot");
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("A reads the framed one");
+        assert_eq!(batch.bodies(), vec![b"framed".to_vec()]);
+        assert_eq!(batch.sent_times(), vec![T_LATER * 1000]);
+    }
+
+    /// Two messages in one batch, sent at different times, each keep their own
+    /// sender's time.
+    #[test]
+    fn each_message_of_a_batch_keeps_its_own_senders_time() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(31);
+        // The later stamp is sent first, so an order by time is not the order
+        // read.
+        for (body, at) in [(b"one".as_slice(), T_LATER), (b"two", T_FIRST)] {
+            send_message(
+                &b.store(),
+                &mut net,
+                &accepted.peer,
+                body,
+                |x| entropy.fill(x),
+                at,
+            )
+            .expect("B sends");
+        }
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("A collects a batch");
+        assert_eq!(
+            batch.messages,
+            vec![
+                ReceivedMessage {
+                    sent_at_ms: T_LATER * 1000,
+                    body: b"one".to_vec(),
+                },
+                ReceivedMessage {
+                    sent_at_ms: T_FIRST * 1000,
+                    body: b"two".to_vec(),
+                },
+            ]
+        );
+    }
+
+    /// A body of exactly [`channel::MESSAGE_BODY_MAX_LEN`] bytes fits its slot
+    /// and is read back; one byte more is refused before anything is persisted
+    /// or written, on a later message and on a first contact alike.
+    #[test]
+    fn a_body_one_byte_over_the_limit_is_refused_before_it_is_sealed() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(31);
+        let at_limit = vec![0x61u8; channel::MESSAGE_BODY_MAX_LEN];
+        let over = vec![0x62u8; channel::MESSAGE_BODY_MAX_LEN + 1];
+
+        let send_seq = load(&b.store(), &accepted.peer)
+            .expect("B's record")
+            .send_seq;
+        net.reset_writes();
+        let refused = send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            &over,
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(
+            matches!(refused, Err(FlowError::BodyTooLong { len }) if len == over.len()),
+            "an over-long body was not refused: {refused:?}"
+        );
+        assert_eq!(net.writes.total(), 0, "the refused send wrote");
+        assert_eq!(
+            load(&b.store(), &accepted.peer)
+                .expect("B's record")
+                .send_seq,
+            send_seq,
+            "the refused send moved the sequence"
+        );
+
+        // Control: the body at the limit is sealed, written and read whole. B
+        // reads a message of A's first, so its next message starts a turn and
+        // carries the largest header.
+        send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"your turn",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A sends");
+        collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects a batch");
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            &at_limit,
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("a body at the limit is sent");
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("A collects a batch");
+        assert_eq!(batch.bodies(), vec![at_limit]);
+
+        // A first contact is refused on entry, creating no record and reading
+        // no advert: the correspondent publishes none, so a check made any
+        // later reports NoAdvert instead.
+        let c = Party::new(0xc3);
+        net.reset_writes();
+        let shapes = net.shapes.len();
+        let refused = first_contact(
+            &a.store(),
+            &mut net,
+            &a.me(),
+            c.pk(),
+            &over,
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(
+            matches!(refused, Err(FlowError::BodyTooLong { len }) if len == over.len()),
+            "an over-long first message was not refused: {refused:?}"
+        );
+        assert_eq!(net.writes.total(), 0, "the refused first contact wrote");
+        assert_eq!(
+            net.shapes.len(),
+            shapes,
+            "the refused first contact addressed a record"
+        );
+        assert_eq!(
+            a.store().load().expect("A's store").convs.len(),
+            1,
+            "the refused first contact created a record"
+        );
+    }
+
+    /// An acceptance whose reply is one byte over the limit is refused on
+    /// entry: no write, no channel named, no conversation record, and the same
+    /// request is accepted afterwards with a reply that fits.
+    #[test]
+    fn an_acceptance_with_an_over_long_reply_is_refused_before_anything_is_done() {
+        let (a, b, mut net) = scene();
+        a_opens(&a, &b, &mut net, b"the first message");
+        let request = only_request(b_collects(&b, &mut net));
+        let over = vec![0x62u8; channel::MESSAGE_BODY_MAX_LEN + 1];
+        let mut entropy = Seeded::at(909);
+        net.reset_writes();
+        let shapes = net.shapes.len();
+        let refused = accept(
+            &b.store(),
+            &mut net,
+            &b.me(),
+            &request,
+            &over,
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(
+            matches!(refused, Err(FlowError::BodyTooLong { len }) if len == over.len()),
+            "an over-long reply was not refused: {refused:?}"
+        );
+        assert_eq!(net.writes.total(), 0, "the refused acceptance wrote");
+        assert_eq!(
+            net.shapes.len(),
+            shapes,
+            "the refused acceptance addressed a record"
+        );
+        assert!(
+            b.store().load().expect("B's store").convs.is_empty(),
+            "the refused acceptance created a record"
+        );
+
+        // Control: the same request, answered with a reply that fits.
+        let accepted = accept(
+            &b.store(),
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B accepts");
+        assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
     }
 
     /// **FC5** (design § Founding claims). No record a whole conversation writes holds either identity
@@ -3576,17 +4016,17 @@ mod tests {
         // included.
         let batch = collect_batch(&b.store(), &mut net, &accepted_b.peer).expect("B collects");
         assert_eq!(
-            batch.bodies.len(),
+            batch.bodies().len(),
             4,
             "B opened {} of A's four messages",
-            batch.bodies.len()
+            batch.bodies().len()
         );
         let batch = collect_batch(&c.store(), &mut net, &c_peer).expect("C collects");
         assert_eq!(
-            batch.bodies.len(),
+            batch.bodies().len(),
             3,
             "C opened {} of A's three messages",
-            batch.bodies.len()
+            batch.bodies().len()
         );
     }
 
@@ -3701,7 +4141,7 @@ mod tests {
             net.before_message_read.is_none(),
             "the reset did not run inside the batch"
         );
-        assert_eq!(batch.bodies.len(), 1, "A read B's message");
+        assert_eq!(batch.bodies().len(), 1, "A read B's message");
         assert!(
             flagged(&a, &peer_a),
             "the batch's write erased the flag the reset stored"
@@ -3747,7 +4187,7 @@ mod tests {
             net.before_message_read.is_none(),
             "the reset did not run inside the acceptance"
         );
-        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
+        assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
         assert!(
             flagged(&b, &accepted.peer),
             "the acceptance's write erased the flag the reset stored"
@@ -3774,7 +4214,7 @@ mod tests {
         );
         match surfaced.as_slice() {
             [Surfaced::Accepted(acceptance)] => {
-                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+                assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
             }
             other => panic!("expected one acceptance, got {other:?}"),
         }
@@ -3960,13 +4400,13 @@ mod tests {
         assert_eq!(
             collect_batch(&a.store(), &mut net, &peer_a)
                 .expect("A collects")
-                .bodies,
+                .bodies(),
             vec![b"from B".to_vec()]
         );
         assert_eq!(
             collect_batch(&b.store(), &mut net, &b_peer)
                 .expect("B collects")
-                .bodies,
+                .bodies(),
             vec![b"from A".to_vec()]
         );
     }
@@ -4115,7 +4555,7 @@ mod tests {
             NOW,
         )
         .expect("A accepts the new first contact");
-        assert_eq!(accepted.bodies, vec![b"hello again".to_vec()]);
+        assert_eq!(accepted.bodies(), vec![b"hello again".to_vec()]);
         assert_eq!(
             a.store().load().expect("load").convs.len(),
             1,
@@ -4131,7 +4571,7 @@ mod tests {
         .expect("B collects");
         match surfaced.as_slice() {
             [Surfaced::Accepted(acceptance)] => {
-                assert_eq!(acceptance.bodies, vec![b"welcome back".to_vec()]);
+                assert_eq!(acceptance.bodies(), vec![b"welcome back".to_vec()]);
             }
             other => panic!("expected B's acceptance, got {other:?}"),
         }
@@ -4172,7 +4612,7 @@ mod tests {
 
         let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
         assert_eq!(
-            batch.bodies,
+            batch.bodies(),
             vec![b"one".to_vec()],
             "collection went past the missing slot"
         );
@@ -4188,7 +4628,7 @@ mod tests {
 
         net.channels.insert(gap, held);
         let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
-        assert_eq!(batch.bodies, vec![b"two".to_vec(), b"three".to_vec()]);
+        assert_eq!(batch.bodies(), vec![b"two".to_vec(), b"three".to_vec()]);
         assert_eq!(batch.my_collected, seqs[2] + 1);
         assert_eq!(
             peer_cursor(&a.store(), &mut net, &peer_a).expect("A reads B's cursor"),
@@ -4767,7 +5207,7 @@ mod tests {
             NOW,
         )
         .expect("A accepts B's new first contact");
-        assert_eq!(accepted.bodies, vec![b"starting over".to_vec()]);
+        assert_eq!(accepted.bodies(), vec![b"starting over".to_vec()]);
         let convs = a.store().load().expect("load").convs;
         assert_eq!(convs.len(), 1, "A holds one conversation with B");
         assert_eq!(convs[0].state.incoming_lookup_key, restart_key);
@@ -4829,11 +5269,8 @@ mod tests {
         net.write_channel(&restart_key, channel::CONTROL_SUBKEY, &control)
             .expect("write the control");
         let mut conversation = opened.conversation;
-        let (header, sealed) = conversation
-            .seal(body, channel::DEVICE_ID_SINGLE_DEVICE, |x| entropy.fill(x))
-            .expect("seal message 0");
-        let mut slot_bytes = header.encode();
-        slot_bytes.extend_from_slice(&sealed);
+        let slot_bytes =
+            seal_slot(&mut conversation, body, NOW, |x| entropy.fill(x)).expect("seal message 0");
         net.write_channel(&restart_key, channel::slot_for(0), &slot_bytes)
             .expect("write message 0");
         let r = drop_plane::repick(|x| entropy.fill(x)).expect("r");
@@ -5008,7 +5445,7 @@ mod tests {
         assert_eq!(
             collect_batch(&a.store(), &mut net, &peer_b)
                 .expect("a batch on an unmarked conversation")
-                .bodies,
+                .bodies(),
             vec![b"from B".to_vec()]
         );
         continue_first_contact(&a.store(), &mut net, &peer_c, |x| entropy.fill(x))
@@ -5330,7 +5767,7 @@ mod tests {
             .expect("the second slot was written");
         let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
         assert_eq!(
-            batch.bodies,
+            batch.bodies(),
             vec![b"one".to_vec()],
             "collection went past a slot that does not decode"
         );
@@ -5341,7 +5778,7 @@ mod tests {
         net.channels
             .insert((lookup_key, channel::slot_for(two)), held);
         let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
-        assert_eq!(batch.bodies, vec![b"two".to_vec()]);
+        assert_eq!(batch.bodies(), vec![b"two".to_vec()]);
 
         let three = send(&mut net, b"three");
         let four = send(&mut net, b"four");
@@ -5356,7 +5793,7 @@ mod tests {
             .expect("the third slot was written");
         let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
         assert!(
-            batch.bodies.is_empty(),
+            batch.bodies().is_empty(),
             "collection opened a slot holding another sequence"
         );
         assert_eq!(
@@ -5366,7 +5803,7 @@ mod tests {
         net.channels
             .insert((lookup_key, channel::slot_for(three)), held);
         let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
-        assert_eq!(batch.bodies, vec![b"three".to_vec(), b"four".to_vec()]);
+        assert_eq!(batch.bodies(), vec![b"three".to_vec(), b"four".to_vec()]);
         assert_eq!(batch.my_collected, four + 1);
     }
 
@@ -5724,7 +6161,7 @@ mod tests {
 
         assert_eq!(acceptance.peer, peer_a);
         assert_eq!(acceptance.lookup_key, accepted.outgoing_lookup_key);
-        assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+        assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
         assert_eq!(
             acceptance.peer_cursor,
             Some(0),
@@ -5997,10 +6434,13 @@ mod tests {
             open_against_either(&b.advert_keys, &rewrite, b.pk(), slot).expect("the rewrite opens");
         let carried = hello.original_secret.expect("a rewrite carries a secret");
         let mut reader = chain::accept(&carried, &first_ratchet_pk).expect("a conversation");
+        let plaintext = reader
+            .open(&header, sealed)
+            .expect("the carried secret opens sequence 0");
         assert_eq!(
-            reader
-                .open(&header, sealed)
-                .expect("the carried secret opens sequence 0"),
+            channel::decode_message_plaintext(&plaintext)
+                .expect("a message plaintext")
+                .1,
             b"the first message"
         );
 
@@ -6021,13 +6461,13 @@ mod tests {
             NOW,
         )
         .expect("B accepts");
-        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
+        assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
 
         let surfaced =
             collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
         match surfaced.as_slice() {
             [Surfaced::Accepted(acceptance)] => {
-                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+                assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
             }
             other => panic!("expected one acceptance, got {other:?}"),
         }
@@ -6049,7 +6489,7 @@ mod tests {
         // and replies to A's first ratchet key.
         rotate(&mut b, &mut net, at, 2_020);
         let accepted = b_accepts(&b, &mut net, b"the reply");
-        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
+        assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
         let channel_before = channel_bytes(&net, &channel);
         let record_before = record_without_hello(&a, &peer_a);
 
@@ -6077,7 +6517,7 @@ mod tests {
             collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
         match surfaced.as_slice() {
             [Surfaced::Accepted(acceptance)] => {
-                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+                assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
             }
             other => panic!("expected one acceptance, got {other:?}"),
         }
@@ -6108,7 +6548,7 @@ mod tests {
         )
         .expect("A sends");
         let batch = collect_batch(&b.store(), &mut net, &accepted.peer).expect("B collects");
-        assert_eq!(batch.bodies, vec![b"after the acceptance".to_vec()]);
+        assert_eq!(batch.bodies(), vec![b"after the acceptance".to_vec()]);
     }
 
     /// A rewritten hello is refused anywhere but the drop it was written for.
@@ -6241,13 +6681,8 @@ mod tests {
         let mut conversation = chain::initiate(channel_secret, |x| entropy.fill(x))
             .expect("initiate")
             .conversation;
-        let (header, sealed) = conversation
-            .seal(b"not from A", channel::DEVICE_ID_SINGLE_DEVICE, |x| {
-                entropy.fill(x)
-            })
+        let slot_bytes = seal_slot(&mut conversation, b"not from A", NOW, |x| entropy.fill(x))
             .expect("seal message 0");
-        let mut slot_bytes = header.encode();
-        slot_bytes.extend_from_slice(&sealed);
         net.write_channel(&channel, channel::slot_for(0), &slot_bytes)
             .expect("write message 0");
         let r = drop_plane::repick(|x| entropy.fill(x)).expect("r");
@@ -6456,7 +6891,7 @@ mod tests {
 
             let accepted = b_accepts(&b, &mut net, b"the reply");
             assert_eq!(
-                accepted.bodies,
+                accepted.bodies(),
                 vec![b"the first message".to_vec()],
                 "boundary {boundary}"
             );
@@ -6740,7 +7175,7 @@ mod tests {
 
         // The stopped run recorded nothing it read, so the finish returns the
         // correspondent's first message, and it is collected exactly once.
-        assert_eq!(accepted.bodies, vec![b"the first message".to_vec()]);
+        assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
         assert_eq!(
             store
                 .load_conv(&accepted.peer)
@@ -6852,9 +7287,9 @@ mod tests {
             NOW,
         )
         .expect("B finishes the acceptance");
-        assert_eq!(finished.bodies, vec![b"the first message".to_vec()]);
+        assert_eq!(finished.bodies(), vec![b"the first message".to_vec()]);
         let batch = collect_batch(&store_b, &mut net, &b_peer).expect("B collects a batch");
-        assert!(batch.bodies.is_empty(), "sequence 0 surfaced twice");
+        assert!(batch.bodies().is_empty(), "sequence 0 surfaced twice");
         assert!(batch.cursor_published, "B's batch published the collection");
         assert_eq!(
             peer_cursor(&a.store(), &mut net, &peer_a).expect("A reads B's cursor"),
@@ -6925,13 +7360,13 @@ mod tests {
                 continue_acceptance(&store, &mut net, &b.me(), &peer, |x| entropy.fill(x), NOW)
                     .expect("the acceptance finishes");
             assert_eq!(
-                finished.bodies,
+                finished.bodies(),
                 vec![b"the first message".to_vec()],
                 "before_mint={before_mint}"
             );
             let batch = collect_batch(&store, &mut net, &peer).expect("B collects a batch");
             assert!(
-                batch.bodies.is_empty(),
+                batch.bodies().is_empty(),
                 "before_mint={before_mint}: sequence 0 surfaced twice"
             );
         }
@@ -6978,7 +7413,7 @@ mod tests {
         let finished =
             continue_acceptance(&store, &mut net, &b.me(), &peer, |x| entropy.fill(x), NOW)
                 .expect("the acceptance finishes");
-        assert_eq!(finished.bodies, vec![b"the first message".to_vec()]);
+        assert_eq!(finished.bodies(), vec![b"the first message".to_vec()]);
         let after = store.load_conv(&peer).expect("load").expect("B's record");
         assert!(after.own_opening.is_some(), "no opening was minted");
         let hello = after
@@ -6996,7 +7431,7 @@ mod tests {
             collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
         match surfaced.as_slice() {
             [Surfaced::Accepted(acceptance)] => {
-                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+                assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
             }
             other => panic!("expected one acceptance, got {other:?}"),
         }
@@ -7098,7 +7533,7 @@ mod tests {
                 |x| entropy.fill(x),
                 NOW,
             ) {
-                Ok(accepted) => surfaced.extend(accepted.bodies),
+                Ok(accepted) => surfaced.extend(accepted.bodies()),
                 Err(FlowError::AlreadyEstablished) => {}
                 Err(other) => panic!("a retry failed: {other:?}"),
             }
@@ -7107,7 +7542,7 @@ mod tests {
         surfaced.extend(
             collect_batch(&store, &mut net, &peer)
                 .expect("B collects a batch")
-                .bodies,
+                .bodies(),
         );
         assert_eq!(
             surfaced,
@@ -7165,7 +7600,7 @@ mod tests {
                 continue_acceptance(&store, &mut net, &b.me(), &peer, |x| entropy.fill(x), NOW)
                     .expect("the relaunch finishes the acceptance");
             assert_eq!(
-                finished.bodies,
+                finished.bodies(),
                 vec![b"the first message".to_vec()],
                 "boundary {boundary}"
             );
@@ -7204,7 +7639,7 @@ mod tests {
             match surfaced.as_slice() {
                 [Surfaced::Accepted(acceptance)] => {
                     assert_eq!(
-                        acceptance.bodies,
+                        acceptance.bodies(),
                         vec![b"the reply".to_vec()],
                         "boundary {boundary}"
                     );
@@ -7268,7 +7703,7 @@ mod tests {
             );
             let accepted = b_accepts(&b, &mut net, b"the reply");
             assert_eq!(
-                accepted.bodies,
+                accepted.bodies(),
                 vec![b"the first message".to_vec()],
                 "boundary {boundary}"
             );
@@ -7343,7 +7778,7 @@ mod tests {
             NOW,
         )
         .expect("the relaunch finishes the acceptance");
-        assert_eq!(again.bodies, vec![b"the first message".to_vec()]);
+        assert_eq!(again.bodies(), vec![b"the first message".to_vec()]);
         let image = encode_conv(&store.load_conv(&peer).expect("load").expect("B's record"));
         assert!(
             !contains(&image, secret.as_bytes()),
@@ -7355,7 +7790,7 @@ mod tests {
             collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
         match surfaced.as_slice() {
             [Surfaced::Accepted(acceptance)] => {
-                assert_eq!(acceptance.bodies, vec![b"the reply".to_vec()]);
+                assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
             }
             other => panic!("expected one acceptance, got {other:?}"),
         }
