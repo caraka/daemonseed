@@ -1525,16 +1525,20 @@ pub(crate) fn dm_command_token(command: &RunnerCommand) -> Option<CommandToken> 
         | RunnerCommand::Send { token, .. }
         | RunnerCommand::Accept { token, .. }
         | RunnerCommand::DeleteConversation { token, .. } => Some(*token),
-        RunnerCommand::Block { .. } | RunnerCommand::Unblock { .. } | RunnerCommand::Shutdown => {
-            None
-        }
+        RunnerCommand::Block { .. }
+        | RunnerCommand::Unblock { .. }
+        | RunnerCommand::NoteHandle { .. }
+        | RunnerCommand::Shutdown => None,
     }
 }
 
 /// Answer a command no runner will take, the way the runner answers one it
-/// stopped before serving. A shutdown needs no answer.
+/// stopped before serving. A shutdown and a handle note need no answer.
 fn refuse_dm_command(evt_tx: &UnboundedSender<NetEvent>, command: &RunnerCommand) {
-    if matches!(command, RunnerCommand::Shutdown) {
+    if matches!(
+        command,
+        RunnerCommand::Shutdown | RunnerCommand::NoteHandle { .. }
+    ) {
         return;
     }
     let _ = evt_tx.send(NetEvent::Dm(Arc::new(RunnerEvent::Refused {
@@ -1820,7 +1824,15 @@ async fn handle_command(
                 let pk = k.public_key().to_vec();
                 hex::encode(&pk[..pk.len().min(8)])
             });
-            connect(evt_tx, net, ev_rx, ns_key).await;
+            let profile_secret = dm_session_keys.as_ref().map(|keys| &*keys.at_rest_key);
+            connect(
+                evt_tx,
+                net,
+                ev_rx,
+                ns_key,
+                profile_secret.map(|key| key.as_slice()),
+            )
+            .await;
             if net.is_some() {
                 // Subscribe the world-derivable lobby so share announcements fold
                 // into the catalog as they arrive (Phase 3 discovery).
@@ -2243,6 +2255,9 @@ async fn connect(
     // #188: stable per-profile veilid namespace discriminator (hex of the unlocked
     // identity pubkey prefix); `None` on the ephemeral no-profile path.
     ns_key: Option<String>,
+    // The unlocked profile's at-rest key, which Veilid's device-key password
+    // derives from; `None` without a profile, which draws a fresh password.
+    profile_secret: Option<&[u8]>,
 ) {
     if net.is_some() {
         let _ = evt_tx.send(NetEvent::Connected);
@@ -2299,6 +2314,11 @@ async fn connect(
         }
     }
 
+    if let Some(secret) = profile_secret
+        && let Err(e) = cfg.protect_with_profile(secret)
+    {
+        return fail(evt_tx, format!("veilid device key: {e}"));
+    }
     daemonseed_veilid_net::vtrace!(
         "gui connect: namespace={} listen={:?} dir-env={:?}",
         cfg.namespace,

@@ -17,6 +17,7 @@ use daemonseed_veilid_net::dm::runner::{
 };
 use daemonseed_veilid_net::dm::view::{
     DmCorrespondence, DmOutstanding, DmState, DmThreadRow, FirstContactBlocked, dm_fingerprint,
+    dm_name,
 };
 
 use super::{GuiState, now_unix_ms};
@@ -128,7 +129,8 @@ pub struct DmRailRow {
     /// A short text key for the row, stable for the session, that
     /// [`GuiState::dm_item_for_slot`] resolves back to [`Self::key`].
     pub slot: String,
-    /// The roster handle for the correspondent, or its fingerprint.
+    /// The handle a room roster lists for the correspondent, else the one
+    /// the runner's store recorded, else its fingerprint.
     pub label: String,
     /// How long ago the item last changed: "now", "2m", "1h", "3d".
     pub age: String,
@@ -281,6 +283,9 @@ pub(super) struct GuiDm {
     notice: Option<DmNotice>,
     /// A session-local number per identity, for [`DmRailRow::slot`].
     ids: BTreeMap<IdentityPk, u64>,
+    /// The handle last sent to the runner for each correspondent, so a roster
+    /// that names them again with the same handle sends nothing.
+    noted_handles: BTreeMap<IdentityPk, String>,
 }
 
 impl Default for GuiDm {
@@ -303,6 +308,7 @@ impl Default for GuiDm {
             blocks_in_flight: VecDeque::new(),
             notice: None,
             ids: BTreeMap::new(),
+            noted_handles: BTreeMap::new(),
         }
     }
 }
@@ -792,6 +798,7 @@ impl GuiState {
             }
         }
         dm.reconcile();
+        self.note_roster_handles();
     }
 
     /// The runner stopped: every message still unanswered is shown not sent,
@@ -806,6 +813,7 @@ impl GuiState {
         }
         let count = dm.state.stop() + accepts;
         dm.blocks_in_flight.clear();
+        dm.noted_handles.clear();
         if count > 0 {
             dm.notice = Some(DmNotice::NotSent { count });
         }
@@ -836,10 +844,40 @@ impl GuiState {
     }
 
     /// The name the rail and the thread header give `peer`: the handle any
-    /// room roster lists for that key, else its fingerprint.
+    /// room roster lists for that key, else the handle the runner's store
+    /// recorded for a correspondent no roster lists now, else its fingerprint.
     pub fn dm_label(&self, peer: &IdentityPk) -> String {
-        self.roster_handle_for_key(peer)
-            .map_or_else(|| dm_fingerprint(peer), str::to_owned)
+        dm_name(
+            self.roster_handle_for_key(peer),
+            self.dm.state.correspondences.get(peer),
+            peer,
+        )
+    }
+
+    /// Queue a [`RunnerCommand::NoteHandle`] for every correspondent a room
+    /// roster names with a handle other than the one the runner's store
+    /// recorded, once per handle. Called whenever a room roster or the runner's
+    /// roster changes.
+    pub fn note_roster_handles(&mut self) {
+        let mut notes = Vec::new();
+        for (pk, correspondence) in &self.dm.state.correspondences {
+            let Some(live) = self.roster_handle_for_key(pk) else {
+                continue;
+            };
+            if correspondence.handle.as_deref() == Some(live)
+                || self.dm.noted_handles.get(pk).map(String::as_str) == Some(live)
+            {
+                continue;
+            }
+            notes.push((pk.clone(), live.to_owned()));
+        }
+        for (pk, handle) in notes {
+            self.dm.noted_handles.insert(pk.clone(), handle.clone());
+            self.dm.pending.push(RunnerCommand::NoteHandle {
+                peer_identity_pk: pk,
+                handle,
+            });
+        }
     }
 
     /// Start a direct message with `peer`, chosen from a roster.
@@ -1349,9 +1387,85 @@ mod tests {
                     state: *state,
                     peer_collected: 0,
                     uncollected: 0,
+                    handle: None,
                 })
                 .collect(),
         )
+    }
+
+    /// A roster naming one established conversation with `tag`, carrying the
+    /// handle the runner's store recorded for it.
+    fn roster_with_handle(peer: CorrespondenceLabel, tag: u8, handle: Option<&str>) -> RunnerEvent {
+        RunnerEvent::Roster(vec![ConversationSummary {
+            peer,
+            peer_identity_pk: pk(tag),
+            state: ConversationState::Established,
+            peer_collected: 0,
+            uncollected: 0,
+            handle: handle.map(str::to_owned),
+        }])
+    }
+
+    /// The label of the one rail row and of the open thread's header.
+    fn labels(st: &mut GuiState, tag: u8) -> (String, String) {
+        st.select_dm_item(&conversation(tag));
+        let rows = st.dm_rail_rows(now_unix_ms());
+        assert_eq!(rows.len(), 1, "one conversation row");
+        let header = st
+            .dm_thread_view()
+            .expect("the thread is open")
+            .header_label;
+        (rows[0].label.clone(), header)
+    }
+
+    /// A conversation keeps its correspondent's handle once no room roster
+    /// lists them, and across a restart, through the handle the runner's store
+    /// records: a roster naming the key sends that handle to the runner once,
+    /// and with none recorded and none listed the fingerprint is shown.
+    #[test]
+    fn a_conversation_keeps_its_handle_after_the_roster_drops_the_peer() {
+        let (mut st, peer) = with_conversation(7);
+        let fingerprint = dm_fingerprint(&pk(7));
+        assert_eq!(
+            labels(&mut st, 7),
+            (fingerprint.clone(), fingerprint.clone())
+        );
+        assert!(st.take_pending_dm().is_empty(), "no handle to note yet");
+
+        st.set_room_roster(None, vec![member("anna", 7)]);
+        assert_eq!(labels(&mut st, 7), ("anna".to_owned(), "anna".to_owned()));
+        let noted = st.take_pending_dm();
+        assert!(
+            matches!(noted.as_slice(), [RunnerCommand::NoteHandle { peer_identity_pk, handle }]
+                if *peer_identity_pk == pk(7) && handle == "anna"),
+            "the roster's handle goes to the runner once: {noted:?}"
+        );
+        st.set_room_roster(None, vec![member("anna", 7)]);
+        assert!(
+            st.take_pending_dm().is_empty(),
+            "the same handle is not sent again"
+        );
+
+        // The runner stored it and reports the roster, and the room roster
+        // then drops the peer.
+        st.on_dm_event(&roster_with_handle(peer, 7, Some("anna")));
+        st.set_room_roster(None, Vec::new());
+        assert_eq!(labels(&mut st, 7), ("anna".to_owned(), "anna".to_owned()));
+
+        // A restart: a fresh front end hears the stored handle from the
+        // runner's first roster, with no room roster yet.
+        let mut restarted = GuiState::lobby_only();
+        restarted.on_dm_event(&roster_with_handle(peer, 7, Some("anna")));
+        assert_eq!(
+            labels(&mut restarted, 7),
+            ("anna".to_owned(), "anna".to_owned())
+        );
+        assert!(restarted.take_pending_dm().is_empty());
+
+        // A live roster handle wins over the stored one, and is noted.
+        restarted.set_room_roster(None, vec![member("anna2", 7)]);
+        assert_eq!(labels(&mut restarted, 7).0, "anna2");
+        assert_eq!(restarted.take_pending_dm().len(), 1);
     }
 
     /// A state holding one conversation with `tag`, under the returned label.

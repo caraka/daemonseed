@@ -311,6 +311,21 @@ pub const PROJECT_ANNOUNCE_OWNER_SALT: &[u8] = b"daemonseed/v1/project-announce-
 /// distinguisher.
 pub const PROJECT_ANNOUNCE_VEILID_OWNER: &str = "daemonseed/veilid/project-announce-owner";
 
+// ── Veilid local storage ────────────────────────────────────────────────────
+
+/// HKDF salt for the two values a profile derives for its Veilid local storage
+/// ([`super::veilid_device_key_password`], [`super::veilid_namespace_tag`]).
+/// The IKM is the unlocked profile's at-rest key.
+pub const VEILID_STORAGE_SALT: &[u8] = b"daemonseed/v1/veilid-storage";
+
+/// HKDF info string for the password Veilid's table store protects its device
+/// encryption key under.
+pub const VEILID_DEVICE_KEY_PASSWORD: &str = "daemonseed/veilid/device-key-password/v1";
+
+/// HKDF info string for the tag a profile's Veilid namespace carries, so two
+/// profiles sharing a storage directory never share a namespace.
+pub const VEILID_NAMESPACE_TAG: &str = "daemonseed/veilid/namespace-tag/v1";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +431,12 @@ mod tests {
         assert_eq!(share_index("uuid"), "daemonseed/share-index/uuid");
         assert_eq!(trust_events("uuid"), "daemonseed/trust-events/uuid");
         assert_eq!(spent_tokens("uuid"), "daemonseed/dm-spent-tokens/uuid");
+        assert_eq!(
+            VEILID_DEVICE_KEY_PASSWORD,
+            "daemonseed/veilid/device-key-password/v1"
+        );
+        assert_eq!(VEILID_NAMESPACE_TAG, "daemonseed/veilid/namespace-tag/v1");
+        assert_eq!(VEILID_STORAGE_SALT, b"daemonseed/v1/veilid-storage");
     }
 
     /// No auxiliary info string is a prefix of another.
@@ -433,8 +454,10 @@ mod tests {
             share_index("uuid"),
             trust_events("uuid"),
             spent_tokens("uuid"),
+            VEILID_DEVICE_KEY_PASSWORD.to_owned(),
+            VEILID_NAMESPACE_TAG.to_owned(),
         ];
-        assert_eq!(all.len(), 5, "control: every auxiliary label is listed");
+        assert_eq!(all.len(), 7, "control: every auxiliary label is listed");
         for (i, a) in all.iter().enumerate() {
             for (j, b) in all.iter().enumerate() {
                 if i != j {

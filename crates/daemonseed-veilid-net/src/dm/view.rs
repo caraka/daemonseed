@@ -60,6 +60,9 @@ pub struct DmCorrespondence {
     /// A counter rather than a clock, because the order events arrived in
     /// is the only recency this state has.
     pub last_activity: u64,
+    /// The handle the runner's store last recorded for the correspondent, from
+    /// the roster: the name to show once no room roster lists them.
+    pub handle: Option<String>,
 }
 
 impl std::fmt::Debug for DmCorrespondence {
@@ -72,6 +75,7 @@ impl std::fmt::Debug for DmCorrespondence {
             .field("thread", &self.thread)
             .field("refusal", &self.refusal)
             .field("last_activity", &self.last_activity)
+            .field("handle", &self.handle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -293,6 +297,19 @@ fn redacted_pk(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 /// an 80-column row. It is a label for a list, not a verification string.
 pub fn dm_fingerprint(pk: &IdentityPk) -> String {
     pk.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
+
+/// The name a front end gives a correspondent: `live`, the handle a room
+/// roster lists for them now, else the handle the runner's store recorded for
+/// their conversation, else [`dm_fingerprint`].
+pub fn dm_name(
+    live: Option<&str>,
+    correspondence: Option<&DmCorrespondence>,
+    pk: &IdentityPk,
+) -> String {
+    live.map(str::to_owned)
+        .or_else(|| correspondence.and_then(|c| c.handle.clone()))
+        .unwrap_or_else(|| dm_fingerprint(pk))
 }
 
 impl std::fmt::Debug for DmState {
@@ -569,6 +586,7 @@ impl DmState {
                         .or_default();
                     entry.state = Some(row.state);
                     entry.peer_collected = row.peer_collected;
+                    entry.handle.clone_from(&row.handle);
                     if let Some(activity) = activity {
                         entry.last_activity = activity;
                     }
@@ -823,6 +841,7 @@ mod tests {
             state: ConversationState::Pending,
             peer_collected: 0,
             uncollected: 1,
+            handle: None,
         }])
     }
 

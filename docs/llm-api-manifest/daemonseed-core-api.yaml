@@ -178,6 +178,11 @@ modules:
       parameters. Changing any of these strings silently breaks
       identity continuity and cross-version interop — wire-visible
       regression tests byte-compare them against the published spec.
+      VEILID_STORAGE_SALT is the salt, and VEILID_DEVICE_KEY_PASSWORD and
+      VEILID_NAMESPACE_TAG the info strings, of
+      kdf::veilid_device_key_password(profile_secret) -> Result<Zeroizing<String>,
+      KdfError> (32 bytes of HKDF-SHA384 as lowercase hex) and
+      kdf::veilid_namespace_tag(profile_secret) -> Result<String, KdfError> (8 bytes).
     no_std: false
     depends_on: []
     iscs:
@@ -230,7 +235,8 @@ modules:
     description: >-
       The DM at-rest store: one directory per correspondence, one fixed-size
       file per correspondence-scoped RecordKind (Resume, Provisional, Outbox,
-      ReceiveCursor, ContactCache, Conversation, ConversationOutbox) inside it,
+      ReceiveCursor, ContactCache, Conversation, ConversationOutbox,
+      CorrespondentHandle) inside it,
       and one fixed-size file per profile-scoped kind (BlockList, AdvertKeys) at
       the store
       root. DmStore::open derives the seal key from the profile at-rest key
@@ -1070,6 +1076,11 @@ modules:
       Sub-module dm::store is the layer's on-disk state, over
       storage::dm_store. Store::open(root, at_rest_key) -> Result<Store, StoreError>
       opens it and records() borrows the record store beneath.
+      record_handle(&label, &str) -> Result<bool, StoreError> keeps the
+      correspondent's last roster handle (at most HANDLE_MAX_LEN bytes) as
+      RecordKind::CorrespondentHandle, refused without a conversation record;
+      handle(&label) reads it and LoadedConv::handle carries it; delete_conv
+      removes it.
       persist_advert_keys(&AdvertSnapshot) and load_advert_keys() ->
       Result<Option<AdvertSnapshot>, StoreError> carry the advert KEM secrets and
       serial as RecordKind::AdvertKeys, one record per profile; an empty payload is
@@ -1208,7 +1219,12 @@ modules:
       conversation record. The module performs no network write.
       Sub-module dm::flows drives first contact and the ordinary message and
       cursor paths over dm::advert, dm::drop, dm::channel, dm::chain and
-      dm::store. Records is the trait carrying every record-store read and
+      dm::store. collect_slot(store, records, me, advert_keys, is_blocked, slot)
+      -> Result<Option<Surfaced>, FlowError> is collect for one drop slot. A ring
+      read stops at a slot whose header names the expected sequence and whose
+      message does not open, without advancing the key schedule or the cursor, and
+      Acceptance, Accepted and Batch report it as unopened: Option<Unopened>
+      (seq, subkey, error: ChainError). Records is the trait carrying every record-store read and
       write: read_advert(&AdvertOwnerSeed, subkeys), read_drop_slot /
       write_drop_slot / erase_drop_slot(&DropOwnerSeed, subkeys, slot),
       open_channel(&ChannelOwnerSeed, subkeys) -> [u8; HELLO_LOOKUP_KEY_LEN],

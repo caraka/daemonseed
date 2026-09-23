@@ -57,6 +57,7 @@ All under the application's at-rest AEAD.
 - **SELF** — the current and previous advert KEM secret keys, the advert serial, the current key's `not_before`, and the moment the previous key stopped being current. Derived owner keypairs are recomputed from the identity, never stored.
 - **CONV(peer)** — the peer's identity public key, both channel lookup keys, the conversation generation, ratchet state (chain roots, the two most recent own ratchet KEM secrets, the peer's latest ratchet public key), `send_seq`, `peer_collected` (their cursor over my messages), `my_collected` (mine over theirs), and, while a hello is outstanding, its slot, `r` and its sealed bytes, so a rewrite is byte-identical.
 - **OUTBOX(peer, seq)** — the exact ciphertext written to the slot. Deleted once the peer's cursor passes `seq`.
+- **HANDLE(peer)** — the handle a room roster last gave the correspondent, so the conversation is named once no roster lists them. Written only where a conversation record exists, and deleted with it.
 
 There is no message store. A received message is held in memory only while the application runs; a sent message persists only as the ciphertext in the outbox. On startup the user sees unread messages only.
 

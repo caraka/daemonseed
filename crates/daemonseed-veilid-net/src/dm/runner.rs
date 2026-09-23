@@ -8,7 +8,13 @@
 //! `<profile_root>/dm-store`, and calls [`daemonseed_core::dm::flows`] directly,
 //! one call at a time. A front end reaches it only through [`RunnerHandle`]:
 //! [`RunnerCommand`]s go in on a bounded queue, [`RunnerEvent`]s come out on
-//! another, and a command is served between flow calls, never during one.
+//! another, and a command is served between flow calls, never during one. A
+//! drop scan, a collection pass, a run of previews and a repair serve the
+//! commands queued meanwhile between their network calls — between drop
+//! slots, conversations, previews and repair steps — and then carry on where
+//! they stopped. A command served that way may accept, block or delete what
+//! the scan in progress surfaced earlier, and the scan drops what went stale
+//! before it reports.
 //!
 //! ## Startup
 //!
@@ -461,6 +467,17 @@ pub enum RunnerCommand {
         /// The conversation.
         peer: CorrespondenceLabel,
     },
+    /// Record `handle` as the name a room roster gives the identity
+    /// `peer_identity_pk`, so its conversation keeps that name once no roster
+    /// lists it and across a restart. Nothing is kept for an identity with no
+    /// conversation. Where the stored handle changes, a
+    /// [`RunnerEvent::Roster`] carrying it follows.
+    NoteHandle {
+        /// The correspondent's identity public key.
+        peer_identity_pk: IdentityPk,
+        /// The handle the roster gives it.
+        handle: String,
+    },
     /// Stop the runner.
     Shutdown,
 }
@@ -473,7 +490,10 @@ impl RunnerCommand {
             | Self::Send { token, .. }
             | Self::Accept { token, .. }
             | Self::DeleteConversation { token, .. } => Some(*token),
-            Self::Block { .. } | Self::Unblock { .. } | Self::Shutdown => None,
+            Self::Block { .. }
+            | Self::Unblock { .. }
+            | Self::NoteHandle { .. }
+            | Self::Shutdown => None,
         }
     }
 }
@@ -488,6 +508,7 @@ impl core::fmt::Debug for RunnerCommand {
             Self::Block { .. } => f.write_str("Block"),
             Self::Unblock { .. } => f.write_str("Unblock"),
             Self::DeleteConversation { token, .. } => write!(f, "DeleteConversation({token:?})"),
+            Self::NoteHandle { .. } => f.write_str("NoteHandle"),
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }
@@ -516,6 +537,9 @@ pub struct ConversationSummary {
     pub peer_collected: u64,
     /// How many of this side's messages the correspondent has not collected.
     pub uncollected: u64,
+    /// The handle a room roster last gave the correspondent, as the store
+    /// recorded it through [`RunnerCommand::NoteHandle`], or `None`.
+    pub handle: Option<String>,
 }
 
 impl core::fmt::Debug for ConversationSummary {
@@ -525,6 +549,7 @@ impl core::fmt::Debug for ConversationSummary {
             .field("state", &self.state)
             .field("peer_collected", &self.peer_collected)
             .field("uncollected", &self.uncollected)
+            .field("handle", &self.handle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -654,6 +679,10 @@ pub struct HealthCounters {
     /// Contact request previews that failed. A request whose preview failed is
     /// not previewed again, and its accept reads the network.
     pub previews_failed: u64,
+    /// Ring reads that stopped at a slot whose message does not open under
+    /// the conversation. The slot is read again by every later collection
+    /// until it is rewritten.
+    pub slots_unopened: u64,
 }
 
 /// What a runner reports.
@@ -1066,7 +1095,7 @@ async fn run<R: RunnerRecords>(
     events: mpsc::Sender<RunnerEvent>,
     stop: Arc<AtomicBool>,
 ) -> Result<(), RunnerError> {
-    let mut runner = match Runner::start(parts, events, stop).await {
+    let mut runner = match Runner::start(parts, Arc::clone(&commands), events, stop).await {
         Ok(runner) => runner,
         Err(Halt::Error(e)) => {
             runner_refuse_unstarted(&commands).await;
@@ -1313,6 +1342,7 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         slot: u16,
         bytes: &[u8],
     ) -> Result<(), RecordError> {
+        crate::vtrace!("dm runner: hello write to slot {slot} starts");
         let result = self.inner.write_drop_slot(owner, subkeys, slot, bytes);
         crate::vtrace!(
             "dm runner: hello write to slot {slot}: {}",
@@ -1333,6 +1363,7 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         subkeys: u16,
         slot: u16,
     ) -> Result<(), RecordError> {
+        crate::vtrace!("dm runner: erase of slot {slot} starts");
         let result = self.inner.erase_drop_slot(owner, subkeys, slot);
         crate::vtrace!(
             "dm runner: erase of slot {slot}: {}",
@@ -1389,6 +1420,7 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         subkey: u16,
         bytes: &[u8],
     ) -> Result<(), RecordError> {
+        crate::vtrace!("dm runner: channel write to subkey {subkey} starts");
         let result = self.inner.write_channel(lookup_key, subkey, bytes);
         crate::vtrace!(
             "dm runner: channel write to subkey {subkey}: {}",
@@ -1638,6 +1670,66 @@ fn tag(peer: &CorrespondenceLabel) -> String {
     format!("{a:02x}{b:02x}")
 }
 
+/// One runner step, traced: a start line when made, and an end line with the
+/// step's duration when dropped, however the step returns.
+struct Step {
+    what: String,
+    started: std::time::Instant,
+}
+
+impl Step {
+    fn start(what: String) -> Self {
+        crate::vtrace!("dm runner: {what} starts");
+        Self {
+            what,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for Step {
+    fn drop(&mut self) {
+        crate::vtrace!(
+            "dm runner: {} ends after {} ms",
+            self.what,
+            self.started.elapsed().as_millis()
+        );
+    }
+}
+
+/// How one drop scan's hellos came out, for its trace.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ScanTally {
+    /// Hellos this side is done with: an acceptance of its own first contact
+    /// recognised, or a hello already collected and erased.
+    settled: usize,
+    /// Hellos whose settling failed, a delete under way aside.
+    failed: usize,
+    /// Everything else: contact requests, identities starting over, blocked
+    /// identities and conversations being deleted.
+    other: usize,
+}
+
+impl ScanTally {
+    fn of(surfaced: &[Surfaced]) -> Self {
+        let mut tally = Self::default();
+        for item in surfaced {
+            match item {
+                Surfaced::Accepted(_) | Surfaced::AlreadyCollected { .. } => tally.settled += 1,
+                Surfaced::Failed {
+                    error: FlowError::DeletePending,
+                    ..
+                } => tally.other += 1,
+                Surfaced::Failed { .. } => tally.failed += 1,
+                Surfaced::ContactRequest(_)
+                | Surfaced::StartedOver { .. }
+                | Surfaced::Dropped { .. } => tally.other += 1,
+            }
+        }
+        tally
+    }
+}
+
 /// Whether a conversation waits on the correspondent to do something a
 /// collection pass would see: its own first contact awaiting acceptance, or an
 /// acceptance whose hello back the correspondent has not yet shown it read.
@@ -1735,6 +1827,7 @@ fn summaries(convs: &[LoadedConv]) -> Vec<ConversationSummary> {
                 .state
                 .send_seq
                 .saturating_sub(conv.state.peer_collected),
+            handle: conv.handle.clone(),
         })
         .collect()
 }
@@ -1854,12 +1947,25 @@ struct Runner<R> {
     /// scan, whatever its read finds, and by a block or unblock the store
     /// accepts.
     block_list_failure_counted: bool,
+    /// The command queue, read between the network calls of a long pass.
+    commands: CommandQueue,
+    /// Whether startup has finished, before which no command is served.
+    started: bool,
+    /// Whether a command is being served, during which no queued command is.
+    serving: bool,
+    /// Whether a command was served during the drop scan in progress, which
+    /// may have accepted, blocked or deleted what the scan read earlier.
+    served_mid_scan: bool,
+    /// Whether a command was served since this was last cleared, which a
+    /// collection pass does before each conversation.
+    served_since: bool,
 }
 
 impl<R: RunnerRecords> Runner<R> {
     /// Open the store and run startup, in the order the module docs give.
     async fn start(
         parts: RunnerParts<R>,
+        commands: CommandQueue,
         events: mpsc::Sender<RunnerEvent>,
         stop: Arc<AtomicBool>,
     ) -> Result<Self, Halt> {
@@ -1929,6 +2035,11 @@ impl<R: RunnerRecords> Runner<R> {
             health_reported: HealthCounters::default(),
             block_list_known: true,
             block_list_failure_counted: false,
+            commands,
+            started: false,
+            serving: false,
+            served_mid_scan: false,
+            served_since: false,
         };
 
         match runner.stored_block_list() {
@@ -1963,7 +2074,42 @@ impl<R: RunnerRecords> Runner<R> {
         let health = runner.records.health;
         runner.health_reported = health;
         runner.emit(RunnerEvent::Health(health)).await?;
+        runner.started = true;
         Ok(runner)
+    }
+
+    /// Serve every command already queued, between two network calls of a
+    /// long pass, so a command waits for the call in progress rather than for
+    /// the pass. Each command runs to its end, and the pass then carries on
+    /// from where it stopped. Nothing is served before startup finishes or
+    /// from inside a command. A queued [`RunnerCommand::Shutdown`] stops the
+    /// pass.
+    async fn serve_queued(&mut self) -> Result<(), Halt> {
+        if !self.started || self.serving {
+            return Ok(());
+        }
+        loop {
+            self.check_stop()?;
+            let command = match self.commands.try_lock() {
+                Ok(mut queue) => match queue.try_recv() {
+                    Ok(command) => command,
+                    Err(_) => return Ok(()),
+                },
+                Err(_) => return Ok(()),
+            };
+            if matches!(command, RunnerCommand::Shutdown) {
+                return Err(Halt::Stopped);
+            }
+            crate::vtrace!("dm runner: pass paused for {command:?}");
+            self.served_mid_scan = true;
+            self.served_since = true;
+            self.serving = true;
+            let served = self.serve(command).await;
+            self.serving = false;
+            served?;
+            self.report_health().await?;
+            crate::vtrace!("dm runner: pass resumes");
+        }
     }
 
     fn stopping(&self) -> bool {
@@ -2172,6 +2318,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// conversation whose delete is under way is left to its teardown, which
     /// opens the record without creating it.
     fn reopen_channels(&mut self, convs: &[LoadedConv]) -> Result<(), Halt> {
+        let _step = Step::start(String::from("channel reopen"));
         for conv in convs {
             self.check_stop()?;
             let stored = conv.state.outgoing_lookup_key;
@@ -2212,6 +2359,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// Rotate the advert when due and publish it where it is new, or where the
     /// network's copy is missing or differs.
     fn refresh_advert(&mut self, minted: bool) {
+        let _step = Step::start(String::from("advert refresh"));
         let owner = match advert::derive_owner_seed(self.signer.public_key()) {
             Ok(owner) => owner,
             Err(_) => {
@@ -2335,32 +2483,65 @@ impl<R: RunnerRecords> Runner<R> {
         if !std::mem::replace(&mut self.block_list_known, true) {
             self.emit_blocked(&blocked).await?;
         }
+        crate::vtrace!("dm runner: drop scan starts");
+        let started = std::time::Instant::now();
         let unread_before = self.records.failed_drop_reads;
-        let me = Me {
-            signer: &self.signer,
-            channel_root: &self.channel_root,
-        };
-        let collected = flows::collect(
-            &self.store,
-            &mut self.records,
-            &me,
-            &self.advert_keys,
-            |identity| blocked.is_blocked(identity),
-        );
+        self.served_mid_scan = false;
+        // One slot at a time, as `flows::collect` reads them, with the queued
+        // commands served between slots.
+        let mut surfaced = Vec::new();
+        let mut stopped = None;
+        for slot in 0..drop_plane::DROP_SUBKEYS {
+            let me = Me {
+                signer: &self.signer,
+                channel_root: &self.channel_root,
+            };
+            match flows::collect_slot(
+                &self.store,
+                &mut self.records,
+                &me,
+                &self.advert_keys,
+                |identity| blocked.is_blocked(identity),
+                slot,
+            ) {
+                Ok(Some(one)) => surfaced.push(one),
+                Ok(None) => {}
+                Err(e) => {
+                    stopped = Some(e);
+                    break;
+                }
+            }
+            self.serve_queued().await?;
+        }
         self.last_scan = Some(Instant::now());
         let partial = self.records.failed_drop_reads > unread_before;
         self.last_scan_partial = partial;
-        match &collected {
-            Ok(surfaced) => crate::vtrace!(
-                "dm runner: drop scanned, {} hello(s) settled, {} slot read(s) failed",
-                surfaced.len(),
-                self.records.failed_drop_reads - unread_before
-            ),
-            Err(e) => crate::vtrace!("dm runner: drop scan stopped, {:?}", refusal_for(e)),
-        }
-        match collected {
-            Ok(surfaced) => self.surface(surfaced, partial).await?,
-            Err(e) => note_failure(&mut self.records.health, &e),
+        let ms = started.elapsed().as_millis();
+        let unread = self.records.failed_drop_reads - unread_before;
+        match stopped {
+            None => {
+                let tally = ScanTally::of(&surfaced);
+                crate::vtrace!(
+                    "dm runner: drop scanned in {ms} ms, {} hello(s): {} settled, {} failed, {} other; {unread} slot read(s) failed",
+                    surfaced.len(),
+                    tally.settled,
+                    tally.failed,
+                    tally.other
+                );
+                for item in &surfaced {
+                    if let Surfaced::Failed { error, .. } = item {
+                        crate::vtrace!("dm runner: a hello did not settle, {error:?}");
+                    }
+                }
+                self.surface(surfaced, partial).await?;
+            }
+            Some(e) => {
+                crate::vtrace!(
+                    "dm runner: drop scan stopped after {ms} ms, {:?}, {e:?}",
+                    refusal_for(&e)
+                );
+                note_failure(&mut self.records.health, &e);
+            }
         }
         Ok(Some(blocked))
     }
@@ -2370,6 +2551,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// The block list is not consulted. A delete that stops short keeps its
     /// mark, and the launch's rescheduling puts it on the repair schedule.
     async fn resume_deletes(&mut self) -> Result<(), Halt> {
+        let _step = Step::start(String::from("delete carry-on"));
         let pending = match self.store.pending_deletes() {
             Ok(pending) => pending,
             Err(_) => {
@@ -2417,6 +2599,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// correspondent's messages and records them as collected. A later call
     /// carries it on once the list reads and no longer lists them.
     async fn resume_incomplete(&mut self, conv: &LoadedConv) -> Result<(), Halt> {
+        let _step = Step::start(format!("carry-on of {}", tag(&conv.peer)));
         self.check_stop()?;
         let state = &conv.state;
         let peer = conv.peer;
@@ -2504,6 +2687,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// alone until a scan reads every slot. Nothing is looked at for a
     /// conversation whose delete is under way.
     fn rewrite_hello(&mut self, peer: &CorrespondenceLabel, state: &ConvState) {
+        let _step = Step::start(format!("hello rewrite of {}", tag(peer)));
         if state.outstanding_hello.is_none() || state.delete_pending || self.stopping() {
             return;
         }
@@ -2634,6 +2818,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// message slot, from the outbox. Nothing is looked at for a conversation
     /// whose delete is under way.
     fn rewrite_evicted(&mut self, state: &ConvState, entries: &[OutboxEntry]) {
+        let _step = Step::start(String::from("channel repair"));
         let lookup_key = state.outgoing_lookup_key;
         if state.delete_pending || lookup_key == NO_LOOKUP_KEY {
             return;
@@ -2707,6 +2892,7 @@ impl<R: RunnerRecords> Runner<R> {
 
     /// Serve one command.
     async fn serve(&mut self, command: RunnerCommand) -> Result<(), Halt> {
+        let _step = Step::start(format!("{command:?}"));
         if self.stopping() {
             if let Some(token) = command.token() {
                 self.refuse(Some(token), Refusal::ShuttingDown).await?;
@@ -2728,6 +2914,10 @@ impl<R: RunnerRecords> Runner<R> {
             RunnerCommand::Block { peer } => self.set_blocked(&peer, true).await,
             RunnerCommand::Unblock { peer } => self.set_blocked(&peer, false).await,
             RunnerCommand::DeleteConversation { token, peer } => self.delete(token, peer).await,
+            RunnerCommand::NoteHandle {
+                peer_identity_pk,
+                handle,
+            } => self.note_handle(&peer_identity_pk, &handle).await,
             RunnerCommand::Shutdown => Ok(()),
         }
     }
@@ -2930,6 +3120,9 @@ impl<R: RunnerRecords> Runner<R> {
                     accepted.hello_slot,
                     accepted.repicks
                 );
+                if let Some(unopened) = &accepted.unopened {
+                    self.note_unopened(&accepted.peer, unopened);
+                }
                 self.collect_sooner();
                 self.requests.remove(&request);
                 let peer = accepted.peer;
@@ -2957,6 +3150,27 @@ impl<R: RunnerRecords> Runner<R> {
                     self.ensure_repair(conv.peer);
                     return self.emit_roster().await;
                 }
+                Ok(())
+            }
+        }
+    }
+
+    /// Store the handle a roster gives an identity with a conversation here,
+    /// and report the roster where it changed.
+    async fn note_handle(
+        &mut self,
+        identity: &[u8; IDENTITY_PK_LEN],
+        handle: &str,
+    ) -> Result<(), Halt> {
+        let conv = match self.conv_with(identity) {
+            Ok(Some(conv)) => conv,
+            Ok(None) | Err(()) => return Ok(()),
+        };
+        match self.store.record_handle(&conv.peer, handle) {
+            Ok(true) => self.emit_roster().await,
+            Ok(false) | Err(StoreError::MissingConversation) => Ok(()),
+            Err(_) => {
+                self.records.health.store_failures += 1;
                 Ok(())
             }
         }
@@ -3109,14 +3323,17 @@ impl<R: RunnerRecords> Runner<R> {
     async fn run_due(&mut self) -> Result<(), Halt> {
         self.answering = None;
         self.preview_requests().await?;
+        self.serve_queued().await?;
         if Instant::now() >= self.next_tick {
             self.collect_tick().await?;
             self.next_tick = Instant::now() + self.collection_interval();
+            self.serve_queued().await?;
         }
         if Instant::now() >= self.next_advert_poll {
             self.check_stop()?;
             self.refresh_advert(false);
             self.next_advert_poll = Instant::now() + advert::next_poll_interval_os();
+            self.serve_queued().await?;
         }
         let now = Instant::now();
         let due: Vec<CorrespondenceLabel> = self
@@ -3128,6 +3345,7 @@ impl<R: RunnerRecords> Runner<R> {
         for peer in due {
             self.check_stop()?;
             self.repair(&peer).await?;
+            self.serve_queued().await?;
         }
         // A repair that left its conversation due is put back a full interval,
         // so the schedule never wakes on it again at once.
@@ -3152,6 +3370,7 @@ impl<R: RunnerRecords> Runner<R> {
             .collect();
         for id in due {
             self.check_stop()?;
+            self.serve_queued().await?;
             let Some(entry) = self.requests.get_mut(&id) else {
                 continue;
             };
@@ -3163,6 +3382,7 @@ impl<R: RunnerRecords> Runner<R> {
                 signer: &self.signer,
                 channel_root: &self.channel_root,
             };
+            crate::vtrace!("dm runner: preview of request {} starts", id.serial);
             let started = std::time::Instant::now();
             self.records.traced = Some("preview");
             let read = flows::preview(&mut self.records, &me, request);
@@ -3218,6 +3438,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// awaiting acceptance, then what startup does for it. For a conversation
     /// whose delete is under way the look retries the delete and nothing else.
     async fn repair(&mut self, peer: &CorrespondenceLabel) -> Result<(), Halt> {
+        let _step = Step::start(format!("repair of {}", tag(peer)));
         let awaiting = match self.load_one(peer) {
             Ok(Some(conv)) if conv.state.delete_pending => {
                 if self.resume_delete(peer) {
@@ -3248,10 +3469,12 @@ impl<R: RunnerRecords> Runner<R> {
             self.resume_incomplete(&conv).await?;
         }
         self.check_stop()?;
+        self.serve_queued().await?;
         if let Ok(Some(conv)) = self.load_one(peer) {
             self.rewrite_hello(peer, &conv.state);
         }
         self.check_stop()?;
+        self.serve_queued().await?;
         match self.load_one(peer) {
             Ok(Some(conv)) => {
                 self.rewrite_evicted(&conv.state, &conv.outstanding_outbox);
@@ -3278,8 +3501,31 @@ impl<R: RunnerRecords> Runner<R> {
             return Ok(());
         };
         let mut collected = 0usize;
-        for conv in &convs {
+        let mut blocked = blocked;
+        for listed in &convs {
             self.check_stop()?;
+            // A command served here may have changed this conversation or the
+            // block list since both were read.
+            self.served_since = false;
+            self.serve_queued().await?;
+            let reloaded;
+            let conv = if self.served_since {
+                match self.load_one(&listed.peer) {
+                    Ok(Some(conv)) => {
+                        reloaded = conv;
+                        &reloaded
+                    }
+                    Ok(None) | Err(()) => continue,
+                }
+            } else {
+                listed
+            };
+            if self.served_since {
+                match self.readable_block_list() {
+                    Some(list) => blocked = list,
+                    None => continue,
+                }
+            }
             if conv.state.awaiting_acceptance
                 || conv.state.acceptance_pending
                 || conv.state.delete_pending
@@ -3301,12 +3547,15 @@ impl<R: RunnerRecords> Runner<R> {
     /// cursor where messages are outstanding, and report what was delivered.
     async fn collect_conversation(&mut self, conv: &LoadedConv) -> Result<(), Halt> {
         let peer = conv.peer;
+        crate::vtrace!("dm runner: collection of {} starts", tag(&peer));
+        let started = std::time::Instant::now();
         match flows::collect_batch(&self.store, &mut self.records, &peer) {
             Ok(batch) => {
                 crate::vtrace!(
-                    "dm runner: collected {} message(s) on {}, cursor {}{}",
+                    "dm runner: collected {} message(s) on {} in {} ms, cursor {}{}",
                     batch.messages.len(),
                     tag(&peer),
+                    started.elapsed().as_millis(),
                     batch.my_collected,
                     if batch.cursor_published {
                         ", published"
@@ -3314,12 +3563,22 @@ impl<R: RunnerRecords> Runner<R> {
                         ""
                     }
                 );
+                if let Some(unopened) = &batch.unopened {
+                    self.note_unopened(&peer, unopened);
+                }
                 let first = batch
                     .my_collected
                     .saturating_sub(batch.messages.len() as u64);
                 self.emit_bodies(peer, first, batch.messages).await?;
             }
-            Err(e) => note_failure(&mut self.records.health, &e),
+            Err(e) => {
+                crate::vtrace!(
+                    "dm runner: collection of {} failed after {} ms, {e:?}",
+                    tag(&peer),
+                    started.elapsed().as_millis()
+                );
+                note_failure(&mut self.records.health, &e);
+            }
         }
         if conv.state.send_seq > conv.state.peer_collected {
             self.check_stop()?;
@@ -3331,6 +3590,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// Read the correspondent's published cursor and take it into the
     /// conversation record where it is ahead, never past `send_seq`.
     fn refresh_peer_cursor(&mut self, peer: &CorrespondenceLabel) {
+        let _step = Step::start(format!("cursor read of {}", tag(peer)));
         match flows::peer_cursor(&self.store, &mut self.records, peer) {
             Ok(Some(cursor)) => {
                 let recorded = self.store.update_conv(peer, |state| {
@@ -3406,6 +3666,11 @@ impl<R: RunnerRecords> Runner<R> {
                 } => {}
                 Surfaced::Failed { .. } => self.records.health.hellos_unsettled += 1,
                 Surfaced::Accepted(acceptance) => accepted.push(acceptance),
+                // A command served during the scan may have accepted or
+                // blocked this identity since its slot was read.
+                Surfaced::ContactRequest(request)
+                    if self.stale_after_commands(&request.identity) => {}
+                Surfaced::StartedOver { identity, .. } if self.stale_after_commands(&identity) => {}
                 Surfaced::ContactRequest(request) => {
                     let id = self.request_id(&held, &request.identity, false);
                     if !prior.contains(&id) && !held.contains_key(&id) {
@@ -3455,6 +3720,13 @@ impl<R: RunnerRecords> Runner<R> {
         let roster_changed = !accepted.is_empty();
         for acceptance in accepted {
             let peer = acceptance.peer;
+            if let Some(unopened) = &acceptance.unopened {
+                self.note_unopened(&peer, unopened);
+            }
+            // A delete served during the scan may have removed it since.
+            if self.served_mid_scan && matches!(self.store.load_conv(&peer), Ok(None)) {
+                continue;
+            }
             self.emit(RunnerEvent::Accepted { peer }).await?;
             match self.store.load_conv(&peer) {
                 Ok(Some(state)) => {
@@ -3471,6 +3743,35 @@ impl<R: RunnerRecords> Runner<R> {
             self.emit_roster().await?;
         }
         Ok(())
+    }
+
+    /// Count and trace a ring slot a read stopped at because its message does
+    /// not open: a message of an earlier conversation under the same channel
+    /// records, or one of this conversation that will not decrypt, which holds
+    /// the conversation until it is rewritten.
+    fn note_unopened(&mut self, peer: &CorrespondenceLabel, unopened: &flows::Unopened) {
+        self.records.health.slots_unopened += 1;
+        crate::vtrace!(
+            "dm runner: {} ring read stopped at sequence {} (subkey {}), whose message does not open: {:?}",
+            tag(peer),
+            unopened.seq,
+            unopened.subkey,
+            unopened.error
+        );
+    }
+
+    /// Whether a hello read before a command served during the same scan no
+    /// longer stands as a request: its identity now has a conversation or is
+    /// blocked. Only asked where a command was served during the scan.
+    fn stale_after_commands(&mut self, identity: &[u8; IDENTITY_PK_LEN]) -> bool {
+        if !self.served_mid_scan {
+            return false;
+        }
+        if matches!(self.conv_with(identity), Ok(Some(_))) {
+            return true;
+        }
+        self.readable_block_list()
+            .is_some_and(|list| list.is_blocked(identity))
     }
 
     /// The id a surfaced hello is held under: the one this identity's hello of

@@ -59,11 +59,13 @@
 //!   C96 GUI circle-detail name vectors;
 //!   C97 right-click clipboard context menu on text fields;
 //!   C98 GUI share-name persistence;
+//!   C101-C103 stored correspondent handle, protected Veilid storage key,
+//!   unopenable ring slot;
 //!   C100 schema-derived DFLT subkey write guard (`RecordShape`), #232;
 //!   C40 DM static key record (publish + verify + rollback guard), #232;
 //!   WB-ISC-9/10/13 pos + WB-ISC-11/12 neg — the WB-3 write scheduler, #159;
 //!   WB-ISC-3/4/5/6/7 pos + WB-ISC-1/2/8 neg — the WB-1 presence model, #159.)
-//! - 244 total = 40 server + 127 client + 77 build-family
+//! - 247 total = 40 server + 130 client + 77 build-family
 //!   (WB-ISC 26, CRSH-ISC 29, DL-ISC 22). The per-family tallies above are the
 //!   authoritative breakdown; [`TOTAL`] is the compile-time-asserted sum.
 //!
@@ -270,6 +272,11 @@ pub const ISCS: &[(&str, IscClass)] = &[
     ("ISC-C99", IscClass::Positive),
     // ── client positive (#232: schema-derived DFLT subkey write guard; RecordShape) ──
     ("ISC-C100", IscClass::Positive),
+    // ── client positive (direct messaging: stored correspondent handle, protected
+    //    Veilid storage key, unopenable ring slot) ──
+    ("ISC-C101", IscClass::Positive),
+    ("ISC-C102", IscClass::Positive),
+    ("ISC-C103", IscClass::Positive),
     // ── client positive (#232: DM static key record — publish/verify/rollback guard;
     //    docs/design/direct-messaging.md DRAFT v6) ──
     ("ISC-C40", IscClass::Positive),
@@ -440,7 +447,7 @@ pub const ISCS: &[(&str, IscClass)] = &[
 /// of truth for the coverage denominator, read live by `xtask isc-coverage`.
 /// Recount on every ISC add/remove (the `const _` assert below guards it
 /// against [`ISCS`]).
-pub const TOTAL: usize = 244;
+pub const TOTAL: usize = 247;
 
 const _: () = assert!(
     ISCS.len() == TOTAL,
@@ -678,14 +685,17 @@ mod tests {
         //                                  verify, highest-version-wins rollback
         //                                  guard) — the rest of the DM family
         //                                  registers per build slice.
-        //   total   159 pos + 85 neg = 244
+        //                                  ISC-C101/C102/C103 pos (stored handle,
+        //                                  protected Veilid storage key, unopenable
+        //                                  ring slot).
+        //   total   162 pos + 85 neg = 247
         //   (A-S27 neg: the project-announce seed is not in the source tree.)
         //   (the v0.33.0 Veilid cutover retired 14 server-positive + 10
         //    server-negative relay/TLS/federation/rate-limit ISCs, and C26
         //    followed it on 2026-09-07. A-C43 was
         //    added with the TLS-stack removal: daemonseed's own envelopes never
         //    fall below CNSA 2.0 even though the transport under them is not.)
-        assert_eq!(pos, 159, "positive count drift");
+        assert_eq!(pos, 162, "positive count drift");
         assert_eq!(neg, 85, "negative count drift");
     }
 

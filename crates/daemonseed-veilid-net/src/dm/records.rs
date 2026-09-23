@@ -926,13 +926,90 @@ where
     .await
 }
 
+/// The trace line of one record call: what it did, to which kind of record
+/// and subkey, how long it took and how it came out. Nothing of the record's
+/// address or contents is in it.
+fn call_line(call: &str, kind: &str, subkey: Option<u32>, ms: u128, outcome: &str) -> String {
+    match subkey {
+        Some(n) => format!("dm records: {call} {kind} subkey {n}: {outcome} in {ms} ms"),
+        None => format!("dm records: {call} {kind}: {outcome} in {ms} ms"),
+    }
+}
+
+/// Run one record call and trace it once, through `sink`, with [`call_line`].
+/// `done` names a success; a failure is traced with its error.
+fn traced_to<T>(
+    sink: &mut dyn FnMut(&str),
+    call: &str,
+    kind: &str,
+    subkey: Option<u32>,
+    run: impl FnOnce() -> core::result::Result<T, RecordError>,
+    done: impl FnOnce(&T) -> &'static str,
+) -> core::result::Result<T, RecordError> {
+    let started = std::time::Instant::now();
+    let result = run();
+    let ms = started.elapsed().as_millis();
+    let line = match &result {
+        Ok(value) => call_line(call, kind, subkey, ms, done(value)),
+        Err(e) => call_line(call, kind, subkey, ms, &format!("failed, {e}")),
+    };
+    sink(&line);
+    result
+}
+
+/// Run one record call and trace it once.
+fn traced<T>(
+    call: &str,
+    kind: &str,
+    subkey: Option<u32>,
+    run: impl FnOnce() -> core::result::Result<T, RecordError>,
+    done: impl FnOnce(&T) -> &'static str,
+) -> core::result::Result<T, RecordError> {
+    traced_to(
+        &mut |line| crate::vtrace!("{line}"),
+        call,
+        kind,
+        subkey,
+        run,
+        done,
+    )
+}
+
+/// How a read came out: a value, or an empty subkey.
+fn found<T>(value: &Option<T>) -> &'static str {
+    if value.is_some() {
+        "found"
+    } else {
+        "empty"
+    }
+}
+
+/// How a call with nothing to report came out.
+fn ok<T>(_: &T) -> &'static str {
+    "ok"
+}
+
+/// The record kind and subkey one batched write addresses, for its trace.
+fn batch_target(write: &BatchWrite<'_>) -> (&'static str, &'static str, u32) {
+    match *write {
+        BatchWrite::Channel { subkey, .. } => ("write", "channel", u32::from(subkey)),
+        BatchWrite::EraseDropSlot { slot, .. } => ("erase", "drop", u32::from(slot)),
+    }
+}
+
 impl Records for VeilidRecords {
     fn read_advert(
         &mut self,
         owner: &AdvertOwnerSeed,
         subkeys: u16,
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
-        read_subkey(&self.transport, owner.as_bytes(), subkeys, ADVERT_SUBKEY)
+        traced(
+            "read",
+            "advert",
+            Some(ADVERT_SUBKEY),
+            || read_subkey(&self.transport, owner.as_bytes(), subkeys, ADVERT_SUBKEY),
+            found,
+        )
     }
 
     /// Read one drop slot, skipping the read where the network says the slot
@@ -951,11 +1028,29 @@ impl Records for VeilidRecords {
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
         let owner_seed = *owner.as_bytes();
         let transport = &self.transport;
+        // Traced inside the pass, so a slot the scan answers without a read
+        // is not traced as one.
         self.drop_pass.read(
             owner_seed,
             slot,
-            || scan_drop(transport, &owner_seed, subkeys),
-            || read_subkey(transport, &owner_seed, subkeys, u32::from(slot)),
+            || {
+                traced(
+                    "inspect",
+                    "drop",
+                    None,
+                    || scan_drop(transport, &owner_seed, subkeys),
+                    ok,
+                )
+            },
+            || {
+                traced(
+                    "read",
+                    "drop",
+                    Some(u32::from(slot)),
+                    || read_subkey(transport, &owner_seed, subkeys, u32::from(slot)),
+                    found,
+                )
+            },
         )
     }
 
@@ -966,9 +1061,18 @@ impl Records for VeilidRecords {
         slot: u16,
         bytes: &[u8],
     ) -> core::result::Result<(), RecordError> {
-        let (kind, record, write) = drop_slot_write(owner.as_bytes(), subkeys, slot, Some(bytes))?;
-        self.drop_pass.forget(owner.as_bytes());
-        self.write(record, kind, write)
+        traced(
+            "write",
+            "drop",
+            Some(u32::from(slot)),
+            || {
+                let (kind, record, write) =
+                    drop_slot_write(owner.as_bytes(), subkeys, slot, Some(bytes))?;
+                self.drop_pass.forget(owner.as_bytes());
+                self.write(record, kind, write)
+            },
+            ok,
+        )
     }
 
     /// An erasure is a write of an empty value to the slot.
@@ -993,8 +1097,16 @@ impl Records for VeilidRecords {
         subkeys: u16,
         slot: u16,
     ) -> core::result::Result<(), RecordError> {
-        let (kind, record, write) = drop_slot_write(owner.as_bytes(), subkeys, slot, None)?;
-        self.write(record, kind, write)
+        traced(
+            "erase",
+            "drop",
+            Some(u32::from(slot)),
+            || {
+                let (kind, record, write) = drop_slot_write(owner.as_bytes(), subkeys, slot, None)?;
+                self.write(record, kind, write)
+            },
+            ok,
+        )
     }
 
     /// Open or create the channel record the seed owns, and return the lookup
@@ -1011,38 +1123,47 @@ impl Records for VeilidRecords {
         owner: &ChannelOwnerSeed,
         subkeys: u16,
     ) -> core::result::Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
-        let (shape, keypair, lookup_key) = channel_open_plan(owner.as_bytes(), subkeys)?;
-        let transport = &self.transport;
-        let opening = keypair.clone();
-        block(retry_transient("dm records channel open", || {
-            let opening = opening.clone();
-            async move {
-                let record_lock = rendezvous::record_lock(&transport.record_locks, &opening.key());
-                let _open_guard = record_lock.lock().await;
-                rendezvous::open_cached(
-                    &transport.opened,
-                    &rendezvous::cached_record_id(&opening.key(), shape),
-                    rendezvous::open_or_create(
-                        &transport.gate,
-                        &transport.api,
-                        &transport.rc,
-                        &opening,
+        traced(
+            "open",
+            "channel",
+            None,
+            || {
+                let (shape, keypair, lookup_key) = channel_open_plan(owner.as_bytes(), subkeys)?;
+                let transport = &self.transport;
+                let opening = keypair.clone();
+                block(retry_transient("dm records channel open", || {
+                    let opening = opening.clone();
+                    async move {
+                        let record_lock =
+                            rendezvous::record_lock(&transport.record_locks, &opening.key());
+                        let _open_guard = record_lock.lock().await;
+                        rendezvous::open_cached(
+                            &transport.opened,
+                            &rendezvous::cached_record_id(&opening.key(), shape),
+                            rendezvous::open_or_create(
+                                &transport.gate,
+                                &transport.api,
+                                &transport.rc,
+                                &opening,
+                                shape,
+                            ),
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                }))
+                .map_err(RecordError::new)?;
+                self.own_channels.insert(
+                    lookup_key,
+                    OwnChannel {
+                        owner: keypair,
                         shape,
-                    ),
-                )
-                .await
-                .map(|_| ())
-            }
-        }))
-        .map_err(RecordError::new)?;
-        self.own_channels.insert(
-            lookup_key,
-            OwnChannel {
-                owner: keypair,
-                shape,
+                    },
+                );
+                Ok(lookup_key)
             },
-        );
-        Ok(lookup_key)
+            ok,
+        )
     }
 
     /// Read one subkey of the channel at `lookup_key`.
@@ -1057,38 +1178,46 @@ impl Records for VeilidRecords {
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
         subkey: u16,
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
-        let shape = self
-            .own_channels
-            .get(lookup_key)
-            .map(|own| own.shape)
-            .map_or_else(|| shape_of(CHANNEL_SUBKEYS), Ok)?;
-        let transport = &self.transport;
-        let lookup_key = *lookup_key;
-        let subkey = u32::from(subkey);
-        block(retry_transient("dm records channel read", || async move {
-            let owner = identity::owner_public_key(&lookup_key);
-            let handle = {
-                let record_lock = rendezvous::record_lock(&transport.record_locks, &owner);
-                let _open_guard = record_lock.lock().await;
-                rendezvous::open_cached_optional(
-                    &transport.opened,
-                    &rendezvous::cached_record_id(&owner, shape),
-                    rendezvous::open_read_only(
-                        &transport.gate,
-                        &transport.api,
-                        &transport.rc,
-                        &lookup_key,
-                        shape,
-                    ),
-                )
-                .await?
-            };
-            let Some(handle) = handle else {
-                return Ok(None);
-            };
-            get_subkey(&transport.gate, &transport.rc, &handle, subkey).await
-        }))
-        .map_err(RecordError::new)
+        traced(
+            "read",
+            "channel",
+            Some(u32::from(subkey)),
+            || {
+                let shape = self
+                    .own_channels
+                    .get(lookup_key)
+                    .map(|own| own.shape)
+                    .map_or_else(|| shape_of(CHANNEL_SUBKEYS), Ok)?;
+                let transport = &self.transport;
+                let lookup_key = *lookup_key;
+                let subkey = u32::from(subkey);
+                block(retry_transient("dm records channel read", || async move {
+                    let owner = identity::owner_public_key(&lookup_key);
+                    let handle = {
+                        let record_lock = rendezvous::record_lock(&transport.record_locks, &owner);
+                        let _open_guard = record_lock.lock().await;
+                        rendezvous::open_cached_optional(
+                            &transport.opened,
+                            &rendezvous::cached_record_id(&owner, shape),
+                            rendezvous::open_read_only(
+                                &transport.gate,
+                                &transport.api,
+                                &transport.rc,
+                                &lookup_key,
+                                shape,
+                            ),
+                        )
+                        .await?
+                    };
+                    let Some(handle) = handle else {
+                        return Ok(None);
+                    };
+                    get_subkey(&transport.gate, &transport.rc, &handle, subkey).await
+                }))
+                .map_err(RecordError::new)
+            },
+            found,
+        )
     }
 
     /// Write one subkey of the channel at `lookup_key`.
@@ -1101,8 +1230,16 @@ impl Records for VeilidRecords {
         subkey: u16,
         bytes: &[u8],
     ) -> core::result::Result<(), RecordError> {
-        let (record, kind, write) = self.channel_write(lookup_key, subkey, bytes)?;
-        self.write(record, kind, write)
+        traced(
+            "write",
+            "channel",
+            Some(u32::from(subkey)),
+            || {
+                let (record, kind, write) = self.channel_write(lookup_key, subkey, bytes)?;
+                self.write(record, kind, write)
+            },
+            ok,
+        )
     }
 
     /// Every write is handed to the funnel before any is confirmed, and each
@@ -1113,12 +1250,25 @@ impl Records for VeilidRecords {
         &mut self,
         writes: &[BatchWrite<'_>],
     ) -> Vec<core::result::Result<(), RecordError>> {
+        let started = std::time::Instant::now();
         let this = &*self;
-        write_shaped(
+        let results = write_shaped(
             &this.writer,
             writes.iter().map(|write| this.shape(write)),
             |kind, target| this.confirming(kind, target),
-        )
+        );
+        // One line per write, each with the batch's duration: the writes were
+        // started together and confirmed together.
+        let ms = started.elapsed().as_millis();
+        for (write, result) in writes.iter().zip(&results) {
+            let (call, kind, subkey) = batch_target(write);
+            let outcome = match result {
+                Ok(()) => "ok in a batch".to_owned(),
+                Err(e) => format!("failed in a batch, {e}"),
+            };
+            crate::vtrace!("{}", call_line(call, kind, Some(subkey), ms, &outcome));
+        }
+        results
     }
 }
 
@@ -1174,7 +1324,13 @@ impl RunnerRecords for VeilidRecords {
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
-        VeilidRecords::inspect_channel(self, lookup_key)
+        traced(
+            "inspect",
+            "channel",
+            None,
+            || VeilidRecords::inspect_channel(self, lookup_key),
+            ok,
+        )
     }
 
     fn inspect_advert(
@@ -1182,7 +1338,13 @@ impl RunnerRecords for VeilidRecords {
         owner: &AdvertOwnerSeed,
         subkeys: u16,
     ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
-        VeilidRecords::inspect_advert(self, owner, subkeys)
+        traced(
+            "inspect",
+            "advert",
+            None,
+            || VeilidRecords::inspect_advert(self, owner, subkeys),
+            ok,
+        )
     }
 
     fn inspect_drop(
@@ -1190,7 +1352,13 @@ impl RunnerRecords for VeilidRecords {
         owner: &DropOwnerSeed,
         subkeys: u16,
     ) -> core::result::Result<Vec<SubkeyReport>, RecordError> {
-        VeilidRecords::inspect_drop(self, owner, subkeys)
+        traced(
+            "inspect",
+            "drop",
+            None,
+            || VeilidRecords::inspect_drop(self, owner, subkeys),
+            ok,
+        )
     }
 
     fn publish_advert(
@@ -1199,14 +1367,26 @@ impl RunnerRecords for VeilidRecords {
         subkeys: u16,
         bytes: &[u8],
     ) -> core::result::Result<(), RecordError> {
-        VeilidRecords::publish_advert(self, owner, subkeys, bytes)
+        traced(
+            "write",
+            "advert",
+            Some(ADVERT_SUBKEY),
+            || VeilidRecords::publish_advert(self, owner, subkeys, bytes),
+            ok,
+        )
     }
 
     fn erase_channel(
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> core::result::Result<(), RecordError> {
-        VeilidRecords::erase_channel(self, lookup_key)
+        traced(
+            "erase",
+            "channel",
+            None,
+            || VeilidRecords::erase_channel(self, lookup_key),
+            ok,
+        )
     }
 
     /// Open the channel record the seed owns without creating it. `None` is
@@ -1217,45 +1397,53 @@ impl RunnerRecords for VeilidRecords {
         owner: &ChannelOwnerSeed,
         subkeys: u16,
     ) -> core::result::Result<Option<[u8; HELLO_LOOKUP_KEY_LEN]>, RecordError> {
-        let (shape, keypair, lookup_key) = channel_open_plan(owner.as_bytes(), subkeys)?;
-        let transport = &self.transport;
-        let opening = keypair.clone();
-        let opened = block(retry_transient(
-            "dm records channel open without create",
+        traced(
+            "open existing",
+            "channel",
+            None,
             || {
-                let opening = opening.clone();
-                async move {
-                    let record_lock =
-                        rendezvous::record_lock(&transport.record_locks, &opening.key());
-                    let _open_guard = record_lock.lock().await;
-                    rendezvous::open_cached_optional(
-                        &transport.opened,
-                        &rendezvous::cached_record_id(&opening.key(), shape),
-                        rendezvous::open_only(
-                            &transport.gate,
-                            &transport.api,
-                            &transport.rc,
-                            &opening,
-                            shape,
-                        ),
-                    )
-                    .await
-                    .map(|handle| handle.is_some())
+                let (shape, keypair, lookup_key) = channel_open_plan(owner.as_bytes(), subkeys)?;
+                let transport = &self.transport;
+                let opening = keypair.clone();
+                let opened = block(retry_transient(
+                    "dm records channel open without create",
+                    || {
+                        let opening = opening.clone();
+                        async move {
+                            let record_lock =
+                                rendezvous::record_lock(&transport.record_locks, &opening.key());
+                            let _open_guard = record_lock.lock().await;
+                            rendezvous::open_cached_optional(
+                                &transport.opened,
+                                &rendezvous::cached_record_id(&opening.key(), shape),
+                                rendezvous::open_only(
+                                    &transport.gate,
+                                    &transport.api,
+                                    &transport.rc,
+                                    &opening,
+                                    shape,
+                                ),
+                            )
+                            .await
+                            .map(|handle| handle.is_some())
+                        }
+                    },
+                ))
+                .map_err(RecordError::new)?;
+                if !opened {
+                    return Ok(None);
                 }
+                self.own_channels.insert(
+                    lookup_key,
+                    OwnChannel {
+                        owner: keypair,
+                        shape,
+                    },
+                );
+                Ok(Some(lookup_key))
             },
-        ))
-        .map_err(RecordError::new)?;
-        if !opened {
-            return Ok(None);
-        }
-        self.own_channels.insert(
-            lookup_key,
-            OwnChannel {
-                owner: keypair,
-                shape,
-            },
-        );
-        Ok(Some(lookup_key))
+            found,
+        )
     }
 
     fn write_counts(&self) -> WriteCountsSnapshot {
@@ -3243,5 +3431,114 @@ mod tests {
             What::Subkey { subkey, value } => Some((*subkey, value.len())),
             What::Delete => None,
         }
+    }
+
+    /// A traced call emits exactly one line, naming the call, the record kind,
+    /// the subkey, the duration and the outcome, whether it succeeds or fails.
+    #[test]
+    fn a_traced_call_emits_one_line_naming_what_it_did() {
+        let mut lines = Vec::new();
+        let read = traced_to(
+            &mut |line| lines.push(line.to_owned()),
+            "read",
+            "channel",
+            Some(3),
+            || Ok(Some(vec![1u8, 2])),
+            found,
+        );
+        assert!(read.is_ok());
+        let failed = traced_to(
+            &mut |line| lines.push(line.to_owned()),
+            "write",
+            "drop",
+            Some(7),
+            || Err::<(), _>(RecordError::new(RecordsError::ChannelNotOpened)),
+            ok,
+        );
+        assert!(failed.is_err());
+        let inspected = traced_to(
+            &mut |line| lines.push(line.to_owned()),
+            "inspect",
+            "advert",
+            None,
+            || Ok(Vec::<SubkeyReport>::new()),
+            ok,
+        );
+        assert!(inspected.is_ok());
+        assert_eq!(lines.len(), 3, "one line per call: {lines:?}");
+        assert!(lines[0].starts_with("dm records: read channel subkey 3: found in "));
+        assert!(lines[1].starts_with("dm records: write drop subkey 7: failed, "));
+        assert!(lines[2].starts_with("dm records: inspect advert: ok in "));
+        assert!(lines.iter().all(|line| line.ends_with(" ms")), "{lines:?}");
+    }
+
+    /// The methods of `impl_header`'s block in `source` whose body names none
+    /// of `tracers`, by name. Nested blocks are skipped over by brace depth.
+    fn untraced_methods(source: &str, impl_header: &str, tracers: &[&str]) -> Vec<String> {
+        let start = source
+            .find(impl_header)
+            .expect("the impl block is in the source");
+        let body = &source[start..];
+        let open = body.find('{').expect("the impl block opens");
+        let mut depth = 0usize;
+        let mut end = open;
+        for (i, c) in body[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let block = &body[open + 1..end];
+        let mut untraced = Vec::new();
+        let mut rest = block;
+        while let Some(at) = rest.find("\n    fn ") {
+            let after = &rest[at + "\n    fn ".len()..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let next = after.find("\n    fn ").unwrap_or(after.len());
+            let method = &after[..next];
+            if !tracers.iter().any(|tracer| method.contains(tracer)) {
+                untraced.push(name);
+            }
+            rest = &after[next..];
+        }
+        untraced
+    }
+
+    /// Every record store method that reaches the network traces its call:
+    /// the only methods without a trace are the four that make none.
+    #[test]
+    fn every_record_call_is_traced() {
+        let tracers = ["traced(", "call_line("];
+        let probe = "impl Records for X {\n    fn a(&self) {\n        traced(1)\n    }\n    fn b(&self) {\n        if x { y() }\n    }\n}";
+        assert_eq!(
+            untraced_methods(probe, "impl Records for X", &tracers),
+            vec!["b".to_owned()],
+            "the probe finds a method without a trace and passes one with"
+        );
+        let source = include_str!("records.rs");
+        assert_eq!(
+            untraced_methods(source, "impl Records for VeilidRecords", &tracers),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            untraced_methods(source, "impl RunnerRecords for VeilidRecords", &tracers),
+            vec![
+                "classify".to_owned(),
+                "take_scan_failure".to_owned(),
+                "same_local_refusal".to_owned(),
+                "write_counts".to_owned(),
+            ],
+            "only the methods that make no network call are untraced"
+        );
     }
 }

@@ -24,7 +24,16 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+### Fixed
+
+- `daemonseed-core`: a direct-message ring read stops at a slot holding a message the conversation does not open, such as one left by a deleted conversation under the same channel records, instead of failing; the initiator now recognises an acceptance in that case. `Acceptance`, `Accepted` and `Batch` report the slot as `unopened` (`Unopened { seq, subkey, error }`), and the runner counts it in `HealthCounters::slots_unopened` and traces it.
+- `daemonseed-veilid-net`: the direct-message runner serves queued commands between the network calls of a drop scan, collection pass, preview or repair instead of after the pass; a scan drops requests a command served meanwhile accepted or blocked, and a collection re-reads a conversation a command changed.
+
 ### Added
+
+- `daemonseed-veilid-net`: one trace line per direct-message record call (call, record kind, subkey, duration, outcome), start and end lines for every runner step, the error of every hello that does not settle, and a drop-scan summary counting settled, failed and other hellos.
+- `daemonseed-core`: `RecordKind::CorrespondentHandle`, `Store::record_handle`, `Store::handle`, `LoadedConv::handle`, `flows::collect_slot`. `daemonseed-veilid-net`: `RunnerCommand::NoteHandle`, `ConversationSummary::handle`, `DmCorrespondence::handle`, `dm::view::dm_name`. The GUI and TUI name a conversation by the live roster handle, else the stored handle, else the fingerprint; the GUI notes roster handles to the runner.
+- `daemonseed-veilid-net`: `VeilidNetConfig::device_key_password` and `protect_with_profile`; Veilid's device encryption key is protected under a password derived from the unlocked profile (`daemonseed_core::kdf::veilid_device_key_password`), under a namespace carrying the profile's tag (`veilid_namespace_tag`), or a random one per start under a `-noprofile` namespace. Storage whose key is refused, confirmed by a start over an empty table directory, is cleared and recreated.
 
 - `daemonseed-veilid-net`: `dm::records::VeilidRecords`, `daemonseed_core::dm::flows::Records` over real
   distributed-hash-table records. Reads go through the DHT gate's read pool under a bounded GET; writes

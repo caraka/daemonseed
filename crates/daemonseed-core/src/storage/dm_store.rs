@@ -149,7 +149,9 @@ use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::dm::block_list::BLOCK_LIST_CAPACITY;
 use crate::dm::contact_cache::CONTACT_RECORD_LEN;
-use crate::dm::store::{ADVERT_KEYS_RECORD_LEN, CONV_OUTBOX_RECORD_LEN, CONV_RECORD_LEN};
+use crate::dm::store::{
+    ADVERT_KEYS_RECORD_LEN, CONV_OUTBOX_RECORD_LEN, CONV_RECORD_LEN, HANDLE_RECORD_LEN,
+};
 use crate::dm::{LEN_PREFIX, domain, push_lp, unpad};
 use crate::storage::atomic_file::{
     AtomicReplaceError, Durability, FileLock, LockError, RealDurability, TMP_INFIX,
@@ -348,6 +350,10 @@ pub enum RecordKind {
     /// key, which is the leak [`OUTBOX_CAPACITY`]'s fixed size is bought to
     /// close.
     ConversationOutbox,
+    /// The handle a room roster last gave the correspondent, kept so the
+    /// conversation is still named once no roster lists them.
+    /// [`crate::dm::store`] owns the encoding.
+    CorrespondentHandle,
 }
 
 /// Whether a [`RecordKind`] belongs to one correspondence or to the profile.
@@ -372,7 +378,7 @@ impl RecordKind {
     /// records filters on [`RecordKind::scope`] rather than walking this
     /// directly — [`DmStore::present_unlocked`] is that filter and is the only
     /// enumeration a caller needs.
-    pub const ALL: [RecordKind; 9] = [
+    pub const ALL: [RecordKind; 10] = [
         RecordKind::Resume,
         RecordKind::Provisional,
         RecordKind::Outbox,
@@ -382,6 +388,7 @@ impl RecordKind {
         RecordKind::AdvertKeys,
         RecordKind::Conversation,
         RecordKind::ConversationOutbox,
+        RecordKind::CorrespondentHandle,
     ];
 
     /// The stable string form, for local persistence.
@@ -404,6 +411,7 @@ impl RecordKind {
             RecordKind::AdvertKeys => "advert-keys",
             RecordKind::Conversation => "conversation",
             RecordKind::ConversationOutbox => "conversation-outbox",
+            RecordKind::CorrespondentHandle => "correspondent-handle",
         }
     }
 
@@ -437,6 +445,7 @@ impl RecordKind {
             RecordKind::AdvertKeys => "advert-keys.bin",
             RecordKind::Conversation => "conversation.bin",
             RecordKind::ConversationOutbox => "conversation-outbox.bin",
+            RecordKind::CorrespondentHandle => "correspondent-handle.bin",
         }
     }
 
@@ -460,6 +469,7 @@ impl RecordKind {
             RecordKind::AdvertKeys => ADVERT_KEYS_RECORD_LEN,
             RecordKind::Conversation => CONV_RECORD_LEN,
             RecordKind::ConversationOutbox => CONV_OUTBOX_RECORD_LEN,
+            RecordKind::CorrespondentHandle => HANDLE_RECORD_LEN,
         }
     }
 
@@ -498,6 +508,7 @@ impl RecordKind {
             RecordKind::AdvertKeys => 7,
             RecordKind::Conversation => 8,
             RecordKind::ConversationOutbox => 9,
+            RecordKind::CorrespondentHandle => 10,
         }
     }
 
@@ -529,7 +540,8 @@ impl RecordKind {
             | RecordKind::ReceiveCursor
             | RecordKind::ContactCache
             | RecordKind::Conversation
-            | RecordKind::ConversationOutbox => RecordScope::Correspondence,
+            | RecordKind::ConversationOutbox
+            | RecordKind::CorrespondentHandle => RecordScope::Correspondence,
             RecordKind::BlockList | RecordKind::AdvertKeys => RecordScope::Profile,
         }
     }
@@ -2580,7 +2592,8 @@ mod tests {
                 | RecordKind::BlockList
                 | RecordKind::AdvertKeys
                 | RecordKind::Conversation
-                | RecordKind::ConversationOutbox => {}
+                | RecordKind::ConversationOutbox
+                | RecordKind::CorrespondentHandle => {}
             }
         }
         let mut names: Vec<_> = RecordKind::ALL.iter().map(|k| k.file_name()).collect();
@@ -2649,11 +2662,16 @@ mod tests {
             CONV_OUTBOX_RECORD_LEN
         );
         assert_eq!(CONV_OUTBOX_RECORD_LEN, 1_033_544);
+        assert_eq!(
+            RecordKind::CorrespondentHandle.capacity(),
+            HANDLE_RECORD_LEN
+        );
+        assert_eq!(HANDLE_RECORD_LEN, 287);
 
         // Every kind, with no exemption: the cursor's exemption is what #389
         // removed, so a loop that filtered any kind out would be the shape of
         // the defect rather than a test of the fix.
-        assert_eq!(RecordKind::ALL.len(), 9, "the loop must cover every kind");
+        assert_eq!(RecordKind::ALL.len(), 10, "the loop must cover every kind");
         for kind in RecordKind::ALL {
             assert_eq!(
                 kind.on_disk_len(),
@@ -2681,6 +2699,7 @@ mod tests {
         assert_eq!(RecordKind::AdvertKeys.aad_tag(), 7);
         assert_eq!(RecordKind::Conversation.aad_tag(), 8);
         assert_eq!(RecordKind::ConversationOutbox.aad_tag(), 9);
+        assert_eq!(RecordKind::CorrespondentHandle.aad_tag(), 10);
         let mut tags: Vec<_> = RecordKind::ALL.iter().map(|k| k.aad_tag()).collect();
         tags.sort_unstable();
         tags.dedup();
@@ -2704,6 +2723,7 @@ mod tests {
                 RecordKind::ConversationOutbox,
                 &payload(CONV_OUTBOX_RECORD_LEN),
             )?;
+            g.replace(RecordKind::CorrespondentHandle, &payload(3))?;
             g.replace(RecordKind::ReceiveCursor, &7u64.to_be_bytes())
         })
         .unwrap();
@@ -3567,7 +3587,7 @@ mod tests {
         // tautology that holds for any set of kinds — it would keep passing if a
         // member were silently replaced by another. The literal is the only part
         // of this test that notices the enum changing shape.
-        assert_eq!(seen.len(), 9, "nine kinds, nine distinct stable strings");
+        assert_eq!(seen.len(), 10, "ten kinds, ten distinct stable strings");
         assert_eq!(RecordKind::from_stable_str("resume.bin"), None);
         assert_eq!(RecordKind::from_stable_str("nope"), None);
     }
@@ -3602,7 +3622,7 @@ mod tests {
                 .iter()
                 .filter(|k| k.scope() == RecordScope::Correspondence)
                 .count(),
-            7,
+            8,
             "one erasure per correspondence kind"
         );
 
@@ -3664,7 +3684,7 @@ mod tests {
     /// is reachable, and this test says plainly that it is only that half.
     #[test]
     fn every_kind_survives_the_hop_from_error_to_trust_event() {
-        assert_eq!(RecordKind::ALL.len(), 9, "one case per kind");
+        assert_eq!(RecordKind::ALL.len(), 10, "one case per kind");
         for kind in RecordKind::ALL {
             for scrubbed in [false, true] {
                 let err = DmStoreError::ErasureBlocked {
@@ -4838,7 +4858,7 @@ mod tests {
         // about the bound vacuous.
         assert_eq!(
             RecordKind::ALL.len(),
-            9,
+            10,
             "the sweep below must not be empty"
         );
         assert!(

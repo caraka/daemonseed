@@ -991,65 +991,83 @@ pub fn collect<R: Records>(
     advert_keys: &AdvertKeys,
     is_blocked: impl Fn(&[u8; ml_dsa::PK_LEN]) -> bool,
 ) -> Result<Vec<Surfaced>, FlowError> {
-    let my_pk = me.signer.public_key();
-    let drop_owner = drop_plane::derive_owner_seed(my_pk)?;
     let mut surfaced = Vec::new();
-
     for slot in 0..drop_plane::DROP_SUBKEYS {
-        let Ok(Some(bytes)) = records.read_drop_slot(&drop_owner, drop_plane::DROP_SUBKEYS, slot)
-        else {
-            continue;
-        };
-        let Some((mut hello, decapsulated, serial)) =
-            open_against_either(advert_keys, &bytes, my_pk, slot)
-        else {
-            continue;
-        };
-        // A rewritten hello's channel is sealed under the secret it carries,
-        // not under the one its own decapsulation yielded.
-        let rewritten = hello.original_secret.is_some();
-        let shared_secret = hello.original_secret.take().unwrap_or(decapsulated);
-        let Ok(control_key) = channel::control_key(&shared_secret) else {
-            continue;
-        };
-        let Some(opening) = read_opening(records, &control_key, &hello.lookup_key) else {
-            continue;
-        };
-        let Some(bound) = opening_serial(rewritten, serial, &opening) else {
-            continue;
-        };
-        if opening.verify(my_pk, &hello.lookup_key, bound).is_err() {
-            continue;
+        if let Some(one) = collect_slot(store, records, me, advert_keys, &is_blocked, slot)? {
+            surfaced.push(one);
         }
-        let identity = opening.writer_identity_pk.clone();
-
-        if is_blocked(&identity) {
-            surfaced.push(Surfaced::Dropped { identity });
-            continue;
-        }
-
-        // Read afresh for each hello: an acceptance settled earlier in this
-        // scan changes what the next one is. A failure that belongs to one
-        // correspondent is carried as a result rather than returned, so one
-        // unsettleable hello cannot hide every hello after it; only a failure
-        // of this side's own store stops the scan.
-        let settled = settle(
-            store,
-            records,
-            me,
-            &identity,
-            &hello,
-            opening,
-            shared_secret,
-            slot,
-        );
-        surfaced.push(match settled {
-            Ok(settled) => settled,
-            Err(FlowError::Store(e)) => return Err(FlowError::Store(e)),
-            Err(error) => Surfaced::Failed { identity, error },
-        });
     }
     Ok(surfaced)
+}
+
+/// Read one slot of this side's drop and settle the hello in it — the body of
+/// [`collect`] for one slot, for a caller that does other work between slots.
+///
+/// `None` where the slot holds no hello this side verifies, for any of the
+/// reasons [`collect`] skips a slot silently. A caller that visits every slot
+/// from 0 to [`drop_plane::DROP_SUBKEYS`] in order, one call each, performs
+/// exactly what [`collect`] performs.
+pub fn collect_slot<R: Records>(
+    store: &Store,
+    records: &mut R,
+    me: &Me<'_>,
+    advert_keys: &AdvertKeys,
+    is_blocked: impl Fn(&[u8; ml_dsa::PK_LEN]) -> bool,
+    slot: u16,
+) -> Result<Option<Surfaced>, FlowError> {
+    let my_pk = me.signer.public_key();
+    let drop_owner = drop_plane::derive_owner_seed(my_pk)?;
+    let Ok(Some(bytes)) = records.read_drop_slot(&drop_owner, drop_plane::DROP_SUBKEYS, slot)
+    else {
+        return Ok(None);
+    };
+    let Some((mut hello, decapsulated, serial)) =
+        open_against_either(advert_keys, &bytes, my_pk, slot)
+    else {
+        return Ok(None);
+    };
+    // A rewritten hello's channel is sealed under the secret it carries,
+    // not under the one its own decapsulation yielded.
+    let rewritten = hello.original_secret.is_some();
+    let shared_secret = hello.original_secret.take().unwrap_or(decapsulated);
+    let Ok(control_key) = channel::control_key(&shared_secret) else {
+        return Ok(None);
+    };
+    let Some(opening) = read_opening(records, &control_key, &hello.lookup_key) else {
+        return Ok(None);
+    };
+    let Some(bound) = opening_serial(rewritten, serial, &opening) else {
+        return Ok(None);
+    };
+    if opening.verify(my_pk, &hello.lookup_key, bound).is_err() {
+        return Ok(None);
+    }
+    let identity = opening.writer_identity_pk.clone();
+
+    if is_blocked(&identity) {
+        return Ok(Some(Surfaced::Dropped { identity }));
+    }
+
+    // Read afresh for each hello: an acceptance settled earlier in this
+    // scan changes what the next one is. A failure that belongs to one
+    // correspondent is carried as a result rather than returned, so one
+    // unsettleable hello cannot hide every hello after it; only a failure
+    // of this side's own store stops the scan.
+    let settled = settle(
+        store,
+        records,
+        me,
+        &identity,
+        &hello,
+        opening,
+        shared_secret,
+        slot,
+    );
+    Ok(Some(match settled {
+        Ok(settled) => settled,
+        Err(FlowError::Store(e)) => return Err(FlowError::Store(e)),
+        Err(error) => Surfaced::Failed { identity, error },
+    }))
 }
 
 /// Settle one verified hello against what this side already holds for the
@@ -1226,6 +1244,12 @@ pub struct Accepted {
     pub hello_slot: u16,
     /// How many times that hello re-picked its slot.
     pub repicks: u32,
+    /// The slot the ring read stopped at because its message does not open
+    /// under this conversation, or `None` where it stopped at an empty slot.
+    /// Such a slot may be left by an earlier conversation under the same
+    /// channel records, or hold a message that will not decrypt; it is read
+    /// again by the next collection.
+    pub unopened: Option<Unopened>,
 }
 
 /// Accept a contact request — § Flows, *Collection*, steps 3 to 5.
@@ -1621,6 +1645,7 @@ fn finish_accept<R: Records>(
         messages: read.messages,
         hello_slot,
         repicks,
+        unopened: read.unopened,
     })
 }
 
@@ -1886,6 +1911,12 @@ pub struct Acceptance {
     pub peer_cursor: Option<u64>,
     /// Any reply already in the correspondent's ring, in sequence order.
     pub messages: Vec<ReceivedMessage>,
+    /// The slot the ring read stopped at because its message does not open
+    /// under this conversation, or `None` where it stopped at an empty slot.
+    /// Such a slot may be left by an earlier conversation under the same
+    /// channel records, or hold a message that will not decrypt; it is read
+    /// again by the next collection.
+    pub unopened: Option<Unopened>,
 }
 
 /// Complete this side's own first contact — § Flows, *A hello from a known
@@ -1951,6 +1982,7 @@ pub fn recognise_acceptance<R: Records>(
         lookup_key: *lookup_key,
         peer_cursor: cursor,
         messages: read.messages,
+        unopened: read.unopened,
     })
 }
 
@@ -1978,10 +2010,36 @@ impl core::fmt::Debug for ReceivedMessage {
 struct RingRead {
     messages: Vec<ReceivedMessage>,
     collected: u64,
+    /// The slot the read stopped at because its message does not open, where
+    /// it stopped at one.
+    unopened: Option<Unopened>,
+}
+
+/// A ring slot whose header names the expected sequence and whose message does
+/// not open under the conversation's key schedule. The ring read stopped there
+/// and records nothing of it; the next read tries the slot again.
+#[derive(Debug)]
+pub struct Unopened {
+    /// The sequence the slot was read for.
+    pub seq: u64,
+    /// The channel subkey that holds it.
+    pub subkey: u16,
+    /// Why the message did not open.
+    pub error: ChainError,
 }
 
 /// Read a correspondent's ring from `from`, opening each message in turn and
 /// stopping at the first sequence the record store does not hold.
+///
+/// A slot whose header names the expected sequence and whose message does not
+/// open under this conversation's key schedule also ends the read, and is
+/// reported in [`RingRead::unopened`]. Channel records are derived from the
+/// two identities and [`FIRST_GENERATION`], so a conversation established
+/// again after a delete reads a ring whose later slots still hold the deleted
+/// conversation's messages until the correspondent overwrites them. Such a
+/// slot is not yet this conversation's message, as an empty one is not: the
+/// key schedule is left where it was, and the next read finds the slot
+/// overwritten. A message that opens and then does not decode is an error.
 fn read_ring<R: Records>(
     records: &mut R,
     conversation: &mut Conversation,
@@ -1991,6 +2049,7 @@ fn read_ring<R: Records>(
 ) -> Result<RingRead, FlowError> {
     let mut messages = Vec::new();
     let mut collected = from;
+    let mut unopened = None;
     loop {
         let Some(raw) = records.read_channel(lookup_key, channel::slot_for(collected))? else {
             break;
@@ -2001,7 +2060,19 @@ fn read_ring<R: Records>(
         if header.seq != collected {
             break;
         }
-        let plaintext = Zeroizing::new(conversation.open(&header, sealed)?);
+        // `open` changes the key schedule only once the message has opened.
+        let opened = match conversation.open(&header, sealed) {
+            Ok(opened) => opened,
+            Err(error) => {
+                unopened = Some(Unopened {
+                    seq: collected,
+                    subkey: channel::slot_for(collected),
+                    error,
+                });
+                break;
+            }
+        };
+        let plaintext = Zeroizing::new(opened);
         let (sent_at, body) = channel::decode_message_plaintext(&plaintext)?;
         ring.advance_peer_collected(header.cursor);
         messages.push(ReceivedMessage {
@@ -2013,6 +2084,7 @@ fn read_ring<R: Records>(
     Ok(RingRead {
         messages,
         collected,
+        unopened,
     })
 }
 
@@ -2200,6 +2272,12 @@ pub struct Batch {
     pub my_collected: u64,
     /// Whether the cursor was published to this side's control subkey.
     pub cursor_published: bool,
+    /// The slot the ring read stopped at because its message does not open
+    /// under this conversation, or `None` where it stopped at an empty slot.
+    /// Such a slot may be left by an earlier conversation under the same
+    /// channel records, or hold a message that will not decrypt; it is read
+    /// again by the next collection.
+    pub unopened: Option<Unopened>,
 }
 
 /// Read everything the correspondent has written since this side's cursor and
@@ -2259,6 +2337,7 @@ pub fn collect_batch<R: Records>(
             messages: read.messages,
             my_collected: read.collected,
             cursor_published: false,
+            unopened: read.unopened,
         });
     }
     let key = state
@@ -2285,6 +2364,7 @@ pub fn collect_batch<R: Records>(
         messages: read.messages,
         my_collected: read.collected,
         cursor_published: true,
+        unopened: read.unopened,
     })
 }
 
@@ -8371,30 +8451,46 @@ mod tests {
         assert_eq!(seq, 1);
     }
 
-    /// One correspondent whose channel this side cannot read does not stop the
-    /// poll: the failure is reported and the scan carries on.
+    /// One correspondent whose acceptance this side cannot recognise does not
+    /// stop the poll: the failure is reported and the scan carries on.
     #[test]
     fn one_unsettleable_correspondent_does_not_stop_the_scan() {
         let (a, b, mut net) = scene();
         a_opens(&a, &b, &mut net, b"the first message");
-        let accepted = b_accepts(&b, &mut net, b"the reply");
+        let request = only_request(b_collects(&b, &mut net));
+        let mut entropy = Seeded::at(909);
+        let accepted = accept(
+            &b.store(),
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B accepts");
 
-        // B's reply is corrupted in place: its header still decodes, so the
-        // read reaches the open, and the open fails.
-        let slot = channel::slot_for(0);
-        let raw = net
-            .channels
-            .get_mut(&(accepted.outgoing_lookup_key, slot))
-            .expect("B's reply is on the network");
-        let last = raw.len() - 1;
-        raw[last] ^= 0xff;
+        // B's reply is replaced by a message that opens under the
+        // conversation's key schedule and whose plaintext does not decode.
+        let mut unframed = chain::accept(&request.shared_secret, &request.first_ratchet_pk)
+            .expect("B's key schedule");
+        let mut entropy = Seeded::at(77);
+        let (header, sealed) = unframed
+            .seal(b"unframed", channel::DEVICE_ID_SINGLE_DEVICE, |x| {
+                entropy.fill(x)
+            })
+            .expect("seal without the prefix");
+        let mut bytes = header.encode();
+        bytes.extend_from_slice(&sealed);
+        net.write_channel(&accepted.outgoing_lookup_key, channel::slot_for(0), &bytes)
+            .expect("overwrite B's reply");
+        let store_a = a.store();
 
         // A third party reaches A at the same time.
         let c = Party::new(0xc3);
         c.publish(&mut net);
         a_opens(&c, &a, &mut net, b"from a third party");
 
-        let store_a = a.store();
         let surfaced =
             collect(&store_a, &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
 
@@ -8411,5 +8507,144 @@ mod tests {
                 .any(|s| matches!(s, Surfaced::ContactRequest(_))),
             "the other hello was hidden by the failure: {surfaced:?}"
         );
+    }
+
+    /// Writes the fixture `dm::store`'s
+    /// `a_store_without_handle_records_loads_every_conversation` loads: the
+    /// conversation record of each side of an accepted conversation in which B
+    /// sent a second message, under `$FIXTURE_OUT/{a,b}/<label>/`, sealed under
+    /// at-rest keys `[0xa1; 32]` and `[0xb2; 32]`. Run with
+    /// `FIXTURE_OUT=crates/daemonseed-core/tests/fixtures/dm-store-without-handles
+    /// cargo test -p daemonseed-core --lib generate_dm_store_without_handles_fixture -- --ignored`
+    /// only from a tree whose conversation record layout is the one the fixture
+    /// is to hold.
+    #[test]
+    #[ignore = "writes a test fixture; run by hand"]
+    fn generate_dm_store_without_handles_fixture() {
+        let out = std::path::PathBuf::from(std::env::var("FIXTURE_OUT").expect("FIXTURE_OUT"));
+        let (a, b, mut net) = scene();
+        let (_, accepted) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(31);
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            b"another",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B sends");
+        for (name, party) in [("a", &a), ("b", &b)] {
+            for (path, bytes) in profile_image(party) {
+                if path.file_name().and_then(|n| n.to_str()) != Some("conversation.bin") {
+                    continue;
+                }
+                let label = path
+                    .parent()
+                    .and_then(|dir| dir.file_name())
+                    .expect("a label directory");
+                let to = out.join(name).join(label);
+                std::fs::create_dir_all(&to).expect("make the label directory");
+                std::fs::write(to.join("conversation.bin"), bytes).expect("write the record");
+            }
+        }
+    }
+
+    /// A conversation established again after a delete reads channel records
+    /// that still hold the deleted conversation's messages. A slot holding one
+    /// of them ends the ring read rather than failing it: the initiator
+    /// recognises the acceptance and reads the reply, and the correspondent's
+    /// next message, written over the old one, is read by the next batch.
+    #[test]
+    fn a_ring_slot_left_by_a_deleted_conversation_does_not_stop_the_recognition() {
+        let (a, b, mut net) = scene();
+        let (_, first) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(31);
+        send_message(
+            &b.store(),
+            &mut net,
+            &first.peer,
+            b"from the deleted conversation",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B sends a second message");
+
+        // Both sides deleted the conversation: the same identities, fresh
+        // profiles, and the channel records still on the network.
+        let (a, b) = (Party::new(0xa1), Party::new(0xb2));
+        let store_a = a.store();
+        let mut entropy = Seeded::at(7_001);
+        let outcome = first_contact(
+            &store_a,
+            &mut net,
+            &a.me(),
+            b.pk(),
+            b"the first message again",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A's second first contact");
+        let peer_a = opened_peer(&outcome);
+        let request = only_request(b_collects(&b, &mut net));
+        let store_b = b.store();
+        let mut entropy = Seeded::at(7_002);
+        let accepted = accept(
+            &store_b,
+            &mut net,
+            &b.me(),
+            &request,
+            b"the reply again",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B accepts again");
+        assert_eq!(
+            accepted.outgoing_lookup_key, first.outgoing_lookup_key,
+            "the conversation reuses the deleted one's channel record"
+        );
+        assert!(
+            net.channels
+                .contains_key(&(accepted.outgoing_lookup_key, channel::slot_for(1))),
+            "the deleted conversation's second message is still in B's ring"
+        );
+
+        let surfaced =
+            collect(&store_a, &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        assert_eq!(surfaced.len(), 1, "one hello back: {surfaced:?}");
+        let acceptance = match surfaced.into_iter().next().expect("one result") {
+            Surfaced::Accepted(acceptance) => acceptance,
+            other => panic!("expected an acceptance, got {other:?}"),
+        };
+        assert_eq!(acceptance.peer, peer_a);
+        assert_eq!(acceptance.bodies(), vec![b"the reply again".to_vec()]);
+        assert_eq!(
+            acceptance.unopened.as_ref().map(|u| (u.seq, u.subkey)),
+            Some((1, channel::slot_for(1))),
+            "the old slot ended the read"
+        );
+        let state = store_a
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        assert!(!state.awaiting_acceptance, "the acceptance is recognised");
+        assert_eq!(
+            state.my_collected, 1,
+            "the old slot is not counted collected"
+        );
+
+        let mut entropy = Seeded::at(7_003);
+        send_message(
+            &store_b,
+            &mut net,
+            &accepted.peer,
+            b"the second message again",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B sends over the old slot");
+        let batch = collect_batch(&store_a, &mut net, &peer_a).expect("A collects a batch");
+        assert_eq!(batch.bodies(), vec![b"the second message again".to_vec()]);
+        assert!(batch.unopened.is_none());
     }
 }

@@ -725,16 +725,20 @@ fn dm_command_token(command: &RunnerCommand) -> Option<CommandToken> {
         | RunnerCommand::Send { token, .. }
         | RunnerCommand::Accept { token, .. }
         | RunnerCommand::DeleteConversation { token, .. } => Some(*token),
-        RunnerCommand::Block { .. } | RunnerCommand::Unblock { .. } | RunnerCommand::Shutdown => {
-            None
-        }
+        RunnerCommand::Block { .. }
+        | RunnerCommand::Unblock { .. }
+        | RunnerCommand::NoteHandle { .. }
+        | RunnerCommand::Shutdown => None,
     }
 }
 
 /// Answer a command no runner will take, the way the runner answers one it
-/// stopped before serving. A shutdown needs no answer.
+/// stopped before serving. A shutdown and a handle note need no answer.
 fn refuse_dm_command(evt_tx: &UnboundedSender<NetEvent>, command: &RunnerCommand) {
-    if matches!(command, RunnerCommand::Shutdown) {
+    if matches!(
+        command,
+        RunnerCommand::Shutdown | RunnerCommand::NoteHandle { .. }
+    ) {
         return;
     }
     let _ = evt_tx.send(NetEvent::Dm(Arc::new(RunnerEvent::Refused {
@@ -1005,7 +1009,8 @@ async fn handle_command(
             if !self_handle.is_empty() && self_handle != "anon" {
                 *my_handle = Some(self_handle);
             }
-            connect(evt_tx, net, ev_rx).await;
+            let profile_secret = dm_session_keys.as_ref().map(|keys| &*keys.at_rest_key);
+            connect(evt_tx, net, ev_rx, profile_secret.map(|key| key.as_slice())).await;
             if net.is_some() {
                 // Subscribe the world-derivable lobby so share announcements fold
                 // into the catalog as they arrive (Phase 3 discovery) and so lobby
@@ -1304,6 +1309,9 @@ async fn connect(
     evt_tx: &UnboundedSender<NetEvent>,
     net: &mut Option<VeilidNetHandle>,
     ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>,
+    // The unlocked profile's at-rest key, which Veilid's device-key password
+    // derives from; `None` without a profile, which draws a fresh password.
+    profile_secret: Option<&[u8]>,
 ) {
     if net.is_some() {
         let _ = evt_tx.send(NetEvent::Connected {
@@ -1346,6 +1354,11 @@ async fn connect(
         // namespace for exactly this reason). Derive it from the distinct port so
         // it tracks automatically.
         cfg.namespace = format!("daemonseed-{port}");
+    }
+    if let Some(secret) = profile_secret
+        && let Err(e) = cfg.protect_with_profile(secret)
+    {
+        return fail(evt_tx, format!("veilid device key: {e}"));
     }
 
     match VeilidNet::start(cfg).await {

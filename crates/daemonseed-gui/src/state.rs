@@ -1044,6 +1044,7 @@ impl GuiState {
         if let Some(c) = self.circles.get_mut(idx) {
             c.roster = roster;
         }
+        self.note_roster_handles();
     }
 
     /// The active room's cached HERE-NOW roster (option A) — repainted into the people

@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 use veilid_core::{
-    api_startup, OperationId, PublicKey, RecordKey, RouteBlob, RouteId, RoutingContext, Target,
-    VeilidAPI, VeilidConfig, VeilidUpdate,
+    OperationId, PublicKey, RecordKey, RouteBlob, RouteId, RoutingContext, Target, VeilidAPI,
+    VeilidConfig, VeilidUpdate,
 };
 
 use daemonseed_core::public_room::PublicRoomKey;
@@ -865,39 +865,7 @@ impl VeilidNet {
             },
         );
 
-        let mut vcfg = VeilidConfig::new(
-            "daemonseed_veilid_net",
-            "daemonseed",
-            "net",
-            Some(&cfg.storage_dir),
-            None,
-        );
-        vcfg.namespace = cfg.namespace.clone();
-        vcfg.protected_store.always_use_insecure_storage = true;
-        vcfg.protected_store.allow_insecure_fallback = true;
-        // Veilid timeouts stay at defaults (rpc 5s, dht value ops 10s).
-        // `rpc.timeout_ms` is not an app_call-only knob: it prices every RPC
-        // probe, the fanout slow-node throttle is pegged to 33% of it, and the
-        // config validator forces the DHT value budgets to >= 2x it — so
-        // raising it reprices every chat publish, sweep, and watch. veilid-core
-        // exposes no per-call app_call timeout ("governed by
-        // network.rpc.timeout_ms"); a longer fragment-fetch deadline needs an
-        // app-level mechanism, not this knob.
-        // Distinct listen ports let several nodes coexist on one host (tests).
-        if let Some(addr) = &cfg.listen_address {
-            vcfg.network.protocol.udp.listen_address = addr.clone();
-            vcfg.network.protocol.tcp.listen_address = addr.clone();
-            vcfg.network.protocol.ws.listen_address = addr.clone();
-        }
-        // D4: public network — no network_key_password. Override bootstrap only
-        // if the caller baked one in (the fra1 seed).
-        if !cfg.bootstrap.is_empty() {
-            vcfg.network.routing_table.bootstrap = cfg.bootstrap.clone();
-        }
-        // D3: pin the daemonseed-derived node identity.
-        let (pks, sks) = identity::identity_groups(&cfg.identity_seed)?;
-        vcfg.network.routing_table.public_keys = pks;
-        vcfg.network.routing_table.secret_keys = sks;
+        let vcfg = veilid_config(&cfg)?;
 
         crate::vtrace!(
             "start: namespace={:?} listen={:?} store={} bootstrap_overrides={}",
@@ -906,7 +874,7 @@ impl VeilidNet {
             cfg.storage_dir,
             cfg.bootstrap.len()
         );
-        let api = api_startup(update_callback, vcfg)
+        let api = crate::device_key::startup_protected(update_callback, vcfg)
             .await
             .map_err(|e| VeilidNetError::Startup(e.to_string()))?;
         crate::vtrace!("start: api_startup ok; node identity assigned");
@@ -2675,9 +2643,159 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
     }
 }
 
+/// The Veilid configuration a node started from `cfg` runs under: its storage
+/// directory and namespace, the insecure protected store with its device
+/// encryption key protected by [`VeilidNetConfig::device_key_password`], the
+/// listen address and bootstrap overrides, and the node identity.
+fn veilid_config(cfg: &VeilidNetConfig) -> Result<VeilidConfig> {
+    let (password, namespace) = match &cfg.device_key_password {
+        Some(password) => (password.as_str().to_owned(), cfg.namespace.clone()),
+        None => (
+            crate::config::random_password(getrandom::fill)
+                .ok_or_else(|| {
+                    VeilidNetError::Startup("no randomness for the device-key password".to_owned())
+                })?
+                .as_str()
+                .to_owned(),
+            format!("{}{}", cfg.namespace, crate::config::NO_PROFILE_SUFFIX),
+        ),
+    };
+    let mut vcfg = VeilidConfig::new(
+        "daemonseed_veilid_net",
+        "daemonseed",
+        "net",
+        Some(&cfg.storage_dir),
+        None,
+    );
+    vcfg.namespace = namespace;
+    vcfg.protected_store.always_use_insecure_storage = true;
+    vcfg.protected_store.allow_insecure_fallback = true;
+    // The insecure store keeps the device encryption key on disk; the
+    // password keeps it from being kept in the clear there.
+    vcfg.protected_store.device_encryption_key_password = password;
+    // Veilid timeouts stay at defaults (rpc 5s, dht value ops 10s).
+    // `rpc.timeout_ms` is not an app_call-only knob: it prices every RPC
+    // probe, the fanout slow-node throttle is pegged to 33% of it, and the
+    // config validator forces the DHT value budgets to >= 2x it — so
+    // raising it reprices every chat publish, sweep, and watch. veilid-core
+    // exposes no per-call app_call timeout ("governed by
+    // network.rpc.timeout_ms"); a longer fragment-fetch deadline needs an
+    // app-level mechanism, not this knob.
+    // Distinct listen ports let several nodes coexist on one host (tests).
+    if let Some(addr) = &cfg.listen_address {
+        vcfg.network.protocol.udp.listen_address = addr.clone();
+        vcfg.network.protocol.tcp.listen_address = addr.clone();
+        vcfg.network.protocol.ws.listen_address = addr.clone();
+    }
+    // D4: public network — no network_key_password. Override bootstrap only
+    // if the caller baked one in.
+    if !cfg.bootstrap.is_empty() {
+        vcfg.network.routing_table.bootstrap = cfg.bootstrap.clone();
+    }
+    // D3: pin the daemonseed-derived node identity.
+    let (pks, sks) = identity::identity_groups(&cfg.identity_seed)?;
+    vcfg.network.routing_table.public_keys = pks;
+    vcfg.network.routing_table.secret_keys = sks;
+    Ok(vcfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn node_seed() -> daemonseed_core::identity::keys::VeilidNodeSeed {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let mnemonic =
+            daemonseed_core::identity::mnemonic::Mnemonic::generate().expect("a recovery phrase");
+        daemonseed_core::identity::keys::derive_identity_keys(
+            &mnemonic,
+            daemonseed_core::identity::keys::Identity::Primary,
+        )
+        .expect("the identity")
+        .veilid_node_seed
+    }
+
+    /// Veilid runs with its device encryption key protected: without a profile
+    /// by a fresh random password each start, under a namespace no profile
+    /// uses; with one by the password the profile derives, the same on every
+    /// launch, under a namespace carrying the profile's tag. A source of
+    /// randomness that fails gives no password at all.
+    #[test]
+    fn the_device_key_password_reaches_veilid() {
+        let bare = VeilidNetConfig::new(node_seed(), "/tmp/unused");
+        let first = veilid_config(&bare).expect("a config");
+        let second = veilid_config(&bare).expect("a config");
+        let drawn = &first.protected_store.device_encryption_key_password;
+        assert_eq!(drawn.len(), 64, "a whole random password");
+        assert_ne!(
+            *drawn, second.protected_store.device_encryption_key_password,
+            "fresh per start"
+        );
+        assert_eq!(first.namespace, "daemonseed-noprofile");
+        assert!(
+            crate::config::random_password(|_| Err(getrandom::Error::UNSUPPORTED)).is_none(),
+            "a failed draw gives no password"
+        );
+
+        let mut profile = VeilidNetConfig::new(node_seed(), "/tmp/unused");
+        profile.protect_with_profile(&[0x21; 32]).expect("derive");
+        let mut relaunch = VeilidNetConfig::new(node_seed(), "/tmp/unused");
+        relaunch.protect_with_profile(&[0x21; 32]).expect("derive");
+        let (a, b) = (
+            veilid_config(&profile).expect("a config"),
+            veilid_config(&relaunch).expect("a config"),
+        );
+        assert_eq!(
+            a.protected_store.device_encryption_key_password,
+            *daemonseed_core::kdf::veilid_device_key_password(&[0x21; 32]).expect("derive")
+        );
+        assert_eq!(
+            a.protected_store.device_encryption_key_password,
+            b.protected_store.device_encryption_key_password
+        );
+        assert_eq!(a.namespace, b.namespace, "one namespace per profile");
+        assert!(a.namespace.starts_with("daemonseed-") && !a.namespace.ends_with("-noprofile"));
+    }
+
+    /// Two profiles and a start without a profile, over one storage directory
+    /// with one base namespace, each start without clearing the others: every
+    /// profile's storage still opens under its own password afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_profiles_on_one_directory_do_not_wipe_each_other() {
+        let tmp = tempfile::tempdir().expect("a directory");
+        let dir = tmp.path().to_string_lossy().into_owned();
+        let quiet = || -> veilid_core::UpdateCallback { Arc::new(|_| {}) };
+        let profile = |secret: u8| {
+            let mut cfg = VeilidNetConfig::new(node_seed(), dir.clone());
+            cfg.namespace = "daemonseed-5150".to_owned();
+            cfg.protect_with_profile(&[secret; 32]).expect("derive");
+            veilid_config(&cfg).expect("a config")
+        };
+        let (one, two) = (profile(1), profile(2));
+        assert_ne!(one.namespace, two.namespace);
+        let mut bare = VeilidNetConfig::new(node_seed(), dir.clone());
+        bare.namespace = "daemonseed-5150".to_owned();
+        for config in [
+            one.clone(),
+            two.clone(),
+            veilid_config(&bare).expect("a config"),
+        ] {
+            crate::device_key::startup_protected(quiet(), config)
+                .await
+                .expect("a start")
+                .shutdown()
+                .await;
+        }
+        for config in [one, two] {
+            api_startup_plain(quiet(), config)
+                .await
+                .expect("each profile's storage was left in place")
+                .shutdown()
+                .await;
+        }
+    }
+
+    use veilid_core::api_startup as api_startup_plain;
 
     // #161: the graceful-close budgets must compose. The whole no-hang argument is
     // arithmetic — a front-end blocks a UI thread for GRACEFUL_CLOSE_BUDGET, and the

@@ -1643,6 +1643,10 @@ fn node_config(role: Role, dir: &Path) -> VeilidNetConfig {
     let mut cfg = VeilidNetConfig::new(id.veilid_node_seed, dir.to_string_lossy().into_owned());
     cfg.namespace = format!("two_node_dm_evict_{}", role.name());
     cfg.listen_address = Some(role.port().to_owned());
+    // One device-key password per role, so a node restarted over its own
+    // directory opens the storage it left, as a profile's node does.
+    cfg.protect_with_profile(role.name().as_bytes())
+        .expect("a device-key password");
     cfg
 }
 

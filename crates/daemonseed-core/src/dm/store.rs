@@ -4,7 +4,9 @@
 //!
 //! Serves FC2.
 //!
-//! `docs/design/direct-messaging.md` § On-disk records gives the three records
+//! `docs/design/direct-messaging.md` § On-disk records gives the records —
+//! the advert keys, the conversation, its outbox and the correspondent's last
+//! roster handle —
 //! and § Flows gives the order they are written in. Everything here is under
 //! [`crate::storage::dm_store`]'s at-rest seal, so this module decides record
 //! *shape* and write *order* and nothing about keys or files.
@@ -102,8 +104,28 @@ const CONV_OUTBOX_RECORD_VERSION: u8 = 2;
 /// at the wrong length.
 const CONV_RECORD_VERSION: u8 = 3;
 
+/// The magic heading a correspondent-handle record.
+const HANDLE_MAGIC: &[u8] = b"daemonseed/dm/store/hndl/v1\0";
+
+/// The version byte a correspondent-handle record carries after its magic,
+/// carried apart for [`CONV_RECORD_VERSION`]'s reason.
+const HANDLE_RECORD_VERSION: u8 = 1;
+
+/// The longest correspondent handle kept, in bytes of UTF-8. A longer one is
+/// cut at the last character boundary at or before it.
+pub const HANDLE_MAX_LEN: usize = 256;
+
+/// Bytes a correspondent-handle record occupies, and so
+/// [`RecordKind::CorrespondentHandle`]'s bucket: the handle's length, then
+/// [`HANDLE_MAX_LEN`] bytes holding it and zeros after it.
+pub const HANDLE_RECORD_LEN: usize = HANDLE_MAGIC.len() + 1 + 2 + HANDLE_MAX_LEN;
+
 /// The order [`Store::delete_conv`] removes a correspondence's records in.
-const DELETE_ORDER: [RecordKind; 2] = [RecordKind::Conversation, RecordKind::ConversationOutbox];
+const DELETE_ORDER: [RecordKind; 3] = [
+    RecordKind::Conversation,
+    RecordKind::ConversationOutbox,
+    RecordKind::CorrespondentHandle,
+];
 
 #[cfg(test)]
 thread_local! {
@@ -469,6 +491,10 @@ pub struct LoadedConv {
     /// whatever its outbox record holds: its channel is being erased, and a
     /// rewrite would put the slots back.
     pub outstanding_outbox: Vec<OutboxEntry>,
+    /// The handle a room roster last gave the correspondent
+    /// ([`Store::record_handle`]), or `None` where none was recorded or its
+    /// record does not decode.
+    pub handle: Option<String>,
 }
 
 /// Everything a launch reads back.
@@ -730,6 +756,41 @@ impl Store {
         })
     }
 
+    /// Record `handle` as the name a room roster gives `peer`'s correspondent,
+    /// where it differs from the one recorded, and return whether it was
+    /// written. A handle longer than [`HANDLE_MAX_LEN`] bytes is cut at the
+    /// last character boundary at or before it, and the cut form is what is
+    /// compared and kept.
+    ///
+    /// Refuses [`StoreError::MissingConversation`] where `peer` holds no
+    /// conversation record, so no handle is kept for a correspondence that
+    /// does not exist. The conversation record is only read.
+    pub fn record_handle(
+        &self,
+        peer: &CorrespondenceLabel,
+        handle: &str,
+    ) -> Result<bool, StoreError> {
+        let handle = cut_handle(handle);
+        self.inner.critical_section::<_, StoreError>(peer, |g| {
+            if read_conv(g)?.is_none() {
+                return Err(StoreError::MissingConversation);
+            }
+            if read_handle(g)?.as_deref() == Some(handle) {
+                return Ok(false);
+            }
+            g.replace(RecordKind::CorrespondentHandle, &encode_handle(handle))?;
+            Ok(true)
+        })
+    }
+
+    /// The handle recorded for `peer`'s correspondent by
+    /// [`Store::record_handle`], or `None` where none was, or its record does
+    /// not decode.
+    pub fn handle(&self, peer: &CorrespondenceLabel) -> Result<Option<String>, StoreError> {
+        self.inner
+            .critical_section::<_, StoreError>(peer, read_handle)
+    }
+
     /// Record that a delete of `peer`'s conversation is under way, returning
     /// the state as it stood.
     ///
@@ -883,14 +944,20 @@ impl Store {
                     if read_finishing_delete(g, RecordKind::ConversationOutbox)?.is_some() {
                         g.delete(RecordKind::ConversationOutbox)?;
                     }
+                    // A handle outlives its conversation only where a delete
+                    // stopped part-way.
+                    if read_finishing_delete(g, RecordKind::CorrespondentHandle)?.is_some() {
+                        g.delete(RecordKind::CorrespondentHandle)?;
+                    }
                     return Ok(None);
                 };
                 let table = read_outbox(
                     read_finishing_delete(g, RecordKind::ConversationOutbox)?.as_deref(),
                 )?;
-                Ok(Some((state, table)))
+                let handle = read_handle(g)?;
+                Ok(Some((state, table, handle)))
             })?;
-            let Some((state, table)) = read else {
+            let Some((state, table, handle)) = read else {
                 continue;
             };
             let mut outstanding: Vec<OutboxEntry> = table
@@ -905,6 +972,7 @@ impl Store {
                 peer,
                 state,
                 outstanding_outbox: outstanding,
+                handle,
             });
         }
         Ok(Loaded { advert_keys, convs })
@@ -963,6 +1031,54 @@ fn read_conv(g: &mut Locked<'_>) -> Result<Option<ConvState>, StoreError> {
     // `Vec` the store hands back would otherwise outlive the decode.
     let bytes = Zeroizing::new(bytes);
     Ok(Some(decode_conv(&bytes)?))
+}
+
+/// The correspondent-handle record under an open guard, or `None` where there
+/// is none or it does not decode. The handle only names the conversation, so a
+/// record that will not decode is treated as absent rather than keeping the
+/// conversation from loading; the next [`Store::record_handle`] replaces it.
+fn read_handle(g: &mut Locked<'_>) -> Result<Option<String>, StoreError> {
+    let Some(bytes) = read_finishing_delete(g, RecordKind::CorrespondentHandle)? else {
+        return Ok(None);
+    };
+    Ok(decode_handle(&bytes).ok())
+}
+
+/// `handle`, cut to at most [`HANDLE_MAX_LEN`] bytes at a character boundary.
+fn cut_handle(handle: &str) -> &str {
+    let mut end = handle.len().min(HANDLE_MAX_LEN);
+    while !handle.is_char_boundary(end) {
+        end -= 1;
+    }
+    &handle[..end]
+}
+
+/// Encode a correspondent-handle record. `handle` is at most
+/// [`HANDLE_MAX_LEN`] bytes.
+pub(crate) fn encode_handle(handle: &str) -> Zeroizing<Vec<u8>> {
+    let handle = cut_handle(handle);
+    let mut w = Writer::with_capacity(HANDLE_RECORD_LEN);
+    w.bytes(HANDLE_MAGIC);
+    w.u8(HANDLE_RECORD_VERSION);
+    w.u16(handle.len() as u16);
+    w.padded(handle.as_bytes(), HANDLE_MAX_LEN);
+    w.0
+}
+
+/// Decode a correspondent-handle record.
+pub(crate) fn decode_handle(bytes: &[u8]) -> Result<String, StoreError> {
+    let mut r = Reader::new(bytes, RecordKind::CorrespondentHandle);
+    r.header_version(HANDLE_MAGIC, HANDLE_RECORD_VERSION)?;
+    let len = usize::from(r.u16()?);
+    let field = r.take(HANDLE_MAX_LEN)?;
+    let held = field
+        .get(..len)
+        .ok_or_else(|| r.corrupt("the handle's length runs past its field"))?;
+    let handle = core::str::from_utf8(held)
+        .map_err(|_| r.corrupt("the handle is not UTF-8"))?
+        .to_owned();
+    r.finish()?;
+    Ok(handle)
 }
 
 /// Which entry of the outbox table a sequence occupies.
@@ -3119,13 +3235,122 @@ mod tests {
         store.delete_conv(&peer).unwrap();
         assert_eq!(
             DELETED.with(|deleted| deleted.borrow().clone()),
-            vec![RecordKind::Conversation, RecordKind::ConversationOutbox],
+            vec![
+                RecordKind::Conversation,
+                RecordKind::ConversationOutbox,
+                RecordKind::CorrespondentHandle
+            ],
             "delete_conv did not remove the conversation record first"
         );
         assert!(
             store.load().unwrap().convs.is_empty(),
             "the control: the delete removed the conversation"
         );
+    }
+
+    // ── correspondent handle ────────────────────────────────────────────────
+
+    /// A recorded handle is loaded with its conversation, across a reopen, is
+    /// written only where it changed, and goes with the conversation's delete.
+    #[test]
+    fn a_recorded_handle_survives_a_reopen_and_goes_with_the_conversation() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = label(0x3a);
+        {
+            let store = Store::open(tmp.path(), &at_rest_key(0x3b)).unwrap();
+            assert!(
+                matches!(
+                    store.record_handle(&peer, "anna"),
+                    Err(StoreError::MissingConversation)
+                ),
+                "no handle is kept for a correspondence with no conversation"
+            );
+            store
+                .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+                .unwrap();
+            assert_eq!(store.load().unwrap().convs[0].handle, None);
+            assert!(store.record_handle(&peer, "anna").unwrap(), "first write");
+            assert!(!store.record_handle(&peer, "anna").unwrap(), "unchanged");
+        }
+        let store = Store::open(tmp.path(), &at_rest_key(0x3b)).unwrap();
+        assert_eq!(store.handle(&peer).unwrap().as_deref(), Some("anna"));
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.convs.len(), 1);
+        assert_eq!(loaded.convs[0].handle.as_deref(), Some("anna"));
+        assert!(store.record_handle(&peer, "anna#2").unwrap(), "changed");
+        assert_eq!(store.handle(&peer).unwrap().as_deref(), Some("anna#2"));
+
+        store.delete_conv(&peer).unwrap();
+        assert_eq!(
+            store.handle(&peer).unwrap(),
+            None,
+            "deleted with the conversation"
+        );
+    }
+
+    /// A handle past [`HANDLE_MAX_LEN`] is kept cut at a character boundary,
+    /// and every record is one size whatever the handle's length.
+    #[test]
+    fn a_long_handle_is_cut_at_a_character_boundary_and_the_record_is_one_size() {
+        let long = "é".repeat(HANDLE_MAX_LEN);
+        let kept = decode_handle(&encode_handle(&long)).unwrap();
+        assert!(kept.len() <= HANDLE_MAX_LEN && kept.len() >= HANDLE_MAX_LEN - 1);
+        assert!(long.starts_with(&kept));
+        assert_eq!(encode_handle(&long).len(), HANDLE_RECORD_LEN);
+        assert_eq!(encode_handle("").len(), HANDLE_RECORD_LEN);
+        assert_eq!(decode_handle(&encode_handle("")).unwrap(), "");
+        let mut bad = encode_handle("anna").to_vec();
+        bad[HANDLE_MAGIC.len() + 1..HANDLE_MAGIC.len() + 3]
+            .copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(
+            decode_handle(&bad).is_err(),
+            "a length past the field is refused"
+        );
+    }
+
+    /// A store holding no correspondent-handle record loads: every
+    /// conversation in it is returned, with no handle, and a handle can then
+    /// be recorded beside it. The fixture holds the conversation records of
+    /// both sides of an accepted conversation, sealed under at-rest keys that
+    /// are the bytes `0xa1` and `0xb2` repeated. `dm::flows`'s ignored
+    /// `generate_dm_store_without_handles_fixture` writes it.
+    #[test]
+    fn a_store_without_handle_records_loads_every_conversation() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dm-store-without-handles");
+        for (side, key) in [("a", 0xa1u8), ("b", 0xb2)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut copied = 0;
+            copy_tree(&fixture.join(side), tmp.path(), &mut copied);
+            assert_eq!(copied, 1, "the fixture for {side} was copied");
+            let store = Store::open(tmp.path(), &at_rest_key(key)).unwrap();
+            let loaded = store.load().unwrap();
+            assert_eq!(loaded.convs.len(), 1, "{side}'s conversation loads");
+            let conv = &loaded.convs[0];
+            assert_eq!(conv.handle, None);
+            assert!(!conv.state.awaiting_acceptance && !conv.state.acceptance_pending);
+            assert!(store.record_handle(&conv.peer, "bert").unwrap());
+            let again = store.load().unwrap();
+            assert_eq!(again.convs.len(), 1);
+            assert_eq!(again.convs[0].handle.as_deref(), Some("bert"));
+        }
+    }
+
+    /// Copy every file under `from` to the same place under `to`, counting them.
+    fn copy_tree(from: &Path, to: &Path, copied: &mut usize) {
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let dest = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                std::fs::create_dir_all(&dest).unwrap();
+                copy_tree(&path, &dest, copied);
+            } else {
+                std::fs::copy(&path, &dest).unwrap();
+                *copied += 1;
+            }
+        }
     }
 
     /// A conversation marked for delete is loaded carrying its mark and with no

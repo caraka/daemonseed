@@ -315,7 +315,7 @@ capabilities:
       - daemonseed_core::dm::drop
       - daemonseed_core::dm::flows
       - daemonseed_core::dm::store
-    iscs: [C38, C39, C40, C41, C42, C43, C44, C45, C46, C100, A-C20, A-C21, A-C22, A-C23, A-C24, A-C25, A-C44, A-C45]
+    iscs: [C38, C39, C40, C41, C42, C43, C44, C45, C46, C100, C101, C103, A-C20, A-C21, A-C22, A-C23, A-C24, A-C25, A-C44, A-C45]
 
   - category: "Direct-messaging records and runner (transport)"
     summary: >-
@@ -330,7 +330,7 @@ capabilities:
       - daemonseed_veilid_net::dm::records
       - daemonseed_veilid_net::dm::runner
       - daemonseed_veilid_net::dm::view
-    iscs: [C39, C40, C41, C42, C43, C45, A-C21, A-C24]
+    iscs: [C39, C40, C41, C42, C43, C45, C103, A-C21, A-C24]
 
   - category: "Wire schema (proto)"
     summary: >-

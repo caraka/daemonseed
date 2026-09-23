@@ -20,7 +20,7 @@ use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 use daemonseed_veilid_net::dm::runner::{ConversationState, HealthCounters};
-use daemonseed_veilid_net::dm::view::{DmThreadRow, dm_fingerprint};
+use daemonseed_veilid_net::dm::view::{DmThreadRow, dm_fingerprint, dm_name};
 
 use crate::app::{
     App, ChatLine, ChatSurface, CircleStatus, ConnectionStatus, DM_ACCEPT_KEY, DM_BLOCK_KEY,
@@ -1351,7 +1351,10 @@ fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
         lines.push(Line::from(vec![
             Span::raw(marker.to_owned()),
             Span::styled(
-                format!("correspondence {} · {state}", dm_fingerprint(pk)),
+                format!(
+                    "correspondence {} · {state}",
+                    dm_name(None, Some(correspondence), pk)
+                ),
                 dm_row_style(row == app.dm_sel()),
             ),
         ]));
@@ -1407,6 +1410,7 @@ fn dm_health_line(h: &HealthCounters) -> Option<String> {
         h.conversation_failures,
         h.hellos_unsettled,
         h.previews_failed,
+        h.slots_unopened,
     ]);
     let groups = [
         (h.store_failures, "store failure", "store failures"),
@@ -1516,7 +1520,7 @@ fn render_dm_thread(app: &App, frame: &mut Frame, area: Rect) {
         return;
     };
     let correspondence = app.dm_thread_correspondence();
-    let title = format!(" dm thread · {} ", dm_fingerprint(pk));
+    let title = format!(" dm thread · {} ", dm_name(None, correspondence, pk));
     let width = usize::from(area.width.saturating_sub(2));
     let height = usize::from(area.height.saturating_sub(2));
     let composed = app.dm_state().composed_to(pk);

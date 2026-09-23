@@ -273,6 +273,16 @@ types:
       - name: listen_address
         type: "Option<String>"
         description: UDP/TCP/WS listen address; None uses veilid's defaults.
+      - name: device_key_password
+        type: "Option<Zeroizing<String>>"
+        description: >-
+          Password Veilid's table store protects its device encryption key under.
+          protect_with_profile(profile_secret) sets the HKDF-derived one and appends
+          the profile's namespace tag; None draws 32 random bytes as hex at start
+          under namespace + NO_PROFILE_SUFFIX ("-noprofile"), failing the start where
+          no randomness is available. A start whose stored key is refused, confirmed
+          by a start over an empty table directory, clears the namespace's keyring and
+          tables and starts again.
   - name: VeilidNetEvent
     module: daemonseed_veilid_net::event
     kind: enum
@@ -450,7 +460,12 @@ types:
     description: >-
       FirstContact{token, peer_identity_pk, body}, Send{token, peer, body},
       Accept{token, request, reply}, Block{peer}, Unblock{peer},
-      DeleteConversation{token, peer}, Shutdown. peer is a CorrespondenceLabel
+      DeleteConversation{token, peer}, NoteHandle{peer_identity_pk, handle},
+      Shutdown. NoteHandle stores the handle a room roster gives an identity with
+      a conversation (no answer; a Roster follows where the stored handle changed).
+      Commands queued while a drop scan, a collection pass, a preview or a repair
+      runs are served between that pass's network calls and the pass resumes
+      where it stopped. peer is a CorrespondenceLabel
       except on Block and Unblock, where it is an identity public key. Debug omits
       bodies and keys.
   - name: RunnerEvent
@@ -490,8 +505,9 @@ types:
     kind: struct
     description: >-
       One roster row: peer, peer_identity_pk, state (ConversationState Pending or
-      Established), peer_collected (the correspondent's cursor) and uncollected
-      (send_seq minus that cursor).
+      Established), peer_collected (the correspondent's cursor), uncollected
+      (send_seq minus that cursor) and handle (Option<String>, the handle stored by
+      NoteHandle).
   - name: ConversationState
     module: daemonseed_veilid_net::dm::runner
     kind: enum
@@ -545,7 +561,9 @@ types:
       for each later drop scan that meets it),
       requests_evicted (held requests dropped, oldest-seen first, above one per
       drop slot) and previews_failed (contact request previews that failed; such a
-      request is not previewed again and its accept reads the network).
+      request is not previewed again and its accept reads the network) and
+      slots_unopened (ring reads that stopped at a slot whose message does not
+      open; each is traced with its sequence, subkey and error).
   - name: ShutdownOutcome
     module: daemonseed_veilid_net::dm::runner
     kind: enum
@@ -939,6 +957,26 @@ functions:
     returns:
       type: String
       description: Eight lowercase hex characters.
+  - name: dm_name
+    module: daemonseed_veilid_net::dm::view
+    description: A correspondent's display name — the live room-roster handle, else the stored handle, else dm_fingerprint.
+    signature: "pub fn dm_name(live: Option<&str>, correspondence: Option<&DmCorrespondence>, pk: &IdentityPk) -> String"
+    parameters:
+      - name: live
+        type: "Option<&str>"
+        direction: in
+        description: The handle a room roster lists for the correspondent now, if any.
+      - name: correspondence
+        type: "Option<&DmCorrespondence>"
+        direction: in
+        description: The conversation, whose handle field is the handle the runner's store recorded.
+      - name: pk
+        type: "&IdentityPk"
+        direction: in
+        description: The correspondent's identity public key.
+    returns:
+      type: String
+      description: The live handle, else the stored handle, else dm_fingerprint(pk).
 
   # ── actor: bring-up ──────────────────────────────────────────────────
   - name: VeilidNet::start
@@ -1427,9 +1465,13 @@ functions:
       description: Returns once the flush has completed or expired and the node has shut down.
 
   # ── config ───────────────────────────────────────────────────────────
+  - name: VeilidNetConfig::protect_with_profile
+    module: daemonseed_veilid_net::config
+    description: Set device_key_password to the one derived from the unlocked profile's at-rest key and append the profile's namespace tag to namespace.
+    signature: "pub fn protect_with_profile(&mut self, profile_secret: &[u8]) -> Result<(), daemonseed_core::kdf::KdfError>"
   - name: VeilidNetConfig::new
     module: daemonseed_veilid_net::config
-    description: A node config with daemonseed defaults (public network, hop_count = 2).
+    description: A node config with daemonseed defaults (public network, hop_count = 2, no profile).
     signature: "pub fn new(identity_seed: VeilidNodeSeed, storage_dir: impl Into<String>) -> Self"
     parameters:
       - name: identity_seed

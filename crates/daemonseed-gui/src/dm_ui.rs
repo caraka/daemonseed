@@ -592,6 +592,7 @@ mod tests {
             state: ConversationState::Established,
             peer_collected: 0,
             uncollected: 0,
+            handle: None,
         }])
     }
 
@@ -1056,6 +1057,7 @@ mod tests {
                     state: ConversationState::Established,
                     peer_collected: 0,
                     uncollected: 0,
+                    handle: None,
                 })
                 .collect(),
         ));

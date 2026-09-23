@@ -9437,6 +9437,7 @@ mod tests {
             state,
             peer_collected: 0,
             uncollected: 0,
+            handle: None,
         }
     }
 
@@ -9634,6 +9635,31 @@ mod tests {
             screen.contains("direct messages · 1 correspondences · 0 pending"),
             "the title must carry both counts; drew:\n{screen}"
         );
+    }
+
+    /// A conversation row names the correspondent by the handle the runner's
+    /// store recorded, and by its fingerprint where none is recorded.
+    #[test]
+    fn a_conversation_row_shows_the_stored_handle_else_the_fingerprint() {
+        let mut app = dm_pane_app();
+        let label = mint_label();
+        dm_event(
+            &mut app,
+            RunnerEvent::Roster(vec![dm_row(4, label, ConversationState::Established)]),
+        );
+        let fingerprint = daemonseed_veilid_net::dm::view::dm_fingerprint(&dm_pk(4));
+        let row = |app: &App| {
+            dm_pane_rows(app)
+                .into_iter()
+                .find(|row| row.contains("correspondence "))
+                .expect("a conversation row")
+        };
+        assert!(row(&app).contains(&fingerprint), "{}", row(&app));
+        let mut named = dm_row(4, label, ConversationState::Established);
+        named.handle = Some("dora".to_owned());
+        dm_event(&mut app, RunnerEvent::Roster(vec![named]));
+        assert!(row(&app).contains("correspondence dora"), "{}", row(&app));
+        assert!(!row(&app).contains(&fingerprint));
     }
 
     /// Composing sends one `Send` naming the conversation by its label and

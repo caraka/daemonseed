@@ -128,6 +128,7 @@ pub fn trace_elapsed_secs() -> f64 {
 pub mod actor;
 pub mod aimd;
 pub mod config;
+mod device_key;
 pub mod dht_gate;
 pub mod discovery;
 pub mod dm;
