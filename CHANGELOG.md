@@ -431,6 +431,9 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- `daemonseed-core`: loading the direct-message store finishes a record delete that was stopped between
+  erasing the file and removing it, for conversation and outbox records alike, and loads every other
+  conversation; a record that fails to decode for any other reason still fails the load.
 - `daemonseed-veilid-net`: the DM runner finishes at launch every conversation delete a previous run marked and did
   not finish, whatever the block list holds, opening the channel record without creating it and erasing it where
   this node still holds it; a delete that stops short keeps the mark, and the repair poll retries it in the same run

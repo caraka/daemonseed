@@ -633,6 +633,10 @@ impl Store {
 
     /// Read one correspondence's state, or `None` where it holds no record.
     ///
+    /// A conversation record that a stopped [`Store::delete_conv`] had already
+    /// scrubbed is removed here, and this returns `None` for it. That delete was
+    /// committed to before it began, so the read completes it.
+    ///
     /// Under the lock, like every other read here. The unlocked door exists and
     /// is correct for a question with no write behind it, but there is no such
     /// caller on this path: a launch reads in order to write, and a read that
@@ -641,7 +645,7 @@ impl Store {
     /// [`Store::update_conv`] is the door that changes what this returns.
     pub fn load_conv(&self, peer: &CorrespondenceLabel) -> Result<Option<ConvState>, StoreError> {
         self.inner
-            .critical_section::<_, StoreError>(peer, |g| read_conv(g))
+            .critical_section::<_, StoreError>(peer, read_conv)
     }
 
     /// Read, change and write back one correspondence's state inside a single
@@ -656,6 +660,11 @@ impl Store {
     ///
     /// Refuses [`StoreError::MissingConversation`] rather than creating a
     /// record: there is nothing this could invent a conversation from.
+    ///
+    /// A conversation record that a stopped [`Store::delete_conv`] had already
+    /// scrubbed is removed here, and this refuses
+    /// [`StoreError::MissingConversation`] for it. That delete was committed to
+    /// before it began, so the read completes it.
     pub fn update_conv<R>(
         &self,
         peer: &CorrespondenceLabel,
@@ -672,6 +681,11 @@ impl Store {
     /// [`Store::update_conv`] for a change that can be refused: the record is
     /// written only where `f` returns `Ok`, so a refusal leaves the record's
     /// bytes as they were.
+    ///
+    /// A conversation record that a stopped [`Store::delete_conv`] had already
+    /// scrubbed is removed here, and this refuses
+    /// [`StoreError::MissingConversation`] for it, as [`Store::update_conv`]
+    /// does.
     pub fn try_update_conv<T, E>(
         &self,
         peer: &CorrespondenceLabel,
@@ -698,6 +712,13 @@ impl Store {
     /// directory stays: it is what [`DmStore::critical_section`] establishes by
     /// being entered, and removing it is the record store's business rather
     /// than this module's.
+    ///
+    /// **Call this only after the channel record has been erased**, as
+    /// [`crate::dm::delivery::finish_delete`] does. The conversation record
+    /// holds the lookup key that erase needs, and the reads here complete any
+    /// delete this left stopped part-way, which removes that key for good.
+    /// Completing a stopped delete is safe only because the erase has already
+    /// run by the time this starts.
     pub fn delete_conv(&self, peer: &CorrespondenceLabel) -> Result<(), StoreError> {
         self.inner.critical_section::<_, StoreError>(peer, |g| {
             for kind in DELETE_ORDER {
@@ -715,6 +736,11 @@ impl Store {
     /// Written in the section that reads the state, so the mark and the values
     /// a teardown is built from are one read. Refuses
     /// [`StoreError::MissingConversation`] where there is no record.
+    ///
+    /// A conversation record that a stopped [`Store::delete_conv`] had already
+    /// scrubbed is removed here, and this refuses
+    /// [`StoreError::MissingConversation`] for it: that delete had passed the
+    /// point this mark records.
     pub fn mark_delete_pending(&self, peer: &CorrespondenceLabel) -> Result<ConvState, StoreError> {
         self.inner.critical_section::<_, StoreError>(peer, |g| {
             let mut state = read_conv(g)?.ok_or(StoreError::MissingConversation)?;
@@ -728,6 +754,10 @@ impl Store {
     /// mark: a teardown that marked it and had not dropped its records when
     /// the process stopped. A launch resumes each one rather than polling or
     /// rewriting it.
+    ///
+    /// A delete that stopped after [`Store::delete_conv`] had scrubbed the
+    /// conversation record is not listed. The read completes it, removing the
+    /// record, because the channel erase ran before that delete began.
     pub fn pending_deletes(&self) -> Result<Vec<CorrespondenceLabel>, StoreError> {
         let mut pending = Vec::new();
         for peer in self.inner.correspondences()? {
@@ -765,7 +795,8 @@ impl Store {
             });
         }
         self.inner.critical_section::<_, StoreError>(peer, |g| {
-            let mut table = read_outbox(g.read(RecordKind::ConversationOutbox)?.as_deref())?;
+            let mut table =
+                read_outbox(read_finishing_delete(g, RecordKind::ConversationOutbox)?.as_deref())?;
             let at = ring_index(seq);
             if let Some(held) = &table[at]
                 && held.seq != seq
@@ -793,7 +824,7 @@ impl Store {
         cursor: u64,
     ) -> Result<(), StoreError> {
         self.inner.critical_section::<_, StoreError>(peer, |g| {
-            let Some(raw) = g.read(RecordKind::ConversationOutbox)? else {
+            let Some(raw) = read_finishing_delete(g, RecordKind::ConversationOutbox)? else {
                 return Ok(());
             };
             let mut table = read_outbox(Some(&raw))?;
@@ -828,6 +859,11 @@ impl Store {
     /// An outbox record with no conversation record beside it is deleted,
     /// scrubbed first. A run that stopped between persisting its first message
     /// and creating the record leaves one, and nothing else reads it.
+    ///
+    /// A conversation or outbox record that a [`Store::delete_conv`] scrubbed
+    /// and had not yet unlinked when the process stopped is removed, and its
+    /// correspondence is left out. Any other record that does not read fails
+    /// the whole load.
     pub fn load(&self) -> Result<Loaded, StoreError> {
         let advert_keys = self.load_advert_keys()?;
         let mut convs = Vec::new();
@@ -842,13 +878,16 @@ impl Store {
                     // An outbox with no conversation record beside it is what a
                     // run leaves that stopped between persisting its first
                     // message and creating the record. Nothing reads it, so it
-                    // is deleted here, scrubbed first.
-                    if g.read(RecordKind::ConversationOutbox)?.is_some() {
+                    // is deleted here, scrubbed first. One a stopped delete
+                    // left is removed by the read.
+                    if read_finishing_delete(g, RecordKind::ConversationOutbox)?.is_some() {
                         g.delete(RecordKind::ConversationOutbox)?;
                     }
                     return Ok(None);
                 };
-                let table = read_outbox(g.read(RecordKind::ConversationOutbox)?.as_deref())?;
+                let table = read_outbox(
+                    read_finishing_delete(g, RecordKind::ConversationOutbox)?.as_deref(),
+                )?;
                 Ok(Some((state, table)))
             })?;
             let Some((state, table)) = read else {
@@ -891,9 +930,33 @@ fn read_advert_keys(
     Ok(Some(decode_advert_keys(&bytes)?))
 }
 
+/// `kind`'s record under an open guard, finishing its delete where one was
+/// stopped between the scrub and the unlink.
+///
+/// The record store reports [`DmStoreError::ErasureInterrupted`] only for a
+/// record that starts with the erasure sentinel, and only [`Locked::delete`]
+/// writes it. Such a record is a delete in progress, never one still wanted, so
+/// the delete is run again, which removes the file, and the record reads as
+/// absent. Every other failure is returned unchanged.
+fn read_finishing_delete(
+    g: &mut Locked<'_>,
+    kind: RecordKind,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    match g.read(kind) {
+        Err(DmStoreError::ErasureInterrupted { .. }) => {
+            g.delete(kind)?;
+            Ok(None)
+        }
+        read => Ok(read?),
+    }
+}
+
 /// The conversation record under an open guard, or `None` where there is none.
-fn read_conv(g: &Locked<'_>) -> Result<Option<ConvState>, StoreError> {
-    let Some(bytes) = g.read(RecordKind::Conversation)? else {
+///
+/// A record left by a stopped delete is removed here and reads as `None`: see
+/// [`read_finishing_delete`].
+fn read_conv(g: &mut Locked<'_>) -> Result<Option<ConvState>, StoreError> {
+    let Some(bytes) = read_finishing_delete(g, RecordKind::Conversation)? else {
         return Ok(None);
     };
     // Wrapped on receipt: the record is a whole key schedule, and the plain
@@ -2747,6 +2810,202 @@ mod tests {
             file(RecordKind::ConversationOutbox).exists(),
             "the control: the stop landed between the two removals"
         );
+    }
+
+    /// Three correspondences, each with a conversation record and an outbox
+    /// record, and the path of any of their records.
+    fn three_conversations(
+        store: &Store,
+        peers: &[CorrespondenceLabel; 3],
+    ) -> impl Fn(&CorrespondenceLabel, RecordKind) -> PathBuf {
+        let (a, _b) = pair();
+        for peer in peers {
+            store
+                .create_conv(peer, &conv_state(&a, 1, 0, 0, None))
+                .unwrap();
+            store.persist_outbox(peer, 0, &[0x7c; 64], NOW).unwrap();
+        }
+        let root = store.records().root().to_path_buf();
+        move |peer, kind| {
+            root.join(hex::encode(peer.as_bytes()))
+                .join(kind.file_name())
+        }
+    }
+
+    /// Run `peer`'s delete of `kind` through `Locked::delete` and stop it
+    /// after the scrub, before the unlink.
+    fn stop_delete_before_unlink(store: &Store, peer: &CorrespondenceLabel, kind: RecordKind) {
+        crate::storage::dm_store::stop_deletes_before_unlink(|| {
+            store
+                .records()
+                .critical_section::<_, DmStoreError>(peer, |g| g.delete(kind))
+        })
+        .unwrap();
+    }
+
+    /// The labels of every correspondence a load offers, sorted.
+    fn loaded_peers(loaded: &Loaded) -> Vec<CorrespondenceLabel> {
+        let mut peers: Vec<_> = loaded.convs.iter().map(|c| c.peer).collect();
+        peers.sort_unstable();
+        peers
+    }
+
+    /// A delete stopped between its scrub and its unlink leaves a conversation
+    /// record that starts with the erasure sentinel. The load finishes that
+    /// delete, outbox included, and offers every other correspondence.
+    #[test]
+    fn load_finishes_a_conversation_delete_stopped_before_its_unlink() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x40)).unwrap();
+        let peers = [label(0x41), label(0x42), label(0x43)];
+        let file = three_conversations(&store, &peers);
+        assert_eq!(
+            store.load().unwrap().convs.len(),
+            3,
+            "the control: every correspondence loads"
+        );
+
+        stop_delete_before_unlink(&store, &peers[0], DELETE_ORDER[0]);
+        let raw = std::fs::read(file(&peers[0], RecordKind::Conversation)).unwrap();
+        assert!(
+            raw.starts_with(crate::storage::dm_store::ERASURE_SENTINEL),
+            "the control: the stop left the scrubbed record under its name"
+        );
+        assert!(
+            file(&peers[0], RecordKind::ConversationOutbox).exists(),
+            "the control: the outbox was not reached"
+        );
+
+        let loaded = store
+            .load()
+            .expect("a stopped delete must not fail the load");
+        assert_eq!(loaded_peers(&loaded), peers[1..].to_vec());
+        for kind in DELETE_ORDER {
+            assert!(
+                !file(&peers[0], kind).exists(),
+                "the load left {} behind",
+                kind.file_name()
+            );
+        }
+        assert!(
+            store.pending_deletes().unwrap().is_empty(),
+            "the finished delete is still reported"
+        );
+    }
+
+    /// The same stop on the second removal leaves an outbox that starts with
+    /// the sentinel and no conversation record beside it. The load removes it.
+    #[test]
+    fn load_finishes_an_outbox_delete_stopped_before_its_unlink() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x44)).unwrap();
+        let peers = [label(0x45), label(0x46), label(0x47)];
+        let file = three_conversations(&store, &peers);
+
+        store
+            .records()
+            .critical_section::<_, DmStoreError>(&peers[0], |g| g.delete(DELETE_ORDER[0]))
+            .unwrap();
+        stop_delete_before_unlink(&store, &peers[0], DELETE_ORDER[1]);
+        let raw = std::fs::read(file(&peers[0], RecordKind::ConversationOutbox)).unwrap();
+        assert!(
+            raw.starts_with(crate::storage::dm_store::ERASURE_SENTINEL),
+            "the control: the stop left the scrubbed outbox under its name"
+        );
+
+        let loaded = store
+            .load()
+            .expect("a stopped delete must not fail the load");
+        assert_eq!(loaded_peers(&loaded), peers[1..].to_vec());
+        assert!(
+            !file(&peers[0], RecordKind::ConversationOutbox).exists(),
+            "the load left the scrubbed outbox behind"
+        );
+    }
+
+    /// A stopped outbox delete followed by a new conversation for the same
+    /// correspondence, before any load has finished the delete. Every outbox
+    /// read finishes it: the load's, [`Store::persist_outbox`]'s and
+    /// [`Store::delete_outbox_through`]'s.
+    #[test]
+    fn a_new_conversation_over_a_stopped_outbox_delete_loads() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x4c)).unwrap();
+        let peers = [label(0x4d), label(0x4e), label(0x4f)];
+        let file = three_conversations(&store, &peers);
+        let (a, _b) = pair();
+
+        for peer in &peers {
+            store
+                .records()
+                .critical_section::<_, DmStoreError>(peer, |g| g.delete(DELETE_ORDER[0]))
+                .unwrap();
+            stop_delete_before_unlink(&store, peer, DELETE_ORDER[1]);
+            let raw = std::fs::read(file(peer, RecordKind::ConversationOutbox)).unwrap();
+            assert!(
+                raw.starts_with(crate::storage::dm_store::ERASURE_SENTINEL),
+                "the control: the stop left the scrubbed outbox under its name"
+            );
+            store
+                .create_conv(peer, &conv_state(&a, 1, 0, 0, None))
+                .unwrap();
+        }
+
+        store
+            .persist_outbox(&peers[1], 0, &[0x7d; 64], NOW)
+            .unwrap();
+        store.delete_outbox_through(&peers[2], 0).unwrap();
+
+        let loaded = store
+            .load()
+            .expect("a stopped outbox delete must not fail the load");
+        assert_eq!(loaded_peers(&loaded), peers.to_vec());
+        assert!(
+            !file(&peers[0], RecordKind::ConversationOutbox).exists(),
+            "the load left the scrubbed outbox behind"
+        );
+        assert!(
+            !file(&peers[2], RecordKind::ConversationOutbox).exists(),
+            "delete_outbox_through left the scrubbed outbox behind"
+        );
+        let raw = std::fs::read(file(&peers[1], RecordKind::ConversationOutbox)).unwrap();
+        assert!(
+            !raw.starts_with(crate::storage::dm_store::ERASURE_SENTINEL),
+            "persist_outbox did not replace the scrubbed outbox"
+        );
+    }
+
+    /// Only the exact sentinel reads as a stopped delete. The same scrubbed
+    /// record with one byte of the sentinel changed is a record that does not
+    /// authenticate, and it still fails the load and stays on disk.
+    #[test]
+    fn load_refuses_a_scrubbed_record_whose_sentinel_is_altered() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x48)).unwrap();
+        let peers = [label(0x49), label(0x4a), label(0x4b)];
+        let file = three_conversations(&store, &peers);
+
+        stop_delete_before_unlink(&store, &peers[0], DELETE_ORDER[0]);
+        let path = file(&peers[0], RecordKind::Conversation);
+        let mut raw = std::fs::read(&path).unwrap();
+        assert!(raw.starts_with(crate::storage::dm_store::ERASURE_SENTINEL));
+        raw[0] ^= 0x01;
+        std::fs::write(&path, &raw).unwrap();
+
+        assert!(
+            matches!(
+                store.load(),
+                Err(StoreError::Store(DmStoreError::NotAuthentic {
+                    kind: RecordKind::Conversation
+                }))
+            ),
+            "a record that is not the exact erase pattern must fail the load"
+        );
+        assert!(path.exists(), "the load removed a record it could not read");
     }
 
     /// A change refused inside `try_update_conv` leaves the conversation

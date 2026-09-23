@@ -174,6 +174,26 @@ use crate::storage::seeds::AEAD_KEY_LEN;
 /// the only place the length bound is expressed.
 pub(crate) const ERASURE_SENTINEL: &[u8; 32] = b"daemonseed/dm/store/erased/v1\0\0\0";
 
+#[cfg(test)]
+thread_local! {
+    /// Set while [`stop_deletes_before_unlink`] runs its closure.
+    static STOP_DELETES_BEFORE_UNLINK: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+/// Run `f` with every [`Locked::delete`] on this thread returning after its
+/// scrub and before its unlink.
+///
+/// What is left on disk is what a process stopped in that window leaves: the
+/// record scrubbed by the production path, still present under its name.
+#[cfg(test)]
+pub(crate) fn stop_deletes_before_unlink<R>(f: impl FnOnce() -> R) -> R {
+    STOP_DELETES_BEFORE_UNLINK.with(|stop| stop.set(true));
+    let out = f();
+    STOP_DELETES_BEFORE_UNLINK.with(|stop| stop.set(false));
+    out
+}
+
 /// The sentinel prefix for `kind`, bounded by that kind's own record length.
 ///
 /// **One definition, because two would be a bug that no test could see.** The
@@ -1680,6 +1700,11 @@ impl Locked<'_> {
                 }
             }
             Err(e) => return Err(DmStoreError::io(&path, e)),
+        }
+
+        #[cfg(test)]
+        if STOP_DELETES_BEFORE_UNLINK.with(core::cell::Cell::get) {
+            return Ok(());
         }
 
         // Phase 3: unlink, then make the removal itself durable.
