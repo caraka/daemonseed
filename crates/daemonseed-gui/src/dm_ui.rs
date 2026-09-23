@@ -496,6 +496,7 @@ pub fn wire_dm(ui: &AppWindow, state: &Rc<RefCell<GuiState>>) {
 mod tests {
     use std::sync::Arc;
 
+    use daemonseed_core::dm::flows::ReceivedMessage;
     use daemonseed_core::identity::keys::IDENTITY_PK_LEN;
     use daemonseed_core::storage::dm_store::CorrespondenceLabel;
     use daemonseed_veilid_net::dm::runner::{
@@ -603,6 +604,20 @@ mod tests {
             body: body.as_bytes().to_vec(),
             sent_at: now - 300_000,
             received_at: now,
+        }
+    }
+
+    /// A preview of request `serial` holding one message, sent five minutes
+    /// ago.
+    fn preview(serial: u64, body: &str) -> RunnerEvent {
+        let now = u64::try_from(now_unix_ms()).expect("a clock after 1970");
+        RunnerEvent::RequestPreview {
+            request: ContactRequestId::for_test(1, serial),
+            messages: vec![ReceivedMessage {
+                sent_at_ms: now - 300_000,
+                body: body.as_bytes().to_vec(),
+            }],
+            read_at: now,
         }
     }
 
@@ -726,7 +741,8 @@ mod tests {
 
     /// Accept pressed in the window turns the request into its conversation in
     /// the window's own models at once: one rail row, no request actions, and
-    /// the reply as this side's message, sending.
+    /// the reply as this side's message, sending, below the message the
+    /// request's preview read.
     #[test]
     fn the_accept_button_shows_the_conversation_at_once() {
         with_app(|app| {
@@ -737,6 +753,10 @@ mod tests {
             app.ui.invoke_select_dm(app.slot_of(&dm_fingerprint(4)));
             assert!(app.ui.get_dm_is_request(), "control: the request shows");
             assert_eq!(app.ui.get_dm_messages().row_count(), 0);
+            app.dm_event(preview(1, "who is this?"));
+            let bodies: Vec<SharedString> =
+                app.ui.get_dm_messages().iter().map(|m| m.body).collect();
+            assert_eq!(bodies, ["who is this?"], "the preview shows on the request");
 
             app.ui.invoke_accept_dm();
             assert!(!app.ui.get_dm_is_request(), "the request still shows");
@@ -750,7 +770,13 @@ mod tests {
                 .iter()
                 .map(|m| (m.body, m.status))
                 .collect();
-            assert_eq!(messages, [("message accepted".into(), "sending…".into())]);
+            assert_eq!(
+                messages,
+                [
+                    ("who is this?".into(), "".into()),
+                    ("message accepted".into(), "sending…".into())
+                ]
+            );
             let token = match app.state.borrow_mut().take_pending_dm().as_slice() {
                 [RunnerCommand::Accept { token, .. }] => *token,
                 other => panic!("expected one accept, got {other:?}"),
@@ -771,7 +797,13 @@ mod tests {
                 .iter()
                 .map(|m| (m.body, m.status))
                 .collect();
-            assert_eq!(messages, [("message accepted".into(), "not sent".into())]);
+            assert_eq!(
+                messages,
+                [
+                    ("who is this?".into(), "".into()),
+                    ("message accepted".into(), "not sent".into())
+                ]
+            );
         });
     }
 
@@ -1172,11 +1204,13 @@ mod tests {
                 reason: Refusal::AwaitingAcceptance,
             });
 
-            // Dave: a request, looked at once, so it is read.
+            // Dave: a request with its message previewed, looked at once, so
+            // it is read.
             app.dm_event(RunnerEvent::ContactRequest {
                 request: ContactRequestId::for_test(1, 1),
                 from: pk(4),
             });
+            app.dm_event(preview(1, "Hi, it's Dave from the Lobby."));
             app.ui.invoke_select_dm(app.slot_of("dave"));
 
             // Bert writes while another item is shown: the one unread row.
@@ -1191,9 +1225,10 @@ mod tests {
             assert_eq!(unread, [false, true, false]);
             shot("2-dm-none-chosen.png");
 
-            // (3) The request.
+            // (3) The request, its message shown before it is accepted.
             app.ui.invoke_select_dm(app.slot_of("dave"));
             assert!(app.ui.get_dm_is_request());
+            assert_eq!(app.ui.get_dm_messages().row_count(), 1);
             shot("3-dm-request.png");
 
             // (4) Cora's conversation.

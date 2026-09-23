@@ -1304,7 +1304,22 @@ modules:
       FlowError> does the same from the record alone, leaving the collected hello
       slot unerased and writing a persisted hello back's bytes rather than
       re-sealing it; FlowError::AlreadyEstablished where acceptance_pending is
-      clear. recognise_acceptance(store, records, me, peer, lookup_key,
+      clear. preview(records, me, &ContactRequest) -> Result<Preview { messages:
+      Vec<ReceivedMessage>, reads: ReadCache }, FlowError> performs the reads
+      accept performs for the correspondent's side before its first write, in
+      its order: the opening, verified as accept verifies it, the correspondent's
+      advert, and the ring from sequence 0, opened on a key schedule built as
+      accept builds its own and then dropped; it writes nothing to the record
+      store and takes no store. ReadCache holds every channel value read,
+      empty subkeys included, and every advert read that held one; len() and
+      is_empty() count them, and ends_at_empty_slot() says whether a channel
+      subkey read empty, the slot an acceptance over the cache ends its ring read
+      at; a message written there since is read by the next collect_batch. CachedRecords::new(&mut R, ReadCache) is a Records
+      answering read_channel and read_advert from the cache where it holds the
+      address and passing every other call to the inner store; accept over it
+      after a preview of the same request makes no read before its first write
+      and persists what it persists over the network.
+      recognise_acceptance(store, records, me, peer, lookup_key,
       peer_secret, slot) -> Result<Acceptance { peer, lookup_key, peer_cursor,
       messages: Vec<ReceivedMessage> }, FlowError> records the correspondent's channel lookup key and
       the control key derived from peer_secret, reads its cursor and any reply,

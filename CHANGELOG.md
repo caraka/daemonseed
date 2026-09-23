@@ -429,6 +429,9 @@ work lives in the maintainer's own planning notes, not here.
   sent. An accepted request's `Sent` also answers a plain request the same identity sent again, and leaves a
   start-over listed. A roster row's right-click menu starts a direct message with that member. Ctrl+D
   opens Direct messages.
+- `daemonseed-core`: `dm::flows::preview` reads a contact request's opening, advert and ring on a throwaway key schedule and returns `Preview { messages, reads }`, writing nothing; `dm::flows::ReadCache` holds the values read, `ends_at_empty_slot` says whether it holds the empty slot a ring read ends at; `dm::flows::CachedRecords` answers those reads from the cache and passes every other call through.
+- `daemonseed-veilid-net`: `RunnerEvent::RequestPreview { request, messages, read_at }`, emitted once per held contact request after its preview reads succeed; `PREVIEW_READS_TTL` (10 minutes), the age up to which an `Accept` of that request answers its opening, advert and ring reads from the preview; `DmContactRequest::preview`, the request's previewed messages as `DmThreadRow::Received` rows. `HealthCounters::previews_failed` counts previews that failed; such a request is not previewed again.
+- `daemonseed-veilid-net`: each network read of an accept and of a preview is traced with what it read (opening, advert, ring slot, drop slot, empty or failed) and its duration in ms.
 
 ### Fixed
 
@@ -584,6 +587,9 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-veilid-net`: `RunnerEvent::Message` carries `sent_at`, the sender's time; `DmThreadRow::Received` carries `sent_at_ms`, held at `received_at_ms` when ahead of it.
 - `daemonseed-gui`: a received direct message's thread and rail age read from its sender's time; thread rows show an age, refreshed with the rail's on the age timer, and none where the time is not known; past 30 days an age is the UTC date; `DmMessageRow::at_ms` added.
 - `daemonseed-tui`: a received direct message shows its sender's time, with its UTC date when not today.
+- `daemonseed-veilid-net`: an accepted request's previewed messages enter its conversation's thread ahead of the reply, once each.
+- `daemonseed-gui`: a contact request's thread shows its previewed messages before it is accepted, and above the reply while the acceptance runs.
+- `daemonseed-tui`: a contact request's previewed messages are drawn under its row.
 - `daemonseed-core`: `dm::flows::Records::write_batch` and `BatchWrite`; first contact writes its channel opening and first slot as one batch, and an acceptance its hello-slot erase, opening and reply slot.
 - `daemonseed-veilid-net`: `VeilidRecords::write_batch` submits every write of a batch before confirming any; the DM runner collects every 12 s (±20 %) while a first contact awaits acceptance or an acceptance awaits the peer's first read, for up to 15 minutes after start, first contact or accept; a drop scan that does not answer is retried three times and defers up to two passes over this side's own drop before every slot is read; a hello awaiting acceptance is not rewritten after a partial drop scan; runner steps are traced.
 

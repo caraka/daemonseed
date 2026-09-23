@@ -1181,8 +1181,8 @@ pub struct App {
     /// its roster.
     ///
     /// **Set only from a conversation row.** A pending contact request is a row
-    /// in the block above and has no thread: nothing a stranger wrote is
-    /// collected until the user accepts.
+    /// in the block above and has no thread: its row shows the messages the
+    /// runner's preview read, and no thread opens until the user accepts.
     dm_thread: Option<IdentityPk>,
     /// The open thread's composer buffer. Cleared on send and on leaving the
     /// thread.
@@ -3095,8 +3095,9 @@ impl App {
     ///
     /// **A pending contact request opens nothing.** Requests are drawn above
     /// the conversations and the selection indexes both blocks, so a selection
-    /// inside the first block has no conversation behind it: nothing a stranger
-    /// wrote is shown until the user accepts.
+    /// inside the first block has no conversation behind it. The request row
+    /// itself shows the previewed messages; no thread opens and nothing can be
+    /// sent there until the user accepts.
     fn open_selected_thread(&mut self) {
         if !self.dm.running {
             return;
@@ -10574,6 +10575,41 @@ mod tests {
         }
     }
 
+    /// A previewed request draws the requester's message under its row, and
+    /// the message stays in view while the reply to it is written.
+    #[test]
+    fn a_previewed_request_draws_its_message_under_its_row() {
+        let mut app = dm_pane_app();
+        dm_event(&mut app, RunnerEvent::Roster(Vec::new()));
+        dm_request(&mut app, 0xAB, 1);
+        let needle = "← kestrel-4471 asks to talk";
+        let rows = dm_pane_rows(&app);
+        assert!(
+            !rows.iter().any(|row| row.contains(needle)),
+            "control: no message before the preview"
+        );
+
+        dm_event(
+            &mut app,
+            RunnerEvent::RequestPreview {
+                request: dm_request_id(1),
+                messages: vec![daemonseed_core::dm::flows::ReceivedMessage {
+                    sent_at_ms: 1_700_000_000_000,
+                    body: b"kestrel-4471 asks to talk".to_vec(),
+                }],
+                read_at: 1_700_000_001_000,
+            },
+        );
+        let rows = dm_pane_rows(&app);
+        let request = dm_row_index(&rows, "pending request from abababab");
+        let message = dm_row_index(&rows, needle);
+        assert_eq!(message, request + 1, "drew:\n{}", rows.join("\n"));
+
+        app.on_key(press(KeyCode::Char(DM_ACCEPT_KEY)));
+        assert!(app.dm_accept_draft().is_some(), "the reply opened");
+        dm_row_index(&dm_pane_rows(&app), needle);
+    }
+
     /// A request row names its sender and the time it was held, and one identity
     /// is one row whatever id it arrives under.
     #[test]
@@ -11038,8 +11074,9 @@ mod tests {
         );
     }
 
-    /// A request row opens no thread: nothing a stranger wrote is shown until the
-    /// user accepts. The conversation below it is the control.
+    /// A request row opens no thread: its previewed messages show on the row,
+    /// and no thread or composer opens until the user accepts. The conversation
+    /// below it is the control.
     #[test]
     fn a_request_row_opens_no_thread() {
         let mut app = dm_pane_app();

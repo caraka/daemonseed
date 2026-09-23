@@ -150,6 +150,13 @@ struct Calls {
     inspect_channel: usize,
     inspect_advert: usize,
     inspect_drop: usize,
+    /// Advert and channel reads.
+    network_reads: usize,
+    /// Advert reads.
+    advert_reads: usize,
+    /// How many of `network_reads` had been made at the first write since the
+    /// field was last cleared.
+    reads_at_first_write: Option<usize>,
 }
 
 /// A barrier a record call waits at until the test releases it.
@@ -315,6 +322,11 @@ impl Fake {
     }
 
     fn write(&self, key: Key, bytes: Vec<u8>) -> Result<(), RecordError> {
+        self.count(|calls| {
+            calls
+                .reads_at_first_write
+                .get_or_insert(calls.network_reads);
+        });
         self.inject(key.0, Op::Write)?;
         {
             let mut faults = self.faults();
@@ -410,6 +422,10 @@ impl Records for Fake {
         owner: &AdvertOwnerSeed,
         _subkeys: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
+        self.count(|calls| {
+            calls.network_reads += 1;
+            calls.advert_reads += 1;
+        });
         self.inject(ADVERT, Op::Read)?;
         Ok(self.read((ADVERT, *owner.as_bytes(), 0)))
     }
@@ -502,7 +518,10 @@ impl Records for Fake {
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
         subkey: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
-        self.count(|calls| calls.channel_reads += 1);
+        self.count(|calls| {
+            calls.channel_reads += 1;
+            calls.network_reads += 1;
+        });
         self.inject(CHANNEL, Op::Read)?;
         Ok(self.read((CHANNEL, *lookup_key, subkey)))
     }
@@ -968,6 +987,379 @@ async fn establish(config: RunnerConfig) -> Scene {
         a_peer,
         b_peer,
     }
+}
+
+/// B's runner holding A's first contact, previewed: both runners, B's fake,
+/// the request's id and the index of the preview among B's events.
+struct Previewed {
+    a: Profile,
+    b: Profile,
+    b_fake: Fake,
+    aw: Watch,
+    bw: Watch,
+    request: ContactRequestId,
+    at: usize,
+}
+
+/// A writes a first contact to B, and B's runner surfaces and previews it.
+async fn previewed_request() -> Previewed {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let (a_fake, b_fake) = (Fake::on(&dht), Fake::on(&dht));
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"the first body".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    let surfaced = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[surfaced]);
+    let at = bw
+        .wait_for("B's preview", |event| {
+            matches!(event, RunnerEvent::RequestPreview { request: r, .. } if *r == request)
+        })
+        .await;
+    assert!(at > surfaced, "the preview follows the request it previews");
+    Previewed {
+        a,
+        b,
+        b_fake,
+        aw,
+        bw,
+        request,
+        at,
+    }
+}
+
+/// A held contact request is previewed before anything accepts it: its
+/// message arrives with its sender's time, and nothing is written to the
+/// network or stored for it.
+#[tokio::test(start_paused = true)]
+async fn a_held_request_is_previewed_before_any_accept() {
+    let Previewed {
+        a: _a,
+        b,
+        b_fake,
+        aw,
+        bw,
+        at,
+        ..
+    } = previewed_request().await;
+    let RunnerEvent::RequestPreview {
+        messages, read_at, ..
+    } = &bw.seen[at]
+    else {
+        panic!("expected a preview, got {:?}", bw.seen[at]);
+    };
+    assert_eq!(messages.len(), 1, "the one message A wrote");
+    assert_eq!(messages[0].body, b"the first body");
+    assert_eq!(messages[0].sent_at_ms % 1000, 0, "the sender's time");
+    assert!(messages[0].sent_at_ms <= *read_at);
+    let calls = b_fake.calls();
+    assert_eq!(
+        calls.hello_writes + calls.ring_writes + calls.control_writes,
+        0,
+        "B wrote for a request it has not accepted"
+    );
+    assert!(finished(&bw.stop().await));
+    assert!(finished(&aw.stop().await));
+    let store = Store::open(b.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("reopen B's store");
+    assert_eq!(
+        store
+            .records()
+            .correspondences()
+            .expect("list B's correspondences"),
+        Vec::new(),
+        "a preview stored a correspondence"
+    );
+}
+
+/// An accept of a previewed request reads nothing from the network before its
+/// first write, and reports the previewed message before its reply. Once the
+/// preview's reads have expired, the same accept reads before it writes.
+#[tokio::test(start_paused = true)]
+async fn an_accept_after_a_fresh_preview_reads_nothing_before_it_writes() {
+    for expired in [false, true] {
+        let Previewed {
+            a: _a,
+            b: _b,
+            b_fake,
+            aw,
+            mut bw,
+            request,
+            ..
+        } = previewed_request().await;
+        if expired {
+            tokio::time::sleep(PREVIEW_READS_TTL + Duration::from_secs(60)).await;
+        }
+        b_fake.count(|calls| {
+            calls.network_reads = 0;
+            calls.reads_at_first_write = None;
+        });
+        bw.send(RunnerCommand::Accept {
+            token: CommandToken(2),
+            request,
+            reply: b"the reply".to_vec(),
+        })
+        .await;
+        let answered = bw.wait_for("B's acceptance", sent(2)).await;
+        let peer = sent_peer(&bw.seen[answered]);
+        let body = bw
+            .wait_for("A's first body at B", message(peer, 0, b"the first body"))
+            .await;
+        assert!(body < answered, "the message precedes the reply");
+        let reads = b_fake
+            .calls()
+            .reads_at_first_write
+            .expect("the acceptance wrote");
+        if expired {
+            assert!(reads > 0, "an expired preview answered the accept");
+        } else {
+            assert_eq!(reads, 0, "reads before the acceptance's first write");
+        }
+        assert!(finished(&bw.stop().await));
+        assert!(finished(&aw.stop().await));
+    }
+}
+
+/// B's store, reopened after its runner stopped.
+fn reopen_store(profile: &Profile) -> Store {
+    Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("reopen the store")
+}
+
+/// A request surfaced again keeps its preview while it names the same channel,
+/// and is previewed afresh, its reads dropped, when it names another.
+#[tokio::test(start_paused = true)]
+async fn a_request_naming_another_channel_is_previewed_afresh() {
+    let Previewed {
+        a: _a,
+        b,
+        mut b_fake,
+        aw,
+        bw,
+        ..
+    } = previewed_request().await;
+    assert!(finished(&bw.stop().await));
+    assert!(finished(&aw.stop().await));
+    let store = reopen_store(&b);
+    let advert_keys = AdvertKeys::restore(
+        store
+            .load()
+            .expect("load B's store")
+            .advert_keys
+            .expect("B's advert keys"),
+    );
+    let keys = b.keys();
+    let me = Me {
+        signer: &keys.signing,
+        channel_root: &keys.dm_channel_root,
+    };
+    let mut request = || {
+        let surfaced =
+            flows::collect(&store, &mut b_fake, &me, &advert_keys, |_| false).expect("B collects");
+        assert_eq!(surfaced.len(), 1, "one hello in B's drop");
+        match surfaced.into_iter().next() {
+            Some(Surfaced::ContactRequest(request)) => request,
+            other => panic!("expected a contact request, got {other:?}"),
+        }
+    };
+    let held = |request, due| HeldRequest {
+        held: Held::Request(request),
+        seen: 1,
+        preview_due: due,
+        preview: Some((ReadCache::default(), Instant::now())),
+    };
+    let same = request();
+    let (due, kept) = carried_preview(Some(held(request(), false)), &same);
+    assert!(!due && kept.is_some(), "the same channel keeps its preview");
+    let mut moved = request();
+    moved.lookup_key[0] ^= 0xff;
+    let (due, kept) = carried_preview(Some(held(request(), false)), &moved);
+    assert!(due && kept.is_none(), "another channel is previewed afresh");
+    let (due, kept) = carried_preview(None, &same);
+    assert!(due && kept.is_none(), "a new request is previewed");
+}
+
+/// A preview whose advert read fails is counted, not retried, and leaves no
+/// preview: the accept of that request reads the network and succeeds.
+#[tokio::test(start_paused = true)]
+async fn a_failed_preview_is_counted_and_the_accept_reads_the_network() {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let (a_fake, b_fake) = (Fake::on(&dht), Fake::on(&dht));
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    b_fake
+        .faults()
+        .plan
+        .push((ADVERT, Op::Read, Fault::Refused));
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"the first body".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+    bw.wait_for(
+        "the failed preview counted",
+        |event| matches!(event, RunnerEvent::Health(h) if h.previews_failed == 1),
+    )
+    .await;
+    let adverts = b_fake.calls().advert_reads;
+    tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+    bw.drain();
+    assert!(b_fake.calls().drop_passes > 2, "control: B kept scanning");
+    assert_eq!(
+        b_fake.calls().advert_reads,
+        adverts,
+        "the failed preview was tried again"
+    );
+    assert!(
+        !bw.seen
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::RequestPreview { .. })),
+        "a failed preview was reported"
+    );
+    b_fake.count(|calls| {
+        calls.network_reads = 0;
+        calls.reads_at_first_write = None;
+    });
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    let answered = bw.wait_for("B's acceptance", sent(2)).await;
+    let peer = sent_peer(&bw.seen[answered]);
+    bw.wait_for("A's first body at B", message(peer, 0, b"the first body"))
+        .await;
+    let reads = b_fake
+        .calls()
+        .reads_at_first_write
+        .expect("the acceptance wrote");
+    assert!(reads > 0, "the accept read nothing before it wrote");
+    assert!(finished(&bw.stop().await));
+    assert!(finished(&aw.stop().await));
+}
+
+/// Two identities' requests held at once are each previewed under their own
+/// id, with their own message.
+#[tokio::test(start_paused = true)]
+async fn two_requests_are_previewed_each_under_its_own_id() {
+    let dht = network();
+    let (a, b, c) = (Profile::new(), Profile::new(), Profile::new());
+    let (a_fake, b_fake, c_fake) = (Fake::on(&dht), Fake::on(&dht), Fake::on(&dht));
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut senders = Vec::new();
+    for (profile, fake, body) in [(&a, &a_fake, &b"from a"[..]), (&c, &c_fake, &b"from c"[..])] {
+        let mut w = profile.spawn(fake, RunnerConfig::default());
+        w.wait_for("the sender's startup", is_health).await;
+        w.send(RunnerCommand::FirstContact {
+            token: CommandToken(1),
+            peer_identity_pk: b.pk.clone(),
+            body: body.to_vec(),
+        })
+        .await;
+        w.wait_for("the first contact", sent(1)).await;
+        senders.push(w);
+    }
+    let mut expected = Vec::new();
+    for (profile, body) in [(&a, &b"from a"[..]), (&c, &b"from c"[..])] {
+        let at = bw
+            .wait_for("the contact request", request_from(&profile.pk))
+            .await;
+        expected.push((request_id(&bw.seen[at]), body.to_vec()));
+    }
+    assert_ne!(expected[0].0, expected[1].0, "two ids");
+    for (request, body) in &expected {
+        let at = bw
+            .wait_for("the preview", |event| {
+                matches!(event, RunnerEvent::RequestPreview { request: r, .. } if r == request)
+            })
+            .await;
+        let RunnerEvent::RequestPreview { messages, .. } = &bw.seen[at] else {
+            unreachable!("matched above");
+        };
+        let bodies: Vec<&[u8]> = messages.iter().map(|m| m.body.as_slice()).collect();
+        assert_eq!(bodies, [body.as_slice()], "request {request:?}");
+    }
+    assert!(finished(&bw.stop().await));
+    for w in senders {
+        assert!(finished(&w.stop().await));
+    }
+}
+
+/// A message that lands in the requester's ring after B's preview reaches
+/// B's thread after the first, at the collection that follows the accept.
+#[tokio::test(start_paused = true)]
+async fn a_message_after_the_preview_reaches_the_thread_after_the_first() {
+    let Previewed {
+        a,
+        b: _b,
+        b_fake,
+        aw,
+        mut bw,
+        request,
+        ..
+    } = previewed_request().await;
+    assert!(finished(&aw.stop().await));
+    // A first contact awaiting acceptance sends nothing further, so the second
+    // message is sealed on A's own key schedule and placed in its ring.
+    let store = reopen_store(&a);
+    let conv = store.load().expect("load A's store").convs.remove(0);
+    let mut writer = daemonseed_core::dm::chain::Conversation::restore(conv.state.conversation);
+    let plaintext = channel::encode_message_plaintext(1_000, b"the second body");
+    let (header, sealed) = writer
+        .seal(&plaintext, channel::DEVICE_ID_SINGLE_DEVICE, os_fill)
+        .expect("seal the second message");
+    let mut slot = header.encode();
+    slot.extend_from_slice(&sealed);
+    b_fake.net().put(
+        (
+            CHANNEL,
+            conv.state.outgoing_lookup_key,
+            channel::slot_for(1),
+        ),
+        slot,
+    );
+    drop(store);
+
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    let answered = bw.wait_for("B's acceptance", sent(2)).await;
+    let peer = sent_peer(&bw.seen[answered]);
+    let first = bw
+        .wait_for("A's first body at B", message(peer, 0, b"the first body"))
+        .await;
+    let second = bw
+        .wait_for("A's second body at B", message(peer, 1, b"the second body"))
+        .await;
+    assert!(
+        first < answered && answered < second,
+        "first, reply, second"
+    );
+    assert!(finished(&bw.stop().await));
 }
 
 /// Passes over the drop `fake` takes in `wait` from now.
@@ -4185,7 +4577,7 @@ fn record_call_counters(counters: &HealthCounters) -> [(&'static str, u64); 23] 
 }
 
 /// Every counter that is not a record store call's, by name.
-fn other_counters(counters: &HealthCounters) -> [(&'static str, u64); 8] {
+fn other_counters(counters: &HealthCounters) -> [(&'static str, u64); 9] {
     [
         ("advert_failures", counters.advert_failures),
         ("network_not_answering", counters.network_not_answering),
@@ -4198,6 +4590,7 @@ fn other_counters(counters: &HealthCounters) -> [(&'static str, u64); 8] {
         ("conversation_failures", counters.conversation_failures),
         ("store_failures", counters.store_failures),
         ("requests_evicted", counters.requests_evicted),
+        ("previews_failed", counters.previews_failed),
     ]
 }
 
@@ -5488,6 +5881,8 @@ fn held_requests_beyond_the_cap_are_dropped_oldest_seen_first() {
     let entry = |byte: u8, seen: u64| HeldRequest {
         held: Held::StartedOver(Box::new([byte; IDENTITY_PK_LEN])),
         seen,
+        preview_due: false,
+        preview: None,
     };
     let id = |serial| ContactRequestId { epoch: 7, serial };
     let mut requests = BTreeMap::new();

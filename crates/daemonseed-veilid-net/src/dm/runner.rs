@@ -102,7 +102,13 @@
 //! and one from an established correspondent a [`RunnerEvent::StartedOver`],
 //! each under a [`ContactRequestId`] that names this run as well as the hello,
 //! so an id from an earlier run is refused. The verified request behind an id
-//! is held in memory and replaced on every complete scan. A blocked sender's
+//! is held in memory and replaced on every complete scan. A held contact
+//! request is previewed as the schedule's next step, ahead of anything else
+//! due: [`flows::preview`] reads its opening, advert and ring without writing,
+//! a [`RunnerEvent::RequestPreview`] carries the messages, and the values read
+//! answer an accept of the request for [`PREVIEW_READS_TTL`] through
+//! [`flows::CachedRecords`]. Every network read of a preview or an accept is
+//! traced with its duration. A blocked sender's
 //! hello and a rewrite of a hello already collected only move a
 //! [`HealthCounters`] field, and so does a verified hello the scan could not
 //! settle. A message's sequence number is derived from the collection cursor
@@ -142,7 +148,8 @@ use daemonseed_core::dm::channel::{self, ChannelError, ChannelOpening, ChannelOw
 use daemonseed_core::dm::delivery::{self, ClosedMarker};
 use daemonseed_core::dm::drop::{self as drop_plane, DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
 use daemonseed_core::dm::flows::{
-    self, BatchWrite, FirstContact, FlowError, Me, ReceivedMessage, RecordError, Records, Surfaced,
+    self, BatchWrite, CachedRecords, FirstContact, FlowError, Me, ReadCache, ReceivedMessage,
+    RecordError, Records, Surfaced,
 };
 use daemonseed_core::dm::store::{
     ConvState, LoadedConv, OutboxEntry, OutstandingHello, Store, StoreError,
@@ -172,6 +179,10 @@ const WAITING_TICK: Duration = Duration::from_secs(12);
 /// [`WAITING_TICK`] can apply. A correspondent who has not answered by then may
 /// be away for days, and is collected on the ordinary tick.
 const WAITING_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// How long the reads a [`RunnerEvent::RequestPreview`] was drawn from answer
+/// the [`RunnerCommand::Accept`] of the same request in place of the network.
+pub const PREVIEW_READS_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// How long [`RunnerHandle::shutdown`] waits for the flow call in progress.
 pub const DEFAULT_GRACE: Duration = Duration::from_secs(10);
@@ -640,6 +651,9 @@ pub struct HealthCounters {
     /// Held requests dropped, oldest-seen first, to keep at most one per drop
     /// slot.
     pub requests_evicted: u64,
+    /// Contact request previews that failed. A request whose preview failed is
+    /// not previewed again, and its accept reads the network.
+    pub previews_failed: u64,
 }
 
 /// What a runner reports.
@@ -652,6 +666,19 @@ pub enum RunnerEvent {
         request: ContactRequestId,
         /// The identity that signed its channel opening.
         from: IdentityPk,
+    },
+    /// The messages a held contact request carries, read before it is
+    /// accepted. Once per request, after its [`RunnerEvent::ContactRequest`],
+    /// and only where every read succeeded. Nothing is stored; an accept of
+    /// the request reports the same messages again as
+    /// [`RunnerEvent::Message`]s.
+    RequestPreview {
+        /// The request, as [`RunnerEvent::ContactRequest`] named it.
+        request: ContactRequestId,
+        /// The requester's messages, in sequence order from 0.
+        messages: Vec<ReceivedMessage>,
+        /// When this runner read them, in Unix milliseconds.
+        read_at: u64,
     },
     /// A new hello from an established correspondent.
     StartedOver {
@@ -736,6 +763,9 @@ impl core::fmt::Debug for RunnerEvent {
         match self {
             Self::Roster(rows) => f.debug_tuple("Roster").field(rows).finish(),
             Self::ContactRequest { request, .. } => write!(f, "ContactRequest({request:?})"),
+            Self::RequestPreview {
+                request, messages, ..
+            } => write!(f, "RequestPreview({request:?}, {})", messages.len()),
             Self::StartedOver { request, .. } => write!(f, "StartedOver({request:?})"),
             Self::Message { from, seq, .. } => write!(f, "Message({from:?}, {seq})"),
             Self::Sent { token, peer, seq } => write!(f, "Sent({token:?}, {peer:?}, {seq})"),
@@ -1106,6 +1136,28 @@ impl Held {
 struct HeldRequest {
     held: Held,
     seen: u64,
+    /// Whether a preview of a contact request is still to be read.
+    preview_due: bool,
+    /// What the preview read, and when.
+    preview: Option<(ReadCache, Instant)>,
+}
+
+/// What a request surfaced again keeps of the preview held for its id: the
+/// preview and whether one is still due where it names the same channel, and
+/// a preview due afresh otherwise.
+fn carried_preview(
+    previous: Option<HeldRequest>,
+    request: &flows::ContactRequest,
+) -> (bool, Option<(ReadCache, Instant)>) {
+    match previous {
+        Some(HeldRequest {
+            held: Held::Request(old),
+            preview_due,
+            preview,
+            ..
+        }) if old.lookup_key == request.lookup_key => (preview_due, preview),
+        _ => (true, None),
+    }
 }
 
 /// Keep at most `cap` held requests, dropping the ones seen longest ago, and
@@ -1173,6 +1225,9 @@ struct Tracked<R> {
     /// read and so counts here once; an inspect failure the store answers by
     /// reading every slot is not a slot read and is not counted here.
     failed_drop_reads: u64,
+    /// The flow call whose every read is traced with its duration, while one
+    /// runs.
+    traced: Option<&'static str>,
 }
 
 /// `result`, having counted it if it failed, as `classify` says it failed:
@@ -1202,7 +1257,9 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         owner: &AdvertOwnerSeed,
         subkeys: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
+        let started = std::time::Instant::now();
         let result = self.inner.read_advert(owner, subkeys);
+        self.trace_read(started, "advert", None, &result);
         tally(
             result,
             R::classify,
@@ -1218,7 +1275,9 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         subkeys: u16,
         slot: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
+        let started = std::time::Instant::now();
         let result = self.inner.read_drop_slot(owner, subkeys, slot);
+        self.trace_read(started, "drop slot", Some(slot), &result);
         if result.is_err() {
             self.failed_drop_reads += 1;
         }
@@ -1308,7 +1367,13 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
         subkey: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
+        let started = std::time::Instant::now();
         let result = self.inner.read_channel(lookup_key, subkey);
+        if subkey == channel::CONTROL_SUBKEY {
+            self.trace_read(started, "opening", None, &result);
+        } else {
+            self.trace_read(started, "ring slot", Some(subkey), &result);
+        }
         tally(
             result,
             R::classify,
@@ -1379,6 +1444,30 @@ impl<R: RunnerRecords> Records for Tracked<R> {
 }
 
 impl<R: RunnerRecords> Tracked<R> {
+    /// Trace one read of the traced flow call: what it read, whether it found
+    /// anything, and how long it took.
+    fn trace_read(
+        &self,
+        started: std::time::Instant,
+        what: &str,
+        index: Option<u16>,
+        result: &Result<Option<Vec<u8>>, RecordError>,
+    ) {
+        let Some(call) = self.traced else {
+            return;
+        };
+        let ms = started.elapsed().as_millis();
+        let state = match result {
+            Ok(Some(_)) => "",
+            Ok(None) => "empty ",
+            Err(_) => "failed ",
+        };
+        match index {
+            Some(n) => crate::vtrace!("dm runner: {call} read {state}{what} {n} in {ms} ms"),
+            None => crate::vtrace!("dm runner: {call} read {state}{what} in {ms} ms"),
+        }
+    }
+
     fn inspect_channel(
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
@@ -1811,6 +1900,7 @@ impl<R: RunnerRecords> Runner<R> {
                 inner: records,
                 health: HealthCounters::default(),
                 failed_drop_reads: 0,
+                traced: None,
             },
             store,
             signer,
@@ -2066,8 +2156,12 @@ impl<R: RunnerRecords> Runner<R> {
         self.next_tick = self.next_tick.min(now + self.collection_interval());
     }
 
-    /// The earliest moment anything on the schedule is due.
+    /// The earliest moment anything on the schedule is due: now, while a held
+    /// request waits for its preview.
     fn next_due(&self) -> Instant {
+        if self.requests.values().any(|entry| entry.preview_due) {
+            return Instant::now();
+        }
         self.repairs
             .values()
             .map(|repair| repair.due)
@@ -2768,28 +2862,65 @@ impl<R: RunnerRecords> Runner<R> {
             Ok(Some(conv)) => conv.state.my_collected,
             Ok(None) | Err(()) => 0,
         };
-        crate::vtrace!("dm runner: accept starts");
         let now = self.clock.now_secs();
-        let outcome = match self.requests.get(&request).map(|entry| &entry.held) {
-            Some(Held::Request(held)) => {
+        let started = std::time::Instant::now();
+        self.records.traced = Some("accept");
+        let outcome = match self.requests.get_mut(&request) {
+            Some(HeldRequest {
+                held: Held::Request(held),
+                preview,
+                ..
+            }) => {
                 let me = Me {
                     signer: &self.signer,
                     channel_root: &self.channel_root,
                 };
-                flows::accept(
-                    &self.store,
-                    &mut self.records,
-                    &me,
-                    held,
-                    &reply,
-                    os_fill,
-                    now,
-                )
+                // The preview's reads answer in place of the network while they
+                // are fresh. Taken, so a refused accept reads afresh next time.
+                let reads = preview
+                    .take()
+                    .filter(|(_, at)| at.elapsed() <= PREVIEW_READS_TTL)
+                    .map(|(reads, _)| reads);
+                crate::vtrace!(
+                    "dm runner: accept starts, {} read(s) held from the preview",
+                    reads.as_ref().map_or(0, ReadCache::len)
+                );
+                if reads.as_ref().is_some_and(ReadCache::ends_at_empty_slot) {
+                    crate::vtrace!(
+                        "dm runner: accept ends its ring read at the preview's empty slot; a later message is read by the next collection"
+                    );
+                }
+                match reads {
+                    Some(reads) => flows::accept(
+                        &self.store,
+                        &mut CachedRecords::new(&mut self.records, reads),
+                        &me,
+                        held,
+                        &reply,
+                        os_fill,
+                        now,
+                    ),
+                    None => flows::accept(
+                        &self.store,
+                        &mut self.records,
+                        &me,
+                        held,
+                        &reply,
+                        os_fill,
+                        now,
+                    ),
+                }
             }
-            Some(Held::StartedOver(_)) | None => {
-                return self.refuse(Some(token), Refusal::UnknownRequest).await
+            Some(_) | None => {
+                self.records.traced = None;
+                return self.refuse(Some(token), Refusal::UnknownRequest).await;
             }
         };
+        self.records.traced = None;
+        crate::vtrace!(
+            "dm runner: accept took {} ms",
+            started.elapsed().as_millis()
+        );
         match outcome {
             Ok(accepted) => {
                 crate::vtrace!(
@@ -2977,6 +3108,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// moved.
     async fn run_due(&mut self) -> Result<(), Halt> {
         self.answering = None;
+        self.preview_requests().await?;
         if Instant::now() >= self.next_tick {
             self.collect_tick().await?;
             self.next_tick = Instant::now() + self.collection_interval();
@@ -3006,6 +3138,62 @@ impl<R: RunnerRecords> Runner<R> {
             }
         }
         self.report_health().await
+    }
+
+    /// Read the preview of every held contact request that has none yet, one
+    /// at a time, and report each one read. A preview that fails is traced and
+    /// not tried again for the same request.
+    async fn preview_requests(&mut self) -> Result<(), Halt> {
+        let due: Vec<ContactRequestId> = self
+            .requests
+            .iter()
+            .filter(|(_, entry)| entry.preview_due)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in due {
+            self.check_stop()?;
+            let Some(entry) = self.requests.get_mut(&id) else {
+                continue;
+            };
+            entry.preview_due = false;
+            let Held::Request(request) = &entry.held else {
+                continue;
+            };
+            let me = Me {
+                signer: &self.signer,
+                channel_root: &self.channel_root,
+            };
+            let started = std::time::Instant::now();
+            self.records.traced = Some("preview");
+            let read = flows::preview(&mut self.records, &me, request);
+            self.records.traced = None;
+            let ms = started.elapsed().as_millis();
+            let preview = match read {
+                Ok(preview) => preview,
+                Err(e) => {
+                    crate::vtrace!(
+                        "dm runner: preview of request {} failed after {ms} ms, {e:?}",
+                        id.serial
+                    );
+                    self.records.health.previews_failed += 1;
+                    continue;
+                }
+            };
+            crate::vtrace!(
+                "dm runner: preview of request {} read {} message(s) in {ms} ms",
+                id.serial,
+                preview.messages.len()
+            );
+            entry.preview = Some((preview.reads, Instant::now()));
+            let read_at = self.clock.now_ms();
+            self.emit(RunnerEvent::RequestPreview {
+                request: id,
+                messages: preview.messages,
+                read_at,
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Emit [`RunnerEvent::Health`] where a counter has moved since the last
@@ -3226,11 +3414,15 @@ impl<R: RunnerRecords> Runner<R> {
                             from: request.identity.clone(),
                         });
                     }
+                    let previous = held.remove(&id).or_else(|| self.requests.remove(&id));
+                    let (preview_due, preview) = carried_preview(previous, &request);
                     held.insert(
                         id,
                         HeldRequest {
                             held: Held::Request(request),
                             seen,
+                            preview_due,
+                            preview,
                         },
                     );
                 }
@@ -3247,6 +3439,8 @@ impl<R: RunnerRecords> Runner<R> {
                         HeldRequest {
                             held: Held::StartedOver(identity),
                             seen,
+                            preview_due: false,
+                            preview: None,
                         },
                     );
                 }

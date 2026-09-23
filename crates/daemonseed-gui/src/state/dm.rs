@@ -190,9 +190,9 @@ pub struct DmThreadView {
     pub header_label: String,
     /// The correspondent's fingerprint, always.
     pub fingerprint: String,
-    /// A contact request: nothing it carries is shown before it is accepted,
-    /// so [`Self::rows`] holds at most this side's refused acceptance reply,
-    /// and the actions are accept, decline, block.
+    /// A contact request: [`Self::rows`] holds the messages the runner's
+    /// preview read from it, then at most this side's refused acceptance
+    /// reply, and the actions are accept, decline, block.
     pub is_request: bool,
     /// The messages, oldest first.
     pub rows: Vec<DmMessageRow>,
@@ -638,6 +638,31 @@ fn activity_marks(state: &DmState) -> BTreeMap<IdentityPk, (usize, u64)> {
         .collect()
 }
 
+/// A thread row as the thread view draws it, `delivered` saying which of this
+/// side's sequences the correspondent has collected.
+fn thread_row(delivered: impl Fn(u64) -> bool) -> impl Fn(&DmThreadRow) -> DmMessageRow {
+    move |row| match row {
+        DmThreadRow::Received {
+            body, sent_at_ms, ..
+        } => DmMessageRow {
+            outgoing: false,
+            body: body.clone(),
+            status: None,
+            at_ms: Some(unix_ms_i64(*sent_at_ms)),
+        },
+        DmThreadRow::Sent { seq, body } => DmMessageRow {
+            outgoing: true,
+            body: body.clone().unwrap_or_else(|| format!("message {seq}")),
+            status: Some(if delivered(*seq) {
+                DmMessageStatus::Delivered
+            } else {
+                DmMessageStatus::Sent
+            }),
+            at_ms: None,
+        },
+    }
+}
+
 /// The status of a composed message.
 fn composed_status(m: &Composed, delivered: impl Fn(u64) -> bool) -> DmMessageStatus {
     match (m.seq, m.refusal) {
@@ -719,6 +744,7 @@ impl GuiState {
             // Requests and received messages are marked unread below, and a
             // start over is logged above.
             RunnerEvent::ContactRequest { .. }
+            | RunnerEvent::RequestPreview { .. }
             | RunnerEvent::StartedOver { .. }
             | RunnerEvent::Message { .. } => {}
             // The fold keeps what these report; the thread view reads it there.
@@ -1186,25 +1212,36 @@ impl GuiState {
         let header_label = self.dm_label(peer);
         let fingerprint = dm_fingerprint(peer);
         let blocked = dm.state.blocked.contains(peer);
+        // The requester's previewed messages, until a conversation holds them.
+        let mut rows: Vec<DmMessageRow> = if dm.state.correspondences.contains_key(peer) {
+            Vec::new()
+        } else {
+            dm.state
+                .requests
+                .iter()
+                .filter(|r| r.from == *peer)
+                .flat_map(|r| &r.preview)
+                .map(thread_row(|_| false))
+                .collect()
+        };
         if key.kind == DmItemKind::Request {
             // A refused acceptance reply stays with the request it answered,
             // unless a conversation with them holds it.
-            let rows = if dm.state.correspondences.contains_key(peer) {
-                Vec::new()
-            } else {
-                dm.composed
-                    .get(peer)
-                    .into_iter()
-                    .flatten()
-                    .filter(|m| m.accept && m.refusal.is_some())
-                    .map(|m| DmMessageRow {
-                        outgoing: true,
-                        body: m.body.clone(),
-                        status: Some(DmMessageStatus::Refused),
-                        at_ms: Some(m.composed_at_ms),
-                    })
-                    .collect()
-            };
+            if !dm.state.correspondences.contains_key(peer) {
+                rows.extend(
+                    dm.composed
+                        .get(peer)
+                        .into_iter()
+                        .flatten()
+                        .filter(|m| m.accept && m.refusal.is_some())
+                        .map(|m| DmMessageRow {
+                            outgoing: true,
+                            body: m.body.clone(),
+                            status: Some(DmMessageStatus::Refused),
+                            at_ms: Some(m.composed_at_ms),
+                        }),
+                );
+            }
             return Some(DmThreadView {
                 refusal: dm
                     .block_refused
@@ -1231,7 +1268,7 @@ impl GuiState {
             status: Some(composed_status(m, delivered)),
             at_ms: Some(m.composed_at_ms),
         };
-        let mut rows = Vec::new();
+        let draw = thread_row(delivered);
         let mut next = composed.iter().peekable();
         let mut foreign = 0usize;
         for row in correspondence.map_or(&[][..], |c| c.thread.as_slice()) {
@@ -1243,26 +1280,7 @@ impl GuiState {
             while let Some(m) = next.next_if(|m| m.after <= foreign) {
                 rows.push(composed_row(m));
             }
-            rows.push(match row {
-                DmThreadRow::Received {
-                    body, sent_at_ms, ..
-                } => DmMessageRow {
-                    outgoing: false,
-                    body: body.clone(),
-                    status: None,
-                    at_ms: Some(unix_ms_i64(*sent_at_ms)),
-                },
-                DmThreadRow::Sent { seq, body } => DmMessageRow {
-                    outgoing: true,
-                    body: body.clone().unwrap_or_else(|| format!("message {seq}")),
-                    status: Some(if delivered(*seq) {
-                        DmMessageStatus::Delivered
-                    } else {
-                        DmMessageStatus::Sent
-                    }),
-                    at_ms: None,
-                },
-            });
+            rows.push(draw(row));
             foreign += 1;
         }
         rows.extend(next.map(composed_row));
@@ -1295,6 +1313,7 @@ impl GuiState {
 mod tests {
     use super::*;
     use crate::net::RosterEntry;
+    use daemonseed_core::dm::flows::ReceivedMessage;
     use daemonseed_core::identity::keys::IDENTITY_PK_LEN;
     use daemonseed_core::storage::dm_store::CorrespondenceLabel;
     use daemonseed_veilid_net::dm::runner::{
@@ -1556,6 +1575,66 @@ mod tests {
         });
         let thread = st.dm_thread_view().expect("the conversation is selected");
         assert_eq!(thread.rows[1].status, Some(DmMessageStatus::Delivered));
+    }
+
+    /// A previewed request shows its message before it is accepted, the
+    /// acceptance shows it above the reply while the runner works, and the
+    /// runner's answer, which reports the message again, leaves it once, above
+    /// the reply.
+    #[test]
+    fn a_previewed_message_shows_before_accept_and_once_above_the_reply() {
+        let mut st = GuiState::lobby_only();
+        st.on_dm_event(&RunnerEvent::ContactRequest {
+            request: request_id(7),
+            from: pk(3),
+        });
+        st.on_dm_event(&RunnerEvent::RequestPreview {
+            request: request_id(7),
+            messages: vec![ReceivedMessage {
+                sent_at_ms: 1,
+                body: b"hi, it's cora".to_vec(),
+            }],
+            read_at: 2,
+        });
+        st.select_dm_item(&request(3));
+        let thread = st.dm_thread_view().expect("the request is selected");
+        assert!(thread.is_request);
+        assert_eq!(thread_rows(&st), [("hi, it's cora".to_owned(), None)]);
+
+        assert!(st.accept_dm_request());
+        let [RunnerCommand::Accept { token, .. }] = st.take_pending_dm()[..] else {
+            panic!("expected one accept");
+        };
+        assert_eq!(
+            thread_rows(&st),
+            [
+                ("hi, it's cora".to_owned(), None),
+                (DM_ACCEPT_REPLY.to_owned(), Some(DmMessageStatus::Pending)),
+            ]
+        );
+
+        let peer = label();
+        st.on_dm_event(&RunnerEvent::Message {
+            from: peer,
+            seq: 0,
+            body: b"hi, it's cora".to_vec(),
+            sent_at: 1,
+            received_at: 3,
+        });
+        st.on_dm_event(&RunnerEvent::Sent {
+            token,
+            peer,
+            seq: 0,
+        });
+        let thread = st.dm_thread_view().expect("the selection followed");
+        assert_eq!(thread.key, conversation(3));
+        assert_eq!(
+            thread_rows(&st),
+            [
+                ("hi, it's cora".to_owned(), None),
+                (DM_ACCEPT_REPLY.to_owned(), Some(DmMessageStatus::Sent)),
+            ]
+        );
     }
 
     /// A received message's age, in its thread and on its conversation's rail

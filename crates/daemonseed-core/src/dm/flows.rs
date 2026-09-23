@@ -1426,23 +1426,21 @@ fn finish_accept<R: Records>(
     let peer_serial = state
         .peer_advert_serial
         .ok_or(FlowError::Incomplete("advert serial of the correspondent"))?;
-    let opening = read_opening(records, peer_key, &incoming).ok_or(FlowError::NoOpening)?;
-    opening.verify(me.signer.public_key(), &incoming, peer_serial)?;
-    // The opening must be the one this record was created from: signed by the
-    // correspondent the record names, and naming the ratchet key the reading
-    // half was opened with.
-    if opening.writer_identity_pk.as_slice() != identity.as_slice() {
-        return Err(FlowError::OpeningWriter);
-    }
     let opened_with = state
         .conversation
         .receiving
         .peer_latest
         .as_ref()
         .map(|turn| turn.pk.as_slice());
-    if opened_with != Some(opening.first_ratchet_pk.as_slice()) {
-        return Err(FlowError::OpeningRatchetKey);
-    }
+    read_accepted_opening(
+        records,
+        me.signer.public_key(),
+        peer_key,
+        &incoming,
+        peer_serial,
+        &identity,
+        opened_with,
+    )?;
 
     let outgoing_lookup_key = if state.outgoing_lookup_key == [0u8; HELLO_LOOKUP_KEY_LEN] {
         let channel_owner =
@@ -1623,6 +1621,256 @@ fn finish_accept<R: Records>(
         messages: read.messages,
         hello_slot,
         repicks,
+    })
+}
+
+/// Read the correspondent's opening from the control subkey of the channel
+/// this side reads, and verify it as the one an acceptance proceeds from: it
+/// names this identity, the channel and the advert serial, it is signed by
+/// `identity`, and it names `opened_with` as the writer's first ratchet key.
+fn read_accepted_opening<R: Records>(
+    records: &mut R,
+    my_pk: &[u8; ml_dsa::PK_LEN],
+    key: &ControlKey,
+    incoming: &[u8; HELLO_LOOKUP_KEY_LEN],
+    serial: u64,
+    identity: &[u8; ml_dsa::PK_LEN],
+    opened_with: Option<&[u8]>,
+) -> Result<(), FlowError> {
+    let opening = read_opening(records, key, incoming).ok_or(FlowError::NoOpening)?;
+    opening.verify(my_pk, incoming, serial)?;
+    if opening.writer_identity_pk.as_slice() != identity.as_slice() {
+        return Err(FlowError::OpeningWriter);
+    }
+    if opened_with != Some(opening.first_ratchet_pk.as_slice()) {
+        return Err(FlowError::OpeningRatchetKey);
+    }
+    Ok(())
+}
+
+/// The raw values one [`preview`] read, by the address it read them at.
+///
+/// A channel subkey that held nothing is kept as `None`, because the empty
+/// slot that ends a ring read is itself an answer an acceptance would read
+/// again. An advert is kept only where the record held one.
+#[derive(Default)]
+pub struct ReadCache {
+    channels: Vec<([u8; HELLO_LOOKUP_KEY_LEN], u16, Option<Vec<u8>>)>,
+    adverts: Vec<([u8; 32], Vec<u8>)>,
+}
+
+impl ReadCache {
+    /// How many values the cache holds, empty channel subkeys included.
+    pub fn len(&self) -> usize {
+        self.channels.len() + self.adverts.len()
+    }
+
+    /// Whether the cache holds no value at all.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the cache holds a channel subkey that read empty: the slot a
+    /// ring read ends at. An acceptance over the cache ends its ring read there,
+    /// and a message written to that slot since is read by the next collection.
+    pub fn ends_at_empty_slot(&self) -> bool {
+        self.channels.iter().any(|(_, _, value)| value.is_none())
+    }
+
+    fn channel(
+        &self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        subkey: u16,
+    ) -> Option<&Option<Vec<u8>>> {
+        self.channels
+            .iter()
+            .find(|(key, at, _)| key == lookup_key && *at == subkey)
+            .map(|(_, _, value)| value)
+    }
+
+    fn advert(&self, owner: &AdvertOwnerSeed) -> Option<&Vec<u8>> {
+        self.adverts
+            .iter()
+            .find(|(seed, _)| seed == owner.as_bytes())
+            .map(|(_, bytes)| bytes)
+    }
+}
+
+/// A record store that answers the channel and advert reads a [`ReadCache`]
+/// holds from the cache, and passes every other read and every write to
+/// `inner`.
+///
+/// [`accept`] run over one of these after a [`preview`] of the same request
+/// makes no network read before its first write where the correspondent's
+/// ring has not moved, and persists what it would have persisted reading the
+/// network: the cache holds the bytes the network answered.
+pub struct CachedRecords<'a, R> {
+    inner: &'a mut R,
+    cache: ReadCache,
+    /// Pass every read to `inner` and keep its answer, rather than answer
+    /// from the cache.
+    recording: bool,
+}
+
+impl<'a, R: Records> CachedRecords<'a, R> {
+    /// `inner`, with the reads `cache` holds answered from it.
+    pub fn new(inner: &'a mut R, cache: ReadCache) -> Self {
+        Self {
+            inner,
+            cache,
+            recording: false,
+        }
+    }
+}
+
+impl<R: Records> Records for CachedRecords<'_, R> {
+    fn read_advert(
+        &mut self,
+        owner: &AdvertOwnerSeed,
+        subkeys: u16,
+    ) -> Result<Option<Vec<u8>>, RecordError> {
+        if self.recording {
+            let read = self.inner.read_advert(owner, subkeys)?;
+            if let Some(bytes) = &read {
+                self.cache.adverts.push((*owner.as_bytes(), bytes.clone()));
+            }
+            return Ok(read);
+        }
+        match self.cache.advert(owner) {
+            Some(bytes) => Ok(Some(bytes.clone())),
+            None => self.inner.read_advert(owner, subkeys),
+        }
+    }
+
+    fn read_drop_slot(
+        &mut self,
+        owner: &DropOwnerSeed,
+        subkeys: u16,
+        slot: u16,
+    ) -> Result<Option<Vec<u8>>, RecordError> {
+        self.inner.read_drop_slot(owner, subkeys, slot)
+    }
+
+    fn write_drop_slot(
+        &mut self,
+        owner: &DropOwnerSeed,
+        subkeys: u16,
+        slot: u16,
+        bytes: &[u8],
+    ) -> Result<(), RecordError> {
+        self.inner.write_drop_slot(owner, subkeys, slot, bytes)
+    }
+
+    fn erase_drop_slot(
+        &mut self,
+        owner: &DropOwnerSeed,
+        subkeys: u16,
+        slot: u16,
+    ) -> Result<(), RecordError> {
+        self.inner.erase_drop_slot(owner, subkeys, slot)
+    }
+
+    fn open_channel(
+        &mut self,
+        owner: &ChannelOwnerSeed,
+        subkeys: u16,
+    ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
+        self.inner.open_channel(owner, subkeys)
+    }
+
+    fn read_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        subkey: u16,
+    ) -> Result<Option<Vec<u8>>, RecordError> {
+        if self.recording {
+            let read = self.inner.read_channel(lookup_key, subkey)?;
+            self.cache
+                .channels
+                .push((*lookup_key, subkey, read.clone()));
+            return Ok(read);
+        }
+        match self.cache.channel(lookup_key, subkey) {
+            Some(value) => Ok(value.clone()),
+            None => self.inner.read_channel(lookup_key, subkey),
+        }
+    }
+
+    fn write_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        subkey: u16,
+        bytes: &[u8],
+    ) -> Result<(), RecordError> {
+        self.inner.write_channel(lookup_key, subkey, bytes)
+    }
+
+    fn write_batch(&mut self, writes: &[BatchWrite<'_>]) -> Vec<Result<(), RecordError>> {
+        self.inner.write_batch(writes)
+    }
+}
+
+/// What a [`preview`] read: the correspondent's messages and the raw values
+/// they were read from.
+pub struct Preview {
+    /// The messages in the correspondent's ring, in sequence order from 0.
+    pub messages: Vec<ReceivedMessage>,
+    /// Every channel and advert value the preview read, for a
+    /// [`CachedRecords`] over the [`accept`] of the same request.
+    pub reads: ReadCache,
+}
+
+impl core::fmt::Debug for Preview {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Preview")
+            .field("messages", &self.messages)
+            .field("reads", &self.reads.len())
+            .finish()
+    }
+}
+
+/// Read a contact request's messages without accepting it.
+///
+/// Performs the reads [`accept`] performs for the correspondent's side before
+/// its first write, in the same order: the opening, verified as an acceptance
+/// verifies it, the correspondent's advert, and the ring from sequence 0. The
+/// ring is opened on a key schedule of its own, built as [`accept`] builds the
+/// one it persists, and dropped on return. Nothing is written to the record
+/// store or the local store.
+pub fn preview<R: Records>(
+    records: &mut R,
+    me: &Me<'_>,
+    request: &ContactRequest,
+) -> Result<Preview, FlowError> {
+    let mut recording = CachedRecords {
+        inner: records,
+        cache: ReadCache::default(),
+        recording: true,
+    };
+    let mut reader = chain::accept(&request.shared_secret, &request.first_ratchet_pk)?;
+    let control_key = channel::control_key(&request.shared_secret)?;
+    read_accepted_opening(
+        &mut recording,
+        me.signer.public_key(),
+        &control_key,
+        &request.lookup_key,
+        request.advert_serial,
+        &request.identity,
+        Some(request.first_ratchet_pk.as_slice()),
+    )?;
+    let advert_owner = advert::derive_owner_seed(&request.identity)?;
+    recording.read_advert(&advert_owner, advert::ADVERT_SUBKEYS)?;
+    let mut ring = Ring::new();
+    let read = read_ring(
+        &mut recording,
+        &mut reader,
+        &mut ring,
+        &request.lookup_key,
+        0,
+    )?;
+    Ok(Preview {
+        messages: read.messages,
+        reads: recording.cache,
     })
 }
 
@@ -2168,6 +2416,11 @@ mod tests {
         write_calls: Vec<WriteCall>,
         /// Inside a batch, whose writes are logged with it.
         in_batch: bool,
+        /// Every advert and channel read, control and message alike.
+        network_reads: usize,
+        /// How many of [`Net::network_reads`] had been made when the first
+        /// write was charged.
+        reads_at_first_write: Option<usize>,
     }
 
     /// One write request a flow made, as [`Net::write_calls`] logs it.
@@ -2192,6 +2445,7 @@ mod tests {
             if self.fail_after.is_some_and(|n| self.writes.total() >= n) {
                 return Err(RecordError::new(Refused));
             }
+            self.reads_at_first_write.get_or_insert(self.network_reads);
             self.writes.bytes += bytes;
             Ok(())
         }
@@ -2258,6 +2512,7 @@ mod tests {
             subkeys: u16,
         ) -> Result<Option<Vec<u8>>, RecordError> {
             self.shapes.push(("advert", subkeys));
+            self.network_reads += 1;
             if self.refuse_adverts {
                 return Err(RecordError::new(Refused));
             }
@@ -2339,6 +2594,7 @@ mod tests {
             subkey: u16,
         ) -> Result<Option<Vec<u8>>, RecordError> {
             self.channel_reads += 1;
+            self.network_reads += 1;
             if let Some(hook) = self
                 .before_message_read
                 .take_if(|_| subkey != channel::CONTROL_SUBKEY)
@@ -2574,6 +2830,209 @@ mod tests {
         let store_a = a.store();
         collect(&store_a, net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
         (opened_peer(&outcome), accepted)
+    }
+
+    // ── preview ─────────────────────────────────────────────────────────────
+
+    /// Every file under a party's profile, by path, with its bytes.
+    fn profile_image(party: &Party) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut dirs = vec![party.root.path().to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read a profile directory") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else {
+                    let bytes = std::fs::read(&path).expect("read a profile file");
+                    files.push((path, bytes));
+                }
+            }
+        }
+        files.sort();
+        files
+    }
+
+    /// B previews the one request in its drop.
+    fn b_previews(b: &Party, net: &mut Net) -> (ContactRequest, Preview) {
+        let request = only_request(b_collects(b, net));
+        let preview = preview(net, &b.me(), &request).expect("B previews");
+        (request, preview)
+    }
+
+    /// A preview reads the requester's first message with its sender's time,
+    /// and writes nothing to the record store or the profile.
+    #[test]
+    fn a_preview_reads_the_requesters_message_and_writes_nothing() {
+        let (a, b, mut net) = scene();
+        a_opens(&a, &b, &mut net, b"the first message");
+        let request = only_request(b_collects(&b, &mut net));
+        net.reset_writes();
+        let before = profile_image(&b);
+        assert!(!before.is_empty(), "the profile holds the store");
+
+        let preview = preview(&mut net, &b.me(), &request).expect("B previews");
+
+        assert_eq!(preview.messages.len(), 1, "the one message A wrote");
+        assert_eq!(preview.messages[0].body, b"the first message");
+        assert_eq!(preview.messages[0].sent_at_ms, NOW * 1000);
+        assert!(
+            preview.reads.len() >= 3,
+            "the opening, the advert, the ring"
+        );
+        assert_eq!(net.writes.total(), 0, "a preview writes no record");
+        assert_eq!(profile_image(&b), before, "a preview writes no file");
+    }
+
+    /// An acceptance over the preview's reads makes no network read before its
+    /// first write; the same acceptance without them reads before it writes.
+    #[test]
+    fn an_acceptance_after_a_preview_reads_nothing_before_its_first_write() {
+        for previewed in [false, true] {
+            let (a, b, mut net) = scene();
+            a_opens(&a, &b, &mut net, b"the first message");
+            let (request, preview) = b_previews(&b, &mut net);
+            net.network_reads = 0;
+            net.reads_at_first_write = None;
+            let store = b.store();
+            let mut entropy = Seeded::at(909);
+            let fill = |x: &mut [u8]| entropy.fill(x);
+            let accepted = if previewed {
+                accept(
+                    &store,
+                    &mut CachedRecords::new(&mut net, preview.reads),
+                    &b.me(),
+                    &request,
+                    b"the reply",
+                    fill,
+                    NOW,
+                )
+            } else {
+                accept(&store, &mut net, &b.me(), &request, b"the reply", fill, NOW)
+            }
+            .expect("B accepts");
+            assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
+            let reads = net.reads_at_first_write.expect("the acceptance wrote");
+            if previewed {
+                assert_eq!(reads, 0, "reads before the first write, previewed");
+            } else {
+                assert!(reads >= 3, "{reads} read(s) before the first write");
+            }
+        }
+    }
+
+    /// A message that lands in the requester's ring after the preview is not
+    /// read by an acceptance over the preview's reads, which ends at the empty
+    /// slot the preview saw, and is read, in order, by the next collection.
+    ///
+    /// A first contact that awaits acceptance sends nothing further, so the
+    /// second message is sealed on the requester's own key schedule and placed
+    /// in its ring directly.
+    #[test]
+    fn a_message_after_the_preview_is_read_by_the_next_collection() {
+        let (a, b, mut net) = scene();
+        let opened = opened_peer(&a_opens(&a, &b, &mut net, b"the first message"));
+        let (request, preview) = b_previews(&b, &mut net);
+        assert_eq!(preview.messages.len(), 1);
+
+        let store_a = a.store();
+        let state_a = store_a
+            .load_conv(&opened)
+            .expect("load")
+            .expect("A's record");
+        assert!(
+            matches!(
+                send_message(&store_a, &mut net, &opened, b"blocked", |_| Ok(()), NOW),
+                Err(FlowError::AwaitingAcceptance)
+            ),
+            "control: an unaccepted first contact sends nothing further"
+        );
+        let mut writer = Conversation::restore(state_a.conversation);
+        let mut entropy = Seeded::at(77);
+        let second = seal_slot(&mut writer, b"the second message", NOW + 1, |x| {
+            entropy.fill(x)
+        })
+        .expect("seal the second message");
+        net.channels
+            .insert((state_a.outgoing_lookup_key, channel::slot_for(1)), second);
+
+        let store = b.store();
+        let mut entropy = Seeded::at(909);
+        let accepted = accept(
+            &store,
+            &mut CachedRecords::new(&mut net, preview.reads),
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B accepts");
+        assert_eq!(accepted.bodies(), vec![b"the first message".to_vec()]);
+        let state = store
+            .load_conv(&accepted.peer)
+            .expect("load")
+            .expect("B's record");
+        assert_eq!(
+            state.my_collected, 1,
+            "the acceptance stopped at the cached empty slot"
+        );
+
+        let batch = collect_batch(&store, &mut net, &accepted.peer).expect("B collects");
+        assert_eq!(batch.bodies(), vec![b"the second message".to_vec()]);
+        assert_eq!(
+            batch.my_collected, 2,
+            "the second message follows the first"
+        );
+    }
+
+    /// The conversation record an acceptance leaves is the same byte for byte
+    /// whether it read the network or a preview's reads, entropy held equal.
+    /// The hello back is compared by what it was sealed from.
+    #[test]
+    fn a_preview_leaves_the_accepted_record_unchanged() {
+        let record = |previewed: bool| {
+            let (a, b, mut net) = scene();
+            a_opens(&a, &b, &mut net, b"the first message");
+            let (request, preview) = b_previews(&b, &mut net);
+            let store = b.store();
+            let mut entropy = Seeded::at(909);
+            let fill = |x: &mut [u8]| entropy.fill(x);
+            let accepted = if previewed {
+                accept(
+                    &store,
+                    &mut CachedRecords::new(&mut net, preview.reads),
+                    &b.me(),
+                    &request,
+                    b"the reply",
+                    fill,
+                    NOW,
+                )
+            } else {
+                accept(&store, &mut net, &b.me(), &request, b"the reply", fill, NOW)
+            }
+            .expect("B accepts");
+            let state = store
+                .load_conv(&accepted.peer)
+                .expect("load")
+                .expect("B's record");
+            assert!(!state.acceptance_pending, "the acceptance finished");
+            assert_eq!(state.my_collected, 1, "the first message was collected");
+            // The hello back's envelope draws a nonce the fill does not
+            // supply, so its sealed bytes are left out and everything they
+            // were sealed from is kept.
+            let mut state = state;
+            let hello = state.outstanding_hello.take().expect("the hello back");
+            let mut image = encode_conv(&state).to_vec();
+            image.extend_from_slice(&hello.slot.to_be_bytes());
+            image.extend_from_slice(&hello.r);
+            image.extend_from_slice(hello.kem_ct.as_slice());
+            image.extend_from_slice(&hello.advert_serial.to_be_bytes());
+            image
+        };
+        let (previewed, direct) = (record(true), record(false));
+        assert!(direct.len() > 1000, "the record was imaged");
+        assert_eq!(previewed, direct);
     }
 
     // ── write budget ────────────────────────────────────────────────────────

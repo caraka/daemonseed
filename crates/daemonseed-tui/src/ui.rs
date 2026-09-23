@@ -1290,8 +1290,9 @@ fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
             u64::try_from(request.held_at_ms).unwrap_or(0),
             now_unix_ms(),
         );
-        // What a request shows is who sent it and when it was held: nothing a
-        // stranger wrote is read before the user accepts.
+        // A request shows who sent it and when it was held, then the messages
+        // the runner's preview read from it, so a reply is written with them
+        // in view.
         let text = if request.started_over {
             format!(
                 "{} started over · held {held}",
@@ -1314,6 +1315,17 @@ fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
                 },
             ),
         ]));
+        for message in &request.preview {
+            if let DmThreadRow::Received {
+                body, sent_at_ms, ..
+            } = message
+            {
+                lines.push(Line::from(format!(
+                    "    ← {body} · sent {}",
+                    utc_clock(*sent_at_ms, now_unix_ms())
+                )));
+            }
+        }
         row += 1;
     }
     for (pk, correspondence) in &correspondences {
@@ -1394,6 +1406,7 @@ fn dm_health_line(h: &HealthCounters) -> Option<String> {
         h.advert_failures,
         h.conversation_failures,
         h.hellos_unsettled,
+        h.previews_failed,
     ]);
     let groups = [
         (h.store_failures, "store failure", "store failures"),

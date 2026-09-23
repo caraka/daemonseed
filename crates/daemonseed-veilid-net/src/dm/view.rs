@@ -161,6 +161,17 @@ impl std::fmt::Debug for DmThreadRow {
     }
 }
 
+/// A correspondent's message as a thread row. A sender's clock ahead of this
+/// side's is held at the time the message was collected.
+fn received(seq: u64, body: &[u8], sent_at: u64, received_at: u64) -> DmThreadRow {
+    DmThreadRow::Received {
+        seq,
+        body: String::from_utf8_lossy(body).into_owned(),
+        sent_at_ms: sent_at.min(received_at),
+        received_at_ms: received_at,
+    }
+}
+
 /// The most contact requests the pane holds: one per drop slot, which is the
 /// most the runner holds at once. The oldest row is dropped to make room.
 pub const DM_REQUEST_CAP: usize = DROP_SUBKEYS as usize;
@@ -316,6 +327,9 @@ pub struct DmContactRequest {
     /// When this session first held a request from this identity, in Unix
     /// milliseconds.
     pub held_at_ms: i64,
+    /// The requester's messages, as [`DmThreadRow::Received`] rows, once the
+    /// runner has previewed the request; empty before then.
+    pub preview: Vec<DmThreadRow>,
 }
 
 impl std::fmt::Debug for DmContactRequest {
@@ -324,8 +338,8 @@ impl std::fmt::Debug for DmContactRequest {
         redacted_pk(f)?;
         write!(
             f,
-            ", started_over: {}, held_at_ms: {} }}",
-            self.started_over, self.held_at_ms
+            ", started_over: {}, held_at_ms: {}, preview: {:?} }}",
+            self.started_over, self.held_at_ms, self.preview
         )
     }
 }
@@ -476,7 +490,14 @@ impl DmState {
         {
             return false;
         }
+        let accepting = self.outstanding.values().any(
+            |outstanding| matches!(outstanding, DmOutstanding::Accept { from: f, .. } if f == from),
+        );
         if let Some(row) = self.requests.iter_mut().find(|row| row.from == *from) {
+            // The messages an acceptance in flight replies to stay in view.
+            if row.request != request && !accepting {
+                row.preview.clear();
+            }
             row.request = request;
             row.started_over = started_over;
             return false;
@@ -490,6 +511,7 @@ impl DmState {
             from: from.clone(),
             started_over,
             held_at_ms: now_ms,
+            preview: Vec::new(),
         });
         evicted
     }
@@ -577,6 +599,34 @@ impl DmState {
             RunnerEvent::StartedOver { request, from } => {
                 evicted_oldest = self.hold_request(*request, from, true, now_ms);
             }
+            RunnerEvent::RequestPreview {
+                request,
+                messages,
+                read_at,
+            } => {
+                // A row whose sender's acceptance is in flight keeps the messages
+                // that acceptance replies to.
+                let accepting: BTreeSet<&IdentityPk> = self
+                    .outstanding
+                    .values()
+                    .filter_map(|outstanding| match outstanding {
+                        DmOutstanding::Accept { from, .. } => Some(from),
+                        _ => None,
+                    })
+                    .collect();
+                if let Some(row) = self
+                    .requests
+                    .iter_mut()
+                    .find(|row| row.request == *request && !accepting.contains(&row.from))
+                {
+                    row.preview = (0..)
+                        .zip(messages)
+                        .map(|(seq, message)| {
+                            received(seq, &message.body, message.sent_at_ms, *read_at)
+                        })
+                        .collect();
+                }
+            }
             RunnerEvent::Message {
                 from,
                 seq,
@@ -584,12 +634,7 @@ impl DmState {
                 sent_at,
                 received_at,
             } => {
-                let row = DmThreadRow::Received {
-                    seq: *seq,
-                    body: String::from_utf8_lossy(body).into_owned(),
-                    sent_at_ms: (*sent_at).min(*received_at),
-                    received_at_ms: *received_at,
-                };
+                let row = received(*seq, body, *sent_at, *received_at);
                 match self.labels.get(from).cloned() {
                     Some(peer) => {
                         let activity = self.next_activity();
@@ -606,6 +651,7 @@ impl DmState {
                 }
             }
             RunnerEvent::Sent { token, peer, seq } => {
+                let mut previewed = Vec::new();
                 let (identity, body) = match self.outstanding.remove(token) {
                     // A first contact to an identity whose conversation is
                     // already named resumed it, and the runner sealed no new
@@ -633,6 +679,14 @@ impl DmState {
                         from,
                         reply,
                     }) => {
+                        // The row may carry a later id from the same identity.
+                        if let Some(held) = self
+                            .requests
+                            .iter_mut()
+                            .find(|held| held.request == request || held.from == from)
+                        {
+                            previewed = std::mem::take(&mut held.preview);
+                        }
                         self.requests.retain(|held| {
                             held.request != request && (held.started_over || held.from != from)
                         });
@@ -647,6 +701,13 @@ impl DmState {
                     entry.last_activity = activity;
                     if body.is_some() {
                         entry.refusal = None;
+                    }
+                    // The requester's messages precede the reply. A row the
+                    // accept already reported holds its place.
+                    for row in previewed {
+                        if !entry.thread.iter().any(|held| held.same_position(&row)) {
+                            entry.record(row);
+                        }
                     }
                     entry.record(DmThreadRow::Sent { seq: *seq, body });
                 }
@@ -830,6 +891,182 @@ mod tests {
                 "after {again:?}"
             );
         }
+    }
+
+    /// A preview puts the requester's messages on its request. The accept's
+    /// answer moves them into the conversation ahead of the reply, and the
+    /// same messages reported again by the accept, and one the preview did
+    /// not see, each appear once.
+    #[test]
+    fn previewed_messages_precede_the_reply_once_each() {
+        use daemonseed_core::dm::flows::ReceivedMessage;
+        for reported in [false, true] {
+            let mut dm = DmState::default();
+            let request = ContactRequestId::for_test(1, 7);
+            dm.fold(
+                &RunnerEvent::ContactRequest {
+                    request,
+                    from: pk(3),
+                },
+                0,
+            );
+            dm.fold(
+                &RunnerEvent::RequestPreview {
+                    request,
+                    messages: vec![ReceivedMessage {
+                        sent_at_ms: 5,
+                        body: b"hi, it's cora".to_vec(),
+                    }],
+                    read_at: 9,
+                },
+                0,
+            );
+            assert_eq!(dm.requests[0].preview.len(), 1, "the preview is held");
+            let token = accept(&mut dm, request, &pk(3));
+            let peer = label();
+            if reported {
+                for (seq, body) in [(0, "hi, it's cora"), (1, "and a second")] {
+                    dm.fold(
+                        &RunnerEvent::Message {
+                            from: peer,
+                            seq,
+                            body: body.as_bytes().to_vec(),
+                            sent_at: 5,
+                            received_at: 10,
+                        },
+                        0,
+                    );
+                }
+            }
+            dm.fold(
+                &RunnerEvent::Sent {
+                    token,
+                    peer,
+                    seq: 0,
+                },
+                0,
+            );
+            let thread: Vec<String> = dm.correspondences[&pk(3)]
+                .thread
+                .iter()
+                .map(|row| match row {
+                    DmThreadRow::Received { seq, body, .. } => format!("<{seq} {body}"),
+                    DmThreadRow::Sent { seq, body } => format!(">{seq} {body:?}"),
+                })
+                .collect();
+            let mut expected = vec!["<0 hi, it's cora".to_owned()];
+            if reported {
+                expected.push("<1 and a second".to_owned());
+            }
+            expected.push(">0 Some(\"message accepted\")".to_owned());
+            assert_eq!(thread, expected, "reported by the accept: {reported}");
+        }
+    }
+
+    /// A preview of request `serial` holding one message.
+    fn preview_of(serial: u64, body: &str) -> RunnerEvent {
+        RunnerEvent::RequestPreview {
+            request: ContactRequestId::for_test(1, serial),
+            messages: vec![daemonseed_core::dm::flows::ReceivedMessage {
+                sent_at_ms: 5,
+                body: body.as_bytes().to_vec(),
+            }],
+            read_at: 9,
+        }
+    }
+
+    /// The bodies of each request's preview, in request order.
+    fn previews(dm: &DmState) -> Vec<Vec<String>> {
+        dm.requests
+            .iter()
+            .map(|r| {
+                r.preview
+                    .iter()
+                    .map(|row| match row {
+                        DmThreadRow::Received { body, .. } => body.clone(),
+                        DmThreadRow::Sent { .. } => "sent".to_owned(),
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A second hello from the same identity while its acceptance is in flight
+    /// leaves the message being replied to in view, and the acceptance's answer
+    /// still places it above the reply. With no acceptance in flight the
+    /// second hello, under a new id, clears the preview.
+    #[test]
+    fn a_second_hello_during_an_acceptance_keeps_the_preview() {
+        for accepting in [false, true] {
+            let mut dm = DmState::default();
+            let first = ContactRequestId::for_test(1, 7);
+            let second = ContactRequestId::for_test(1, 8);
+            dm.fold(
+                &RunnerEvent::ContactRequest {
+                    request: first,
+                    from: pk(3),
+                },
+                0,
+            );
+            dm.fold(&preview_of(7, "hi, it's cora"), 0);
+            let token = accepting.then(|| accept(&mut dm, first, &pk(3)));
+            dm.fold(
+                &RunnerEvent::ContactRequest {
+                    request: second,
+                    from: pk(3),
+                },
+                0,
+            );
+            dm.fold(&preview_of(8, "a later hello"), 0);
+            let expected = if accepting {
+                vec![vec!["hi, it's cora".to_owned()]]
+            } else {
+                vec![vec!["a later hello".to_owned()]]
+            };
+            assert_eq!(previews(&dm), expected, "accepting: {accepting}");
+            let Some(token) = token else { continue };
+            dm.fold(
+                &RunnerEvent::Sent {
+                    token,
+                    peer: label(),
+                    seq: 0,
+                },
+                0,
+            );
+            let thread: Vec<bool> = dm.correspondences[&pk(3)]
+                .thread
+                .iter()
+                .map(|row| matches!(row, DmThreadRow::Received { body, .. } if body == "hi, it's cora"))
+                .collect();
+            assert_eq!(thread, [true, false], "the message, then the reply");
+        }
+    }
+
+    /// Two identities' previews each land on their own request row.
+    #[test]
+    fn previews_of_two_identities_do_not_cross() {
+        let mut dm = DmState::default();
+        dm.fold(
+            &RunnerEvent::ContactRequest {
+                request: ContactRequestId::for_test(1, 1),
+                from: pk(3),
+            },
+            0,
+        );
+        dm.fold(
+            &RunnerEvent::ContactRequest {
+                request: ContactRequestId::for_test(1, 2),
+                from: pk(4),
+            },
+            0,
+        );
+        dm.fold(&preview_of(2, "from four"), 0);
+        dm.fold(&preview_of(1, "from three"), 0);
+        assert_eq!(dm.requests[0].from, pk(3));
+        assert_eq!(
+            previews(&dm),
+            [vec!["from three".to_owned()], vec!["from four".to_owned()]]
+        );
     }
 
     /// The token a first contact carries.
