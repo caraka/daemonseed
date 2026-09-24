@@ -26,7 +26,7 @@
 //!   A-S26 neg — the receiver-verifiable share_id binding; A-S27 neg — the
 //!   project-announce seed is not in the source tree, the operator loads it at
 //!   runtime and both derived public keys are checked against the baked ones)
-//! - 128 client-side: 89 positive (`ISC-C*`) + 39 negative (`ISC-A-C*`)
+//! - 137 client-side: 98 positive (`ISC-C*`) + 39 negative (`ISC-A-C*`)
 //!   (C26 withdrawn as an ISA tombstone on 2026-09-07: the Veilid cutover
 //!   removed the server-id, APP_HELLO_ACK and TLS handshake it described)
 //!   (A-C45 added with the #293 decision: the DM store scrubs a record before

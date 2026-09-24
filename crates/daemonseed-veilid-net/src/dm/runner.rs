@@ -2265,6 +2265,11 @@ impl<R: RunnerRecords> Runner<R> {
             let Ok(note) = self.lane_notes.try_recv() else {
                 break;
             };
+            // A block the live lane served is a command served during the
+            // scan, as one served here is.
+            if matches!(note, live_lane::LaneNote::Blocked { .. }) {
+                self.served_mid_scan = true;
+            }
             self.serving = true;
             let served = self.serve_lane_note(note).await;
             self.serving = false;

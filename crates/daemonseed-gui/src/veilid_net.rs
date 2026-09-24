@@ -721,7 +721,11 @@ pub async fn veilid_net_actor(
             started = wait_dm_start(&mut dm_start), if dm_start.is_some() => {
                 dm_start = None;
                 match started {
-                    Ok(Some(handle)) => dm = Some(DmSession::new(handle, &evt_tx)),
+                    Ok(Some(handle)) => {
+                        dm = Some(DmSession::new(handle, &evt_tx));
+                        // A handle set while the runner was starting.
+                        note_own_handle(dm.as_ref(), shares.signing.as_ref(), &my_handle);
+                    }
                     Ok(None) => {}
                     Err(e) => daemonseed_veilid_net::vtrace!("gui dm: runner start task failed ({e})"),
                 }
@@ -1547,6 +1551,22 @@ fn refuse_dm_command(evt_tx: &UnboundedSender<NetEvent>, command: &RunnerCommand
     })));
 }
 
+/// Hand `handle` to the runner as this side's own identity's, which rewrites
+/// every established conversation's control subkey where the handle changed.
+/// Nothing is sent without a runner or an identity.
+fn note_own_handle(dm: Option<&DmSession>, signing: Option<&Arc<SignKeypair>>, handle: &str) {
+    let (Some(session), Some(signing)) = (dm, signing) else {
+        return;
+    };
+    let own = RunnerCommand::NoteHandle {
+        peer_identity_pk: Box::new(*signing.public_key()),
+        handle: handle.to_owned(),
+    };
+    if session.commands.send(own).is_err() {
+        daemonseed_veilid_net::vtrace!("gui dm: own handle not taken");
+    }
+}
+
 /// Forward runner events to the UI, in order.
 fn forward_dm_events(evt_tx: &UnboundedSender<NetEvent>, events: Vec<RunnerEvent>) {
     for event in events {
@@ -1973,6 +1993,7 @@ async fn handle_command(
         // awaited there before a later connect starts another.
         NetCommand::StopDm => begin_dm_restart(dm, dm_start, evt_tx, async { None }),
         NetCommand::SetMyHandle { handle } => {
+            note_own_handle(dm.as_ref(), shares.signing.as_ref(), &handle);
             *my_handle = handle;
         }
         NetCommand::JoinCircle { circle_id, phrase } => {
@@ -8997,6 +9018,62 @@ mod tests {
             answer,
             (Some(CommandToken(9)), Refusal::UnknownConversation)
         );
+    }
+
+    /// A handle set while a runner is up reaches that runner at once as the
+    /// handle of this side's own identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handle_set_mid_session_reaches_the_runner_as_its_own() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let (commands, mut queued) = unbounded_channel();
+        let mut dm = Some(DmSession {
+            handle: empty_runner(
+                profile.path(),
+                EmptyRecords::new(Duration::ZERO),
+                RunnerConfig::default(),
+            ),
+            commands,
+        });
+        let mut dm_start: Option<DmStart> = None;
+        let me = Arc::new(dm_test_identity().signing);
+        let (fetch_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_tx, _confirm_rx) = unbounded_channel();
+        let (self_tx, _self_rx) = unbounded_channel();
+        let mut my_handle = "alice#000000000000".to_owned();
+        let mut shares = ShareState::new();
+        shares.signing = Some(Arc::clone(&me));
+        handle_command(
+            NetCommand::SetMyHandle {
+                handle: "alicia#000000000000".to_owned(),
+            },
+            &evt_tx,
+            &self_tx,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+            &mut my_handle,
+            &mut shares,
+            &fetch_tx,
+            &confirm_tx,
+            false,
+            &mut dm,
+            &mut dm_start,
+        )
+        .await;
+
+        assert_eq!(my_handle, "alicia#000000000000");
+        match queued.try_recv() {
+            Ok(RunnerCommand::NoteHandle {
+                peer_identity_pk,
+                handle,
+            }) => {
+                assert_eq!(peer_identity_pk.as_slice(), me.public_key().as_slice());
+                assert_eq!(handle, "alicia#000000000000");
+            }
+            other => panic!("expected the own handle note, got {other:?}"),
+        }
+        assert!(queued.try_recv().is_err(), "one note");
     }
 
     /// With no runner, a command is answered as the runner answers one it

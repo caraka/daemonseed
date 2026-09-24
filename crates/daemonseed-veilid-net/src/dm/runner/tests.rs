@@ -5193,50 +5193,79 @@ async fn a_conversation_established_again_after_a_delete_is_recognised() {
 /// slot after A's hello, so the scan has read the hello before it is held.
 struct HeldScan {
     a: Profile,
-    /// Held so B's profile directory outlives the test.
-    _b: Profile,
-    aw: Watch,
+    b: Profile,
     bw: Watch,
     b_fake: Fake,
     request: ContactRequestId,
     held: Arc<Gate>,
 }
 
+/// Entropy that is the same on every run: successive bytes of a counter
+/// starting at `seed`.
+fn counter_fill(seed: u8) -> impl FnMut(&mut [u8]) -> Result<(), ()> {
+    let mut next = seed;
+    move |buf| {
+        for byte in buf {
+            *byte = next;
+            next = next.wrapping_add(1);
+        }
+        Ok(())
+    }
+}
+
 /// A's first contact held by B as a request, and B's next drop scan held at
-/// the slot after A's hello. `None` where the hello is in the drop's last slot.
-async fn held_scan_after_a_request() -> Option<HeldScan> {
+/// the slot after A's hello. A writes its first contact through the flows
+/// with [`counter_fill`], so the hello's slot is the same on every run and is
+/// not the drop's last.
+async fn held_scan_after_a_request() -> HeldScan {
     let dht = network();
     let (a, b) = (Profile::new(), Profile::new());
     let (a_fake, b_fake) = (Fake::on(&dht), Fake::on(&dht));
-    let mut bw = b.spawn(&b_fake, real_clock());
-    bw.wait_for("B's startup", is_health).await;
     let mut aw = a.spawn(&a_fake, real_clock());
     aw.wait_for("A's startup", is_health).await;
-    aw.send(RunnerCommand::FirstContact {
-        token: CommandToken(1),
-        peer_identity_pk: b.pk.clone(),
-        body: b"the first body".to_vec(),
-    })
-    .await;
-    aw.wait_for("A's first contact", sent(1)).await;
+    assert!(finished(&aw.stop().await));
+    let mut bw = b.spawn(&b_fake, real_clock());
+    bw.wait_for("B's startup", is_health).await;
+    let keys = a.keys();
+    let me = Me {
+        signer: &keys.signing,
+        channel_root: &keys.dm_channel_root,
+    };
+    let store =
+        Store::open(a.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).expect("A's store opens");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_secs();
+    let mut records = a_fake.restart();
+    flows::first_contact(
+        &store,
+        &mut records,
+        &me,
+        &b.pk,
+        b"the first body",
+        counter_fill(0),
+        now,
+    )
+    .expect("A's first contact");
     let at = bw.wait_for("B's request", request_from(&a.pk)).await;
     let request = request_id(&bw.seen[at]);
     let slot = hello_slot(&dht, &b);
-    if slot + 1 >= drop_plane::DROP_SUBKEYS {
-        return None;
-    }
+    assert!(
+        slot + 1 < drop_plane::DROP_SUBKEYS,
+        "the hello is in the drop's last slot, {slot}; choose another counter_fill seed"
+    );
     let held = Arc::new(Gate::default());
     b_fake.faults().gate_drop_slot = Some((b.drop_name(), slot + 1, Arc::clone(&held)));
     held.reached().await;
-    Some(HeldScan {
+    HeldScan {
         a,
-        _b: b,
-        aw,
+        b,
         bw,
         b_fake,
         request,
         held,
-    })
+    }
 }
 
 /// Wait until `fake`'s runner starts its next drop pass after this call.
@@ -5255,9 +5284,7 @@ async fn next_pass(fake: &Fake) {
 /// is not surfaced again as a request by that scan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_accepted_during_a_scan_is_not_surfaced_again() {
-    let Some(mut scan) = held_scan_after_a_request().await else {
-        return;
-    };
+    let mut scan = held_scan_after_a_request().await;
     let _release = ReleaseOnDrop(Arc::clone(&scan.held));
     scan.bw
         .send(RunnerCommand::Accept {
@@ -5281,7 +5308,6 @@ async fn a_request_accepted_during_a_scan_is_not_surfaced_again() {
         "the accepted request came back: {:?}",
         &scan.bw.seen[at..]
     );
-    assert!(finished(&scan.aw.stop().await));
     assert!(finished(&scan.bw.stop().await));
 }
 
@@ -5289,9 +5315,7 @@ async fn a_request_accepted_during_a_scan_is_not_surfaced_again() {
 /// earlier is not surfaced again as a request by that scan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_blocked_during_a_scan_is_not_surfaced_again() {
-    let Some(mut scan) = held_scan_after_a_request().await else {
-        return;
-    };
+    let mut scan = held_scan_after_a_request().await;
     let _release = ReleaseOnDrop(Arc::clone(&scan.held));
     let from = scan.bw.seen.len();
     scan.bw
@@ -5299,9 +5323,17 @@ async fn a_request_blocked_during_a_scan_is_not_surfaced_again() {
             peer: scan.a.pk.clone(),
         })
         .await;
+    let store = Store::open(scan.b.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+        .expect("B's store opens");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !read_block_list(&store).is_some_and(|list| list.is_blocked(&scan.a.pk)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the block is stored while the scan is held");
     scan.held.release();
-    let at = scan
-        .bw
+    scan.bw
         .wait_from(from, "the block", |event| {
             is_block_list(event) && !block_list(event).is_empty()
         })
@@ -5309,11 +5341,10 @@ async fn a_request_blocked_during_a_scan_is_not_surfaced_again() {
     next_pass(&scan.b_fake).await;
     scan.bw.drain();
     assert!(
-        !scan.bw.seen[at..].iter().any(request_from(&scan.a.pk)),
+        !scan.bw.seen[from..].iter().any(request_from(&scan.a.pk)),
         "the blocked request came back: {:?}",
-        &scan.bw.seen[at..]
+        &scan.bw.seen[from..]
     );
-    assert!(finished(&scan.aw.stop().await));
     assert!(finished(&scan.bw.stop().await));
 }
 
@@ -7467,6 +7498,107 @@ async fn a_dead_route_is_replaced_and_republished() {
         k.board.lock().unwrap().routes.contains_key(&route),
         "the published route is one A allocated"
     );
+}
+
+/// A change of this side's own handle rewrites the control subkey of every
+/// established conversation at once, with the new handle, one write each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_own_handle_change_is_republished_to_every_conversation_at_once() {
+    let (mut k, _) = establish_pushed().await;
+    let c = Profile::new();
+    let c_fake = Fake::on(&k.dht);
+    attach_push(&c_fake, &k.board);
+    let mut cw = c.spawn(&c_fake, real_clock());
+    cw.wait_for("C's startup", is_health).await;
+    k.aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(3),
+        peer_identity_pk: c.pk.clone(),
+        body: b"to C".to_vec(),
+    })
+    .await;
+    let at = k.aw.wait_for("A's first contact to C", sent(3)).await;
+    let a_peer_c = sent_peer(&k.aw.seen[at]);
+    let at = cw.wait_for("C's request", request_from(&k.a.pk)).await;
+    cw.send(RunnerCommand::Accept {
+        token: CommandToken(4),
+        request: request_id(&cw.seen[at]),
+        reply: b"from C".to_vec(),
+    })
+    .await;
+    cw.wait_for("C's acceptance", sent(4)).await;
+    k.aw.wait_for("A's acceptance by C", accepted(a_peer_c))
+        .await;
+
+    let store = Store::open(k.a.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).unwrap();
+    let states: Vec<_> = store
+        .load()
+        .unwrap()
+        .convs
+        .into_iter()
+        .map(|conv| conv.state)
+        .collect();
+    assert_eq!(states.len(), 2, "A has two conversations");
+    let published = || {
+        let dht = k.dht.lock().unwrap();
+        states
+            .iter()
+            .map(|state| {
+                let bytes = &dht
+                    .records
+                    .get(&(CHANNEL, state.outgoing_lookup_key, channel::CONTROL_SUBKEY))
+                    .expect("A's control")
+                    .0;
+                channel::open_control_with_key(
+                    state.own_control_key.as_ref().expect("A's key"),
+                    bytes,
+                )
+                .expect("opens")
+                .reach
+                .handle
+            })
+            .collect::<Vec<_>>()
+    };
+    let hash = daemonseed_core::handle::Handle::from_pubkey(None, k.a.pk.as_slice())
+        .unwrap()
+        .hash_prefix()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let (old, new) = (format!("alice#{hash}"), format!("alicia#{hash}"));
+    let carries = |handle: &str| {
+        let handle = Some(handle.to_owned());
+        move || published().iter().all(|published| *published == handle)
+    };
+
+    k.aw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: k.a.pk.clone(),
+        handle: old.clone(),
+    })
+    .await;
+    prod_until(&k.aw, "both controls carry the first handle", carries(&old)).await;
+    let mut settled = k.a_fake.calls().control_writes;
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = k.a_fake.calls().control_writes;
+        if now == settled {
+            break;
+        }
+        settled = now;
+    }
+
+    k.aw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: k.a.pk.clone(),
+        handle: new.clone(),
+    })
+    .await;
+    prod_until(&k.aw, "both controls carry the new handle", carries(&new)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        k.a_fake.calls().control_writes - settled,
+        states.len(),
+        "one control rewrite per established conversation"
+    );
+    assert!(finished(&cw.stop().await));
 }
 
 /// ISC-C105 — a handle this side sets as its own travels in its control

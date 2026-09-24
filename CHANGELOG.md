@@ -40,6 +40,8 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- `daemonseed-gui`: a handle set mid-session reaches the direct-message runner at once, which rewrites the control subkey of every established conversation with it, instead of at the next connect.
+- `daemonseed-veilid-net`: a contact request whose identity is blocked while a drop scan is under way is not surfaced again by that scan.
 - `daemonseed-veilid-net`: a direct-message collection pass reads established conversations before the drop scan, and scans the drop every `DROP_SCAN_TICKS` (5) collection intervals, or every pass while a conversation awaits acceptance; a request is previewed directly after the scan that surfaced it.
 - `daemonseed-veilid-net`: the runner reports each collected message as its ring slot opens, not when the ring read ends; each message is recorded read before it is reported.
 - `daemonseed-veilid-net`, `daemonseed-gui`: a direct-message thread is in conversation order, the two directions interleaved by send time, instead of arrival order.
