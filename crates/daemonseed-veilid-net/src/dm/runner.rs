@@ -320,6 +320,12 @@ pub trait RunnerRecords: Records {
         let _ = (scan, read);
         false
     }
+
+    /// The push lane, taken once by the runner at startup. A store with none
+    /// answers `None`, and the runner delivers through the store alone.
+    fn take_push(&mut self) -> Option<crate::dm::push::PushParts> {
+        None
+    }
 }
 
 /// How a failed record store call failed.
@@ -491,7 +497,10 @@ pub enum RunnerCommand {
     /// `peer_identity_pk`, so its conversation keeps that name once no roster
     /// lists it and across a restart. Nothing is kept for an identity with no
     /// conversation. Where the stored handle changes, a
-    /// [`RunnerEvent::Roster`] carrying it follows.
+    /// [`RunnerEvent::Roster`] carrying it follows. Where `peer_identity_pk` is
+    /// this runner's own identity, `handle` is this side's own handle: it is
+    /// published in every control subkey this side writes, and only where its
+    /// hash part names this identity.
     NoteHandle {
         /// The correspondent's identity public key.
         peer_identity_pk: IdentityPk,
@@ -703,6 +712,16 @@ pub struct HealthCounters {
     /// the conversation. The slot is read again by every later collection
     /// until it is rewritten.
     pub slots_unopened: u64,
+    /// Pushes dropped unanswered because the push queue did not admit them (a
+    /// channel this side does not read, or past a channel's or the
+    /// acceptances' share of the queue), or because they did not decode, named
+    /// no conversation, did not open, did not verify, came from a blocked
+    /// correspondent, or failed on this side's store, which is also counted
+    /// where the failure belongs.
+    pub pushes_dropped: u64,
+    /// Pushes dropped unanswered because the runner reached them after their
+    /// answer window.
+    pub pushes_expired: u64,
 }
 
 /// What a runner reports.
@@ -1083,6 +1102,8 @@ where
 enum Wake {
     /// A command arrived, or the queue closed.
     Command(Option<RunnerCommand>),
+    /// The push transport handed the runner something.
+    Push(crate::dm::push::PushInbound),
     /// Something on the schedule is due.
     Due,
 }
@@ -1133,12 +1154,17 @@ async fn run<R: RunnerRecords>(
             tokio::select! {
                 biased;
                 command = queue.recv() => Wake::Command(command),
+                Some(push) = runner.push.next() => Wake::Push(push),
                 () = tokio::time::sleep_until(due) => Wake::Due,
             }
         };
         let step = match wake {
             Wake::Command(None | Some(RunnerCommand::Shutdown)) => Err(Halt::Stopped),
             Wake::Command(Some(command)) => match runner.serve(command).await {
+                Ok(()) => runner.report_health().await,
+                halted => halted,
+            },
+            Wake::Push(push) => match runner.serve_push(push).await {
                 Ok(()) => runner.report_health().await,
                 halted => halted,
             },
@@ -1917,12 +1943,15 @@ fn closed_control(state: &ConvState, marker: ClosedMarker) -> Option<Vec<u8>> {
 }
 
 /// The control record this side's channel holds while the conversation runs:
-/// the opening and the cursor last published.
-fn current_control(state: &ConvState) -> Option<Vec<u8>> {
+/// the opening, the cursor last published, the generation and the reach the
+/// store holds.
+fn current_control(store: &Store, state: &ConvState) -> Option<Vec<u8>> {
     own_control(state, |opening| Control {
         opening: Some(opening),
         collected_cursor: state.cursor_published,
         closed: false,
+        generation: state.generation,
+        reach: store.reach(),
     })
 }
 
@@ -1982,6 +2011,8 @@ struct Runner<R> {
     /// Whether a command was served since this was last cleared, which a
     /// collection pass does before each conversation.
     served_since: bool,
+    /// Push delivery's state.
+    push: push_hooks::PushState,
 }
 
 impl<R: RunnerRecords> Runner<R> {
@@ -1993,13 +2024,14 @@ impl<R: RunnerRecords> Runner<R> {
         stop: Arc<AtomicBool>,
     ) -> Result<Self, Halt> {
         let RunnerParts {
-            records,
+            mut records,
             signer,
             channel_root,
             at_rest_key,
             profile_root,
             config,
         } = parts;
+        let push = push_hooks::PushState::new(records.take_push());
         let clock = Clock::start();
         let store = Store::open(profile_root.join(STORE_DIR), &at_rest_key)?;
         drop(at_rest_key);
@@ -2064,6 +2096,7 @@ impl<R: RunnerRecords> Runner<R> {
             serving: false,
             served_mid_scan: false,
             served_since: false,
+            push,
         };
 
         match runner.stored_block_list() {
@@ -2075,6 +2108,7 @@ impl<R: RunnerRecords> Runner<R> {
             }
         }
         runner.reopen_channels(&loaded.convs)?;
+        runner.start_push().await?;
         runner.resume_deletes().await?;
         runner.refresh_advert(minted);
         runner.answering = None;
@@ -2112,6 +2146,7 @@ impl<R: RunnerRecords> Runner<R> {
         if !self.started || self.serving {
             return Ok(());
         }
+        self.serve_queued_pushes().await?;
         loop {
             self.check_stop()?;
             let command = match self.commands.try_lock() {
@@ -2234,6 +2269,7 @@ impl<R: RunnerRecords> Runner<R> {
     async fn emit_roster(&mut self) -> Result<(), Halt> {
         match self.store.load() {
             Ok(loaded) => {
+                self.admit_pushes_for(&loaded.convs);
                 self.emit(RunnerEvent::Roster(summaries(&loaded.convs)))
                     .await
             }
@@ -2862,7 +2898,7 @@ impl<R: RunnerRecords> Runner<R> {
             && !self.stopping()
             && behind(report_at(&reports, usize::from(channel::CONTROL_SUBKEY)))
         {
-            match current_control(state) {
+            match current_control(&self.store, state) {
                 Some(control) => {
                     let _ =
                         self.records
@@ -3018,9 +3054,10 @@ impl<R: RunnerRecords> Runner<R> {
         body: &[u8],
     ) -> Result<(), Halt> {
         crate::vtrace!("dm runner: send on {} starts", tag(&peer));
+        let pusher = self.push.pusher_for(&self.store, &peer, &self.events);
         let sent = flows::send_message(
             &self.store,
-            &mut self.records,
+            &mut crate::dm::push::Pushing::new(&mut self.records, pusher, Some(peer)),
             &peer,
             body,
             os_fill,
@@ -3105,25 +3142,21 @@ impl<R: RunnerRecords> Runner<R> {
                         "dm runner: accept ends its ring read at the preview's empty slot; a later message is read by the next collection"
                     );
                 }
+                let pusher = self.push.pusher(held.reach.route.as_ref(), &self.events);
+                let mut records = crate::dm::push::Pushing::new(&mut self.records, pusher, None);
                 match reads {
                     Some(reads) => flows::accept(
                         &self.store,
-                        &mut CachedRecords::new(&mut self.records, reads),
+                        &mut CachedRecords::new(&mut records, reads),
                         &me,
                         held,
                         &reply,
                         os_fill,
                         now,
                     ),
-                    None => flows::accept(
-                        &self.store,
-                        &mut self.records,
-                        &me,
-                        held,
-                        &reply,
-                        os_fill,
-                        now,
-                    ),
+                    None => {
+                        flows::accept(&self.store, &mut records, &me, held, &reply, os_fill, now)
+                    }
                 }
             }
             Some(_) | None => {
@@ -3149,6 +3182,9 @@ impl<R: RunnerRecords> Runner<R> {
                     self.note_unopened(&accepted.peer, unopened);
                 }
                 self.collect_sooner();
+                if let Some(reach) = self.held_reach(&request) {
+                    self.note_reach(&accepted.peer, &reach);
+                }
                 self.requests.remove(&request);
                 let peer = accepted.peer;
                 self.delivered.entry(peer).or_insert(0);
@@ -3187,6 +3223,9 @@ impl<R: RunnerRecords> Runner<R> {
         identity: &[u8; IDENTITY_PK_LEN],
         handle: &str,
     ) -> Result<(), Halt> {
+        if identity == self.signer.public_key() {
+            return self.set_own_handle(handle).await;
+        }
         let conv = match self.conv_with(identity) {
             Ok(Some(conv)) => conv,
             Ok(None) | Err(()) => return Ok(()),
@@ -3444,6 +3483,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// Emit [`RunnerEvent::Health`] where a counter has moved since the last
     /// report.
     async fn report_health(&mut self) -> Result<(), Halt> {
+        self.flush_push_notes().await?;
         let health = self.records.health;
         if health == self.health_reported {
             return Ok(());
@@ -3687,8 +3727,10 @@ impl<R: RunnerRecords> Runner<R> {
     /// conversation record where it is ahead, never past `send_seq`.
     fn refresh_peer_cursor(&mut self, peer: &CorrespondenceLabel) {
         let _step = Step::start(format!("cursor read of {}", tag(peer)));
-        match flows::peer_cursor(&self.store, &mut self.records, peer) {
-            Ok(Some(cursor)) => {
+        match flows::peer_control(&self.store, &mut self.records, peer) {
+            Ok(Some(control)) => {
+                self.note_reach(peer, &control.reach);
+                let cursor = control.collected_cursor;
                 let recorded = self.store.update_conv(peer, |state| {
                     let cursor = cursor.min(state.send_seq);
                     if cursor > state.peer_collected {
@@ -3823,6 +3865,7 @@ impl<R: RunnerRecords> Runner<R> {
             if self.served_mid_scan && matches!(self.store.load_conv(&peer), Ok(None)) {
                 continue;
             }
+            self.note_reach(&peer, &acceptance.peer_reach);
             self.emit(RunnerEvent::Accepted { peer }).await?;
             match self.store.load_conv(&peer) {
                 Ok(Some(state)) => {
@@ -3895,6 +3938,8 @@ impl<R: RunnerRecords> Runner<R> {
         })
     }
 }
+
+mod push_hooks;
 
 #[cfg(test)]
 mod tests;

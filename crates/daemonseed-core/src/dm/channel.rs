@@ -179,9 +179,27 @@ const SERIAL_AT: usize = RATCHET_PK_AT + ml_kem::EK_LEN;
 /// Byte offset of the signature within an encoded opening.
 const SIGNATURE_AT: usize = SERIAL_AT + 8;
 
-/// Bytes a sealed control subkey takes at its largest: an opening, a cursor
-/// and the closed flag, under the AEAD envelope.
-pub const SEALED_CONTROL_MAX_LEN: usize = ENVELOPE_OVERHEAD + 8 + OPENING_LEN + 8 + 1;
+/// Bytes of private-route blob a control record carries at most. A longer
+/// route is left out of the record.
+pub const REACH_ROUTE_MAX_LEN: usize = 4096;
+
+/// Bytes of handle a control record carries at most. A longer handle is left
+/// out of the record.
+pub const REACH_HANDLE_MAX_LEN: usize = 256;
+
+/// Bytes a sealed control subkey takes at its largest: an opening, a cursor,
+/// the closed flag, the generation and the longest [`Reach`], under the AEAD
+/// envelope.
+pub const SEALED_CONTROL_MAX_LEN: usize = ENVELOPE_OVERHEAD
+    + 8
+    + OPENING_LEN
+    + 8
+    + 1
+    + 8
+    + 8
+    + REACH_ROUTE_MAX_LEN
+    + 8
+    + REACH_HANDLE_MAX_LEN;
 
 const _: () = assert!(
     SEALED_CONTROL_MAX_LEN <= CHANNEL_SUBKEY_LEN,
@@ -1059,13 +1077,42 @@ impl ChannelOpening {
     }
 }
 
+/// How the writer of a control record can be reached directly, and the name
+/// it goes by: its current Veilid private-route blob and its handle.
+///
+/// Both are optional and both are claims of the writer: a route is only an
+/// address to try, and a handle is kept only where its hash part names the
+/// writer's identity key ([`Reach::verified_handle`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reach {
+    /// The writer's private-route blob, at most [`REACH_ROUTE_MAX_LEN`] bytes.
+    pub route: Option<Vec<u8>>,
+    /// The writer's handle, `<display-name>#<12 hex>`, at most
+    /// [`REACH_HANDLE_MAX_LEN`] bytes.
+    pub handle: Option<String>,
+}
+
+impl Reach {
+    /// The handle in its canonical form, `<display-name>#<12 lowercase hex>`,
+    /// where it parses ([`crate::handle::Handle`], which refuses control and
+    /// bidirectional formatting characters in the name) and its hash part is
+    /// `SHA-384(writer_identity_pk)[:12]` (ISC-C4); `None` otherwise.
+    pub fn verified_handle(&self, writer_identity_pk: &[u8]) -> Option<String> {
+        let handle = self.handle.as_deref()?;
+        let claimed = handle.parse::<crate::handle::Handle>().ok()?;
+        let actual = crate::handle::Handle::from_pubkey(None, writer_identity_pk).ok()?;
+        (claimed.hash_prefix() == actual.hash_prefix())
+            .then(|| claimed.format(crate::handle::DisplayMode::Verify))
+    }
+}
+
 /// The control subkey's plaintext: the opening, the writer's collection
-/// cursor over the reverse direction, and whether the writer has closed the
-/// conversation.
+/// cursor over the reverse direction, whether the writer has closed the
+/// conversation, the conversation generation and the writer's [`Reach`].
 ///
 /// The opening is written once and then carried unchanged; the cursor is
 /// rewritten in place, which is why the sealing key does not step.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Control {
     /// The channel opening, absent only before it has been written.
     pub opening: Option<ChannelOpening>,
@@ -1074,26 +1121,55 @@ pub struct Control {
     pub collected_cursor: u64,
     /// Whether the writer has torn this conversation down (§ Delivery).
     pub closed: bool,
+    /// The generation both channels of the conversation are derived under
+    /// ([`derive_owner_seed`]). A record without the field reads as 0.
+    pub generation: u64,
+    /// How the writer can be reached directly. A record without the field
+    /// reads as no route and no handle.
+    pub reach: Reach,
 }
 
 impl Control {
     /// Encode the control record: `lp(opening) ‖ BE64(collected_cursor) ‖
-    /// closed`, the opening field empty when absent and the flag one byte.
+    /// closed ‖ BE64(generation) ‖ lp(route) ‖ lp(handle)`, the opening,
+    /// route and handle fields empty when absent and the flag one byte.
+    ///
+    /// A route longer than [`REACH_ROUTE_MAX_LEN`] or a handle longer than
+    /// [`REACH_HANDLE_MAX_LEN`] is written as absent.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(OPENING_LEN + 24);
+        let route = self
+            .reach
+            .route
+            .as_deref()
+            .filter(|route| route.len() <= REACH_ROUTE_MAX_LEN)
+            .unwrap_or(&[]);
+        let handle = self
+            .reach
+            .handle
+            .as_deref()
+            .filter(|handle| handle.len() <= REACH_HANDLE_MAX_LEN)
+            .unwrap_or("");
+        let mut out = Vec::with_capacity(OPENING_LEN + 48 + route.len() + handle.len());
         let encoded = self.opening.as_ref().map(ChannelOpening::encode);
         push_lp(&mut out, encoded.as_deref().unwrap_or(&[]));
         out.extend_from_slice(&self.collected_cursor.to_be_bytes());
         out.push(u8::from(self.closed));
+        out.extend_from_slice(&self.generation.to_be_bytes());
+        push_lp(&mut out, route);
+        push_lp(&mut out, handle.as_bytes());
         out
     }
 
     /// Decode a control record. Reading an opening is not verifying it — the
     /// caller calls [`ChannelOpening::verify`].
     ///
+    /// A record that ends at the flag is one written without the generation
+    /// and reach fields, and reads as generation 0 with no route and no
+    /// handle.
+    ///
     /// Fails closed with [`ChannelError::Malformed`] on bytes that run out, a
-    /// flag byte that is neither zero nor one, or trailing bytes past the
-    /// flag.
+    /// flag byte that is neither zero nor one, a route or handle over its
+    /// bound, a handle that is not UTF-8, or trailing bytes past the handle.
     pub fn decode(bytes: &[u8]) -> Result<Self, ChannelError> {
         let mut reader = Reader::new(bytes);
         let opening_field = reader.take_lp()?;
@@ -1102,6 +1178,22 @@ impl Control {
             0 => false,
             1 => true,
             _ => return Err(ChannelError::Malformed),
+        };
+        let (generation, reach) = if reader.bytes.is_empty() {
+            (0, Reach::default())
+        } else {
+            let generation = u64::from_be_bytes(reader.take_array::<8>()?);
+            let route = reader.take_lp()?;
+            let handle = reader.take_lp()?;
+            if route.len() > REACH_ROUTE_MAX_LEN || handle.len() > REACH_HANDLE_MAX_LEN {
+                return Err(ChannelError::Malformed);
+            }
+            let handle = core::str::from_utf8(handle).map_err(|_| ChannelError::Malformed)?;
+            let reach = Reach {
+                route: (!route.is_empty()).then(|| route.to_vec()),
+                handle: (!handle.is_empty()).then(|| handle.to_owned()),
+            };
+            (generation, reach)
         };
         if !reader.rest().is_empty() {
             return Err(ChannelError::Malformed);
@@ -1115,6 +1207,8 @@ impl Control {
             opening,
             collected_cursor,
             closed,
+            generation,
+            reach,
         })
     }
 }
@@ -1693,6 +1787,7 @@ mod tests {
             opening: Some(opening(7)),
             collected_cursor: 12,
             closed: false,
+            ..Control::default()
         };
         let sealed = seal_control(&ss, &control).unwrap();
         let opened = open_control(&ss, &sealed).unwrap();
@@ -1711,6 +1806,7 @@ mod tests {
             opening: None,
             collected_cursor: 0,
             closed: true,
+            ..Control::default()
         };
         let sealed = seal_control(&ss, &control).unwrap();
         assert_eq!(open_control(&ss, &sealed).unwrap(), control);
@@ -1724,6 +1820,7 @@ mod tests {
                 opening: Some(opening(7)),
                 collected_cursor: 12,
                 closed: false,
+                ..Control::default()
             },
         )
         .unwrap();
@@ -1747,6 +1844,7 @@ mod tests {
                 opening: Some(built.clone()),
                 collected_cursor: 12,
                 closed: false,
+                ..Control::default()
             },
         )
         .unwrap();
@@ -1768,25 +1866,54 @@ mod tests {
 
     #[test]
     fn a_malformed_control_record_is_refused() {
-        // A flag byte that is neither zero nor one.
+        // A flag byte that is neither zero nor one: it follows the empty
+        // opening's length prefix and the cursor.
         let mut bytes = Control {
             opening: None,
             collected_cursor: 3,
             closed: false,
+            ..Control::default()
         }
         .encode();
-        let last = bytes.len() - 1;
-        bytes[last] = 2;
+        bytes[16] = 2;
         assert_eq!(
             Control::decode(&bytes).unwrap_err(),
             ChannelError::Malformed
         );
 
-        // Trailing bytes past the flag.
+        // A handle that is not UTF-8.
+        let mut bad_handle = Control {
+            reach: Reach {
+                route: None,
+                handle: Some("ab".to_owned()),
+            },
+            ..Control::default()
+        }
+        .encode();
+        let last = bad_handle.len() - 1;
+        bad_handle[last] = 0xff;
+        assert_eq!(
+            Control::decode(&bad_handle).unwrap_err(),
+            ChannelError::Malformed
+        );
+
+        // A route over its bound.
+        let mut long_route = Control::default().encode();
+        long_route.truncate(long_route.len() - 16);
+        long_route.extend_from_slice(&((REACH_ROUTE_MAX_LEN + 1) as u64).to_be_bytes());
+        long_route.extend(core::iter::repeat_n(7u8, REACH_ROUTE_MAX_LEN + 1));
+        long_route.extend_from_slice(&0u64.to_be_bytes());
+        assert_eq!(
+            Control::decode(&long_route).unwrap_err(),
+            ChannelError::Malformed
+        );
+
+        // Trailing bytes past the handle.
         let mut trailing = Control {
             opening: None,
             collected_cursor: 3,
             closed: false,
+            ..Control::default()
         }
         .encode();
         trailing.push(0);
@@ -1802,11 +1929,104 @@ mod tests {
                     opening: None,
                     collected_cursor: 3,
                     closed: false,
+                    ..Control::default()
                 }
                 .encode()
             )
             .is_ok()
         );
+    }
+
+    /// ISC-C104 / ISC-C106 — the generation, the route and the handle travel
+    /// in the control record and come back unchanged.
+    #[test]
+    fn the_generation_and_reach_round_trip_through_the_control_subkey() {
+        let ss = shared_secret(0x11);
+        let control = Control {
+            opening: Some(opening(7)),
+            collected_cursor: 12,
+            closed: false,
+            generation: 0x0123_4567_89ab_cdef,
+            reach: Reach {
+                route: Some(vec![0x5a; REACH_ROUTE_MAX_LEN]),
+                handle: Some("alice#0123456789ab".to_owned()),
+            },
+        };
+        let sealed = seal_control(&ss, &control).unwrap();
+        assert!(sealed.len() <= SEALED_CONTROL_MAX_LEN);
+        assert_eq!(open_control(&ss, &sealed).unwrap(), control);
+    }
+
+    /// ISC-C106 — a control record that ends at the closed flag reads as
+    /// generation 0 with no route and no handle.
+    #[test]
+    fn a_control_record_ending_at_the_flag_reads_as_generation_zero() {
+        let mut old = Vec::new();
+        push_lp(&mut old, &opening(7).encode());
+        old.extend_from_slice(&12u64.to_be_bytes());
+        old.push(0);
+        let decoded = Control::decode(&old).unwrap();
+        assert_eq!(decoded.generation, 0);
+        assert_eq!(decoded.reach, Reach::default());
+        assert_eq!(decoded.collected_cursor, 12);
+        assert!(decoded.opening.is_some());
+    }
+
+    /// A route or handle over its bound is left out rather than written.
+    #[test]
+    fn an_oversized_route_or_handle_is_written_as_absent() {
+        let control = Control {
+            reach: Reach {
+                route: Some(vec![1; REACH_ROUTE_MAX_LEN + 1]),
+                handle: Some("x".repeat(REACH_HANDLE_MAX_LEN + 1)),
+            },
+            ..Control::default()
+        };
+        assert_eq!(
+            Control::decode(&control.encode()).unwrap().reach,
+            Reach::default()
+        );
+    }
+
+    /// ISC-C105 — a handle is kept only where its hash part names the
+    /// writer's identity key.
+    #[test]
+    fn a_handle_verifies_only_against_the_key_its_hash_names() {
+        let key = signer(0x21).public_key().to_vec();
+        let hash = hex::encode(
+            crate::handle::Handle::from_pubkey(None, &key)
+                .unwrap()
+                .hash_prefix(),
+        );
+        let genuine = Reach {
+            route: None,
+            handle: Some(format!("alice#{hash}")),
+        };
+        assert_eq!(genuine.verified_handle(&key), Some(format!("alice#{hash}")));
+        let upper = Reach {
+            route: None,
+            handle: Some(format!("alice#{}", hash.to_uppercase())),
+        };
+        assert_eq!(
+            upper.verified_handle(&key),
+            Some(format!("alice#{hash}")),
+            "the hash part is kept in lowercase"
+        );
+        for name in ["al\u{202E}ice", "al\u{2066}ice", "al\nice", "al\u{200F}ice"] {
+            let unsafe_name = Reach {
+                route: None,
+                handle: Some(format!("{name}#{hash}")),
+            };
+            assert_eq!(unsafe_name.verified_handle(&key), None, "{name:?}");
+        }
+        let other = signer(0x22).public_key().to_vec();
+        assert_eq!(genuine.verified_handle(&other), None);
+        let unparseable = Reach {
+            route: None,
+            handle: Some("alice".to_owned()),
+        };
+        assert_eq!(unparseable.verified_handle(&key), None);
+        assert_eq!(Reach::default().verified_handle(&key), None);
     }
 
     /// **Known-answer vectors, computed outside this crate from the preimages

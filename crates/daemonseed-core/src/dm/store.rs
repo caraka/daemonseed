@@ -71,7 +71,7 @@ use crate::dm::chain::{
     CHAIN_KEY_LEN, ChainKey, ConversationSnapshot, DirectionState, OWN_TURNS_RETAINED, OwnTurn,
     PeerTurn, ROOT_LEN, RatchetDecapKey, RatchetKeypair, ReceivingState, Root, TurnSecret,
 };
-use crate::dm::channel::{CHANNEL_SUBKEY_LEN, ControlKey, OPENING_LEN, RING_SLOTS};
+use crate::dm::channel::{CHANNEL_SUBKEY_LEN, ControlKey, OPENING_LEN, RING_SLOTS, Reach};
 use crate::dm::drop::{DROP_SUBKEYS, HELLO_LEN, HELLO_LOOKUP_KEY_LEN, HELLO_R_LEN};
 use crate::storage::dm_store::{
     CorrespondenceLabel, DmStore, DmStoreError, Locked, LockedProfile, RecordKind,
@@ -522,6 +522,9 @@ pub struct Loaded {
 /// The direct-messaging layer's disk.
 pub struct Store {
     inner: DmStore,
+    /// This node's [`Reach`], held in memory only: every control record a flow
+    /// writes carries it, and nothing of it reaches the disk.
+    reach: std::sync::Mutex<Reach>,
 }
 
 impl core::fmt::Debug for Store {
@@ -538,7 +541,25 @@ impl Store {
     ) -> Result<Self, StoreError> {
         Ok(Self {
             inner: DmStore::open(root, at_rest_key)?,
+            reach: std::sync::Mutex::new(Reach::default()),
         })
+    }
+
+    /// The route and handle every control record written from now on carries.
+    /// Held in memory for the life of this value and never written to disk.
+    pub fn set_reach(&self, reach: Reach) {
+        *self
+            .reach
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reach;
+    }
+
+    /// The route and handle [`Store::set_reach`] last set, or none.
+    pub fn reach(&self) -> Reach {
+        self.reach
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The record store beneath, for a caller that needs to name a

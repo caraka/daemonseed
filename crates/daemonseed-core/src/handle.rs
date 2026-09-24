@@ -81,6 +81,21 @@ pub enum HandleParseError {
     /// The display-name portion contains a `#` — would alias with the
     /// hash-separator and break round-trip.
     DisplayNameHasHash,
+    /// The display-name portion contains a control character or a
+    /// bidirectional override, embedding, isolate or mark, any of which can
+    /// make a rendered name read as something other than its characters.
+    DisplayNameHasUnsafeChar,
+}
+
+/// Whether `c` may not appear in a parsed display name: a control character,
+/// or a bidirectional formatting character (U+061C, U+200E, U+200F,
+/// U+202A..=U+202E, U+2066..=U+2069).
+fn unsafe_in_display_name(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 impl fmt::Display for HandleParseError {
@@ -99,6 +114,12 @@ impl fmt::Display for HandleParseError {
                 write!(
                     f,
                     "display name contains '#', which would alias the hash separator"
+                )
+            }
+            HandleParseError::DisplayNameHasUnsafeChar => {
+                write!(
+                    f,
+                    "display name contains a control or bidirectional formatting character"
                 )
             }
         }
@@ -279,6 +300,9 @@ impl FromStr for Handle {
 
         if name_segment.contains('#') {
             return Err(HandleParseError::DisplayNameHasHash);
+        }
+        if name_segment.chars().any(unsafe_in_display_name) {
+            return Err(HandleParseError::DisplayNameHasUnsafeChar);
         }
 
         let display_name = if name_segment.is_empty() {

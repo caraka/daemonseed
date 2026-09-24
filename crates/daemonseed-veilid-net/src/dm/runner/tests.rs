@@ -270,6 +270,10 @@ struct Faults {
     /// Hold a channel read at this gate: the first read of any of these
     /// channels after this many reads of them have passed.
     gate_channel_read: Option<(Vec<[u8; HELLO_LOOKUP_KEY_LEN]>, usize, Arc<Gate>)>,
+    /// Hold every ring-slot write at this gate.
+    gate_ring_write: Option<Arc<Gate>>,
+    /// The push lane the runner takes at startup.
+    push: Option<crate::dm::push::PushParts>,
 }
 
 /// One record call, as [`Faults::trail`] logs it.
@@ -626,6 +630,10 @@ impl Records for Fake {
             }
             self.count(|calls| calls.control_writes += 1);
         } else {
+            let gate = self.faults().gate_ring_write.clone();
+            if let Some(gate) = gate {
+                tokio::task::block_in_place(|| gate.hold());
+            }
             self.count(|calls| calls.ring_writes += 1);
             if let Some(trail) = self.faults().trail.as_mut() {
                 trail.push(Trail::Ring(subkey));
@@ -637,6 +645,10 @@ impl Records for Fake {
 }
 
 impl RunnerRecords for Fake {
+    fn take_push(&mut self) -> Option<crate::dm::push::PushParts> {
+        self.faults().push.take()
+    }
+
     fn inspect_channel(
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
@@ -818,14 +830,23 @@ impl Profile {
         }
     }
 
-    /// The lookup key of the channel this identity writes to `peer`.
+    /// The lookup key of the channel this identity writes to `peer`, derived
+    /// under the generation this profile's store holds for the conversation,
+    /// or under generation 0 where it holds none.
     fn outgoing_lookup_key(&self, peer: &Profile) -> [u8; HELLO_LOOKUP_KEY_LEN] {
-        let owner = channel::derive_owner_seed(
-            &self.keys().dm_channel_root,
-            &peer.pk,
-            flows::FIRST_GENERATION,
-        )
-        .expect("the channel owner seed");
+        let generation = Store::open(self.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
+            .and_then(|store| store.load())
+            .ok()
+            .and_then(|loaded| {
+                loaded
+                    .convs
+                    .into_iter()
+                    .find(|conv| conv.state.peer_identity_pk.as_slice() == peer.pk.as_slice())
+                    .map(|conv| conv.state.generation)
+            })
+            .unwrap_or(flows::FIRST_GENERATION);
+        let owner = channel::derive_owner_seed(&self.keys().dm_channel_root, &peer.pk, generation)
+            .expect("the channel owner seed");
         Fake::lookup_key(&owner)
     }
 
@@ -1718,8 +1739,6 @@ async fn a_request_is_previewed_before_the_next_conversation_read() {
         ..
     } = establish(RunnerConfig::default()).await;
     let c = Profile::new();
-    let (from_b, from_c) = (b.outgoing_lookup_key(&a), c.outgoing_lookup_key(&a));
-    assert_ne!(from_b[0], from_c[0], "the trail tells the channels apart");
     let mut cw = c.spawn(&Fake::on(&dht), RunnerConfig::default());
     cw.wait_for("C's startup", is_health).await;
     cw.send(RunnerCommand::FirstContact {
@@ -1730,6 +1749,9 @@ async fn a_request_is_previewed_before_the_next_conversation_read() {
     .await;
     cw.wait_for("C's first contact", sent(70)).await;
     assert!(finished(&cw.stop().await));
+    // C's channel is derived under the generation its first contact drew.
+    let (from_b, from_c) = (b.outgoing_lookup_key(&a), c.outgoing_lookup_key(&a));
+    assert_ne!(from_b[0], from_c[0], "the trail tells the channels apart");
     let hello = dht
         .lock()
         .expect("the network lock")
@@ -5019,12 +5041,11 @@ async fn a_noted_handle_is_kept_with_the_conversation_across_a_relaunch() {
     assert!(finished(&bw.stop().await));
 }
 
-/// A conversation deleted on both sides and established again reuses the
-/// channel records of the deleted one, whose network copies a delete leaves
-/// behind. The initiator recognises the new acceptance and reads the new
-/// reply though the next slot of the acceptor's ring still holds a message of
-/// the deleted conversation, and reads the acceptor's next message written
-/// over it.
+/// ISC-C106 — a conversation deleted on both sides and established again
+/// names channel records other than the deleted one's, whose network copies a
+/// delete leaves behind. The initiator recognises the new acceptance, reads
+/// the new reply and then the acceptor's next message, and nothing the deleted
+/// conversation left is read.
 #[tokio::test(start_paused = true)]
 async fn a_conversation_established_again_after_a_delete_is_recognised() {
     let Scene {
@@ -5053,6 +5074,7 @@ async fn a_conversation_established_again_after_a_delete_is_recognised() {
 
     a_fake.faults().erase_local_only = true;
     b_fake.faults().erase_local_only = true;
+    let b_old = b.outgoing_lookup_key(&a);
     for (watch, token, peer) in [(&mut aw, 51u64, a_peer), (&mut bw, 52, b_peer)] {
         watch
             .send(RunnerCommand::DeleteConversation {
@@ -5069,9 +5091,7 @@ async fn a_conversation_established_again_after_a_delete_is_recognised() {
     }
     let stale = channel::slot_for(1);
     assert!(
-        b_fake
-            .read((CHANNEL, b.outgoing_lookup_key(&a), stale))
-            .is_some(),
+        b_fake.read((CHANNEL, b_old, stale)).is_some(),
         "the deleted conversation's second message is still in B's ring"
     );
 
@@ -5121,16 +5141,11 @@ async fn a_conversation_established_again_after_a_delete_is_recognised() {
         message(a_again, 0, b"the reply again"),
     )
     .await;
-    tokio::time::timeout(
-        Duration::from_secs(5 * 60),
-        aw.wait_from(
-            from,
-            "the old slot counted",
-            |event| matches!(event, RunnerEvent::Health(h) if h.slots_unopened >= 1),
-        ),
-    )
-    .await
-    .expect("the old slot is counted in the health report");
+    assert_ne!(
+        b.outgoing_lookup_key(&a),
+        b_old,
+        "the new conversation writes a channel record of its own"
+    );
     bw.send(RunnerCommand::Send {
         token: CommandToken(62),
         peer: b_again,
@@ -7024,4 +7039,748 @@ fn a_tick_of_any_size_is_clamped_and_jitters_without_overflow() {
             "{tick:?} jittered to {got} ns, outside {low}..={high}"
         );
     }
+}
+
+// ── push delivery ───────────────────────────────────────────────────────────
+
+use crate::dm::push::{
+    push_queue, OwnRoute, PushError, PushFuture, PushInbound, PushOutbox, PushParts, PushTransport,
+};
+
+/// A fake `app_call` network: routes by blob to the runner that allocated
+/// them, calls answered through a one-shot per call.
+#[derive(Default)]
+struct Board {
+    routes: HashMap<Vec<u8>, (String, PushOutbox)>,
+    waiting: HashMap<u64, tokio::sync::oneshot::Sender<Vec<u8>>>,
+    next: u64,
+    /// Fail every call, as a transport that cannot reach the correspondent.
+    down: bool,
+    /// Calls made.
+    calls: usize,
+    /// Answers sent.
+    replies: usize,
+    /// Answer every call with the bare recorded tag, as a node that is not the
+    /// correspondent would.
+    forge_answer: bool,
+    /// Routes released, in order.
+    released: Vec<Vec<u8>>,
+}
+
+struct FakePush {
+    board: Arc<Mutex<Board>>,
+    inbound: PushOutbox,
+}
+
+impl PushTransport for FakePush {
+    fn call(&self, route: Vec<u8>, request: Vec<u8>) -> PushFuture<Result<Vec<u8>, PushError>> {
+        let board = Arc::clone(&self.board);
+        Box::pin(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let target = {
+                let mut board = board.lock().expect("the board lock");
+                board.calls += 1;
+                if board.down {
+                    return Err(PushError("the transport is down".to_owned()));
+                }
+                board.next += 1;
+                let id = board.next;
+                board.waiting.insert(id, tx);
+                board.routes.get(&route).map(|(_, to)| (id, to.clone()))
+            };
+            let Some((id, to)) = target else {
+                return Err(PushError("no such route".to_owned()));
+            };
+            if !to.offer(PushInbound::Call {
+                id,
+                message: request,
+                received: std::time::Instant::now(),
+            }) {
+                return Err(PushError("not admitted".to_owned()));
+            }
+            match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                Ok(Ok(answer)) => Ok(answer),
+                _ => Err(PushError("no answer".to_owned())),
+            }
+        })
+    }
+
+    fn new_route(&self) -> PushFuture<Result<OwnRoute, PushError>> {
+        let board = Arc::clone(&self.board);
+        let inbound = self.inbound.clone();
+        Box::pin(async move {
+            let mut board = board.lock().expect("the board lock");
+            board.next += 1;
+            let id = format!("route-{}", board.next);
+            let blob = id.clone().into_bytes();
+            board.routes.insert(blob.clone(), (id.clone(), inbound));
+            Ok(OwnRoute { id, blob })
+        })
+    }
+
+    fn reply(&self, call: u64, answer: Vec<u8>) -> PushFuture<Result<(), PushError>> {
+        let (waiting, answer) = {
+            let mut board = self.board.lock().expect("the board lock");
+            board.replies += 1;
+            let answer = if board.forge_answer {
+                daemonseed_core::dm::push::RECORDED.to_vec()
+            } else {
+                answer
+            };
+            (board.waiting.remove(&call), answer)
+        };
+        Box::pin(async move {
+            if let Some(waiting) = waiting {
+                let _ = waiting.send(answer);
+            }
+            Ok(())
+        })
+    }
+
+    fn release(&self, route: &[u8]) {
+        self.board
+            .lock()
+            .expect("the board lock")
+            .released
+            .push(route.to_vec());
+    }
+}
+
+/// Give `fake`'s next runner a push lane on `board`.
+fn attach_push(fake: &Fake, board: &Arc<Mutex<Board>>) -> PushOutbox {
+    let (outbox, inbox) = push_queue();
+    fake.faults().push = Some(PushParts {
+        transport: Arc::new(FakePush {
+            board: Arc::clone(board),
+            inbound: outbox.clone(),
+        }),
+        inbound: inbox,
+    });
+    outbox
+}
+
+/// A collection interval long enough that no collection runs inside a test
+/// on the real clock, so what arrives arrives by push.
+fn no_collection() -> RunnerConfig {
+    RunnerConfig {
+        tick: Duration::from_secs(600),
+        grace: Duration::from_secs(5),
+    }
+}
+
+/// A's first contact reaching B through the record store, B's runner holding
+/// it: both runners with push lanes on one board.
+struct Knocked {
+    dht: Arc<Mutex<Dht>>,
+    board: Arc<Mutex<Board>>,
+    a: Profile,
+    b: Profile,
+    a_fake: Fake,
+    b_fake: Fake,
+    aw: Watch,
+    bw: Watch,
+    a_peer: CorrespondenceLabel,
+    request: ContactRequestId,
+}
+
+async fn knock(config: RunnerConfig) -> Knocked {
+    let dht = network();
+    let board = Arc::new(Mutex::new(Board::default()));
+    let (a, b) = (Profile::new(), Profile::new());
+    let (a_fake, b_fake) = (Fake::on(&dht), Fake::on(&dht));
+    attach_push(&a_fake, &board);
+    attach_push(&b_fake, &board);
+    let mut bw = b.spawn(&b_fake, real_clock());
+    bw.wait_for("B's startup", is_health).await;
+    let mut aw = a.spawn(&a_fake, config);
+    // The real clock drives these runners whatever their tick.
+    aw.budget = REAL_BUDGET;
+    aw.wait_for("A's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"the first body".to_vec(),
+    })
+    .await;
+    let at = aw.wait_for("A's first contact", sent(1)).await;
+    let a_peer = sent_peer(&aw.seen[at]);
+    let at = bw
+        .wait_for("B's contact request", request_from(&a.pk))
+        .await;
+    let request = request_id(&bw.seen[at]);
+    Knocked {
+        dht,
+        board,
+        a,
+        b,
+        a_fake,
+        b_fake,
+        aw,
+        bw,
+        a_peer,
+        request,
+    }
+}
+
+/// ISC-C109 — B's acceptance reaches A by push: A's conversation is
+/// established and B's reply shown with no network read at A while B's
+/// control write is still held, and B's reply is reported delivered before
+/// any of B's acceptance writes has completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acceptance_is_pushed_and_recognised_before_its_writes_complete() {
+    let mut k = knock(no_collection()).await;
+    let held = Arc::new(Gate::default());
+    k.b_fake.faults().gate_control = Some(Arc::clone(&held));
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let reads_before = k.a_fake.calls().network_reads;
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    held.reached().await;
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    k.aw.wait_for("B's reply at A", message(k.a_peer, 0, b"the reply"))
+        .await;
+    assert_eq!(
+        k.a_fake.calls().network_reads,
+        reads_before,
+        "the acceptance was recognised from the push alone"
+    );
+    let at =
+        k.bw.wait_for("B's reply delivered", |event| {
+            matches!(event, RunnerEvent::Delivered { through_seq: 0, .. })
+        })
+        .await;
+    assert!(
+        !k.bw.seen.iter().any(sent(2)),
+        "delivered is reported before the acceptance's writes complete"
+    );
+    let RunnerEvent::Delivered { peer: b_peer, .. } = k.bw.seen[at] else {
+        unreachable!()
+    };
+    held.release();
+    k.bw.wait_for("B's acceptance", sent(2)).await;
+    k.bw.wait_for("A's first body at B", message(b_peer, 0, b"the first body"))
+        .await;
+    assert!(k.board.lock().unwrap().calls >= 1);
+    let _ = (&k.dht, &k.b);
+}
+
+/// Establish a conversation between two runners with push lanes, the
+/// acceptance pushed.
+async fn establish_pushed() -> (Knocked, CorrespondenceLabel) {
+    let mut k = knock(no_collection()).await;
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    let at = k.bw.wait_for("B's acceptance", sent(2)).await;
+    let b_peer = sent_peer(&k.bw.seen[at]);
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    k.bw.wait_for("B's reply delivered by A's answer", delivered(b_peer, 0))
+        .await;
+    (k, b_peer)
+}
+
+/// ISC-C107 / ISC-C108 — a message is pushed as its slot is written: B records
+/// it and A reports it delivered while A's slot write is still held; the
+/// sent report follows the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pushed_message_is_delivered_before_its_write_completes() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let held = Arc::new(Gate::default());
+    k.a_fake.faults().gate_ring_write = Some(Arc::clone(&held));
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"pushed".to_vec(),
+    })
+    .await;
+    held.reached().await;
+    k.bw.wait_for("the pushed message at B", message(b_peer, 1, b"pushed"))
+        .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 1)).await;
+    assert!(
+        !k.aw.seen.iter().any(sent(3)),
+        "delivered is reported before the write completes"
+    );
+    held.release();
+    k.aw.wait_for("A's send", sent(3)).await;
+}
+
+/// ISC-C107 — with the transport down a message is sent and then
+/// delivered through the record store as without push, and nothing is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_whose_push_fails_is_delivered_through_the_record_store() {
+    let dht = network();
+    let board = Arc::new(Mutex::new(Board::default()));
+    let (a, b) = (Profile::new(), Profile::new());
+    let (a_fake, b_fake) = (Fake::on(&dht), Fake::on(&dht));
+    attach_push(&a_fake, &board);
+    attach_push(&b_fake, &board);
+    board.lock().unwrap().down = true;
+    let mut bw = b.spawn(&b_fake, real_clock());
+    let mut aw = a.spawn(&a_fake, real_clock());
+    aw.wait_for("A's startup", is_health).await;
+    bw.wait_for("B's startup", is_health).await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"first".to_vec(),
+    })
+    .await;
+    let at = aw.wait_for("A's first contact", sent(1)).await;
+    let a_peer = sent_peer(&aw.seen[at]);
+    let at = bw.wait_for("B's request", request_from(&a.pk)).await;
+    let request = request_id(&bw.seen[at]);
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"reply".to_vec(),
+    })
+    .await;
+    let at = bw.wait_for("B's acceptance", sent(2)).await;
+    let b_peer = sent_peer(&bw.seen[at]);
+    aw.wait_for("A's acceptance", accepted(a_peer)).await;
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: a_peer,
+        body: b"through the store".to_vec(),
+    })
+    .await;
+    let sent_at = aw.wait_for("A's send", sent(3)).await;
+    bw.wait_for("the message at B", message(b_peer, 1, b"through the store"))
+        .await;
+    let delivered_at = aw
+        .wait_for("delivery by cursor", delivered(a_peer, 1))
+        .await;
+    assert!(sent_at < delivered_at, "sent, then delivered by the cursor");
+    assert!(board.lock().unwrap().calls >= 1, "a push was attempted");
+}
+
+/// ISC-C104 — when this node's route dies the runner allocates another and
+/// rewrites its control subkey with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_route_is_replaced_and_republished() {
+    let (k, _) = establish_pushed().await;
+    let (a_route, a_inbound) = {
+        let board = k.board.lock().unwrap();
+        let mut routes: Vec<_> = board.routes.values().cloned().collect();
+        // B started first, so A's route is the second allocated.
+        routes.sort_by(|x, y| x.0.cmp(&y.0));
+        routes[1].clone()
+    };
+    let store = Store::open(k.a.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).unwrap();
+    let state = store.load().unwrap().convs.remove(0).state;
+    let published = || {
+        let bytes = k
+            .dht
+            .lock()
+            .unwrap()
+            .records
+            .get(&(CHANNEL, state.outgoing_lookup_key, channel::CONTROL_SUBKEY))
+            .expect("A's control")
+            .0
+            .clone();
+        channel::open_control_with_key(state.own_control_key.as_ref().expect("A's key"), &bytes)
+            .expect("opens")
+            .reach
+            .route
+    };
+    assert_eq!(
+        published(),
+        Some(a_route.clone().into_bytes()),
+        "A's control subkey carries its route"
+    );
+    assert!(a_inbound.offer(PushInbound::RoutesDied(vec![a_route.clone()])));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while published() == Some(a_route.clone().into_bytes()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A republished its control subkey with a new route");
+    let route = published().expect("a route is published");
+    assert!(
+        k.board.lock().unwrap().routes.contains_key(&route),
+        "the published route is one A allocated"
+    );
+}
+
+/// ISC-C105 — a handle this side sets as its own travels in its control
+/// subkey, and the correspondent stores it where its hash names the writer;
+/// one naming another identity is not published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_own_handle_is_published_checked_and_stored() {
+    let dht = network();
+    let board = Arc::new(Mutex::new(Board::default()));
+    let (a, b) = (Profile::new(), Profile::new());
+    let (a_fake, b_fake) = (Fake::on(&dht), Fake::on(&dht));
+    attach_push(&a_fake, &board);
+    attach_push(&b_fake, &board);
+    let mut bw = b.spawn(&b_fake, real_clock());
+    let mut aw = a.spawn(&a_fake, no_collection());
+    aw.budget = REAL_BUDGET;
+    aw.wait_for("A's startup", is_health).await;
+    bw.wait_for("B's startup", is_health).await;
+    let hash = |pk: &IdentityPk| {
+        daemonseed_core::handle::Handle::from_pubkey(None, pk.as_slice())
+            .unwrap()
+            .hash_prefix()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let genuine = format!("alice#{}", hash(&a.pk));
+    let forged = format!("mallory#{}", hash(&b.pk));
+    aw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: a.pk.clone(),
+        handle: forged,
+    })
+    .await;
+    aw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: a.pk.clone(),
+        handle: genuine.clone(),
+    })
+    .await;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hi".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact", sent(1)).await;
+    let at = bw.wait_for("B's request", request_from(&a.pk)).await;
+    let request = request_id(&bw.seen[at]);
+    bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"reply".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's acceptance", sent(2)).await;
+    bw.wait_for("A's handle in B's roster", |event| {
+        matches!(event, RunnerEvent::Roster(rows)
+            if rows.iter().any(|row| row.handle.as_deref() == Some(genuine.as_str())))
+    })
+    .await;
+    assert!(
+        !bw.seen.iter().any(|event| matches!(event, RunnerEvent::Roster(rows)
+            if rows.iter().any(|row| row.handle.as_deref().is_some_and(|h| h.starts_with("mallory"))))),
+        "a handle naming another identity is never published"
+    );
+}
+
+/// Wait on the real clock until `done` holds, prodding `watch`'s runner with a
+/// command that changes nothing so its after-command bookkeeping runs.
+async fn prod_until(watch: &Watch, what: &str, done: impl Fn() -> bool) {
+    let nobody = Profile::new().pk;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !done() {
+            watch
+                .send(RunnerCommand::NoteHandle {
+                    peer_identity_pk: nobody.clone(),
+                    handle: "nobody#000000000000".to_owned(),
+                })
+                .await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// A pushed message from a correspondent this side has blocked is neither
+/// recorded nor answered, and is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_from_a_blocked_correspondent_is_not_recorded() {
+    let (mut k, b_peer) = establish_pushed().await;
+    k.aw.send(RunnerCommand::Block {
+        peer: k.b.pk.clone(),
+    })
+    .await;
+    k.aw.wait_for(
+        "A's block list",
+        |event| matches!(event, RunnerEvent::BlockList(list) if !list.is_empty()),
+    )
+    .await;
+    let replies = k.board.lock().unwrap().replies;
+    let calls = k.board.lock().unwrap().calls;
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(5),
+        peer: b_peer,
+        body: b"from a blocked sender".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("B's send", sent(5)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while k.board.lock().unwrap().calls == calls {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("B pushed");
+    k.aw.wait_for(
+        "the push counted dropped",
+        |event| matches!(event, RunnerEvent::Health(h) if h.pushes_dropped >= 1),
+    )
+    .await;
+    assert_eq!(k.board.lock().unwrap().replies, replies, "not answered");
+    assert!(
+        !k.aw
+            .seen
+            .iter()
+            .any(message(k.a_peer, 1, b"from a blocked sender")),
+        "not recorded"
+    );
+}
+
+/// An answer that is not the one the correspondent makes under the
+/// conversation's key does not mark the message delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_answer_does_not_mark_delivered() {
+    let (mut k, b_peer) = establish_pushed().await;
+    k.board.lock().unwrap().forge_answer = true;
+    let held = Arc::new(Gate::default());
+    k.a_fake.faults().gate_ring_write = Some(Arc::clone(&held));
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let replies = k.board.lock().unwrap().replies;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"answered falsely".to_vec(),
+    })
+    .await;
+    held.reached().await;
+    k.bw.wait_for("the message at B", message(b_peer, 1, b"answered falsely"))
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while k.board.lock().unwrap().replies == replies {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("B answered");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    k.aw.drain();
+    assert!(
+        !k.aw.seen.iter().any(delivered(k.a_peer, 1)),
+        "a forged answer marked the message delivered"
+    );
+}
+
+/// A push the runner reaches after its answer window is dropped unanswered
+/// and counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_push_is_dropped_unanswered() {
+    let (mut k, _) = establish_pushed().await;
+    let a_inbound = {
+        let board = k.board.lock().unwrap();
+        let mut routes: Vec<_> = board.routes.values().cloned().collect();
+        routes.sort_by(|x, y| x.0.cmp(&y.0));
+        routes[1].1.clone()
+    };
+    let replies = k.board.lock().unwrap().replies;
+    let mut message = daemonseed_core::dm::push::PUSH_TAG.to_vec();
+    message.push(2);
+    message.extend_from_slice(&[0; 64]);
+    let received = std::time::Instant::now()
+        .checked_sub(Duration::from_secs(60))
+        .expect("an instant a minute ago");
+    assert!(a_inbound.offer(PushInbound::Call {
+        id: 9_999,
+        message,
+        received,
+    }));
+    k.aw.wait_for(
+        "the expired push counted",
+        |event| matches!(event, RunnerEvent::Health(h) if h.pushes_expired >= 1),
+    )
+    .await;
+    assert_eq!(k.board.lock().unwrap().replies, replies, "not answered");
+}
+
+/// After a push fails the correspondent's route is released and forgotten:
+/// the next message is not pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_push_forgets_and_releases_the_route() {
+    let (mut k, _) = establish_pushed().await;
+    let b_route = {
+        let board = k.board.lock().unwrap();
+        let mut routes: Vec<_> = board.routes.keys().cloned().collect();
+        routes.sort();
+        routes[0].clone()
+    };
+    k.board.lock().unwrap().down = true;
+    let calls = k.board.lock().unwrap().calls;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"one".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's first send", sent(3)).await;
+    let board = Arc::clone(&k.board);
+    prod_until(&k.aw, "the first is pushed", || {
+        board.lock().unwrap().calls == calls + 1
+    })
+    .await;
+    prod_until(&k.aw, "A released B's route", || {
+        board.lock().unwrap().released.contains(&b_route)
+    })
+    .await;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"two".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's second send", sent(4)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        k.board.lock().unwrap().calls,
+        calls + 1,
+        "the second is not pushed"
+    );
+}
+
+/// A store failure on the push receive path drops the push and is counted as
+/// a store failure. Collection meets the same broken store and counts store
+/// failures of its own, so the dropped push is what ties the count to the
+/// push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_failure_taking_a_push_is_counted() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let before =
+        k.aw.seen
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                RunnerEvent::Health(h) => Some(h.store_failures),
+                _ => None,
+            })
+            .unwrap_or(0);
+    let mut corrupted = 0;
+    for entry in walk(&k.a.root.path().join(STORE_DIR)) {
+        if entry.file_name().and_then(|name| name.to_str()) == Some("conversation.bin") {
+            std::fs::write(&entry, [0x5a; 64]).expect("corrupt the record");
+            corrupted += 1;
+        }
+    }
+    assert_eq!(corrupted, 1, "one conversation record");
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(5),
+        peer: b_peer,
+        body: b"into a broken store".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("B's send", sent(5)).await;
+    k.aw.wait_for("the failed push counted", |event| {
+        matches!(event, RunnerEvent::Health(h)
+            if h.store_failures > before && h.pushes_dropped >= 1)
+    })
+    .await;
+}
+
+/// Every file under `dir`.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .expect("read the directory")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// A handle in a correspondent's control record whose hash names another
+/// identity is not recorded; one naming the writer is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_handle_in_a_control_record_is_not_recorded() {
+    let mut k = knock(real_clock()).await;
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("B's acceptance", sent(2)).await;
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    assert!(finished(&k.bw.stop().await));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"outstanding".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(3)).await;
+
+    let b_store = Store::open(k.b.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).unwrap();
+    let state = b_store.load().unwrap().convs.remove(0).state;
+    let hash = |pk: &IdentityPk| {
+        daemonseed_core::handle::Handle::from_pubkey(None, pk.as_slice())
+            .unwrap()
+            .hash_prefix()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let write_handle = |handle: String| {
+        let control = Control {
+            opening: Some(
+                ChannelOpening::decode(state.own_opening.as_ref().unwrap().as_slice()).unwrap(),
+            ),
+            collected_cursor: state.cursor_published,
+            closed: false,
+            generation: state.generation,
+            reach: daemonseed_core::dm::channel::Reach {
+                route: None,
+                handle: Some(handle),
+            },
+        };
+        let sealed =
+            channel::seal_control_with_key(state.own_control_key.as_ref().unwrap(), &control)
+                .unwrap();
+        k.dht.lock().unwrap().put(
+            (CHANNEL, state.outgoing_lookup_key, channel::CONTROL_SUBKEY),
+            sealed,
+        );
+    };
+    let a_store = Store::open(k.a.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).unwrap();
+    write_handle(format!("mallory#{}", hash(&k.a.pk)));
+    let reads = k.a_fake.calls().channel_reads;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while k.a_fake.calls().channel_reads < reads + 10 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A kept reading");
+    assert_eq!(
+        a_store.handle(&k.a_peer).unwrap(),
+        None,
+        "a handle naming another identity is not recorded"
+    );
+    // The control: a handle naming B is recorded through the same read.
+    let genuine = format!("bob#{}", hash(&k.b.pk));
+    write_handle(genuine.clone());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while a_store.handle(&k.a_peer).unwrap().as_deref() != Some(genuine.as_str()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A recorded B's genuine handle");
+    let _ = &k.aw;
 }

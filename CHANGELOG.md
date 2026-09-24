@@ -24,6 +24,16 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+### Added
+
+- `daemonseed-core`: `dm::push` — push envelopes (`Push`, `PUSH_TAG`, `RECORDED`), push answers keyed to the conversation (`answer`, `answer_matches`, `AnswerKey`, `ANSWER_LEN`), `take_message` (refuses a blocked correspondent: `Taken::Blocked`) and `recognise_acceptance` for pushed messages and acceptances; `HandleParseError::DisplayNameHasUnsafeChar`; `channel::Reach`; `Control::generation` and `Control::reach`; `Store::set_reach` / `Store::reach`; `flows::peer_control`, `flows::AcceptanceWrites`, `Records::offer_acceptance`, `ReadCache::insert_channel` / `insert_drop_slot`; `ContactRequest::generation` / `reach`; `Acceptance::peer_reach`.
+- `daemonseed-veilid-net`: `dm::push` — `PushTransport` (with `release`), `PushParts`, `PushInbound`, `OwnRoute`, `push_queue` / `PushOutbox` / `PushInbox` (per-channel and acceptance admission caps `PUSH_PER_CHANNEL`, `PUSH_ACCEPTANCES`); shed calls counted in `HealthCounters::pushes_dropped`; direct-message runners push messages and acceptances over `app_call` to the correspondent's route, answer pushes addressed to them, and republish their route on route change; `RunnerRecords::take_push`; `HealthCounters::pushes_dropped` / `pushes_expired`; `NoteHandle` for the runner's own identity sets the handle it publishes.
+
+### Changed
+
+- `daemonseed-core`: `Handle` parsing refuses control and bidirectional formatting characters in the display name; `Reach::verified_handle` returns the handle in canonical lowercase form.
+- `daemonseed-core`: the direct-message control subkey carries the conversation generation, the writer's route and its handle (wire change; a control subkey without them reads as generation 0); each first contact draws a random conversation generation.
+
 ### Fixed
 
 - `daemonseed-veilid-net`: a direct-message collection pass reads established conversations before the drop scan, and scans the drop every `DROP_SCAN_TICKS` (5) collection intervals, or every pass while a conversation awaits acceptance; a request is previewed directly after the scan that surfaced it.

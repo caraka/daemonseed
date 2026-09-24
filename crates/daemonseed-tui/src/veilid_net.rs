@@ -898,6 +898,7 @@ fn dm_after_connect(
     net: &Option<VeilidNetHandle>,
     keys: Option<Box<DmSessionKeys>>,
     profile_root: Option<PathBuf>,
+    own_handle: Option<String>,
     dm: &mut Option<DmSession>,
     dm_start: &mut Option<DmStart>,
     evt_tx: &UnboundedSender<NetEvent>,
@@ -906,7 +907,7 @@ fn dm_after_connect(
         dm,
         dm_start,
         evt_tx,
-        dm_runner_over_veilid(net.clone(), keys, profile_root),
+        dm_runner_over_veilid(net.clone(), keys, profile_root, own_handle),
     );
 }
 
@@ -920,6 +921,7 @@ async fn dm_runner_over_veilid(
     net: Option<VeilidNetHandle>,
     keys: Option<Box<DmSessionKeys>>,
     profile_root: Option<PathBuf>,
+    own_handle: Option<String>,
 ) -> Option<RunnerHandle> {
     let (Some(net), Some(keys), Some(profile_root)) = (net, keys, profile_root) else {
         return None;
@@ -936,6 +938,7 @@ async fn dm_runner_over_veilid(
         dm_channel_root,
         at_rest_key,
     } = *keys;
+    let own_pk = Box::new(*signing.public_key());
     match RunnerParts::<VeilidRecords>::over_veilid(
         parts,
         signing,
@@ -946,7 +949,18 @@ async fn dm_runner_over_veilid(
     ) {
         Ok(parts) => {
             daemonseed_veilid_net::vtrace!("tui dm: runner started");
-            Some(spawn_runner(parts))
+            let runner = spawn_runner(parts);
+            // The runner publishes this side's own handle to correspondents.
+            if let Some(handle) = own_handle {
+                let own = RunnerCommand::NoteHandle {
+                    peer_identity_pk: own_pk,
+                    handle,
+                };
+                if runner.send(own).await.is_err() {
+                    daemonseed_veilid_net::vtrace!("tui dm: own handle not taken");
+                }
+            }
+            Some(runner)
         }
         Err(e) => {
             daemonseed_veilid_net::vtrace!("tui dm: runner not started ({e})");
@@ -1026,6 +1040,7 @@ async fn handle_command(
                 net,
                 dm_session_keys,
                 shares.profile_root.clone(),
+                my_handle.clone(),
                 dm,
                 dm_start,
                 evt_tx,
@@ -5579,6 +5594,7 @@ mod tests {
             &None,
             Some(keys),
             Some(profile.path().to_path_buf()),
+            None,
             &mut dm,
             &mut dm_start,
             &evt_tx,

@@ -9,7 +9,7 @@
 //! online. No handshake round-trip, no session, no new transport.
 //!
 //! `docs/design/direct-messaging.md` is implemented by [`advert`], [`mod@drop`],
-//! [`channel`], [`chain`], [`store`], [`delivery`] and [`flows`], alongside
+//! [`channel`], [`chain`], [`store`], [`delivery`], [`flows`] and [`push`], alongside
 //! [`block_list`], [`contact_cache`] and [`domain`].
 
 /// Append a `u64` big-endian length prefix and the bytes.
@@ -47,4 +47,5 @@ pub mod delivery;
 pub mod domain;
 pub mod drop;
 pub mod flows;
+pub mod push;
 pub mod store;

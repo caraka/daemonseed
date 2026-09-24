@@ -10,8 +10,9 @@
 //!
 //! [`Records`] is the whole of this module's contact with the network: seven
 //! methods over the three distributed-hash-table record kinds the flow
-//! touches, and [`Records::write_batch`] for writes one step makes that do not
-//! wait on each other. Nothing here opens a socket, reads a clock or draws entropy of its
+//! touches, [`Records::write_batch`] for writes one step makes that do not
+//! wait on each other, and [`Records::offer_acceptance`] for the bytes an
+//! acceptance hands the correspondent directly. Nothing here opens a socket, reads a clock or draws entropy of its
 //! own — the current time is a parameter and entropy arrives as a fill
 //! function — so the flow runs identically against a transport and against a
 //! counting fake.
@@ -37,7 +38,8 @@ use zeroize::Zeroizing;
 use crate::dm::advert::{self, AdvertError, AdvertKeys, AdvertOwnerSeed, AdvertSharedSecret};
 use crate::dm::chain::{self, ChainError, Conversation};
 use crate::dm::channel::{
-    self, ChannelError, ChannelOpening, ChannelOwnerSeed, Control, ControlKey, OPENING_LEN, Ring,
+    self, ChannelError, ChannelOpening, ChannelOwnerSeed, Control, ControlKey, OPENING_LEN, Reach,
+    Ring,
 };
 use crate::dm::drop as drop_plane;
 use crate::dm::drop::{
@@ -47,11 +49,11 @@ use crate::dm::store::{ConvState, OutstandingHello, Store, StoreError};
 use crate::identity::keys::{DmChannelRootSecret, SignKeypair};
 use crate::storage::dm_store::CorrespondenceLabel;
 
-/// The conversation generation a first contact opens at.
+/// The generation of a conversation whose control record names none.
 ///
-/// Every first contact and every acceptance opens at this generation, and no
-/// flow turns it over, so a conversation established again after a delete
-/// derives the same channel records as the one deleted.
+/// A first contact draws its generation at random and the acceptance takes the
+/// initiator's, so a conversation established again after a delete derives
+/// channel records other than the deleted one's.
 pub const FIRST_GENERATION: u64 = 0;
 
 /// How many times a hello re-picks its slot after a clobbered read-back.
@@ -185,6 +187,38 @@ pub trait Records {
         }
         results
     }
+
+    /// Offered the bytes a fresh acceptance is about to write, before the
+    /// first of them is written: this side's control subkey and reply, and the
+    /// hello back as its first placement seals it. A store that can hand them
+    /// to the correspondent directly does so here; the default does nothing.
+    /// The writes that follow are made whatever this does.
+    fn offer_acceptance(&mut self, writes: &AcceptanceWrites<'_>) {
+        let _ = writes;
+    }
+}
+
+/// The bytes a fresh acceptance writes, as [`Records::offer_acceptance`] is
+/// offered them.
+#[derive(Debug, Clone, Copy)]
+pub struct AcceptanceWrites<'a> {
+    /// The correspondence the acceptance belongs to.
+    pub peer: CorrespondenceLabel,
+    /// The channel this side writes.
+    pub lookup_key: &'a [u8; HELLO_LOOKUP_KEY_LEN],
+    /// The sealed control subkey, carrying this side's opening.
+    pub control: &'a [u8],
+    /// The subkey the reply is written to.
+    pub reply_subkey: u16,
+    /// The reply's slot bytes.
+    pub reply: &'a [u8],
+    /// The correspondent's drop slot the hello back is placed in first.
+    pub hello_slot: u16,
+    /// The sealed hello back.
+    pub hello: &'a [u8],
+    /// The answer the correspondent makes once it has persisted the acceptance
+    /// ([`crate::dm::push::answer`] of the reply under this side's control key).
+    pub answer: [u8; crate::dm::push::ANSWER_LEN],
 }
 
 /// One write of a [`Records::write_batch`].
@@ -441,9 +475,11 @@ pub fn first_contact<R: Records>(
 
     // 2. The channel's lookup key, which the opening signs, then the key
     //    schedule and the conversation record, before any write to the record
-    //    store. Naming the channel to the transport writes no value.
-    let channel_owner =
-        channel::derive_owner_seed(me.channel_root, peer_identity_pk, FIRST_GENERATION)?;
+    //    store. Naming the channel to the transport writes no value. The
+    //    generation is drawn fresh, so a later conversation between the same
+    //    two identities names other records.
+    let generation = draw_generation(&mut fill)?;
+    let channel_owner = channel::derive_owner_seed(me.channel_root, peer_identity_pk, generation)?;
     let outgoing_lookup_key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
     let encapsulation = advert::encapsulate_to(&advert, now, &mut fill)?;
     let opened = chain::initiate(&encapsulation.shared_secret, &mut fill)?;
@@ -477,7 +513,7 @@ pub fn first_contact<R: Records>(
             peer_identity_pk: Box::new(*peer_identity_pk),
             outgoing_lookup_key,
             incoming_lookup_key: [0u8; HELLO_LOOKUP_KEY_LEN],
-            generation: FIRST_GENERATION,
+            generation,
             conversation: conversation.snapshot(),
             send_seq: ring.send_seq(),
             peer_collected: 0,
@@ -578,6 +614,8 @@ fn finish_first_contact<R: Records>(
             opening: Some(opening),
             collected_cursor: 0,
             closed: false,
+            generation: state.generation,
+            reach: store.reach(),
         },
     )?;
     // The opening and sequence 0 are one step, and neither needs the other on
@@ -901,6 +939,11 @@ pub struct ContactRequest {
     /// The secret the correspondent's hello established. It opens the
     /// correspondent's control subkey and seals nothing this side writes.
     pub shared_secret: AdvertSharedSecret,
+    /// The conversation generation the correspondent's control subkey names;
+    /// [`accept`] derives this side's channel under it.
+    pub generation: u64,
+    /// How the correspondent can be reached, as its control subkey says.
+    pub reach: Reach,
 }
 
 impl core::fmt::Debug for ContactRequest {
@@ -1065,8 +1108,12 @@ pub fn collect_slot<R: Records>(
         me,
         &identity,
         &hello,
-        opening,
-        cursor,
+        Heard {
+            opening,
+            cursor,
+            generation: control.generation,
+            reach: control.reach,
+        },
         shared_secret,
         slot,
     );
@@ -1079,7 +1126,6 @@ pub fn collect_slot<R: Records>(
 
 /// Settle one verified hello against what this side already holds for the
 /// identity that signed it — § Flows, *A hello from a known identity*.
-/// `cursor` is the one the control record carrying `opening` published.
 #[allow(clippy::too_many_arguments)]
 fn settle<R: Records>(
     store: &Store,
@@ -1087,8 +1133,7 @@ fn settle<R: Records>(
     me: &Me<'_>,
     identity: &[u8; ml_dsa::PK_LEN],
     hello: &drop_plane::Hello,
-    opening: ChannelOpening,
-    cursor: u64,
+    heard: Heard,
     shared_secret: AdvertSharedSecret,
     slot: u16,
 ) -> Result<Surfaced, FlowError> {
@@ -1096,23 +1141,25 @@ fn settle<R: Records>(
         return Ok(Surfaced::ContactRequest(contact_request(
             identity,
             hello,
-            opening,
+            heard,
             shared_secret,
             slot,
         )));
     };
     let state = load(store, &peer)?;
     if state.awaiting_acceptance {
-        return Ok(Surfaced::Accepted(recognise_acceptance(
+        let mut acceptance = recognise_acceptance(
             store,
             records,
             me,
             &peer,
             &hello.lookup_key,
-            cursor,
+            heard.cursor,
             shared_secret,
             slot,
-        )?));
+        )?;
+        acceptance.peer_reach = heard.reach;
+        return Ok(Surfaced::Accepted(acceptance));
     }
     // A hello naming the channel this side already reads is the correspondent
     // rewriting the hello that opened this conversation, which it does until
@@ -1126,8 +1173,25 @@ fn settle<R: Records>(
     }
     Ok(Surfaced::StartedOver {
         identity: Box::new(*identity),
-        request: contact_request(identity, hello, opening, shared_secret, slot),
+        request: contact_request(identity, hello, heard, shared_secret, slot),
     })
+}
+
+/// What a verified hello's channel said in its control subkey, beside the
+/// opening: the cursor it published, the generation the correspondent derived
+/// its channel under, and how it can be reached.
+struct Heard {
+    opening: ChannelOpening,
+    cursor: u64,
+    generation: u64,
+    reach: Reach,
+}
+
+/// Draw a conversation generation from `fill`.
+fn draw_generation(fill: &mut impl FnMut(&mut [u8]) -> Result<(), ()>) -> Result<u64, FlowError> {
+    let mut bytes = [0u8; 8];
+    fill(&mut bytes).map_err(|()| FlowError::Chain(ChainError::Entropy))?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 /// The contact request a verified hello becomes: everything [`accept`]
@@ -1135,17 +1199,19 @@ fn settle<R: Records>(
 fn contact_request(
     identity: &[u8; ml_dsa::PK_LEN],
     hello: &drop_plane::Hello,
-    opening: ChannelOpening,
+    heard: Heard,
     shared_secret: AdvertSharedSecret,
     slot: u16,
 ) -> ContactRequest {
     ContactRequest {
         identity: Box::new(*identity),
         lookup_key: hello.lookup_key,
-        first_ratchet_pk: opening.first_ratchet_pk,
+        first_ratchet_pk: heard.opening.first_ratchet_pk,
         slot,
-        advert_serial: opening.advert_serial,
+        advert_serial: heard.opening.advert_serial,
         shared_secret,
+        generation: heard.generation,
+        reach: heard.reach,
     }
 }
 
@@ -1236,6 +1302,17 @@ pub fn peer_cursor<R: Records>(
     records: &mut R,
     peer: &CorrespondenceLabel,
 ) -> Result<Option<u64>, FlowError> {
+    Ok(peer_control(store, records, peer)?.map(|control| control.collected_cursor))
+}
+
+/// The correspondent's control subkey, opened, from the channel this side
+/// reads: its cursor, the generation it names and how it can be reached. One
+/// read, as [`peer_cursor`] makes.
+pub fn peer_control<R: Records>(
+    store: &Store,
+    records: &mut R,
+    peer: &CorrespondenceLabel,
+) -> Result<Option<Control>, FlowError> {
     let state = load(store, peer)?;
     let key = state
         .peer_control_key
@@ -1245,8 +1322,7 @@ pub fn peer_cursor<R: Records>(
     else {
         return Ok(None);
     };
-    let control = channel::open_control_with_key(key, &bytes)?;
-    Ok(Some(control.collected_cursor))
+    Ok(Some(channel::open_control_with_key(key, &bytes)?))
 }
 
 /// What an [`accept`] left behind.
@@ -1334,7 +1410,7 @@ pub fn accept<R: Records>(
 
     fits_a_message(reply)?;
     let channel_owner =
-        channel::derive_owner_seed(me.channel_root, &request.identity, FIRST_GENERATION)?;
+        channel::derive_owner_seed(me.channel_root, &request.identity, request.generation)?;
     let outgoing_lookup_key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
     let peer = CorrespondenceLabel::mint().map_err(|e| FlowError::Store(StoreError::Store(e)))?;
 
@@ -1352,7 +1428,7 @@ pub fn accept<R: Records>(
             peer_identity_pk: request.identity.clone(),
             outgoing_lookup_key,
             incoming_lookup_key: request.lookup_key,
-            generation: FIRST_GENERATION,
+            generation: request.generation,
             conversation: conversation.snapshot(),
             send_seq: ring.send_seq(),
             peer_collected: 0,
@@ -1486,7 +1562,7 @@ fn finish_accept<R: Records>(
 
     let outgoing_lookup_key = if state.outgoing_lookup_key == [0u8; HELLO_LOOKUP_KEY_LEN] {
         let channel_owner =
-            channel::derive_owner_seed(me.channel_root, &identity, FIRST_GENERATION)?;
+            channel::derive_owner_seed(me.channel_root, &identity, state.generation)?;
         let key = records.open_channel(&channel_owner, channel::CHANNEL_SUBKEYS)?;
         store.update_conv(&peer, |state| state.outgoing_lookup_key = key)?;
         key
@@ -1583,8 +1659,45 @@ fn finish_accept<R: Records>(
             // the read reached.
             collected_cursor: state.my_collected,
             closed: false,
+            generation: state.generation,
+            reach: store.reach(),
         },
     )?;
+    // The hello back, sealed now for a fresh placement so that its bytes can
+    // be offered with the writes below. Sealing is deterministic in the
+    // attempt, so the placement after those writes reseals the same bytes.
+    let fresh_attempt = match (&state.outstanding_hello, &state.own_hello_secret) {
+        (None, Some(own_secret)) => {
+            let own_kem_ct = state
+                .own_hello_kem_ct
+                .as_ref()
+                .ok_or(FlowError::Incomplete("hello encapsulation of its own"))?;
+            let attempt = HelloAttempt::new(drop_plane::repick(&mut *fill)?)?;
+            let hello = seal_outstanding(
+                &HelloSeal {
+                    shared_secret: own_secret,
+                    kem_ct: own_kem_ct,
+                    advert_serial,
+                    original: None,
+                },
+                &outgoing_lookup_key,
+                &identity,
+                &attempt,
+            )?;
+            records.offer_acceptance(&AcceptanceWrites {
+                peer,
+                lookup_key: &outgoing_lookup_key,
+                control: &control,
+                reply_subkey: channel::slot_for(reply_seq),
+                reply: &slot_bytes,
+                hello_slot: attempt.slot(),
+                hello: hello.sealed.as_slice(),
+                answer: crate::dm::push::answer(own_control_key, &outgoing_lookup_key, reply_seq)?,
+            });
+            Some(attempt)
+        }
+        _ => None,
+    };
     let mut writes = Vec::with_capacity(3);
     if let (Some(owner), Some(slot)) = (&my_drop, slot) {
         writes.push(BatchWrite::EraseDropSlot {
@@ -1641,7 +1754,10 @@ fn finish_accept<R: Records>(
                     advert_serial,
                     original: None,
                 },
-                HelloAttempt::new(drop_plane::repick(&mut *fill)?)?,
+                match fresh_attempt {
+                    Some(attempt) => attempt,
+                    None => HelloAttempt::new(drop_plane::repick(&mut *fill)?)?,
+                },
                 fill,
             )?;
             (attempt.slot(), attempt.repicks())
@@ -1700,12 +1816,29 @@ fn read_accepted_opening<R: Records>(
 pub struct ReadCache {
     channels: Vec<([u8; HELLO_LOOKUP_KEY_LEN], u16, Option<Vec<u8>>)>,
     adverts: Vec<([u8; 32], Vec<u8>)>,
+    drop_slots: Vec<([u8; 32], u16, Vec<u8>)>,
 }
 
 impl ReadCache {
+    /// Answer a read of `subkey` of the channel at `lookup_key` with `value`,
+    /// `None` being a subkey that holds nothing.
+    pub fn insert_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        subkey: u16,
+        value: Option<Vec<u8>>,
+    ) {
+        self.channels.push((*lookup_key, subkey, value));
+    }
+
+    /// Answer a read of `slot` of the drop `owner` owns with `bytes`.
+    pub fn insert_drop_slot(&mut self, owner: &DropOwnerSeed, slot: u16, bytes: Vec<u8>) {
+        self.drop_slots.push((*owner.as_bytes(), slot, bytes));
+    }
+
     /// How many values the cache holds, empty channel subkeys included.
     pub fn len(&self) -> usize {
-        self.channels.len() + self.adverts.len()
+        self.channels.len() + self.adverts.len() + self.drop_slots.len()
     }
 
     /// Whether the cache holds no value at all.
@@ -1791,7 +1924,15 @@ impl<R: Records> Records for CachedRecords<'_, R> {
         subkeys: u16,
         slot: u16,
     ) -> Result<Option<Vec<u8>>, RecordError> {
-        self.inner.read_drop_slot(owner, subkeys, slot)
+        let cached = self
+            .cache
+            .drop_slots
+            .iter()
+            .find(|(seed, at, _)| seed == owner.as_bytes() && *at == slot);
+        match cached {
+            Some((_, _, bytes)) => Ok(Some(bytes.clone())),
+            None => self.inner.read_drop_slot(owner, subkeys, slot),
+        }
     }
 
     fn write_drop_slot(
@@ -1850,6 +1991,10 @@ impl<R: Records> Records for CachedRecords<'_, R> {
 
     fn write_batch(&mut self, writes: &[BatchWrite<'_>]) -> Vec<Result<(), RecordError>> {
         self.inner.write_batch(writes)
+    }
+
+    fn offer_acceptance(&mut self, writes: &AcceptanceWrites<'_>) {
+        self.inner.offer_acceptance(writes);
     }
 }
 
@@ -1927,6 +2072,8 @@ pub struct Acceptance {
     /// The correspondent's published cursor, from the control record the
     /// acceptance was recognised by.
     pub peer_cursor: u64,
+    /// How the correspondent can be reached, as the same control record says.
+    pub peer_reach: Reach,
     /// Any reply already in the correspondent's ring, in sequence order.
     pub messages: Vec<ReceivedMessage>,
     /// The slot the ring read stopped at because its message does not open
@@ -2000,6 +2147,7 @@ pub fn recognise_acceptance<R: Records>(
         peer: *peer,
         lookup_key: *lookup_key,
         peer_cursor,
+        peer_reach: Reach::default(),
         messages: read.messages,
         unopened: read.unopened,
     })
@@ -2052,11 +2200,10 @@ pub struct Unopened {
 ///
 /// A slot whose header names the expected sequence and whose message does not
 /// open under this conversation's key schedule also ends the read, and is
-/// reported in [`RingRead::unopened`]. Channel records are derived from the
-/// two identities and [`FIRST_GENERATION`], so a conversation established
-/// again after a delete reads a ring whose later slots still hold the deleted
-/// conversation's messages until the correspondent overwrites them. Such a
-/// slot is not yet this conversation's message, as an empty one is not: the
+/// reported in [`RingRead::unopened`]. A conversation of generation
+/// [`FIRST_GENERATION`] established again after a delete reads a ring whose
+/// later slots still hold the deleted conversation's messages until the
+/// correspondent overwrites them. Such a slot is treated as an empty one: the
 /// key schedule is left where it was, and the next read finds the slot
 /// overwritten. A message that opens and then does not decode is an error.
 fn read_ring<R: Records>(
@@ -2417,6 +2564,8 @@ pub fn publish_cursor<R: Records>(
             opening: Some(ChannelOpening::decode(opening_bytes.as_slice())?),
             collected_cursor: collected,
             closed: false,
+            generation: state.generation,
+            reach: store.reach(),
         },
     )?;
     records.write_channel(
@@ -2647,6 +2796,11 @@ mod tests {
         /// How many of [`Net::network_reads`] had been made when the first
         /// write was charged.
         reads_at_first_write: Option<usize>,
+        /// Every drop slot read.
+        drop_reads: usize,
+        /// Every acceptance offered through [`Records::offer_acceptance`], as
+        /// the push it becomes.
+        offered: Vec<(crate::dm::push::Push, [u8; crate::dm::push::ANSWER_LEN])>,
     }
 
     /// One write request a flow made, as [`Net::write_calls`] logs it.
@@ -2752,6 +2906,7 @@ mod tests {
             slot: u16,
         ) -> Result<Option<Vec<u8>>, RecordError> {
             self.shapes.push(("drop", subkeys));
+            self.drop_reads += 1;
             if self.unreadable_slot == Some(slot)
                 || self
                     .refuse_reads_after
@@ -2899,6 +3054,20 @@ mod tests {
             }
             self.in_batch = false;
             results
+        }
+
+        fn offer_acceptance(&mut self, writes: &AcceptanceWrites<'_>) {
+            self.offered.push((
+                crate::dm::push::Push::Acceptance {
+                    lookup_key: *writes.lookup_key,
+                    hello_slot: writes.hello_slot,
+                    hello: writes.hello.to_vec(),
+                    control: writes.control.to_vec(),
+                    reply_subkey: writes.reply_subkey,
+                    reply: writes.reply.to_vec(),
+                },
+                writes.answer,
+            ));
         }
     }
 
@@ -4249,7 +4418,7 @@ mod tests {
     ///
     /// The values scanned are every value written through `Records` by the
     /// core flows in this conversation, overwritten versions included, with
-    /// the runner's writes out of scope: a first contact stopped before its
+    /// writes made outside these flows out of scope: a first contact stopped before its
     /// hello and carried on, its hello resumed and then refreshed across a
     /// rotation, an acceptance stopped after its hello back and continued, and
     /// messages and cursors each way. To those are added a closed marker sealed
@@ -4458,6 +4627,7 @@ mod tests {
             opening: Some(opening),
             collected_cursor: 0,
             closed: false,
+            ..Control::default()
         }
         .encode();
         assert!(
@@ -6091,6 +6261,7 @@ mod tests {
                 opening: Some(opening),
                 collected_cursor: 0,
                 closed: false,
+                ..Control::default()
             },
         )
         .expect("seal the control");
@@ -6857,6 +7028,7 @@ mod tests {
                 opening: Some(opening),
                 collected_cursor: 0,
                 closed: false,
+                ..Control::default()
             },
         )
         .expect("seal the control");
@@ -7500,6 +7672,7 @@ mod tests {
                 opening: Some(opening.clone()),
                 collected_cursor: 0,
                 closed: false,
+                ..Control::default()
             },
         )
         .expect("seal the control");
@@ -7844,6 +8017,7 @@ mod tests {
                 opening: Some(forged),
                 collected_cursor: 0,
                 closed: false,
+                ..Control::default()
             },
         )
         .expect("seal the control");
@@ -8290,6 +8464,8 @@ mod tests {
             slot: 0,
             advert_serial: 0,
             shared_secret: AdvertSharedSecret::from_bytes(&[0x23u8; ml_kem::SHARED_SECRET_LEN]),
+            generation: 0,
+            reach: Reach::default(),
         };
         let mut entropy = Seeded::at(909);
         assert!(matches!(
@@ -8668,6 +8844,8 @@ mod tests {
             slot: from_c.slot,
             advert_serial: from_c.advert_serial,
             shared_secret: AdvertSharedSecret::from_bytes(from_c.shared_secret.as_bytes()),
+            generation: from_c.generation,
+            reach: Reach::default(),
         };
 
         let store_b = b.store();
@@ -8837,15 +9015,21 @@ mod tests {
         }
     }
 
-    /// A conversation established again after a delete reads channel records
-    /// that still hold the deleted conversation's messages. A slot holding one
-    /// of them ends the ring read rather than failing it: the initiator
-    /// recognises the acceptance and reads the reply, and the correspondent's
-    /// next message, written over the old one, is read by the next batch.
+    /// ISC-C106 — a conversation established again after a delete draws a new
+    /// generation, so both of its channels are records other than the deleted
+    /// conversation's, and nothing the deleted conversation left in them is
+    /// read: the initiator recognises the acceptance and reads the reply
+    /// alone, and the correspondent's next message is read by the next batch.
     #[test]
-    fn a_ring_slot_left_by_a_deleted_conversation_does_not_stop_the_recognition() {
+    fn a_conversation_established_again_names_other_channel_records() {
         let (a, b, mut net) = scene();
         let (_, first) = round_trip(&a, &b, &mut net);
+        let first_initiator_channel = b
+            .store()
+            .load_conv(&first.peer)
+            .expect("load")
+            .expect("B's record")
+            .incoming_lookup_key;
         let mut entropy = Seeded::at(31);
         send_message(
             &b.store(),
@@ -8886,14 +9070,27 @@ mod tests {
             NOW,
         )
         .expect("B accepts again");
-        assert_eq!(
+        assert_ne!(
             accepted.outgoing_lookup_key, first.outgoing_lookup_key,
-            "the conversation reuses the deleted one's channel record"
+            "the conversation names a channel record of its own"
+        );
+        assert_ne!(
+            request.lookup_key, first_initiator_channel,
+            "the initiator's channel is a record of its own"
         );
         assert!(
             net.channels
-                .contains_key(&(accepted.outgoing_lookup_key, channel::slot_for(1))),
-            "the deleted conversation's second message is still in B's ring"
+                .contains_key(&(first.outgoing_lookup_key, channel::slot_for(1))),
+            "the deleted conversation's second message is still in its ring"
+        );
+        assert_eq!(
+            b.store()
+                .load_conv(&accepted.peer)
+                .expect("load")
+                .expect("B's record")
+                .generation,
+            request.generation,
+            "the acceptor derives its channel under the initiator's generation"
         );
 
         let surfaced =
@@ -8905,20 +9102,16 @@ mod tests {
         };
         assert_eq!(acceptance.peer, peer_a);
         assert_eq!(acceptance.bodies(), vec![b"the reply again".to_vec()]);
-        assert_eq!(
-            acceptance.unopened.as_ref().map(|u| (u.seq, u.subkey)),
-            Some((1, channel::slot_for(1))),
-            "the old slot ended the read"
+        assert!(
+            acceptance.unopened.is_none(),
+            "no slot of the deleted conversation is read"
         );
         let state = store_a
             .load_conv(&peer_a)
             .expect("load")
             .expect("A's record");
         assert!(!state.awaiting_acceptance, "the acceptance is recognised");
-        assert_eq!(
-            state.my_collected, 1,
-            "the old slot is not counted collected"
-        );
+        assert_eq!(state.my_collected, 1);
 
         let mut entropy = Seeded::at(7_003);
         send_message(
@@ -8929,9 +9122,634 @@ mod tests {
             |x| entropy.fill(x),
             NOW,
         )
-        .expect("B sends over the old slot");
+        .expect("B sends its second message");
         let batch = collect_batch(&store_a, &mut net, &peer_a).expect("A collects a batch");
         assert_eq!(batch.bodies(), vec![b"the second message again".to_vec()]);
         assert!(batch.unopened.is_none());
+    }
+
+    // ── push delivery ───────────────────────────────────────────────────────
+
+    use crate::dm::push::{self as push_plane, Push, Taken};
+
+    /// B sends `body` on an established conversation and the slot it wrote is
+    /// taken back off the network, as a push that outran the write would find
+    /// it. Returns the subkey and the slot bytes.
+    fn b_sends_unwritten(
+        b: &Party,
+        net: &mut Net,
+        peer_b: &CorrespondenceLabel,
+        body: &[u8],
+        seed: u64,
+    ) -> (u16, Vec<u8>) {
+        let mut entropy = Seeded::at(seed);
+        let seq =
+            send_message(&b.store(), net, peer_b, body, |x| entropy.fill(x), NOW).expect("B sends");
+        let subkey = channel::slot_for(seq);
+        let lookup = b
+            .store()
+            .load_conv(peer_b)
+            .expect("load")
+            .expect("B's record")
+            .outgoing_lookup_key;
+        let slot = net
+            .channels
+            .remove(&(lookup, subkey))
+            .expect("the slot B wrote");
+        (subkey, slot)
+    }
+
+    fn a_reads(a: &Party, peer_a: &CorrespondenceLabel) -> [u8; HELLO_LOOKUP_KEY_LEN] {
+        a.store()
+            .load_conv(peer_a)
+            .expect("load")
+            .expect("A's record")
+            .incoming_lookup_key
+    }
+
+    /// ISC-C108 — a pushed message that is the next sequence is opened and
+    /// persisted as a collection would, and a later collection neither reads
+    /// it again nor loses the next one, across a reopen of the store.
+    #[test]
+    fn a_pushed_next_message_is_recorded_once_across_a_restart() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup = a_reads(&a, &peer_a);
+        let before = a.store().load_conv(&peer_a).unwrap().unwrap().my_collected;
+        let (subkey, slot) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"pushed", 51);
+        match push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot).expect("take")
+        {
+            Taken::Recorded {
+                peer,
+                seq,
+                message,
+                answer,
+            } => {
+                assert_eq!(peer, peer_a);
+                assert_eq!(seq, before);
+                assert_eq!(message.body, b"pushed".to_vec());
+                let b_state = b.store().load_conv(&accepted.peer).unwrap().unwrap();
+                let expected = push_plane::answer(
+                    b_state.own_control_key.as_ref().expect("B's control key"),
+                    &lookup,
+                    seq,
+                )
+                .unwrap();
+                assert!(
+                    push_plane::answer_matches(&expected, &answer),
+                    "the answer is the one B expects"
+                );
+                assert!(!push_plane::answer_matches(&expected, push_plane::RECORDED));
+            }
+            other => panic!("expected a recorded message, got {other:?}"),
+        }
+        assert_eq!(
+            a.store().load_conv(&peer_a).unwrap().unwrap().my_collected,
+            before + 1,
+            "the cursor is persisted before any answer"
+        );
+        // The write lands afterwards; a fresh store reads nothing twice.
+        net.channels.insert((lookup, subkey), slot.clone());
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("collect");
+        assert!(batch.bodies().is_empty(), "nothing is read twice");
+        assert!(
+            batch.cursor_published,
+            "the cursor reaches the network next"
+        );
+        let mut entropy = Seeded::at(52);
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            b"after",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B sends again");
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("collect");
+        assert_eq!(batch.bodies(), vec![b"after".to_vec()], "nothing is lost");
+    }
+
+    /// ISC-C108 — a duplicate push and a push ahead of the next sequence change
+    /// nothing, and the ahead one is collected from the network in order.
+    #[test]
+    fn a_duplicate_or_ahead_push_is_ignored() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup = a_reads(&a, &peer_a);
+        let (first_subkey, first) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"one", 61);
+        let (second_subkey, second) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"two", 62);
+        let before = a.store().load_conv(&peer_a).unwrap().unwrap();
+        assert!(matches!(
+            push_plane::take_message(&a.store(), |_| false, &lookup, second_subkey, &second)
+                .unwrap(),
+            Taken::Ahead { .. }
+        ));
+        assert_eq!(
+            a.store().load_conv(&peer_a).unwrap().unwrap().my_collected,
+            before.my_collected
+        );
+        assert!(matches!(
+            push_plane::take_message(&a.store(), |_| false, &lookup, first_subkey, &first).unwrap(),
+            Taken::Recorded { .. }
+        ));
+        assert!(matches!(
+            push_plane::take_message(&a.store(), |_| false, &lookup, first_subkey, &first).unwrap(),
+            Taken::Duplicate { .. }
+        ));
+        assert_eq!(
+            a.store().load_conv(&peer_a).unwrap().unwrap().my_collected,
+            before.my_collected + 1
+        );
+        net.channels.insert((lookup, first_subkey), first);
+        net.channels.insert((lookup, second_subkey), second);
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("collect");
+        assert_eq!(batch.bodies(), vec![b"two".to_vec()]);
+    }
+
+    /// ISC-C108 — a push that does not open under the conversation, or names
+    /// no conversation, is dropped with nothing changed.
+    #[test]
+    fn an_unopenable_or_unknown_push_is_dropped() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup = a_reads(&a, &peer_a);
+        let (subkey, slot) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"real", 71);
+        let before = a.store().load_conv(&peer_a).unwrap().unwrap().my_collected;
+        let mut forged = slot.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        assert!(matches!(
+            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &forged).unwrap(),
+            Taken::Dropped
+        ));
+        assert!(matches!(
+            push_plane::take_message(
+                &a.store(),
+                |_| false,
+                &[0x77; HELLO_LOOKUP_KEY_LEN],
+                subkey,
+                &slot
+            )
+            .unwrap(),
+            Taken::Dropped
+        ));
+        assert_eq!(
+            a.store().load_conv(&peer_a).unwrap().unwrap().my_collected,
+            before
+        );
+        // The control: the genuine slot is taken.
+        assert!(matches!(
+            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot).unwrap(),
+            Taken::Recorded { .. }
+        ));
+    }
+
+    /// A's first contact and B's acceptance, B's writes all refused so that
+    /// nothing of the acceptance reaches the network: what reaches A is the
+    /// acceptance B offered to push.
+    fn accepted_unwritten(
+        a: &Party,
+        b: &Party,
+        net: &mut Net,
+    ) -> (CorrespondenceLabel, Push, [u8; push_plane::ANSWER_LEN]) {
+        let outcome = a_opens(a, b, net, b"the first message");
+        let request = only_request(b_collects(b, net));
+        net.fail_after = Some(net.writes.total());
+        let mut entropy = Seeded::at(909);
+        accept(
+            &b.store(),
+            net,
+            &b.me(),
+            &request,
+            b"the reply",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect_err("no write of the acceptance lands");
+        net.fail_after = None;
+        let (offered, answer) = net.offered.pop().expect("B offered its acceptance");
+        (opened_peer(&outcome), offered, answer)
+    }
+
+    /// ISC-C109 — a pushed acceptance is recognised with no network read, from
+    /// the pushed bytes alone, before any of B's writes has landed, and the
+    /// reply is read from it.
+    #[test]
+    fn a_pushed_acceptance_is_recognised_from_the_push_alone() {
+        let (a, b, mut net) = scene();
+        let (peer_a, offered, expected) = accepted_unwritten(&a, &b, &mut net);
+        assert!(offered.encode().is_some(), "the push fits the transport");
+        let (reads, drops) = (net.network_reads, net.drop_reads);
+        let (acceptance, answer) = push_plane::recognise_acceptance(
+            &a.store(),
+            &mut net,
+            &a.me(),
+            &a.advert_keys,
+            |_| false,
+            &offered,
+        )
+        .expect("recognise")
+        .expect("the push completes the acceptance");
+        assert!(
+            push_plane::answer_matches(&expected, &answer),
+            "A's answer is the one B expects"
+        );
+        assert_eq!(acceptance.peer, peer_a);
+        assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
+        assert_eq!(net.network_reads, reads, "no channel or advert read");
+        assert_eq!(net.drop_reads, drops, "no drop read");
+        let state = a.store().load_conv(&peer_a).unwrap().unwrap();
+        assert!(
+            !state.awaiting_acceptance,
+            "the conversation is established"
+        );
+        assert_eq!(state.my_collected, 1);
+    }
+
+    /// ISC-C109 — a pushed acceptance that fails any check completes nothing:
+    /// a tampered control subkey, a tampered hello, a hello pushed under
+    /// another slot, and a push naming another channel.
+    #[test]
+    fn a_forged_or_mismatched_pushed_acceptance_is_refused() {
+        let (a, b, mut net) = scene();
+        let (peer_a, offered, _) = accepted_unwritten(&a, &b, &mut net);
+        let Push::Acceptance {
+            lookup_key,
+            hello_slot,
+            hello,
+            control,
+            reply_subkey,
+            reply,
+        } = offered.clone()
+        else {
+            panic!("an acceptance push");
+        };
+        let flip = |bytes: &[u8]| {
+            let mut out = bytes.to_vec();
+            let at = out.len() / 2;
+            out[at] ^= 1;
+            out
+        };
+        let build = |lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
+                     hello_slot: u16,
+                     hello: Vec<u8>,
+                     control: Vec<u8>| Push::Acceptance {
+            lookup_key,
+            hello_slot,
+            hello,
+            control,
+            reply_subkey,
+            reply: reply.clone(),
+        };
+        let forgeries = [
+            build(lookup_key, hello_slot, hello.clone(), flip(&control)),
+            build(lookup_key, hello_slot, flip(&hello), control.clone()),
+            build(
+                lookup_key,
+                (hello_slot + 1) % drop_plane::DROP_SUBKEYS,
+                hello.clone(),
+                control.clone(),
+            ),
+            build(
+                [0x55; HELLO_LOOKUP_KEY_LEN],
+                hello_slot,
+                hello.clone(),
+                control.clone(),
+            ),
+            build(
+                lookup_key,
+                hello_slot,
+                hello.clone(),
+                forged_opening(&b, &control),
+            ),
+        ];
+        for forged in &forgeries {
+            let recognised = push_plane::recognise_acceptance(
+                &a.store(),
+                &mut net,
+                &a.me(),
+                &a.advert_keys,
+                |_| false,
+                forged,
+            )
+            .expect("recognise");
+            assert!(
+                recognised.is_none(),
+                "a forged push completed an acceptance"
+            );
+            assert!(
+                a.store()
+                    .load_conv(&peer_a)
+                    .unwrap()
+                    .unwrap()
+                    .awaiting_acceptance,
+                "a forged push changed the conversation"
+            );
+        }
+        // The control: the genuine push, rebuilt from its parts, completes it.
+        let genuine = Push::Acceptance {
+            lookup_key,
+            hello_slot,
+            hello,
+            control,
+            reply_subkey,
+            reply,
+        };
+        assert!(
+            push_plane::recognise_acceptance(
+                &a.store(),
+                &mut net,
+                &a.me(),
+                &a.advert_keys,
+                |_| false,
+                &genuine
+            )
+            .expect("recognise")
+            .is_some()
+        );
+    }
+
+    /// B's control subkey resealed under B's own control key with the
+    /// opening's signature altered: it opens, and only the signature check
+    /// refuses it.
+    fn forged_opening(b: &Party, control: &[u8]) -> Vec<u8> {
+        let store = b.store();
+        let state = store.load().unwrap().convs.remove(0).state;
+        let key = state.own_control_key.expect("B's control key");
+        let mut opened = channel::open_control_with_key(&key, control).expect("opens");
+        let mut encoded = opened.opening.take().expect("an opening").encode();
+        let last = encoded.len() - 1;
+        encoded[last] ^= 1;
+        opened.opening = Some(ChannelOpening::decode(&encoded).expect("decodes"));
+        channel::seal_control_with_key(&key, &opened).expect("seals")
+    }
+
+    /// A pushed message or acceptance from a blocked correspondent is neither
+    /// recorded nor answered.
+    #[test]
+    fn a_push_from_a_blocked_correspondent_is_refused() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup = a_reads(&a, &peer_a);
+        let (subkey, slot) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"blocked", 81);
+        let before = a.store().load_conv(&peer_a).unwrap().unwrap().my_collected;
+        let b_pk = *b.pk();
+        assert!(matches!(
+            push_plane::take_message(&a.store(), |pk| pk == &b_pk, &lookup, subkey, &slot).unwrap(),
+            Taken::Blocked { .. }
+        ));
+        assert_eq!(
+            a.store().load_conv(&peer_a).unwrap().unwrap().my_collected,
+            before
+        );
+        // The control: unblocked, the same push is recorded.
+        assert!(matches!(
+            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot).unwrap(),
+            Taken::Recorded { .. }
+        ));
+
+        let (a, b, mut net) = scene();
+        let (peer_a, offered, _) = accepted_unwritten(&a, &b, &mut net);
+        let b_pk = *b.pk();
+        assert!(
+            push_plane::recognise_acceptance(
+                &a.store(),
+                &mut net,
+                &a.me(),
+                &a.advert_keys,
+                |pk| pk == &b_pk,
+                &offered,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            a.store()
+                .load_conv(&peer_a)
+                .unwrap()
+                .unwrap()
+                .awaiting_acceptance
+        );
+    }
+
+    /// A pushed acceptance whose reply names the largest sequence number is
+    /// refused rather than overflowing.
+    #[test]
+    fn a_pushed_acceptance_naming_the_last_sequence_is_refused() {
+        let (a, b, mut net) = scene();
+        let (peer_a, offered, _) = accepted_unwritten(&a, &b, &mut net);
+        let Push::Acceptance {
+            lookup_key,
+            hello_slot,
+            hello,
+            control,
+            ..
+        } = offered
+        else {
+            panic!("an acceptance push");
+        };
+        let header = channel::MessageHeader::continuing(0, 0, 0, u64::MAX, 0);
+        let mut reply = header.encode();
+        reply.extend_from_slice(&[0u8; 64]);
+        let last = Push::Acceptance {
+            lookup_key,
+            hello_slot,
+            hello,
+            control,
+            reply_subkey: channel::slot_for(u64::MAX),
+            reply,
+        };
+        assert!(
+            push_plane::recognise_acceptance(
+                &a.store(),
+                &mut net,
+                &a.me(),
+                &a.advert_keys,
+                |_| false,
+                &last,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            a.store()
+                .load_conv(&peer_a)
+                .unwrap()
+                .unwrap()
+                .awaiting_acceptance
+        );
+    }
+
+    /// A push survives its encoding, and bytes that are not a push are not
+    /// taken for one.
+    #[test]
+    fn a_push_round_trips_and_other_requests_are_not_pushes() {
+        let message = Push::Message {
+            lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
+            subkey: 9,
+            slot: vec![1, 2, 3],
+        };
+        let bytes = message.encode().expect("fits");
+        assert!(push_plane::is_push(&bytes));
+        assert_eq!(Push::decode(&bytes), Some(message));
+        let acceptance = Push::Acceptance {
+            lookup_key: [4; HELLO_LOOKUP_KEY_LEN],
+            hello_slot: 7,
+            hello: vec![5; 10],
+            control: vec![6; 20],
+            reply_subkey: 1,
+            reply: vec![7; 30],
+        };
+        let mut bytes = acceptance.encode().expect("fits");
+        assert_eq!(Push::decode(&bytes), Some(acceptance));
+        bytes.push(0);
+        assert_eq!(Push::decode(&bytes), None, "trailing bytes");
+        // A share fetch request starts with its own one-byte tag.
+        assert!(!push_plane::is_push(&[0x00, b'a', b'b']));
+        assert_eq!(Push::decode(&[0x01; 64]), None);
+        let too_big = Push::Message {
+            lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
+            subkey: 1,
+            slot: vec![0; push_plane::PUSH_MAX_LEN],
+        };
+        assert_eq!(too_big.encode(), None);
+    }
+
+    /// ISC-C104 — every control record a flow writes carries the route and
+    /// handle the store holds, and the reader hands them on: the acceptor in
+    /// its contact request, the initiator in its acceptance.
+    #[test]
+    fn the_route_and_handle_travel_in_every_control_record() {
+        let (a, b, mut net) = scene();
+        let reach_a = Reach {
+            route: Some(vec![0xaa; 300]),
+            handle: Some("alice#0123456789ab".to_owned()),
+        };
+        let reach_b = Reach {
+            route: Some(vec![0xbb; 400]),
+            handle: None,
+        };
+        let store_a = a.store();
+        store_a.set_reach(reach_a.clone());
+        let mut entropy = Seeded::at(4_242);
+        let outcome = first_contact(
+            &store_a,
+            &mut net,
+            &a.me(),
+            b.pk(),
+            b"hi",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A's first contact");
+        let request = only_request(b_collects(&b, &mut net));
+        assert_eq!(
+            request.reach, reach_a,
+            "the acceptor reads the initiator's reach"
+        );
+        let store_b = b.store();
+        store_b.set_reach(reach_b.clone());
+        let mut entropy = Seeded::at(909);
+        accept(
+            &store_b,
+            &mut net,
+            &b.me(),
+            &request,
+            b"reply",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B accepts");
+        let surfaced =
+            collect(&store_a, &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        let acceptance = match surfaced.into_iter().next() {
+            Some(Surfaced::Accepted(acceptance)) => acceptance,
+            other => panic!("expected an acceptance, got {other:?}"),
+        };
+        assert_eq!(
+            acceptance.peer_reach, reach_b,
+            "the initiator reads the acceptor's reach"
+        );
+        // A collection batch's cursor write carries the reach too.
+        let peer_a = opened_peer(&outcome);
+        let moved = Reach {
+            route: Some(vec![0xcc; 10]),
+            handle: None,
+        };
+        let peer_b = store_b.load().unwrap().convs[0].peer;
+        store_b.set_reach(moved.clone());
+        let mut entropy = Seeded::at(5);
+        send_message(
+            &store_a,
+            &mut net,
+            &peer_a,
+            b"more",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("A sends");
+        assert!(
+            collect_batch(&store_b, &mut net, &peer_b)
+                .unwrap()
+                .cursor_published
+        );
+        let control = peer_control(&store_a, &mut net, &peer_a)
+            .unwrap()
+            .expect("B's control");
+        assert_eq!(control.reach, moved);
+        assert_eq!(control.generation, request.generation);
+    }
+
+    /// ISC-C106 — a conversation whose generation is 0 derives its channels
+    /// from generation 0 on both sides and carries messages both ways.
+    #[test]
+    fn a_generation_zero_conversation_still_works() {
+        let (a, b, mut net) = scene();
+        let mut entropy = Seeded::at(4_242);
+        let mut drawn = 0usize;
+        let mut zero_first = |x: &mut [u8]| {
+            if drawn == 0 {
+                drawn += 1;
+                x.fill(0);
+                Ok(())
+            } else {
+                entropy.fill(x)
+            }
+        };
+        let store_a = a.store();
+        let outcome = first_contact(
+            &store_a,
+            &mut net,
+            &a.me(),
+            b.pk(),
+            b"old",
+            &mut zero_first,
+            NOW,
+        )
+        .expect("A's first contact");
+        let peer_a = opened_peer(&outcome);
+        let state_a = store_a.load_conv(&peer_a).unwrap().unwrap();
+        assert_eq!(state_a.generation, 0);
+        let zero = channel::derive_owner_seed(a.me().channel_root, b.pk(), 0).unwrap();
+        assert_eq!(state_a.outgoing_lookup_key, Net::lookup_key(&zero));
+        let accepted = b_accepts(&b, &mut net, b"old reply");
+        let state_b = b.store().load_conv(&accepted.peer).unwrap().unwrap();
+        assert_eq!(state_b.generation, 0);
+        let zero_b = channel::derive_owner_seed(b.me().channel_root, a.pk(), 0).unwrap();
+        assert_eq!(accepted.outgoing_lookup_key, Net::lookup_key(&zero_b));
+        collect(&store_a, &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        let mut entropy = Seeded::at(8);
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            b"still",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B sends");
+        let batch = collect_batch(&store_a, &mut net, &peer_a).expect("A collects");
+        assert_eq!(batch.bodies(), vec![b"still".to_vec()]);
     }
 }

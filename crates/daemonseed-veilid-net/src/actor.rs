@@ -824,8 +824,24 @@ impl VeilidNet {
             mpsc::channel::<(OperationId, Vec<u8>, std::time::Instant)>(SERVE_QUEUE_CAP);
         let ev_tx_cb = ev_tx.clone();
         let cmd_tx_cb = cmd_tx.clone();
+        // Direct-message pushes go to the DM runner, never to the serve lane:
+        // the push tag is how one is told from a share fetch.
+        let push_lane: crate::dm::push::PushLane = Arc::new(Mutex::new(None));
+        let push_lane_cb = push_lane.clone();
         let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> = Arc::new(
             move |u: VeilidUpdate| match u {
+                VeilidUpdate::AppCall(call)
+                    if daemonseed_core::dm::push::is_push(call.message()) =>
+                {
+                    crate::dm::push::offer(
+                        &push_lane_cb,
+                        crate::dm::push::PushInbound::Call {
+                            id: u64::from(call.id()),
+                            message: call.message().to_vec(),
+                            received: std::time::Instant::now(),
+                        },
+                    );
+                }
                 VeilidUpdate::AppCall(call) => {
                     let entry = (
                         call.id(),
@@ -846,6 +862,12 @@ impl VeilidNet {
                 // is a ONE-SHOT event, so a full FIFO must not eat it — on Full,
                 // deliver on a spawned awaited send once a slot frees.
                 VeilidUpdate::RouteChange(chg) => {
+                    crate::dm::push::offer(
+                        &push_lane_cb,
+                        crate::dm::push::PushInbound::RoutesDied(
+                            chg.dead_routes.iter().map(ToString::to_string).collect(),
+                        ),
+                    );
                     let cmd = Command::RouteMaintenance {
                         dead_routes: chg.dead_routes.clone(),
                     };
@@ -938,6 +960,7 @@ impl VeilidNet {
             shares,
             cmd_weak,
             write_latency.clone(),
+            push_lane,
         ));
         Ok((
             VeilidNetHandle {
@@ -963,6 +986,7 @@ async fn actor_loop(
     shares: Arc<Mutex<HashMap<String, share::ServedShare>>>,
     cmd_weak: mpsc::WeakSender<Command>,
     write_latency: Arc<AtomicU64>,
+    push_lane: crate::dm::push::PushLane,
 ) {
     // Cache of opened rendezvous records (owner seed → post-reopen key):
     // open_or_create costs a fresh ~6–10 s open per publish/subscribe, so once a
@@ -1436,6 +1460,11 @@ async fn actor_loop(
                         record_locks: record_locks.clone(),
                     },
                     sched: sched.clone(),
+                    push: Some(crate::dm::push::veilid_parts(
+                        api.clone(),
+                        rc.clone(),
+                        &push_lane,
+                    )),
                 });
             }
             Command::Shutdown {

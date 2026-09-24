@@ -230,6 +230,15 @@ dm_labels! {
     /// [`DM_CHANNEL_MK`] under one extraction, so learning a message key never
     /// yields the chain it came from. FROZEN.
     DM_CHANNEL_CK = b"daemonseed/dm/channel/ck/v1";
+
+    /// HKDF-Extract salt for the key a push's answer is made under, rooted in the
+    /// pushing side's control key. FROZEN.
+    DM_PUSH_ANSWER_SALT = b"daemonseed/dm/push/answer-salt/v1";
+
+    /// HKDF-Expand `info` prefix for a push's answer. The pushing side's channel
+    /// lookup key and the sequence pushed follow it, each length-prefixed, so an
+    /// answer names one message of one conversation. FROZEN.
+    DM_PUSH_ANSWER = b"daemonseed/dm/push/answer/v1";
 }
 
 #[cfg(test)]
@@ -280,6 +289,8 @@ mod tests {
         assert_eq!(DM_CHANNEL_STEP_SALT, b"daemonseed/dm/channel/step-salt/v1");
         assert_eq!(DM_CHANNEL_MK, b"daemonseed/dm/channel/mk/v1");
         assert_eq!(DM_CHANNEL_CK, b"daemonseed/dm/channel/ck/v1");
+        assert_eq!(DM_PUSH_ANSWER_SALT, b"daemonseed/dm/push/answer-salt/v1");
+        assert_eq!(DM_PUSH_ANSWER, b"daemonseed/dm/push/answer/v1");
     }
 
     /// No label is a prefix of another.
@@ -357,7 +368,7 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 28] = [
+        let pinned: [(&[u8], &[u8]); 30] = [
             (DM_ADVERT_OWNER, b"daemonseed/dm/advert/owner/v1".as_slice()),
             (DM_ADVERT_SALT, b"daemonseed/dm/advert/salt/v1".as_slice()),
             (DM_ADVERT_SIG, b"daemonseed/dm/advert/sig/v1".as_slice()),
@@ -422,6 +433,11 @@ mod tests {
             ),
             (DM_STORE_SALT, b"daemonseed/dm/store/salt/v1".as_slice()),
             (DM_STORE_SEAL, b"daemonseed/dm/store/seal/v1".as_slice()),
+            (
+                DM_PUSH_ANSWER_SALT,
+                b"daemonseed/dm/push/answer-salt/v1".as_slice(),
+            ),
+            (DM_PUSH_ANSWER, b"daemonseed/dm/push/answer/v1".as_slice()),
         ];
         assert_eq!(
             pinned.len(),

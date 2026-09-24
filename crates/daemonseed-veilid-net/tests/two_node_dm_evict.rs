@@ -1538,6 +1538,8 @@ async fn a_rewrites(records: &mut VeilidRecords, state: &Path, notes: &mut Notes
                 opening: Some(opening),
                 collected_cursor: conv.state.my_collected,
                 closed: false,
+                generation: conv.state.generation,
+                reach: Default::default(),
             },
         )
         .expect("the control reseals");

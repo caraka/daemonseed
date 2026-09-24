@@ -169,6 +169,7 @@ pub(crate) struct Transport {
 pub struct VeilidRecordsParts {
     pub(crate) transport: Transport,
     pub(crate) sched: WriteSchedulerHandle<ProdWrite>,
+    pub(crate) push: Option<crate::dm::push::PushParts>,
 }
 
 /// Why a [`VeilidRecords`] would not build, or would not bridge a call.
@@ -512,6 +513,8 @@ pub struct VeilidRecords {
     own_channels: HashMap<[u8; HELLO_LOOKUP_KEY_LEN], OwnChannel>,
     /// The scans the slot reads of each pass over a drop are answered from.
     drop_pass: DropPass,
+    /// The push lane, until a runner takes it.
+    push: Option<crate::dm::push::PushParts>,
 }
 
 impl core::fmt::Debug for VeilidRecords {
@@ -536,6 +539,7 @@ impl VeilidRecords {
             writer: Writer::new(parts.sched),
             own_channels: HashMap::new(),
             drop_pass: DropPass::default(),
+            push: parts.push,
         })
     }
 
@@ -1448,6 +1452,10 @@ impl RunnerRecords for VeilidRecords {
 
     fn write_counts(&self) -> WriteCountsSnapshot {
         VeilidRecords::write_counts(self)
+    }
+
+    fn take_push(&mut self) -> Option<crate::dm::push::PushParts> {
+        self.push.take()
     }
 }
 
@@ -3537,6 +3545,7 @@ mod tests {
                 "take_scan_failure".to_owned(),
                 "same_local_refusal".to_owned(),
                 "write_counts".to_owned(),
+                "take_push".to_owned(),
             ],
             "only the methods that make no network call are untraced"
         );

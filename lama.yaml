@@ -300,9 +300,10 @@ capabilities:
       of a conversation, written only by its owner, and `chain` its key
       schedule. `store` is the layer's on-disk state and `delivery` decides
       whether a written message has reached the correspondent. `flows` drives
-      first contact and messaging over a `Records` store. `contact_cache` and
-      `block_list` hold per-correspondent state; `domain` fixes the label
-      namespace.
+      first contact and messaging over a `Records` store, and `push` builds,
+      takes and answers the bytes a flow hands the correspondent directly.
+      `contact_cache` and `block_list` hold per-correspondent state; `domain`
+      fixes the label namespace.
     crate: daemonseed-core
     modules:
       - daemonseed_core::dm::advert
@@ -314,8 +315,9 @@ capabilities:
       - daemonseed_core::dm::domain
       - daemonseed_core::dm::drop
       - daemonseed_core::dm::flows
+      - daemonseed_core::dm::push
       - daemonseed_core::dm::store
-    iscs: [C38, C39, C40, C41, C42, C43, C44, C45, C46, C100, C101, C103, A-C20, A-C21, A-C22, A-C23, A-C24, A-C25, A-C44, A-C45]
+    iscs: [C38, C39, C40, C41, C42, C43, C44, C45, C46, C100, C101, C103, C104, C105, C106, C108, C109, A-C20, A-C21, A-C22, A-C23, A-C24, A-C25, A-C44, A-C45]
 
   - category: "Direct-messaging records and runner (transport)"
     summary: >-
@@ -324,13 +326,15 @@ capabilities:
       records, reading through the DHT gate and writing through the write
       scheduler. `runner` is the task a front end spawns to drive one
       identity's conversations over that record store: `RunnerCommand` in,
-      `RunnerEvent` out. `view` is the view model a front end renders.
+      `RunnerEvent` out. `push` carries pushes to and from a correspondent's
+      private route, and `view` is the view model a front end renders.
     crate: daemonseed-veilid-net
     modules:
       - daemonseed_veilid_net::dm::records
+      - daemonseed_veilid_net::dm::push
       - daemonseed_veilid_net::dm::runner
       - daemonseed_veilid_net::dm::view
-    iscs: [C39, C40, C41, C42, C43, C45, C103, A-C21, A-C24]
+    iscs: [C39, C40, C41, C42, C43, C45, C103, C104, C107, C108, C109, A-C21, A-C24]
 
   - category: "Wire schema (proto)"
     summary: >-

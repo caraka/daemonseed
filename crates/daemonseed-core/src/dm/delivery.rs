@@ -137,12 +137,14 @@ impl ClosedMarker {
     /// `opening` is an argument rather than a field because a control record
     /// written without one erases the opening from the channel, and the store
     /// keeps no copy of it to default to. `None` is correct only where the
-    /// opening is going with the record.
+    /// opening is going with the record. The marker carries no route and no
+    /// handle: a closed conversation is reached by no one.
     pub fn control(&self, opening: Option<ChannelOpening>) -> Control {
         Control {
             opening,
             collected_cursor: self.collected_cursor,
             closed: true,
+            ..Control::default()
         }
     }
 }
