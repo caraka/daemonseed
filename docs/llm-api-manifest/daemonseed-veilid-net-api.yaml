@@ -154,17 +154,25 @@ modules:
       - daemonseed_veilid_net::rendezvous
   - name: daemonseed_veilid_net::dm::runner
     description: >-
-      The direct-message runner: one tokio task per identity that owns a record
+      The direct-message runner: per identity, one tokio task that owns a record
       store and a daemonseed_core::dm::store::Store at <profile_root>/dm-store,
       calls daemonseed_core::dm::flows one call at a time, serves RunnerCommands
       between flow calls and emits RunnerEvents, on a collection tick, a repair
-      poll and an advert poll. With a push lane it allocates a private route at
-      startup and republishes every control subkey when the route dies or its
-      own handle (NoteHandle for its own identity) changes, pushes each message
-      and acceptance to a correspondent whose route it has read, reports
-      Delivered on an answer of RECORDED, and serves pushes addressed to it
-      between network calls, counting HealthCounters::pushes_dropped (queue
-      sheds included) and pushes_expired. A push is reported delivered only on the
+      poll and an advert poll; and a second task, the live lane, sharing the
+      Store, that reads the command queue, serves RunnerCommand::Send at once
+      (seal, persist the outbox entry, commit, push) unless an earlier send to
+      the conversation is the first task's to commit, applies Block and Unblock
+      to the stored list, marks a DeleteConversation's conversation for delete
+      and records a correspondent's NoteHandle, passes every other command, and
+      the rest of those, on in order, and takes pushes addressed to the runner
+      while the first task is inside a network call. The first task writes a
+      send's slot from the stored outbox bytes and then emits Sent; where that
+      write fails the send stays unanswered until the repair writes the slot. With a push lane it
+      allocates a private route at startup and republishes every control subkey
+      when the route dies or its own handle (NoteHandle for its own identity)
+      changes, pushes each message and acceptance to a correspondent whose route
+      it has read, reports Delivered on an answer of RECORDED, and counts
+      HealthCounters::pushes_dropped (queue sheds included) and pushes_expired. A push is reported delivered only on the
       answer the correspondent makes under the conversation's control key; a
       push from a blocked correspondent, or with the block list unreadable, is
       dropped unanswered.
@@ -626,7 +634,7 @@ types:
   - name: RunnerError
     module: daemonseed_veilid_net::dm::runner
     kind: enum
-    description: Store(StoreError) or Advert(AdvertError), a startup failure that stopped the runner.
+    description: Store(StoreError) or Advert(AdvertError), a startup failure that stopped the runner, or Lane, the live lane's task panicked.
   - name: OwnerSeed
     module: daemonseed_veilid_net::identity
     kind: struct

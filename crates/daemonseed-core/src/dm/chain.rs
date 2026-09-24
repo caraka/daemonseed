@@ -956,6 +956,43 @@ impl Conversation {
         }
     }
 
+    /// A byte-for-byte copy of `state`, which [`Self::restore`] takes by value.
+    pub(crate) fn restore_copy(state: &ConversationSnapshot) -> Self {
+        Self::restore(ConversationSnapshot {
+            sending: DirectionState {
+                root: state.sending.root.clone(),
+                chain: state.sending.chain.clone(),
+                n: state.sending.n,
+                m_seen: state.sending.m_seen,
+                seq: state.sending.seq,
+                cursor: state.sending.cursor,
+                peer_pk: state.sending.peer_pk.clone(),
+                peer_ss: state.sending.peer_ss.clone(),
+                pending_turn: state.sending.pending_turn.as_ref().map(OwnTurn::duplicate),
+                force_turn: state.sending.force_turn,
+            },
+            receiving: ReceivingState {
+                root: state.receiving.root.clone(),
+                chain: state.receiving.chain.clone(),
+                n: state.receiving.n,
+                next_seq: state.receiving.next_seq,
+                own_turns: [
+                    state.receiving.own_turns[0]
+                        .as_ref()
+                        .map(OwnTurn::duplicate),
+                    state.receiving.own_turns[1]
+                        .as_ref()
+                        .map(OwnTurn::duplicate),
+                ],
+                peer_latest: state
+                    .receiving
+                    .peer_latest
+                    .as_ref()
+                    .map(PeerTurn::duplicate),
+            },
+        })
+    }
+
     /// Rebuild a conversation from a snapshot.
     ///
     /// Total in its input and fallible in nothing: every field is state this

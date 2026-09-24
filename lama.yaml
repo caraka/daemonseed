@@ -334,7 +334,7 @@ capabilities:
       - daemonseed_veilid_net::dm::push
       - daemonseed_veilid_net::dm::runner
       - daemonseed_veilid_net::dm::view
-    iscs: [C39, C40, C41, C42, C43, C45, C103, C104, C107, C108, C109, A-C21, A-C24]
+    iscs: [C39, C40, C41, C42, C43, C45, C103, C104, C107, C108, C109, C110, A-C21, A-C24]
 
   - category: "Wire schema (proto)"
     summary: >-

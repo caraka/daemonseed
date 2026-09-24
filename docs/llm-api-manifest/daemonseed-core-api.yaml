@@ -1090,7 +1090,10 @@ modules:
       correspondent's last roster handle (at most HANDLE_MAX_LEN bytes) as
       RecordKind::CorrespondentHandle, refused without a conversation record;
       handle(&label) reads it and LoadedConv::handle carries it; delete_conv
-      removes it.
+      removes it. sweep_orphaned_outboxes() -> Result<usize, StoreError> deletes
+      and counts every outbox left with no
+      conversation record; a client calls it once at startup, before anything else
+      uses the store, and an ordinary load leaves such an outbox in place.
       persist_advert_keys(&AdvertSnapshot) and load_advert_keys() ->
       Result<Option<AdvertSnapshot>, StoreError> carry the advert KEM secrets and
       serial as RecordKind::AdvertKeys, one record per profile; an empty payload is
@@ -1256,7 +1259,9 @@ modules:
       Result<Taken, FlowError> takes a pushed slot only as the next sequence of
       an established conversation, through collect_step: Taken { Recorded {
       peer, seq, message, answer } | Blocked { peer } | Duplicate { peer } |
-      Ahead { peer } | Dropped }. recognise_acceptance(store, records, me,
+      Ahead { peer } | Dropped }; a commit that conflicts is taken again from a
+      fresh load, TAKE_ATTEMPTS (4) times in all. NoNetwork is a Records that
+      refuses every call. recognise_acceptance(store, records, me,
       advert_keys, is_blocked, &Push) -> Result<Option<(Acceptance, [u8;
       ANSWER_LEN])>, FlowError> runs collect_slot over the pushed bytes as a
       ReadCache, without erasing the hello back. AcceptanceWrites carries answer:
@@ -1282,9 +1287,20 @@ modules:
       own error; FlowError is Advert, Drop, Channel, Chain, Store, Records,
       NoAdvert, NoOpening, NotOutstanding, AlreadyEstablished,
       AwaitingAcceptance, AlreadyAccepted, OpeningWriter, OpeningRatchetKey, DropFull,
-      Incomplete, HelloLength, DeletePending and BodyTooLong { len } (a body over
+      Incomplete, HelloLength, DeletePending, BodyTooLong { len } (a body over
       channel::MESSAGE_BODY_MAX_LEN, refused before it is sealed, so nothing is
-      persisted or written). ReceivedMessage { sent_at_ms, body } is one message
+      persisted or written) and Conflict (the conversation record changed
+      between the flow's load and its commit, and nothing the flow computed was
+      written). send_message, commit_message and recognise_acceptance commit
+      only where the stored conversation record, force-turn flag and published
+      cursor aside, encodes to the bytes they loaded. collect_step opens the
+      slot again on the stored record under its lock and writes only the
+      reading half, my_collected and peer_collected, refusing Conflict only
+      where my_collected or the incoming channel moved or the stored record no
+      longer opens the slot. commit_message(store, peer, body, fill, now) -> Result<Committed,
+      FlowError> seals, persists the outbox entry and commits, without writing
+      the slot; Committed { seq, lookup_key, subkey, slot } names the slot and
+      its bytes. send_message is commit_message followed by that write. ReceivedMessage { sent_at_ms, body } is one message
       read from a correspondent's ring, sent_at_ms the sender's clock in Unix
       milliseconds; its Debug shows the body's length only. Me { signer, channel_root } is this side's
       identity, FIRST_GENERATION is 0 and MAX_REPICKS is 1.

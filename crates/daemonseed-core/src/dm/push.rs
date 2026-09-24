@@ -296,9 +296,33 @@ pub enum Taken {
 /// that does not open under the conversation's key schedule changes nothing,
 /// and a message this returns is persisted as read before it is returned. The
 /// cursor reaches the record store with the next [`flows::publish_cursor`].
+///
+/// Where the conversation record changes between the load and the commit
+/// ([`FlowError::Conflict`]), nothing is recorded and the push is taken again
+/// from a fresh load, at most [`TAKE_ATTEMPTS`] times in all; the last
+/// attempt's conflict is returned.
 pub fn take_message(
     store: &Store,
     is_blocked: impl Fn(&[u8; IDENTITY_PK_LEN]) -> bool,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    subkey: u16,
+    slot: &[u8],
+) -> Result<Taken, FlowError> {
+    let mut attempts = 1;
+    loop {
+        match take_message_once(store, &is_blocked, lookup_key, subkey, slot) {
+            Err(FlowError::Conflict) if attempts < TAKE_ATTEMPTS => attempts += 1,
+            taken => return taken,
+        }
+    }
+}
+
+/// How many times [`take_message`] takes one push whose commit conflicts.
+pub const TAKE_ATTEMPTS: usize = 4;
+
+fn take_message_once(
+    store: &Store,
+    is_blocked: &impl Fn(&[u8; IDENTITY_PK_LEN]) -> bool,
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     subkey: u16,
     slot: &[u8],
@@ -485,6 +509,70 @@ impl Records for OneSlot<'_> {
         _: &[u8],
     ) -> Result<(), RecordError> {
         Err(refused())
+    }
+}
+
+/// A record store that refuses every call: what a push is taken through where
+/// no network call may be made. [`recognise_acceptance`] over it recognises an
+/// acceptance from the pushed bytes alone, and refuses one they do not cover.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoNetwork;
+
+fn no_network() -> RecordError {
+    RecordError::new(std::io::Error::other("no network call is made here"))
+}
+
+impl Records for NoNetwork {
+    fn read_advert(&mut self, _: &AdvertOwnerSeed, _: u16) -> Result<Option<Vec<u8>>, RecordError> {
+        Err(no_network())
+    }
+
+    fn read_drop_slot(
+        &mut self,
+        _: &DropOwnerSeed,
+        _: u16,
+        _: u16,
+    ) -> Result<Option<Vec<u8>>, RecordError> {
+        Err(no_network())
+    }
+
+    fn write_drop_slot(
+        &mut self,
+        _: &DropOwnerSeed,
+        _: u16,
+        _: u16,
+        _: &[u8],
+    ) -> Result<(), RecordError> {
+        Err(no_network())
+    }
+
+    fn erase_drop_slot(&mut self, _: &DropOwnerSeed, _: u16, _: u16) -> Result<(), RecordError> {
+        Err(no_network())
+    }
+
+    fn open_channel(
+        &mut self,
+        _: &ChannelOwnerSeed,
+        _: u16,
+    ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
+        Err(no_network())
+    }
+
+    fn read_channel(
+        &mut self,
+        _: &[u8; HELLO_LOOKUP_KEY_LEN],
+        _: u16,
+    ) -> Result<Option<Vec<u8>>, RecordError> {
+        Err(no_network())
+    }
+
+    fn write_channel(
+        &mut self,
+        _: &[u8; HELLO_LOOKUP_KEY_LEN],
+        _: u16,
+        _: &[u8],
+    ) -> Result<(), RecordError> {
+        Err(no_network())
     }
 }
 

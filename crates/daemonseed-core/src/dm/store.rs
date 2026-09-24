@@ -766,7 +766,8 @@ impl Store {
     /// ciphertext it still owes or an outbox with no conversation to place it
     /// in. The removals run in `DELETE_ORDER`, conversation record first: a
     /// stop between the two leaves an outbox with no conversation record, which
-    /// nothing lists or polls and [`Store::load`] deletes, rather than a
+    /// nothing lists or polls and [`Store::sweep_orphaned_outboxes`] deletes,
+    /// rather than a
     /// conversation the user deleted still being listed. The correspondence's
     /// directory stays: it is what [`DmStore::critical_section`] establishes by
     /// being entered, and removing it is the record store's business rather
@@ -946,6 +947,33 @@ impl Store {
         })
     }
 
+    /// Delete, scrubbed first, every outbox record with no conversation
+    /// record beside it, and return how many were deleted. A run that stopped
+    /// between persisting its first message and creating the record leaves
+    /// one, as does a delete stopped between its two removals, and nothing
+    /// else reads it.
+    ///
+    /// **Call this only at startup, before anything else uses the store.**
+    /// While a first contact or an accept runs, its outbox has no
+    /// conversation record beside it yet, and this would delete it.
+    pub fn sweep_orphaned_outboxes(&self) -> Result<usize, StoreError> {
+        let mut swept = 0;
+        for peer in self.inner.correspondences()? {
+            let orphan = self.inner.critical_section::<_, StoreError>(&peer, |g| {
+                if read_conv(g)?.is_some() {
+                    return Ok(false);
+                }
+                if read_finishing_delete(g, RecordKind::ConversationOutbox)?.is_none() {
+                    return Ok(false);
+                }
+                g.delete(RecordKind::ConversationOutbox)?;
+                Ok(true)
+            })?;
+            swept += usize::from(orphan);
+        }
+        Ok(swept)
+    }
+
     /// Everything a launch needs: the advert state and every correspondence,
     /// each with the messages whose slots may need rewriting.
     ///
@@ -957,9 +985,13 @@ impl Store {
     /// expecting. An entry below `peer_collected` has been collected and is
     /// waiting for the next [`Store::delete_outbox_through`].
     ///
-    /// An outbox record with no conversation record beside it is deleted,
-    /// scrubbed first. A run that stopped between persisting its first message
-    /// and creating the record leaves one, and nothing else reads it.
+    /// An outbox record with no conversation record beside it is left in
+    /// place and not reported: a first contact or an accept persists its
+    /// outbox before it creates the record, so while one runs, its outbox has
+    /// no record beside it. [`Store::sweep_orphaned_outboxes`] removes one a
+    /// stopped run left. Where the conversation record is one a stopped delete
+    /// scrubbed and did not unlink, the outbox is that delete's, and is
+    /// deleted with it.
     ///
     /// A conversation or outbox record that a [`Store::delete_conv`] scrubbed
     /// and had not yet unlinked when the process stopped is removed, and its
@@ -975,13 +1007,22 @@ impl Store {
             // launch would then rewrite a slot the correspondent has collected
             // or leave one it has not.
             let read = self.inner.critical_section::<_, StoreError>(&peer, |g| {
+                // Read only to test for the sentinel; held so the plaintext,
+                // a whole key schedule, is wiped when dropped.
+                let delete_stopped = matches!(
+                    g.read(RecordKind::Conversation)
+                        .map(|bytes| bytes.map(Zeroizing::new)),
+                    Err(DmStoreError::ErasureInterrupted { .. })
+                );
                 let Some(state) = read_conv(g)? else {
-                    // An outbox with no conversation record beside it is what a
-                    // run leaves that stopped between persisting its first
-                    // message and creating the record. Nothing reads it, so it
-                    // is deleted here, scrubbed first. One a stopped delete
-                    // left is removed by the read.
-                    if read_finishing_delete(g, RecordKind::ConversationOutbox)?.is_some() {
+                    // An outbox with no conversation record beside it may be a
+                    // first contact's or an accept's whose record is not yet
+                    // created, so it is kept, unless a delete of the
+                    // conversation record stopped before its unlink. One a
+                    // stopped delete left half-erased is removed by the read.
+                    if read_finishing_delete(g, RecordKind::ConversationOutbox)?.is_some()
+                        && delete_stopped
+                    {
                         g.delete(RecordKind::ConversationOutbox)?;
                     }
                     // A handle outlives its conversation only where a delete
@@ -2929,7 +2970,7 @@ mod tests {
 
     /// A delete stopped after its first removal leaves no conversation record,
     /// so nothing a launch would list or poll; the outbox it had not yet
-    /// removed is an orphan the next load deletes.
+    /// removed is an orphan the next startup sweep deletes.
     #[test]
     fn a_delete_stopped_after_its_first_removal_leaves_no_conversation() {
         let (a, _b) = pair();
@@ -3510,10 +3551,12 @@ mod tests {
     }
 
     /// An outbox record whose correspondence holds no conversation record is
-    /// deleted by the next load, and an outbox beside a conversation record is
-    /// kept.
+    /// kept by an ordinary load, which may run while a first contact or an
+    /// accept is between persisting its outbox and creating the record, and is
+    /// deleted by the startup sweep. An outbox beside a conversation record is
+    /// kept by both.
     #[test]
-    fn a_load_deletes_an_outbox_with_no_conversation_record() {
+    fn a_load_keeps_an_outbox_with_no_conversation_record_and_the_sweep_deletes_it() {
         // First: the pair brings the crypto module up, which opening the store
         // needs.
         let (a, _b) = pair();
@@ -3541,13 +3584,24 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded.convs.len(), 1, "one correspondence has a record");
         assert!(
-            outbox_of(&orphan).is_none(),
-            "an outbox with no conversation record survived the load"
+            outbox_of(&orphan).is_some(),
+            "a load deleted an outbox with no conversation record"
         );
         assert!(
             outbox_of(&genuine).is_some(),
             "the load deleted an outbox beside its conversation record"
         );
+
+        assert_eq!(store.sweep_orphaned_outboxes().unwrap(), 1);
+        assert!(
+            outbox_of(&orphan).is_none(),
+            "an outbox with no conversation record survived the sweep"
+        );
+        assert!(
+            outbox_of(&genuine).is_some(),
+            "the sweep deleted an outbox beside its conversation record"
+        );
+        assert_eq!(store.load().unwrap().convs.len(), 1);
     }
 
     // ── what a decoder refuses ──────────────────────────────────────────────

@@ -45,7 +45,7 @@ use crate::dm::drop as drop_plane;
 use crate::dm::drop::{
     DropError, DropOwnerSeed, HELLO_LEN, HELLO_LOOKUP_KEY_LEN, HelloAttempt, ReadBack,
 };
-use crate::dm::store::{ConvState, OutstandingHello, Store, StoreError};
+use crate::dm::store::{ConvState, OutstandingHello, Store, StoreError, encode_conv};
 use crate::identity::keys::{DmChannelRootSecret, SignKeypair};
 use crate::storage::dm_store::CorrespondenceLabel;
 
@@ -312,6 +312,12 @@ pub enum FlowError {
         /// The body's length in bytes.
         len: usize,
     },
+    /// The conversation record changed between the flow's load and its commit,
+    /// so the flow's result was discarded and nothing it computed was written.
+    /// [`send_message`], [`commit_message`], [`collect_step`] and
+    /// [`recognise_acceptance`] refuse it. Loading again and repeating the flow
+    /// is correct.
+    Conflict,
 }
 
 impl core::fmt::Display for FlowError {
@@ -350,6 +356,7 @@ impl core::fmt::Display for FlowError {
                 "a {len}-byte body is longer than the {} bytes a message holds",
                 channel::MESSAGE_BODY_MAX_LEN
             ),
+            Self::Conflict => f.write_str("the conversation record changed while the flow held it"),
         }
     }
 }
@@ -680,10 +687,16 @@ fn place_hello<R: Records>(
     fill: &mut impl FnMut(&mut [u8]) -> Result<(), ()>,
 ) -> Result<HelloAttempt, FlowError> {
     let drop_owner = drop_plane::derive_owner_seed(peer_identity_pk)?;
+    let awaiting = load(store, peer)?.awaiting_acceptance;
     loop {
         let hello = seal_outstanding(seal, lookup_key, peer_identity_pk, &attempt)?;
         let written = *hello.sealed;
-        store.update_conv(peer, |state| {
+        store.try_update_conv(peer, |state| {
+            // A first contact whose acceptance was recognised since the load
+            // has no hello left to place.
+            if awaiting && !state.awaiting_acceptance {
+                return Err(FlowError::AlreadyAccepted);
+            }
             state.outstanding_hello = Some(hello);
             // From here on the accepting side's hello back is rewritten from
             // these sealed bytes, so the secret it was sealed from goes in the
@@ -692,7 +705,8 @@ fn place_hello<R: Records>(
             if !state.awaiting_acceptance {
                 state.own_hello_secret = None;
             }
-        })?;
+            Ok::<_, FlowError>(())
+        })??;
         records.write_drop_slot(
             &drop_owner,
             drop_plane::DROP_SUBKEYS,
@@ -2107,15 +2121,19 @@ pub fn recognise_acceptance<R: Records>(
     if !state.awaiting_acceptance {
         return Err(FlowError::NotOutstanding);
     }
+    let loaded = AsLoaded::of(&state);
     let control_bytes = Zeroizing::new(*channel::control_key(&peer_secret)?.as_bytes());
     drop(peer_secret);
     // Refused here rather than at the load: this section is the first thing
     // the recognition changes, and before it the flow has only read the record.
-    store.try_update_conv(peer, |state| {
+    // The record as this section leaves it is what the final commit compares
+    // against.
+    let loaded = store.try_update_conv(peer, |state| {
         refuse_if_marked(state)?;
+        loaded.unchanged(state)?;
         state.incoming_lookup_key = *lookup_key;
         state.peer_control_key = Some(ControlKey::from_bytes(&control_bytes));
-        Ok::<_, FlowError>(())
+        Ok::<_, FlowError>(AsLoaded::of(state))
     })??;
 
     let loaded_forced = state.conversation.sending.force_turn;
@@ -2131,6 +2149,7 @@ pub fn recognise_acceptance<R: Records>(
     )?;
     store.try_update_conv(peer, |state| {
         refuse_if_marked(state)?;
+        loaded.unchanged(state)?;
         write_conversation(state, &conversation, loaded_forced);
         state.my_collected = read.collected;
         state.peer_collected = ring.peer_collected();
@@ -2245,7 +2264,17 @@ fn read_ring_slot<R: Records>(
     let Some(raw) = records.read_channel(lookup_key, channel::slot_for(seq))? else {
         return Ok(RingStep::End);
     };
-    let Ok((header, sealed)) = channel::MessageHeader::decode(&raw) else {
+    open_ring_slot(conversation, ring, &raw, seq)
+}
+
+/// The step [`read_ring_slot`] takes once it holds the slot's bytes `raw`.
+fn open_ring_slot(
+    conversation: &mut Conversation,
+    ring: &mut Ring,
+    raw: &[u8],
+    seq: u64,
+) -> Result<RingStep, FlowError> {
+    let Ok((header, sealed)) = channel::MessageHeader::decode(raw) else {
         return Ok(RingStep::End);
     };
     if header.seq != seq {
@@ -2376,6 +2405,53 @@ fn write_conversation(state: &mut ConvState, written: &Conversation, loaded_forc
     state.conversation = snapshot;
 }
 
+/// A conversation record as a flow loaded it, which the flow's commit compares
+/// the stored record against.
+///
+/// A flow that loads a record, computes from it, and writes the result back
+/// overwrites whatever another writer committed in between: a key schedule
+/// advanced by a send, a collection cursor advanced by a pushed message. The
+/// commit therefore applies only where the stored record still encodes to the
+/// bytes loaded, and is refused [`FlowError::Conflict`] otherwise.
+///
+/// Two fields are left out of the comparison because no flow that compares
+/// writes them: the force-turn flag, which [`reset`] sets and
+/// [`write_conversation`] keeps, and the published cursor, which
+/// [`publish_cursor`] raises and never lowers.
+struct AsLoaded {
+    bytes: Zeroizing<Vec<u8>>,
+    force_turn: bool,
+    cursor_published: u64,
+}
+
+impl AsLoaded {
+    fn of(state: &ConvState) -> Self {
+        Self {
+            bytes: encode_conv(state),
+            force_turn: state.conversation.sending.force_turn,
+            cursor_published: state.cursor_published,
+        }
+    }
+
+    /// Refuse [`FlowError::Conflict`] where `stored` differs from the record
+    /// loaded in anything but the two fields left out. `stored` is left as it
+    /// was read.
+    fn unchanged(&self, stored: &mut ConvState) -> Result<(), FlowError> {
+        let force_turn = stored.conversation.sending.force_turn;
+        let cursor_published = stored.cursor_published;
+        stored.conversation.sending.force_turn = self.force_turn;
+        stored.cursor_published = self.cursor_published;
+        let same = encode_conv(stored).as_slice() == self.bytes.as_slice();
+        stored.conversation.sending.force_turn = force_turn;
+        stored.cursor_published = cursor_published;
+        if same {
+            Ok(())
+        } else {
+            Err(FlowError::Conflict)
+        }
+    }
+}
+
 /// Refuse, from inside the critical section that is about to change a
 /// conversation record, a conversation a delete has marked since the flow
 /// loaded it.
@@ -2414,6 +2490,9 @@ thread_local! {
 ///
 /// `now` is the caller's clock in Unix seconds, recorded with the outbox entry
 /// as the time the message was sent.
+///
+/// Refused with [`FlowError::Conflict`], before the slot is written, where the
+/// conversation record changed between the load and the commit.
 pub fn send_message<R: Records>(
     store: &Store,
     records: &mut R,
@@ -2422,7 +2501,43 @@ pub fn send_message<R: Records>(
     fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
     now: u64,
 ) -> Result<u64, FlowError> {
+    let committed = commit_message(store, peer, body, fill, now)?;
+    records.write_channel(&committed.lookup_key, committed.subkey, &committed.slot)?;
+    Ok(committed.seq)
+}
+
+/// A message [`commit_message`] committed: the slot it owes and the bytes
+/// that slot must hold, which are also its outbox entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Committed {
+    /// The message's sequence within this side's direction.
+    pub seq: u64,
+    /// The channel this side writes.
+    pub lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
+    /// The ring subkey the slot is written to.
+    pub subkey: u16,
+    /// The slot's bytes.
+    pub slot: Vec<u8>,
+}
+
+/// The first two acts of [`send_message`]: seal the message, persist its outbox
+/// entry, and commit the advanced key schedule and `send_seq`. The slot is not
+/// written; a launch or a repair rewrites a committed entry's slot from the
+/// stored bytes, and so can the caller.
+///
+/// Refused as [`send_message`] is, and with [`FlowError::Conflict`] where the
+/// conversation record changed between the load and the commit. A refused
+/// commit leaves an outbox entry at or above `send_seq`, which no launch lists
+/// and the next commit at that sequence replaces.
+pub fn commit_message(
+    store: &Store,
+    peer: &CorrespondenceLabel,
+    body: &[u8],
+    fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+    now: u64,
+) -> Result<Committed, FlowError> {
     let state = load(store, peer)?;
+    let loaded = AsLoaded::of(&state);
     if state.delete_pending {
         return Err(FlowError::DeletePending);
     }
@@ -2442,12 +2557,17 @@ pub fn send_message<R: Records>(
     }
     store.try_update_conv(peer, |state| {
         refuse_if_marked(state)?;
+        loaded.unchanged(state)?;
         write_conversation(state, &conversation, loaded_forced);
         state.send_seq = ring.send_seq();
         Ok::<_, FlowError>(())
     })??;
-    records.write_channel(&lookup_key, channel::slot_for(seq), &slot_bytes)?;
-    Ok(seq)
+    Ok(Committed {
+        seq,
+        lookup_key,
+        subkey: channel::slot_for(seq),
+        slot: slot_bytes,
+    })
 }
 
 /// What one step of a ring read found at the slot of the next sequence.
@@ -2489,7 +2609,12 @@ pub enum RingStep {
 /// Refused as [`collect_batch`] is: [`FlowError::DeletePending`] for a
 /// conversation marked for delete, at the load or at the commit, and
 /// [`FlowError::AwaitingAcceptance`] while this side's acceptance is not
-/// finished.
+/// finished. Refused with [`FlowError::Conflict`], with nothing recorded,
+/// where another writer recorded this sequence during the read, or the record
+/// as it stands at the commit no longer opens the slot; the message read here
+/// is then discarded. Any other change since the load, such as a send, is
+/// kept: the open is made again on the stored record under its lock and only
+/// the reading half, `my_collected` and `peer_collected` are written.
 pub fn collect_step<R: Records>(
     store: &Store,
     records: &mut R,
@@ -2503,25 +2628,43 @@ pub fn collect_step<R: Records>(
         return Err(FlowError::AwaitingAcceptance);
     }
     let incoming = state.incoming_lookup_key;
-    let loaded_forced = state.conversation.sending.force_turn;
     let seq = state.my_collected;
     let mut conversation = Conversation::restore(state.conversation);
     let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
-    let mut step = read_ring_slot(records, &mut conversation, &mut ring, &incoming, seq)?;
+    let Some(raw) = records.read_channel(&incoming, channel::slot_for(seq))? else {
+        return Ok(RingStep::End);
+    };
+    let mut step = open_ring_slot(&mut conversation, &mut ring, &raw, seq)?;
     if !matches!(step, RingStep::Message { .. }) {
         return Ok(step);
     }
-    store.try_update_conv(peer, |state| {
+    // The open is made again, under the lock, on the record as it stands, so
+    // what another writer committed since the load (a send's key schedule and
+    // sequence, a reset's flag) is kept. Only the reading half, the collection
+    // cursor and the correspondent's cursor move.
+    let peer_collected = store.try_update_conv(peer, |state| {
         refuse_if_marked(state)?;
-        write_conversation(state, &conversation, loaded_forced);
+        if state.acceptance_pending {
+            return Err(FlowError::AwaitingAcceptance);
+        }
+        if state.my_collected != seq || state.incoming_lookup_key != incoming {
+            return Err(FlowError::Conflict);
+        }
+        let stored_forced = state.conversation.sending.force_turn;
+        let mut fresh = Conversation::restore_copy(&state.conversation);
+        let mut fresh_ring = Ring::restore(state.send_seq, state.peer_collected)?;
+        match open_ring_slot(&mut fresh, &mut fresh_ring, &raw, seq)? {
+            RingStep::Message { .. } => {}
+            RingStep::End | RingStep::Unopened(_) => return Err(FlowError::Conflict),
+        }
+        write_conversation(state, &fresh, stored_forced);
         state.my_collected = seq + 1;
-        state.peer_collected = ring.peer_collected();
-        Ok::<_, FlowError>(())
+        state.peer_collected = fresh_ring.peer_collected();
+        Ok::<_, FlowError>(state.peer_collected)
     })??;
-    if let (Err(e), RingStep::Message { outbox_error, .. }) = (
-        store.delete_outbox_through(peer, ring.peer_collected()),
-        &mut step,
-    ) {
+    if let (Err(e), RingStep::Message { outbox_error, .. }) =
+        (store.delete_outbox_through(peer, peer_collected), &mut step)
+    {
         *outbox_error = Some(e);
     }
     Ok(step)
@@ -2641,7 +2784,9 @@ pub fn collect_batch<R: Records>(
     let unopened = loop {
         match collect_step(store, records, peer) {
             Ok(RingStep::Message { message, .. }) => messages.push(message),
-            Ok(RingStep::End) => break None,
+            // Another writer recorded the slot first: the read ends here and
+            // the next batch carries on from the cursor it recorded.
+            Ok(RingStep::End) | Err(FlowError::Conflict) => break None,
             Ok(RingStep::Unopened(unopened)) => break Some(unopened),
             Err(e) if messages.is_empty() => return Err(e),
             Err(e) => {
@@ -5220,6 +5365,90 @@ mod tests {
             flagged(&a, &peer_a),
             "the recognition's write erased the flag the reset stored"
         );
+    }
+
+    /// The commit comparison passes an unchanged record, passes one that
+    /// differs only in the force-turn flag and the published cursor and leaves
+    /// those as read, and refuses any other change.
+    #[test]
+    fn the_commit_comparison_refuses_a_change_and_ignores_the_two_left_out() {
+        let (a, b, mut net) = scene();
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+        let mut stored = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        let loaded = AsLoaded::of(&stored);
+        assert!(loaded.unchanged(&mut stored).is_ok(), "unchanged");
+        let forced = !stored.conversation.sending.force_turn;
+        stored.conversation.sending.force_turn = forced;
+        stored.cursor_published += 7;
+        let published = stored.cursor_published;
+        assert!(
+            loaded.unchanged(&mut stored).is_ok(),
+            "the two fields left out are ignored"
+        );
+        assert_eq!(
+            (
+                stored.conversation.sending.force_turn,
+                stored.cursor_published
+            ),
+            (forced, published),
+            "the stored values are left as read"
+        );
+        stored.send_seq += 1;
+        assert!(matches!(
+            loaded.unchanged(&mut stored),
+            Err(FlowError::Conflict)
+        ));
+    }
+
+    /// A change committed between a send's load and its commit refuses the
+    /// send with a conflict: nothing of it is committed or written, and the
+    /// change is kept.
+    #[test]
+    fn a_send_whose_record_changed_under_it_commits_nothing() {
+        let (a, b, mut net) = scene();
+        let (peer_a, _) = round_trip(&a, &b, &mut net);
+        let before = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        let root = a.root.path().to_path_buf();
+        let at_rest = a.at_rest;
+        BETWEEN_SEND_LOAD_AND_WRITE.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let store = Store::open(root, &at_rest).expect("open the store");
+                store
+                    .update_conv(&peer_a, |state| state.my_collected += 1)
+                    .expect("the change");
+            }))
+        });
+        net.reset_writes();
+        let mut entropy = Seeded::at(1_200);
+        let sent = send_message(
+            &a.store(),
+            &mut net,
+            &peer_a,
+            b"raced",
+            |x| entropy.fill(x),
+            NOW,
+        );
+        assert!(matches!(sent, Err(FlowError::Conflict)), "{sent:?}");
+        let after = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("A's record");
+        assert_eq!(after.send_seq, before.send_seq, "nothing committed");
+        assert_eq!(
+            after.my_collected,
+            before.my_collected + 1,
+            "the change is kept"
+        );
+        assert_eq!(net.writes.total(), 0, "nothing written");
     }
 
     /// A reset that lands while a send holds the key schedule it loaded is not

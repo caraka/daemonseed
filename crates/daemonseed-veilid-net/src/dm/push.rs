@@ -268,6 +268,29 @@ impl PushInbox {
     pub fn shed(&self) -> u64 {
         lock(&self.admission).shed
     }
+
+    /// A handle on this queue's admission, for a holder other than the one
+    /// that receives from it.
+    pub(crate) fn admission(&self) -> Admitting {
+        Admitting(Arc::clone(&self.admission))
+    }
+}
+
+/// [`PushInbox::set_known`] and [`PushInbox::shed`] over a queue received from
+/// elsewhere.
+#[derive(Clone)]
+pub(crate) struct Admitting(Arc<Mutex<Admission>>);
+
+impl Admitting {
+    /// [`PushInbox::set_known`].
+    pub(crate) fn set_known(&self, known: impl IntoIterator<Item = [u8; HELLO_LOOKUP_KEY_LEN]>) {
+        lock(&self.0).known = known.into_iter().collect();
+    }
+
+    /// [`PushInbox::shed`].
+    pub(crate) fn shed(&self) -> u64 {
+        lock(&self.0).shed
+    }
 }
 
 impl core::fmt::Debug for PushParts {
@@ -417,6 +440,36 @@ pub(crate) struct Pusher {
 }
 
 impl Pusher {
+    /// Push the ring slot `bytes`, written to `subkey` of the channel at
+    /// `lookup_key`, on its own task, where it decodes as a message and this
+    /// pusher holds the key its answer is checked under.
+    pub(crate) fn push_slot(
+        &self,
+        peer: CorrespondenceLabel,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        subkey: u16,
+        bytes: &[u8],
+    ) {
+        let expected = channel::MessageHeader::decode(bytes)
+            .ok()
+            .zip(self.answer_key.as_deref())
+            .and_then(|((header, _), key)| {
+                Some((header.seq, key.answer(lookup_key, header.seq).ok()?))
+            });
+        if let Some((seq, expected)) = expected {
+            self.start(
+                peer,
+                seq,
+                &Push::Message {
+                    lookup_key: *lookup_key,
+                    subkey,
+                    slot: bytes.to_vec(),
+                },
+                expected,
+            );
+        }
+    }
+
     /// Push `push` on its own task. An answer equal to `expected` is reported
     /// as [`RunnerEvent::Delivered`] through `seq`; any other outcome names
     /// `peer` on the unanswered queue.
@@ -541,24 +594,7 @@ impl<R: Records> Records for Pushing<'_, R> {
     ) -> Result<(), RecordError> {
         if let (Some(pusher), Some(peer)) = (&self.pusher, self.peer) {
             if subkey != channel::CONTROL_SUBKEY {
-                let expected = channel::MessageHeader::decode(bytes)
-                    .ok()
-                    .zip(pusher.answer_key.as_deref())
-                    .and_then(|((header, _), key)| {
-                        Some((header.seq, key.answer(lookup_key, header.seq).ok()?))
-                    });
-                if let Some((seq, expected)) = expected {
-                    pusher.start(
-                        peer,
-                        seq,
-                        &Push::Message {
-                            lookup_key: *lookup_key,
-                            subkey,
-                            slot: bytes.to_vec(),
-                        },
-                        expected,
-                    );
-                }
+                pusher.push_slot(peer, lookup_key, subkey, bytes);
             }
         }
         self.inner.write_channel(lookup_key, subkey, bytes)

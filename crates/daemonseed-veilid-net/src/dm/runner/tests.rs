@@ -272,8 +272,15 @@ struct Faults {
     gate_channel_read: Option<(Vec<[u8; HELLO_LOOKUP_KEY_LEN]>, usize, Arc<Gate>)>,
     /// Hold every ring-slot write at this gate.
     gate_ring_write: Option<Arc<Gate>>,
+    /// Hold every ring-slot read of this channel at this gate, before the read.
+    gate_ring_read: Option<([u8; HELLO_LOOKUP_KEY_LEN], Arc<Gate>)>,
     /// The push lane the runner takes at startup.
     push: Option<crate::dm::push::PushParts>,
+    /// Send commits the live lane refuses as conflicting before it attempts one.
+    forced_conflicts: Arc<std::sync::atomic::AtomicUsize>,
+    /// The subkeys of every ring read of the channel `gate_ring_read` names,
+    /// in order.
+    gated_ring_reads: Vec<u16>,
 }
 
 /// One record call, as [`Faults::trail`] logs it.
@@ -602,6 +609,19 @@ impl Records for Fake {
         if let Some(gate) = gate {
             tokio::task::block_in_place(|| gate.hold());
         }
+        let gate = {
+            let mut faults = self.faults();
+            match faults.gate_ring_read.clone() {
+                Some((key, gate)) if key == *lookup_key && subkey != channel::CONTROL_SUBKEY => {
+                    faults.gated_ring_reads.push(subkey);
+                    Some(gate)
+                }
+                _ => None,
+            }
+        };
+        if let Some(gate) = gate {
+            tokio::task::block_in_place(|| gate.hold());
+        }
         if let Some(trail) = self.faults().trail.as_mut() {
             trail.push(Trail::ChannelRead(lookup_key[0]));
         }
@@ -647,6 +667,10 @@ impl Records for Fake {
 impl RunnerRecords for Fake {
     fn take_push(&mut self) -> Option<crate::dm::push::PushParts> {
         self.faults().push.take()
+    }
+
+    fn forced_conflicts(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.faults().forced_conflicts)
     }
 
     fn inspect_channel(
@@ -2381,6 +2405,9 @@ async fn refusals_carry_the_token_and_name_backpressure_apart() {
         .await;
     }
     let at = aw.wait_for("the backpressure refusal", refused(163)).await;
+    // A send is refused as it is served, and reported sent once the runner has
+    // written its slot, so the last send's report may follow the refusal.
+    aw.wait_for("the last send that fits", sent(162)).await;
     let answers: Vec<String> = aw
         .seen
         .iter()
@@ -5428,6 +5455,7 @@ async fn a_send_issued_during_a_collection_writes_before_the_next_conversation()
         body: b"during the collection".to_vec(),
     })
     .await;
+    committed(&a, &a_peer, 2).await;
     held.release();
     aw.wait_for("A's send", sent(42)).await;
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -5510,6 +5538,14 @@ async fn a_command_issued_during_a_preview_is_served_before_the_next_one() {
         peer: stranger.pk.clone(),
     })
     .await;
+    within(Duration::from_secs(10), "the block stored", async {
+        while !read_block_list(&reopen_store(&b)).is_some_and(|list| list.is_blocked(&stranger.pk))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     held.release();
     let previews = |event: &RunnerEvent| matches!(event, RunnerEvent::RequestPreview { .. });
     let first = bw.wait_for("the first preview", previews).await;
@@ -5561,6 +5597,7 @@ async fn a_send_issued_during_a_drop_scan_writes_before_the_scan_ends() {
         body: b"during the scan".to_vec(),
     })
     .await;
+    committed(&b, &b_peer, 2).await;
     held.release();
     bw.wait_for("B's send", sent(40)).await;
     // The scan resumes after the send is answered; wait for its next read.
@@ -6107,22 +6144,42 @@ async fn a_failure_a_command_counts_is_reported_before_the_runner_stops() {
         .faults()
         .plan
         .push((CHANNEL, Op::Write, Fault::Refused));
+    let writes = a_fake.calls().ring_writes;
     aw.send(RunnerCommand::Send {
         token: CommandToken(30),
         peer: a_peer,
         body: b"refused".to_vec(),
     })
     .await;
-    let at = aw.wait_for("the refused send", refused(30)).await;
-    assert_eq!(refusal(&aw.seen[at]), Refusal::Network);
+    // The message is committed, so a refused first write leaves it to the
+    // repair rather than refusing the send.
+    while a_fake.calls().ring_writes == writes {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    aw.drain();
+    assert!(!aw.seen.iter().any(refused(30)), "the send is not refused");
+    let seen = std::mem::take(&mut aw.seen);
     let stop = aw.stop().await;
     assert!(finished(&stop));
     assert!(
         stop.undelivered.iter().any(|event| matches!(
             event,
+            RunnerEvent::Refused {
+                token: Some(CommandToken(30)),
+                reason: Refusal::ShuttingDown
+            }
+        )),
+        "the send still pending is answered at the stop: {:?}",
+        stop.undelivered
+    );
+    assert!(
+        seen.iter().chain(&stop.undelivered).any(|event| matches!(
+            event,
             RunnerEvent::Health(counters) if counters.channel_write_failures == 1
         )),
-        "the report of the refused write is among the events the shutdown hands back: {:?}",
+        "the report of the refused write is among the events read before the stop \
+         or handed back by it: {:?}",
         stop.undelivered
     );
 }
@@ -7783,4 +7840,709 @@ async fn a_forged_handle_in_a_control_record_is_not_recorded() {
     .await
     .expect("A recorded B's genuine handle");
     let _ = &k.aw;
+}
+
+// ── the live lane ───────────────────────────────────────────────────────────
+
+/// Wait on the real clock until `profile`'s conversation `peer` has committed
+/// sends up to `send_seq`, and then for the live lane to hand the send to the
+/// runner, which it does directly after the commit.
+async fn committed(profile: &Profile, peer: &CorrespondenceLabel, send_seq: u64) {
+    within(Duration::from_secs(10), "the send's commit", async {
+        while conv_of(profile, peer).send_seq < send_seq {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+/// Hold `fake`'s next ring read of the channel at `lookup_key`, and wait until
+/// its runner is inside that read.
+async fn hold_ring_read(fake: &Fake, lookup_key: [u8; HELLO_LOOKUP_KEY_LEN]) -> Arc<Gate> {
+    let held = Arc::new(Gate::default());
+    fake.faults().gate_ring_read = Some((lookup_key, Arc::clone(&held)));
+    held.reached().await;
+    held
+}
+
+/// How soon a send or a push the live lane serves is seen at the other end
+/// while the runner is held: one second in an optimised build, and three in
+/// the unoptimised dev profile, whose post-quantum arithmetic is several times
+/// slower.
+const LIVE_WITHIN: Duration = if cfg!(debug_assertions) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(1)
+};
+
+/// `what`, which must happen within `limit` on the real clock.
+async fn within<T>(
+    limit: Duration,
+    what: &str,
+    happens: impl core::future::Future<Output = T>,
+) -> T {
+    tokio::time::timeout(limit, happens)
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not happen within {limit:?}"))
+}
+
+/// Wait on the real clock until `fake` has ended `more` further ring reads,
+/// each the end of one collection pass over one conversation.
+async fn passes_after(fake: &Fake, more: usize) {
+    let from = fake.calls().ring_ends;
+    within(Duration::from_secs(30), "the collection passes", async {
+        while fake.calls().ring_ends < from + more {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+/// How many of the events seen report `seq` from `peer`.
+fn reported(seen: &[RunnerEvent], peer: CorrespondenceLabel, seq: u64) -> usize {
+    seen.iter()
+        .filter(|event| {
+            matches!(event, RunnerEvent::Message { from, seq: at, .. } if *from == peer && *at == seq)
+        })
+        .count()
+}
+
+/// B's conversation record with A, read from B's store.
+fn conv_of(profile: &Profile, peer: &CorrespondenceLabel) -> ConvState {
+    reopen_store(profile)
+        .load_conv(peer)
+        .expect("the store reads")
+        .expect("the conversation")
+}
+
+/// ISC-C110 — a message pushed to a node whose runner is held inside a record
+/// call is recorded, reported and answered within `LIVE_WITHIN`, while the
+/// call is still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_is_taken_while_the_runner_is_held_in_a_call() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let replies = k.board.lock().unwrap().replies;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"while B is held".to_vec(),
+    })
+    .await;
+    within(
+        LIVE_WITHIN,
+        "the pushed message at B",
+        k.bw.wait_for(
+            "the pushed message at B",
+            message(b_peer, 1, b"while B is held"),
+        ),
+    )
+    .await;
+    within(
+        LIVE_WITHIN,
+        "B's answer at A",
+        k.aw.wait_for("delivery at A", delivered(k.a_peer, 1)),
+    )
+    .await;
+    assert!(k.board.lock().unwrap().replies > replies, "B answered");
+    assert_eq!(
+        conv_of(&k.b, &b_peer).my_collected,
+        2,
+        "B recorded the message while its runner was held"
+    );
+}
+
+/// ISC-C110 — a send issued while the runner is held inside a record call is
+/// pushed and answered within `LIVE_WITHIN`. Its slot is written only once
+/// the call is released, from the stored outbox bytes, and it is reported sent after
+/// that write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_while_the_runner_is_held_is_pushed_at_once_and_written_after() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let writes = k.b_fake.calls().ring_writes;
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(7),
+        peer: b_peer,
+        body: b"from a held B".to_vec(),
+    })
+    .await;
+    within(
+        LIVE_WITHIN,
+        "B's message at A",
+        k.aw.wait_for("B's message at A", message(k.a_peer, 1, b"from a held B")),
+    )
+    .await;
+    within(
+        LIVE_WITHIN,
+        "A's answer at B",
+        k.bw.wait_for("delivery at B", delivered(b_peer, 1)),
+    )
+    .await;
+    k.bw.drain();
+    assert!(
+        !k.bw.seen.iter().any(sent(7)),
+        "sent is reported only after the slot write"
+    );
+    assert_eq!(
+        k.b_fake.calls().ring_writes,
+        writes,
+        "no slot is written while the runner is held"
+    );
+    let owed = reopen_store(&k.b)
+        .load()
+        .expect("B's store loads")
+        .convs
+        .into_iter()
+        .find(|conv| conv.peer == b_peer)
+        .expect("B's conversation")
+        .outstanding_outbox;
+    let entry = owed
+        .iter()
+        .find(|entry| entry.seq == 1)
+        .expect("the message is committed and owed")
+        .clone();
+    held.release();
+    k.bw.wait_for("B's send", sent(7)).await;
+    assert_eq!(k.b_fake.calls().ring_writes, writes + 1, "one slot write");
+    let slot = (CHANNEL, k.b.outgoing_lookup_key(&k.a), channel::slot_for(1));
+    assert_eq!(
+        k.dht
+            .lock()
+            .unwrap()
+            .records
+            .get(&slot)
+            .map(|(bytes, _)| bytes.clone()),
+        Some(entry.ciphertext),
+        "the slot holds the committed outbox bytes"
+    );
+}
+
+/// ISC-C110 — a pushed message recorded while the runner's collection is
+/// reading the same sequence is reported once, and the runner's read of it is
+/// discarded rather than recorded again. A restart reports it no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_recorded_during_a_held_read_of_its_slot_is_reported_once() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"raced".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("the pushed message at B", message(b_peer, 1, b"raced"))
+        .await;
+    // A's slot is written, so the held read finds the message when released.
+    k.aw.wait_for("A's send", sent(3)).await;
+    held.release();
+    passes_after(&k.b_fake, 3).await;
+    k.bw.drain();
+    assert_eq!(
+        reported(&k.bw.seen, b_peer, 1),
+        1,
+        "the message is reported once: {:?}",
+        k.bw.seen
+    );
+    let state = conv_of(&k.b, &b_peer);
+    assert_eq!(state.my_collected, 2, "one sequence recorded");
+
+    let stop = k.bw.stop().await;
+    assert!(finished(&stop));
+    let b_fake = k.b_fake.restart();
+    attach_push(&b_fake, &k.board);
+    let mut bw = k.b.spawn(&b_fake, real_clock());
+    bw.wait_for("B's restart", is_health).await;
+    passes_after(&b_fake, 3).await;
+    bw.drain();
+    assert_eq!(
+        reported(&bw.seen, b_peer, 1),
+        0,
+        "the restart reports nothing already recorded"
+    );
+    assert_eq!(conv_of(&k.b, &b_peer).my_collected, 2);
+}
+
+/// ISC-C110 — a send committed while the runner's collection of the same
+/// conversation is inside its read loses neither update: the collection is
+/// read again, the key schedule the send advanced is kept, and the next send
+/// opens at the correspondent. A restart changes neither cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_during_a_held_collection_of_its_conversation_loses_neither_update() {
+    let (mut k, b_peer) = establish_pushed().await;
+    // A's message reaches B through the record store only.
+    k.board.lock().unwrap().down = true;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"collected".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(3)).await;
+    k.board.lock().unwrap().down = false;
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(7),
+        peer: b_peer,
+        body: b"sent meanwhile".to_vec(),
+    })
+    .await;
+    within(
+        LIVE_WITHIN,
+        "B's pushed message at A",
+        k.aw.wait_for("B's message at A", message(k.a_peer, 1, b"sent meanwhile")),
+    )
+    .await;
+    held.release();
+    k.bw.wait_for("B's send", sent(7)).await;
+    k.bw.wait_for("A's message at B", message(b_peer, 1, b"collected"))
+        .await;
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(8),
+        peer: b_peer,
+        body: b"after both".to_vec(),
+    })
+    .await;
+    within(
+        Duration::from_secs(10),
+        "B's next message at A",
+        k.aw.wait_for("B's next message at A", message(k.a_peer, 2, b"after both")),
+    )
+    .await;
+    k.bw.wait_for("B's next send", sent(8)).await;
+    let state = conv_of(&k.b, &b_peer);
+    assert_eq!(state.send_seq, 3, "both sends are counted");
+    assert_eq!(state.my_collected, 2, "the collection is recorded");
+    assert_eq!(reported(&k.bw.seen, b_peer, 1), 1);
+
+    let stop = k.bw.stop().await;
+    assert!(finished(&stop));
+    let b_fake = k.b_fake.restart();
+    attach_push(&b_fake, &k.board);
+    let mut bw = k.b.spawn(&b_fake, real_clock());
+    bw.wait_for("B's restart", is_health).await;
+    passes_after(&b_fake, 3).await;
+    bw.drain();
+    let state = conv_of(&k.b, &b_peer);
+    assert_eq!((state.send_seq, state.my_collected), (3, 2));
+    assert_eq!(
+        reported(&bw.seen, b_peer, 1),
+        0,
+        "nothing is reported twice"
+    );
+}
+
+/// ISC-C110 — a send committed while the runner is held, and stopped before
+/// its slot is written, is answered as shutting down and its slot is written
+/// by the next launch from the stored bytes, the message sealed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_stopped_before_its_write_is_written_by_the_next_launch() {
+    let (k, b_peer) = establish_pushed().await;
+    k.board.lock().unwrap().down = true;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let writes = k.b_fake.calls().ring_writes;
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(7),
+        peer: b_peer,
+        body: b"before the stop".to_vec(),
+    })
+    .await;
+    within(LIVE_WITHIN, "the commit", async {
+        while conv_of(&k.b, &b_peer).send_seq != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let committed = reopen_store(&k.b)
+        .load()
+        .expect("B's store loads")
+        .convs
+        .into_iter()
+        .find(|conv| conv.peer == b_peer)
+        .expect("B's conversation")
+        .outstanding_outbox
+        .into_iter()
+        .find(|entry| entry.seq == 1)
+        .expect("the message is committed and owed");
+    let Watch { handle, .. } = k.bw;
+    let stopping = tokio::spawn(handle.shutdown());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    held.release();
+    let stop = stopping.await.expect("the shutdown");
+    assert!(finished(&stop));
+    assert!(
+        stop.undelivered.iter().any(|event| matches!(
+            event,
+            RunnerEvent::Refused {
+                token: Some(CommandToken(7)),
+                reason: Refusal::ShuttingDown
+            }
+        )),
+        "the send is answered: {:?}",
+        stop.undelivered
+    );
+    assert_eq!(
+        k.b_fake.calls().ring_writes,
+        writes,
+        "no slot is written once stop is asked for"
+    );
+
+    let b_fake = k.b_fake.restart();
+    let mut bw = k.b.spawn(&b_fake, real_clock());
+    bw.wait_for("B's restart", is_health).await;
+    let slot = (CHANNEL, k.b.outgoing_lookup_key(&k.a), channel::slot_for(1));
+    assert_eq!(
+        k.dht
+            .lock()
+            .unwrap()
+            .records
+            .get(&slot)
+            .map(|(bytes, _)| bytes.clone()),
+        Some(committed.ciphertext),
+        "the launch wrote the committed bytes"
+    );
+    assert_eq!(conv_of(&k.b, &b_peer).send_seq, 2, "sealed once");
+    let _ = &k.aw;
+}
+
+/// ISC-C110 — a send whose commit keeps meeting a changed record is committed
+/// on a later attempt within the lane's allowance, and past it is refused and
+/// counted as a conversation failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_whose_commits_keep_conflicting_is_retried_then_refused_and_counted() {
+    let Scene {
+        a: _a,
+        b: _b,
+        a_fake,
+        mut aw,
+        a_peer,
+        ..
+    } = establish(real_clock()).await;
+    let forced = Arc::clone(&a_fake.faults().forced_conflicts);
+    forced.store(3, std::sync::atomic::Ordering::Relaxed);
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(50),
+        peer: a_peer,
+        body: b"after three conflicts".to_vec(),
+    })
+    .await;
+    within(
+        Duration::from_secs(20),
+        "the send after three conflicts",
+        aw.wait_for("the send", sent(50)),
+    )
+    .await;
+    forced.store(4, std::sync::atomic::Ordering::Relaxed);
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(51),
+        peer: a_peer,
+        body: b"after four conflicts".to_vec(),
+    })
+    .await;
+    let at = within(
+        Duration::from_secs(20),
+        "the refusal",
+        aw.wait_for("the refusal", refused(51)),
+    )
+    .await;
+    assert_eq!(refusal(&aw.seen[at]), Refusal::Flow);
+    within(
+        Duration::from_secs(20),
+        "the failure counted",
+        aw.wait_for(
+            "the failure counted",
+            |event| matches!(event, RunnerEvent::Health(h) if h.conversation_failures >= 1),
+        ),
+    )
+    .await;
+}
+
+/// ISC-C110 — sends committed at once from two threads to one conversation
+/// never share a sequence, and every one of them opens at the correspondent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_concurrent_senders_never_share_a_sequence() {
+    let Scene {
+        a,
+        b: _b,
+        a_fake,
+        aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = establish(real_clock()).await;
+    assert!(finished(&aw.stop().await));
+    let keys = a.keys();
+    let (events, _events_rx) = mpsc::channel(EVENT_QUEUE);
+    let (push, _) = push_hooks::PushState::new(None);
+    let share = live_lane::LaneShare::new(
+        Arc::new(reopen_store(&a)),
+        Arc::new(keys.signing),
+        Arc::new(keys.dm_channel_root),
+        events,
+        push.share.clone(),
+        Clock::start(),
+    );
+    let before = conv_of(&a, &a_peer).send_seq;
+    let seqs: Vec<u64> = std::thread::scope(|scope| {
+        let senders: Vec<_> = ["x", "y"]
+            .into_iter()
+            .map(|who| {
+                let share = share.clone();
+                scope.spawn(move || {
+                    (0..20)
+                        .map(|i| {
+                            share
+                                .commit_send(&a_peer, format!("{who}{i}").as_bytes())
+                                .expect("the commit")
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        senders
+            .into_iter()
+            .flat_map(|sender| sender.join().expect("the sender"))
+            .collect()
+    });
+    let distinct: HashSet<u64> = seqs.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        40,
+        "no two sends share a sequence: {seqs:?}"
+    );
+    assert_eq!(conv_of(&a, &a_peer).send_seq, before + 40);
+    drop(share);
+    // A's next launch writes the committed slots, and B reads every one.
+    let _aw = a.spawn(&a_fake.restart(), real_clock());
+    for seq in before..before + 40 {
+        within(
+            Duration::from_secs(60),
+            "each message at B",
+            bw.wait_for("a message at B", |event| {
+                matches!(event, RunnerEvent::Message { from, seq: at, .. } if *from == b_peer && *at == seq)
+            }),
+        )
+        .await;
+    }
+    let bodies: HashSet<Vec<u8>> = bw
+        .seen
+        .iter()
+        .filter_map(|event| match event {
+            RunnerEvent::Message {
+                from, seq, body, ..
+            } if *from == b_peer && *seq >= before => Some(body.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(bodies.len(), 40, "every committed message opens once");
+}
+
+/// ISC-C110 — with the runner held and its command queue full, a send is
+/// still read, committed and pushed at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_behind_a_full_runner_queue_is_pushed_at_once() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    for serial in 0..(COMMAND_QUEUE as u64 + 3) {
+        k.bw.send(RunnerCommand::Accept {
+            token: CommandToken(1_000 + serial),
+            request: ContactRequestId { epoch: 0, serial },
+            reply: b"to nobody".to_vec(),
+        })
+        .await;
+    }
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(7),
+        peer: b_peer,
+        body: b"past the queue".to_vec(),
+    })
+    .await;
+    within(
+        LIVE_WITHIN,
+        "B's message at A",
+        k.aw.wait_for("B's message at A", message(k.a_peer, 1, b"past the queue")),
+    )
+    .await;
+    held.release();
+    k.bw.wait_for("B's send", sent(7)).await;
+    k.bw.wait_for(
+        "the last refusal",
+        refused(1_000 + COMMAND_QUEUE as u64 + 2),
+    )
+    .await;
+}
+
+/// ISC-C110 — a stop asked for while the runner writes a committed send's
+/// slot answers the send and loses nothing: the slot holds the committed
+/// bytes once the next launch is up, and the message is sealed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_during_a_committed_write_answers_the_send_and_loses_nothing() {
+    let (k, b_peer) = establish_pushed().await;
+    k.board.lock().unwrap().down = true;
+    let writing = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&writing));
+    k.b_fake.faults().gate_ring_write = Some(Arc::clone(&writing));
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(7),
+        peer: b_peer,
+        body: b"written while stopping".to_vec(),
+    })
+    .await;
+    writing.reached().await;
+    let committed = reopen_store(&k.b)
+        .load()
+        .expect("B's store loads")
+        .convs
+        .into_iter()
+        .find(|conv| conv.peer == b_peer)
+        .expect("B's conversation")
+        .outstanding_outbox
+        .into_iter()
+        .find(|entry| entry.seq == 1)
+        .expect("the message is committed and owed");
+    let Watch { handle, .. } = k.bw;
+    let stopping = tokio::spawn(handle.shutdown());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    writing.release();
+    let stop = stopping.await.expect("the shutdown");
+    assert!(finished(&stop));
+    assert!(
+        stop.undelivered.iter().any(|event| matches!(
+            event,
+            RunnerEvent::Sent {
+                token: CommandToken(7),
+                ..
+            } | RunnerEvent::Refused {
+                token: Some(CommandToken(7)),
+                ..
+            }
+        )),
+        "the send is answered: {:?}",
+        stop.undelivered
+    );
+    let mut bw = k.b.spawn(&k.b_fake.restart(), real_clock());
+    bw.wait_for("B's restart", is_health).await;
+    let slot = (CHANNEL, k.b.outgoing_lookup_key(&k.a), channel::slot_for(1));
+    assert_eq!(
+        k.dht
+            .lock()
+            .unwrap()
+            .records
+            .get(&slot)
+            .map(|(bytes, _)| bytes.clone()),
+        Some(committed.ciphertext)
+    );
+    assert_eq!(conv_of(&k.b, &b_peer).send_seq, 2, "sealed once");
+    let _ = &k.aw;
+}
+
+/// ISC-C110 — a block takes effect at once while the runner is held: a push
+/// from the blocked correspondent that follows it is neither recorded nor
+/// answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_after_a_block_is_neither_recorded_nor_answered() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.bw.send(RunnerCommand::Block {
+        peer: k.a.pk.clone(),
+    })
+    .await;
+    let (calls, replies) = {
+        let board = k.board.lock().unwrap();
+        (board.calls, board.replies)
+    };
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"after the block".to_vec(),
+    })
+    .await;
+    within(LIVE_WITHIN, "A's push", async {
+        while k.board.lock().unwrap().calls == calls {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    k.bw.drain();
+    assert_eq!(k.board.lock().unwrap().replies, replies, "not answered");
+    assert_eq!(reported(&k.bw.seen, b_peer, 1), 0, "not recorded");
+}
+
+/// ISC-C110 — a delete takes effect at once while the runner is held: a send
+/// on the conversation that follows it is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_after_a_delete_is_refused() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.bw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(20),
+        peer: b_peer,
+    })
+    .await;
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(21),
+        peer: b_peer,
+        body: b"after the delete".to_vec(),
+    })
+    .await;
+    let at = within(
+        LIVE_WITHIN,
+        "the refusal",
+        k.bw.wait_for("the refusal", refused(21)),
+    )
+    .await;
+    assert_eq!(refusal(&k.bw.seen[at]), Refusal::UnknownConversation);
+    assert_eq!(conv_of(&k.b, &b_peer).send_seq, 1, "nothing committed");
+}
+
+/// ISC-C110 — sends made while a collection reads the same conversation do
+/// not stop the collection: the read held across them records its message,
+/// and the slot is not read again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sends_during_a_collection_do_not_make_it_read_again() {
+    let (mut k, b_peer) = establish_pushed().await;
+    k.board.lock().unwrap().down = true;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"read once".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(3)).await;
+    for token in [7u64, 8] {
+        k.bw.send(RunnerCommand::Send {
+            token: CommandToken(token),
+            peer: b_peer,
+            body: b"meanwhile".to_vec(),
+        })
+        .await;
+    }
+    committed(&k.b, &b_peer, 3).await;
+    held.release();
+    k.bw.wait_for("A's message at B", message(b_peer, 1, b"read once"))
+        .await;
+    passes_after(&k.b_fake, 2).await;
+    let reads = k.b_fake.faults().gated_ring_reads.clone();
+    assert_eq!(
+        reads
+            .iter()
+            .filter(|subkey| **subkey == channel::slot_for(1))
+            .count(),
+        1,
+        "the held read recorded the message: {reads:?}"
+    );
+    assert_eq!(conv_of(&k.b, &b_peer).my_collected, 2);
 }

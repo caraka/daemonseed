@@ -1,15 +1,29 @@
 //! The direct-messaging runner: the long-running task that drives one
 //! identity's conversations over a record store.
 //!
-//! Serves FC1, FC2 and FC4.
+//! Serves FC1, FC2, FC4 and FC7.
 //!
 //! [`spawn_runner`] starts one task on the caller's multi-thread tokio runtime.
 //! The task owns one record store and one [`Store`], opened at
 //! `<profile_root>/dm-store`, and calls [`daemonseed_core::dm::flows`] directly,
 //! one call at a time. A front end reaches it only through [`RunnerHandle`]:
 //! [`RunnerCommand`]s go in on a bounded queue, [`RunnerEvent`]s come out on
-//! another, and a command is served between flow calls, never during one. A
-//! drop scan, a collection pass, a run of previews and a repair serve the
+//! another.
+//!
+//! Once the store is open the task starts a second one, the live lane, which
+//! shares the store and is the only reader of the command queue. The lane
+//! serves [`RunnerCommand::Send`] at once, committing the message and pushing
+//! it, and takes pushes addressed to this node, so neither waits for a network
+//! call the task is inside; the task then writes the send's slot from the
+//! stored outbox bytes and reports it sent. Every other command, and every
+//! route death, passes to the task in the order it arrived, and a command is
+//! served between flow calls, never during one. A collection applies what it
+//! read to the conversation record as it stands at its commit, and other flows
+//! that read a record before their network calls commit only where it is
+//! unchanged since, so what the lane commits meanwhile is never overwritten.
+//! The module `live_lane` gives the detail.
+//!
+//! A drop scan, a collection pass, a run of previews and a repair serve the
 //! commands queued meanwhile between their network calls — between drop
 //! slots, conversations, previews and repair steps — and then carry on where
 //! they stopped. A command served that way may accept, block or delete what
@@ -137,7 +151,9 @@
 //! while it finishes the flow call in progress, and waits at most
 //! [`RunnerConfig::grace`]. It returns every event not yet read and answers
 //! every command still queued. Once stop is asked for, the task starts no flow
-//! call that writes.
+//! call that writes, and a send the live lane committed whose slot is not yet
+//! written is answered [`Refusal::ShuttingDown`]; its slot is written from the
+//! stored bytes by the next startup.
 //!
 //! A flow call still running when the grace period ends is not interrupted.
 //! It may still save a collection cursor or an acceptance to the store, and
@@ -325,6 +341,13 @@ pub trait RunnerRecords: Records {
     /// answers `None`, and the runner delivers through the store alone.
     fn take_push(&mut self) -> Option<crate::dm::push::PushParts> {
         None
+    }
+
+    /// How many send commits the live lane refuses as conflicting before it
+    /// attempts one, shared with the test that sets it.
+    #[cfg(test)]
+    fn forced_conflicts(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::default()
     }
 }
 
@@ -724,6 +747,17 @@ pub struct HealthCounters {
     pub pushes_expired: u64,
 }
 
+impl HealthCounters {
+    /// Add the counters the live lane moves: pushes dropped and expired, and
+    /// the store and conversation failures taking them met.
+    fn absorb_lane(&mut self, lane: &HealthCounters) {
+        self.pushes_dropped += lane.pushes_dropped;
+        self.pushes_expired += lane.pushes_expired;
+        self.store_failures += lane.store_failures;
+        self.conversation_failures += lane.conversation_failures;
+    }
+}
+
 /// What a runner reports.
 pub enum RunnerEvent {
     /// Every conversation, at startup and whenever the set or a state changes.
@@ -857,6 +891,8 @@ pub enum RunnerError {
     Store(StoreError),
     /// The advert keys would not mint.
     Advert(AdvertError),
+    /// The live lane's task panicked.
+    Lane,
 }
 
 impl core::fmt::Display for RunnerError {
@@ -864,6 +900,7 @@ impl core::fmt::Display for RunnerError {
         match self {
             Self::Store(e) => write!(f, "direct-message store: {e}"),
             Self::Advert(e) => write!(f, "advert keys: {e}"),
+            Self::Lane => f.write_str("the direct-message live lane stopped abnormally"),
         }
     }
 }
@@ -1102,8 +1139,8 @@ where
 enum Wake {
     /// A command arrived, or the queue closed.
     Command(Option<RunnerCommand>),
-    /// The push transport handed the runner something.
-    Push(crate::dm::push::PushInbound),
+    /// The live lane handed the runner something.
+    Lane(live_lane::LaneNote),
     /// Something on the schedule is due.
     Due,
 }
@@ -1149,14 +1186,11 @@ async fn run<R: RunnerRecords>(
             break Ok(());
         }
         let due = runner.next_due();
-        let wake = {
-            let mut queue = commands.lock().await;
-            tokio::select! {
-                biased;
-                command = queue.recv() => Wake::Command(command),
-                Some(push) = runner.push.next() => Wake::Push(push),
-                () = tokio::time::sleep_until(due) => Wake::Due,
-            }
+        let wake = tokio::select! {
+            biased;
+            Some(note) = runner.lane_notes.recv() => Wake::Lane(note),
+            command = runner.commands.recv() => Wake::Command(command),
+            () = tokio::time::sleep_until(due) => Wake::Due,
         };
         let step = match wake {
             Wake::Command(None | Some(RunnerCommand::Shutdown)) => Err(Halt::Stopped),
@@ -1164,7 +1198,7 @@ async fn run<R: RunnerRecords>(
                 Ok(()) => runner.report_health().await,
                 halted => halted,
             },
-            Wake::Push(push) => match runner.serve_push(push).await {
+            Wake::Lane(note) => match runner.serve_lane_note(note).await {
                 Ok(()) => runner.report_health().await,
                 halted => halted,
             },
@@ -1179,9 +1213,16 @@ async fn run<R: RunnerRecords>(
     // A counter the last command or pass moved is reported before the queue is
     // answered, however the loop ended. A closed event stream has no reader to
     // report to.
+    // The lane is stopped and waited for first, so no send commits after the
+    // notes are drained, and every command it still holds is answered.
+    runner.stop.store(true, Ordering::Relaxed);
+    let lane = runner.end_lane().await;
     let _ = runner.report_health().await;
-    runner.refuse_queued(&commands).await;
-    result
+    runner.refuse_queued().await;
+    match (result, lane) {
+        (Ok(()), Err(e)) => Err(e),
+        (result, _) => result,
+    }
 }
 
 /// Close the queue of a runner whose startup failed. Its handle sees every
@@ -1263,6 +1304,7 @@ struct Repair {
 }
 
 /// Wall-clock time that advances with [`tokio::time`].
+#[derive(Clone, Copy)]
 struct Clock {
     wall_ms: u64,
     started: Instant,
@@ -1657,6 +1699,15 @@ impl From<DmStoreError> for BlockListFailure {
 /// Decode a stored block list. Every decode error is [`BlockListFailure::Store`],
 /// a record holding more identities than the maximum included: no write here
 /// stores such a record, so it is corruption and not a full list.
+/// The block list as `store` holds it now, or `None` where the record is absent
+/// or would not read or decode.
+fn read_block_list(store: &Store) -> Option<BlockList> {
+    match store.records().read_profile_unlocked(RecordKind::BlockList) {
+        Ok(Some(bytes)) => decode_stored_block_list(&bytes).ok(),
+        Ok(None) | Err(_) => None,
+    }
+}
+
 fn decode_stored_block_list(bytes: &[u8]) -> Result<BlockList, BlockListFailure> {
     BlockList::decode(bytes).map_err(|_| BlockListFailure::Store)
 }
@@ -1958,9 +2009,9 @@ fn current_control(store: &Store, state: &ConvState) -> Option<Vec<u8>> {
 /// The runner's state between flow calls.
 struct Runner<R> {
     records: Tracked<R>,
-    store: Store,
+    store: Arc<Store>,
     signer: Arc<SignKeypair>,
-    channel_root: DmChannelRootSecret,
+    channel_root: Arc<DmChannelRootSecret>,
     advert_keys: AdvertKeys,
     config: RunnerConfig,
     events: mpsc::Sender<RunnerEvent>,
@@ -1999,8 +2050,18 @@ struct Runner<R> {
     /// scan, whatever its read finds, and by a block or unblock the store
     /// accepts.
     block_list_failure_counted: bool,
-    /// The command queue, read between the network calls of a long pass.
-    commands: CommandQueue,
+    /// The commands the live lane hands on, read between the network calls of
+    /// a long pass.
+    commands: mpsc::Receiver<RunnerCommand>,
+    /// What the live lane shares with the runner.
+    lane: live_lane::LaneShare,
+    /// What the live lane hands the runner besides commands.
+    lane_notes: mpsc::UnboundedReceiver<live_lane::LaneNote>,
+    /// Sends whose first slot write failed, by conversation and sequence, each
+    /// answered once the repair has the slot on the network.
+    unwritten: HashMap<(CorrespondenceLabel, u64), CommandToken>,
+    /// The live lane's task, and what ends it when dropped.
+    lane_task: Option<(tokio::sync::oneshot::Sender<()>, JoinHandle<()>)>,
     /// Whether startup has finished, before which no command is served.
     started: bool,
     /// Whether a command is being served, during which no queued command is.
@@ -2031,10 +2092,46 @@ impl<R: RunnerRecords> Runner<R> {
             profile_root,
             config,
         } = parts;
-        let push = push_hooks::PushState::new(records.take_push());
+        let (push, inbound) = push_hooks::PushState::new(records.take_push());
         let clock = Clock::start();
-        let store = Store::open(profile_root.join(STORE_DIR), &at_rest_key)?;
+        let store = Arc::new(Store::open(profile_root.join(STORE_DIR), &at_rest_key)?);
         drop(at_rest_key);
+        // Before the live lane starts: once it runs, an outbox with no
+        // conversation record beside it may be one a first contact or an
+        // accept is still creating the record for.
+        let swept = store.sweep_orphaned_outboxes()?;
+        if swept > 0 {
+            crate::vtrace!(
+                "dm runner: {swept} outbox(es) with no conversation record swept at startup"
+            );
+        }
+        let channel_root = Arc::new(channel_root);
+
+        let lane = live_lane::LaneShare::new(
+            Arc::clone(&store),
+            Arc::clone(&signer),
+            Arc::clone(&channel_root),
+            events.clone(),
+            push.share.clone(),
+            clock,
+        );
+        #[cfg(test)]
+        let lane = lane.with_forced_conflicts(records.forced_conflicts());
+        let (to_runner, runner_commands) = mpsc::channel(COMMAND_QUEUE);
+        let (notes, lane_notes) = mpsc::unbounded_channel();
+        let (lane_end, runner_gone) = tokio::sync::oneshot::channel();
+        let lane_task = tokio::spawn(
+            live_lane::Lane {
+                share: lane.clone(),
+                inbound,
+                commands,
+                to_runner,
+                notes,
+                stop: Arc::clone(&stop),
+                runner_gone,
+            }
+            .run(),
+        );
 
         let loaded = store.load()?;
         events
@@ -2091,7 +2188,11 @@ impl<R: RunnerRecords> Runner<R> {
             health_reported: HealthCounters::default(),
             block_list_known: true,
             block_list_failure_counted: false,
-            commands,
+            commands: runner_commands,
+            lane,
+            lane_notes,
+            unwritten: HashMap::new(),
+            lane_task: Some((lane_end, lane_task)),
             started: false,
             serving: false,
             served_mid_scan: false,
@@ -2099,6 +2200,21 @@ impl<R: RunnerRecords> Runner<R> {
             push,
         };
 
+        // A startup that stops part way ends the live lane before it returns,
+        // so the commands the lane holds are answered while the task is still
+        // running.
+        if let Err(halt) = runner.startup(&loaded.convs, minted).await {
+            runner.stop.store(true, Ordering::Relaxed);
+            let _ = runner.end_lane().await;
+            return Err(halt);
+        }
+        runner.started = true;
+        Ok(runner)
+    }
+
+    /// Startup after the store has loaded, in the order the module docs give.
+    async fn startup(&mut self, convs: &[LoadedConv], minted: bool) -> Result<(), Halt> {
+        let runner = self;
         match runner.stored_block_list() {
             Some(list) => runner.emit_blocked(&list).await?,
             None => {
@@ -2107,7 +2223,7 @@ impl<R: RunnerRecords> Runner<R> {
                 runner.emit(RunnerEvent::BlockListUnreadable).await?;
             }
         }
-        runner.reopen_channels(&loaded.convs)?;
+        runner.reopen_channels(convs)?;
         runner.start_push().await?;
         runner.resume_deletes().await?;
         runner.refresh_advert(minted);
@@ -2131,9 +2247,7 @@ impl<R: RunnerRecords> Runner<R> {
             .min(Instant::now() + runner.collection_interval());
         let health = runner.records.health;
         runner.health_reported = health;
-        runner.emit(RunnerEvent::Health(health)).await?;
-        runner.started = true;
-        Ok(runner)
+        runner.emit(RunnerEvent::Health(health)).await
     }
 
     /// Serve every command already queued, between two network calls of a
@@ -2146,15 +2260,20 @@ impl<R: RunnerRecords> Runner<R> {
         if !self.started || self.serving {
             return Ok(());
         }
-        self.serve_queued_pushes().await?;
         loop {
             self.check_stop()?;
-            let command = match self.commands.try_lock() {
-                Ok(mut queue) => match queue.try_recv() {
-                    Ok(command) => command,
-                    Err(_) => return Ok(()),
-                },
-                Err(_) => return Ok(()),
+            let Ok(note) = self.lane_notes.try_recv() else {
+                break;
+            };
+            self.serving = true;
+            let served = self.serve_lane_note(note).await;
+            self.serving = false;
+            served?;
+        }
+        loop {
+            self.check_stop()?;
+            let Ok(command) = self.commands.try_recv() else {
+                return Ok(());
             };
             if matches!(command, RunnerCommand::Shutdown) {
                 return Err(Halt::Stopped);
@@ -2191,15 +2310,33 @@ impl<R: RunnerRecords> Runner<R> {
         self.emit(RunnerEvent::Refused { token, reason }).await
     }
 
-    /// Answer every command still queued with [`Refusal::ShuttingDown`].
-    async fn refuse_queued(&mut self, commands: &CommandQueue) {
-        let tokens: Vec<CommandToken> = {
-            let mut queue = commands.lock().await;
-            queue.close();
-            std::iter::from_fn(|| queue.try_recv().ok())
-                .filter_map(|command| command.token())
-                .collect()
+    /// End the live lane and wait for it, so every command it still holds is
+    /// answered before the task ends. A lane that panicked is
+    /// [`RunnerError::Lane`].
+    async fn end_lane(&mut self) -> Result<(), RunnerError> {
+        let Some((end, task)) = self.lane_task.take() else {
+            return Ok(());
         };
+        drop(end);
+        task.await.map_err(|e| {
+            crate::vtrace!("dm runner: the live lane ended abnormally ({e})");
+            RunnerError::Lane
+        })
+    }
+
+    /// Answer every command still queued with [`Refusal::ShuttingDown`], and
+    /// every send the live lane committed whose slot is not yet written.
+    async fn refuse_queued(&mut self) {
+        self.commands.close();
+        let mut tokens: Vec<CommandToken> = std::iter::from_fn(|| self.commands.try_recv().ok())
+            .filter_map(|command| command.token())
+            .collect();
+        while let Ok(note) = self.lane_notes.try_recv() {
+            if let live_lane::LaneNote::Committed { token, .. } = note {
+                tokens.push(token);
+            }
+        }
+        tokens.extend(std::mem::take(&mut self.unwritten).into_values());
         for token in tokens {
             if self
                 .refuse(Some(token), Refusal::ShuttingDown)
@@ -2256,14 +2393,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// absent or would not read or decode. Neither counts nor reports: the drop
     /// scan does both.
     fn readable_block_list(&self) -> Option<BlockList> {
-        match self
-            .store
-            .records()
-            .read_profile_unlocked(RecordKind::BlockList)
-        {
-            Ok(Some(bytes)) => decode_stored_block_list(&bytes).ok(),
-            Ok(None) | Err(_) => None,
-        }
+        read_block_list(&self.store)
     }
 
     async fn emit_roster(&mut self) -> Result<(), Halt> {
@@ -2878,21 +3008,24 @@ impl<R: RunnerRecords> Runner<R> {
     /// subkey, resealed from the conversation record, and every outstanding
     /// message slot, from the outbox. Nothing is looked at for a conversation
     /// whose delete is under way.
-    fn rewrite_evicted(&mut self, state: &ConvState, entries: &[OutboxEntry]) {
+    /// Returns the sequences of `entries` whose slot the network holds once
+    /// the repair is done: found there, or written.
+    fn rewrite_evicted(&mut self, state: &ConvState, entries: &[OutboxEntry]) -> Vec<u64> {
         let _step = Step::start(String::from("channel repair"));
+        let mut held = Vec::new();
         let lookup_key = state.outgoing_lookup_key;
         if state.delete_pending || lookup_key == NO_LOOKUP_KEY {
-            return;
+            return held;
         }
         let has_control = state.own_control_key.is_some() && state.own_opening.is_some();
         if entries.is_empty() && !has_control {
-            return;
+            return held;
         }
         let Ok(reports) = self.records.inspect_channel(&lookup_key) else {
-            return;
+            return held;
         };
         if self.dropped_but_unanswered(&reports) {
-            return;
+            return held;
         }
         if has_control
             && !self.stopping()
@@ -2909,14 +3042,120 @@ impl<R: RunnerRecords> Runner<R> {
         }
         for entry in entries {
             if self.stopping() {
-                return;
+                return held;
             }
             let subkey = channel::slot_for(entry.seq);
-            if behind(report_at(&reports, usize::from(subkey))) {
-                let _ = self
-                    .records
-                    .write_channel(&lookup_key, subkey, &entry.ciphertext);
+            let report = report_at(&reports, usize::from(subkey));
+            if !behind(report) {
+                if report.network_seq.is_some() {
+                    held.push(entry.seq);
+                }
+            } else if self.rewrite_slot(&lookup_key, entry).is_ok() {
+                held.push(entry.seq);
             }
+        }
+        held
+    }
+
+    /// Answer [`RunnerEvent::Sent`] for each send to `peer` whose first slot
+    /// write failed, where its slot is now among `held` or the correspondent
+    /// has collected it (`outstanding` no longer lists it).
+    async fn settle_unwritten(
+        &mut self,
+        peer: CorrespondenceLabel,
+        held: &[u64],
+        outstanding: &[OutboxEntry],
+    ) -> Result<(), Halt> {
+        let settled: Vec<(u64, CommandToken)> = self
+            .unwritten
+            .iter()
+            .filter(|((at, seq), _)| {
+                *at == peer
+                    && (held.contains(seq) || !outstanding.iter().any(|entry| entry.seq == *seq))
+            })
+            .map(|((_, seq), token)| (*seq, *token))
+            .collect();
+        for (seq, token) in settled {
+            self.unwritten.remove(&(peer, seq));
+            self.emit(RunnerEvent::Sent { token, peer, seq }).await?;
+        }
+        Ok(())
+    }
+
+    /// Write a committed message's slot from its outbox entry, byte for byte.
+    fn rewrite_slot(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        entry: &OutboxEntry,
+    ) -> Result<(), RecordError> {
+        self.records
+            .write_channel(lookup_key, channel::slot_for(entry.seq), &entry.ciphertext)
+    }
+
+    /// Write the slot of the message `seq` a send committed to `peer`, from
+    /// its outbox entry, and answer `token`: [`RunnerEvent::Sent`] once the
+    /// write completes, or where the correspondent has already collected the
+    /// message and its entry is gone.
+    async fn write_committed(
+        &mut self,
+        token: CommandToken,
+        peer: CorrespondenceLabel,
+        seq: u64,
+    ) -> Result<(), Halt> {
+        let conv = match self.load_one(&peer) {
+            Ok(Some(conv)) if !conv.state.delete_pending => conv,
+            Ok(_) => return self.refuse(Some(token), Refusal::UnknownConversation).await,
+            Err(()) => return self.refuse(Some(token), Refusal::Store).await,
+        };
+        self.ensure_repair(peer);
+        let entry = conv
+            .outstanding_outbox
+            .iter()
+            .find(|entry| entry.seq == seq);
+        if let Some(entry) = entry {
+            let _step = Step::start(format!("slot write of {}", tag(&peer)));
+            if let Err(e) = self.rewrite_slot(&conv.state.outgoing_lookup_key, entry) {
+                // The message is committed: the repair writes the slot and
+                // answers the send then. Until that answer a front end shows it
+                // pending, as it does before any send is answered.
+                crate::vtrace!(
+                    "dm runner: slot write on {} failed, seq {seq}, left to the repair ({e})",
+                    tag(&peer)
+                );
+                self.unwritten.insert((peer, seq), token);
+                return Ok(());
+            }
+        }
+        crate::vtrace!("dm runner: send on {} done, seq {seq}", tag(&peer));
+        self.emit(RunnerEvent::Sent { token, peer, seq }).await
+    }
+
+    /// Serve one thing the live lane handed on.
+    async fn serve_lane_note(&mut self, note: live_lane::LaneNote) -> Result<(), Halt> {
+        match note {
+            live_lane::LaneNote::Committed { token, peer, seq } => {
+                if self.stopping() {
+                    return self.refuse(Some(token), Refusal::ShuttingDown).await;
+                }
+                self.write_committed(token, peer, seq).await
+            }
+            live_lane::LaneNote::Accepted {
+                peer,
+                reach,
+                unopened,
+            } => {
+                if let Some(unopened) = &unopened {
+                    self.note_unopened(&peer, unopened);
+                }
+                self.note_reach(&peer, &reach);
+                self.report_delivery(&peer).await
+            }
+            live_lane::LaneNote::RoutesDied(dead) => self.routes_died(&dead).await,
+            live_lane::LaneNote::Blocked {
+                identity,
+                block,
+                updated,
+            } => self.block_applied(&identity, block, updated).await,
         }
     }
 
@@ -3054,28 +3293,17 @@ impl<R: RunnerRecords> Runner<R> {
         body: &[u8],
     ) -> Result<(), Halt> {
         crate::vtrace!("dm runner: send on {} starts", tag(&peer));
-        let pusher = self.push.pusher_for(&self.store, &peer, &self.events);
-        let sent = flows::send_message(
-            &self.store,
-            &mut crate::dm::push::Pushing::new(&mut self.records, pusher, Some(peer)),
-            &peer,
-            body,
-            os_fill,
-            self.clock.now_secs(),
-        );
-        match &sent {
-            Ok(seq) => crate::vtrace!("dm runner: send on {} done, seq {seq}", tag(&peer)),
-            Err(e) => crate::vtrace!(
+        let sent = self.lane.commit_send(&peer, body);
+        self.lane.routed_done(&peer);
+        if let Err(e) = &sent {
+            crate::vtrace!(
                 "dm runner: send on {} refused, {:?}",
                 tag(&peer),
                 refusal_for(e)
-            ),
+            );
         }
         match sent {
-            Ok(seq) => {
-                self.ensure_repair(peer);
-                self.emit(RunnerEvent::Sent { token, peer, seq }).await
-            }
+            Ok(seq) => self.write_committed(token, peer, seq).await,
             Err(FlowError::AwaitingAcceptance) if matches!(self.store.load_conv(&peer), Ok(Some(state)) if state.acceptance_pending) => {
                 self.refuse(Some(token), Refusal::AcceptanceUnfinished)
                     .await
@@ -3252,6 +3480,18 @@ impl<R: RunnerRecords> Runner<R> {
                 list.unblock(identity);
             }
         });
+        self.block_applied(identity, block, updated).await
+    }
+
+    /// What follows a block or unblock the store answered `updated`: held
+    /// requests from a blocked identity dropped, and the list reported, or the
+    /// refusal.
+    async fn block_applied(
+        &mut self,
+        identity: &[u8; IDENTITY_PK_LEN],
+        block: bool,
+        updated: Result<BlockList, BlockListFailure>,
+    ) -> Result<(), Halt> {
         crate::vtrace!(
             "dm runner: {} {}",
             if block { "block" } else { "unblock" },
@@ -3543,8 +3783,10 @@ impl<R: RunnerRecords> Runner<R> {
         self.serve_queued().await?;
         match self.load_one(peer) {
             Ok(Some(conv)) => {
-                self.rewrite_evicted(&conv.state, &conv.outstanding_outbox);
+                let held = self.rewrite_evicted(&conv.state, &conv.outstanding_outbox);
                 self.reschedule(&conv);
+                self.settle_unwritten(*peer, &held, &conv.outstanding_outbox)
+                    .await?;
             }
             Ok(None) => {
                 self.repairs.remove(peer);
@@ -3671,6 +3913,16 @@ impl<R: RunnerRecords> Runner<R> {
                 Ok(flows::RingStep::End) => break,
                 Ok(flows::RingStep::Unopened(unopened)) => {
                     self.note_unopened(&peer, &unopened);
+                    break;
+                }
+                // The live lane recorded this sequence, or sent, while the slot
+                // was read: the read is discarded and the next pass carries on
+                // from the recorded cursor.
+                Err(FlowError::Conflict) => {
+                    crate::vtrace!(
+                        "dm runner: collection of {} yields to a record made meanwhile",
+                        tag(&peer)
+                    );
                     break;
                 }
                 Err(e) => {
@@ -3802,6 +4054,11 @@ impl<R: RunnerRecords> Runner<R> {
                     error: FlowError::DeletePending,
                     ..
                 } => {}
+                // Recognised by the live lane from a push while this scan read.
+                Surfaced::Failed {
+                    error: FlowError::Conflict,
+                    ..
+                } => {}
                 Surfaced::Failed { .. } => self.records.health.hellos_unsettled += 1,
                 Surfaced::Accepted(acceptance) => accepted.push(acceptance),
                 // A command served during the scan may have accepted or
@@ -3861,8 +4118,11 @@ impl<R: RunnerRecords> Runner<R> {
             if let Some(unopened) = &acceptance.unopened {
                 self.note_unopened(&peer, unopened);
             }
-            // A delete served during the scan may have removed it since.
-            if self.served_mid_scan && matches!(self.store.load_conv(&peer), Ok(None)) {
+            // A delete served during the scan may have removed it since, and
+            // one the live lane took may have marked it.
+            if matches!(self.store.load_conv(&peer), Ok(None))
+                || matches!(self.store.load_conv(&peer), Ok(Some(state)) if state.delete_pending)
+            {
                 continue;
             }
             self.note_reach(&peer, &acceptance.peer_reach);
@@ -3939,6 +4199,7 @@ impl<R: RunnerRecords> Runner<R> {
     }
 }
 
+mod live_lane;
 mod push_hooks;
 
 #[cfg(test)]
