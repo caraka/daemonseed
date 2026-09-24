@@ -154,6 +154,9 @@ struct Calls {
     network_reads: usize,
     /// Advert reads.
     advert_reads: usize,
+    /// Ring slot reads that found the slot empty, which is where a ring read
+    /// ends: one per established conversation per collection pass.
+    ring_ends: usize,
     /// How many of `network_reads` had been made at the first write since the
     /// field was last cleared.
     reads_at_first_write: Option<usize>,
@@ -253,6 +256,12 @@ struct Faults {
     gate_inspect_channel: Option<Arc<Gate>>,
     /// Hold the reads of one slot of one drop at this gate.
     gate_drop_slot: Option<([u8; 32], u16, Arc<Gate>)>,
+    /// Hold the scans of one drop at this gate, at their read of slot 0, once
+    /// this many scans of it have passed.
+    gate_drop_scan: Option<([u8; 32], usize, Arc<Gate>)>,
+    /// Hold every ring slot read that finds the slot empty at this gate, after
+    /// the read and before it returns.
+    gate_empty_ring_read: Option<Arc<Gate>>,
     /// Where set, every drop slot read and ring slot write, in order.
     trail: Option<Vec<Trail>>,
     /// Erase a channel from this node only and leave the network's copies, as
@@ -470,6 +479,23 @@ impl Records for Fake {
         if let Some(gate) = slot_gate {
             tokio::task::block_in_place(|| gate.hold());
         }
+        let scan_gate = {
+            let mut faults = self.faults();
+            match faults.gate_drop_scan.as_mut() {
+                Some((name, skip, gate)) if name == owner.as_bytes() && slot == 0 => {
+                    if *skip == 0 {
+                        Some(Arc::clone(gate))
+                    } else {
+                        *skip -= 1;
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(gate) = scan_gate {
+            tokio::task::block_in_place(|| gate.hold());
+        }
         if let Some(trail) = self.faults().trail.as_mut() {
             trail.push(Trail::OwnDrop(slot));
         }
@@ -576,7 +602,15 @@ impl Records for Fake {
             trail.push(Trail::ChannelRead(lookup_key[0]));
         }
         self.inject(CHANNEL, Op::Read)?;
-        Ok(self.read((CHANNEL, *lookup_key, subkey)))
+        let read = self.read((CHANNEL, *lookup_key, subkey));
+        if subkey != channel::CONTROL_SUBKEY && read.is_none() {
+            self.count(|calls| calls.ring_ends += 1);
+            let gate = self.faults().gate_empty_ring_read.clone();
+            if let Some(gate) = gate {
+                tokio::task::block_in_place(|| gate.hold());
+            }
+        }
+        Ok(read)
     }
 
     fn write_channel(
@@ -1279,9 +1313,13 @@ async fn a_failed_preview_is_counted_and_the_accept_reads_the_network() {
     )
     .await;
     let adverts = b_fake.calls().advert_reads;
-    tokio::time::sleep(Duration::from_secs(5 * 60)).await;
+    let scans = b_fake.calls().drop_passes;
+    tokio::time::sleep(DEFAULT_TICK * DROP_SCAN_TICKS * 3).await;
     bw.drain();
-    assert!(b_fake.calls().drop_passes > 2, "control: B kept scanning");
+    assert!(
+        b_fake.calls().drop_passes >= scans + 2,
+        "control: B kept scanning"
+    );
     assert_eq!(
         b_fake.calls().advert_reads,
         adverts,
@@ -1420,11 +1458,338 @@ async fn a_message_after_the_preview_reaches_the_thread_after_the_first() {
     assert!(finished(&bw.stop().await));
 }
 
+/// A pass reads the established conversations before it scans the drop: with
+/// the scan due on every pass, because a first contact awaits acceptance, and
+/// the scan held at its first read, a message already written to an
+/// established conversation is reported while the scan is still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_collects_its_conversations_before_a_slow_drop_scan() {
+    let config = RunnerConfig {
+        tick: Duration::from_millis(200),
+        grace: Duration::from_secs(5),
+    };
+    let Scene {
+        dht,
+        a,
+        b: _b,
+        a_fake,
+        aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = establish(config).await;
+    let c = Profile::new();
+    let mut cw = c.spawn(&Fake::on(&dht), config);
+    cw.wait_for("C's startup", is_health).await;
+    assert!(finished(&cw.stop().await), "C is away from here on");
+    let mut aw = aw;
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(50),
+        peer_identity_pk: c.pk.clone(),
+        body: b"to C".to_vec(),
+    })
+    .await;
+    aw.wait_for("A's first contact to C", sent(50)).await;
+    assert!(finished(&aw.stop().await));
+
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(51),
+        peer: b_peer,
+        body: b"while A was away".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's send", sent(51)).await;
+
+    // The relaunch scans once at startup; every scan after that is held.
+    let a_fake = a_fake.restart();
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    a_fake.faults().gate_drop_scan = Some((a.drop_name(), 1, Arc::clone(&held)));
+    let mut aw = a.spawn(&a_fake, config);
+    aw.wait_for("A's startup", is_health).await;
+    aw.wait_for("B's message at A", message(a_peer, 1, b"while A was away"))
+        .await;
+    held.reached().await;
+    assert!(
+        a_fake.faults().gate_drop_scan.is_some(),
+        "the scan is held after the message was reported"
+    );
+    held.release();
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+}
+
+/// With nothing awaiting acceptance, the drop is scanned on its own interval,
+/// [`DROP_SCAN_TICKS`] collection intervals, while every interval collects the
+/// established conversations.
+#[tokio::test(start_paused = true)]
+async fn the_drop_is_scanned_less_often_than_conversations_are_collected() {
+    let Scene {
+        a: _a,
+        b: _b,
+        a_fake,
+        aw,
+        mut bw,
+        b_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    bw.wait_for("delivery of B's reply", delivered(b_peer, 0))
+        .await;
+    tokio::time::sleep(WAITING_WINDOW).await;
+    let (collections, scans) = collections_in(&a_fake, DEFAULT_TICK * 20).await;
+    assert!(
+        (17..=25).contains(&collections),
+        "twenty ticks are seventeen to twenty-five collections, took {collections}"
+    );
+    assert!(
+        (2..=6).contains(&scans),
+        "twenty ticks are two to six drop scans, took {scans}"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+}
+
+/// A message is reported as soon as its slot has opened, while the read of the
+/// empty slot after it is still held, and only once it is recorded: a relaunch
+/// after a stop inside that read neither reports it again nor loses the next.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_is_reported_before_the_ring_read_ends_and_once_across_a_restart() {
+    let config = RunnerConfig {
+        tick: Duration::from_millis(50),
+        grace: Duration::from_millis(300),
+    };
+    let Scene {
+        a,
+        b: _b,
+        a_fake,
+        aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = establish(config).await;
+    assert!(finished(&aw.stop().await));
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(60),
+        peer: b_peer,
+        body: b"first".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's first send", sent(60)).await;
+
+    let a_fake = a_fake.restart();
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    a_fake.faults().gate_empty_ring_read = Some(Arc::clone(&held));
+    let mut aw = a.spawn(&a_fake, config);
+    aw.wait_for("the first message at A", message(a_peer, 1, b"first"))
+        .await;
+    held.reached().await;
+    assert!(
+        !held.state.lock().expect("the gate lock").1,
+        "the message was reported while the read after it was held"
+    );
+
+    let Watch { handle, .. } = aw;
+    let stop = tokio::time::timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown returned while the read was held");
+    let end = match stop.outcome {
+        ShutdownOutcome::TimedOut(end) => end,
+        other => panic!("expected TimedOut, got {other:?}"),
+    };
+    a_fake.faults().gate_empty_ring_read = None;
+    held.release();
+    let late = tokio::time::timeout(Duration::from_secs(30), end.finish())
+        .await
+        .expect("the task ended once its read returned");
+    assert!(
+        messages_from(&late.undelivered, a_peer).is_empty(),
+        "a message came back twice: {:?}",
+        late.undelivered
+    );
+
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(61),
+        peer: b_peer,
+        body: b"second".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's second send", sent(61)).await;
+    let a_fake = a_fake.restart();
+    let mut aw = a.spawn(&a_fake, config);
+    aw.wait_for("the second message at A", message(a_peer, 2, b"second"))
+        .await;
+    bw.wait_for("delivery of both at B", delivered(b_peer, 2))
+        .await;
+    // Past the delivery report: every collection that could report again has
+    // run.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    aw.drain();
+    assert_eq!(
+        messages_from(&aw.seen, a_peer),
+        vec![2],
+        "the relaunch reported a recorded message again, or lost one"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+}
+
+/// The pass whose scan surfaces a request previews it before the pass ends,
+/// without the schedule's next wake.
+#[tokio::test(start_paused = true)]
+async fn the_pass_whose_scan_surfaces_a_request_previews_it() {
+    let Scene {
+        dht,
+        a,
+        b: _b,
+        a_fake,
+        aw,
+        bw,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&aw.stop().await));
+    let keys = a.keys();
+    let (_command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+    let commands: CommandQueue = Arc::new(tokio::sync::Mutex::new(command_rx));
+    let (event_tx, mut events) = mpsc::channel(EVENT_QUEUE);
+    let started = Runner::start(
+        RunnerParts {
+            records: a_fake.restart(),
+            signer: Arc::new(keys.signing),
+            channel_root: keys.dm_channel_root,
+            at_rest_key: Zeroizing::new([0x42; AEAD_KEY_LEN]),
+            profile_root: a.root.path().to_path_buf(),
+            config: RunnerConfig::default(),
+        },
+        commands,
+        event_tx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    let Ok(mut runner) = started else {
+        panic!("A's runner did not start");
+    };
+
+    let c = Profile::new();
+    let mut cw = c.spawn(&Fake::on(&dht), RunnerConfig::default());
+    cw.wait_for("C's startup", is_health).await;
+    cw.send(RunnerCommand::FirstContact {
+        token: CommandToken(80),
+        peer_identity_pk: a.pk.clone(),
+        body: b"from C".to_vec(),
+    })
+    .await;
+    cw.wait_for("C's first contact", sent(80)).await;
+    assert!(finished(&cw.stop().await));
+
+    runner.next_drop_scan = Instant::now();
+    assert!(runner.collect_tick().await.is_ok(), "the pass ran");
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(event);
+    }
+    let surfaced = seen
+        .iter()
+        .position(request_from(&c.pk))
+        .expect("the pass surfaced C's request");
+    assert!(
+        seen[surfaced..]
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::RequestPreview { .. })),
+        "the pass ended without previewing the request: {seen:?}"
+    );
+    drop(runner);
+    assert!(finished(&bw.stop().await));
+}
+
+/// A request is previewed directly after the scan that surfaced it, before the
+/// next read of an established conversation.
+#[tokio::test(start_paused = true)]
+async fn a_request_is_previewed_before_the_next_conversation_read() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        mut aw,
+        bw,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    let c = Profile::new();
+    let (from_b, from_c) = (b.outgoing_lookup_key(&a), c.outgoing_lookup_key(&a));
+    assert_ne!(from_b[0], from_c[0], "the trail tells the channels apart");
+    let mut cw = c.spawn(&Fake::on(&dht), RunnerConfig::default());
+    cw.wait_for("C's startup", is_health).await;
+    cw.send(RunnerCommand::FirstContact {
+        token: CommandToken(70),
+        peer_identity_pk: a.pk.clone(),
+        body: b"from C".to_vec(),
+    })
+    .await;
+    cw.wait_for("C's first contact", sent(70)).await;
+    assert!(finished(&cw.stop().await));
+    let hello = dht
+        .lock()
+        .expect("the network lock")
+        .records
+        .iter()
+        .find(|((kind, name, _), (bytes, _))| {
+            *kind == DROP && *name == a.drop_name() && !bytes.is_empty()
+        })
+        .map(|((_, _, slot), _)| *slot)
+        .expect("C's hello is in A's drop");
+    a_fake.faults().trail = Some(Vec::new());
+    aw.wait_for("C's request at A", request_from(&c.pk)).await;
+    aw.wait_for("the preview of C's request", |event| {
+        matches!(event, RunnerEvent::RequestPreview { .. })
+    })
+    .await;
+    let trail = a_fake.faults().trail.take().expect("the trail");
+    let surfaced = trail
+        .iter()
+        .position(|step| *step == Trail::OwnDrop(hello))
+        .expect("the scan read C's hello");
+    // The scan itself reads the channel C's hello names, to verify it, so the
+    // read that counts is the first one after the scan's last slot.
+    let last_slot = Trail::OwnDrop(drop_plane::DROP_SUBKEYS - 1);
+    let ended = surfaced
+        + trail[surfaced..]
+            .iter()
+            .position(|step| *step == last_slot)
+            .expect("the scan that read C's hello ended");
+    let next = trail[ended..]
+        .iter()
+        .find(|step| matches!(step, Trail::ChannelRead(_)))
+        .expect("a channel read after the scan");
+    assert_eq!(
+        *next,
+        Trail::ChannelRead(from_c[0]),
+        "a conversation was read between the scan and the preview: {trail:?}"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+}
+
 /// Passes over the drop `fake` takes in `wait` from now.
 async fn passes_in(fake: &Fake, wait: Duration) -> usize {
     let before = fake.calls().drop_passes;
     tokio::time::sleep(wait).await;
     fake.calls().drop_passes - before
+}
+
+/// Collection passes over one established conversation `fake` takes in `wait`
+/// from now, counted by the empty slot each ring read ends at, and passes over
+/// the drop in the same time.
+async fn collections_in(fake: &Fake, wait: Duration) -> (usize, usize) {
+    let before = fake.calls();
+    tokio::time::sleep(wait).await;
+    let after = fake.calls();
+    (
+        after.ring_ends - before.ring_ends,
+        after.drop_passes - before.drop_passes,
+    )
 }
 
 /// A first contact awaiting acceptance is collected on the waiting interval,
@@ -1479,7 +1844,7 @@ async fn collection_returns_to_the_tick_once_nothing_waits() {
     } = establish(RunnerConfig::default()).await;
     bw.wait_for("delivery of B's reply", delivered(b_peer, 0))
         .await;
-    let settled = passes_in(&a_fake, DEFAULT_TICK * 3).await;
+    let (settled, _) = collections_in(&a_fake, DEFAULT_TICK * 3).await;
     assert!(
         (2..=4).contains(&settled),
         "three ticks with nothing waiting are two to four passes, took {settled}"
@@ -1524,7 +1889,10 @@ async fn collection_runs_sooner_after_an_accept_until_the_hello_back_is_read() {
         .expect("the request is held");
     let request = request_id(&bw.seen[at]);
     let idle = passes_in(&b_fake, DEFAULT_TICK).await;
-    assert!(idle <= 2, "before the accept B is on the tick, took {idle}");
+    assert!(
+        idle <= 1,
+        "before the accept B scans on the drop's own interval, took {idle}"
+    );
     bw.send(RunnerCommand::Accept {
         token: CommandToken(2),
         request,
@@ -1532,7 +1900,7 @@ async fn collection_runs_sooner_after_an_accept_until_the_hello_back_is_read() {
     })
     .await;
     bw.wait_for("B's acceptance", sent(2)).await;
-    let waiting = passes_in(&b_fake, DEFAULT_TICK).await;
+    let (waiting, _) = collections_in(&b_fake, DEFAULT_TICK).await;
     assert!(
         waiting >= 4,
         "a minute waiting on the hello back is at least four passes, took {waiting}"
@@ -5671,7 +6039,7 @@ async fn held_request_survives_an_unread_slot(fault: Fault, counted: fn(&HealthC
         "the read of the request's slot failed"
     );
     let reads_before = b_fake.calls().drop_reads;
-    tokio::time::sleep(DEFAULT_TICK * 3).await;
+    tokio::time::sleep(DEFAULT_TICK * DROP_SCAN_TICKS * 2).await;
     bw.drain();
     assert!(
         b_fake.calls().drop_reads >= reads_before + usize::from(drop_plane::DROP_SUBKEYS),
@@ -6372,8 +6740,9 @@ fn messages_from(events: &[RunnerEvent], from: CorrespondenceLabel) -> Vec<u64> 
 
 /// A shutdown whose grace period ends inside a flow call returns with the task
 /// still running. The command still queued is answered by the shutdown itself,
-/// the task reads as unfinished while its call is held, and the messages that
-/// call collected come back through the task's end once it returns.
+/// the task reads as unfinished while its call is held, the messages collected
+/// before the held call come back with the shutdown, and the one that call
+/// collects comes back through the task's end once it returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_timed_out_shutdown_hands_back_the_running_task_and_its_messages() {
     let config = RunnerConfig {
@@ -6381,8 +6750,8 @@ async fn a_timed_out_shutdown_hands_back_the_running_task_and_its_messages() {
         grace: Duration::from_millis(300),
     };
     let Scene {
-        a: _a,
-        b: _b,
+        a,
+        b,
         aw,
         bw,
         b_fake,
@@ -6405,15 +6774,17 @@ async fn a_timed_out_shutdown_hands_back_the_running_task_and_its_messages() {
         .await;
         aw.wait_for("A's send", sent(token)).await;
     }
-    let publishing = Arc::new(Gate::default());
-    let _release_publishing = ReleaseOnDrop(Arc::clone(&publishing));
+    // The third read of A's ring is the read of m3: m1 and m2 have been
+    // collected and reported when it is held.
+    let reading = Arc::new(Gate::default());
+    let _release_reading = ReleaseOnDrop(Arc::clone(&reading));
     {
         let mut faults = b_fake.faults();
         faults.gate_drop = None;
-        faults.gate_control = Some(Arc::clone(&publishing));
+        faults.gate_channel_read = Some((vec![a.outgoing_lookup_key(&b)], 2, Arc::clone(&reading)));
     }
     paused.release();
-    publishing.reached().await;
+    reading.reached().await;
 
     let Watch { handle, .. } = bw;
     handle
@@ -6427,9 +6798,10 @@ async fn a_timed_out_shutdown_hands_back_the_running_task_and_its_messages() {
     let stop = tokio::time::timeout(Duration::from_secs(30), handle.shutdown())
         .await
         .expect("shutdown returned while the call was held");
-    assert!(
-        messages_from(&stop.undelivered, b_peer).is_empty(),
-        "the held call has not handed over its bodies yet: {:?}",
+    assert_eq!(
+        messages_from(&stop.undelivered, b_peer),
+        vec![1, 2],
+        "the messages read before the held call, and not the one it reads: {:?}",
         stop.undelivered
     );
     assert!(
@@ -6453,15 +6825,14 @@ async fn a_timed_out_shutdown_hands_back_the_running_task_and_its_messages() {
         "the task has not ended while its call is held"
     );
 
-    b_fake.faults().gate_control = None;
-    publishing.release();
+    b_fake.faults().gate_channel_read = None;
+    reading.release();
     let late = tokio::time::timeout(Duration::from_secs(30), end.finish())
         .await
         .expect("the task ended once its call returned");
     assert!(finished(&late), "{late:?}");
     let seqs = messages_from(&late.undelivered, b_peer);
-    assert!(!seqs.is_empty(), "late events: {:?}", late.undelivered);
-    assert_eq!(seqs, vec![1, 2, 3]);
+    assert_eq!(seqs, vec![3], "late events: {:?}", late.undelivered);
     assert!(finished(&aw.stop().await));
 }
 

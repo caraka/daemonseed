@@ -129,6 +129,18 @@ const DELETE_ORDER: [RecordKind; 3] = [
 
 #[cfg(test)]
 thread_local! {
+    /// Refuse the next [`Store::delete_outbox_through`] on this thread.
+    static REFUSE_OUTBOX_DELETE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Refuse the next [`Store::delete_outbox_through`] made on this thread.
+#[cfg(test)]
+pub(crate) fn refuse_next_outbox_delete() {
+    REFUSE_OUTBOX_DELETE.with(|refuse| refuse.set(true));
+}
+
+#[cfg(test)]
+thread_local! {
     /// Every record kind [`Store::delete_conv`] has removed on this thread, in
     /// the order it removed them.
     static DELETED: core::cell::RefCell<Vec<RecordKind>> =
@@ -884,6 +896,13 @@ impl Store {
         peer: &CorrespondenceLabel,
         cursor: u64,
     ) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if REFUSE_OUTBOX_DELETE.with(|refuse| refuse.replace(false)) {
+            return Err(StoreError::Corrupt {
+                kind: RecordKind::ConversationOutbox,
+                reason: "refused by the test",
+            });
+        }
         self.inner.critical_section::<_, StoreError>(peer, |g| {
             let Some(raw) = read_finishing_delete(g, RecordKind::ConversationOutbox)? else {
                 return Ok(());

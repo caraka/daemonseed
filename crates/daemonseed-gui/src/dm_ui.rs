@@ -622,6 +622,207 @@ mod tests {
         }
     }
 
+    /// Two circles beside the Lobby, and two established conversations, bert
+    /// and cora, with the rail built over them.
+    fn two_rooms_two_conversations(app: &App) -> (CorrespondenceLabel, CorrespondenceLabel) {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let phrase =
+            "abandon ability able about above absent absorb abstract absurd abuse access accident";
+        {
+            let mut st = app.state.borrow_mut();
+            st.materialize_from_phrase(phrase)
+                .expect("the first circle");
+            st.materialize_from_phrase(phrase)
+                .expect("the second circle");
+        }
+        crate::rebuild_rail(&app.ui, &app.state.borrow());
+        let (bert, cora) = (label(), label());
+        let summary = |peer, tag| ConversationSummary {
+            peer,
+            peer_identity_pk: pk(tag),
+            state: ConversationState::Established,
+            peer_collected: 0,
+            uncollected: 0,
+            handle: None,
+        };
+        app.dm_event(RunnerEvent::Roster(vec![
+            summary(bert, 2),
+            summary(cora, 3),
+        ]));
+        (bert, cora)
+    }
+
+    /// A message into room `circle_id` from someone else.
+    fn room_message(app: &App, circle_id: u64) {
+        apply_net_event(
+            &app.ui,
+            &app.state,
+            &app.browser,
+            NetEvent::CircleMessage {
+                circle_id,
+                who: "anna".into(),
+                text: "hello".into(),
+                mine: false,
+                sent_unix_ms: now_unix_ms(),
+            },
+        );
+    }
+
+    /// Each room row's dot, in rail order.
+    fn room_dots(app: &App) -> Vec<bool> {
+        app.ui.get_circles().iter().map(|c| c.unread).collect()
+    }
+
+    /// Each direct-message row's dot, by label.
+    fn dm_dots(app: &App) -> Vec<(SharedString, bool)> {
+        app.ui
+            .get_dm_rows()
+            .iter()
+            .map(|r| (r.label, r.unread))
+            .collect()
+    }
+
+    /// With Chats unfolded, an unread message marks its own room's row, the
+    /// header only summing it up: the active room's row too while a direct
+    /// message has the main pane. Folded when the message arrives, the row is
+    /// marked once Chats unfolds.
+    #[test]
+    fn an_unread_room_marks_its_own_row_with_chats_unfolded() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            assert!(app.ui.get_chats_open(), "control: Chats is unfolded");
+            room_message(app, 2);
+            assert_eq!(room_dots(app), [false, false, true]);
+            assert!(app.ui.get_chats_unread());
+
+            // A direct message takes the main pane with Chats still unfolded,
+            // and the active room, the Lobby, is written to.
+            app.ui.invoke_toggle_section(1);
+            let first = app.ui.get_dm_rows().row_data(0).expect("a row").slot;
+            app.ui.invoke_select_dm(first);
+            assert_eq!(app.ui.get_main_pane(), 3, "control: a thread is shown");
+            assert!(app.ui.get_chats_open(), "control: Chats is unfolded");
+            apply_net_event(
+                &app.ui,
+                &app.state,
+                &app.browser,
+                NetEvent::Message {
+                    who: "anna".into(),
+                    text: "hello".into(),
+                    mine: false,
+                    sent_unix_ms: now_unix_ms(),
+                },
+            );
+            assert_eq!(room_dots(app), [true, false, true]);
+
+            // Folded at arrival: the row is marked once Chats unfolds.
+            app.ui.invoke_toggle_section(0);
+            assert!(!app.ui.get_chats_open(), "control: Chats is folded");
+            room_message(app, 1);
+            app.ui.invoke_toggle_section(0);
+            assert_eq!(room_dots(app), [true, true, true]);
+        });
+    }
+
+    /// The rail's unread dots with both sections unfolded, drawn to the same
+    /// directory as [`screenshots`]: the active room's row marked while a
+    /// direct message has the main pane, and the selected conversation's row
+    /// marked while a room has it. Run with `--ignored`.
+    #[test]
+    #[ignore = "writes PNG files; run on demand with --ignored"]
+    fn rail_unread_screenshots() {
+        with_app(|app| {
+            let dir = std::env::temp_dir().join("dm-shots");
+            std::fs::create_dir_all(&dir).expect("create the shot directory");
+            let shot = |name: &str| {
+                let path = dir.join(name);
+                render_png(&app.window, path.to_str().expect("a UTF-8 path"));
+            };
+            let (bert, cora) = two_rooms_two_conversations(app);
+            app.ui.invoke_toggle_section(1);
+            let first = app.ui.get_dm_rows().row_data(0).expect("a row").slot;
+            app.ui.invoke_select_dm(first);
+            room_message(app, 2);
+            apply_net_event(
+                &app.ui,
+                &app.state,
+                &app.browser,
+                NetEvent::Message {
+                    who: "anna".into(),
+                    text: "hello".into(),
+                    mine: false,
+                    sent_unix_ms: now_unix_ms(),
+                },
+            );
+            shot("14-rail-unread-rooms-while-dm.png");
+            app.ui.invoke_switch_circle(1);
+            app.dm_event(message(bert, 0, "from bert"));
+            app.dm_event(message(cora, 0, "from cora"));
+            let selected = app
+                .ui
+                .get_dm_rows()
+                .iter()
+                .find(|r| r.selected)
+                .expect("a selected row");
+            assert!(selected.unread, "the selected row is marked");
+            shot("14-rail-unread-dms-while-room.png");
+        });
+    }
+
+    /// With Direct messages unfolded, a message marks its own conversation's
+    /// row: one not selected, and the selected one while a room has the main
+    /// pane. Folded when the message arrives, the row is marked once the
+    /// section unfolds.
+    #[test]
+    fn an_unread_conversation_marks_its_own_row_with_direct_messages_unfolded() {
+        with_app(|app| {
+            let (bert, cora) = two_rooms_two_conversations(app);
+            app.ui.invoke_open_section(1);
+            let rows = dm_dots(app);
+            let cora_label = rows[0].0.clone();
+            app.ui.invoke_select_dm(app.slot_of(&cora_label));
+            assert_eq!(app.ui.get_main_pane(), 3, "control: cora's thread is shown");
+
+            app.dm_event(message(bert, 0, "from bert"));
+            let dots = dm_dots(app);
+            assert!(
+                dots.iter().any(|(l, dot)| *l != cora_label && *dot),
+                "bert's row: {dots:?}"
+            );
+            assert!(
+                dots.iter().any(|(l, dot)| *l == cora_label && !*dot),
+                "cora's thread is on screen: {dots:?}"
+            );
+            assert!(app.ui.get_dms_unread());
+
+            // A room takes the main pane with the section still unfolded, and
+            // the selected conversation is written to.
+            app.ui.invoke_toggle_section(0);
+            app.ui.invoke_switch_circle(1);
+            assert_eq!(app.ui.get_main_pane(), 0, "control: a room is shown");
+            assert!(app.ui.get_dms_open(), "control: the section is unfolded");
+            app.dm_event(message(cora, 0, "from cora"));
+            assert_eq!(dm_dots(app).len(), 2, "both rows are listed");
+            assert!(
+                dm_dots(app).iter().all(|(_, dot)| *dot),
+                "both rows: {:?}",
+                dm_dots(app)
+            );
+
+            // Folded at arrival: the row is marked once the section unfolds.
+            app.ui.invoke_toggle_section(1);
+            assert!(!app.ui.get_dms_open(), "control: the section is folded");
+            app.dm_event(message(bert, 1, "again"));
+            app.ui.invoke_toggle_section(1);
+            assert_eq!(dm_dots(app).len(), 2, "both rows are listed");
+            assert!(
+                dm_dots(app).iter().all(|(_, dot)| *dot),
+                "both rows: {:?}",
+                dm_dots(app)
+            );
+        });
+    }
+
     /// The menu reads the member when it opens: a roster re-sort before the item
     /// is chosen does not change who the message is for.
     #[test]

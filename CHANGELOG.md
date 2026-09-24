@@ -26,11 +26,17 @@ work lives in the maintainer's own planning notes, not here.
 
 ### Fixed
 
+- `daemonseed-veilid-net`: a direct-message collection pass reads established conversations before the drop scan, and scans the drop every `DROP_SCAN_TICKS` (5) collection intervals, or every pass while a conversation awaits acceptance; a request is previewed directly after the scan that surfaced it.
+- `daemonseed-veilid-net`: the runner reports each collected message as its ring slot opens, not when the ring read ends; each message is recorded read before it is reported.
+- `daemonseed-veilid-net`, `daemonseed-gui`: a direct-message thread is in conversation order, the two directions interleaved by send time, instead of arrival order.
+- `daemonseed-core`: recognising an acceptance reads the correspondent's control subkey once, taking the opening and the cursor from the same read.
+- `daemonseed-gui`: an unread room or conversation marks its own rail row while its section is unfolded and another item has the main pane, including the active room and the selected conversation; the Lobby row's dot stays inside the row.
 - `daemonseed-core`: a direct-message ring read stops at a slot holding a message the conversation does not open, such as one left by a deleted conversation under the same channel records, instead of failing; the initiator now recognises an acceptance in that case. `Acceptance`, `Accepted` and `Batch` report the slot as `unopened` (`Unopened { seq, subkey, error }`), and the runner counts it in `HealthCounters::slots_unopened` and traces it.
 - `daemonseed-veilid-net`: the direct-message runner serves queued commands between the network calls of a drop scan, collection pass, preview or repair instead of after the pass; a scan drops requests a command served meanwhile accepted or blocked, and a collection re-reads a conversation a command changed.
 
 ### Added
 
+- `daemonseed-core`: `flows::collect_step`, `flows::publish_cursor`, `flows::RingStep`, `Batch::stopped`; `flows::recognise_acceptance` takes the correspondent's cursor and `Acceptance::peer_cursor` is a `u64`. `daemonseed-veilid-net`: `dm::runner::DROP_SCAN_TICKS`, `DmThreadRow::Sent::sent_at_ms`.
 - `daemonseed-veilid-net`: one trace line per direct-message record call (call, record kind, subkey, duration, outcome), start and end lines for every runner step, the error of every hello that does not settle, and a drop-scan summary counting settled, failed and other hellos.
 - `daemonseed-core`: `RecordKind::CorrespondentHandle`, `Store::record_handle`, `Store::handle`, `LoadedConv::handle`, `flows::collect_slot`. `daemonseed-veilid-net`: `RunnerCommand::NoteHandle`, `ConversationSummary::handle`, `DmCorrespondence::handle`, `dm::view::dm_name`. The GUI and TUI name a conversation by the live roster handle, else the stored handle, else the fingerprint; the GUI notes roster handles to the runner.
 - `daemonseed-veilid-net`: `VeilidNetConfig::device_key_password` and `protect_with_profile`; Veilid's device encryption key is protected under a password derived from the unlocked profile (`daemonseed_core::kdf::veilid_device_key_password`), under a namespace carrying the profile's tag (`veilid_namespace_tag`), or a random one per start under a `-noprofile` namespace. Storage whose key is refused, confirmed by a start over an empty table directory, is cleared and recreated.

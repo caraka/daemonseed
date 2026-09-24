@@ -442,8 +442,11 @@ types:
     module: daemonseed_veilid_net::dm::runner
     kind: struct
     description: >-
-      tick (collection interval before ±20 % jitter, default DEFAULT_TICK 60 s)
-      and grace (the longest RunnerHandle::shutdown waits, default DEFAULT_GRACE
+      tick (collection interval before ±20 % jitter, default DEFAULT_TICK 60 s;
+      a collection pass reads every established conversation, then scans the
+      drop where a conversation awaits acceptance or DROP_SCAN_TICKS (5)
+      jittered ticks have passed since the last scan, then previews the requests
+      that scan surfaced) and grace (the longest RunnerHandle::shutdown waits, default DEFAULT_GRACE
       10 s). Implements Default. clamped() holds tick within MIN_TICK (1 ms) and
       MAX_TICK (24 h); spawn_runner applies it.
   - name: RunnerHandle
@@ -476,7 +479,8 @@ types:
       RequestPreview{request, messages: Vec<ReceivedMessage>, read_at (Unix ms)},
       StartedOver{request, from}, Message{from, seq, body, sent_at (Unix ms, the
       sender's clock, carried inside the message's encryption), received_at (Unix
-      ms, stamped by the runner)}, Sent{token, peer, seq}, Deleted{token, peer},
+      ms, stamped by the runner)} — emitted as each ring slot opens, once the
+      store has recorded it read, Sent{token, peer, seq}, Deleted{token, peer},
       Delivered{peer, through_seq}, Accepted{peer}, Refused{token:
       Option<CommandToken>, reason: Refusal}, Health(HealthCounters),
       BlockList(Vec<IdentityPk>), BlockListUnreadable. Every command with a token
@@ -894,7 +898,10 @@ types:
     description: >-
       One conversation as the runner has reported it: label (Option<CorrespondenceLabel>),
       state (Option<ConversationState>), peer_collected (u64 — the roster's cursor),
-      delivered_through (Option<u64>), thread (Vec<DmThreadRow>), refusal (Option<Refusal>
+      delivered_through (Option<u64>), thread (Vec<DmThreadRow> in conversation
+      order: each direction in sequence order, the two interleaved by send time to
+      the whole second, a row heard of later going after one sent in the same
+      second), refusal (Option<Refusal>
       — cleared by a send that goes through), last_activity (u64). delivered(seq) -> bool
       is true below peer_collected or at or below delivered_through.
   - name: DmThreadRow
@@ -902,10 +909,12 @@ types:
     kind: enum
     description: >-
       One row of a conversation's thread: Received { seq, body, sent_at_ms,
-      received_at_ms } or Sent { seq, body: Option<String> }, body None for a message
-      this session did not compose. sent_at_ms is the sender's time, held at
-      received_at_ms when the sender's clock put it later.
-    variants: ["Received { seq, body, sent_at_ms, received_at_ms }", "Sent { seq, body }"]
+      received_at_ms } or Sent { seq, body: Option<String>, sent_at_ms }, body None
+      for a message this session did not compose. A Received sent_at_ms is the
+      sender's time, held at received_at_ms when the sender's clock put it later;
+      a Sent sent_at_ms is this side's clock when the runner reported it sent, or
+      first listed it where this session did not send it.
+    variants: ["Received { seq, body, sent_at_ms, received_at_ms }", "Sent { seq, body, sent_at_ms }"]
   - name: DmContactRequest
     module: daemonseed_veilid_net::dm::view
     kind: struct

@@ -1549,7 +1549,7 @@ fn render_dm_thread(app: &App, frame: &mut Frame, area: Rect) {
                     format!("← {body} · sent {}", utc_clock(*sent_at_ms, now_unix_ms())),
                     Style::default(),
                 ),
-                DmThreadRow::Sent { seq, body } => {
+                DmThreadRow::Sent { seq, body, .. } => {
                     // A message this session did not compose is named by its
                     // sequence number; its text was never held here.
                     let text = match body {

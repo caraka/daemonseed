@@ -402,12 +402,13 @@ fn rebuild_rail(ui: &AppWindow, st: &GuiState) {
     let circles: Vec<CircleData> = st
         .metas()
         .iter()
-        .map(|c| CircleData {
+        .enumerate()
+        .map(|(idx, c)| CircleData {
             name: SharedString::from(c.name.as_str()),
             sub: SharedString::from(c.sub.as_str()),
             initial: SharedString::from(c.initial.as_str()),
             pinned: c.pinned,
-            unread: c.unread,
+            unread: st.room_row_unread(idx),
         })
         .collect();
     ui.set_circles(ModelRc::from(Rc::new(VecModel::from(circles))));

@@ -50,7 +50,10 @@ pub struct DmCorrespondence {
     /// The highest sequence of this side's the correspondent has collected, from
     /// the last delivery report.
     pub delivered_through: Option<u64>,
-    /// The conversation's messages, in the order this session heard of them.
+    /// The conversation's messages, in conversation order: each direction's
+    /// messages in sequence order, and the two directions interleaved by the
+    /// time each message was sent, to the whole second, a message heard of
+    /// later going after one sent in the same second.
     pub thread: Vec<DmThreadRow>,
     /// The refusal that stopped the last send, held until a send goes through.
     pub refusal: Option<Refusal>,
@@ -87,18 +90,66 @@ impl DmCorrespondence {
         seq < self.peer_collected || self.delivered_through.is_some_and(|through| seq <= through)
     }
 
-    /// Record a thread row, replacing the row held at the same position.
+    /// Record a thread row, replacing the row held at the same position, or
+    /// placing a new one in conversation order (see [`Self::thread`]).
     ///
     /// A sent row without a body never replaces one with a body: the body is
     /// what this session composed, and a later report of the same message does
-    /// not carry it.
+    /// not carry it. A sent row that replaces another keeps the earlier of the
+    /// two times.
     fn record(&mut self, row: DmThreadRow) {
-        match self.thread.iter_mut().find(|held| held.same_position(&row)) {
-            Some(DmThreadRow::Sent { body: Some(_), .. })
-                if matches!(row, DmThreadRow::Sent { body: None, .. }) => {}
-            Some(held) => *held = row,
-            None => self.thread.push(row),
+        let Some(at) = self.thread.iter().position(|held| held.same_position(&row)) else {
+            let at = self.conversation_position(&row);
+            self.thread.insert(at, row);
+            return;
+        };
+        let row = match (&self.thread[at], row) {
+            (
+                DmThreadRow::Sent {
+                    body: kept_body,
+                    sent_at_ms: kept,
+                    ..
+                },
+                DmThreadRow::Sent {
+                    seq,
+                    body,
+                    sent_at_ms,
+                },
+            ) => DmThreadRow::Sent {
+                seq,
+                body: body.or_else(|| kept_body.clone()),
+                sent_at_ms: sent_at_ms.min(*kept),
+            },
+            (_, row) => row,
+        };
+        // An earlier time can move the row ahead of the other direction's.
+        if row.order_secs() < self.thread[at].order_secs() {
+            self.thread.remove(at);
+            let to = self.conversation_position(&row);
+            self.thread.insert(to, row);
+        } else {
+            self.thread[at] = row;
         }
+    }
+
+    /// Where a row not yet held goes: after every row of its own direction
+    /// with a lower sequence and before every one with a higher, and between
+    /// those, before the first row of the other direction sent in a later
+    /// second.
+    fn conversation_position(&self, row: &DmThreadRow) -> usize {
+        let same = |held: &DmThreadRow| held.outgoing() == row.outgoing();
+        let lo = self
+            .thread
+            .iter()
+            .rposition(|held| same(held) && held.seq() < row.seq())
+            .map_or(0, |at| at + 1);
+        let hi = self.thread[lo..]
+            .iter()
+            .position(|held| same(held) && held.seq() > row.seq())
+            .map_or(self.thread.len(), |at| lo + at);
+        (lo..hi)
+            .find(|&at| self.thread[at].order_secs() > row.order_secs())
+            .unwrap_or(hi)
     }
 }
 
@@ -126,10 +177,34 @@ pub enum DmThreadRow {
         seq: u64,
         /// The body, or `None` for a message this session did not compose.
         body: Option<String>,
+        /// When this side sent it, by this side's clock, in Unix
+        /// milliseconds: the time the runner reported it sent, or first
+        /// listed it where this session did not send it.
+        sent_at_ms: u64,
     },
 }
 
 impl DmThreadRow {
+    /// Whether this side wrote it.
+    fn outgoing(&self) -> bool {
+        matches!(self, Self::Sent { .. })
+    }
+
+    /// Its sequence number in its own direction.
+    fn seq(&self) -> u64 {
+        match self {
+            Self::Received { seq, .. } | Self::Sent { seq, .. } => *seq,
+        }
+    }
+
+    /// When it was sent, in whole Unix seconds: a correspondent's time is
+    /// carried to the second, so both directions are compared at that grain.
+    fn order_secs(&self) -> u64 {
+        match self {
+            Self::Received { sent_at_ms, .. } | Self::Sent { sent_at_ms, .. } => sent_at_ms / 1000,
+        }
+    }
+
     /// Whether two rows stand for the same message: the same direction and the
     /// same sequence number.
     fn same_position(&self, other: &Self) -> bool {
@@ -156,13 +231,23 @@ impl std::fmt::Debug for DmThreadRow {
                  received_at_ms: {received_at_ms} }}",
                 body.len()
             ),
-            Self::Sent { seq, body } => write!(
+            Self::Sent {
+                seq,
+                body,
+                sent_at_ms,
+            } => write!(
                 f,
-                "Sent {{ seq: {seq}, body_len: {:?} }}",
+                "Sent {{ seq: {seq}, body_len: {:?}, sent_at_ms: {sent_at_ms} }}",
                 body.as_ref().map(String::len)
             ),
         }
     }
+}
+
+/// A signed Unix-millisecond clock value as a thread row's time, with a time
+/// before the epoch held at it.
+fn unix_ms(now_ms: i64) -> u64 {
+    u64::try_from(now_ms).unwrap_or(0)
 }
 
 /// A correspondent's message as a thread row. A sender's clock ahead of this
@@ -601,6 +686,7 @@ impl DmState {
                             entry.record(DmThreadRow::Sent {
                                 seq: 0,
                                 body: Some(body),
+                                sent_at_ms: unix_ms(now_ms),
                             });
                         }
                     }
@@ -727,7 +813,11 @@ impl DmState {
                             entry.record(row);
                         }
                     }
-                    entry.record(DmThreadRow::Sent { seq: *seq, body });
+                    entry.record(DmThreadRow::Sent {
+                        seq: *seq,
+                        body,
+                        sent_at_ms: unix_ms(now_ms),
+                    });
                 }
             }
             RunnerEvent::Deleted { token, peer } => {
@@ -970,7 +1060,7 @@ mod tests {
                 .iter()
                 .map(|row| match row {
                     DmThreadRow::Received { seq, body, .. } => format!("<{seq} {body}"),
-                    DmThreadRow::Sent { seq, body } => format!(">{seq} {body:?}"),
+                    DmThreadRow::Sent { seq, body, .. } => format!(">{seq} {body:?}"),
                 })
                 .collect();
             let mut expected = vec!["<0 hi, it's cora".to_owned()];
@@ -1145,6 +1235,7 @@ mod tests {
             vec![DmThreadRow::Sent {
                 seq: 0,
                 body: Some("hello".to_owned()),
+                sent_at_ms: 0,
             }]
         );
         assert!(entry.last_activity > 0);
@@ -1173,6 +1264,7 @@ mod tests {
             vec![DmThreadRow::Sent {
                 seq: 0,
                 body: Some("hello".to_owned()),
+                sent_at_ms: 0,
             }]
         );
     }
@@ -1210,6 +1302,122 @@ mod tests {
             dm.correspondences[&pk(7)].refusal,
             Some(Refusal::AlreadyEstablished)
         );
+    }
+
+    /// A thread is in conversation order: a reply the correspondent sent
+    /// before this side's newer message, and heard of after it, is placed
+    /// above it; a message sent in the same second as one already held goes
+    /// after it; and each direction keeps its sequence order whatever the
+    /// clocks say.
+    #[test]
+    fn a_thread_is_in_conversation_order() {
+        let mut dm = DmState::default();
+        let peer = label();
+        dm.fold(&roster(peer, &pk(7)), 0);
+        let received = |seq: u64, sent_at: u64| RunnerEvent::Message {
+            from: peer,
+            seq,
+            body: format!("r{seq}").into_bytes(),
+            sent_at,
+            received_at: 90_000,
+        };
+        let sent = |seq: u64| RunnerEvent::Sent {
+            token: CommandToken(1_000 + seq),
+            peer,
+            seq,
+        };
+        dm.fold(&received(0, 10_000), 10_000);
+        dm.fold(&sent(0), 20_000);
+        // Sent before the local message, heard of after it.
+        dm.fold(&received(1, 15_000), 25_000);
+        // A clock behind: still after the correspondent's earlier message.
+        dm.fold(&received(2, 5_000), 30_000);
+        // This side's clock behind: still after this side's earlier message.
+        dm.fold(&sent(1), 1_000);
+        dm.fold(&sent(2), 40_200);
+        // The same second as the send before it.
+        dm.fold(&received(3, 40_000), 41_000);
+        let order: Vec<String> = dm.correspondences[&pk(7)]
+            .thread
+            .iter()
+            .map(|row| match row {
+                DmThreadRow::Received { seq, .. } => format!("r{seq}"),
+                DmThreadRow::Sent { seq, .. } => format!("s{seq}"),
+            })
+            .collect();
+        assert_eq!(order, ["r0", "r1", "r2", "s0", "s1", "s2", "r3"]);
+    }
+
+    /// A repeat report of a sent row that carries an earlier time moves the row
+    /// to where that time places it.
+    #[test]
+    fn a_sent_row_reported_earlier_again_moves_up() {
+        let mut dm = DmState::default();
+        let peer = label();
+        dm.fold(&roster(peer, &pk(7)), 0);
+        let sent = RunnerEvent::Sent {
+            token: CommandToken(3_001),
+            peer,
+            seq: 1,
+        };
+        dm.fold(&sent, 50_000);
+        dm.fold(
+            &RunnerEvent::Message {
+                from: peer,
+                seq: 0,
+                body: b"r0".to_vec(),
+                sent_at: 30_000,
+                received_at: 60_000,
+            },
+            60_000,
+        );
+        dm.fold(&sent, 20_000);
+        let order: Vec<String> = dm.correspondences[&pk(7)]
+            .thread
+            .iter()
+            .map(|row| match row {
+                DmThreadRow::Received { seq, .. } => format!("r{seq}"),
+                DmThreadRow::Sent { seq, .. } => format!("s{seq}"),
+            })
+            .collect();
+        assert_eq!(order, ["s1", "r0"]);
+    }
+
+    /// A sent row this session did not send carries only the time it was
+    /// heard of, which may be earlier than a lower sequence's: it still goes
+    /// after every lower sequence of its own direction.
+    #[test]
+    fn a_row_with_no_known_send_time_keeps_its_sequence_place() {
+        let mut dm = DmState::default();
+        let peer = label();
+        dm.fold(&roster(peer, &pk(7)), 0);
+        let sent = |seq: u64| RunnerEvent::Sent {
+            token: CommandToken(2_000 + seq),
+            peer,
+            seq,
+        };
+        dm.fold(&sent(3), 10_000);
+        dm.fold(
+            &RunnerEvent::Message {
+                from: peer,
+                seq: 0,
+                body: b"r0".to_vec(),
+                sent_at: 20_000,
+                received_at: 20_000,
+            },
+            20_000,
+        );
+        // Heard of by a clock that reads earlier than sequence 3's.
+        dm.fold(&sent(7), 5_000);
+        let order: Vec<String> = dm.correspondences[&pk(7)]
+            .thread
+            .iter()
+            .map(|row| match row {
+                DmThreadRow::Received { seq, .. } => format!("r{seq}"),
+                DmThreadRow::Sent { seq, .. } => format!("s{seq}"),
+            })
+            .collect();
+        assert_eq!(order, ["s3", "s7", "r0"]);
     }
 
     /// A received row keeps the correspondent's send time, and a send time
@@ -1347,6 +1555,7 @@ mod tests {
             vec![DmThreadRow::Sent {
                 seq: 0,
                 body: Some("hello".to_owned()),
+                sent_at_ms: 0,
             }]
         );
 
@@ -1395,6 +1604,7 @@ mod tests {
             vec![DmThreadRow::Sent {
                 seq: 0,
                 body: Some("hello".to_owned()),
+                sent_at_ms: 0,
             }]
         );
     }
@@ -1415,7 +1625,11 @@ mod tests {
         );
         assert_eq!(
             dm.correspondences[&pk(7)].thread,
-            vec![DmThreadRow::Sent { seq: 0, body: None }]
+            vec![DmThreadRow::Sent {
+                seq: 0,
+                body: None,
+                sent_at_ms: 0,
+            }]
         );
     }
 

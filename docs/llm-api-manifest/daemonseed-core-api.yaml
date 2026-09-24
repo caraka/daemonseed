@@ -1335,26 +1335,43 @@ modules:
       address and passing every other call to the inner store; accept over it
       after a preview of the same request makes no read before its first write
       and persists what it persists over the network.
-      recognise_acceptance(store, records, me, peer, lookup_key,
+      recognise_acceptance(store, records, me, peer, lookup_key, peer_cursor,
       peer_secret, slot) -> Result<Acceptance { peer, lookup_key, peer_cursor,
       messages: Vec<ReceivedMessage> }, FlowError> records the correspondent's channel lookup key and
-      the control key derived from peer_secret, reads its cursor and any reply,
+      the control key derived from peer_secret, takes peer_cursor (u64, the
+      cursor in the control record the caller read the opening from, reported
+      as Acceptance::peer_cursor: u64) without
+      reading the control subkey again, reads any reply,
       clears the outstanding hello, awaiting_acceptance and own_hello_secret, and
-      erases the slot. send_message(store, records,
+      erases the slot; collect and collect_slot read that control subkey once
+      per recognised acceptance. send_message(store, records,
       peer, body, fill, now) -> Result<u64, FlowError> persists the ciphertext
       with now as its send time and the advanced send_seq, and writes one ring
       slot; first_contact and accept record their own now with the entry they
       persist; it is
       FlowError::DeletePending while delete_pending is set, and
       FlowError::AwaitingAcceptance while awaiting_acceptance or acceptance_pending is
-      set. collect_batch(store,
+      set. collect_step(store, records, peer) -> Result<RingStep, FlowError>
+      reads the one ring slot at this side's cursor: RingStep::Message { seq,
+      message: ReceivedMessage, outbox_error: Option<StoreError> } after
+      persisting the advanced key schedule, my_collected past it and the peer
+      cursor it carries (outbox_error holds a refused deletion of the outbox
+      entries that cursor passed; the message stands), RingStep::End where the
+      slot holds no message for that sequence, RingStep::Unopened(Unopened) where
+      its message does not open; it writes nothing to the network, and a message
+      it returns is one a restart has recorded as read. publish_cursor(store,
+      records, peer) -> Result<bool, FlowError> writes the recorded my_collected
+      in one control write where it is above cursor_published, sealed under
+      own_control_key and carrying own_opening, and reports whether it wrote.
+      Both are FlowError::DeletePending while delete_pending is set and
+      FlowError::AwaitingAcceptance while acceptance_pending is set.
+      collect_batch(store,
       records, peer) -> Result<Batch { messages: Vec<ReceivedMessage>, my_collected,
-      cursor_published }, FlowError> is FlowError::DeletePending while delete_pending is set,
-      FlowError::AwaitingAcceptance while acceptance_pending is set, and
-      otherwise reads the correspondent's ring from this side's cursor and
-      publishes the new cursor in one control write where my_collected is above
-      the record's cursor_published, sealed under own_control_key and carrying
-      own_opening. peer_cursor(store, records, peer) ->
+      cursor_published, unopened, stopped: Option<FlowError> }, FlowError> is
+      collect_step until the ring ends or stops at an unopened slot, then
+      publish_cursor; a read that fails after a message was recorded ends the
+      batch with the messages recorded and the failure in stopped, and the
+      failure is the error only where nothing was read. peer_cursor(store, records, peer) ->
       Result<Option<u64>, FlowError> reads the correspondent's published cursor
       under peer_control_key. reset(store, fill, now) -> Result<(), FlowError> sets
       force_turn in every conversation record, so the next message in each starts

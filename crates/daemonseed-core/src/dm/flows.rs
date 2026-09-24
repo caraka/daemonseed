@@ -1033,7 +1033,13 @@ pub fn collect_slot<R: Records>(
     let Ok(control_key) = channel::control_key(&shared_secret) else {
         return Ok(None);
     };
-    let Some(opening) = read_opening(records, &control_key, &hello.lookup_key) else {
+    // The one read of the correspondent's control record: its opening
+    // verifies the hello, and its cursor is what an acceptance takes.
+    let Some(control) = read_control(records, &control_key, &hello.lookup_key) else {
+        return Ok(None);
+    };
+    let cursor = control.collected_cursor;
+    let Some(opening) = control.opening else {
         return Ok(None);
     };
     let Some(bound) = opening_serial(rewritten, serial, &opening) else {
@@ -1060,6 +1066,7 @@ pub fn collect_slot<R: Records>(
         &identity,
         &hello,
         opening,
+        cursor,
         shared_secret,
         slot,
     );
@@ -1072,6 +1079,7 @@ pub fn collect_slot<R: Records>(
 
 /// Settle one verified hello against what this side already holds for the
 /// identity that signed it — § Flows, *A hello from a known identity*.
+/// `cursor` is the one the control record carrying `opening` published.
 #[allow(clippy::too_many_arguments)]
 fn settle<R: Records>(
     store: &Store,
@@ -1080,6 +1088,7 @@ fn settle<R: Records>(
     identity: &[u8; ml_dsa::PK_LEN],
     hello: &drop_plane::Hello,
     opening: ChannelOpening,
+    cursor: u64,
     shared_secret: AdvertSharedSecret,
     slot: u16,
 ) -> Result<Surfaced, FlowError> {
@@ -1100,6 +1109,7 @@ fn settle<R: Records>(
             me,
             &peer,
             &hello.lookup_key,
+            cursor,
             shared_secret,
             slot,
         )?));
@@ -1191,20 +1201,28 @@ fn opening_serial(
     (opening.advert_serial < decapsulated_under).then_some(opening.advert_serial)
 }
 
-/// The opening in a channel's control subkey, or `None` where the record store
-/// will not read it, the subkey holds nothing, or it will not open under this
-/// key.
+/// The control record in a channel's control subkey, or `None` where the
+/// record store will not read it, the subkey holds nothing, or it will not open
+/// under this key.
+fn read_control<R: Records>(
+    records: &mut R,
+    control_key: &ControlKey,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+) -> Option<Control> {
+    let bytes = records
+        .read_channel(lookup_key, channel::CONTROL_SUBKEY)
+        .ok()??;
+    channel::open_control_with_key(control_key, &bytes).ok()
+}
+
+/// The opening in a channel's control subkey, or `None` where
+/// [`read_control`] reads no record or the record carries no opening.
 fn read_opening<R: Records>(
     records: &mut R,
     control_key: &ControlKey,
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
 ) -> Option<ChannelOpening> {
-    let bytes = records
-        .read_channel(lookup_key, channel::CONTROL_SUBKEY)
-        .ok()??;
-    channel::open_control_with_key(control_key, &bytes)
-        .ok()?
-        .opening
+    read_control(records, control_key, lookup_key)?.opening
 }
 
 /// The cursor the correspondent publishes, from the control subkey of the
@@ -1906,9 +1924,9 @@ pub struct Acceptance {
     pub peer: CorrespondenceLabel,
     /// The channel the correspondent named, now this side's incoming channel.
     pub lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
-    /// The correspondent's published cursor, where its control subkey carried
-    /// one.
-    pub peer_cursor: Option<u64>,
+    /// The correspondent's published cursor, from the control record the
+    /// acceptance was recognised by.
+    pub peer_cursor: u64,
     /// Any reply already in the correspondent's ring, in sequence order.
     pub messages: Vec<ReceivedMessage>,
     /// The slot the ring read stopped at because its message does not open
@@ -1922,15 +1940,19 @@ pub struct Acceptance {
 /// Complete this side's own first contact — § Flows, *A hello from a known
 /// identity*, the outstanding-first-contact case.
 ///
-/// The correspondent's channel lookup key and hello secret are recorded, its
-/// cursor and any reply are read, this side stops awaiting an acceptance, and
-/// the slot is erased. One write.
+/// The correspondent's channel lookup key and hello secret are recorded, any
+/// reply is read, this side stops awaiting an acceptance, and the slot is
+/// erased. One write. `peer_cursor` is the cursor the correspondent published
+/// in the control record the caller read the channel's opening from, so the
+/// control subkey is not read again.
+#[allow(clippy::too_many_arguments)]
 pub fn recognise_acceptance<R: Records>(
     store: &Store,
     records: &mut R,
     me: &Me<'_>,
     peer: &CorrespondenceLabel,
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    peer_cursor: u64,
     peer_secret: AdvertSharedSecret,
     slot: u16,
 ) -> Result<Acceptance, FlowError> {
@@ -1952,10 +1974,7 @@ pub fn recognise_acceptance<R: Records>(
     let loaded_forced = state.conversation.sending.force_turn;
     let mut conversation = Conversation::restore(state.conversation);
     let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
-    let cursor = peer_cursor(store, records, peer)?;
-    if let Some(cursor) = cursor {
-        ring.advance_peer_collected(cursor);
-    }
+    ring.advance_peer_collected(peer_cursor);
     let read = read_ring(
         records,
         &mut conversation,
@@ -1980,7 +1999,7 @@ pub fn recognise_acceptance<R: Records>(
     Ok(Acceptance {
         peer: *peer,
         lookup_key: *lookup_key,
-        peer_cursor: cursor,
+        peer_cursor,
         messages: read.messages,
         unopened: read.unopened,
     })
@@ -2049,42 +2068,63 @@ fn read_ring<R: Records>(
 ) -> Result<RingRead, FlowError> {
     let mut messages = Vec::new();
     let mut collected = from;
-    let mut unopened = None;
-    loop {
-        let Some(raw) = records.read_channel(lookup_key, channel::slot_for(collected))? else {
-            break;
-        };
-        let Ok((header, sealed)) = channel::MessageHeader::decode(&raw) else {
-            break;
-        };
-        if header.seq != collected {
-            break;
-        }
-        // `open` changes the key schedule only once the message has opened.
-        let opened = match conversation.open(&header, sealed) {
-            Ok(opened) => opened,
-            Err(error) => {
-                unopened = Some(Unopened {
-                    seq: collected,
-                    subkey: channel::slot_for(collected),
-                    error,
-                });
-                break;
+    let unopened = loop {
+        match read_ring_slot(records, conversation, ring, lookup_key, collected)? {
+            RingStep::Message { message, .. } => {
+                messages.push(message);
+                collected += 1;
             }
-        };
-        let plaintext = Zeroizing::new(opened);
-        let (sent_at, body) = channel::decode_message_plaintext(&plaintext)?;
-        ring.advance_peer_collected(header.cursor);
-        messages.push(ReceivedMessage {
-            sent_at_ms: sent_at,
-            body: body.to_vec(),
-        });
-        collected += 1;
-    }
+            RingStep::End => break None,
+            RingStep::Unopened(unopened) => break Some(unopened),
+        }
+    };
     Ok(RingRead {
         messages,
         collected,
         unopened,
+    })
+}
+
+/// Read and open the one ring slot that holds sequence `seq`, as [`read_ring`]
+/// does for each slot it reads. The key schedule and the correspondent's
+/// cursor in `ring` move only where the message opens.
+fn read_ring_slot<R: Records>(
+    records: &mut R,
+    conversation: &mut Conversation,
+    ring: &mut Ring,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    seq: u64,
+) -> Result<RingStep, FlowError> {
+    let Some(raw) = records.read_channel(lookup_key, channel::slot_for(seq))? else {
+        return Ok(RingStep::End);
+    };
+    let Ok((header, sealed)) = channel::MessageHeader::decode(&raw) else {
+        return Ok(RingStep::End);
+    };
+    if header.seq != seq {
+        return Ok(RingStep::End);
+    }
+    // `open` changes the key schedule only once the message has opened.
+    let opened = match conversation.open(&header, sealed) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return Ok(RingStep::Unopened(Unopened {
+                seq,
+                subkey: channel::slot_for(seq),
+                error,
+            }));
+        }
+    };
+    let plaintext = Zeroizing::new(opened);
+    let (sent_at, body) = channel::decode_message_plaintext(&plaintext)?;
+    ring.advance_peer_collected(header.cursor);
+    Ok(RingStep::Message {
+        seq,
+        message: ReceivedMessage {
+            sent_at_ms: sent_at,
+            body: body.to_vec(),
+        },
+        outbox_error: None,
     })
 }
 
@@ -2263,6 +2303,133 @@ pub fn send_message<R: Records>(
     Ok(seq)
 }
 
+/// What one step of a ring read found at the slot of the next sequence.
+#[derive(Debug)]
+pub enum RingStep {
+    /// The message at that sequence opened. From [`collect_step`], the
+    /// conversation record already counts it collected.
+    Message {
+        /// Its sequence number.
+        seq: u64,
+        /// The opened message.
+        message: ReceivedMessage,
+        /// Why the outbox entries the correspondent's cursor passed were not
+        /// deleted after the message was recorded, where they were not. The
+        /// message stands; the next step or collection deletes them.
+        outbox_error: Option<StoreError>,
+    },
+    /// The slot holds no message for that sequence: the read is at the end of
+    /// what the correspondent has written.
+    End,
+    /// The slot's header names that sequence and its message does not open
+    /// under this conversation; the slot is read again by the next collection.
+    Unopened(Unopened),
+}
+
+/// Read the next message of a correspondent's ring and record it collected —
+/// one slot of [`collect_batch`].
+///
+/// Where the message opens, the advanced key schedule, the collection cursor
+/// past it and the correspondent's cursor it carries are persisted before the
+/// message is returned, so a message this returns is one a restart has
+/// recorded as read and will not read again, and an error leaves the record
+/// where it was. Outbox entries the correspondent's cursor passed are then
+/// deleted; a deletion the store refuses is reported in the step's
+/// `outbox_error` rather than as an error, because the message is recorded.
+/// Nothing is written to the network: the cursor is published by
+/// [`publish_cursor`], after the reads it covers.
+///
+/// Refused as [`collect_batch`] is: [`FlowError::DeletePending`] for a
+/// conversation marked for delete, at the load or at the commit, and
+/// [`FlowError::AwaitingAcceptance`] while this side's acceptance is not
+/// finished.
+pub fn collect_step<R: Records>(
+    store: &Store,
+    records: &mut R,
+    peer: &CorrespondenceLabel,
+) -> Result<RingStep, FlowError> {
+    let state = load(store, peer)?;
+    if state.delete_pending {
+        return Err(FlowError::DeletePending);
+    }
+    if state.acceptance_pending {
+        return Err(FlowError::AwaitingAcceptance);
+    }
+    let incoming = state.incoming_lookup_key;
+    let loaded_forced = state.conversation.sending.force_turn;
+    let seq = state.my_collected;
+    let mut conversation = Conversation::restore(state.conversation);
+    let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
+    let mut step = read_ring_slot(records, &mut conversation, &mut ring, &incoming, seq)?;
+    if !matches!(step, RingStep::Message { .. }) {
+        return Ok(step);
+    }
+    store.try_update_conv(peer, |state| {
+        refuse_if_marked(state)?;
+        write_conversation(state, &conversation, loaded_forced);
+        state.my_collected = seq + 1;
+        state.peer_collected = ring.peer_collected();
+        Ok::<_, FlowError>(())
+    })??;
+    if let (Err(e), RingStep::Message { outbox_error, .. }) = (
+        store.delete_outbox_through(peer, ring.peer_collected()),
+        &mut step,
+    ) {
+        *outbox_error = Some(e);
+    }
+    Ok(step)
+}
+
+/// Publish this side's collection cursor to its control subkey where the
+/// published cursor is behind the recorded one, and report whether it wrote.
+///
+/// The cursor published is the one the conversation record holds, so it never
+/// runs ahead of what is persisted as read. At most one write. Refused with
+/// [`FlowError::DeletePending`] and [`FlowError::AwaitingAcceptance`] as
+/// [`collect_step`] is.
+pub fn publish_cursor<R: Records>(
+    store: &Store,
+    records: &mut R,
+    peer: &CorrespondenceLabel,
+) -> Result<bool, FlowError> {
+    let state = load(store, peer)?;
+    if state.delete_pending {
+        return Err(FlowError::DeletePending);
+    }
+    if state.acceptance_pending {
+        return Err(FlowError::AwaitingAcceptance);
+    }
+    let collected = state.my_collected;
+    if collected <= state.cursor_published {
+        return Ok(false);
+    }
+    let key = state
+        .own_control_key
+        .as_ref()
+        .ok_or(FlowError::Incomplete("control key of its own"))?;
+    let opening_bytes = state
+        .own_opening
+        .as_ref()
+        .ok_or(FlowError::Incomplete("channel opening of its own"))?;
+    let control = channel::seal_control_with_key(
+        key,
+        &Control {
+            opening: Some(ChannelOpening::decode(opening_bytes.as_slice())?),
+            collected_cursor: collected,
+            closed: false,
+        },
+    )?;
+    records.write_channel(
+        &state.outgoing_lookup_key,
+        channel::CONTROL_SUBKEY,
+        &control,
+    )?;
+    store.update_conv(peer, |state| {
+        state.cursor_published = state.cursor_published.max(collected);
+    })?;
+    Ok(true)
+}
+
 /// What one collection batch read and published.
 #[derive(Debug)]
 pub struct Batch {
@@ -2278,10 +2445,20 @@ pub struct Batch {
     /// channel records, or hold a message that will not decrypt; it is read
     /// again by the next collection.
     pub unopened: Option<Unopened>,
+    /// The failure that ended the ring read after a message was recorded, or
+    /// `None` where it ended at an empty or unopened slot. The messages
+    /// recorded before it are in `messages`.
+    pub stopped: Option<FlowError>,
 }
 
 /// Read everything the correspondent has written since this side's cursor and
 /// publish the new cursor — § Flows, *Ordinary message*, the recipient half.
+///
+/// [`collect_step`] until the ring ends or stops at a message that does not
+/// open, then [`publish_cursor`]. Each message is recorded as read before the
+/// next slot is read, and the cursor is persisted before it is published, so a
+/// stop at any point leaves a record the next batch carries on from: nothing
+/// it returned is read again and nothing it did not return was recorded.
 ///
 /// At most one write: the cursor, as a control record, and only where the
 /// published cursor is behind the collection cursor. The two are separate
@@ -2294,6 +2471,12 @@ pub struct Batch {
 /// control write without the opening erases it from the channel, and the
 /// signature is randomized, so it cannot be rebuilt to the same bytes.
 ///
+/// A read that fails after a message was recorded ends the read there: the
+/// messages recorded are returned with the failure in [`Batch::stopped`], and
+/// the cursor covering them is published. The failure is returned as the error
+/// only where nothing was read. A refused outbox deletion is retried by the
+/// batch's next step or the next batch.
+///
 /// Refused with [`FlowError::AwaitingAcceptance`] while this side's acceptance
 /// of the correspondent's first contact is not finished. The step that finishes
 /// it records the collection and the key schedule, so a batch run before it
@@ -2304,67 +2487,28 @@ pub fn collect_batch<R: Records>(
     records: &mut R,
     peer: &CorrespondenceLabel,
 ) -> Result<Batch, FlowError> {
-    let state = load(store, peer)?;
-    if state.delete_pending {
-        return Err(FlowError::DeletePending);
-    }
-    if state.acceptance_pending {
-        return Err(FlowError::AwaitingAcceptance);
-    }
-    let incoming = state.incoming_lookup_key;
-    let outgoing = state.outgoing_lookup_key;
-    let loaded_forced = state.conversation.sending.force_turn;
-    let mut conversation = Conversation::restore(state.conversation);
-    let mut ring = Ring::restore(state.send_seq, state.peer_collected)?;
-    let read = read_ring(
-        records,
-        &mut conversation,
-        &mut ring,
-        &incoming,
-        state.my_collected,
-    )?;
-    store.try_update_conv(peer, |state| {
-        refuse_if_marked(state)?;
-        write_conversation(state, &conversation, loaded_forced);
-        state.my_collected = read.collected;
-        state.peer_collected = ring.peer_collected();
-        Ok::<_, FlowError>(())
-    })??;
-    store.delete_outbox_through(peer, ring.peer_collected())?;
-
-    if read.collected <= state.cursor_published {
-        return Ok(Batch {
-            messages: read.messages,
-            my_collected: read.collected,
-            cursor_published: false,
-            unopened: read.unopened,
-        });
-    }
-    let key = state
-        .own_control_key
-        .as_ref()
-        .ok_or(FlowError::Incomplete("control key of its own"))?;
-    let opening_bytes = state
-        .own_opening
-        .as_ref()
-        .ok_or(FlowError::Incomplete("channel opening of its own"))?;
-    let control = channel::seal_control_with_key(
-        key,
-        &Control {
-            opening: Some(ChannelOpening::decode(opening_bytes.as_slice())?),
-            collected_cursor: read.collected,
-            closed: false,
-        },
-    )?;
-    records.write_channel(&outgoing, channel::CONTROL_SUBKEY, &control)?;
-    store.update_conv(peer, |state| {
-        state.cursor_published = read.collected;
-    })?;
+    let mut messages = Vec::new();
+    let mut stopped = None;
+    let unopened = loop {
+        match collect_step(store, records, peer) {
+            Ok(RingStep::Message { message, .. }) => messages.push(message),
+            Ok(RingStep::End) => break None,
+            Ok(RingStep::Unopened(unopened)) => break Some(unopened),
+            Err(e) if messages.is_empty() => return Err(e),
+            Err(e) => {
+                stopped = Some(e);
+                break None;
+            }
+        }
+    };
+    let cursor_published = publish_cursor(store, records, peer)?;
+    let my_collected = load(store, peer)?.my_collected;
     Ok(Batch {
-        messages: read.messages,
-        my_collected: read.collected,
-        cursor_published: true,
-        unopened: read.unopened,
+        messages,
+        my_collected,
+        cursor_published,
+        unopened,
+        stopped,
     })
 }
 
@@ -2491,6 +2635,8 @@ mod tests {
         before_message_read: Option<Box<dyn FnOnce()>>,
         /// Every channel subkey read, control and message alike.
         channel_reads: usize,
+        /// Every control subkey read.
+        control_reads: usize,
         /// Every write, as the flow asked for it: a batch as one entry naming
         /// its writes in order, a single write as its own.
         write_calls: Vec<WriteCall>,
@@ -2675,6 +2821,9 @@ mod tests {
         ) -> Result<Option<Vec<u8>>, RecordError> {
             self.channel_reads += 1;
             self.network_reads += 1;
+            if subkey == channel::CONTROL_SUBKEY {
+                self.control_reads += 1;
+            }
             if let Some(hook) = self
                 .before_message_read
                 .take_if(|_| subkey != channel::CONTROL_SUBKEY)
@@ -3332,6 +3481,146 @@ mod tests {
         assert!(net.writes.bytes > 0, "the write carried bytes");
         assert_eq!(net.writes.ring, 1, "one ring slot");
         assert_eq!(net.writes.total(), 1, "an ordinary message is one write");
+    }
+
+    /// A collection step whose outbox deletion the store refuses still returns
+    /// the message it recorded, once, with the refusal beside it; the next step
+    /// reads on past it.
+    #[test]
+    fn a_refused_outbox_deletion_keeps_the_recorded_message() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let mut entropy = Seeded::at(53);
+        send_message(
+            &b.store(),
+            &mut net,
+            &accepted.peer,
+            b"kept",
+            |x| entropy.fill(x),
+            NOW,
+        )
+        .expect("B sends");
+        crate::dm::store::refuse_next_outbox_delete();
+        let step = collect_step(&a.store(), &mut net, &peer_a).expect("the message is returned");
+        let RingStep::Message {
+            seq,
+            message,
+            outbox_error,
+        } = step
+        else {
+            panic!("expected the message, got {step:?}");
+        };
+        assert_eq!((seq, message.body.as_slice()), (1, b"kept".as_slice()));
+        assert!(outbox_error.is_some(), "the refusal is reported");
+        let next = collect_step(&a.store(), &mut net, &peer_a).expect("A reads on");
+        assert!(matches!(next, RingStep::End), "read twice: {next:?}");
+    }
+
+    /// Recognising an acceptance reads the correspondent's control subkey
+    /// once: the opening that verifies the hello back and the cursor the
+    /// acceptance takes come from the same read.
+    #[test]
+    fn recognising_an_acceptance_reads_the_control_subkey_once() {
+        let (a, b, mut net) = scene();
+        a_opens(&a, &b, &mut net, b"the first message");
+        b_accepts(&b, &mut net, b"the reply");
+        let control_before = net.control_reads;
+        let surfaced =
+            collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
+        let accepted: Vec<&Acceptance> = surfaced
+            .iter()
+            .filter_map(|item| match item {
+                Surfaced::Accepted(acceptance) => Some(acceptance),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(accepted.len(), 1, "A recognised one acceptance");
+        assert_eq!(
+            accepted[0].messages.len(),
+            1,
+            "the reply was read with the acceptance"
+        );
+        assert_eq!(accepted[0].peer_cursor, 0, "the cursor was taken");
+        assert_eq!(
+            net.control_reads - control_before,
+            1,
+            "one control read per recognition"
+        );
+    }
+
+    /// A collection step records each message read before returning it: a
+    /// store opened afresh after the step, as a restart opens it, carries on at
+    /// the next sequence, so nothing returned is read again and nothing is
+    /// skipped. The cursor is published only after, and only as far as, what
+    /// the record holds.
+    #[test]
+    fn a_collection_step_records_its_message_before_returning_it() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let store_b = b.store();
+        let mut entropy = Seeded::at(47);
+        for body in [b"second".as_slice(), b"third".as_slice()] {
+            send_message(
+                &store_b,
+                &mut net,
+                &accepted.peer,
+                body,
+                |x| entropy.fill(x),
+                NOW,
+            )
+            .expect("B sends");
+        }
+        net.reset_writes();
+        let published_before = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("a record")
+            .cursor_published;
+
+        let first = collect_step(&a.store(), &mut net, &peer_a).expect("A reads one slot");
+        let RingStep::Message { seq, message, .. } = first else {
+            panic!("the first step found no message: {first:?}");
+        };
+        assert_eq!((seq, message.body.as_slice()), (1, b"second".as_slice()));
+        let recorded = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("a record");
+        assert_eq!(
+            recorded.my_collected, 2,
+            "the step returned an unrecorded read"
+        );
+        assert_eq!(
+            recorded.cursor_published, published_before,
+            "a step published a cursor"
+        );
+        assert_eq!(net.writes.total(), 0, "a step wrote to the network");
+
+        // A restart: every step opens the store afresh.
+        let second = collect_step(&a.store(), &mut net, &peer_a).expect("A reads on");
+        let RingStep::Message { seq, message, .. } = second else {
+            panic!("the restarted read found no message: {second:?}");
+        };
+        assert_eq!((seq, message.body.as_slice()), (2, b"third".as_slice()));
+        let end = collect_step(&a.store(), &mut net, &peer_a).expect("A reads the end");
+        assert!(matches!(end, RingStep::End), "read past the end: {end:?}");
+
+        assert!(publish_cursor(&a.store(), &mut net, &peer_a).expect("A publishes"));
+        assert_eq!(net.writes.control, 1);
+        let state = a
+            .store()
+            .load_conv(&peer_a)
+            .expect("load")
+            .expect("a record");
+        assert_eq!((state.my_collected, state.cursor_published), (3, 3));
+        assert!(!publish_cursor(&a.store(), &mut net, &peer_a).expect("current"));
+        let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("A collects");
+        assert!(
+            batch.bodies().is_empty(),
+            "a recorded message was read again"
+        );
     }
 
     /// A collection batch publishes its cursor in at most one write, and
@@ -6702,8 +6991,7 @@ mod tests {
         assert_eq!(acceptance.lookup_key, accepted.outgoing_lookup_key);
         assert_eq!(acceptance.bodies(), vec![b"the reply".to_vec()]);
         assert_eq!(
-            acceptance.peer_cursor,
-            Some(0),
+            acceptance.peer_cursor, 0,
             "the acceptance publishes B's persisted cursor; its next batch publishes the collection"
         );
         assert_eq!(net.writes.erase, 1, "the collected hello slot is erased");
@@ -7794,8 +8082,7 @@ mod tests {
             collect(&a.store(), &mut net, &a.me(), &a.advert_keys, |_| false).expect("A collects");
         match surfaced.as_slice() {
             [Surfaced::Accepted(acceptance)] => assert_eq!(
-                acceptance.peer_cursor,
-                Some(0),
+                acceptance.peer_cursor, 0,
                 "B published a collection it had not recorded"
             ),
             other => panic!("expected one acceptance, got {other:?}"),

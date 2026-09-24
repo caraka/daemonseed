@@ -134,7 +134,10 @@ pub struct DmRailRow {
     pub label: String,
     /// How long ago the item last changed: "now", "2m", "1h", "3d".
     pub age: String,
-    /// Whether something arrived in the item that the user has not viewed.
+    /// Whether the row shows the unread dot: something arrived in the item
+    /// that the user has not viewed, and its thread is not in the main pane.
+    /// A selected item whose thread a room has replaced in the main pane
+    /// shows it.
     pub unread: bool,
     /// Whether the item is the selected one.
     pub selected: bool,
@@ -228,7 +231,8 @@ struct Composed {
     /// opened.
     opens_conversation: bool,
     /// How many thread rows not composed here the conversation held when it
-    /// was composed: it is drawn after them.
+    /// was composed: it is drawn after them, and after every later one sent no
+    /// later than the second it was composed in.
     after: usize,
     /// Its sequence number, once the runner reports it held.
     seq: Option<u64>,
@@ -441,7 +445,7 @@ impl GuiDm {
                 .filter(|m| m.first_contact && m.seq.is_none() && m.refusal.is_some())
             {
                 let held = c.thread.iter().any(|row| {
-                    matches!(row, DmThreadRow::Sent { seq: 0, body: Some(body) } if *body == m.body)
+                    matches!(row, DmThreadRow::Sent { seq: 0, body: Some(body), .. } if *body == m.body)
                 });
                 if held {
                     m.seq = Some(0);
@@ -584,7 +588,7 @@ impl GuiDm {
             slot: format!("{}{id}", key.kind.letter()),
             label,
             age: at_ms.map_or_else(String::new, |at| dm_age_text(at, now_ms)),
-            unread,
+            unread: unread && !self.viewing(&key),
             selected: self.selected.as_ref() == Some(&key),
             blocking: key.kind == DmItemKind::Request && self.state.blocking.contains(&key.peer),
             key,
@@ -644,6 +648,24 @@ fn activity_marks(state: &DmState) -> BTreeMap<IdentityPk, (usize, u64)> {
         .collect()
 }
 
+/// Whether a composed message goes above `row`. A row this side sent, where the
+/// message has its sequence, goes by sequence alone: one direction is always in
+/// sequence order, whatever time a row carries. Otherwise the row was sent in a
+/// later whole second than the message was composed in. A correspondent's time
+/// is carried to the second, so both are compared at that grain.
+fn composed_before(m: &Composed, row: &DmThreadRow) -> bool {
+    if let (DmThreadRow::Sent { seq, .. }, Some(mine)) = (row, m.seq) {
+        return mine < *seq;
+    }
+    let row_ms = match row {
+        DmThreadRow::Received { sent_at_ms, .. } | DmThreadRow::Sent { sent_at_ms, .. } => {
+            *sent_at_ms
+        }
+    };
+    let composed_ms = u64::try_from(m.composed_at_ms).unwrap_or(0);
+    row_ms / 1000 > composed_ms / 1000
+}
+
 /// A thread row as the thread view draws it, `delivered` saying which of this
 /// side's sequences the correspondent has collected.
 fn thread_row(delivered: impl Fn(u64) -> bool) -> impl Fn(&DmThreadRow) -> DmMessageRow {
@@ -656,7 +678,7 @@ fn thread_row(delivered: impl Fn(u64) -> bool) -> impl Fn(&DmThreadRow) -> DmMes
             status: None,
             at_ms: Some(unix_ms_i64(*sent_at_ms)),
         },
-        DmThreadRow::Sent { seq, body } => DmMessageRow {
+        DmThreadRow::Sent { seq, body, .. } => DmMessageRow {
             outgoing: true,
             body: body.clone().unwrap_or_else(|| format!("message {seq}")),
             status: Some(if delivered(*seq) {
@@ -1185,6 +1207,14 @@ impl GuiState {
         self.dm.is_open(section)
     }
 
+    /// Whether room `idx`'s rail row shows the unread dot: the room is unread
+    /// and its chat is not in the main pane. The active room shows it while a
+    /// direct-message thread or a placeholder has the main pane.
+    pub fn room_row_unread(&self, idx: usize) -> bool {
+        self.metas().get(idx).is_some_and(|c| c.unread)
+            && !(idx == self.active() && self.main_pane() == MainPane::Chat)
+    }
+
     /// Whether anything in `section` is unread: for Chats, any room's unread
     /// dot; for Direct messages, any request or conversation.
     pub fn rail_section_unread(&self, section: RailSection) -> bool {
@@ -1315,7 +1345,7 @@ impl GuiState {
             {
                 continue;
             }
-            while let Some(m) = next.next_if(|m| m.after <= foreign) {
+            while let Some(m) = next.next_if(|m| m.after <= foreign && composed_before(m, row)) {
                 rows.push(composed_row(m));
             }
             rows.push(draw(row));
@@ -2425,7 +2455,7 @@ mod tests {
         let thread = st.dm_thread_view().expect("the conversation is selected");
         let times: Vec<(bool, Option<i64>)> =
             thread.rows.iter().map(|r| (r.outgoing, r.at_ms)).collect();
-        assert_eq!(times, [(true, None), (false, Some(1_000))]);
+        assert_eq!(times, [(false, Some(1_000)), (true, None)]);
     }
 
     /// The token and body of the one command `st` queued.
@@ -2598,12 +2628,13 @@ mod tests {
         st.select_dm_item(&conversation(1));
         assert!(st.send_dm("a"));
         let a = only_token(&mut st);
+        let later = u64::try_from(now_unix_ms()).expect("a clock past the epoch") + 60_000;
         st.on_dm_event(&RunnerEvent::Message {
             from: peer,
             seq: 0,
             body: b"b".to_vec(),
-            sent_at: 1,
-            received_at: 1,
+            sent_at: later,
+            received_at: later,
         });
         assert!(st.send_dm("c"));
         let c = only_token(&mut st);
@@ -2618,6 +2649,34 @@ mod tests {
         });
         let bodies: Vec<String> = thread_rows(&st).into_iter().map(|(b, _)| b).collect();
         assert_eq!(bodies, ["a", "b", "c"]);
+    }
+
+    /// A thread is in conversation order: a reply sent before a message
+    /// composed here, and heard of after it, is drawn above it, and one sent
+    /// after it below.
+    #[test]
+    fn a_reply_sent_before_a_composed_message_is_drawn_above_it() {
+        let (mut st, peer) = with_conversation(1);
+        st.select_dm_item(&conversation(1));
+        assert!(st.send_dm("mine"));
+        let mine = only_token(&mut st);
+        st.on_dm_event(&RunnerEvent::Sent {
+            token: mine,
+            peer,
+            seq: 0,
+        });
+        let now = u64::try_from(now_unix_ms()).expect("a clock past the epoch");
+        for (seq, body, sent_at) in [(0, "earlier", now - 60_000), (1, "later", now + 60_000)] {
+            st.on_dm_event(&RunnerEvent::Message {
+                from: peer,
+                seq,
+                body: body.as_bytes().to_vec(),
+                sent_at,
+                received_at: now + 120_000,
+            });
+        }
+        let bodies: Vec<String> = thread_rows(&st).into_iter().map(|(b, _)| b).collect();
+        assert_eq!(bodies, ["earlier", "mine", "later"]);
     }
 
     /// An unreadable block list is a notice while it lasts.

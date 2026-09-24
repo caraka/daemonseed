@@ -131,20 +131,22 @@ component RailRow inherits Rectangle {
             border-width: 1px; border-color: #ffffff14;
             Text { text: root.initial; color: #8b93a1; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
         }
+        // Stretches and elides, so the unread dot keeps its place inside the row.
         VerticalLayout {
             alignment: center; spacing: 2px;
+            horizontal-stretch: 1;
             HorizontalLayout {
                 spacing: 6px;
-                Text { text: root.name; color: #d6dae1; font-size: 14px; vertical-alignment: center; }
+                Text { text: root.name; color: #d6dae1; font-size: 14px; vertical-alignment: center; overflow: elide; }
                 if root.pinned : Text { text: "PINNED"; color: #555d6a; font-size: 9px; vertical-alignment: center; }
             }
-            Text { text: root.sub; color: #5b6472; font-size: 12px; }
+            Text { text: root.sub; color: #5b6472; font-size: 12px; overflow: elide; }
         }
         Rectangle { }
-        // #64: unread dot — unseen activity in a room you're not focused on. The
-        // active row never shows it (state clears unread on focus), but gate on
-        // !selected too so it can never linger on the focused row.
-        if root.unread && !root.selected : Rectangle {
+        // #64: unread dot — unseen activity in a room whose chat is not on
+        // screen. Rust decides it, so the active room shows it while a direct
+        // message has the main pane.
+        if root.unread : Rectangle {
             width: 8px; height: 8px; border-radius: 4px; background: #4a9d8e;
         }
     }
@@ -323,8 +325,9 @@ component DmRailRowView inherits Rectangle {
         VerticalLayout {
             width: 8px;
             alignment: center;
-            // Never on the selected row, mirroring the room dot.
-            if root.item.unread && !root.item.selected : Rectangle {
+            // Rust decides it: never on the thread in the main pane, and on a
+            // selected row whose thread a room has replaced there.
+            if root.item.unread : Rectangle {
                 width: 8px; height: 8px; border-radius: 4px; background: #4a9d8e;
             }
         }

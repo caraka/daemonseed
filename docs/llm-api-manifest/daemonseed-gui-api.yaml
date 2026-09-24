@@ -73,7 +73,11 @@ library:
 # budget has passed.
 # `NetEvent::Dm(Arc<RunnerEvent>)` reaches `GuiState::on_dm_event`, and the
 # binary then redraws the rail's Chats and Direct messages sections, the main pane
-# and the selected thread. For `RunnerEvent::StartedOver`, `on_dm_event` appends
+# and the selected thread. A room or conversation row shows the unread dot while it
+# is unread and its chat or thread is not in the main pane, whether or not it is the
+# active room or selected item; a section header's dot sums its rows. A message
+# composed here is drawn after the thread rows sent no later than the second it was
+# composed in. For `RunnerEvent::StartedOver`, `on_dm_event` appends
 # `TrustEventKey::DmCorrespondentStateLost` to `GuiState::trust_log`, the audit
 # log. A queued command `NetHandle::dm` cannot hand over, because the network
 # thread is gone, is folded back as `RunnerEvent::Refused { reason:

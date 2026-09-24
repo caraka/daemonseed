@@ -38,10 +38,17 @@
 //!
 //! ## Schedule
 //!
-//! - **Collection**, every [`RunnerConfig::tick`] jittered by ±20 %: the drop
-//!   scan, every established conversation's ring, the correspondent's published
-//!   cursor where messages are outstanding, and the delivery reports those
-//!   produce. While a conversation waits on the correspondent — a first contact
+//! - **Collection**, every [`RunnerConfig::tick`] jittered by ±20 %: every
+//!   established conversation's ring, the correspondent's published cursor
+//!   where messages are outstanding, and the delivery reports those produce;
+//!   then the drop scan, where one is due; then the preview of every request
+//!   that scan surfaced. A ring is read a slot at a time, and each message is
+//!   reported as its slot opens, once the store has recorded it read. The drop
+//!   is scanned on every pass while a conversation awaits acceptance, whose
+//!   answer arrives there, and otherwise [`DROP_SCAN_TICKS`] jittered ticks
+//!   after the last scan, so a scan that takes minutes holds back only
+//!   strangers' requests and not the conversations already established.
+//!   While a conversation waits on the correspondent — a first contact
 //!   awaiting acceptance, or an acceptance whose hello back the correspondent
 //!   has not yet shown it read — and for at most a quarter of an hour after
 //!   this runner started, sent a first contact or accepted one, collection runs
@@ -109,15 +116,17 @@
 //! each under a [`ContactRequestId`] that names this run as well as the hello,
 //! so an id from an earlier run is refused. The verified request behind an id
 //! is held in memory and replaced on every complete scan. A held contact
-//! request is previewed as the schedule's next step, ahead of anything else
-//! due: [`flows::preview`] reads its opening, advert and ring without writing,
+//! request is previewed directly after the scan that surfaced it, before any
+//! conversation is read again, and a request left without one is previewed
+//! as the schedule's next step, ahead of anything else due:
+//! [`flows::preview`] reads its opening, advert and ring without writing,
 //! a [`RunnerEvent::RequestPreview`] carries the messages, and the values read
 //! answer an accept of the request for [`PREVIEW_READS_TTL`] through
 //! [`flows::CachedRecords`]. Every network read of a preview or an accept is
 //! traced with its duration. A blocked sender's
 //! hello and a rewrite of a hello already collected only move a
 //! [`HealthCounters`] field, and so does a verified hello the scan could not
-//! settle. A message's sequence number is derived from the collection cursor
+//! settle. A message's sequence number is the ring position it was read at
 //! and its `received_at` is stamped here; its `sent_at` is the correspondent's
 //! clock, read from inside the message's encryption. Every
 //! command that carries a [`CommandToken`] is answered by an event carrying it.
@@ -180,6 +189,17 @@ pub const DEFAULT_TICK: Duration = Duration::from_secs(60);
 /// ring read and at most one control read per established conversation, so this
 /// adds at most four passes a minute over [`DEFAULT_TICK`]'s one, and no write.
 const WAITING_TICK: Duration = Duration::from_secs(12);
+
+/// How many collection intervals, before jitter, a drop scan waits after the
+/// last one, where no conversation awaits acceptance.
+///
+/// A scan reads every drop slot, and each read can take tens of seconds on the
+/// network, so a scan can outlast several intervals. Only a contact request
+/// from a stranger waits on it then, and five intervals keep that wait to
+/// minutes at [`DEFAULT_TICK`] while leaving most passes to the conversations
+/// already established. A conversation awaiting acceptance is answered through
+/// the drop, so it has the drop scanned on every pass.
+pub const DROP_SCAN_TICKS: u32 = 5;
 
 /// How long after this runner starts, sends a first contact or accepts one that
 /// [`WAITING_TICK`] can apply. A correspondent who has not answered by then may
@@ -1927,6 +1947,9 @@ struct Runner<R> {
     /// Until when [`WAITING_TICK`] may apply.
     waiting_until: Instant,
     next_advert_poll: Instant,
+    /// When a collection pass next scans the drop where no conversation awaits
+    /// acceptance.
+    next_drop_scan: Instant,
     last_scan: Option<Instant>,
     /// Whether the last drop scan left a slot unread, so a first contact's
     /// acceptance may be in the drop unseen.
@@ -2029,6 +2052,7 @@ impl<R: RunnerRecords> Runner<R> {
             next_tick: now + jittered(config.tick),
             waiting_until: now + WAITING_WINDOW,
             next_advert_poll: now + advert::next_poll_interval_os(),
+            next_drop_scan: now,
             last_scan: None,
             last_scan_partial: false,
             answering: None,
@@ -2514,6 +2538,7 @@ impl<R: RunnerRecords> Runner<R> {
             self.serve_queued().await?;
         }
         self.last_scan = Some(Instant::now());
+        self.next_drop_scan = Instant::now() + jittered(self.config.tick * DROP_SCAN_TICKS);
         let partial = self.records.failed_drop_reads > unread_before;
         self.last_scan_partial = partial;
         let ms = started.elapsed().as_millis();
@@ -3463,6 +3488,7 @@ impl<R: RunnerRecords> Runner<R> {
             .is_none_or(|at| at.elapsed() >= self.config.tick);
         if awaiting && scan_stale {
             self.scan_drop().await?;
+            self.preview_requests().await?;
         }
         self.check_stop()?;
         if let Ok(Some(conv)) = self.load_one(peer) {
@@ -3488,20 +3514,24 @@ impl<R: RunnerRecords> Runner<R> {
         Ok(())
     }
 
-    /// One collection pass: the drop, then every established conversation whose
-    /// delete is not under way.
+    /// One collection pass: every established conversation whose delete is not
+    /// under way, then the drop where a scan is due, then the preview of every
+    /// request that scan surfaced. A scan is due where a conversation awaits
+    /// acceptance, and otherwise [`DROP_SCAN_TICKS`] intervals after the last.
     async fn collect_tick(&mut self) -> Result<(), Halt> {
         crate::vtrace!("dm runner: collection starts");
-        let Some(blocked) = self.scan_drop().await? else {
+        let Some(mut blocked) = self.readable_block_list() else {
+            // The scan reports the unreadable list, and reads nothing.
+            self.scan_drop().await?;
             crate::vtrace!("dm runner: collection done, block list unreadable, drop not scanned");
             return Ok(());
         };
         let Ok(convs) = self.load_convs() else {
-            crate::vtrace!("dm runner: collection done, drop only, the store would not load");
+            crate::vtrace!("dm runner: collection done, the store would not load");
             return Ok(());
         };
+        let awaiting = convs.iter().any(|conv| conv.state.awaiting_acceptance);
         let mut collected = 0usize;
-        let mut blocked = blocked;
         for listed in &convs {
             self.check_stop()?;
             // A command served here may have changed this conversation or the
@@ -3515,7 +3545,20 @@ impl<R: RunnerRecords> Runner<R> {
                         reloaded = conv;
                         &reloaded
                     }
-                    Ok(None) | Err(()) => continue,
+                    Ok(None) => {
+                        crate::vtrace!(
+                            "dm runner: {} not collected, deleted by a command",
+                            tag(&listed.peer)
+                        );
+                        continue;
+                    }
+                    Err(()) => {
+                        crate::vtrace!(
+                            "dm runner: {} not collected, the store would not load it",
+                            tag(&listed.peer)
+                        );
+                        continue;
+                    }
                 }
             } else {
                 listed
@@ -3523,7 +3566,13 @@ impl<R: RunnerRecords> Runner<R> {
             if self.served_since {
                 match self.readable_block_list() {
                     Some(list) => blocked = list,
-                    None => continue,
+                    None => {
+                        crate::vtrace!(
+                            "dm runner: {} not collected, the block list will not read",
+                            tag(&listed.peer)
+                        );
+                        continue;
+                    }
                 }
             }
             if conv.state.awaiting_acceptance
@@ -3537,49 +3586,96 @@ impl<R: RunnerRecords> Runner<R> {
             collected += 1;
         }
         crate::vtrace!(
-            "dm runner: collection done, {collected} of {} conversation(s) collected",
+            "dm runner: {collected} of {} conversation(s) collected",
             convs.len()
         );
+        self.check_stop()?;
+        self.serve_queued().await?;
+        if awaiting || Instant::now() >= self.next_drop_scan {
+            self.scan_drop().await?;
+            self.preview_requests().await?;
+        }
+        crate::vtrace!("dm runner: collection done");
         Ok(())
     }
 
-    /// Read one established conversation's ring, then its correspondent's
-    /// cursor where messages are outstanding, and report what was delivered.
+    /// Read one established conversation's ring a slot at a time, reporting
+    /// each message as soon as its slot has opened and the store has recorded
+    /// it read, then publish the cursor, read the correspondent's cursor where
+    /// messages are outstanding, and report what was delivered. The commands
+    /// queued meanwhile are served between slots, and a slot is not read for a
+    /// conversation a command deleted or blocked.
     async fn collect_conversation(&mut self, conv: &LoadedConv) -> Result<(), Halt> {
         let peer = conv.peer;
+        let identity = conv.state.peer_identity_pk.clone();
         crate::vtrace!("dm runner: collection of {} starts", tag(&peer));
         let started = std::time::Instant::now();
-        match flows::collect_batch(&self.store, &mut self.records, &peer) {
-            Ok(batch) => {
-                crate::vtrace!(
-                    "dm runner: collected {} message(s) on {} in {} ms, cursor {}{}",
-                    batch.messages.len(),
-                    tag(&peer),
-                    started.elapsed().as_millis(),
-                    batch.my_collected,
-                    if batch.cursor_published {
-                        ", published"
-                    } else {
-                        ""
+        let mut read = 0usize;
+        loop {
+            match flows::collect_step(&self.store, &mut self.records, &peer) {
+                Ok(flows::RingStep::Message {
+                    seq,
+                    message,
+                    outbox_error,
+                }) => {
+                    read += 1;
+                    if let Some(e) = outbox_error {
+                        crate::vtrace!(
+                            "dm runner: {} outbox not trimmed after sequence {seq}, {e:?}",
+                            tag(&peer)
+                        );
+                        self.records.health.store_failures += 1;
                     }
-                );
-                if let Some(unopened) = &batch.unopened {
-                    self.note_unopened(&peer, unopened);
+                    self.emit_bodies(peer, seq, vec![message]).await?;
                 }
-                let first = batch
-                    .my_collected
-                    .saturating_sub(batch.messages.len() as u64);
-                self.emit_bodies(peer, first, batch.messages).await?;
+                Ok(flows::RingStep::End) => break,
+                Ok(flows::RingStep::Unopened(unopened)) => {
+                    self.note_unopened(&peer, &unopened);
+                    break;
+                }
+                Err(e) => {
+                    crate::vtrace!(
+                        "dm runner: collection of {} failed after {} ms, {e:?}",
+                        tag(&peer),
+                        started.elapsed().as_millis()
+                    );
+                    note_failure(&mut self.records.health, &e);
+                    break;
+                }
             }
-            Err(e) => {
-                crate::vtrace!(
-                    "dm runner: collection of {} failed after {} ms, {e:?}",
-                    tag(&peer),
-                    started.elapsed().as_millis()
-                );
-                note_failure(&mut self.records.health, &e);
+            self.check_stop()?;
+            self.served_since = false;
+            self.serve_queued().await?;
+            if self.served_since {
+                let stop = match self.load_one(&peer) {
+                    Ok(Some(conv)) if !conv.state.delete_pending => None,
+                    Ok(Some(_) | None) => Some("deleted by a command"),
+                    Err(()) => Some("the store would not load it"),
+                };
+                let stop = stop.or_else(|| match self.readable_block_list() {
+                    None => Some("the block list will not read"),
+                    Some(list) if list.is_blocked(&identity) => Some("blocked by a command"),
+                    Some(_) => None,
+                });
+                if let Some(reason) = stop {
+                    crate::vtrace!("dm runner: collection of {} stops, {reason}", tag(&peer));
+                    return Ok(());
+                }
             }
         }
+        let published = match flows::publish_cursor(&self.store, &mut self.records, &peer) {
+            Ok(published) => published,
+            Err(e) => {
+                note_failure(&mut self.records.health, &e);
+                false
+            }
+        };
+        crate::vtrace!(
+            "dm runner: collected {read} message(s) on {} in {} ms{}",
+            tag(&peer),
+            started.elapsed().as_millis(),
+            if published { ", cursor published" } else { "" }
+        );
         if conv.state.send_seq > conv.state.peer_collected {
             self.check_stop()?;
             self.refresh_peer_cursor(&peer);
