@@ -411,6 +411,34 @@ impl VeilidNetHandle {
         self.write_latency.load(Ordering::Relaxed)
     }
 
+    /// A handle over no node, for a front end's own tests to drive its circle and
+    /// room subscribe paths. Its actor answers each subscribe request
+    /// ([`Self::subscribe_circle`] and [`Self::subscribe_room`] alike) with what
+    /// `script` returns for the request's owner, so a test decides per owner which
+    /// attempts fail and with which error. Every other command is dropped
+    /// unanswered, so its call returns [`VeilidNetError::Actor`]. Spawns the actor,
+    /// so it must be called inside a Tokio runtime.
+    ///
+    /// Only with the `test-support` feature, which is off by default. Without it
+    /// every handle is backed by a started node.
+    #[cfg(feature = "test-support")]
+    pub fn with_scripted_subscribes(
+        mut script: impl FnMut(&RendezvousOwner) -> Result<bool> + Send + 'static,
+    ) -> Self {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(64);
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                if let Command::SubscribeRendezvous { owner, reply } = cmd {
+                    let _ = reply.send(script(&owner));
+                }
+            }
+        });
+        VeilidNetHandle {
+            cmd_tx,
+            write_latency: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
     // ── Circles (Phase 2): shared-owner DFLT rendezvous + append-ring fan-out ──
 
     /// Publish a SEALED message to a circle (Phase 2). `owner_seed` is the

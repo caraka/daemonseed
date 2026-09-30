@@ -116,8 +116,10 @@ oxicrypt-integrity-sign = { workspace = true }
 # so "off in every build" would be false — it is off in the build that ships.
 daemonseed-core = { path = "../daemonseed-core", features = ["testing"] }
 # Named again to switch on `test-support`, whose `ContactRequestId::for_test`
-# lets this crate's tests build the contact-request events a runner sends. The
-# shipped build carries no dev-dependency edge, so it cannot make such an id.
+# lets this crate's tests build the contact-request events a runner sends, and
+# whose `VeilidNetHandle::with_scripted_subscribes` gives them a handle whose
+# subscribes fail on cue. The shipped build carries no dev-dependency edge, so it
+# cannot make such an id or such a handle.
 daemonseed-veilid-net = { path = "../daemonseed-veilid-net", features = ["test-support"] }
 # Share publish→fetch round-trip oracle (veilid_net tests): a temp share directory
 # + a temp fetch root.

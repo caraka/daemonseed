@@ -173,6 +173,10 @@ pub enum NetCommand {
     /// inbound frame lands in the right circle. Mirrors `daemonseed_tui`'s
     /// `handle_join_circle` (derive_cot_key → asset_address → subscribe).
     JoinCircle { circle_id: u64, phrase: String },
+    /// Leave a circle: stop receiving it and drop any queued retry of its join.
+    /// `circle_id` is the tag the circle was joined under. A later
+    /// [`NetCommand::JoinCircle`] of the same phrase subscribes afresh.
+    LeaveCircle { circle_id: u64 },
     /// Publish a message to a joined circle: seal it under that circle's `cot_key`
     /// and LOCAL-ECHO it (the relay never reflects a sender's own frame). Mirrors
     /// `daemonseed_tui`'s `handle_send_chat`.

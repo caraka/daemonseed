@@ -288,7 +288,11 @@ types:
     description: >-
       Cloneable handle to the running actor — every transport operation goes
       through it; the actor task serializes access to the single VeilidAPI. The
-      shape the app/UI drives (the AppSession replacement).
+      shape the app/UI drives (the AppSession replacement). Under the crate's
+      `test-support` cargo feature (off by default),
+      VeilidNetHandle::with_scripted_subscribes(script) builds a handle over no
+      node whose circle and room subscribes answer from `script` per owner; every
+      other command is dropped unanswered.
   - name: VeilidNetConfig
     module: daemonseed_veilid_net::config
     kind: struct

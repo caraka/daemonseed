@@ -768,6 +768,7 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
     ui.on_leave_circle({
         let weak = ui.as_weak();
         let state = state.clone();
+        let net = net.clone();
         move || {
             // #120: this callback fires from inside the Slint clicked handler
             // (app.slint leave-confirm), and the NetEvent drain timer can be
@@ -778,15 +779,21 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
             // same re-entrancy guard `defer` already applies to focus calls.
             let weak = weak.clone();
             let state = state.clone();
+            let net = net.clone();
             defer(move || {
                 let Some(ui) = weak.upgrade() else {
                     return;
                 };
-                let outcome = {
+                let (left, outcome) = {
                     let mut st = state.borrow_mut();
                     let active = st.active();
-                    st.forget_circle(active)
+                    (st.active_circle_id(), st.forget_circle(active))
                 };
+                // Tell the actor too, so it stops receiving and retrying this circle
+                // and a later join of the same phrase subscribes afresh.
+                if let Some(circle_id) = left {
+                    let _ = net.borrow().send(NetCommand::LeaveCircle { circle_id });
+                }
                 let st = state.borrow();
                 rebuild_rail(&ui, &st);
                 let now_active = st.active();

@@ -137,6 +137,22 @@ const SHARE_CATALOG_TTL: Duration = Duration::from_secs(600);
 /// How often the recipient ages out shares it has not reheard within the TTL.
 const SHARE_CATALOG_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// The wait before a circle whose join failed at the transport is tried again.
+const JOIN_RETRY_FIRST_DELAY: Duration = Duration::from_secs(5);
+
+/// The longest wait between retries of a failed circle join. Each failed retry
+/// doubles the wait, up to this.
+const JOIN_RETRY_MAX_DELAY: Duration = Duration::from_secs(120);
+
+/// How often the actor loop looks for a failed circle join that is due again. The
+/// clock is only polled while a join is pending.
+const JOIN_RETRY_TICK: Duration = Duration::from_secs(1);
+
+/// The longest a retried circle join may take. The retry runs on the actor loop,
+/// so this bounds how long a join nobody is waiting for can hold it. Running out
+/// of time counts as a refusal.
+const JOIN_RETRY_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+
 // ── Operator announce-record item envelope (Phase 4 A-c) ─────────────────────
 //
 // Inbound `VeilidNetEvent::Inbound { bytes }` carries NO slot id, and a
@@ -586,11 +602,22 @@ fn now_unix_ms() -> i64 {
 /// (`cmd_rx` in, `evt_tx` out; `_cmd_tx` is the self-send handle the relay actor
 /// uses for timers — unused here, kept for a uniform spawn signature).
 pub async fn veilid_net_actor(
-    mut cmd_rx: UnboundedReceiver<NetCommand>,
+    cmd_rx: UnboundedReceiver<NetCommand>,
     cmd_tx: UnboundedSender<NetCommand>,
     evt_tx: UnboundedSender<NetEvent>,
 ) {
-    let mut net: Option<VeilidNetHandle> = None;
+    run_actor(cmd_rx, cmd_tx, evt_tx, None).await;
+}
+
+/// The actor loop behind [`veilid_net_actor`], starting from the transport
+/// handle `net`: `None` until a Connect starts a node, or a handle a test
+/// supplies.
+async fn run_actor(
+    mut cmd_rx: UnboundedReceiver<NetCommand>,
+    cmd_tx: UnboundedSender<NetCommand>,
+    evt_tx: UnboundedSender<NetEvent>,
+    mut net: Option<VeilidNetHandle>,
+) {
     let mut ev_rx: Option<UnboundedReceiver<VeilidNetEvent>> = None;
     // The direct-messaging runner started at each connect with a started node.
     // `None` before the first such connect, without a profile, and after the
@@ -600,6 +627,11 @@ pub async fn veilid_net_actor(
     // being replaced.
     let mut dm_start: Option<DmStart> = None;
     let mut circles: Vec<VeilidCircle> = Vec::new();
+    // Circles whose join failed at the transport, retried on `join_retry` while
+    // connected until they join (see `retry_due_join`).
+    let mut pending_joins: Vec<PendingJoin> = Vec::new();
+    let mut join_retry = tokio::time::interval(JOIN_RETRY_TICK);
+    join_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut shares = ShareState::new();
     // The presented display name. Set from a profile's persisted handle on
     // Connect/SetMyHandle; the fallback only matters on the ephemeral path, and
@@ -705,7 +737,8 @@ pub async fn veilid_net_actor(
                     // below takes it as a value.
                     let operator_write = shares.is_operator();
                     handle_command(
-                        cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles, &mut my_handle,
+                        cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles,
+                        &mut pending_joins, &mut my_handle,
                         &mut shares, &fetch_outcome_tx, &confirm_outcome_tx,
                         operator_write, &mut dm, &mut dm_start,
                     ).await;
@@ -865,6 +898,15 @@ pub async fn veilid_net_actor(
                     // Everything else demuxes in handle_inbound (which only acts on Inbound).
                     other => handle_inbound(other, &evt_tx, &mut circles, &mut shares),
                 }
+            }
+            // Try again one circle whose join failed at the transport, if one is due.
+            // One per tick, so a run of failed joins never holds the loop for more
+            // than one subscribe at a time.
+            _ = join_retry.tick(), if !pending_joins.is_empty() => {
+                retry_due_join(
+                    &mut pending_joins, tokio::time::Instant::now(), &evt_tx, &net, &mut circles,
+                    &my_handle, shares.signing.clone(),
+                ).await;
             }
             // Age out discovered shares not reheard within the TTL (Shape B liveness):
             // a sharer that vanished without a withdraw self-clears from the list.
@@ -1800,6 +1842,8 @@ async fn handle_command(
     net: &mut Option<VeilidNetHandle>,
     ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>,
     circles: &mut Vec<VeilidCircle>,
+    // Circles whose join failed at the transport, retried by the actor loop.
+    pending_joins: &mut Vec<PendingJoin>,
     my_handle: &mut String,
     shares: &mut ShareState,
     // (#180 §RS-2) Where a spawned `FetchShare` reports its generation-tagged outcome for
@@ -1884,12 +1928,13 @@ async fn handle_command(
                 // attach, so a circle restored into the UI is actually joined on the
                 // transport (else SendCircle finds known=[] → "join before sending").
                 for (circle_id, phrase) in rejoin_circles {
-                    join_circle(
+                    join_or_schedule_retry(
                         circle_id,
-                        &phrase,
+                        phrase,
                         evt_tx,
                         net,
                         circles,
+                        pending_joins,
                         my_handle,
                         shares.signing.clone(),
                     )
@@ -1997,16 +2042,25 @@ async fn handle_command(
             *my_handle = handle;
         }
         NetCommand::JoinCircle { circle_id, phrase } => {
-            join_circle(
+            join_or_schedule_retry(
                 circle_id,
-                &phrase,
+                phrase,
                 evt_tx,
                 net,
                 circles,
+                pending_joins,
                 my_handle,
                 shares.signing.clone(),
             )
             .await;
+        }
+        NetCommand::LeaveCircle { circle_id } => {
+            // Forget the circle and any queued retry of its join, so its inbound
+            // is no longer delivered and a later join of the same phrase subscribes
+            // afresh under the id it is given.
+            daemonseed_veilid_net::vtrace!("gui leave_circle: id={circle_id}");
+            circles.retain(|c| c.circle_id != circle_id);
+            pending_joins.retain(|p| p.circle_id != circle_id);
         }
         NetCommand::SendCircle { circle_id, text } => {
             send_circle(
@@ -2199,6 +2253,8 @@ async fn handle_command(
             // an exhausted receiver and a handle whose every command now fails.
             *net = None;
             *ev_rx = None;
+            // A retry needs a connection, and this session has none left.
+            pending_joins.clear();
             let _ = ack.send(());
         }
         NetCommand::RefreshShares => {
@@ -2495,8 +2551,154 @@ async fn subscribe_lobby(
     let _ = evt_tx.send(NetEvent::RoomJoined);
 }
 
+/// A circle whose join failed at the transport, waiting to be tried again.
+struct PendingJoin {
+    circle_id: u64,
+    phrase: String,
+    /// The wait before this retry, doubled for the next one.
+    delay: Duration,
+    due: tokio::time::Instant,
+}
+
+/// How one [`join_circle`] call ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JoinAttempt {
+    /// Subscribed now, and reported with `CircleJoined`.
+    Joined,
+    /// Already joined, or failed in a way a retry cannot fix.
+    Settled,
+    /// The transport refused the subscribe for a reason that may pass. Carries the
+    /// reason, which the caller reports or traces.
+    TransportFailed(String),
+}
+
+/// Whether a refused circle subscribe may succeed if tried again: a routing
+/// failure (Veilid's `TryAgain` and offline answers arrive as
+/// [`VeilidNetError::Routing`]), a call that ran out of time, or any error
+/// naming `TryAgain`. Everything else, the transport actor being gone included,
+/// is final.
+fn is_transient_subscribe_error(e: &VeilidNetError) -> bool {
+    matches!(e, VeilidNetError::Routing(_) | VeilidNetError::TimedOut(_))
+        || e.to_string().to_ascii_lowercase().contains("tryagain")
+}
+
+/// Join a circle, and queue a background retry if the transport refused the
+/// subscribe for a reason that may pass. Only this first refusal is reported
+/// with `CircleError`; the retries are traced. A join that ends any other way
+/// drops a retry queued for the same phrase, so a circle joined meanwhile is not
+/// tried again.
+#[allow(clippy::too_many_arguments)]
+async fn join_or_schedule_retry(
+    circle_id: u64,
+    phrase: String,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+    circles: &mut Vec<VeilidCircle>,
+    pending_joins: &mut Vec<PendingJoin>,
+    my_handle: &str,
+    signing: Option<Arc<SignKeypair>>,
+) {
+    let attempt = join_circle(circle_id, &phrase, evt_tx, net, circles, my_handle, signing).await;
+    pending_joins.retain(|p| p.phrase != phrase);
+    if let JoinAttempt::TransportFailed(reason) = attempt {
+        daemonseed_veilid_net::vtrace!("gui join_circle: CircleError id={circle_id}: {reason}");
+        let _ = evt_tx.send(NetEvent::CircleError { circle_id, reason });
+        schedule_join_retry(
+            pending_joins,
+            circle_id,
+            phrase,
+            JOIN_RETRY_FIRST_DELAY,
+            tokio::time::Instant::now(),
+        );
+    }
+}
+
+/// Queue a retry of `phrase`'s join `delay` after `now`.
+fn schedule_join_retry(
+    pending_joins: &mut Vec<PendingJoin>,
+    circle_id: u64,
+    phrase: String,
+    delay: Duration,
+    now: tokio::time::Instant,
+) {
+    daemonseed_veilid_net::vtrace!("gui join_circle: retry scheduled id={circle_id} in {delay:?}");
+    pending_joins.push(PendingJoin {
+        circle_id,
+        phrase,
+        delay,
+        due: now + delay,
+    });
+}
+
+/// Try again the earliest pending circle join that is due at `now`, if any. The
+/// attempt is bounded by [`JOIN_RETRY_ATTEMPT_TIMEOUT`]. A retry the transport
+/// refuses again, or that runs out of time, is queued with its wait doubled, up
+/// to [`JOIN_RETRY_MAX_DELAY`], counted from when the attempt ended. Does nothing
+/// while not connected, leaving the queue for when a connection is back.
+async fn retry_due_join(
+    pending_joins: &mut Vec<PendingJoin>,
+    now: tokio::time::Instant,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+    circles: &mut Vec<VeilidCircle>,
+    my_handle: &str,
+    signing: Option<Arc<SignKeypair>>,
+) {
+    if net.is_none() {
+        return;
+    }
+    let Some(index) = pending_joins
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.due <= now)
+        .min_by_key(|(_, p)| p.due)
+        .map(|(i, _)| i)
+    else {
+        return;
+    };
+    let pending = pending_joins.swap_remove(index);
+    let circle_id = pending.circle_id;
+    let attempt = tokio::time::timeout(
+        JOIN_RETRY_ATTEMPT_TIMEOUT,
+        join_circle(
+            circle_id,
+            &pending.phrase,
+            evt_tx,
+            net,
+            circles,
+            my_handle,
+            signing,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        JoinAttempt::TransportFailed(format!("no answer within {JOIN_RETRY_ATTEMPT_TIMEOUT:?}"))
+    });
+    match attempt {
+        JoinAttempt::Joined => {
+            daemonseed_veilid_net::vtrace!("gui join_circle: retry succeeded id={circle_id}");
+        }
+        JoinAttempt::Settled => {}
+        JoinAttempt::TransportFailed(reason) => {
+            daemonseed_veilid_net::vtrace!(
+                "gui join_circle: retry refused id={circle_id}: {reason}"
+            );
+            let delay = (pending.delay * 2).min(JOIN_RETRY_MAX_DELAY);
+            schedule_join_retry(
+                pending_joins,
+                circle_id,
+                pending.phrase,
+                delay,
+                tokio::time::Instant::now(),
+            );
+        }
+    }
+}
+
 /// Join a circle: derive the content key + the shared rendezvous-owner seed from
-/// the phrase, subscribe the rendezvous record, and record local state.
+/// the phrase, subscribe the rendezvous record, and record local state. A
+/// subscribe refused for a reason that may pass is returned, not reported; every
+/// other failure is reported with `CircleError`.
 async fn join_circle(
     circle_id: u64,
     phrase: &str,
@@ -2505,22 +2707,29 @@ async fn join_circle(
     circles: &mut Vec<VeilidCircle>,
     my_handle: &str,
     signing: Option<Arc<SignKeypair>>,
-) {
+) -> JoinAttempt {
     daemonseed_veilid_net::vtrace!("gui join_circle: requested id={circle_id}");
     let err = |reason: String| {
         daemonseed_veilid_net::vtrace!("gui join_circle: CircleError id={circle_id}: {reason}");
         let _ = evt_tx.send(NetEvent::CircleError { circle_id, reason });
     };
     let Some(handle) = net.as_ref() else {
-        return err("not connected to Veilid yet".to_owned());
+        err("not connected to Veilid yet".to_owned());
+        return JoinAttempt::Settled;
     };
     let cot_key = match derive_cot_key(phrase, &CNSA_2_0) {
         Ok(k) => k,
-        Err(e) => return err(format!("circle-key derivation failed: {e}")),
+        Err(e) => {
+            err(format!("circle-key derivation failed: {e}"));
+            return JoinAttempt::Settled;
+        }
     };
     let owner_seed = match derive_circle_veilid_owner_seed(phrase, &CNSA_2_0) {
         Ok(s) => *s.as_bytes(),
-        Err(e) => return err(format!("rendezvous-owner derivation failed: {e}")),
+        Err(e) => {
+            err(format!("rendezvous-owner derivation failed: {e}"));
+            return JoinAttempt::Settled;
+        }
     };
     // A circle already joined (same phrase → same owner_seed) re-emits CircleJoined
     // so the UI re-selects it, rather than re-subscribing.
@@ -2533,10 +2742,15 @@ async fn join_circle(
             circle_id: existing.circle_id,
             asset_addr: circle_fingerprint(&existing.cot_key),
         });
-        return;
+        return JoinAttempt::Settled;
     }
     if let Err(e) = handle.subscribe_circle(OwnerSeed::new(owner_seed)).await {
-        return err(format!("subscribe failed: {e}"));
+        let reason = format!("subscribe failed: {e}");
+        if is_transient_subscribe_error(&e) {
+            return JoinAttempt::TransportFailed(reason);
+        }
+        err(reason);
+        return JoinAttempt::Settled;
     }
     // #77: the circle PRESENCE sibling record (P1) — a distinct rendezvous so circle
     // beacons never share the chat append-ring. Non-fatal on failure (chat still
@@ -2571,6 +2785,7 @@ async fn join_circle(
         circle_id,
         asset_addr: fingerprint,
     });
+    JoinAttempt::Joined
 }
 
 /// A stable per-circle fingerprint for the UI's `asset_addr` slot. The Veilid
@@ -6609,6 +6824,7 @@ mod tests {
             &mut net,
             &mut ev_rx,
             &mut circles,
+            &mut Vec::new(),
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
@@ -6671,6 +6887,7 @@ mod tests {
             &mut net,
             &mut ev_rx,
             &mut circles,
+            &mut Vec::new(),
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
@@ -6741,6 +6958,7 @@ mod tests {
             &mut net,
             &mut ev_rx,
             &mut circles,
+            &mut Vec::new(),
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
@@ -6788,6 +7006,7 @@ mod tests {
             &mut net,
             &mut ev_rx,
             &mut circles,
+            &mut Vec::new(),
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
@@ -6833,6 +7052,7 @@ mod tests {
             &mut net,
             &mut ev_rx,
             &mut circles,
+            &mut Vec::new(),
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
@@ -7812,6 +8032,7 @@ mod tests {
             &mut net,
             &mut ev_rx,
             &mut circles,
+            &mut Vec::new(),
             &mut my_handle,
             &mut shares,
             &fetch_outcome_tx,
@@ -8227,6 +8448,7 @@ mod tests {
             &mut net,
             &mut ev_rx,
             &mut circles,
+            &mut Vec::new(),
             &mut my_handle,
             &mut shares,
             &fetch_tx,
@@ -9052,6 +9274,7 @@ mod tests {
             &mut None,
             &mut None,
             &mut Vec::new(),
+            &mut Vec::new(),
             &mut my_handle,
             &mut shares,
             &fetch_tx,
@@ -9143,5 +9366,660 @@ mod tests {
             1,
             "the runner's task did not end"
         );
+    }
+
+    /// The circle ids named by every `CircleJoined` in `events`.
+    fn joined_ids(events: &[NetEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::CircleJoined { circle_id, .. } => Some(*circle_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// How many `CircleError`s `events` holds.
+    fn circle_errors(events: &[NetEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, NetEvent::CircleError { .. }))
+            .count()
+    }
+
+    /// The chat rendezvous-owner seed of the circle `phrase` names.
+    fn circle_seed(phrase: &str) -> [u8; 32] {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        *derive_circle_veilid_owner_seed(phrase, &CNSA_2_0)
+            .expect("owner seed derives")
+            .as_bytes()
+    }
+
+    /// The refusal the transport gives while the node cannot route yet.
+    fn try_again() -> VeilidNetError {
+        VeilidNetError::Routing("open_or_create reopen: TryAgain: offline, try again later".into())
+    }
+
+    /// A subscribe script that refuses the owner `seed` with [`try_again`] the
+    /// first `times` times it is asked, and accepts everything else.
+    fn refusing(
+        seed: [u8; 32],
+        times: usize,
+    ) -> impl FnMut(&RendezvousOwner) -> daemonseed_veilid_net::Result<bool> + Send + 'static {
+        let mut left = times;
+        move |owner| match owner {
+            RendezvousOwner::Held(s) if *s.as_bytes() == seed && left > 0 => {
+                left -= 1;
+                Err(try_again())
+            }
+            _ => Ok(true),
+        }
+    }
+
+    /// A queued retry of `phrase`'s join as `circle_id`, due at `due`.
+    fn queued(
+        circle_id: u64,
+        phrase: &str,
+        delay: Duration,
+        due: tokio::time::Instant,
+    ) -> PendingJoin {
+        PendingJoin {
+            circle_id,
+            phrase: phrase.to_owned(),
+            delay,
+            due,
+        }
+    }
+
+    /// Run one command through the actor's dispatcher over `net`, `circles` and
+    /// `pending`.
+    async fn command_over(
+        command: NetCommand,
+        evt_tx: &UnboundedSender<NetEvent>,
+        net: &mut Option<VeilidNetHandle>,
+        circles: &mut Vec<VeilidCircle>,
+        pending: &mut Vec<PendingJoin>,
+    ) {
+        let (fetch_tx, _fetch_rx) = unbounded_channel();
+        let (confirm_tx, _confirm_rx) = unbounded_channel();
+        let (self_tx, _self_rx) = unbounded_channel();
+        let mut ev_rx = None;
+        let mut my_handle = "guest".to_owned();
+        let mut shares = ShareState::new();
+        handle_command(
+            command,
+            evt_tx,
+            &self_tx,
+            net,
+            &mut ev_rx,
+            circles,
+            pending,
+            &mut my_handle,
+            &mut shares,
+            &fetch_tx,
+            &confirm_tx,
+            false,
+            &mut None,
+            &mut None,
+        )
+        .await;
+    }
+
+    /// A circle whose join the transport refuses is retried in the background
+    /// until it joins, and is then reported joined as a first-time join is.
+    #[tokio::test]
+    async fn a_circle_join_refused_by_the_transport_is_retried_until_it_joins() {
+        let phrase = "retry phrase";
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let net = Some(VeilidNetHandle::with_scripted_subscribes(refusing(
+            circle_seed(phrase),
+            2,
+        )));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+        let start = tokio::time::Instant::now();
+
+        join_or_schedule_retry(
+            7,
+            phrase.to_owned(),
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut pending,
+            "guest",
+            None,
+        )
+        .await;
+        assert!(circles.is_empty(), "a refused subscribe joined the circle");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the refused join was not queued for a retry"
+        );
+        assert!(joined_ids(&drain(&mut evt_rx)).is_empty());
+
+        // Not yet due: nothing is tried.
+        retry_due_join(
+            &mut pending,
+            start,
+            &evt_tx,
+            &net,
+            &mut circles,
+            "guest",
+            None,
+        )
+        .await;
+        assert_eq!(pending.len(), 1);
+        assert!(
+            drain(&mut evt_rx).is_empty(),
+            "a retry ran before it was due"
+        );
+
+        // The first retry is refused again and queued with a longer wait.
+        let first_due = pending[0].due;
+        retry_due_join(
+            &mut pending,
+            first_due,
+            &evt_tx,
+            &net,
+            &mut circles,
+            "guest",
+            None,
+        )
+        .await;
+        assert!(circles.is_empty());
+        assert_eq!(pending.len(), 1, "a refused retry was not queued again");
+        assert_eq!(pending[0].delay, JOIN_RETRY_FIRST_DELAY * 2);
+
+        // The second retry is accepted.
+        let second_due = pending[0].due;
+        retry_due_join(
+            &mut pending,
+            second_due,
+            &evt_tx,
+            &net,
+            &mut circles,
+            "guest",
+            None,
+        )
+        .await;
+        assert_eq!(joined_ids(&drain(&mut evt_rx)), vec![7]);
+        assert_eq!(circles.len(), 1);
+        assert_eq!(circles[0].circle_id, 7);
+        assert!(pending.is_empty(), "a joined circle stayed queued");
+    }
+
+    /// A join of the same phrase while its retry is pending joins the circle once,
+    /// and the pending retry does not run afterwards.
+    #[tokio::test]
+    async fn a_join_while_a_retry_is_pending_joins_the_circle_once() {
+        let phrase = "same phrase";
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let net = Some(VeilidNetHandle::with_scripted_subscribes(refusing(
+            circle_seed(phrase),
+            1,
+        )));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+
+        join_or_schedule_retry(
+            7,
+            phrase.to_owned(),
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut pending,
+            "guest",
+            None,
+        )
+        .await;
+        assert_eq!(
+            pending.len(),
+            1,
+            "the refused join was not queued for a retry"
+        );
+        let due = pending[0].due;
+        let _ = drain(&mut evt_rx);
+
+        join_or_schedule_retry(
+            7,
+            phrase.to_owned(),
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut pending,
+            "guest",
+            None,
+        )
+        .await;
+        assert_eq!(joined_ids(&drain(&mut evt_rx)), vec![7]);
+        assert_eq!(circles.len(), 1);
+        assert!(
+            pending.is_empty(),
+            "the retry stayed queued after the circle joined"
+        );
+
+        retry_due_join(
+            &mut pending,
+            due + JOIN_RETRY_MAX_DELAY,
+            &evt_tx,
+            &net,
+            &mut circles,
+            "guest",
+            None,
+        )
+        .await;
+        assert!(
+            drain(&mut evt_rx).is_empty(),
+            "a retry ran for a circle already joined"
+        );
+        assert_eq!(circles.len(), 1, "the circle was joined twice");
+
+        // A further join of the joined circle re-reports it and adds nothing.
+        join_or_schedule_retry(
+            7,
+            phrase.to_owned(),
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut pending,
+            "guest",
+            None,
+        )
+        .await;
+        assert_eq!(joined_ids(&drain(&mut evt_rx)), vec![7]);
+        assert_eq!(circles.len(), 1, "a joined circle was joined again");
+        assert!(pending.is_empty());
+    }
+
+    /// The running actor retries a refused join on its own clock, with no further
+    /// command, and reports the circle joined.
+    #[tokio::test(start_paused = true)]
+    async fn the_actor_retries_a_refused_join_on_its_own() {
+        let phrase = "actor phrase";
+        let net = VeilidNetHandle::with_scripted_subscribes(refusing(circle_seed(phrase), 1));
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let actor = tokio::spawn(run_actor(cmd_rx, cmd_tx.clone(), evt_tx, Some(net)));
+
+        cmd_tx
+            .send(NetCommand::JoinCircle {
+                circle_id: 7,
+                phrase: phrase.to_owned(),
+            })
+            .expect("actor is running");
+        let mut errors = 0;
+        let joined = loop {
+            match tokio::time::timeout(JOIN_RETRY_MAX_DELAY * 4, evt_rx.recv()).await {
+                Ok(Some(NetEvent::CircleJoined { circle_id, .. })) => break Some(circle_id),
+                Ok(Some(NetEvent::CircleError { .. })) => errors += 1,
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break None,
+            }
+        };
+        assert_eq!(joined, Some(7), "the actor never retried the refused join");
+        assert_eq!(errors, 1, "the first refusal was not reported exactly once");
+        // The actor holds its own sender, so it runs until stopped.
+        actor.abort();
+    }
+
+    /// A refused join from the Connect re-join list is queued for a retry.
+    #[tokio::test]
+    async fn a_refused_rejoin_on_connect_is_queued() {
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let mut net = Some(VeilidNetHandle::with_scripted_subscribes(|_| {
+            Err(try_again())
+        }));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+        let _ = circle_seed("init");
+
+        command_over(
+            NetCommand::Connect {
+                display_handle: None,
+                rejoin_circles: vec![(7, "rejoin phrase".to_owned())],
+                republish_roots: Vec::new(),
+                stable_signing_key: None,
+                stable_share_root_ikm: None,
+                dm_session_keys: None,
+                profile_root: None,
+                project_announce_seed: None,
+            },
+            &evt_tx,
+            &mut net,
+            &mut circles,
+            &mut pending,
+        )
+        .await;
+        assert!(circles.is_empty());
+        assert_eq!(pending.len(), 1, "the refused re-join was not queued");
+        assert_eq!(pending[0].circle_id, 7);
+    }
+
+    /// A refused `JoinCircle` command is queued for a retry.
+    #[tokio::test]
+    async fn a_refused_join_command_is_queued() {
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let mut net = Some(VeilidNetHandle::with_scripted_subscribes(|_| {
+            Err(try_again())
+        }));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+        let _ = circle_seed("init");
+
+        command_over(
+            NetCommand::JoinCircle {
+                circle_id: 7,
+                phrase: "command phrase".to_owned(),
+            },
+            &evt_tx,
+            &mut net,
+            &mut circles,
+            &mut pending,
+        )
+        .await;
+        assert_eq!(pending.len(), 1, "the refused join was not queued");
+    }
+
+    /// Leaving a circle forgets it and drops its queued retry, and a later join of
+    /// the same phrase subscribes afresh under its new id.
+    #[tokio::test]
+    async fn leaving_forgets_the_circle_and_its_retry() {
+        let joined = "joined phrase";
+        let waiting = "waiting phrase";
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let mut net = Some(VeilidNetHandle::with_scripted_subscribes(refusing(
+            circle_seed(waiting),
+            usize::MAX,
+        )));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+        for (id, phrase) in [(7, joined), (8, waiting)] {
+            command_over(
+                NetCommand::JoinCircle {
+                    circle_id: id,
+                    phrase: phrase.to_owned(),
+                },
+                &evt_tx,
+                &mut net,
+                &mut circles,
+                &mut pending,
+            )
+            .await;
+        }
+        assert_eq!((circles.len(), pending.len()), (1, 1));
+        let _ = drain(&mut evt_rx);
+
+        for id in [7, 8] {
+            command_over(
+                NetCommand::LeaveCircle { circle_id: id },
+                &evt_tx,
+                &mut net,
+                &mut circles,
+                &mut pending,
+            )
+            .await;
+        }
+        assert!(circles.is_empty(), "the left circle is still joined");
+        assert!(
+            pending.is_empty(),
+            "the left circle's retry is still queued"
+        );
+
+        command_over(
+            NetCommand::JoinCircle {
+                circle_id: 9,
+                phrase: joined.to_owned(),
+            },
+            &evt_tx,
+            &mut net,
+            &mut circles,
+            &mut pending,
+        )
+        .await;
+        assert_eq!(
+            joined_ids(&drain(&mut evt_rx)),
+            vec![9],
+            "the rejoin did not subscribe afresh"
+        );
+        assert_eq!(circles.len(), 1);
+    }
+
+    /// A close drops every queued retry.
+    #[tokio::test]
+    async fn a_close_clears_the_retry_queue() {
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let mut net = None;
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending = vec![queued(
+            7,
+            "a phrase",
+            JOIN_RETRY_FIRST_DELAY,
+            tokio::time::Instant::now(),
+        )];
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+
+        command_over(
+            NetCommand::GracefulClose { ack: ack_tx },
+            &evt_tx,
+            &mut net,
+            &mut circles,
+            &mut pending,
+        )
+        .await;
+        assert!(ack_rx.await.is_ok(), "the close must still ack");
+        assert!(pending.is_empty(), "a retry outlived the close");
+    }
+
+    /// The wait between refused retries stops growing at the cap.
+    #[tokio::test]
+    async fn the_retry_wait_stays_at_the_cap() {
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let net = Some(VeilidNetHandle::with_scripted_subscribes(|_| {
+            Err(try_again())
+        }));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let now = tokio::time::Instant::now();
+        let mut pending = vec![queued(7, "capped phrase", JOIN_RETRY_MAX_DELAY, now)];
+        let _ = circle_seed("init");
+
+        for round in 0..2 {
+            let far = now + JOIN_RETRY_MAX_DELAY * 4 * (round + 1);
+            retry_due_join(
+                &mut pending,
+                far,
+                &evt_tx,
+                &net,
+                &mut circles,
+                "guest",
+                None,
+            )
+            .await;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                pending[0].delay, JOIN_RETRY_MAX_DELAY,
+                "round {round} grew past the cap"
+            );
+        }
+    }
+
+    /// Without a connection a due retry waits in the queue and says nothing.
+    #[tokio::test]
+    async fn without_a_connection_a_due_retry_waits() {
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let now = tokio::time::Instant::now();
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending = vec![queued(7, "offline phrase", JOIN_RETRY_FIRST_DELAY, now)];
+        let _ = circle_seed("init");
+
+        retry_due_join(
+            &mut pending,
+            now + JOIN_RETRY_MAX_DELAY,
+            &evt_tx,
+            &None,
+            &mut circles,
+            "guest",
+            None,
+        )
+        .await;
+        assert_eq!(
+            pending.len(),
+            1,
+            "the retry left the queue without a connection"
+        );
+        assert!(
+            drain(&mut evt_rx).is_empty(),
+            "a retry without a connection sent events"
+        );
+    }
+
+    /// Two refused joins of one phrase leave one queued retry.
+    #[tokio::test]
+    async fn two_refused_joins_of_one_phrase_queue_one_retry() {
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let net = Some(VeilidNetHandle::with_scripted_subscribes(|_| {
+            Err(try_again())
+        }));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+        let _ = circle_seed("init");
+        for _ in 0..2 {
+            join_or_schedule_retry(
+                7,
+                "twice".to_owned(),
+                &evt_tx,
+                &net,
+                &mut circles,
+                &mut pending,
+                "guest",
+                None,
+            )
+            .await;
+        }
+        assert_eq!(pending.len(), 1, "one phrase was queued twice");
+    }
+
+    /// A retry that ends in a final refusal leaves the queue.
+    #[tokio::test]
+    async fn a_retry_that_settles_leaves_the_queue() {
+        let (evt_tx, _evt_rx) = unbounded_channel();
+        let net = Some(VeilidNetHandle::with_scripted_subscribes(|_| {
+            Err(VeilidNetError::Actor("actor task is gone".into()))
+        }));
+        let now = tokio::time::Instant::now();
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending = vec![queued(7, "settled phrase", JOIN_RETRY_FIRST_DELAY, now)];
+        let _ = circle_seed("init");
+
+        retry_due_join(
+            &mut pending,
+            now + JOIN_RETRY_MAX_DELAY,
+            &evt_tx,
+            &net,
+            &mut circles,
+            "guest",
+            None,
+        )
+        .await;
+        assert!(pending.is_empty(), "a finally refused retry stayed queued");
+    }
+
+    /// A refusal that cannot pass is reported and never queued.
+    #[tokio::test]
+    async fn a_final_refusal_is_reported_and_not_queued() {
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let net = Some(VeilidNetHandle::with_scripted_subscribes(|_| {
+            Err(VeilidNetError::Actor("actor task is gone".into()))
+        }));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+        let _ = circle_seed("init");
+
+        join_or_schedule_retry(
+            7,
+            "final".to_owned(),
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut pending,
+            "guest",
+            None,
+        )
+        .await;
+        assert!(pending.is_empty(), "a final refusal was queued for a retry");
+        assert_eq!(circle_errors(&drain(&mut evt_rx)), 1);
+    }
+
+    /// Only the first refusal of a join is reported, however many retries follow.
+    #[tokio::test]
+    async fn only_the_first_refusal_is_reported() {
+        let phrase = "quiet phrase";
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let net = Some(VeilidNetHandle::with_scripted_subscribes(refusing(
+            circle_seed(phrase),
+            4,
+        )));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+
+        join_or_schedule_retry(
+            7,
+            phrase.to_owned(),
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut pending,
+            "guest",
+            None,
+        )
+        .await;
+        for _ in 0..4 {
+            let due = pending[0].due;
+            retry_due_join(
+                &mut pending,
+                due,
+                &evt_tx,
+                &net,
+                &mut circles,
+                "guest",
+                None,
+            )
+            .await;
+        }
+        let events = drain(&mut evt_rx);
+        assert_eq!(joined_ids(&events), vec![7]);
+        assert_eq!(circle_errors(&events), 1, "a retried refusal was reported");
+    }
+
+    /// A circle whose presence record cannot be subscribed still joins.
+    #[tokio::test]
+    async fn a_circle_whose_presence_subscribe_fails_still_joins() {
+        let phrase = "presence phrase";
+        let _ = circle_seed(phrase);
+        let presence = *derive_circle_presence_veilid_owner_seed(phrase, &CNSA_2_0)
+            .expect("presence seed derives")
+            .as_bytes();
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let net = Some(VeilidNetHandle::with_scripted_subscribes(refusing(
+            presence,
+            usize::MAX,
+        )));
+        let mut circles: Vec<VeilidCircle> = Vec::new();
+        let mut pending: Vec<PendingJoin> = Vec::new();
+
+        join_or_schedule_retry(
+            7,
+            phrase.to_owned(),
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut pending,
+            "guest",
+            None,
+        )
+        .await;
+        assert_eq!(joined_ids(&drain(&mut evt_rx)), vec![7]);
+        assert_eq!(circles.len(), 1);
+        assert!(pending.is_empty());
     }
 }
