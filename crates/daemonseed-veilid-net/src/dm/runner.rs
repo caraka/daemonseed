@@ -81,6 +81,10 @@
 //!   Each rewrite the network takes, and each poll whose numbers match and whose
 //!   bytes are the current key's advert, is recorded as the published advert,
 //!   which a later reset rotates past.
+//! - **Route**, where this node has a push transport and its last route
+//!   allocation failed: another allocation, 5 seconds after the failure and
+//!   twice as long after each further one, up to 2 minutes, until one succeeds
+//!   and every control subkey is republished with it.
 //!
 //! The schedule reads [`tokio::time`], so a paused test clock drives it, and the
 //! wall-clock time the flows and events see advances with it.
@@ -2069,9 +2073,13 @@ struct Runner<R> {
     /// Whether a command was served during the drop scan in progress, which
     /// may have accepted, blocked or deleted what the scan read earlier.
     served_mid_scan: bool,
-    /// Whether a command was served since this was last cleared, which a
-    /// collection pass does before each conversation.
+    /// Whether a command, or a block the live lane applied, was served since
+    /// this was last cleared, which a collection pass does before it serves
+    /// what is queued after each ring slot it reads.
     served_since: bool,
+    /// How many lane notes and commands [`Self::serve_queued`] has served,
+    /// which a control republish compares across each of its serves.
+    served: u64,
     /// Push delivery's state.
     push: push_hooks::PushState,
 }
@@ -2197,6 +2205,7 @@ impl<R: RunnerRecords> Runner<R> {
             serving: false,
             served_mid_scan: false,
             served_since: false,
+            served: 0,
             push,
         };
 
@@ -2254,8 +2263,20 @@ impl<R: RunnerRecords> Runner<R> {
     /// long pass, so a command waits for the call in progress rather than for
     /// the pass. Each command runs to its end, and the pass then carries on
     /// from where it stopped. Nothing is served before startup finishes or
-    /// from inside a command. A queued [`RunnerCommand::Shutdown`] stops the
-    /// pass.
+    /// from inside a command, with one exception: a control republish serves
+    /// before each conversation's rewrite, so a send the live lane committed
+    /// is written without waiting for the rest. A republish ends a
+    /// [`live_lane::LaneNote::RoutesDied`] that renews this node's route and a
+    /// [`RunnerCommand::NoteHandle`] naming this node whose handle changed, so
+    /// those two serve from inside themselves when the main loop serves them.
+    /// That is safe because the republish is the last thing either does, and
+    /// it reloads each conversation after serving anything. A route death
+    /// served there republishes again, and that inner republish serves nothing
+    /// because `serving` is set, so the nesting is at most two deep. Where the
+    /// republish itself runs from here, during a long pass, `serving` is set
+    /// throughout it, nothing is served between its rewrites, and a committed
+    /// send waits for the whole republish. A queued
+    /// [`RunnerCommand::Shutdown`] stops the pass.
     async fn serve_queued(&mut self) -> Result<(), Halt> {
         if !self.started || self.serving {
             return Ok(());
@@ -2266,10 +2287,12 @@ impl<R: RunnerRecords> Runner<R> {
                 break;
             };
             // A block the live lane served is a command served during the
-            // scan, as one served here is.
+            // scan or the collection, as one served here is.
             if matches!(note, live_lane::LaneNote::Blocked { .. }) {
                 self.served_mid_scan = true;
+                self.served_since = true;
             }
+            self.served += 1;
             self.serving = true;
             let served = self.serve_lane_note(note).await;
             self.serving = false;
@@ -2286,6 +2309,7 @@ impl<R: RunnerRecords> Runner<R> {
             crate::vtrace!("dm runner: pass paused for {command:?}");
             self.served_mid_scan = true;
             self.served_since = true;
+            self.served += 1;
             self.serving = true;
             let served = self.serve(command).await;
             self.serving = false;
@@ -2506,6 +2530,7 @@ impl<R: RunnerRecords> Runner<R> {
         self.repairs
             .values()
             .map(|repair| repair.due)
+            .chain(self.push.route_retry_due())
             .fold(self.next_tick.min(self.next_advert_poll), Instant::min)
     }
 
@@ -3633,6 +3658,7 @@ impl<R: RunnerRecords> Runner<R> {
         self.answering = None;
         self.preview_requests().await?;
         self.serve_queued().await?;
+        self.retry_route().await?;
         if Instant::now() >= self.next_tick {
             self.collect_tick().await?;
             self.next_tick = Instant::now() + self.collection_interval();
@@ -3818,15 +3844,18 @@ impl<R: RunnerRecords> Runner<R> {
             return Ok(());
         };
         let awaiting = convs.iter().any(|conv| conv.state.awaiting_acceptance);
+        // How many commands and lane notes had been served when the
+        // conversations and the block list were read: anything served since,
+        // here or inside an earlier conversation's collection, may have
+        // changed them.
+        let convs_read_at = self.served;
+        let mut list_read_at = self.served;
         let mut collected = 0usize;
         for listed in &convs {
             self.check_stop()?;
-            // A command served here may have changed this conversation or the
-            // block list since both were read.
-            self.served_since = false;
             self.serve_queued().await?;
             let reloaded;
-            let conv = if self.served_since {
+            let conv = if self.served != convs_read_at {
                 match self.load_one(&listed.peer) {
                     Ok(Some(conv)) => {
                         reloaded = conv;
@@ -3850,9 +3879,12 @@ impl<R: RunnerRecords> Runner<R> {
             } else {
                 listed
             };
-            if self.served_since {
+            if self.served != list_read_at {
                 match self.readable_block_list() {
-                    Some(list) => blocked = list,
+                    Some(list) => {
+                        blocked = list;
+                        list_read_at = self.served;
+                    }
                     None => {
                         crate::vtrace!(
                             "dm runner: {} not collected, the block list will not read",

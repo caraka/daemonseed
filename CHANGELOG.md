@@ -41,6 +41,8 @@ work lives in the maintainer's own planning notes, not here.
 ### Fixed
 
 - `daemonseed-gui`: a handle set mid-session reaches the direct-message runner at once, which rewrites the control subkey of every established conversation with it, instead of at the next connect.
+- `daemonseed-veilid-net`: a direct-message runner whose route allocation fails tries again 5 seconds later, doubling the wait up to 2 minutes, until a route is allocated and published, instead of leaving pushes to it off until restart.
+- `daemonseed-veilid-net`: a send committed while the runner rewrites control subkeys has its slot written before the next conversation's rewrite, instead of after the last one.
 - `daemonseed-veilid-net`: a contact request whose identity is blocked while a drop scan is under way is not surfaced again by that scan.
 - `daemonseed-veilid-net`: a direct-message collection pass reads established conversations before the drop scan, and scans the drop every `DROP_SCAN_TICKS` (5) collection intervals, or every pass while a conversation awaits acceptance; a request is previewed directly after the scan that surfaced it.
 - `daemonseed-veilid-net`: the runner reports each collected message as its ring slot opens, not when the ring read ends; each message is recorded read before it is reported.
@@ -50,6 +52,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-core`: a direct-message ring read stops at a slot holding a message the conversation does not open, such as one left by a deleted conversation under the same channel records, instead of failing; the initiator now recognises an acceptance in that case. `Acceptance`, `Accepted` and `Batch` report the slot as `unopened` (`Unopened { seq, subkey, error }`), and the runner counts it in `HealthCounters::slots_unopened` and traces it.
 - `daemonseed-veilid-net`: the direct-message runner serves queued commands between the network calls of a drop scan, collection pass, preview or repair instead of after the pass; a scan drops requests a command served meanwhile accepted or blocked, and a collection re-reads a conversation a command changed.
 - `daemonseed-core`: loading the direct-message store keeps the first outbox entry of a conversation being created; the startup sweep removes orphaned outboxes.
+- `daemonseed-veilid-net`: a block applied during a collection pass stops that pass recording the blocked correspondent's messages.
 
 ### Added
 

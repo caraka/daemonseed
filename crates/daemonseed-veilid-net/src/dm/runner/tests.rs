@@ -281,6 +281,9 @@ struct Faults {
     /// The subkeys of every ring read of the channel `gate_ring_read` names,
     /// in order.
     gated_ring_reads: Vec<u16>,
+    /// Where set, the lookup key and subkey of every channel write, in order,
+    /// logged as the write is made.
+    channel_writes: Option<Vec<([u8; HELLO_LOOKUP_KEY_LEN], u16)>>,
 }
 
 /// One record call, as [`Faults::trail`] logs it.
@@ -643,6 +646,9 @@ impl Records for Fake {
         subkey: u16,
         bytes: &[u8],
     ) -> Result<(), RecordError> {
+        if let Some(writes) = self.faults().channel_writes.as_mut() {
+            writes.push((*lookup_key, subkey));
+        }
         if subkey == channel::CONTROL_SUBKEY {
             let gate = self.faults().gate_control.clone();
             if let Some(gate) = gate {
@@ -7153,6 +7159,10 @@ struct Board {
     forge_answer: bool,
     /// Routes released, in order.
     released: Vec<Vec<u8>>,
+    /// Fail this many route allocations before allocating any.
+    failed_routes: usize,
+    /// When each route allocation was asked for, failed or not.
+    route_attempts: Vec<Instant>,
 }
 
 struct FakePush {
@@ -7198,6 +7208,11 @@ impl PushTransport for FakePush {
         let inbound = self.inbound.clone();
         Box::pin(async move {
             let mut board = board.lock().expect("the board lock");
+            board.route_attempts.push(Instant::now());
+            if board.failed_routes > 0 {
+                board.failed_routes -= 1;
+                return Err(PushError("allocated route failed to test".to_owned()));
+            }
             board.next += 1;
             let id = format!("route-{}", board.next);
             let blob = id.clone().into_bytes();
@@ -7498,6 +7513,182 @@ async fn a_dead_route_is_replaced_and_republished() {
         k.board.lock().unwrap().routes.contains_key(&route),
         "the published route is one A allocated"
     );
+}
+
+/// The route a conversation's control subkey carries, as its writer published
+/// it.
+fn published_route(dht: &Arc<Mutex<Dht>>, state: &ConvState) -> Option<Vec<u8>> {
+    let bytes = dht
+        .lock()
+        .unwrap()
+        .records
+        .get(&(CHANNEL, state.outgoing_lookup_key, channel::CONTROL_SUBKEY))
+        .expect("the control subkey")
+        .0
+        .clone();
+    channel::open_control_with_key(state.own_control_key.as_ref().expect("the key"), &bytes)
+        .expect("opens")
+        .reach
+        .route
+}
+
+/// A route allocation that fails at startup is tried again from the schedule,
+/// 5 seconds later and twice as long after each further failure, up to 2
+/// minutes, until one succeeds; the route is then published in the control
+/// subkey of the established conversation.
+#[tokio::test(start_paused = true)]
+async fn a_failed_route_allocation_is_retried_until_a_route_is_published() {
+    let scene = establish(RunnerConfig::default()).await;
+    let (a, a_peer, dht) = (scene.a, scene.a_peer, scene.dht);
+    assert!(finished(&scene.aw.stop().await));
+    let a_fake = scene.a_fake.restart();
+    let board = Arc::new(Mutex::new(Board {
+        failed_routes: 7,
+        ..Board::default()
+    }));
+    attach_push(&a_fake, &board);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's restart", is_health).await;
+    let state = conv_of(&a, &a_peer);
+    tokio::time::timeout(Duration::from_secs(15 * 60), async {
+        while published_route(&dht, &state).is_none() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await
+    .expect("A allocated a route and republished its control subkey");
+    let route = published_route(&dht, &state).expect("a route is published");
+    let (attempts, allocated) = {
+        let board = board.lock().unwrap();
+        (
+            board.route_attempts.clone(),
+            board.routes.contains_key(&route),
+        )
+    };
+    assert!(allocated, "the published route is the one allocated");
+    assert_eq!(attempts.len(), 8, "seven failures, then a route");
+    let gaps: Vec<Duration> = attempts.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let slack = Duration::from_secs(1);
+    for (gap, secs) in gaps.iter().zip([5, 10, 20, 40, 80, 120, 120]) {
+        let want = Duration::from_secs(secs);
+        assert!(
+            *gap >= want && *gap <= want + slack,
+            "the waits between attempts double from 5 s to a 2 minute cap: {gaps:?}"
+        );
+    }
+    assert!(finished(&aw.stop().await));
+}
+
+/// A send the live lane commits while the runner is rewriting control subkeys
+/// has its slot written before the rewrite of the next conversation, not after
+/// the last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_committed_during_a_control_rewrite_is_written_before_it_ends() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let c = Profile::new();
+    let c_fake = Fake::on(&k.dht);
+    attach_push(&c_fake, &k.board);
+    let mut cw = c.spawn(&c_fake, real_clock());
+    cw.wait_for("C's startup", is_health).await;
+    k.aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(3),
+        peer_identity_pk: c.pk.clone(),
+        body: b"to C".to_vec(),
+    })
+    .await;
+    let at = k.aw.wait_for("A's first contact to C", sent(3)).await;
+    let a_peer_c = sent_peer(&k.aw.seen[at]);
+    let at = cw.wait_for("C's request", request_from(&k.a.pk)).await;
+    cw.send(RunnerCommand::Accept {
+        token: CommandToken(4),
+        request: request_id(&cw.seen[at]),
+        reply: b"from C".to_vec(),
+    })
+    .await;
+    cw.wait_for("C's acceptance", sent(4)).await;
+    k.aw.wait_for("A's acceptance by C", accepted(a_peer_c))
+        .await;
+    let route = published_route(&k.dht, &conv_of(&k.a, &k.a_peer)).expect("A's route");
+    let a_inbound = k.board.lock().unwrap().routes[&route].1.clone();
+
+    let held = Arc::new(Gate::default());
+    {
+        let mut faults = k.a_fake.faults();
+        faults.gate_control = Some(Arc::clone(&held));
+        faults.channel_writes = Some(Vec::new());
+    }
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    assert!(a_inbound.offer(PushInbound::RoutesDied(vec![
+        String::from_utf8(route).expect("a fake route id")
+    ])));
+    held.reached().await;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(5),
+        peer: k.a_peer,
+        body: b"during the rewrite".to_vec(),
+    })
+    .await;
+    k.bw.wait_for(
+        "the pushed message at B",
+        message(b_peer, 1, b"during the rewrite"),
+    )
+    .await;
+    committed(&k.a, &k.a_peer, 2).await;
+    held.release();
+    k.aw.wait_for("A's send", sent(5)).await;
+    let to_b = conv_of(&k.a, &k.a_peer).outgoing_lookup_key;
+    let to_c = conv_of(&k.a, &a_peer_c).outgoing_lookup_key;
+    let slot = (to_b, channel::slot_for(1));
+    let control = channel::CONTROL_SUBKEY;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let done = k
+                .a_fake
+                .faults()
+                .channel_writes
+                .as_ref()
+                .is_some_and(|writes| {
+                    writes
+                        .iter()
+                        .filter(|(_, subkey)| *subkey == control)
+                        .count()
+                        >= 2
+                        && writes.contains(&slot)
+                });
+            if done {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both control rewrites and the send's slot write were made");
+    let writes = k.a_fake.faults().channel_writes.take().expect("the log");
+    let mut controls: Vec<_> = writes
+        .iter()
+        .filter(|(_, subkey)| *subkey == control)
+        .map(|(key, _)| *key)
+        .collect();
+    controls.sort_unstable();
+    let mut rewritten = vec![to_b, to_c];
+    rewritten.sort_unstable();
+    assert_eq!(
+        controls, rewritten,
+        "one control rewrite of each conversation: {writes:?}"
+    );
+    let write = writes
+        .iter()
+        .position(|entry| *entry == slot)
+        .expect("the send's slot write, on the conversation it was sent to");
+    let last_control = writes
+        .iter()
+        .rposition(|(_, subkey)| *subkey == control)
+        .expect("a control rewrite");
+    assert!(
+        write < last_control,
+        "the slot is written between two control rewrites: {writes:?}"
+    );
+    assert!(finished(&cw.stop().await));
 }
 
 /// A change of this side's own handle rewrites the control subkey of every

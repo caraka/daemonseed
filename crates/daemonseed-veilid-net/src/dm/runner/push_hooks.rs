@@ -5,7 +5,10 @@
 //! private route at startup, sets it and its handle as the reach every control
 //! record carries ([`Store::set_reach`]), and rewrites the control subkey of
 //! every established conversation. It does so again whenever the route dies
-//! or the handle changes. A correspondent's route is learned from every
+//! or the handle changes. An allocation that fails is tried again from the
+//! schedule, [`ROUTE_RETRY_FIRST`] after the failure and twice as long after
+//! each further failure, up to [`ROUTE_RETRY_CAP`], for as long as the runner
+//! runs without a route. A correspondent's route is learned from every
 //! control subkey of theirs the runner opens, and held in memory only; a push
 //! that goes unanswered forgets it until the next such read.
 //!
@@ -21,6 +24,21 @@ use daemonseed_core::dm::channel::Reach;
 use daemonseed_core::dm::push as core_push;
 
 use crate::dm::push::{Admitting, OwnRoute, PushInbox, PushParts, PushTransport, Pusher};
+
+/// How long after a failed route allocation the runner first tries again.
+const ROUTE_RETRY_FIRST: Duration = Duration::from_secs(5);
+
+/// The longest wait between two route allocation attempts.
+const ROUTE_RETRY_CAP: Duration = Duration::from_secs(120);
+
+/// The next route allocation attempt of a runner that holds no route.
+#[derive(Clone, Copy)]
+struct RouteRetry {
+    /// When the attempt is due.
+    due: Instant,
+    /// How long the runner waited for it, which doubles after it fails.
+    wait: Duration,
+}
 
 /// What the runner and the live lane both push with: the transport, the
 /// routes of this side's correspondents, and where an unanswered push names
@@ -104,6 +122,8 @@ pub(super) struct PushState {
     pub(super) share: PushShare,
     admission: Option<Admitting>,
     own_route: Option<OwnRoute>,
+    /// Where the last allocation failed, the next attempt.
+    route_retry: Option<RouteRetry>,
     own_handle: Option<String>,
     unanswered_rx: mpsc::UnboundedReceiver<CorrespondenceLabel>,
     /// A stored handle changed since the roster was last reported.
@@ -129,6 +149,7 @@ impl PushState {
             },
             admission: inbound.as_ref().map(PushInbox::admission),
             own_route: None,
+            route_retry: None,
             own_handle: None,
             unanswered_rx,
             roster_due: false,
@@ -144,6 +165,11 @@ impl PushState {
         events: &mpsc::Sender<RunnerEvent>,
     ) -> Option<Pusher> {
         self.share.pusher(route, events)
+    }
+
+    /// When the next route allocation attempt is due, where one is.
+    pub(super) fn route_retry_due(&self) -> Option<Instant> {
+        self.route_retry.map(|retry| retry.due)
     }
 
     fn reach(&self) -> Reach {
@@ -172,28 +198,111 @@ impl<R: RunnerRecords> Runner<R> {
         let Some(transport) = self.push.share.transport.clone() else {
             return Ok(());
         };
+        self.allocate_route(transport.as_ref(), ROUTE_RETRY_FIRST)
+            .await;
+        self.republish_controls().await
+    }
+
+    /// Try again to allocate this node's route, where an earlier allocation
+    /// failed and the next attempt is due, and republish every control subkey
+    /// once one is allocated.
+    pub(super) async fn retry_route(&mut self) -> Result<(), Halt> {
+        let Some(retry) = self.push.route_retry else {
+            return Ok(());
+        };
+        if Instant::now() < retry.due {
+            return Ok(());
+        }
+        self.check_stop()?;
+        let Some(transport) = self.push.share.transport.clone() else {
+            self.push.route_retry = None;
+            return Ok(());
+        };
+        let wait = retry.wait.saturating_mul(2).min(ROUTE_RETRY_CAP);
+        if self.allocate_route(transport.as_ref(), wait).await {
+            self.republish_controls().await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Ask `transport` for a route and hold it, or hold none and try again
+    /// `wait` from now. Whether a route was allocated.
+    async fn allocate_route(&mut self, transport: &dyn PushTransport, wait: Duration) -> bool {
         match transport.new_route().await {
             Ok(route) => {
                 crate::vtrace!("dm push: route allocated, {} bytes", route.blob.len());
                 self.push.own_route = Some(route);
+                self.push.route_retry = None;
+                true
             }
             Err(e) => {
-                crate::vtrace!("dm push: no route, pushes to this node are off ({e})");
+                crate::vtrace!(
+                    "dm push: no route, pushes to this node are off, next try in {} s ({e})",
+                    wait.as_secs()
+                );
                 self.push.own_route = None;
+                self.push.route_retry = Some(RouteRetry {
+                    due: Instant::now() + wait,
+                    wait,
+                });
+                false
             }
         }
-        self.republish_controls().await
     }
 
     /// Set the reach and rewrite the control subkey of every established
-    /// conversation this side has written one for.
+    /// conversation this side has written one for. What is queued is served
+    /// before each rewrite, as a long pass serves it between its network
+    /// calls, so a send the live lane committed meanwhile has its slot written
+    /// without waiting for the remaining rewrites. That is the one place a
+    /// command or lane note is served from inside another, and the exception
+    /// is stated at [`Runner::serve_queued`].
     async fn republish_controls(&mut self) -> Result<(), Halt> {
         self.store.set_reach(self.push.reach());
         let Ok(convs) = self.load_convs() else {
             return Ok(());
         };
+        // What had been served when `convs` was loaded; anything served since
+        // may have changed any conversation still to come.
+        let loaded_at = self.served;
         for conv in convs {
             self.check_stop()?;
+            // Served from inside the route death or own-handle command this
+            // republish ends, as [`Runner::serve_queued`] states. A route death
+            // served here republishes again, and that republish's serve does
+            // nothing because `serving` is set, so the nesting stops at two
+            // levels; the box gives the recursive future a fixed size. Where
+            // this republish itself runs inside `serve_queued`, during a long
+            // pass, nothing is served here and a committed send waits for the
+            // whole republish.
+            Box::pin(self.serve_queued()).await?;
+            let reloaded;
+            let conv = if self.served == loaded_at {
+                &conv
+            } else {
+                // What was served may have deleted or changed the conversation.
+                match self.load_one(&conv.peer) {
+                    Ok(Some(conv)) => {
+                        reloaded = conv;
+                        &reloaded
+                    }
+                    Ok(None) => {
+                        crate::vtrace!(
+                            "dm push: control of {} not rewritten, deleted by a command",
+                            tag(&conv.peer)
+                        );
+                        continue;
+                    }
+                    Err(()) => {
+                        crate::vtrace!(
+                            "dm push: control of {} not rewritten, the store would not load it",
+                            tag(&conv.peer)
+                        );
+                        continue;
+                    }
+                }
+            };
             let state = &conv.state;
             if state.delete_pending
                 || state.acceptance_pending
