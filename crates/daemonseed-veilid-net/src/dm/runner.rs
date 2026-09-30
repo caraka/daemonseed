@@ -33,7 +33,9 @@
 //! ## Startup
 //!
 //! Once the store has loaded, the task reports the [`RunnerEvent::Roster`],
-//! reopens every channel this side owns, finishes every conversation delete a
+//! admits message pushes from every established correspondent and allocates
+//! this node's route, reopens every channel this side owns, rewrites every
+//! control subkey with the route, finishes every conversation delete a
 //! previous run marked and did not finish, restores or mints the advert keys and
 //! repairs the advert, and scans the drop. Only then does it look at what a
 //! previous run left: a first contact or an acceptance that stopped part way
@@ -85,6 +87,14 @@
 //!   allocation failed: another allocation, 5 seconds after the failure and
 //!   twice as long after each further one, up to 2 minutes, until one succeeds
 //!   and every control subkey is republished with it.
+//! - **Reopen**, where a channel this side owns failed to open at startup:
+//!   another open, 30 seconds after the failure and twice as long after each
+//!   further one, up to 10 minutes, until it opens and its control subkey is
+//!   rewritten, after whatever write opened it. A control republish leaves
+//!   such a channel to this reopen. Any other write to it, in the runner or in
+//!   a flow, opens it first, except inside the wait after a failed open, where
+//!   the write fails at once and is left to the repair. The channel is dropped
+//!   from the schedule once its conversation's delete is under way.
 //!
 //! The schedule reads [`tokio::time`], so a paused test clock drives it, and the
 //! wall-clock time the flows and events see advances with it.
@@ -248,6 +258,13 @@ const TICK_JITTER_PERCENT: u128 = 20;
 
 /// The lookup key a conversation record holds before its channel is opened.
 const NO_LOOKUP_KEY: [u8; HELLO_LOOKUP_KEY_LEN] = [0u8; HELLO_LOOKUP_KEY_LEN];
+
+/// How long after a failed channel reopen at startup the runner first tries
+/// again from the schedule.
+const REOPEN_RETRY_FIRST: Duration = Duration::from_secs(30);
+
+/// The longest wait between two scheduled channel reopens.
+const REOPEN_RETRY_CAP: Duration = Duration::from_secs(10 * 60);
 
 /// An identity's long-term public key.
 pub type IdentityPk = Box<[u8; IDENTITY_PK_LEN]>;
@@ -1349,6 +1366,43 @@ struct Tracked<R> {
     /// The flow call whose every read is traced with its duration, while one
     /// runs.
     traced: Option<&'static str>,
+    /// This side's channels whose open failed, by the lookup key their
+    /// conversation recorded, until they open.
+    reopen_pending: HashMap<[u8; HELLO_LOOKUP_KEY_LEN], PendingOpen>,
+    /// Channels opened after a failed open whose control subkey the runner
+    /// rewrites after the write that opened them, until a rewrite succeeds.
+    control_owed: HashMap<[u8; HELLO_LOOKUP_KEY_LEN], OwedControl>,
+    /// The runner's stop flag, so no write opens a channel during a shutdown.
+    stop: Arc<AtomicBool>,
+}
+
+/// A control rewrite owed to a channel of this side's that opened after a
+/// failed open.
+struct OwedControl {
+    /// Its conversation.
+    peer: CorrespondenceLabel,
+    /// When the runner next tries it.
+    due: Instant,
+    /// How long after a failed try the next is due, which doubles after each
+    /// failed try, up to [`REOPEN_RETRY_CAP`].
+    wait: Duration,
+}
+
+/// A channel of this side's whose open failed.
+struct PendingOpen {
+    /// What opens it.
+    owner: ChannelOwnerSeed,
+    /// Its conversation.
+    peer: CorrespondenceLabel,
+    /// When the schedule next opens it.
+    due: Instant,
+    /// How long the schedule waited for that open, which doubles after each
+    /// failed open, up to [`REOPEN_RETRY_CAP`].
+    wait: Duration,
+    /// From when a write opens it first: at once after the open at startup
+    /// fails, and after that not before the schedule's next open, so a write
+    /// never waits out an open that failed moments ago.
+    inline_after: Instant,
 }
 
 /// `result`, having counted it if it failed, as `classify` says it failed:
@@ -1476,6 +1530,10 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         subkeys: u16,
     ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
         let result = self.inner.open_channel(owner, subkeys);
+        // A flow that opens a pending channel itself leaves it open.
+        if let Ok(lookup_key) = &result {
+            self.reopen_pending.remove(lookup_key);
+        }
         tally(
             result,
             R::classify,
@@ -1512,8 +1570,12 @@ impl<R: RunnerRecords> Records for Tracked<R> {
         subkey: u16,
         bytes: &[u8],
     ) -> Result<(), RecordError> {
+        self.open_before_write(lookup_key);
         crate::vtrace!("dm runner: channel write to subkey {subkey} starts");
         let result = self.inner.write_channel(lookup_key, subkey, bytes);
+        if result.is_ok() && subkey == channel::CONTROL_SUBKEY {
+            self.control_owed.remove(lookup_key);
+        }
         crate::vtrace!(
             "dm runner: channel write to subkey {subkey}: {}",
             outcome(&result, R::classify)
@@ -1530,12 +1592,22 @@ impl<R: RunnerRecords> Records for Tracked<R> {
     /// Passed to the store whole, so a store that starts the writes together
     /// does, and each result counted as its own single write would be.
     fn write_batch(&mut self, writes: &[BatchWrite<'_>]) -> Vec<Result<(), RecordError>> {
+        for write in writes {
+            if let BatchWrite::Channel { lookup_key, .. } = *write {
+                self.open_before_write(lookup_key);
+            }
+        }
         crate::vtrace!("dm runner: {} writes started together", writes.len());
         let results = self.inner.write_batch(writes);
         let mut counted = Vec::with_capacity(results.len());
         for (result, write) in results.into_iter().zip(writes) {
             counted.push(match *write {
-                BatchWrite::Channel { subkey, .. } => {
+                BatchWrite::Channel {
+                    lookup_key, subkey, ..
+                } => {
+                    if result.is_ok() && subkey == channel::CONTROL_SUBKEY {
+                        self.control_owed.remove(lookup_key);
+                    }
                     crate::vtrace!(
                         "dm runner: channel write to subkey {subkey}: {}",
                         outcome(&result, R::classify)
@@ -1568,6 +1640,109 @@ impl<R: RunnerRecords> Records for Tracked<R> {
 }
 
 impl<R: RunnerRecords> Tracked<R> {
+    /// Hold `lookup_key` as a channel of `peer`'s conversation whose open at
+    /// startup failed: opened by the schedule [`REOPEN_RETRY_FIRST`] from now,
+    /// and by any write before then.
+    fn hold_unopened(
+        &mut self,
+        lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
+        owner: ChannelOwnerSeed,
+        peer: CorrespondenceLabel,
+    ) {
+        let now = Instant::now();
+        self.reopen_pending.insert(
+            lookup_key,
+            PendingOpen {
+                owner,
+                peer,
+                due: now + REOPEN_RETRY_FIRST,
+                wait: REOPEN_RETRY_FIRST,
+                inline_after: now,
+            },
+        );
+    }
+
+    /// Open the pending channel at `lookup_key`, returning whether it opened.
+    /// One that opens is owed a control rewrite. One that opens under another
+    /// lookup key is not the channel its conversation names: it is counted and
+    /// no longer held. One that fails waits twice as long for its next
+    /// scheduled open, up to [`REOPEN_RETRY_CAP`], and no write opens it
+    /// before then.
+    fn reopen(&mut self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> bool {
+        let Some(mut pending) = self.reopen_pending.remove(lookup_key) else {
+            return false;
+        };
+        match self.open_channel(&pending.owner, channel::CHANNEL_SUBKEYS) {
+            Ok(opened) if opened != *lookup_key => {
+                crate::vtrace!("dm runner: a reopened channel is not the one the store recorded");
+                self.health.channel_open_failures += 1;
+                false
+            }
+            Ok(_) => {
+                crate::vtrace!("dm runner: channel of {} reopened", tag(&pending.peer));
+                self.control_owed.insert(
+                    *lookup_key,
+                    OwedControl {
+                        peer: pending.peer,
+                        due: Instant::now(),
+                        wait: REOPEN_RETRY_FIRST,
+                    },
+                );
+                true
+            }
+            Err(e) => {
+                let now = Instant::now();
+                pending.wait = pending.wait.saturating_mul(2).min(REOPEN_RETRY_CAP);
+                pending.due = now + pending.wait;
+                pending.inline_after = pending.due;
+                crate::vtrace!(
+                    "dm runner: channel reopen of {} failed again, next in {} s ({e})",
+                    tag(&pending.peer),
+                    pending.wait.as_secs()
+                );
+                self.reopen_pending.insert(*lookup_key, pending);
+                false
+            }
+        }
+    }
+
+    /// The owed control rewrites that are due, none while the runner stops.
+    fn owed_due(&self) -> Vec<([u8; HELLO_LOOKUP_KEY_LEN], CorrespondenceLabel)> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
+        let now = Instant::now();
+        self.control_owed
+            .iter()
+            .filter(|(_, owed)| owed.due <= now)
+            .map(|(lookup_key, owed)| (*lookup_key, owed.peer))
+            .collect()
+    }
+
+    /// Put the owed control rewrite of `lookup_key` off after a failed try:
+    /// due one wait from now, the wait then doubling up to
+    /// [`REOPEN_RETRY_CAP`].
+    fn defer_owed(&mut self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) {
+        if let Some(owed) = self.control_owed.get_mut(lookup_key) {
+            owed.due = Instant::now() + owed.wait;
+            owed.wait = owed.wait.saturating_mul(2).min(REOPEN_RETRY_CAP);
+        }
+    }
+
+    /// Open the channel at `lookup_key` before a write to it, where its open
+    /// failed, the wait after the last failed open is over and the runner is
+    /// not stopping. The write that follows fails at once where it stays
+    /// unopened.
+    fn open_before_write(&mut self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) {
+        let due = self
+            .reopen_pending
+            .get(lookup_key)
+            .is_some_and(|pending| Instant::now() >= pending.inline_after);
+        if due && !self.stop.load(Ordering::Relaxed) {
+            self.reopen(lookup_key);
+        }
+    }
+
     /// Trace one read of the traced flow call: what it read, whether it found
     /// anything, and how long it took.
     fn trace_read(
@@ -2167,6 +2342,9 @@ impl<R: RunnerRecords> Runner<R> {
                 health: HealthCounters::default(),
                 failed_drop_reads: 0,
                 traced: None,
+                reopen_pending: HashMap::new(),
+                control_owed: HashMap::new(),
+                stop: Arc::clone(&stop),
             },
             store,
             signer,
@@ -2232,8 +2410,9 @@ impl<R: RunnerRecords> Runner<R> {
                 runner.emit(RunnerEvent::BlockListUnreadable).await?;
             }
         }
-        runner.reopen_channels(convs)?;
         runner.start_push().await?;
+        runner.reopen_channels(convs)?;
+        runner.publish_route().await?;
         runner.resume_deletes().await?;
         runner.refresh_advert(minted);
         runner.answering = None;
@@ -2531,12 +2710,20 @@ impl<R: RunnerRecords> Runner<R> {
             .values()
             .map(|repair| repair.due)
             .chain(self.push.route_retry_due())
+            .chain(
+                self.records
+                    .reopen_pending
+                    .values()
+                    .map(|pending| pending.due),
+            )
+            .chain(self.records.control_owed.values().map(|owed| owed.due))
             .fold(self.next_tick.min(self.next_advert_poll), Instant::min)
     }
 
     /// Open every channel this side owns, so the record store can write it. A
     /// conversation whose delete is under way is left to its teardown, which
-    /// opens the record without creating it.
+    /// opens the record without creating it. A channel that fails to open is
+    /// held by the record store adapter and put on the schedule.
     fn reopen_channels(&mut self, convs: &[LoadedConv]) -> Result<(), Halt> {
         let _step = Step::start(String::from("channel reopen"));
         for conv in convs {
@@ -2553,13 +2740,132 @@ impl<R: RunnerRecords> Runner<R> {
                 self.records.health.local_refusals += 1;
                 continue;
             };
-            if let Ok(lookup_key) = self.records.open_channel(&owner, channel::CHANNEL_SUBKEYS) {
-                if lookup_key != stored {
+            match self.records.open_channel(&owner, channel::CHANNEL_SUBKEYS) {
+                Ok(lookup_key) if lookup_key != stored => {
                     crate::vtrace!(
                         "dm runner: a reopened channel is not the one the store recorded"
                     );
                     self.records.health.channel_open_failures += 1;
                 }
+                Ok(_) => {}
+                Err(e) => {
+                    crate::vtrace!(
+                        "dm runner: channel reopen of {} failed, opened again before a write and from the schedule ({e})",
+                        tag(&conv.peer)
+                    );
+                    self.records.hold_unopened(stored, owner, conv.peer);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Open again every pending channel whose scheduled open is due, serving
+    /// what is queued after each. A conversation that is gone or no longer
+    /// records the channel has it dropped unopened. One whose delete is under
+    /// way keeps it, unopened, for its teardown, which opens the record without
+    /// creating it and drops it once the delete finishes.
+    async fn retry_reopens(&mut self) -> Result<(), Halt> {
+        let now = Instant::now();
+        let due: Vec<([u8; HELLO_LOOKUP_KEY_LEN], CorrespondenceLabel)> = self
+            .records
+            .reopen_pending
+            .iter()
+            .filter(|(_, pending)| pending.due <= now)
+            .map(|(lookup_key, pending)| (*lookup_key, pending.peer))
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let _step = Step::start(String::from("channel reopen retry"));
+        for (lookup_key, peer) in due {
+            self.check_stop()?;
+            // What was served may have opened the channel or put it off.
+            let still_due = self
+                .records
+                .reopen_pending
+                .get(&lookup_key)
+                .is_some_and(|pending| pending.due <= Instant::now());
+            if !still_due {
+                continue;
+            }
+            match self.load_one(&peer) {
+                Ok(Some(conv))
+                    if !conv.state.delete_pending
+                        && conv.state.outgoing_lookup_key == lookup_key =>
+                {
+                    self.records.reopen(&lookup_key);
+                }
+                Ok(Some(conv)) if conv.state.outgoing_lookup_key == lookup_key => {
+                    self.defer_reopen(&lookup_key);
+                }
+                Ok(_) => {
+                    self.records.reopen_pending.remove(&lookup_key);
+                }
+                // Counted where the load failed.
+                Err(()) => self.defer_reopen(&lookup_key),
+            }
+            self.serve_queued().await?;
+        }
+        Ok(())
+    }
+
+    /// Look at a pending channel again a wait from now, without opening it.
+    fn defer_reopen(&mut self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) {
+        if let Some(pending) = self.records.reopen_pending.get_mut(lookup_key) {
+            pending.due = Instant::now() + pending.wait;
+        }
+    }
+
+    /// Rewrite the control subkey of every channel owed one since it opened
+    /// whose rewrite is due, from its conversation record, so the reach a
+    /// republish could not write while it was unopened reaches it. What is
+    /// queued is served before each rewrite, so a committed send waits for no
+    /// more than one, and the conversation is loaded after the serve. A
+    /// rewrite that fails, or that the store cannot yet make, stays owed and is
+    /// tried again on a doubling wait. A conversation that is gone, whose
+    /// delete or acceptance is under way, or that no longer records the channel
+    /// is owed nothing.
+    async fn write_owed_controls(&mut self) -> Result<(), Halt> {
+        for (lookup_key, peer) in self.records.owed_due() {
+            self.check_stop()?;
+            self.serve_queued().await?;
+            if !self.records.control_owed.contains_key(&lookup_key) {
+                continue;
+            }
+            let conv = match self.load_one(&peer) {
+                Ok(Some(conv)) => conv,
+                Ok(None) => {
+                    self.records.control_owed.remove(&lookup_key);
+                    continue;
+                }
+                Err(()) => {
+                    self.records.defer_owed(&lookup_key);
+                    continue;
+                }
+            };
+            let state = &conv.state;
+            if state.delete_pending
+                || state.acceptance_pending
+                || state.outgoing_lookup_key != lookup_key
+            {
+                self.records.control_owed.remove(&lookup_key);
+                continue;
+            }
+            let Some(control) = current_control(&self.store, state) else {
+                self.records.health.conversation_failures += 1;
+                self.records.defer_owed(&lookup_key);
+                continue;
+            };
+            if let Err(e) =
+                self.records
+                    .write_channel(&lookup_key, channel::CONTROL_SUBKEY, &control)
+            {
+                crate::vtrace!(
+                    "dm runner: control rewrite of {} after its reopen failed ({e})",
+                    tag(&peer)
+                );
+                self.records.defer_owed(&lookup_key);
             }
         }
         Ok(())
@@ -3592,6 +3898,17 @@ impl<R: RunnerRecords> Runner<R> {
                 Ok(None) => return Err(TeardownStop::Missing),
                 Err(_) => return Err(TeardownStop::Store),
             };
+            // A channel whose open failed is opened, without being created,
+            // before the marker is written to it. A record this node does not
+            // hold may be one the network has not answered for, so the delete
+            // stops short and is retried.
+            if erase.marker.is_some() && self.records.reopen_pending.contains_key(&erase.lookup_key)
+            {
+                if !self.open_channel_if_held(&state)? {
+                    return Err(TeardownStop::Network);
+                }
+                self.records.reopen_pending.remove(&erase.lookup_key);
+            }
             let held = match erase.marker {
                 Some(marker) => {
                     match closed_control(&state, marker) {
@@ -3618,6 +3935,7 @@ impl<R: RunnerRecords> Runner<R> {
         if delivery::finish_delete(&self.store, peer).is_err() {
             return Err(TeardownStop::Store);
         }
+        self.records.reopen_pending.remove(&erase.lookup_key);
         self.repairs.remove(peer);
         self.delivered.remove(peer);
         Ok(())
@@ -3659,6 +3977,8 @@ impl<R: RunnerRecords> Runner<R> {
         self.preview_requests().await?;
         self.serve_queued().await?;
         self.retry_route().await?;
+        self.retry_reopens().await?;
+        self.write_owed_controls().await?;
         if Instant::now() >= self.next_tick {
             self.collect_tick().await?;
             self.next_tick = Instant::now() + self.collection_interval();

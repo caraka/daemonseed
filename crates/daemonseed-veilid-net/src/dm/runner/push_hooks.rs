@@ -181,16 +181,28 @@ impl PushState {
 }
 
 impl<R: RunnerRecords> Runner<R> {
-    /// Allocate this node's route, where it has a push transport, and publish
-    /// it in every established conversation's control subkey.
+    /// Admit message pushes from every established conversation, and allocate
+    /// this node's route where it has a push transport. Nothing is written to
+    /// the network, so neither waits on a channel reopen:
+    /// [`Self::publish_route`] publishes the route once the channels are open.
     pub(super) async fn start_push(&mut self) -> Result<(), Halt> {
         if let Ok(convs) = self.load_convs() {
             self.admit_pushes_for(&convs);
         }
-        if self.push.share.transport.is_some() {
-            self.renew_route().await?;
+        if let Some(transport) = self.push.share.transport.clone() {
+            self.allocate_route(transport.as_ref(), ROUTE_RETRY_FIRST)
+                .await;
         }
         Ok(())
+    }
+
+    /// Publish the reach [`Self::start_push`] left in every established
+    /// conversation's control subkey, where this node has a push transport.
+    pub(super) async fn publish_route(&mut self) -> Result<(), Halt> {
+        if self.push.share.transport.is_none() {
+            return Ok(());
+        }
+        self.republish_controls().await
     }
 
     /// Replace this node's route and republish every control subkey with it.
@@ -308,6 +320,20 @@ impl<R: RunnerRecords> Runner<R> {
                 || state.acceptance_pending
                 || state.outgoing_lookup_key == NO_LOOKUP_KEY
             {
+                continue;
+            }
+            // A channel whose reopen failed is left to its scheduled reopen,
+            // which rewrites the control subkey with the reach set here once
+            // the channel opens, so a republish never waits out a failing open.
+            if self
+                .records
+                .reopen_pending
+                .contains_key(&state.outgoing_lookup_key)
+            {
+                crate::vtrace!(
+                    "dm push: control of {} not rewritten, its channel is not open",
+                    tag(&conv.peer)
+                );
                 continue;
             }
             let Some(control) = current_control(&self.store, state) else {

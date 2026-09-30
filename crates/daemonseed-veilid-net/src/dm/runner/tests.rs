@@ -254,6 +254,8 @@ struct Faults {
     gate_control: Option<Arc<Gate>>,
     /// Hold every channel inspect at this gate.
     gate_inspect_channel: Option<Arc<Gate>>,
+    /// Hold every channel open that may create the record at this gate.
+    gate_open_channel: Option<Arc<Gate>>,
     /// Hold the reads of one slot of one drop at this gate.
     gate_drop_slot: Option<([u8; 32], u16, Arc<Gate>)>,
     /// Hold the scans of one drop at this gate, at their read of slot 0, once
@@ -580,6 +582,10 @@ impl Records for Fake {
         _subkeys: u16,
     ) -> Result<[u8; HELLO_LOOKUP_KEY_LEN], RecordError> {
         self.count(|calls| calls.open_channel += 1);
+        let gate = self.faults().gate_open_channel.clone();
+        if let Some(gate) = gate {
+            tokio::task::block_in_place(|| gate.hold());
+        }
         self.inject(CHANNEL, Op::Open)?;
         let lookup_key = Self::lookup_key(owner);
         self.hold(lookup_key);
@@ -8868,4 +8874,781 @@ async fn sends_during_a_collection_do_not_make_it_read_again() {
         "the held read recorded the message: {reads:?}"
     );
     assert_eq!(conv_of(&k.b, &b_peer).my_collected, 2);
+}
+
+/// Whether `fake`'s record store holds the channel at `lookup_key`, as one
+/// relaunched by [`relaunch_owning`] tracks it.
+fn holds(fake: &Fake, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> bool {
+    fake.faults()
+        .owned
+        .as_ref()
+        .is_some_and(|owned| owned.contains(lookup_key))
+}
+
+/// The sequence a [`RunnerEvent::Sent`] answers with.
+fn sent_seq(event: &RunnerEvent) -> u64 {
+    match event {
+        RunnerEvent::Sent { seq, .. } => *seq,
+        other => panic!("not a sent event: {other:?}"),
+    }
+}
+
+/// A channel whose reopen fails at launch is left out of the launch's control
+/// rewrite and opened again from the schedule: the record store then holds it
+/// without any write asking, the control subkey carries the route allocated at
+/// launch, a send's slot is written, and a slot and a control subkey the
+/// network loses are rewritten by the repair.
+#[tokio::test(start_paused = true)]
+async fn a_channel_whose_reopen_fails_at_launch_is_reopened_from_the_schedule() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    assert!(finished(&aw.stop().await));
+    let lookup_key = a.outgoing_lookup_key(&b);
+    let relaunched = relaunch_owning(&a_fake, false);
+    let board = Arc::new(Mutex::new(Board::default()));
+    attach_push(&relaunched, &board);
+    relaunched
+        .faults()
+        .plan
+        .push((CHANNEL, Op::Open, Fault::TimedOut));
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    let state = conv_of(&a, &a_peer);
+    assert_eq!(
+        relaunched.calls().open_channel,
+        1,
+        "the launch's reopen fails, and its control rewrite opens nothing"
+    );
+    assert!(!holds(&relaunched, &lookup_key), "the channel is not held");
+    assert_eq!(published_route(&dht, &state), None, "no route is published");
+
+    tokio::time::sleep(REOPEN_RETRY_FIRST + Duration::from_secs(1)).await;
+    assert!(
+        holds(&relaunched, &lookup_key),
+        "the scheduled reopen opens the channel"
+    );
+    assert_eq!(relaunched.calls().open_channel, 2);
+    let route = published_route(&dht, &state).expect("the control subkey carries a route");
+    assert!(
+        board.lock().unwrap().routes.contains_key(&route),
+        "the route is the one allocated at launch"
+    );
+
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(20),
+        peer: a_peer,
+        body: b"after the reopen".to_vec(),
+    })
+    .await;
+    let at = aw.wait_for("the send", sent(20)).await;
+    let slot = channel::slot_for(sent_seq(&aw.seen[at]));
+    assert!(dht
+        .lock()
+        .unwrap()
+        .records
+        .contains_key(&(CHANNEL, lookup_key, slot)));
+
+    {
+        let mut net = dht.lock().unwrap();
+        net.evict((CHANNEL, lookup_key, slot));
+        net.evict((CHANNEL, lookup_key, channel::CONTROL_SUBKEY));
+    }
+    tokio::time::sleep(delivery::POLL_INTERVAL_MAX * 2).await;
+    {
+        let net = dht.lock().unwrap();
+        assert!(
+            net.records.contains_key(&(CHANNEL, lookup_key, slot)),
+            "the repair rewrites the lost slot"
+        );
+        assert!(
+            net.records
+                .contains_key(&(CHANNEL, lookup_key, channel::CONTROL_SUBKEY)),
+            "the repair rewrites the lost control subkey"
+        );
+    }
+    assert_eq!(
+        relaunched.calls().open_channel,
+        2,
+        "a held channel is not opened again"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A channel whose reopen fails at launch, on a node with no push transport
+/// and so no control rewrite at launch, is opened by a send made at once
+/// before its slot write, without waiting for the schedule.
+#[tokio::test(start_paused = true)]
+async fn a_channel_whose_reopen_fails_at_launch_is_opened_before_it_is_written() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    assert!(finished(&aw.stop().await));
+    let lookup_key = a.outgoing_lookup_key(&b);
+    let relaunched = relaunch_owning(&a_fake, false);
+    relaunched
+        .faults()
+        .plan
+        .push((CHANNEL, Op::Open, Fault::TimedOut));
+    let launched = Instant::now();
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    assert_eq!(relaunched.calls().open_channel, 1);
+    assert!(!holds(&relaunched, &lookup_key), "the channel is not held");
+
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(21),
+        peer: a_peer,
+        body: b"at once".to_vec(),
+    })
+    .await;
+    let at = aw
+        .wait_for("the send", |event| sent(21)(event) || refused(21)(event))
+        .await;
+    let slot = channel::slot_for(sent_seq(&aw.seen[at]));
+    assert!(
+        launched.elapsed() < REOPEN_RETRY_FIRST,
+        "answered before the scheduled reopen"
+    );
+    assert_eq!(relaunched.calls().open_channel, 2);
+    assert!(holds(&relaunched, &lookup_key), "the channel is held");
+    assert!(dht
+        .lock()
+        .unwrap()
+        .records
+        .contains_key(&(CHANNEL, lookup_key, slot)));
+    assert!(finished(&aw.stop().await));
+}
+
+/// A conversation whose channel failed to open at launch, and whose delete
+/// then fails to open the record, stays marked, and the scheduled reopen does
+/// not open its channel.
+#[tokio::test(start_paused = true)]
+async fn a_scheduled_reopen_skips_a_conversation_being_deleted() {
+    let Scene {
+        a,
+        b,
+        a_fake,
+        aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    assert!(finished(&aw.stop().await));
+    let lookup_key = a.outgoing_lookup_key(&b);
+    let relaunched = relaunch_owning(&a_fake, true);
+    // The launch's reopen fails, and so does the delete's open of the record.
+    relaunched
+        .faults()
+        .plan
+        .extend([(CHANNEL, Op::Open, Fault::TimedOut); 2]);
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    assert_eq!(
+        relaunched.calls().open_channel,
+        1,
+        "the launch's reopen fails"
+    );
+    assert!(!holds(&relaunched, &lookup_key));
+
+    aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(22),
+        peer: a_peer,
+    })
+    .await;
+    let at = aw
+        .wait_for("the delete's answer", |event| {
+            refused(22)(event)
+                || matches!(event, RunnerEvent::Deleted { token, .. } if token.0 == 22)
+        })
+        .await;
+    assert_eq!(refusal(&aw.seen[at]), Refusal::Network);
+    assert_eq!(
+        pending_deletes(&a),
+        vec![a_peer],
+        "the conversation stays marked"
+    );
+    assert!(
+        relaunched.calls().open_existing >= 1,
+        "the delete opened the channel without creating it"
+    );
+
+    tokio::time::sleep(REOPEN_RETRY_FIRST * 8).await;
+    assert_eq!(
+        relaunched.calls().open_channel,
+        1,
+        "no scheduled reopen is made for a conversation being deleted"
+    );
+
+    // The schedule kept the channel for the teardown, so a delete asked for
+    // again opens the record without creating it and writes the marker.
+    relaunched.faults().fail_erase = false;
+    let controls = relaunched.calls().control_writes;
+    aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(23),
+        peer: a_peer,
+    })
+    .await;
+    let at = aw
+        .wait_for("the second delete's answer", |event| {
+            refused(23)(event)
+                || matches!(event, RunnerEvent::Deleted { token, .. } if token.0 == 23)
+        })
+        .await;
+    assert!(
+        matches!(aw.seen[at], RunnerEvent::Deleted { .. }),
+        "{:?}",
+        aw.seen[at]
+    );
+    let calls = relaunched.calls();
+    assert_eq!(calls.open_channel, 1, "nothing is created");
+    assert_eq!(calls.control_writes, controls + 1, "the marker is written");
+    assert!(finished(&aw.stop().await));
+}
+
+/// A relaunch admits message pushes from its established
+/// correspondent and asks for a route while its channel reopen is still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relaunch_admits_pushes_and_asks_for_a_route_before_its_reopen() {
+    let (k, _) = establish_pushed().await;
+    assert!(finished(&k.bw.stop().await));
+    assert!(finished(&k.aw.stop().await));
+    let incoming = conv_of(&k.a, &k.a_peer).incoming_lookup_key;
+    let attempts = k.board.lock().unwrap().route_attempts.len();
+
+    let relaunched = k.a_fake.restart();
+    let a_inbound = attach_push(&relaunched, &k.board);
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    relaunched.faults().gate_open_channel = Some(Arc::clone(&held));
+    let aw = k.a.spawn(&relaunched, no_collection());
+    held.reached().await;
+
+    assert_eq!(
+        k.board.lock().unwrap().route_attempts.len(),
+        attempts + 1,
+        "a route is asked for before the reopen"
+    );
+    let mut message = daemonseed_core::dm::push::PUSH_TAG.to_vec();
+    message.push(1);
+    message.extend_from_slice(&incoming);
+    assert!(
+        a_inbound.offer(PushInbound::Call {
+            id: 9_998,
+            message,
+            received: std::time::Instant::now(),
+        }),
+        "a message push on the correspondent's channel is admitted"
+    );
+    assert_eq!(relaunched.calls().open_channel, 1, "the reopen is held");
+    assert_eq!(
+        relaunched.calls().control_writes,
+        0,
+        "no control subkey is written before the reopen"
+    );
+    held.release();
+    assert!(finished(&aw.stop().await));
+}
+
+/// A relaunch of A after `establish`, holding channels as the record store
+/// does, whose first `opens` channel opens fail: what the tests of a failed
+/// reopen start from.
+struct Unopened {
+    dht: Arc<Mutex<Dht>>,
+    a: Profile,
+    a_peer: CorrespondenceLabel,
+    relaunched: Fake,
+    lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
+}
+
+async fn unopened(opens: usize, send_from_b: bool) -> Unopened {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    if send_from_b {
+        bw.send(RunnerCommand::Send {
+            token: CommandToken(30),
+            peer: b_peer,
+            body: b"from B".to_vec(),
+        })
+        .await;
+        bw.wait_for("B's send", sent(30)).await;
+    }
+    assert!(finished(&bw.stop().await));
+    assert!(finished(&aw.stop().await));
+    let lookup_key = a.outgoing_lookup_key(&b);
+    let relaunched = relaunch_owning(&a_fake, false);
+    relaunched.faults().plan.extend(std::iter::repeat_n(
+        (CHANNEL, Op::Open, Fault::TimedOut),
+        opens,
+    ));
+    Unopened {
+        dht,
+        a,
+        a_peer,
+        relaunched,
+        lookup_key,
+    }
+}
+
+/// A channel whose open keeps failing is opened by the schedule 30 seconds
+/// after the launch's failure and twice as long after each further failure,
+/// up to 10 minutes.
+#[tokio::test(start_paused = true)]
+async fn a_failed_reopen_is_retried_on_a_doubling_schedule_up_to_its_cap() {
+    let u = unopened(20, false).await;
+    let launched = Instant::now();
+    let mut aw = u.a.spawn(&u.relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    let mut seen = Vec::new();
+    for (at, opens) in [
+        (29, 1),
+        (31, 2),
+        (89, 2),
+        (91, 3),
+        (209, 3),
+        (211, 4),
+        (451, 5),
+        (931, 6),
+        (1529, 6),
+        (1531, 7),
+        (2129, 7),
+        (2131, 8),
+    ] {
+        tokio::time::sleep_until(launched + Duration::from_secs(at)).await;
+        seen.push((at, u.relaunched.calls().open_channel));
+        assert_eq!(
+            u.relaunched.calls().open_channel,
+            opens,
+            "opens by {at} s: {seen:?}"
+        );
+    }
+    assert!(!holds(&u.relaunched, &u.lookup_key));
+    assert!(finished(&aw.stop().await));
+}
+
+/// A cursor published while the channel's launch reopen has failed opens the
+/// channel first, and is written before the scheduled reopen.
+#[tokio::test(start_paused = true)]
+async fn a_cursor_publish_opens_a_channel_whose_reopen_failed() {
+    let u = unopened(1, true).await;
+    u.relaunched.faults().channel_writes = Some(Vec::new());
+    let before = conv_of(&u.a, &u.a_peer).cursor_published;
+    let launched = Instant::now();
+    let config = RunnerConfig {
+        tick: Duration::from_secs(10),
+        grace: DEFAULT_GRACE,
+    };
+    let mut aw = u.a.spawn(&u.relaunched, config);
+    aw.wait_for("the relaunch", is_health).await;
+    assert!(!holds(&u.relaunched, &u.lookup_key));
+    while conv_of(&u.a, &u.a_peer).cursor_published <= before
+        && launched.elapsed() < REOPEN_RETRY_FIRST * 4
+    {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert!(
+        conv_of(&u.a, &u.a_peer).cursor_published > before,
+        "the cursor is published"
+    );
+    assert!(
+        launched.elapsed() < REOPEN_RETRY_FIRST,
+        "before the scheduled reopen: {:?}",
+        launched.elapsed()
+    );
+    assert!(holds(&u.relaunched, &u.lookup_key));
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        control_writes_to(&u.relaunched, &u.lookup_key),
+        1,
+        "the publish that opened the channel owes no second control write"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A first contact stopped before its channel writes, relaunched with its
+/// channel's reopen failed, opens the channel before those writes and places
+/// its hello during the launch.
+#[tokio::test(start_paused = true)]
+async fn a_first_contact_carried_on_opens_a_channel_whose_reopen_failed() {
+    let dht = network();
+    let (a, b) = (Profile::new(), Profile::new());
+    let mut bw = b.spawn(&Fake::on(&dht), RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    a_fake.fail_write(1);
+    aw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: b.pk.clone(),
+        body: b"hello".to_vec(),
+    })
+    .await;
+    aw.wait_for("the refused first contact", refused(1)).await;
+    assert!(finished(&aw.stop().await));
+    let lookup_key = a.outgoing_lookup_key(&b);
+    assert_ne!(lookup_key, [0u8; HELLO_LOOKUP_KEY_LEN]);
+
+    let relaunched = relaunch_owning(&a_fake, false);
+    relaunched
+        .faults()
+        .plan
+        .push((CHANNEL, Op::Open, Fault::TimedOut));
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    let calls = relaunched.calls();
+    assert_eq!(
+        calls.open_channel, 2,
+        "the launch's reopen, then the flow's"
+    );
+    assert!(holds(&relaunched, &lookup_key));
+    assert!(calls.hello_writes >= 1, "the hello is placed at launch");
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+}
+
+/// A send that opens a channel whose reopen failed writes its slot before the
+/// control subkey the reopen owes.
+#[tokio::test(start_paused = true)]
+async fn a_send_that_opens_a_channel_writes_its_slot_before_the_control() {
+    let u = unopened(1, false).await;
+    u.relaunched.faults().channel_writes = Some(Vec::new());
+    let mut aw = u.a.spawn(&u.relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(31),
+        peer: u.a_peer,
+        body: b"slot first".to_vec(),
+    })
+    .await;
+    let at = aw.wait_for("the send", sent(31)).await;
+    let slot = channel::slot_for(sent_seq(&aw.seen[at]));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let writes: Vec<u16> = u
+        .relaunched
+        .faults()
+        .channel_writes
+        .clone()
+        .expect("writes are logged")
+        .into_iter()
+        .filter(|(key, _)| *key == u.lookup_key)
+        .map(|(_, subkey)| subkey)
+        .collect();
+    assert_eq!(writes, vec![slot, channel::CONTROL_SUBKEY]);
+    assert!(finished(&aw.stop().await));
+}
+
+/// While the network does not answer, sends to a channel whose reopen failed
+/// open it once, and later sends inside the wait for the scheduled reopen fail
+/// at once without opening it again.
+#[tokio::test(start_paused = true)]
+async fn sends_inside_the_reopen_wait_do_not_open_the_channel() {
+    let u = unopened(10, false).await;
+    let mut aw = u.a.spawn(&u.relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    for (i, token) in [32u64, 33, 34].into_iter().enumerate() {
+        aw.send(RunnerCommand::Send {
+            token: CommandToken(token),
+            peer: u.a_peer,
+            body: b"offline".to_vec(),
+        })
+        .await;
+        while u.relaunched.calls().ring_writes <= i {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let calls = u.relaunched.calls();
+    assert_eq!(calls.ring_writes, 3, "each send reaches its slot write");
+    assert_eq!(
+        calls.open_channel, 2,
+        "the launch's reopen and the first send's, and no more"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A delete whose channel failed to open at launch, and whose record the
+/// network then reports absent, stops short and stays marked: nothing is
+/// created, marked or erased.
+#[tokio::test(start_paused = true)]
+async fn a_delete_of_an_unopened_channel_not_found_stays_marked() {
+    let u = unopened(1, false).await;
+    let lookup_key = u.lookup_key;
+    let mut aw = u.a.spawn(&u.relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    u.dht
+        .lock()
+        .unwrap()
+        .records
+        .retain(|(kind, name, _), _| !(*kind == CHANNEL && *name == lookup_key));
+    u.relaunched
+        .node
+        .lock()
+        .unwrap()
+        .local
+        .retain(|(kind, name, _), _| !(*kind == CHANNEL && *name == lookup_key));
+    aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(35),
+        peer: u.a_peer,
+    })
+    .await;
+    let at = aw
+        .wait_for("the delete's answer", |event| {
+            refused(35)(event)
+                || matches!(event, RunnerEvent::Deleted { token, .. } if token.0 == 35)
+        })
+        .await;
+    assert_eq!(refusal(&aw.seen[at]), Refusal::Network);
+    assert_eq!(pending_deletes(&u.a), vec![u.a_peer]);
+    let calls = u.relaunched.calls();
+    assert_eq!(
+        (
+            calls.open_channel,
+            calls.open_existing,
+            calls.control_writes,
+            calls.erases
+        ),
+        (1, 1, 0, 0),
+        "only the launch's reopen and the delete's open are made"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// How many control subkey writes `fake` logged to the channel at
+/// `lookup_key`, refused or not.
+fn control_writes_to(fake: &Fake, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> usize {
+    fake.faults()
+        .channel_writes
+        .as_ref()
+        .expect("writes are logged")
+        .iter()
+        .filter(|(key, subkey)| key == lookup_key && *subkey == channel::CONTROL_SUBKEY)
+        .count()
+}
+
+/// A record store adapter over `fake`, as the runner holds one.
+fn tracked(fake: &Fake) -> Tracked<Fake> {
+    Tracked {
+        inner: fake.clone(),
+        health: HealthCounters::default(),
+        failed_drop_reads: 0,
+        traced: None,
+        reopen_pending: HashMap::new(),
+        control_owed: HashMap::new(),
+        stop: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+/// An adapter over a fresh fake holding one pending channel, with its lookup
+/// key and the profile whose channel it is.
+fn tracked_pending() -> (Fake, Tracked<Fake>, [u8; HELLO_LOOKUP_KEY_LEN], Profile) {
+    let (a, b) = (Profile::new(), Profile::new());
+    let fake = Fake::on(&network());
+    let mut records = tracked(&fake);
+    let owner =
+        channel::derive_owner_seed(&a.keys().dm_channel_root, &b.pk, flows::FIRST_GENERATION)
+            .expect("the channel owner seed");
+    let lookup_key = Fake::lookup_key(&owner);
+    records.hold_unopened(
+        lookup_key,
+        owner,
+        CorrespondenceLabel::mint().expect("a label"),
+    );
+    (fake, records, lookup_key, a)
+}
+
+/// While the runner stops, a write opens no pending channel and no owed
+/// control rewrite is due; once it runs, both happen.
+#[tokio::test(start_paused = true)]
+async fn a_stopping_adapter_opens_nothing_and_owes_no_rewrite() {
+    let (fake, mut records, lookup_key, _) = tracked_pending();
+    records.control_owed.insert(
+        [7; HELLO_LOOKUP_KEY_LEN],
+        OwedControl {
+            peer: CorrespondenceLabel::mint().expect("a label"),
+            due: Instant::now(),
+            wait: REOPEN_RETRY_FIRST,
+        },
+    );
+    records.stop.store(true, Ordering::Relaxed);
+    let _ = records.write_channel(&lookup_key, channel::slot_for(1), b"slot");
+    assert_eq!(fake.calls().open_channel, 0, "no open while stopping");
+    assert!(records.owed_due().is_empty(), "no rewrite while stopping");
+
+    records.stop.store(false, Ordering::Relaxed);
+    assert_eq!(records.owed_due().len(), 1);
+    let _ = records.write_channel(&lookup_key, channel::slot_for(1), b"slot");
+    assert_eq!(fake.calls().open_channel, 1);
+}
+
+/// A write exactly at the end of the wait after a failed open opens the
+/// channel; one a moment before does not.
+#[tokio::test(start_paused = true)]
+async fn a_write_at_the_end_of_the_reopen_wait_opens_the_channel() {
+    let (fake, mut records, lookup_key, _) = tracked_pending();
+    fake.faults()
+        .plan
+        .push((CHANNEL, Op::Open, Fault::TimedOut));
+    let _ = records.write_channel(&lookup_key, channel::slot_for(1), b"slot");
+    assert_eq!(
+        fake.calls().open_channel,
+        1,
+        "the first write opens, and fails"
+    );
+    let until = records.reopen_pending[&lookup_key].inline_after;
+    assert!(until > Instant::now());
+    tokio::time::advance(until - Instant::now() - Duration::from_millis(1)).await;
+    let _ = records.write_channel(&lookup_key, channel::slot_for(1), b"slot");
+    assert_eq!(fake.calls().open_channel, 1, "not inside the wait");
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert_eq!(Instant::now(), until);
+    let _ = records.write_channel(&lookup_key, channel::slot_for(1), b"slot");
+    assert_eq!(fake.calls().open_channel, 2, "at its end");
+    assert!(!records.reopen_pending.contains_key(&lookup_key));
+}
+
+/// A batch whose pending channel write follows another write opens the
+/// channel once.
+#[tokio::test(start_paused = true)]
+async fn a_batch_opens_a_pending_channel_after_its_first_write() {
+    let (fake, mut records, lookup_key, a) = tracked_pending();
+    let drop_owner = drop_plane::derive_owner_seed(&a.pk).expect("the drop owner seed");
+    let results = records.write_batch(&[
+        BatchWrite::EraseDropSlot {
+            owner: &drop_owner,
+            subkeys: drop_plane::DROP_SUBKEYS,
+            slot: 0,
+        },
+        BatchWrite::Channel {
+            lookup_key: &lookup_key,
+            subkey: channel::slot_for(1),
+            bytes: b"slot",
+        },
+    ]);
+    assert_eq!(results.len(), 2);
+    assert_eq!(fake.calls().open_channel, 1);
+    assert!(!records.reopen_pending.contains_key(&lookup_key));
+}
+
+/// An owed control rewrite that fails is tried again on the schedule.
+#[tokio::test(start_paused = true)]
+async fn a_failed_owed_control_rewrite_is_tried_again() {
+    let u = unopened(1, false).await;
+    u.relaunched.faults().channel_writes = Some(Vec::new());
+    let mut aw = u.a.spawn(&u.relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    // The send's slot write goes through; the owed control write after it is
+    // refused.
+    u.relaunched.fail_write(2);
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(36),
+        peer: u.a_peer,
+        body: b"owed".to_vec(),
+    })
+    .await;
+    aw.wait_for("the send", sent(36)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(control_writes_to(&u.relaunched, &u.lookup_key), 1);
+    tokio::time::sleep(REOPEN_RETRY_FIRST + Duration::from_secs(2)).await;
+    assert_eq!(
+        control_writes_to(&u.relaunched, &u.lookup_key),
+        2,
+        "the refused rewrite is tried again"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// An owed control rewrite is not made over a conversation whose delete is
+/// under way after its marker write failed.
+#[tokio::test(start_paused = true)]
+async fn an_owed_control_is_not_written_over_a_delete_under_way() {
+    let u = unopened(1, false).await;
+    u.relaunched.faults().channel_writes = Some(Vec::new());
+    let mut aw = u.a.spawn(&u.relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    u.relaunched.fail_write(2);
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(37),
+        peer: u.a_peer,
+        body: b"owed".to_vec(),
+    })
+    .await;
+    aw.wait_for("the send", sent(37)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        control_writes_to(&u.relaunched, &u.lookup_key),
+        1,
+        "the owed rewrite failed"
+    );
+    u.relaunched.fail_write(1);
+    aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(38),
+        peer: u.a_peer,
+    })
+    .await;
+    let at = aw.wait_for("the delete's answer", refused(38)).await;
+    assert_eq!(refusal(&aw.seen[at]), Refusal::Network);
+    assert_eq!(pending_deletes(&u.a), vec![u.a_peer]);
+    let controls = control_writes_to(&u.relaunched, &u.lookup_key);
+    assert_eq!(controls, 2, "the refused marker");
+    tokio::time::sleep(REOPEN_RETRY_FIRST * 3).await;
+    assert_eq!(
+        control_writes_to(&u.relaunched, &u.lookup_key),
+        controls,
+        "no control is written over the delete"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A delete of a conversation whose channel failed to open at launch opens
+/// the record without creating it and finishes.
+#[tokio::test(start_paused = true)]
+async fn a_delete_of_an_unopened_channel_is_finished() {
+    let u = unopened(1, false).await;
+    let mut aw = u.a.spawn(&u.relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(39),
+        peer: u.a_peer,
+    })
+    .await;
+    let at = aw
+        .wait_for("the delete's answer", |event| {
+            refused(39)(event)
+                || matches!(event, RunnerEvent::Deleted { token, .. } if token.0 == 39)
+        })
+        .await;
+    assert!(
+        matches!(aw.seen[at], RunnerEvent::Deleted { .. }),
+        "{:?}",
+        aw.seen[at]
+    );
+    let calls = u.relaunched.calls();
+    assert_eq!((calls.open_channel, calls.open_existing), (1, 1));
+    assert!(finished(&aw.stop().await));
 }
