@@ -429,11 +429,18 @@ impl PushTransport for VeilidPush {
 /// What a push is made with: the transport, the correspondent's route, and
 /// where its outcome goes.
 #[derive(Clone)]
+/// A push that went unanswered: its correspondent, and the route it was made
+/// on, so only that route is forgotten.
+pub(crate) struct Unanswered {
+    pub(crate) peer: CorrespondenceLabel,
+    pub(crate) route: Vec<u8>,
+}
+
 pub(crate) struct Pusher {
     pub(crate) transport: Arc<dyn PushTransport>,
     pub(crate) route: Vec<u8>,
     pub(crate) events: mpsc::Sender<RunnerEvent>,
-    pub(crate) unanswered: mpsc::UnboundedSender<CorrespondenceLabel>,
+    pub(crate) unanswered: mpsc::UnboundedSender<Unanswered>,
     /// This side's control key for the conversation, which a message push's
     /// answer is checked under.
     pub(crate) answer_key: Option<Arc<AnswerKey>>,
@@ -481,6 +488,7 @@ impl Pusher {
         let call = self.transport.call(self.route.clone(), bytes);
         let events = self.events.clone();
         let unanswered = self.unanswered.clone();
+        let route = self.route.clone();
         tokio::spawn(async move {
             let started = Instant::now();
             match call.await {
@@ -502,7 +510,7 @@ impl Pusher {
                         started.elapsed().as_millis(),
                         outcome.err()
                     );
-                    let _ = unanswered.send(peer);
+                    let _ = unanswered.send(Unanswered { peer, route });
                 }
             }
         });

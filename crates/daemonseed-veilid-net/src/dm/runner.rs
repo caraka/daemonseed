@@ -1162,6 +1162,8 @@ enum Wake {
     Command(Option<RunnerCommand>),
     /// The live lane handed the runner something.
     Lane(live_lane::LaneNote),
+    /// A push went unanswered.
+    Unanswered(crate::dm::push::Unanswered),
     /// Something on the schedule is due.
     Due,
 }
@@ -1210,6 +1212,7 @@ async fn run<R: RunnerRecords>(
         let wake = tokio::select! {
             biased;
             Some(note) = runner.lane_notes.recv() => Wake::Lane(note),
+            Some(unanswered) = runner.push.unanswered() => Wake::Unanswered(unanswered),
             command = runner.commands.recv() => Wake::Command(command),
             () = tokio::time::sleep_until(due) => Wake::Due,
         };
@@ -1223,6 +1226,10 @@ async fn run<R: RunnerRecords>(
                 Ok(()) => runner.report_health().await,
                 halted => halted,
             },
+            Wake::Unanswered(unanswered) => {
+                runner.forget_route(&unanswered);
+                runner.report_health().await
+            }
             Wake::Due => runner.run_due().await,
         };
         match step {

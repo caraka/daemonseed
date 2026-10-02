@@ -189,6 +189,19 @@ impl Gate {
         self.turned.notify_all();
     }
 
+    /// [`Self::hold`] for an async caller: wait, without blocking the thread,
+    /// until the test releases the gate.
+    async fn pass(&self) {
+        {
+            let mut state = self.state.lock().expect("the gate lock");
+            state.0 = true;
+            self.turned.notify_all();
+        }
+        while !self.state.lock().expect("the gate lock").1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Wait on the real clock for a call to reach the gate.
     async fn reached(&self) {
         tokio::time::timeout(Duration::from_secs(60), async {
@@ -5032,12 +5045,12 @@ async fn a_noted_handle_is_kept_with_the_conversation_across_a_relaunch() {
         handle: "bert".to_owned(),
     })
     .await;
-    let at = aw
-        .wait_from(from, "the roster after the note", |event| {
-            handle_of(event).is_some()
-        })
-        .await;
-    assert_eq!(handle_of(&aw.seen[at]), Some(Some("bert".to_owned())));
+    // A roster the acceptance emitted can still be unread here, so the wait
+    // matches the roster that carries the handle rather than the next one.
+    aw.wait_from(from, "the roster carrying the noted handle", |event| {
+        handle_of(event) == Some(Some("bert".to_owned()))
+    })
+    .await;
 
     let stranger = Profile::new();
     aw.send(RunnerCommand::NoteHandle {
@@ -5418,6 +5431,23 @@ async fn a_conversation_deleted_during_the_scan_that_accepted_it_is_not_reported
         peer: a_peer,
     })
     .await;
+    // The live lane marks the delete on its own task, so the held scan is let
+    // go only once the store shows it, or the scan can reach its check first.
+    let store = reopen_store(&a);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !matches!(
+            store.load_conv(&a_peer),
+            Ok(None)
+                | Ok(Some(ConvState {
+                    delete_pending: true,
+                    ..
+                }))
+        ) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the delete is marked while the scan is held");
     held.release();
     aw.wait_from(
         from,
@@ -5432,14 +5462,16 @@ async fn a_conversation_deleted_during_the_scan_that_accepted_it_is_not_reported
         "an acceptance was reported for the deleted conversation: {:?}",
         aw.seen
     );
+    let seen = std::mem::take(&mut aw.seen);
+    let stop = aw.stop().await;
+    assert!(finished(&stop));
     assert!(
-        aw.seen
-            .iter()
+        seen.iter()
+            .chain(&stop.undelivered)
             .filter(|event| is_health(event))
             .all(|event| health(event).store_failures == 0),
-        "no store failure is counted for it"
+        "no store failure is counted for it, the health the shutdown reports included"
     );
-    assert!(finished(&aw.stop().await));
     assert!(finished(&bw.stop().await));
 }
 
@@ -6854,8 +6886,10 @@ fn messages_from(events: &[RunnerEvent], from: CorrespondenceLabel) -> Vec<u64> 
 }
 
 /// A shutdown whose grace period ends inside a flow call returns with the task
-/// still running. The command still queued is answered by the shutdown itself,
-/// the task reads as unfinished while its call is held, the messages collected
+/// still running. A send made as the shutdown begins is answered once: by the
+/// shutdown itself where it was still queued, or, where the live lane committed
+/// it first, when the task ends, with the message kept for the next launch. The
+/// task reads as unfinished while its call is held, the messages collected
 /// before the held call come back with the shutdown, and the one that call
 /// collects comes back through the task's end once it returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6919,17 +6953,6 @@ async fn a_timed_out_shutdown_hands_back_the_running_task_and_its_messages() {
         "the messages read before the held call, and not the one it reads: {:?}",
         stop.undelivered
     );
-    assert!(
-        stop.undelivered.iter().any(|event| matches!(
-            event,
-            RunnerEvent::Refused {
-                token: Some(CommandToken(77)),
-                reason: Refusal::ShuttingDown
-            }
-        )),
-        "the queued command is answered by the shutdown: {:?}",
-        stop.undelivered
-    );
     let end = match stop.outcome {
         ShutdownOutcome::TimedOut(end) => end,
         other => panic!("expected TimedOut, got {other:?}"),
@@ -6948,6 +6971,46 @@ async fn a_timed_out_shutdown_hands_back_the_running_task_and_its_messages() {
     assert!(finished(&late), "{late:?}");
     let seqs = messages_from(&late.undelivered, b_peer);
     assert_eq!(seqs, vec![3], "late events: {:?}", late.undelivered);
+    // The live lane takes the late send off the queue on its own task: refused
+    // by the shutdown where the stop was raised first, or committed and then
+    // refused when the task ends. Either way it is answered, once, and the
+    // store says which: only a committed send is owed.
+    let refused_77 = |events: &[RunnerEvent]| {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RunnerEvent::Refused {
+                        token: Some(CommandToken(77)),
+                        reason: Refusal::ShuttingDown
+                    }
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        refused_77(&stop.undelivered) + refused_77(&late.undelivered),
+        1,
+        "the late send is answered once: {:?} then {:?}",
+        stop.undelivered,
+        late.undelivered
+    );
+    let committed = reopen_store(&b)
+        .load()
+        .expect("B's store loads")
+        .convs
+        .into_iter()
+        .find(|conv| conv.peer == b_peer)
+        .expect("B's conversation")
+        .outstanding_outbox
+        .iter()
+        .any(|entry| entry.seq == 1);
+    assert_eq!(
+        committed,
+        refused_77(&late.undelivered) == 1,
+        "refused by the shutdown exactly when it was not committed"
+    );
     assert!(finished(&aw.stop().await));
 }
 
@@ -7169,6 +7232,8 @@ struct Board {
     failed_routes: usize,
     /// When each route allocation was asked for, failed or not.
     route_attempts: Vec<Instant>,
+    /// Where set, every call waits here before it is made.
+    hold_calls: Option<Arc<Gate>>,
 }
 
 struct FakePush {
@@ -7180,6 +7245,10 @@ impl PushTransport for FakePush {
     fn call(&self, route: Vec<u8>, request: Vec<u8>) -> PushFuture<Result<Vec<u8>, PushError>> {
         let board = Arc::clone(&self.board);
         Box::pin(async move {
+            let hold = board.lock().expect("the board lock").hold_calls.clone();
+            if let Some(hold) = hold {
+                hold.pass().await;
+            }
             let (tx, rx) = tokio::sync::oneshot::channel();
             let target = {
                 let mut board = board.lock().expect("the board lock");
@@ -7772,7 +7841,12 @@ async fn an_own_handle_change_is_republished_to_every_conversation_at_once() {
         handle: old.clone(),
     })
     .await;
-    prod_until(&k.aw, "both controls carry the first handle", carries(&old)).await;
+    wait_until(
+        "both controls carry the first handle",
+        AT_ONCE,
+        carries(&old),
+    )
+    .await;
     let mut settled = k.a_fake.calls().control_writes;
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -7788,7 +7862,7 @@ async fn an_own_handle_change_is_republished_to_every_conversation_at_once() {
         handle: new.clone(),
     })
     .await;
-    prod_until(&k.aw, "both controls carry the new handle", carries(&new)).await;
+    wait_until("both controls carry the new handle", AT_ONCE, carries(&new)).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(
         k.a_fake.calls().control_writes - settled,
@@ -7862,18 +7936,14 @@ async fn an_own_handle_is_published_checked_and_stored() {
     );
 }
 
-/// Wait on the real clock until `done` holds, prodding `watch`'s runner with a
-/// command that changes nothing so its after-command bookkeeping runs.
-async fn prod_until(watch: &Watch, what: &str, done: impl Fn() -> bool) {
-    let nobody = Profile::new().pk;
-    tokio::time::timeout(Duration::from_secs(30), async {
+/// Well inside the 600 s tick of `no_collection`, so what happens within it
+/// was not left to the next collection.
+const AT_ONCE: Duration = Duration::from_secs(5);
+
+/// Wait on the real clock, up to `limit`, until `done` holds.
+async fn wait_until(what: &str, limit: Duration, done: impl Fn() -> bool) {
+    tokio::time::timeout(limit, async {
         while !done() {
-            watch
-                .send(RunnerCommand::NoteHandle {
-                    peer_identity_pk: nobody.clone(),
-                    handle: "nobody#000000000000".to_owned(),
-                })
-                .await;
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
@@ -8012,11 +8082,11 @@ async fn a_failed_push_forgets_and_releases_the_route() {
     .await;
     k.aw.wait_for("A's first send", sent(3)).await;
     let board = Arc::clone(&k.board);
-    prod_until(&k.aw, "the first is pushed", || {
+    wait_until("the first is pushed", Duration::from_secs(30), || {
         board.lock().unwrap().calls == calls + 1
     })
     .await;
-    prod_until(&k.aw, "A released B's route", || {
+    wait_until("A released B's route", Duration::from_secs(30), || {
         board.lock().unwrap().released.contains(&b_route)
     })
     .await;
@@ -8033,6 +8103,47 @@ async fn a_failed_push_forgets_and_releases_the_route() {
         calls + 1,
         "the second is not pushed"
     );
+}
+
+/// A push that goes unanswered after the runner has gone idle releases the
+/// correspondent's route at once, with no command or collection to wake the
+/// runner, and not at its next collection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_push_releases_the_route_while_the_runner_is_idle() {
+    let (mut k, _) = establish_pushed().await;
+    let b_route = {
+        let board = k.board.lock().unwrap();
+        let mut routes: Vec<_> = board.routes.keys().cloned().collect();
+        routes.sort();
+        routes[0].clone()
+    };
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    {
+        let mut board = k.board.lock().unwrap();
+        board.down = true;
+        board.hold_calls = Some(Arc::clone(&held));
+    }
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"one".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(3)).await;
+    held.reached().await;
+    // What the send handed the runner is served before the push fails.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !k.board.lock().unwrap().released.contains(&b_route),
+        "the route is held while the push is"
+    );
+    held.release();
+    let board = Arc::clone(&k.board);
+    wait_until("A released B's route", AT_ONCE, || {
+        board.lock().unwrap().released.contains(&b_route)
+    })
+    .await;
 }
 
 /// A store failure on the push receive path drops the push and is counted as

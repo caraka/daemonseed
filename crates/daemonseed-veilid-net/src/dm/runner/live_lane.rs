@@ -666,8 +666,14 @@ impl Lane {
                 return;
             }
         };
-        self.share.push.answer(id, answer);
         let peer = acceptance.peer;
+        // The route is held before the answer and the event, so a send the
+        // front end makes on `Accepted` is pushed. The runner notes the reach
+        // again when it serves the note below, which changes nothing here.
+        self.share
+            .push
+            .set_peer_route(&peer, acceptance.peer_reach.route.clone());
+        self.share.push.answer(id, answer);
         crate::vtrace!("dm push: {} acceptance recognised", tag(&peer));
         self.share.emit(RunnerEvent::Accepted { peer }).await;
         match store.load_conv(&peer) {

@@ -820,30 +820,20 @@ impl DmStore {
     /// passphrase the profile already has, and the store never holds a secret
     /// with a lifetime of its own.
     ///
-    /// **The correspondence sweep is not under any lock, and does not need to
-    /// be.** It removes only names containing `TMP_INFIX`, and a live writer's
-    /// sibling has a CSPRNG suffix no other process can predict; removing one
-    /// under a concurrent writer would cost that writer its in-flight write,
-    /// reported as [`AtomicReplaceError::NotLanded`] or `Indeterminate`, never a
-    /// committed record. Two stores opening at once can only race to remove the
-    /// same dead file, and a `NotFound` on removal is not an error.
-    ///
-    /// **The ROOT sweep is different and does take the lock, because that
-    /// argument does not survive at the root.** A profile record's writer holds
-    /// the profile lock across its whole read-modify-write, so an unlocked sweep
-    /// can land between that writer's scrub-free `rename(2)` and its cleanup:
-    /// scrub the temp file *after* the rename committed it and the live record
-    /// is a zeroed inode that every later read reports as
-    /// [`DmStoreError::ErasureInterrupted`]. That is a committed record lost,
-    /// which is precisely what the paragraph above promises cannot happen — so
-    /// the root branch runs inside [`Self::profile_critical_section`], where no
+    /// **Every sweep runs under the lock of what it sweeps.** A record's writer
+    /// holds its lock across the whole read-modify-write, and the scrub writes
+    /// zeros through a handle opened on the temp sibling's name: a `rename(2)`
+    /// landing between that open and the zeroing leaves the live record a
+    /// zeroed inode, which every later read refuses. That is a committed record
+    /// lost. So each correspondence directory is swept holding that
+    /// correspondence's lock, and the root holding the profile lock, where no
     /// writer can be mid-commit.
     ///
-    /// **Opening a store never blocks on that lock and never fails because of
-    /// it.** The profile housekeeping takes the lock with
-    /// [`FileLock::try_acquire`] and skips its whole body when another holder
-    /// has it; the holder is itself a store that has done, or is doing, exactly
-    /// that work.
+    /// **Opening a store never blocks on those locks and never fails because
+    /// of them.** Each is taken with [`FileLock::try_acquire`], and what it
+    /// guards is skipped while another holder has it, or where the lock cannot
+    /// be taken at all; the sibling of a writer that dies holding it is swept
+    /// by the next open that finds it free.
     pub fn open(
         root: impl Into<PathBuf>,
         at_rest_key: &[u8; AEAD_KEY_LEN],
@@ -1290,13 +1280,23 @@ impl DmStore {
         for entry in entries {
             let entry = entry.map_err(|e| DmStoreError::io(&self.root, e))?;
             // Correspondence directories only. The root's own temp siblings
-            // are swept by `sweep_root_orphans`, which runs under the profile
-            // lock — this sweep is unlocked, and unlocked it could scrub a
-            // profile record's sibling after the `rename(2)` that committed it.
+            // are swept by `sweep_root_orphans`, under the profile lock.
             if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let dir = entry.path();
+            // Under the correspondence's lock, which every writer of its
+            // records holds across its commit, and skipped while another holder
+            // has it: that holder may be between its `rename(2)` and its
+            // cleanup, where a scrub would zero the record it just committed. A
+            // lock that cannot be taken at all is skipped too; every read and
+            // write of the correspondence fails on it the same way. The guard
+            // is bound to a name, not `_`, so it is held for the whole sweep of
+            // the directory.
+            let _held = match FileLock::try_acquire(&dir.join(LOCK_FILE_NAME)) {
+                Ok(Some(lock)) => lock,
+                Ok(None) | Err(_) => continue,
+            };
             let inner = std::fs::read_dir(&dir).map_err(|e| DmStoreError::io(&dir, e))?;
             for candidate in inner {
                 let candidate = candidate.map_err(|e| DmStoreError::io(&dir, e))?;
@@ -5005,6 +5005,35 @@ mod tests {
             dir.join(LOCK_FILE_NAME).exists(),
             "the sweep must not remove the lock file"
         );
+    }
+
+    /// A correspondence whose lock another holder has is not swept, because
+    /// that holder may be between the `rename(2)` that commits a record and its
+    /// cleanup, and is swept by the next open that finds the lock free.
+    #[test]
+    fn open_does_not_sweep_a_correspondence_whose_lock_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = label(18);
+        let dir = tmp.path().join("dm").join(l.dir_name());
+        {
+            let s = store(tmp.path());
+            s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Resume, b"alive"))
+                .unwrap();
+        }
+        let sibling = dir.join("outbox.bin.tmp.00112233445566778899aabb");
+        std::fs::write(&sibling, b"a writer's sibling").unwrap();
+
+        let held = FileLock::acquire(&dir.join(LOCK_FILE_NAME)).unwrap();
+        drop(store(tmp.path()));
+        assert_eq!(
+            std::fs::read(&sibling).unwrap(),
+            b"a writer's sibling",
+            "a sibling under a held lock is neither scrubbed nor removed"
+        );
+
+        drop(held);
+        drop(store(tmp.path()));
+        assert!(!sibling.exists(), "swept once the lock is free");
     }
 
     #[test]

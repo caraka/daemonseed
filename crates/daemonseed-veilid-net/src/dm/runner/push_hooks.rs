@@ -23,7 +23,9 @@ use super::*;
 use daemonseed_core::dm::channel::Reach;
 use daemonseed_core::dm::push as core_push;
 
-use crate::dm::push::{Admitting, OwnRoute, PushInbox, PushParts, PushTransport, Pusher};
+use crate::dm::push::{
+    Admitting, OwnRoute, PushInbox, PushParts, PushTransport, Pusher, Unanswered,
+};
 
 /// How long after a failed route allocation the runner first tries again.
 const ROUTE_RETRY_FIRST: Duration = Duration::from_secs(5);
@@ -47,7 +49,7 @@ struct RouteRetry {
 pub(super) struct PushShare {
     pub(super) transport: Option<Arc<dyn PushTransport>>,
     peer_routes: Arc<std::sync::Mutex<HashMap<CorrespondenceLabel, Vec<u8>>>>,
-    unanswered: mpsc::UnboundedSender<CorrespondenceLabel>,
+    unanswered: mpsc::UnboundedSender<Unanswered>,
 }
 
 impl PushShare {
@@ -103,7 +105,7 @@ impl PushShare {
 
     /// Take `route` as `peer`'s, or none, releasing the route held before
     /// where it changes.
-    fn set_peer_route(&self, peer: &CorrespondenceLabel, route: Option<Vec<u8>>) {
+    pub(super) fn set_peer_route(&self, peer: &CorrespondenceLabel, route: Option<Vec<u8>>) {
         let old = match route {
             Some(route) => self
                 .routes()
@@ -113,6 +115,21 @@ impl PushShare {
         };
         if let (Some(old), Some(transport)) = (old, &self.transport) {
             transport.release(&old);
+        }
+    }
+
+    /// Forget and release the route `unanswered` was pushed on, where it is
+    /// still the one held for its correspondent.
+    fn forget_route(&self, unanswered: &Unanswered) {
+        let held = {
+            let mut routes = self.routes();
+            match routes.get(&unanswered.peer) {
+                Some(route) if *route == unanswered.route => routes.remove(&unanswered.peer),
+                _ => None,
+            }
+        };
+        if let (Some(held), Some(transport)) = (held, &self.transport) {
+            transport.release(&held);
         }
     }
 }
@@ -125,7 +142,7 @@ pub(super) struct PushState {
     /// Where the last allocation failed, the next attempt.
     route_retry: Option<RouteRetry>,
     own_handle: Option<String>,
-    unanswered_rx: mpsc::UnboundedReceiver<CorrespondenceLabel>,
+    unanswered_rx: mpsc::UnboundedReceiver<Unanswered>,
     /// A stored handle changed since the roster was last reported.
     roster_due: bool,
     /// How many of the queue's shed calls are counted in the health counters.
@@ -156,6 +173,12 @@ impl PushState {
             shed_counted: 0,
         };
         (state, inbound)
+    }
+
+    /// The next correspondent whose push went unanswered. The sender lives as
+    /// long as this state, so this waits rather than ending.
+    pub(super) async fn unanswered(&mut self) -> Option<Unanswered> {
+        self.unanswered_rx.recv().await
     }
 
     /// [`PushShare::pusher`].
@@ -405,11 +428,19 @@ impl<R: RunnerRecords> Runner<R> {
         }
     }
 
+    /// Forget, and release, the route an unanswered push was made on, so the
+    /// next message to its correspondent is not pushed until its control
+    /// subkey names a route again. A route the correspondent has published
+    /// since is kept.
+    pub(super) fn forget_route(&self, unanswered: &Unanswered) {
+        self.push.share.forget_route(unanswered);
+    }
+
     /// Report the roster where a stored handle changed, and forget the routes
     /// of correspondents whose pushes went unanswered.
     pub(super) async fn flush_push_notes(&mut self) -> Result<(), Halt> {
-        while let Ok(peer) = self.push.unanswered_rx.try_recv() {
-            self.push.share.set_peer_route(&peer, None);
+        while let Ok(unanswered) = self.push.unanswered_rx.try_recv() {
+            self.forget_route(&unanswered);
         }
         self.records.health.absorb_lane(&self.lane.take_counts());
         if let Some(admission) = &self.push.admission {
