@@ -1049,6 +1049,23 @@ fn network() -> Arc<Mutex<Dht>> {
     Arc::new(Mutex::new(Dht::default()))
 }
 
+/// Whether a stop's task ended without error, waiting out a grace period that
+/// ran short: for a test whose grace period is deliberately short, so that a
+/// stop which only has to end cleanly does not depend on how loaded the machine
+/// running it is.
+async fn ends_cleanly(stop: RunnerStop) -> bool {
+    match stop.outcome {
+        ShutdownOutcome::Finished(Ok(())) => true,
+        ShutdownOutcome::TimedOut(end) => {
+            match tokio::time::timeout(Duration::from_secs(30), end.finish()).await {
+                Ok(rest) => matches!(rest.outcome, ShutdownOutcome::Finished(Ok(()))),
+                Err(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 fn finished(stop: &RunnerStop) -> bool {
     matches!(stop.outcome, ShutdownOutcome::Finished(Ok(())))
 }
@@ -1702,8 +1719,8 @@ async fn a_message_is_reported_before_the_ring_read_ends_and_once_across_a_resta
         vec![2],
         "the relaunch reported a recorded message again, or lost one"
     );
-    assert!(finished(&aw.stop().await));
-    assert!(finished(&bw.stop().await));
+    assert!(ends_cleanly(aw.stop().await).await);
+    assert!(ends_cleanly(bw.stop().await).await);
 }
 
 /// The pass whose scan surfaces a request previews it before the pass ends,

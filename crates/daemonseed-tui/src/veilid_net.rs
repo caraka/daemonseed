@@ -5196,11 +5196,26 @@ mod tests {
 
         fn read(&self) {
             self.reading.store(true, Ordering::SeqCst);
-            std::thread::sleep(self.pause);
+            off_worker(|| std::thread::sleep(self.pause));
         }
 
         fn refuse<T>() -> Result<T, RecordError> {
             Err(RecordError::new("this store takes no writes"))
+        }
+    }
+
+    /// Run a blocking wait the way the real store runs a network call: through
+    /// `block_in_place` on a multi-thread runtime, so the worker it occupies hands
+    /// its other work, the timer included, to another thread. A bare sleep on a
+    /// worker can leave no thread driving the timer.
+    fn off_worker(wait: impl FnOnce()) {
+        let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        if multi_thread {
+            tokio::task::block_in_place(wait);
+        } else {
+            wait();
         }
     }
 
