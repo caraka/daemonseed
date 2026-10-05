@@ -9,8 +9,18 @@
 //! schedule, [`ROUTE_RETRY_FIRST`] after the failure and twice as long after
 //! each further failure, up to [`ROUTE_RETRY_CAP`], for as long as the runner
 //! runs without a route. A correspondent's route is learned from every
-//! control subkey of theirs the runner opens, and held in memory only; a push
-//! that goes unanswered forgets it until the next such read.
+//! control subkey of theirs the runner opens, from a reach notice and from a
+//! message push that carries it, and is kept beside the conversation
+//! ([`Store::record_route`]), so a relaunch starts with the routes it held. A
+//! kept route is only an address to try: a push on it that goes unanswered
+//! forgets it, in memory and on disk, until the correspondent gives one again.
+//!
+//! Once this node holds a route, at launch and whenever it is replaced, and
+//! before the control subkeys are rewritten with it, the runner pushes a
+//! reach notice to every correspondent whose route it holds: the control
+//! subkey the rewrite is about to write, sealed as the record store will hold
+//! it. A correspondent that takes it learns the new route without reading the
+//! record store; one that does not answer has its route forgotten.
 //!
 //! Pushed messages and acceptances, and route deaths, are taken by the live
 //! lane ([`super::live_lane`]), which hands the runner the route deaths and
@@ -72,6 +82,7 @@ impl PushShare {
             events: events.clone(),
             unanswered: self.unanswered.clone(),
             answer_key: None,
+            own_route: None,
         })
     }
 
@@ -88,6 +99,7 @@ impl PushShare {
         let route = self.routes().get(peer).cloned();
         let mut pusher = self.pusher(route.as_ref(), events)?;
         pusher.answer_key = Some(Arc::new(core_push::AnswerKey::new(key)));
+        pusher.own_route = store.reach().route;
         Some(pusher)
     }
 
@@ -268,6 +280,13 @@ impl<R: RunnerRecords> Runner<R> {
     pub(super) async fn start_push(&mut self) -> Result<(), Halt> {
         if let Ok(convs) = self.load_convs() {
             self.admit_pushes_for(&convs);
+            for conv in &convs {
+                if conv.route.is_some() {
+                    self.push
+                        .share
+                        .set_peer_route(&conv.peer, conv.route.clone());
+                }
+            }
         }
         if let Some(transport) = self.push.share.transport.clone() {
             self.allocate_route(transport.as_ref(), ROUTE_RETRY_FIRST)
@@ -282,17 +301,58 @@ impl<R: RunnerRecords> Runner<R> {
         if self.push.share.transport.is_none() {
             return Ok(());
         }
+        self.push_reach_notices();
         self.republish_controls().await
     }
 
-    /// Replace this node's route and republish every control subkey with it.
+    /// Replace this node's route, push it to every correspondent whose route
+    /// is held, and republish every control subkey with it.
     async fn renew_route(&mut self) -> Result<(), Halt> {
         let Some(transport) = self.push.share.transport.clone() else {
             return Ok(());
         };
         self.allocate_route(transport.as_ref(), ROUTE_RETRY_FIRST)
             .await;
+        self.push_reach_notices();
         self.republish_controls().await
+    }
+
+    /// Push a reach notice carrying this node's current route to every
+    /// established conversation whose correspondent's route is held: the
+    /// control subkey this side's channel is about to be rewritten with. Each
+    /// is made on its own task; one that goes unanswered forgets the route it
+    /// was made on. Nothing where this node holds no route.
+    fn push_reach_notices(&mut self) {
+        if self.push.own_route.is_none() {
+            return;
+        }
+        self.store.set_reach(self.push.reach());
+        let Ok(convs) = self.load_convs() else {
+            return;
+        };
+        for conv in convs {
+            let state = &conv.state;
+            if state.delete_pending
+                || state.acceptance_pending
+                || state.awaiting_acceptance
+                || state.outgoing_lookup_key == NO_LOOKUP_KEY
+                || !self.push.share.holds_route(&conv.peer)
+            {
+                continue;
+            }
+            let Some(control) = current_control(&self.store, state) else {
+                continue;
+            };
+            let Some(pusher) = self
+                .push
+                .share
+                .pusher_for(&self.store, &conv.peer, &self.events)
+            else {
+                continue;
+            };
+            crate::vtrace!("dm push: reach notice to {}", tag(&conv.peer));
+            pusher.push_reach(conv.peer, &state.outgoing_lookup_key, &control);
+        }
     }
 
     /// Try again to allocate this node's route, where an earlier allocation
@@ -312,6 +372,7 @@ impl<R: RunnerRecords> Runner<R> {
         };
         let wait = retry.wait.saturating_mul(2).min(ROUTE_RETRY_CAP);
         if self.allocate_route(transport.as_ref(), wait).await {
+            self.push_reach_notices();
             self.republish_controls().await
         } else {
             Ok(())
@@ -319,9 +380,11 @@ impl<R: RunnerRecords> Runner<R> {
     }
 
     /// Ask `transport` for a route and hold it, or hold none and try again
-    /// `wait` from now. Whether a route was allocated.
+    /// `wait` from now. Whether a route was allocated. The reach the store
+    /// holds names the route from here on, so a message pushed before the
+    /// control subkeys are rewritten carries it.
     async fn allocate_route(&mut self, transport: &dyn PushTransport, wait: Duration) -> bool {
-        match transport.new_route().await {
+        let allocated = match transport.new_route().await {
             Ok(route) => {
                 crate::vtrace!("dm push: route allocated, {} bytes", route.blob.len());
                 self.push.own_route = Some(route);
@@ -340,7 +403,9 @@ impl<R: RunnerRecords> Runner<R> {
                 });
                 false
             }
-        }
+        };
+        self.store.set_reach(self.push.reach());
+        allocated
     }
 
     /// Set the reach and rewrite the control subkey of every established
@@ -465,9 +530,16 @@ impl<R: RunnerRecords> Runner<R> {
     }
 
     /// Hold what a correspondent's control subkey said of how it is reached:
-    /// its route, and its handle where the handle names its identity.
+    /// its route, kept beside the conversation, and its handle where the
+    /// handle names its identity.
     pub(super) fn note_reach(&mut self, peer: &CorrespondenceLabel, reach: &Reach) {
         self.push.share.set_peer_route(peer, reach.route.clone());
+        if let Some(route) = &reach.route {
+            match self.store.record_route(peer, route) {
+                Ok(_) | Err(StoreError::MissingConversation) => {}
+                Err(_) => self.records.health.store_failures += 1,
+            }
+        }
         let Ok(Some(state)) = self.store.load_conv(peer) else {
             return;
         };
@@ -487,12 +559,20 @@ impl<R: RunnerRecords> Runner<R> {
         }
     }
 
-    /// Forget, and release, the route an unanswered push was made on, so the
-    /// next message to its correspondent is not pushed until its control
-    /// subkey names a route again. A route the correspondent has published
-    /// since is kept.
-    pub(super) fn forget_route(&self, unanswered: &Unanswered) {
+    /// Forget, and release, the route an unanswered push was made on, in
+    /// memory and where it is kept beside the conversation, so the next
+    /// message to its correspondent is not pushed until the correspondent
+    /// gives a route again. A route the correspondent has given since is kept,
+    /// and nothing else of the conversation changes.
+    pub(super) fn forget_route(&mut self, unanswered: &Unanswered) {
         self.push.share.forget_route(unanswered);
+        match self.store.forget_route(&unanswered.peer, &unanswered.route) {
+            Ok(true) => {
+                crate::vtrace!("dm push: kept route of {} forgotten", tag(&unanswered.peer))
+            }
+            Ok(false) => {}
+            Err(_) => self.records.health.store_failures += 1,
+        }
     }
 
     /// Report the roster where a stored handle changed, and forget the routes

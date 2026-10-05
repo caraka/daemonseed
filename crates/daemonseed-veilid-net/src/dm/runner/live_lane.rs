@@ -26,7 +26,13 @@
 //!   answered here, while it is inside [`PUSH_ANSWER_WINDOW`], through
 //!   [`daemonseed_core::dm::push`] with the block list read from the store. An
 //!   acceptance is recognised from the pushed bytes alone, over
-//!   [`core_push::NoNetwork`]. A route death is handed to the runner.
+//!   [`core_push::NoNetwork`]. A route a message push carries replaces the
+//!   one held for its correspondent once the message is recorded. A reach
+//!   notice is opened under the conversation's control key and, where its
+//!   reach is newer than the one applied, answered, and its reach and cursor
+//!   handed to the runner as a watched control's are; any other is not
+//!   answered. A route death is handed to the
+//!   runner.
 //! - **Watched changes.** A change Veilid reports on the correspondent's
 //!   channel is applied from the bytes the report carries, with no read of the
 //!   record store: a control subkey is opened under the conversation's
@@ -286,6 +292,15 @@ impl LaneShare {
             .filter(|conv| conv.state.incoming_lookup_key != NO_LOOKUP_KEY)
             .map(|conv| (conv.state.incoming_lookup_key, conv.peer))
             .collect();
+    }
+
+    /// Hold `route` as `peer`'s, and keep it beside the conversation.
+    fn hold_route(&self, peer: &CorrespondenceLabel, route: &[u8]) {
+        self.push.set_peer_route(peer, Some(route.to_vec()));
+        match self.store.record_route(peer, route) {
+            Ok(_) | Err(StoreError::MissingConversation) => {}
+            Err(_) => self.count(|health| health.store_failures += 1),
+        }
     }
 
     /// The conversation that reads the channel at `lookup_key`, and its stored
@@ -638,6 +653,10 @@ impl Lane {
                 match Push::decode(&message) {
                     Some(push @ Push::Message { .. }) => self.take_message(id, &push).await,
                     Some(push @ Push::Acceptance { .. }) => self.take_acceptance(id, &push).await,
+                    Some(Push::Reach {
+                        lookup_key,
+                        control,
+                    }) => self.take_reach(id, &lookup_key, &control),
                     None => {
                         crate::vtrace!("dm push: a push that does not decode, dropped");
                         self.share.count(|health| health.pushes_dropped += 1);
@@ -813,6 +832,7 @@ impl Lane {
             lookup_key,
             subkey,
             slot,
+            route,
         } = push
         else {
             return;
@@ -836,6 +856,9 @@ impl Lane {
                 message,
                 answer,
             }) => {
+                if let Some(route) = route {
+                    self.share.hold_route(&peer, route);
+                }
                 self.share.push.answer(id, answer);
                 crate::vtrace!("dm push: {} sequence {seq} recorded", tag(&peer));
                 self.share.emit_bodies(peer, seq, vec![message]).await;
@@ -861,6 +884,65 @@ impl Lane {
             }
             Err(e) => {
                 crate::vtrace!("dm push: a message push failed, {:?}", refusal_for(&e));
+                self.failed(&e);
+            }
+        }
+    }
+
+    /// Take a reach notice: the correspondent's control subkey, opened under
+    /// the conversation's control key. One that opens and carries a reach
+    /// newer than the one applied is answered, its route held, and its reach
+    /// and cursor handed to the runner; any other is dropped unanswered.
+    fn take_reach(&self, id: u64, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], control: &[u8]) {
+        let Some(blocked) = read_block_list(&self.share.store) else {
+            crate::vtrace!("dm push: the block list will not read, a reach notice is dropped");
+            self.share.count(|health| health.pushes_dropped += 1);
+            return;
+        };
+        let taken = core_push::take_reach(
+            &self.share.store,
+            |identity| blocked.is_blocked(identity),
+            lookup_key,
+            control,
+        );
+        match taken {
+            Ok(core_push::ReachTaken::Applied {
+                peer,
+                control,
+                answer,
+            }) => {
+                // Held before the answer, so a send made once the notice is
+                // answered is pushed to the new route.
+                if let Some(route) = &control.reach.route {
+                    self.share.hold_route(&peer, route);
+                }
+                self.share.push.answer(id, answer);
+                crate::vtrace!(
+                    "dm push: reach notice of {} taken, cursor {}",
+                    tag(&peer),
+                    control.collected_cursor
+                );
+                let _ = self.notes.send(LaneNote::PeerControl {
+                    peer,
+                    reach: control.reach,
+                    cursor: control.collected_cursor,
+                });
+            }
+            Ok(core_push::ReachTaken::Blocked { peer }) => {
+                crate::vtrace!(
+                    "dm push: {} is blocked, its reach notice is dropped",
+                    tag(&peer)
+                );
+                self.share.count(|health| health.pushes_dropped += 1);
+            }
+            Ok(core_push::ReachTaken::Dropped) => {
+                crate::vtrace!(
+                    "dm push: a reach notice names no conversation or does not open, dropped"
+                );
+                self.share.count(|health| health.pushes_dropped += 1);
+            }
+            Err(e) => {
+                crate::vtrace!("dm push: a reach notice failed, {:?}", refusal_for(&e));
                 self.failed(&e);
             }
         }

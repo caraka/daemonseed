@@ -170,8 +170,13 @@ modules:
       write fails the send stays unanswered until the repair writes the slot. With a push lane it
       allocates a private route at startup and republishes every control subkey
       when the route dies or its own handle (NoteHandle for its own identity)
-      changes, pushes each message and acceptance to a correspondent whose route
-      it has read, reports Delivered on an answer of RECORDED, and counts
+      changes, pushes each message (carrying its own route) and acceptance to a
+      correspondent whose route it holds, keeps each correspondent's route with
+      the conversation across relaunches, pushes a reach notice to every held
+      route at launch and on each route renewal before the control rewrite,
+      forgets a route (held and kept) whose push goes unanswered, reports
+      Delivered on an answer of RECORDED followed by the code computed under the
+      conversation's control key (a bare RECORDED is refused), and counts
       HealthCounters::pushes_dropped (queue sheds included) and pushes_expired. A push is reported delivered only on the
       answer the correspondent makes under the conversation's control key; a
       push from a blocked correspondent, or with the block list unreadable, is
@@ -189,8 +194,8 @@ modules:
       PushFuture<Result<(), PushError>> and release(&[u8]) (drops an imported
       correspondent route). PushParts { transport: Arc<dyn PushTransport>,
       inbound: PushInbox }; push_queue() -> (PushOutbox, PushInbox):
-      PushOutbox::offer(PushInbound) -> bool admits a message push only for a
-      channel PushInbox::set_known names, at most PUSH_PER_CHANNEL (4) per
+      PushOutbox::offer(PushInbound) -> bool admits a message push or a reach
+      notice only for a channel PushInbox::set_known names, at most PUSH_PER_CHANNEL (4) per
       channel and PUSH_ACCEPTANCES (4) acceptances queued, counting the rest in
       PushInbox::shed(); PushInbox::recv / try_recv;
       PushInbound { Call { id, message, received } | RoutesDied(Vec<String>) |

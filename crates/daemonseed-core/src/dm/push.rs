@@ -19,6 +19,13 @@
 //! not erased by a pushed recognition: the next scan finds it and erases it as
 //! already collected.
 //!
+//! A message push may carry the sender's current private route after the slot,
+//! so every delivered push refreshes the receiver's view of how the sender is
+//! reached. A reach notice carries the sender's sealed control subkey alone,
+//! the same bytes its channel record holds: it is opened under the control key
+//! the conversation holds for the sender, so only the correspondent can make
+//! one that is taken, and only the correspondent can answer one.
+//!
 //! A push is answered [`RECORDED`] only after what it carried has been
 //! persisted. Nothing here answers anything: the caller replies.
 //!
@@ -126,6 +133,8 @@ pub fn answer_matches(expected: &[u8; ANSWER_LEN], got: &[u8]) -> bool {
 
 const KIND_MESSAGE: u8 = 1;
 const KIND_ACCEPTANCE: u8 = 2;
+const KIND_REACH: u8 = 3;
+const KIND_MESSAGE_WITH_ROUTE: u8 = 4;
 
 /// One push, as it travels.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +147,19 @@ pub enum Push {
         subkey: u16,
         /// The slot's bytes.
         slot: Vec<u8>,
+        /// The sender's current private-route blob, where it has one it can
+        /// publish: non-empty and at most [`channel::REACH_ROUTE_MAX_LEN`]
+        /// bytes.
+        route: Option<Vec<u8>>,
+    },
+    /// The sender's sealed control subkey, sent to the route it holds for
+    /// the receiver so the receiver learns the sender's reach without
+    /// reading the record store.
+    Reach {
+        /// The sender's channel, which the receiver reads.
+        lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
+        /// The sealed control subkey, as the channel record holds it.
+        control: Vec<u8>,
     },
     /// What an acceptance writes: the accepting side's control subkey and
     /// reply, and its hello back.
@@ -158,10 +180,13 @@ pub enum Push {
 }
 
 impl Push {
-    /// Encode: [`PUSH_TAG`] ‖ kind ‖ lookup key, then for a message
-    /// `BE16(subkey) ‖ slot`, and for an acceptance `BE16(hello_slot) ‖
-    /// lp(hello) ‖ lp(control) ‖ BE16(reply_subkey) ‖ lp(reply)`. `None` where
-    /// the result would exceed [`PUSH_MAX_LEN`].
+    /// Encode: [`PUSH_TAG`] ‖ kind ‖ lookup key, then for a message without
+    /// a route, kind 1, `BE16(subkey) ‖ slot`; for a message with one, kind 4,
+    /// `BE16(subkey) ‖ lp(slot) ‖ lp(route)`; for a reach notice, kind 3,
+    /// `lp(control)`; and for an acceptance, kind 2, `BE16(hello_slot) ‖
+    /// lp(hello) ‖ lp(control) ‖ BE16(reply_subkey) ‖ lp(reply)`. A route
+    /// that is empty or longer than [`channel::REACH_ROUTE_MAX_LEN`] is left
+    /// out. `None` where the result would exceed [`PUSH_MAX_LEN`].
     pub fn encode(&self) -> Option<Vec<u8>> {
         let mut out = Vec::new();
         out.extend_from_slice(PUSH_TAG);
@@ -170,11 +195,29 @@ impl Push {
                 lookup_key,
                 subkey,
                 slot,
+                route,
+            } => match route.as_deref().filter(|route| publishable(route)) {
+                Some(route) => {
+                    out.push(KIND_MESSAGE_WITH_ROUTE);
+                    out.extend_from_slice(lookup_key);
+                    out.extend_from_slice(&subkey.to_be_bytes());
+                    crate::dm::push_lp(&mut out, slot);
+                    crate::dm::push_lp(&mut out, route);
+                }
+                None => {
+                    out.push(KIND_MESSAGE);
+                    out.extend_from_slice(lookup_key);
+                    out.extend_from_slice(&subkey.to_be_bytes());
+                    out.extend_from_slice(slot);
+                }
+            },
+            Self::Reach {
+                lookup_key,
+                control,
             } => {
-                out.push(KIND_MESSAGE);
+                out.push(KIND_REACH);
                 out.extend_from_slice(lookup_key);
-                out.extend_from_slice(&subkey.to_be_bytes());
-                out.extend_from_slice(slot);
+                crate::dm::push_lp(&mut out, control);
             }
             Self::Acceptance {
                 lookup_key,
@@ -197,7 +240,9 @@ impl Push {
     }
 
     /// Decode a push, or `None` for bytes that are not one: another tag, an
-    /// unknown kind, a field that runs out, or trailing bytes.
+    /// unknown kind, a field that runs out, trailing bytes, a route that is
+    /// empty or longer than [`channel::REACH_ROUTE_MAX_LEN`], or a control
+    /// that is empty or longer than [`channel::SEALED_CONTROL_MAX_LEN`].
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let rest = bytes.strip_prefix(PUSH_TAG.as_slice())?;
         let (&kind, rest) = rest.split_first()?;
@@ -210,7 +255,29 @@ impl Push {
                     lookup_key,
                     subkey,
                     slot: slot.to_vec(),
+                    route: None,
                 })
+            }
+            KIND_MESSAGE_WITH_ROUTE => {
+                let (subkey, rest) = take_u16(rest)?;
+                let (slot, rest) = take_lp(rest)?;
+                let (route, rest) = take_lp(rest)?;
+                (rest.is_empty() && publishable(route)).then(|| Self::Message {
+                    lookup_key,
+                    subkey,
+                    slot: slot.to_vec(),
+                    route: Some(route.to_vec()),
+                })
+            }
+            KIND_REACH => {
+                let (control, rest) = take_lp(rest)?;
+                (rest.is_empty()
+                    && !control.is_empty()
+                    && control.len() <= channel::SEALED_CONTROL_MAX_LEN)
+                    .then(|| Self::Reach {
+                        lookup_key,
+                        control: control.to_vec(),
+                    })
             }
             KIND_ACCEPTANCE => {
                 let (hello_slot, rest) = take_u16(rest)?;
@@ -236,6 +303,11 @@ impl Push {
 /// push from every other request it carries.
 pub fn is_push(bytes: &[u8]) -> bool {
     bytes.starts_with(PUSH_TAG)
+}
+
+/// Whether `route` is one a control record would carry.
+fn publishable(route: &[u8]) -> bool {
+    !route.is_empty() && route.len() <= channel::REACH_ROUTE_MAX_LEN
 }
 
 fn take_u16(bytes: &[u8]) -> Option<(u16, &[u8])> {
@@ -380,6 +452,88 @@ fn take_message_once(
         | Err(FlowError::Store(StoreError::MissingConversation)) => Ok(Taken::Dropped),
         Err(e) => Err(e),
     }
+}
+
+/// What [`take_reach`] did with a reach notice.
+#[derive(Debug)]
+pub enum ReachTaken {
+    /// The control opened under the control key the conversation holds for
+    /// its correspondent: take in its reach and cursor, and answer with
+    /// `answer`.
+    Applied {
+        /// The conversation.
+        peer: CorrespondenceLabel,
+        /// The opened control subkey.
+        control: channel::Control,
+        /// The answer the pusher checks the notice was taken by
+        /// ([`answer`] at [`reach_seq`] of the notice's control).
+        answer: [u8; ANSWER_LEN],
+    },
+    /// From a correspondent `is_blocked` holds. Nothing was opened.
+    Blocked {
+        /// The conversation.
+        peer: CorrespondenceLabel,
+    },
+    /// Not the control of any conversation this side reads: no conversation
+    /// reads that channel, the conversation is not established or is being
+    /// deleted, or the control does not open under its key. Not answered.
+    Dropped,
+}
+
+/// The sequence a reach notice's answer is made at: the first eight bytes of
+/// `SHA-384(control)`, big-endian, so an answer is bound to the one notice it
+/// answers.
+pub fn reach_seq(control: &[u8]) -> Result<u64, FlowError> {
+    let digest =
+        oxicrypt_sha::sha384(control).map_err(|e| FlowError::Channel(ChannelError::Module(e)))?;
+    let mut seq = [0u8; 8];
+    seq.copy_from_slice(&digest[..8]);
+    Ok(u64::from_be_bytes(seq))
+}
+
+/// Open a reach notice: the sealed control subkey of the channel at
+/// `lookup_key`, pushed by its writer.
+///
+/// The conversation is the one whose incoming channel is `lookup_key`, once it
+/// is established. The control is opened under the control key that
+/// conversation holds for its correspondent, so a notice from anyone else does
+/// not open and is not answered. Nothing is persisted: the caller takes the
+/// reach and cursor in as it takes a control read from the record store.
+pub fn take_reach(
+    store: &Store,
+    is_blocked: impl Fn(&[u8; IDENTITY_PK_LEN]) -> bool,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    control: &[u8],
+) -> Result<ReachTaken, FlowError> {
+    if lookup_key == &[0u8; HELLO_LOOKUP_KEY_LEN] {
+        return Ok(ReachTaken::Dropped);
+    }
+    let Some(conv) = store
+        .load()?
+        .convs
+        .into_iter()
+        .find(|conv| &conv.state.incoming_lookup_key == lookup_key)
+    else {
+        return Ok(ReachTaken::Dropped);
+    };
+    let (peer, state) = (conv.peer, conv.state);
+    if is_blocked(&state.peer_identity_pk) {
+        return Ok(ReachTaken::Blocked { peer });
+    }
+    if state.delete_pending || state.awaiting_acceptance || state.acceptance_pending {
+        return Ok(ReachTaken::Dropped);
+    }
+    let Some(peer_control_key) = state.peer_control_key.as_ref() else {
+        return Ok(ReachTaken::Dropped);
+    };
+    let Ok(opened) = channel::open_control_with_key(peer_control_key, control) else {
+        return Ok(ReachTaken::Dropped);
+    };
+    Ok(ReachTaken::Applied {
+        peer,
+        control: opened,
+        answer: answer(peer_control_key, lookup_key, reach_seq(control)?)?,
+    })
 }
 
 /// Recognise a pushed acceptance of this side's own first contact.

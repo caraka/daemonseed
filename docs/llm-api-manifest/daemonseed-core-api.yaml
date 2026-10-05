@@ -236,7 +236,7 @@ modules:
       The DM at-rest store: one directory per correspondence, one fixed-size
       file per correspondence-scoped RecordKind (Resume, Provisional, Outbox,
       ReceiveCursor, ContactCache, Conversation, ConversationOutbox,
-      CorrespondentHandle) inside it,
+      CorrespondentHandle, CorrespondentRoute) inside it,
       and one fixed-size file per profile-scoped kind (BlockList, AdvertKeys) at
       the store
       root. DmStore::open derives the seal key from the profile at-rest key
@@ -966,7 +966,7 @@ modules:
       control subkey and RING_SLOTS (63) the message ring; slot_for(seq) is 1 + (seq
       mod RING_SLOTS). CHANNEL_SUBKEY_LEN (16384) is one subkey,
       MESSAGE_HEADER_MAX_LEN (3188) a header carrying both turn fields,
-      SEALED_CONTROL_MAX_LEN (11464) a sealed control record, and MESSAGE_BODY_MAX_LEN
+      SEALED_CONTROL_MAX_LEN (15848) a sealed control record, and MESSAGE_BODY_MAX_LEN
       (13159) is derived as CHANNEL_SUBKEY_LEN less the header maximum, the AEAD
       envelope overhead and MESSAGE_PLAINTEXT_PREFIX_LEN (9). derive_owner_seed(channel_root, peer_identity_pk, generation)
       -> Result<ChannelOwnerSeed, ChannelError> is HKDF-SHA384(salt=
@@ -1094,6 +1094,13 @@ modules:
       and counts every outbox left with no
       conversation record; a client calls it once at startup, before anything else
       uses the store, and an ordinary load leaves such an outbox in place.
+      record_route(&label, &[u8]) -> Result<bool, StoreError> keeps
+      the correspondent's last private route (non-empty, at most
+      REACH_ROUTE_MAX_LEN bytes; any other is not kept) as
+      RecordKind::CorrespondentRoute (ROUTE_RECORD_LEN bytes), refused without a
+      conversation record; forget_route(&label, &[u8]) -> Result<bool,
+      StoreError> removes it only where it is that route; route(&label) reads it
+      and LoadedConv::route carries it; delete_conv removes it.
       persist_advert_keys(&AdvertSnapshot) and load_advert_keys() ->
       Result<Option<AdvertSnapshot>, StoreError> carry the advert KEM secrets and
       serial as RecordKind::AdvertKeys, one record per profile; an empty payload is
@@ -1158,7 +1165,8 @@ modules:
       StoreError::CiphertextTooLong { len } above CHANNEL_SUBKEY_LEN;
       delete_outbox_through(peer, cursor) drops every entry below cursor.
       load() -> Result<Loaded { advert_keys, convs: Vec<LoadedConv { peer, state,
-      outstanding_outbox: Vec<OutboxEntry { seq, sent_at, ciphertext }> }> }, StoreError>
+      outstanding_outbox: Vec<OutboxEntry { seq, sent_at, ciphertext }>, handle,
+      route }> }, StoreError>
       is what a launch reads; an outbox entry is outstanding only while
       peer_collected <= seq < send_seq, so an entry at or above send_seq is a seal
       whose conversation record did not commit and is not reported. A conversation
@@ -1245,10 +1253,14 @@ modules:
       ReadCache::insert_channel(lookup_key, subkey, Option<Vec<u8>>) and
       insert_drop_slot(&DropOwnerSeed, slot, Vec<u8>) seed a cache, and
       CachedRecords answers drop-slot reads from it.
-      Sub-module dm::push: Push { Message { lookup_key, subkey, slot } |
-      Acceptance { lookup_key, hello_slot, hello, control, reply_subkey, reply } }
-      with encode() -> Option<Vec<u8>> (None above PUSH_MAX_LEN = 32 KiB) and
-      decode(&[u8]) -> Option<Push>; PUSH_TAG (8 bytes every push starts with),
+      Sub-module dm::push: Push { Message { lookup_key, subkey, slot, route:
+      Option<Vec<u8>> } | Reach { lookup_key, control } | Acceptance {
+      lookup_key, hello_slot, hello, control, reply_subkey, reply } } with
+      encode() -> Option<Vec<u8>> (None above PUSH_MAX_LEN = 32 KiB; kind 1 a
+      message without a route, kind 4 one with lp(slot) and lp(route), kind 3 a
+      reach notice, kind 2 an acceptance) and decode(&[u8]) -> Option<Push>,
+      which refuses a route that is empty or over REACH_ROUTE_MAX_LEN and a
+      control that is empty or over SEALED_CONTROL_MAX_LEN; PUSH_TAG (8 bytes every push starts with),
       RECORDED (the prefix of an answer), is_push(&[u8]) -> bool.
       answer(&ControlKey, lookup_key, seq) -> Result<[u8; ANSWER_LEN],
       FlowError> is RECORDED followed by a 32-byte HKDF code under the pushing
@@ -1260,7 +1272,13 @@ modules:
       an established conversation, through collect_step: Taken { Recorded {
       peer, seq, message, answer } | Blocked { peer } | Duplicate { peer } |
       Ahead { peer } | Dropped }; a commit that conflicts is taken again from a
-      fresh load, TAKE_ATTEMPTS (4) times in all. NoNetwork is a Records that
+      fresh load, TAKE_ATTEMPTS (4) times in all. take_reach(store, is_blocked,
+      lookup_key, control) -> Result<ReachTaken, FlowError> opens a reach
+      notice's control under the established conversation's peer control key:
+      ReachTaken { Applied { peer, control: Control, answer } | Blocked { peer }
+      | Dropped }, persisting nothing; reach_seq(control) -> Result<u64,
+      FlowError> is the sequence its answer is made at, the first eight bytes of
+      SHA-384(control). NoNetwork is a Records that
       refuses every call. recognise_acceptance(store, records, me,
       advert_keys, is_blocked, &Push) -> Result<Option<(Acceptance, [u8;
       ANSWER_LEN])>, FlowError> runs collect_slot over the pushed bytes as a
@@ -9616,8 +9634,8 @@ constants:
   - name: SEALED_CONTROL_MAX_LEN
     module: daemonseed_core::dm::channel
     type: usize
-    value: "11464"
-    description: Bytes a sealed control record takes at its largest, with the opening present.
+    value: "15848"
+    description: Bytes a sealed control record takes at its largest, with the opening, the longest route and the longest handle present.
 
 # ─────────────────────────────────────────────────────────────────────
 # Common gotchas across modules (non-spec extra section, retained from the

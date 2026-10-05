@@ -5,8 +5,8 @@
 //! Serves FC2.
 //!
 //! `docs/design/direct-messaging.md` § On-disk records gives the records —
-//! the advert keys, the conversation, its outbox and the correspondent's last
-//! roster handle —
+//! the advert keys, the conversation, its outbox, the correspondent's last
+//! roster handle and the correspondent's last private route —
 //! and § Flows gives the order they are written in. Everything here is under
 //! [`crate::storage::dm_store`]'s at-rest seal, so this module decides record
 //! *shape* and write *order* and nothing about keys or files.
@@ -71,7 +71,9 @@ use crate::dm::chain::{
     CHAIN_KEY_LEN, ChainKey, ConversationSnapshot, DirectionState, OWN_TURNS_RETAINED, OwnTurn,
     PeerTurn, ROOT_LEN, RatchetDecapKey, RatchetKeypair, ReceivingState, Root, TurnSecret,
 };
-use crate::dm::channel::{CHANNEL_SUBKEY_LEN, ControlKey, OPENING_LEN, RING_SLOTS, Reach};
+use crate::dm::channel::{
+    CHANNEL_SUBKEY_LEN, ControlKey, OPENING_LEN, REACH_ROUTE_MAX_LEN, RING_SLOTS, Reach,
+};
 use crate::dm::drop::{DROP_SUBKEYS, HELLO_LEN, HELLO_LOOKUP_KEY_LEN, HELLO_R_LEN};
 use crate::storage::dm_store::{
     CorrespondenceLabel, DmStore, DmStoreError, Locked, LockedProfile, RecordKind,
@@ -120,11 +122,24 @@ pub const HANDLE_MAX_LEN: usize = 256;
 /// [`HANDLE_MAX_LEN`] bytes holding it and zeros after it.
 pub const HANDLE_RECORD_LEN: usize = HANDLE_MAGIC.len() + 1 + 2 + HANDLE_MAX_LEN;
 
+/// The magic heading a correspondent-route record.
+const ROUTE_MAGIC: &[u8] = b"daemonseed/dm/store/rout/v1\0";
+
+/// The version byte a correspondent-route record carries after its magic,
+/// carried apart for [`CONV_RECORD_VERSION`]'s reason.
+const ROUTE_RECORD_VERSION: u8 = 1;
+
+/// Bytes a correspondent-route record occupies, and so
+/// [`RecordKind::CorrespondentRoute`]'s bucket: the route's length, then
+/// [`REACH_ROUTE_MAX_LEN`] bytes holding it and zeros after it.
+pub const ROUTE_RECORD_LEN: usize = ROUTE_MAGIC.len() + 1 + 2 + REACH_ROUTE_MAX_LEN;
+
 /// The order [`Store::delete_conv`] removes a correspondence's records in.
-const DELETE_ORDER: [RecordKind; 3] = [
+const DELETE_ORDER: [RecordKind; 4] = [
     RecordKind::Conversation,
     RecordKind::ConversationOutbox,
     RecordKind::CorrespondentHandle,
+    RecordKind::CorrespondentRoute,
 ];
 
 #[cfg(test)]
@@ -507,6 +522,10 @@ pub struct LoadedConv {
     /// ([`Store::record_handle`]), or `None` where none was recorded or its
     /// record does not decode.
     pub handle: Option<String>,
+    /// The private route the correspondent last gave
+    /// ([`Store::record_route`]), or `None` where none is held or its record
+    /// does not decode.
+    pub route: Option<Vec<u8>>,
 }
 
 /// Everything a launch reads back.
@@ -825,6 +844,58 @@ impl Store {
             .critical_section::<_, StoreError>(peer, read_handle)
     }
 
+    /// Record `route` as the private route `peer`'s correspondent last gave,
+    /// where it differs from the one recorded, and return whether it was
+    /// written. A route that is empty or longer than [`REACH_ROUTE_MAX_LEN`]
+    /// is not kept.
+    ///
+    /// Refuses [`StoreError::MissingConversation`] where `peer` holds no
+    /// conversation record. The conversation record is only read.
+    pub fn record_route(
+        &self,
+        peer: &CorrespondenceLabel,
+        route: &[u8],
+    ) -> Result<bool, StoreError> {
+        self.inner.critical_section::<_, StoreError>(peer, |g| {
+            if read_conv(g)?.is_none() {
+                return Err(StoreError::MissingConversation);
+            }
+            if route.is_empty() || route.len() > REACH_ROUTE_MAX_LEN {
+                return Ok(false);
+            }
+            if read_route(g)?.as_deref() == Some(route) {
+                return Ok(false);
+            }
+            g.replace(RecordKind::CorrespondentRoute, &encode_route(route))?;
+            Ok(true)
+        })
+    }
+
+    /// Remove the route recorded for `peer`'s correspondent where it is
+    /// `route`, and return whether it was removed. A route recorded since is
+    /// kept. Nothing else of the correspondence is touched.
+    pub fn forget_route(
+        &self,
+        peer: &CorrespondenceLabel,
+        route: &[u8],
+    ) -> Result<bool, StoreError> {
+        self.inner.critical_section::<_, StoreError>(peer, |g| {
+            if read_route(g)?.as_deref() != Some(route) {
+                return Ok(false);
+            }
+            g.delete(RecordKind::CorrespondentRoute)?;
+            Ok(true)
+        })
+    }
+
+    /// The route recorded for `peer`'s correspondent by
+    /// [`Store::record_route`], or `None` where none was, or its record does
+    /// not decode.
+    pub fn route(&self, peer: &CorrespondenceLabel) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner
+            .critical_section::<_, StoreError>(peer, read_route)
+    }
+
     /// Record that a delete of `peer`'s conversation is under way, returning
     /// the state as it stood.
     ///
@@ -1030,15 +1101,19 @@ impl Store {
                     if read_finishing_delete(g, RecordKind::CorrespondentHandle)?.is_some() {
                         g.delete(RecordKind::CorrespondentHandle)?;
                     }
+                    if read_finishing_delete(g, RecordKind::CorrespondentRoute)?.is_some() {
+                        g.delete(RecordKind::CorrespondentRoute)?;
+                    }
                     return Ok(None);
                 };
                 let table = read_outbox(
                     read_finishing_delete(g, RecordKind::ConversationOutbox)?.as_deref(),
                 )?;
                 let handle = read_handle(g)?;
-                Ok(Some((state, table, handle)))
+                let route = read_route(g)?;
+                Ok(Some((state, table, handle, route)))
             })?;
-            let Some((state, table, handle)) = read else {
+            let Some((state, table, handle, route)) = read else {
                 continue;
             };
             let mut outstanding: Vec<OutboxEntry> = table
@@ -1054,6 +1129,7 @@ impl Store {
                 state,
                 outstanding_outbox: outstanding,
                 handle,
+                route,
             });
         }
         Ok(Loaded { advert_keys, convs })
@@ -1123,6 +1199,47 @@ fn read_handle(g: &mut Locked<'_>) -> Result<Option<String>, StoreError> {
         return Ok(None);
     };
     Ok(decode_handle(&bytes).ok())
+}
+
+/// The correspondent-route record under an open guard, or `None` where there
+/// is none or it does not decode, for [`read_handle`]'s reason: the route is
+/// only an address to try.
+/// The correspondent-route record under an open guard, or `None` where there
+/// is none or it does not decode, for [`read_handle`]'s reason: the route is
+/// only an address to try.
+fn read_route(g: &mut Locked<'_>) -> Result<Option<Vec<u8>>, StoreError> {
+    let Some(bytes) = read_finishing_delete(g, RecordKind::CorrespondentRoute)? else {
+        return Ok(None);
+    };
+    Ok(decode_route(&bytes).ok())
+}
+
+/// Encode a correspondent-route record. `route` is at most
+/// [`REACH_ROUTE_MAX_LEN`] bytes.
+pub(crate) fn encode_route(route: &[u8]) -> Zeroizing<Vec<u8>> {
+    let route = &route[..route.len().min(REACH_ROUTE_MAX_LEN)];
+    let mut w = Writer::with_capacity(ROUTE_RECORD_LEN);
+    w.bytes(ROUTE_MAGIC);
+    w.u8(ROUTE_RECORD_VERSION);
+    w.u16(route.len() as u16);
+    w.padded(route, REACH_ROUTE_MAX_LEN);
+    w.0
+}
+
+/// Decode a correspondent-route record. A record holding an empty route is
+/// refused, as no route is ever recorded empty.
+pub(crate) fn decode_route(bytes: &[u8]) -> Result<Vec<u8>, StoreError> {
+    let mut r = Reader::new(bytes, RecordKind::CorrespondentRoute);
+    r.header_version(ROUTE_MAGIC, ROUTE_RECORD_VERSION)?;
+    let len = usize::from(r.u16()?);
+    let field = r.take(REACH_ROUTE_MAX_LEN)?;
+    let route = field
+        .get(..len)
+        .filter(|route| !route.is_empty())
+        .ok_or_else(|| r.corrupt("the route's length runs past its field"))?
+        .to_vec();
+    r.finish()?;
+    Ok(route)
 }
 
 /// `handle`, cut to at most [`HANDLE_MAX_LEN`] bytes at a character boundary.
@@ -3319,7 +3436,8 @@ mod tests {
             vec![
                 RecordKind::Conversation,
                 RecordKind::ConversationOutbox,
-                RecordKind::CorrespondentHandle
+                RecordKind::CorrespondentHandle,
+                RecordKind::CorrespondentRoute
             ],
             "delete_conv did not remove the conversation record first"
         );
@@ -3368,6 +3486,110 @@ mod tests {
             None,
             "deleted with the conversation"
         );
+    }
+
+    // ── correspondent route ─────────────────────────────────────────────────
+
+    /// A recorded route is loaded with its conversation across a reopen, is
+    /// written only where it changed, is forgotten only where it is still the
+    /// one held, and goes with the conversation's delete. Forgetting it leaves
+    /// the conversation record, its outbox and its handle as they were.
+    #[test]
+    fn a_recorded_route_survives_a_reopen_and_is_forgotten_alone() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = label(0x4a);
+        let (first, second) = (vec![0x11; 742], vec![0x22; 800]);
+        {
+            let store = Store::open(tmp.path(), &at_rest_key(0x4b)).unwrap();
+            assert!(
+                matches!(
+                    store.record_route(&peer, &first),
+                    Err(StoreError::MissingConversation)
+                ),
+                "no route is kept for a correspondence with no conversation"
+            );
+            store
+                .create_conv(&peer, &conv_state(&a, 2, 1, 0, None))
+                .unwrap();
+            store.persist_outbox(&peer, 1, &[0x7e; 64], NOW).unwrap();
+            assert!(store.record_handle(&peer, "anna").unwrap());
+            assert_eq!(store.load().unwrap().convs[0].route, None);
+            assert!(store.record_route(&peer, &first).unwrap(), "first write");
+            assert!(!store.record_route(&peer, &first).unwrap(), "unchanged");
+            assert!(
+                !store.record_route(&peer, &[]).unwrap(),
+                "an empty route is not kept"
+            );
+            let over = vec![0x33; REACH_ROUTE_MAX_LEN + 1];
+            assert!(
+                !store.record_route(&peer, &over).unwrap(),
+                "a route longer than a control record carries is not kept"
+            );
+        }
+        let store = Store::open(tmp.path(), &at_rest_key(0x4b)).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.convs.len(), 1);
+        assert_eq!(loaded.convs[0].route.as_deref(), Some(first.as_slice()));
+        let state_before = format!("{:?}", loaded.convs[0].state);
+        let outbox_before = loaded.convs[0].outstanding_outbox.clone();
+
+        assert!(store.record_route(&peer, &second).unwrap(), "changed");
+        assert!(
+            !store.forget_route(&peer, &first).unwrap(),
+            "a route no longer held is not forgotten"
+        );
+        assert_eq!(store.route(&peer).unwrap(), Some(second.clone()));
+        assert!(store.forget_route(&peer, &second).unwrap(), "forgotten");
+        assert_eq!(store.route(&peer).unwrap(), None);
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.convs.len(), 1, "the conversation is still there");
+        let conv = &loaded.convs[0];
+        assert_eq!(conv.route, None);
+        assert_eq!(format!("{:?}", conv.state), state_before);
+        assert_eq!(conv.outstanding_outbox, outbox_before);
+        assert_eq!(conv.outstanding_outbox.len(), 1);
+        assert_eq!(conv.handle.as_deref(), Some("anna"));
+
+        assert!(store.record_route(&peer, &first).unwrap());
+        store.delete_conv(&peer).unwrap();
+        assert_eq!(
+            store.route(&peer).unwrap(),
+            None,
+            "deleted with the conversation"
+        );
+    }
+
+    /// Every route record is one size whatever the route's length, and one
+    /// that does not decode reads as no route rather than failing the load.
+    #[test]
+    fn a_route_record_is_one_size_and_an_undecodable_one_is_no_route() {
+        assert_eq!(encode_route(&[1]).len(), ROUTE_RECORD_LEN);
+        assert_eq!(
+            encode_route(&[1; REACH_ROUTE_MAX_LEN]).len(),
+            ROUTE_RECORD_LEN
+        );
+        assert_eq!(
+            decode_route(&encode_route(&[5; 300])).unwrap(),
+            vec![5; 300]
+        );
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path(), &at_rest_key(0x4c)).unwrap();
+        let peer = label(0x4d);
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        store
+            .records()
+            .critical_section::<_, StoreError>(&peer, |g| {
+                Ok(g.replace(RecordKind::CorrespondentRoute, &[0xff; 9])?)
+            })
+            .unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.convs.len(), 1, "the conversation still loads");
+        assert_eq!(loaded.convs[0].route, None);
     }
 
     /// A handle past [`HANDLE_MAX_LEN`] is kept cut at a character boundary,

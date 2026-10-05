@@ -33,9 +33,10 @@
 //! ## Startup
 //!
 //! Once the store has loaded, the task reports the [`RunnerEvent::Roster`],
-//! admits message pushes from every established correspondent and allocates
-//! this node's route, reopens every channel this side owns, rewrites every
-//! control subkey with the route, finishes every conversation delete a
+//! admits message pushes from every established correspondent, holds the
+//! routes it kept for them and allocates this node's route, reopens every
+//! channel this side owns, pushes a reach notice to every route it holds and
+//! rewrites every control subkey with the route, finishes every conversation delete a
 //! previous run marked and did not finish, restores or mints the advert keys and
 //! repairs the advert, and scans the drop. Only then does it look at what a
 //! previous run left: a first contact or an acceptance that stopped part way
@@ -91,8 +92,13 @@
 //!   which a later reset rotates past.
 //! - **Route**, where this node has a push transport and its last route
 //!   allocation failed: another allocation, 5 seconds after the failure and
-//!   twice as long after each further one, up to 2 minutes, until one succeeds
-//!   and every control subkey is republished with it.
+//!   twice as long after each further one, up to 2 minutes, until one
+//!   succeeds. Then a reach notice is pushed to every route held, and every
+//!   control subkey is republished with the new route.
+//! - **Cursor publish**, where a message recorded from a watched change left
+//!   the conversation's cursor to publish: at once, and after a publish that
+//!   fails on the network, 5 seconds later and twice as long after each
+//!   further failure, up to 2 minutes, until it is written.
 //! - **Reopen**, where a channel this side owns failed to open at startup:
 //!   another open, 30 seconds after the failure and twice as long after each
 //!   further one, up to 10 minutes, until it opens and its control subkey is
@@ -258,6 +264,21 @@ const REOPEN_RETRY_FIRST: Duration = Duration::from_secs(30);
 
 /// The longest wait between two scheduled channel reopens.
 const REOPEN_RETRY_CAP: Duration = Duration::from_secs(10 * 60);
+
+/// How long after a cursor publish fails on the network the runner first
+/// tries it again.
+const CURSOR_RETRY_FIRST: Duration = Duration::from_secs(5);
+
+/// The longest wait between two tries of one owed cursor publish.
+const CURSOR_RETRY_CAP: Duration = Duration::from_secs(2 * 60);
+
+/// A cursor publish owed to a conversation: when it is next tried, and how
+/// long the runner waits after that try if it fails too.
+#[derive(Clone, Copy)]
+struct OwedPublish {
+    due: Instant,
+    wait: Duration,
+}
 
 /// An identity's long-term public key.
 pub type IdentityPk = Box<[u8; IDENTITY_PK_LEN]>;
@@ -2269,10 +2290,12 @@ struct Runner<R> {
     /// Conversations a watched change or an establishment asked to have
     /// collected, at the next wake.
     collect_now: HashSet<CorrespondenceLabel>,
-    /// Conversations whose cursor is published at the next wake, after a
-    /// message recorded from a watched change. One entry per conversation, so
-    /// messages recorded meanwhile ride the same write.
-    publish_owed: HashSet<CorrespondenceLabel>,
+    /// Conversations whose cursor is published once due, after a message
+    /// recorded from a watched change: at the next wake, and after a publish
+    /// that failed on the network, on a doubling wait up to
+    /// [`CURSOR_RETRY_CAP`]. One entry per conversation, so messages recorded
+    /// meanwhile ride the same write.
+    publish_owed: HashMap<CorrespondenceLabel, OwedPublish>,
     /// Conversations whose next asked-for collection also catches up on the
     /// correspondent's control: just established, or watched again after the
     /// watch died, so a control change may have landed while none was live.
@@ -2441,7 +2464,7 @@ impl<R: RunnerRecords> Runner<R> {
                 .collect(),
             repairs: HashMap::new(),
             collect_now: HashSet::new(),
-            publish_owed: HashSet::new(),
+            publish_owed: HashMap::new(),
             catch_up: HashSet::new(),
             startup_collected: false,
             next_tick: now + jittered(config.tick),
@@ -2778,15 +2801,13 @@ impl<R: RunnerRecords> Runner<R> {
     /// The earliest moment anything on the schedule is due: now, while a held
     /// request waits for its preview.
     fn next_due(&self) -> Instant {
-        if self.requests.values().any(|entry| entry.preview_due)
-            || !self.collect_now.is_empty()
-            || !self.publish_owed.is_empty()
-        {
+        if self.requests.values().any(|entry| entry.preview_due) || !self.collect_now.is_empty() {
             return Instant::now();
         }
         self.repairs
             .values()
             .map(|repair| repair.due)
+            .chain(self.publish_owed.values().map(|owed| owed.due))
             .chain(self.push.route_retry_due())
             .chain(
                 self.records
@@ -3583,7 +3604,10 @@ impl<R: RunnerRecords> Runner<R> {
                 Ok(())
             }
             live_lane::LaneNote::PublishCursor(peer) => {
-                self.publish_owed.insert(peer);
+                self.publish_owed.entry(peer).or_insert(OwedPublish {
+                    due: Instant::now(),
+                    wait: CURSOR_RETRY_FIRST,
+                });
                 Ok(())
             }
             live_lane::LaneNote::Blocked {
@@ -4504,32 +4528,60 @@ impl<R: RunnerRecords> Runner<R> {
         }
     }
 
-    /// Publish the cursor of each conversation a watched message left owed,
-    /// with the control write alone: no ring is read. The cursor written is
-    /// the one the store holds now, so every message recorded since the note
-    /// rides this write, and a conversation already published writes nothing.
+    /// Publish the cursor of each conversation a watched message left owed
+    /// whose publish is due, with the control write alone: no ring is read.
+    /// The cursor written is the one the store holds now, so every message
+    /// recorded since the note rides this write, and a conversation already
+    /// published writes nothing.
+    ///
+    /// A publish that fails stays owed and is tried again after its wait,
+    /// which doubles after each failure up to [`CURSOR_RETRY_CAP`]. One the
+    /// conversation refuses, because it is being deleted, awaits acceptance or
+    /// is gone, is dropped.
     fn publish_owed_cursors(&mut self) {
-        let owed: Vec<CorrespondenceLabel> = self.publish_owed.drain().collect();
-        for peer in owed {
+        let now = Instant::now();
+        let due: Vec<CorrespondenceLabel> = self
+            .publish_owed
+            .iter()
+            .filter(|(_, owed)| owed.due <= now)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in due {
             if self.stopping() {
                 return;
             }
             match flows::publish_cursor(&self.store, &mut self.records, &peer) {
-                Ok(published) => crate::vtrace!(
-                    "dm runner: cursor of {} {}",
-                    tag(&peer),
-                    if published {
-                        "published"
-                    } else {
-                        "already published"
-                    }
-                ),
+                Ok(published) => {
+                    self.publish_owed.remove(&peer);
+                    crate::vtrace!(
+                        "dm runner: cursor of {} {}",
+                        tag(&peer),
+                        if published {
+                            "published"
+                        } else {
+                            "already published"
+                        }
+                    );
+                }
                 Err(
                     FlowError::DeletePending
                     | FlowError::AwaitingAcceptance
                     | FlowError::Store(StoreError::MissingConversation),
-                ) => {}
-                Err(e) => note_failure(&mut self.records.health, &e),
+                ) => {
+                    self.publish_owed.remove(&peer);
+                }
+                Err(e) => {
+                    note_failure(&mut self.records.health, &e);
+                    if let Some(owed) = self.publish_owed.get_mut(&peer) {
+                        crate::vtrace!(
+                            "dm runner: cursor of {} not published, next try in {} s",
+                            tag(&peer),
+                            owed.wait.as_secs()
+                        );
+                        owed.due = Instant::now() + owed.wait;
+                        owed.wait = owed.wait.saturating_mul(2).min(CURSOR_RETRY_CAP);
+                    }
+                }
             }
         }
     }

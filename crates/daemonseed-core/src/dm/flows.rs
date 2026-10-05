@@ -9818,6 +9818,7 @@ mod tests {
             lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
             subkey: 9,
             slot: vec![1, 2, 3],
+            route: None,
         };
         let bytes = message.encode().expect("fits");
         assert!(push_plane::is_push(&bytes));
@@ -9841,8 +9842,183 @@ mod tests {
             lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
             subkey: 1,
             slot: vec![0; push_plane::PUSH_MAX_LEN],
+            route: None,
         };
         assert_eq!(too_big.encode(), None);
+    }
+
+    /// A message push carrying the sender's route survives its encoding, and
+    /// one encoded without a route still decodes, with none; a route that runs
+    /// out, is empty, is longer than a control record carries, or is followed
+    /// by more bytes is refused.
+    #[test]
+    fn a_message_push_carries_the_senders_route() {
+        let with_route = Push::Message {
+            lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
+            subkey: 9,
+            slot: vec![1, 2, 3],
+            route: Some(vec![0xab; 742]),
+        };
+        let bytes = with_route.encode().expect("fits");
+        assert_eq!(Push::decode(&bytes), Some(with_route));
+
+        // The form a sender writes without a route: the slot runs to the end.
+        let mut old = push_plane::PUSH_TAG.to_vec();
+        old.push(1);
+        old.extend_from_slice(&[3; HELLO_LOOKUP_KEY_LEN]);
+        old.extend_from_slice(&9u16.to_be_bytes());
+        old.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(
+            Push::decode(&old),
+            Some(Push::Message {
+                lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
+                subkey: 9,
+                slot: vec![1, 2, 3],
+                route: None,
+            })
+        );
+
+        let with_route_bytes = |route: &[u8], extra: &[u8]| {
+            let mut out = push_plane::PUSH_TAG.to_vec();
+            out.push(4);
+            out.extend_from_slice(&[3; HELLO_LOOKUP_KEY_LEN]);
+            out.extend_from_slice(&9u16.to_be_bytes());
+            crate::dm::push_lp(&mut out, &[1, 2, 3]);
+            crate::dm::push_lp(&mut out, route);
+            out.extend_from_slice(extra);
+            out
+        };
+        // The control: the hand-built form with a well-formed route decodes.
+        assert!(Push::decode(&with_route_bytes(&[7; 16], &[])).is_some());
+        let mut truncated = with_route_bytes(&[7; 16], &[]);
+        truncated.pop();
+        assert_eq!(Push::decode(&truncated), None, "a route that runs out");
+        assert_eq!(
+            Push::decode(&with_route_bytes(&[], &[])),
+            None,
+            "an empty route"
+        );
+        assert_eq!(
+            Push::decode(&with_route_bytes(&[7; 16], &[0])),
+            None,
+            "bytes after the route"
+        );
+        let longest = vec![7; channel::REACH_ROUTE_MAX_LEN];
+        assert!(
+            Push::decode(&with_route_bytes(&longest, &[])).is_some(),
+            "the longest route a control record carries"
+        );
+        let over = vec![7; channel::REACH_ROUTE_MAX_LEN + 1];
+        assert_eq!(
+            Push::decode(&with_route_bytes(&over, &[])),
+            None,
+            "a route longer than a control record carries"
+        );
+        // A sender never writes a route it could not publish: it is left out.
+        let left_out = Push::Message {
+            lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
+            subkey: 9,
+            slot: vec![1, 2, 3],
+            route: Some(over),
+        };
+        assert_eq!(left_out.encode(), Some(old));
+    }
+
+    /// A reach notice survives its encoding, and one whose control runs out,
+    /// is empty, is longer than a sealed control subkey, or is followed by
+    /// more bytes is refused.
+    #[test]
+    fn a_reach_notice_round_trips_and_malformed_ones_are_refused() {
+        let notice = Push::Reach {
+            lookup_key: [5; HELLO_LOOKUP_KEY_LEN],
+            control: vec![9; 1200],
+        };
+        let bytes = notice.encode().expect("fits");
+        assert!(push_plane::is_push(&bytes));
+        assert_eq!(bytes[push_plane::PUSH_TAG.len()], 3, "kind 3");
+        assert_eq!(Push::decode(&bytes), Some(notice));
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert_eq!(Push::decode(&truncated), None, "a control that runs out");
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert_eq!(Push::decode(&trailing), None, "bytes after the control");
+        let empty = Push::Reach {
+            lookup_key: [5; HELLO_LOOKUP_KEY_LEN],
+            control: Vec::new(),
+        };
+        assert_eq!(Push::decode(&empty.encode().expect("fits")), None);
+        let over = Push::Reach {
+            lookup_key: [5; HELLO_LOOKUP_KEY_LEN],
+            control: vec![9; channel::SEALED_CONTROL_MAX_LEN + 1],
+        };
+        assert_eq!(Push::decode(&over.encode().expect("fits")), None);
+    }
+
+    /// A reach notice carrying the correspondent's control, sealed under the
+    /// key the conversation holds for it, is opened and answered with the
+    /// answer its pusher expects; a control sealed under any other key, or
+    /// naming no conversation, is dropped unanswered with nothing changed.
+    #[test]
+    fn a_reach_notice_opens_only_under_the_correspondents_control_key() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup = a_reads(&a, &peer_a);
+        let b_state = b.store().load_conv(&accepted.peer).unwrap().unwrap();
+        let b_key = b_state.own_control_key.as_ref().expect("B's control key");
+        let control = channel::Control {
+            collected_cursor: 1,
+            generation: b_state.generation,
+            reach: Reach {
+                route: Some(vec![0x5a; 500]),
+                handle: None,
+            },
+            ..channel::Control::default()
+        };
+        let sealed = channel::seal_control_with_key(b_key, &control).unwrap();
+        let before = a.store().load_conv(&peer_a).unwrap().unwrap();
+        match push_plane::take_reach(&a.store(), |_| false, &lookup, &sealed).unwrap() {
+            push_plane::ReachTaken::Applied {
+                peer,
+                control: opened,
+                answer,
+            } => {
+                assert_eq!(peer, peer_a);
+                assert_eq!(opened.reach.route, Some(vec![0x5a; 500]));
+                let expected = push_plane::AnswerKey::new(b_key)
+                    .answer(&lookup, push_plane::reach_seq(&sealed).unwrap())
+                    .unwrap();
+                assert!(push_plane::answer_matches(&expected, &answer));
+            }
+            other => panic!("the notice was applied: {other:?}"),
+        }
+
+        let stranger = channel::ControlKey::from_bytes(&[0x33; 32]);
+        let forged = channel::seal_control_with_key(&stranger, &control).unwrap();
+        assert!(matches!(
+            push_plane::take_reach(&a.store(), |_| false, &lookup, &forged).unwrap(),
+            push_plane::ReachTaken::Dropped
+        ));
+        assert!(matches!(
+            push_plane::take_reach(
+                &a.store(),
+                |_| false,
+                &[0x77; HELLO_LOOKUP_KEY_LEN],
+                &sealed
+            )
+            .unwrap(),
+            push_plane::ReachTaken::Dropped
+        ));
+        assert!(matches!(
+            push_plane::take_reach(&a.store(), |_| true, &lookup, &sealed).unwrap(),
+            push_plane::ReachTaken::Blocked { .. }
+        ));
+        let after = a.store().load_conv(&peer_a).unwrap().unwrap();
+        assert_eq!(
+            (after.peer_collected, after.my_collected, after.send_seq),
+            (before.peer_collected, before.my_collected, before.send_seq),
+            "taking a notice changes no conversation state"
+        );
     }
 
     /// ISC-C104 — every control record a flow writes carries the route and

@@ -8,8 +8,8 @@
 //! to a call it received. Calls addressed to the runner arrive on the
 //! [`PushParts::inbound`] queue, beside notice of this node's routes dying and
 //! of changes to the channel records it watches ([`crate::dm::watch`]).
-//! That queue admits a message push only for a channel the runner reads, and
-//! at most [`PUSH_PER_CHANNEL`] per channel and [`PUSH_ACCEPTANCES`]
+//! That queue admits a message push or a reach notice only for a channel the
+//! runner reads, and at most [`PUSH_PER_CHANNEL`] per channel and [`PUSH_ACCEPTANCES`]
 //! acceptances at a time; a sender's own route is not known to the receiver,
 //! so the channel a push names is what it is counted against. Watched changes
 //! hold at most [`CHANGES_PER_CHANNEL`] places per channel and
@@ -26,6 +26,9 @@
 //! wait for the write. An answer the correspondent can make only with the conversation's control key
 //! ([`daemonseed_core::dm::push::answer`]) reports the message delivered; any
 //! other outcome forgets the correspondent's route and changes nothing else.
+//! A message push carries this node's own current route, so the correspondent
+//! holds it; a reach notice carries this node's sealed control subkey alone,
+//! and its answer is checked the same way.
 //!
 //! Serves FC1.
 
@@ -159,10 +162,12 @@ enum Charge {
 }
 
 /// The kind and channel a call's bytes name, read without decoding the rest.
+/// A message, with or without the sender's route, and a reach notice are
+/// counted against the channel they name.
 fn charge_of(message: &[u8]) -> Option<Charge> {
     let rest = message.strip_prefix(daemonseed_core::dm::push::PUSH_TAG.as_slice())?;
     match rest.first()? {
-        1 => Some(Charge::Channel(
+        1 | 3 | 4 => Some(Charge::Channel(
             rest.get(1..1 + HELLO_LOOKUP_KEY_LEN)?.try_into().ok()?,
         )),
         2 => Some(Charge::Acceptance),
@@ -544,6 +549,9 @@ pub(crate) struct Pusher {
     /// This side's control key for the conversation, which a message push's
     /// answer is checked under.
     pub(crate) answer_key: Option<Arc<AnswerKey>>,
+    /// This node's own current route, which a message push carries so the
+    /// correspondent holds it.
+    pub(crate) own_route: Option<Vec<u8>>,
 }
 
 impl Pusher {
@@ -566,11 +574,39 @@ impl Pusher {
         if let Some((seq, expected)) = expected {
             self.start(
                 peer,
-                seq,
+                Some(seq),
                 &Push::Message {
                     lookup_key: *lookup_key,
                     subkey,
                     slot: bytes.to_vec(),
+                    route: self.own_route.clone(),
+                },
+                expected,
+            );
+        }
+    }
+
+    /// Push the sealed control subkey `control` of the channel at
+    /// `lookup_key` as a reach notice, on its own task, where this pusher
+    /// holds the key its answer is checked under. An unanswered notice
+    /// forgets the route it was made on, as an unanswered message does.
+    pub(crate) fn push_reach(
+        &self,
+        peer: CorrespondenceLabel,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        control: &[u8],
+    ) {
+        let expected = self.answer_key.as_deref().and_then(|key| {
+            let seq = daemonseed_core::dm::push::reach_seq(control).ok()?;
+            key.answer(lookup_key, seq).ok()
+        });
+        if let Some(expected) = expected {
+            self.start(
+                peer,
+                None,
+                &Push::Reach {
+                    lookup_key: *lookup_key,
+                    control: control.to_vec(),
                 },
                 expected,
             );
@@ -578,9 +614,15 @@ impl Pusher {
     }
 
     /// Push `push` on its own task. An answer equal to `expected` is reported
-    /// as [`RunnerEvent::Delivered`] through `seq`; any other outcome names
-    /// `peer` on the unanswered queue.
-    fn start(&self, peer: CorrespondenceLabel, seq: u64, push: &Push, expected: [u8; ANSWER_LEN]) {
+    /// as [`RunnerEvent::Delivered`] through `seq` where `push` is a message;
+    /// any other outcome names `peer` on the unanswered queue.
+    fn start(
+        &self,
+        peer: CorrespondenceLabel,
+        seq: Option<u64>,
+        push: &Push,
+        expected: [u8; ANSWER_LEN],
+    ) {
         let Some(bytes) = push.encode() else {
             crate::vtrace!("dm push: too large to push, left to the record store");
             return;
@@ -589,24 +631,30 @@ impl Pusher {
         let events = self.events.clone();
         let unanswered = self.unanswered.clone();
         let route = self.route.clone();
+        let what = match seq {
+            Some(seq) => format!("sequence {seq}"),
+            None => String::from("reach notice"),
+        };
         tokio::spawn(async move {
             let started = Instant::now();
             match call.await {
                 Ok(answer) if answer_matches(&expected, &answer) => {
                     crate::vtrace!(
-                        "dm push: sequence {seq} recorded after {} ms",
+                        "dm push: {what} recorded after {} ms",
                         started.elapsed().as_millis()
                     );
-                    let _ = events
-                        .send(RunnerEvent::Delivered {
-                            peer,
-                            through_seq: seq,
-                        })
-                        .await;
+                    if let Some(seq) = seq {
+                        let _ = events
+                            .send(RunnerEvent::Delivered {
+                                peer,
+                                through_seq: seq,
+                            })
+                            .await;
+                    }
                 }
                 outcome => {
                     crate::vtrace!(
-                        "dm push: sequence {seq} not recorded after {} ms ({:?})",
+                        "dm push: {what} not recorded after {} ms ({:?})",
                         started.elapsed().as_millis(),
                         outcome.err()
                     );
@@ -717,7 +765,7 @@ impl<R: Records> Records for Pushing<'_, R> {
             if let Ok((header, _)) = channel::MessageHeader::decode(writes.reply) {
                 pusher.start(
                     writes.peer,
-                    header.seq,
+                    Some(header.seq),
                     &Push::Acceptance {
                         lookup_key: *writes.lookup_key,
                         hello_slot: writes.hello_slot,
