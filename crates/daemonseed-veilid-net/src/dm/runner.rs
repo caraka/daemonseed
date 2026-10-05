@@ -54,22 +54,28 @@
 //!
 //! ## Schedule
 //!
-//! - **Collection**, every [`RunnerConfig::tick`] jittered by ±20 %: every
-//!   established conversation's ring, the correspondent's published cursor
-//!   where messages are outstanding, and the delivery reports those produce;
+//! - **Collection**, first one [`RunnerConfig::tick`] after startup, jittered
+//!   by ±20 %, and then on § Delivery's 40 to 60 minute band: every
+//!   established conversation's ring and the delivery reports it produces;
 //!   then the drop scan, where one is due; then the preview of every request
 //!   that scan surfaced. A ring is read a slot at a time, and each message is
-//!   reported as its slot opens, once the store has recorded it read. The drop
-//!   is scanned on every pass while a conversation awaits acceptance, whose
-//!   answer arrives there, and otherwise [`DROP_SCAN_TICKS`] jittered ticks
-//!   after the last scan, so a scan that takes minutes holds back only
-//!   strangers' requests and not the conversations already established.
-//!   While a conversation waits on the correspondent — a first contact
-//!   awaiting acceptance, or an acceptance whose hello back the correspondent
-//!   has not yet shown it read — and for at most a quarter of an hour after
-//!   this runner started, sent a first contact or accepted one, collection runs
-//!   every twelve seconds instead, jittered the same way, or on the tick where
-//!   that is shorter. Collection only reads.
+//!   reported as its slot opens, once the store has recorded it read. A
+//!   correspondent's messages and cursor reach this node as they are written,
+//!   by push or by a watch on the correspondent's channel, so the band
+//!   collection is a sweep for anything those missed. A conversation just
+//!   established, and one with a watched change this node cannot apply, is
+//!   collected at once; the first read of a correspondent's channel is what
+//!   watches it. The first collection after startup, the one at
+//!   establishment and the one after a dead watch is registered again also
+//!   read the correspondent's control once where messages are outstanding,
+//!   for a cursor written while no watch was live; a sweep does not.
+//!   Collection only reads.
+//! - **Drop scan**, every [`RunnerConfig::tick`] jittered by ±20 % while a
+//!   first contact of this node's awaits acceptance, whose answer arrives in
+//!   the drop, and otherwise [`DROP_SCAN_TICKS`] jittered ticks after the last
+//!   scan, so a scan that takes minutes holds back only strangers' requests;
+//!   then the preview of every request it surfaced. A first contact sent brings
+//!   the next scan forward to one tick away.
 //! - **Repair**, per conversation with anything outstanding, on § Delivery's
 //!   interval (40 to 60 minutes, daily after seven days): the same look at
 //!   what is left undone that startup takes, preceded by a drop scan for a
@@ -179,7 +185,7 @@
 //! [`TaskEnd::is_finished`] reads true. Anything the call left pending is
 //! resumed by the next startup.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -209,32 +215,19 @@ use zeroize::Zeroizing;
 
 use crate::dm::records::WriteCountsSnapshot;
 
-/// How often collection runs, before jitter.
+/// The drop scan's interval while a first contact awaits acceptance, and the
+/// wait before the first collection after startup, before jitter.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(60);
 
-/// How often collection runs while a conversation waits on the correspondent,
-/// before jitter.
-///
-/// A pass is a drop inspect plus the slot reads it says are worth making, and a
-/// ring read and at most one control read per established conversation, so this
-/// adds at most four passes a minute over [`DEFAULT_TICK`]'s one, and no write.
-const WAITING_TICK: Duration = Duration::from_secs(12);
-
-/// How many collection intervals, before jitter, a drop scan waits after the
-/// last one, where no conversation awaits acceptance.
+/// How many ticks, before jitter, a drop scan waits after the last one, where
+/// no conversation awaits acceptance.
 ///
 /// A scan reads every drop slot, and each read can take tens of seconds on the
-/// network, so a scan can outlast several intervals. Only a contact request
-/// from a stranger waits on it then, and five intervals keep that wait to
-/// minutes at [`DEFAULT_TICK`] while leaving most passes to the conversations
-/// already established. A conversation awaiting acceptance is answered through
-/// the drop, so it has the drop scanned on every pass.
+/// network, so a scan can outlast several ticks. Only a contact request from a
+/// stranger waits on it then, and five ticks keep that wait to minutes at
+/// [`DEFAULT_TICK`]. A conversation awaiting acceptance is answered through the
+/// drop, so it has the drop scanned every tick.
 pub const DROP_SCAN_TICKS: u32 = 5;
-
-/// How long after this runner starts, sends a first contact or accepts one that
-/// [`WAITING_TICK`] can apply. A correspondent who has not answered by then may
-/// be away for days, and is collected on the ordinary tick.
-const WAITING_WINDOW: Duration = Duration::from_secs(15 * 60);
 
 /// How long the reads a [`RunnerEvent::RequestPreview`] was drawn from answer
 /// the [`RunnerCommand::Accept`] of the same request in place of the network.
@@ -252,8 +245,8 @@ pub const EVENT_QUEUE: usize = 256;
 /// The directory under the profile root the runner's [`Store`] lives in.
 pub const STORE_DIR: &str = "dm-store";
 
-/// How far either side of [`RunnerConfig::tick`] a collection may land, in
-/// percent.
+/// How far either side of a tick a drop scan or the first collection may land,
+/// in percent.
 const TICK_JITTER_PERCENT: u128 = 20;
 
 /// The lookup key a conversation record holds before its channel is opened.
@@ -333,6 +326,36 @@ pub trait RunnerRecords: Records {
     /// How many writes of each kind this store has submitted.
     fn write_counts(&self) -> WriteCountsSnapshot;
 
+    /// Register again the watch on the correspondent's channel at
+    /// `lookup_key`, which the store reported dead. A channel the store does
+    /// not watch is left alone. The default watches nothing.
+    fn rewatch_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> Result<(), RecordError> {
+        let _ = lookup_key;
+        Ok(())
+    }
+
+    /// How many watch registrations made by channel reads failed, or left
+    /// Veilid holding no watch, since this was last asked. The read goes
+    /// ahead either way, so the failure is not the read's; the runner counts
+    /// it in [`HealthCounters::watch_failures`]. The default watches nothing.
+    fn take_watch_failures(&mut self) -> u64 {
+        0
+    }
+
+    /// Stop watching the correspondent's channel at `lookup_key`, as a
+    /// conversation's teardown does. Where cancelling the watch fails, the
+    /// channel stays watched. The default watches nothing.
+    fn unwatch_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> Result<(), RecordError> {
+        let _ = lookup_key;
+        Ok(())
+    }
+
     /// How a failed call failed, which decides the [`HealthCounters`] field it
     /// is counted in. A store that cannot tell reports every failure as
     /// [`RecordFailure::Refused`].
@@ -392,7 +415,9 @@ pub enum RecordFailure {
 /// How a runner paces itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunnerConfig {
-    /// The collection interval, before ±20 % jitter.
+    /// The drop scan's interval while a first contact awaits acceptance, and
+    /// the wait before the first collection after startup, before ±20 %
+    /// jitter. A drop scan waits [`DROP_SCAN_TICKS`] ticks otherwise.
     pub tick: Duration,
     /// How long a shutdown waits for the flow call in progress.
     pub grace: Duration,
@@ -407,10 +432,10 @@ impl Default for RunnerConfig {
     }
 }
 
-/// The shortest collection interval a runner uses; a shorter one is raised to it.
+/// The shortest tick a runner uses; a shorter one is raised to it.
 pub const MIN_TICK: Duration = Duration::from_millis(1);
 
-/// The longest collection interval a runner uses; a longer one is lowered to it.
+/// The longest tick a runner uses; a longer one is lowered to it.
 pub const MAX_TICK: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl RunnerConfig {
@@ -766,6 +791,10 @@ pub struct HealthCounters {
     /// Pushes dropped unanswered because the runner reached them after their
     /// answer window.
     pub pushes_expired: u64,
+    /// Channel watches that failed to register, to register again after the
+    /// watch died, or to cancel. A registration after which Veilid holds no
+    /// watch has failed.
+    pub watch_failures: u64,
 }
 
 impl HealthCounters {
@@ -780,6 +809,9 @@ impl HealthCounters {
 }
 
 /// What a runner reports.
+// `Health` carries every counter by value. An event is sent once per change,
+// so its size costs nothing that boxing the counters would save.
+#[allow(clippy::large_enum_variant)]
 pub enum RunnerEvent {
     /// Every conversation, at startup and whenever the set or a state changes.
     Roster(Vec<ConversationSummary>),
@@ -1557,6 +1589,7 @@ impl<R: RunnerRecords> Records for Tracked<R> {
     ) -> Result<Option<Vec<u8>>, RecordError> {
         let started = std::time::Instant::now();
         let result = self.inner.read_channel(lookup_key, subkey);
+        self.health.watch_failures += self.inner.take_watch_failures();
         if subkey == channel::CONTROL_SUBKEY {
             self.trace_read(started, "opening", None, &result);
         } else {
@@ -1647,6 +1680,32 @@ impl<R: RunnerRecords> Records for Tracked<R> {
 }
 
 impl<R: RunnerRecords> Tracked<R> {
+    /// [`RunnerRecords::rewatch_channel`], with a failure counted in
+    /// [`HealthCounters::watch_failures`].
+    fn rewatch_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> Result<(), RecordError> {
+        let result = self.inner.rewatch_channel(lookup_key);
+        if result.is_err() {
+            self.health.watch_failures += 1;
+        }
+        result
+    }
+
+    /// [`RunnerRecords::unwatch_channel`], with a failure counted in
+    /// [`HealthCounters::watch_failures`].
+    fn unwatch_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> Result<(), RecordError> {
+        let result = self.inner.unwatch_channel(lookup_key);
+        if result.is_err() {
+            self.health.watch_failures += 1;
+        }
+        result
+    }
+
     /// Hold `lookup_key` as a channel of `peer`'s conversation whose open at
     /// startup failed: opened by the schedule [`REOPEN_RETRY_FIRST`] from now,
     /// and by any write before then.
@@ -2013,18 +2072,16 @@ impl ScanTally {
     }
 }
 
-/// Whether a conversation waits on the correspondent to do something a
-/// collection pass would see: its own first contact awaiting acceptance, or an
-/// acceptance whose hello back the correspondent has not yet shown it read.
-fn waiting_on_peer(state: &ConvState) -> bool {
-    !state.delete_pending
-        && (state.awaiting_acceptance
-            || (state.outstanding_hello.is_some() && state.peer_collected == 0))
-}
-
 /// Entropy from the operating system, in the shape the flows take it.
 fn os_fill(buf: &mut [u8]) -> Result<(), ()> {
     getrandom::fill(buf).map_err(|_| ())
+}
+
+/// The wait before the next collection after one: a draw from § Delivery's
+/// repair band, the same as a repair's, so the collection is a sweep for what
+/// pushes and watches did not bring.
+fn collection_interval() -> Duration {
+    delivery::next_poll_interval_os(0, 0)
 }
 
 /// `tick`, moved by up to [`TICK_JITTER_PERCENT`] either way.
@@ -2209,9 +2266,21 @@ struct Runner<R> {
     requests: BTreeMap<ContactRequestId, HeldRequest>,
     delivered: HashMap<CorrespondenceLabel, u64>,
     repairs: HashMap<CorrespondenceLabel, Repair>,
+    /// Conversations a watched change or an establishment asked to have
+    /// collected, at the next wake.
+    collect_now: HashSet<CorrespondenceLabel>,
+    /// Conversations whose cursor is published at the next wake, after a
+    /// message recorded from a watched change. One entry per conversation, so
+    /// messages recorded meanwhile ride the same write.
+    publish_owed: HashSet<CorrespondenceLabel>,
+    /// Conversations whose next asked-for collection also catches up on the
+    /// correspondent's control: just established, or watched again after the
+    /// watch died, so a control change may have landed while none was live.
+    catch_up: HashSet<CorrespondenceLabel>,
+    /// Whether the first collection after startup has run, which catches up on
+    /// every correspondent's control written while this node was off.
+    startup_collected: bool,
     next_tick: Instant,
-    /// Until when [`WAITING_TICK`] may apply.
-    waiting_until: Instant,
     next_advert_poll: Instant,
     /// When a collection pass next scans the drop where no conversation awaits
     /// acceptance.
@@ -2371,8 +2440,11 @@ impl<R: RunnerRecords> Runner<R> {
                 .map(|conv| (conv.peer, conv.state.peer_collected))
                 .collect(),
             repairs: HashMap::new(),
+            collect_now: HashSet::new(),
+            publish_owed: HashSet::new(),
+            catch_up: HashSet::new(),
+            startup_collected: false,
             next_tick: now + jittered(config.tick),
-            waiting_until: now + WAITING_WINDOW,
             next_advert_poll: now + advert::next_poll_interval_os(),
             next_drop_scan: now,
             last_scan: None,
@@ -2430,6 +2502,21 @@ impl<R: RunnerRecords> Runner<R> {
         }
         for conv in runner.store.load()?.convs {
             runner.check_stop()?;
+            // An acceptor learns its hello back was read only from the
+            // correspondent's cursor, which may have been written while this
+            // node was off: catch up on it before deciding to rewrite.
+            let state = &conv.state;
+            if state.outstanding_hello.is_some()
+                && !state.awaiting_acceptance
+                && !state.delete_pending
+                && state.peer_collected == 0
+            {
+                runner.catch_up_peer_control(&conv.peer);
+                if let Ok(Some(fresh)) = runner.load_one(&conv.peer) {
+                    runner.rewrite_hello(&fresh.peer, &fresh.state);
+                }
+                continue;
+            }
             runner.rewrite_hello(&conv.peer, &conv.state);
         }
         for conv in runner.store.load()?.convs {
@@ -2437,9 +2524,6 @@ impl<R: RunnerRecords> Runner<R> {
             runner.rewrite_evicted(&conv.state, &conv.outstanding_outbox);
             runner.reschedule(&conv);
         }
-        runner.next_tick = runner
-            .next_tick
-            .min(Instant::now() + runner.collection_interval());
         let health = runner.records.health;
         runner.health_reported = health;
         runner.emit(RunnerEvent::Health(health)).await
@@ -2673,44 +2757,31 @@ impl<R: RunnerRecords> Runner<R> {
             .find(|conv| conv.state.peer_identity_pk.as_slice() == identity.as_slice()))
     }
 
-    /// The jittered wait before the next collection: [`WAITING_TICK`] while a
-    /// conversation waits on the correspondent inside [`WAITING_WINDOW`], and
-    /// [`RunnerConfig::tick`] otherwise or where that is shorter.
-    fn collection_interval(&mut self) -> Duration {
-        let tick = self.config.tick;
-        if Instant::now() >= self.waiting_until || tick <= WAITING_TICK {
-            return jittered(tick);
-        }
-        let waiting = match self.load_convs() {
-            Ok(convs) => convs
-                .iter()
-                .filter(|conv| waiting_on_peer(&conv.state))
-                .count(),
-            Err(()) => 0,
-        };
-        if waiting == 0 {
-            return jittered(tick);
-        }
-        let interval = jittered(WAITING_TICK);
-        crate::vtrace!(
-            "dm runner: {waiting} conversation(s) wait on the correspondent; next collection in {:.1}s",
-            interval.as_secs_f64()
-        );
-        interval
+    /// Scan the drop no later than one jittered tick from now, after this side
+    /// sent a first contact, whose acceptance arrives there.
+    fn scan_drop_sooner(&mut self) {
+        let soon = Instant::now() + jittered(self.config.tick);
+        self.next_drop_scan = self.next_drop_scan.min(soon);
     }
 
-    /// Collect on [`WAITING_TICK`] from now, for [`WAITING_WINDOW`], after this
-    /// side did something the correspondent answers.
-    fn collect_sooner(&mut self) {
-        let now = Instant::now();
-        self.waiting_until = now + WAITING_WINDOW;
-        self.next_tick = self.next_tick.min(now + self.collection_interval());
+    /// When the drop is next scanned after one that ended now: one jittered
+    /// tick away while a first contact awaits acceptance, and
+    /// [`DROP_SCAN_TICKS`] jittered ticks away otherwise.
+    fn drop_scan_after_this(&mut self) -> Instant {
+        let awaiting = self
+            .load_convs()
+            .is_ok_and(|convs| convs.iter().any(|conv| conv.state.awaiting_acceptance));
+        let ticks = if awaiting { 1 } else { DROP_SCAN_TICKS };
+        Instant::now() + jittered(self.config.tick * ticks)
     }
 
     /// The earliest moment anything on the schedule is due: now, while a held
     /// request waits for its preview.
     fn next_due(&self) -> Instant {
-        if self.requests.values().any(|entry| entry.preview_due) {
+        if self.requests.values().any(|entry| entry.preview_due)
+            || !self.collect_now.is_empty()
+            || !self.publish_owed.is_empty()
+        {
             return Instant::now();
         }
         self.repairs
@@ -2724,7 +2795,12 @@ impl<R: RunnerRecords> Runner<R> {
                     .map(|pending| pending.due),
             )
             .chain(self.records.control_owed.values().map(|owed| owed.due))
-            .fold(self.next_tick.min(self.next_advert_poll), Instant::min)
+            .fold(
+                self.next_tick
+                    .min(self.next_advert_poll)
+                    .min(self.next_drop_scan),
+                Instant::min,
+            )
     }
 
     /// Open every channel this side owns, so the record store can write it. A
@@ -3010,6 +3086,8 @@ impl<R: RunnerRecords> Runner<R> {
             if std::mem::replace(&mut self.block_list_known, false) {
                 self.emit(RunnerEvent::BlockListUnreadable).await?;
             }
+            // The list is read again a tick from now, and the scan with it.
+            self.next_drop_scan = Instant::now() + jittered(self.config.tick);
             return Ok(None);
         };
         self.block_list_failure_counted = false;
@@ -3047,7 +3125,7 @@ impl<R: RunnerRecords> Runner<R> {
             self.serve_queued().await?;
         }
         self.last_scan = Some(Instant::now());
-        self.next_drop_scan = Instant::now() + jittered(self.config.tick * DROP_SCAN_TICKS);
+        self.next_drop_scan = self.drop_scan_after_this();
         let partial = self.records.failed_drop_reads > unread_before;
         self.last_scan_partial = partial;
         let ms = started.elapsed().as_millis();
@@ -3234,22 +3312,9 @@ impl<R: RunnerRecords> Runner<R> {
             );
             return;
         }
-        // An acceptor learns its hello back was read only from the
-        // correspondent's cursor, which collection alone refreshes; take it
-        // now, so a hello already read is settled rather than rewritten.
-        let refreshed: LoadedConv;
-        let state = if !state.awaiting_acceptance && state.peer_collected == 0 {
-            self.refresh_peer_cursor(peer);
-            match self.load_one(peer) {
-                Ok(Some(conv)) => {
-                    refreshed = conv;
-                    &refreshed.state
-                }
-                Ok(None) | Err(()) => return,
-            }
-        } else {
-            state
-        };
+        // An acceptor learns its hello back was read from the correspondent's
+        // cursor, recorded as it arrived, so a hello already read is settled
+        // rather than rewritten.
         if self.settle_hello(peer, state) {
             return;
         }
@@ -3491,9 +3556,36 @@ impl<R: RunnerRecords> Runner<R> {
                     self.note_unopened(&peer, unopened);
                 }
                 self.note_reach(&peer, &reach);
+                self.collect_established(peer);
                 self.report_delivery(&peer).await
             }
             live_lane::LaneNote::RoutesDied(dead) => self.routes_died(&dead).await,
+            live_lane::LaneNote::WatchDied(lookup_key) => {
+                self.rewatch(&lookup_key);
+                // A change may have landed while the watch was dead.
+                if let Some((peer, _)) = self.lane.reader_of(&lookup_key) {
+                    self.collect_now.insert(peer);
+                    self.catch_up.insert(peer);
+                }
+                Ok(())
+            }
+            live_lane::LaneNote::PeerControl {
+                peer,
+                reach,
+                cursor,
+            } => {
+                self.note_reach(&peer, &reach);
+                self.take_peer_cursor(&peer, cursor);
+                self.report_delivery(&peer).await
+            }
+            live_lane::LaneNote::CollectNow(peer) => {
+                self.collect_now.insert(peer);
+                Ok(())
+            }
+            live_lane::LaneNote::PublishCursor(peer) => {
+                self.publish_owed.insert(peer);
+                Ok(())
+            }
             live_lane::LaneNote::Blocked {
                 identity,
                 block,
@@ -3604,7 +3696,7 @@ impl<R: RunnerRecords> Runner<R> {
                 }
                 self.delivered.entry(peer).or_insert(0);
                 self.ensure_repair(peer);
-                self.collect_sooner();
+                self.scan_drop_sooner();
                 self.emit(RunnerEvent::Sent {
                     token,
                     peer,
@@ -3752,13 +3844,13 @@ impl<R: RunnerRecords> Runner<R> {
                 if let Some(unopened) = &accepted.unopened {
                     self.note_unopened(&accepted.peer, unopened);
                 }
-                self.collect_sooner();
                 if let Some(reach) = self.held_reach(&request) {
                     self.note_reach(&accepted.peer, &reach);
                 }
                 self.requests.remove(&request);
                 let peer = accepted.peer;
                 self.delivered.entry(peer).or_insert(0);
+                self.collect_established(peer);
                 self.emit_bodies(peer, first, accepted.messages).await?;
                 // The reply is sequence 0 of this side's direction on every
                 // path through an acceptance.
@@ -3883,7 +3975,8 @@ impl<R: RunnerRecords> Runner<R> {
 
     /// Tear a conversation down: mark it delete-pending, write the closed
     /// marker where `closed_marker` asks for one, erase this side's channel,
-    /// drop the local records and take the conversation off the schedule.
+    /// drop the local records, stop watching the correspondent's channel and
+    /// take the conversation off the schedule.
     ///
     /// Without the marker, the channel record is first opened without being
     /// created: the delete may be a retry in a process that has not opened the
@@ -3894,6 +3987,10 @@ impl<R: RunnerRecords> Runner<R> {
         peer: &CorrespondenceLabel,
         closed_marker: bool,
     ) -> Result<(), TeardownStop> {
+        let incoming = match self.store.load_conv(peer) {
+            Ok(Some(state)) => Some(state.incoming_lookup_key),
+            Ok(None) | Err(_) => None,
+        };
         let erase = match delivery::prepare_delete(&self.store, peer, closed_marker) {
             Ok(erase) => erase,
             Err(StoreError::MissingConversation) => return Err(TeardownStop::Missing),
@@ -3942,10 +4039,27 @@ impl<R: RunnerRecords> Runner<R> {
         if delivery::finish_delete(&self.store, peer).is_err() {
             return Err(TeardownStop::Store);
         }
+        if let Some(incoming) = incoming.filter(|key| *key != NO_LOOKUP_KEY) {
+            if let Err(e) = self.records.unwatch_channel(&incoming) {
+                crate::vtrace!(
+                    "dm watch: cancelling the watch of {} failed ({e})",
+                    tag(peer)
+                );
+            }
+        }
         self.records.reopen_pending.remove(&erase.lookup_key);
         self.repairs.remove(peer);
         self.delivered.remove(peer);
         Ok(())
+    }
+
+    /// Register again the watch on the correspondent's channel at
+    /// `lookup_key`, which Veilid reported dead. The registration is a local
+    /// call; a failure is traced, counted, and not retried here.
+    fn rewatch(&mut self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) {
+        if let Err(e) = self.records.rewatch_channel(lookup_key) {
+            crate::vtrace!("dm watch: registering a dead watch again failed ({e})");
+        }
     }
 
     /// Open this side's channel for `state` without creating it, returning
@@ -3986,9 +4100,17 @@ impl<R: RunnerRecords> Runner<R> {
         self.retry_route().await?;
         self.retry_reopens().await?;
         self.write_owed_controls().await?;
+        self.collect_asked().await?;
+        self.publish_owed_cursors();
         if Instant::now() >= self.next_tick {
             self.collect_tick().await?;
-            self.next_tick = Instant::now() + self.collection_interval();
+            self.next_tick = Instant::now() + collection_interval();
+            self.serve_queued().await?;
+        }
+        if Instant::now() >= self.next_drop_scan {
+            self.check_stop()?;
+            self.scan_drop().await?;
+            self.preview_requests().await?;
             self.serve_queued().await?;
         }
         if Instant::now() >= self.next_advert_poll {
@@ -4156,8 +4278,7 @@ impl<R: RunnerRecords> Runner<R> {
 
     /// One collection pass: every established conversation whose delete is not
     /// under way, then the drop where a scan is due, then the preview of every
-    /// request that scan surfaced. A scan is due where a conversation awaits
-    /// acceptance, and otherwise [`DROP_SCAN_TICKS`] intervals after the last.
+    /// request that scan surfaced.
     async fn collect_tick(&mut self) -> Result<(), Halt> {
         crate::vtrace!("dm runner: collection starts");
         let Some(mut blocked) = self.readable_block_list() else {
@@ -4170,7 +4291,9 @@ impl<R: RunnerRecords> Runner<R> {
             crate::vtrace!("dm runner: collection done, the store would not load");
             return Ok(());
         };
-        let awaiting = convs.iter().any(|conv| conv.state.awaiting_acceptance);
+        // The first collection after startup catches up on what was written
+        // while this node was off; every later one is a sweep of the rings.
+        let catch_up = !std::mem::replace(&mut self.startup_collected, true);
         // How many commands and lane notes had been served when the
         // conversations and the block list were read: anything served since,
         // here or inside an earlier conversation's collection, may have
@@ -4228,7 +4351,7 @@ impl<R: RunnerRecords> Runner<R> {
             {
                 continue;
             }
-            self.collect_conversation(conv).await?;
+            self.collect_conversation(conv, catch_up).await?;
             collected += 1;
         }
         crate::vtrace!(
@@ -4237,7 +4360,7 @@ impl<R: RunnerRecords> Runner<R> {
         );
         self.check_stop()?;
         self.serve_queued().await?;
-        if awaiting || Instant::now() >= self.next_drop_scan {
+        if Instant::now() >= self.next_drop_scan {
             self.scan_drop().await?;
             self.preview_requests().await?;
         }
@@ -4247,11 +4370,16 @@ impl<R: RunnerRecords> Runner<R> {
 
     /// Read one established conversation's ring a slot at a time, reporting
     /// each message as soon as its slot has opened and the store has recorded
-    /// it read, then publish the cursor, read the correspondent's cursor where
-    /// messages are outstanding, and report what was delivered. The commands
+    /// it read, then publish the cursor and report what was delivered. With
+    /// `catch_up`, the correspondent's control is also read once where
+    /// messages are outstanding, for a cursor written while no watch was live. The commands
     /// queued meanwhile are served between slots, and a slot is not read for a
     /// conversation a command deleted or blocked.
-    async fn collect_conversation(&mut self, conv: &LoadedConv) -> Result<(), Halt> {
+    async fn collect_conversation(
+        &mut self,
+        conv: &LoadedConv,
+        catch_up: bool,
+    ) -> Result<(), Halt> {
         let peer = conv.peer;
         let identity = conv.state.peer_identity_pk.clone();
         crate::vtrace!("dm runner: collection of {} starts", tag(&peer));
@@ -4332,34 +4460,115 @@ impl<R: RunnerRecords> Runner<R> {
             started.elapsed().as_millis(),
             if published { ", cursor published" } else { "" }
         );
-        if conv.state.send_seq > conv.state.peer_collected {
+        if catch_up {
             self.check_stop()?;
-            self.refresh_peer_cursor(&peer);
+            self.catch_up_peer_control(&peer);
         }
         self.report_delivery(&peer).await
     }
 
-    /// Read the correspondent's published cursor and take it into the
-    /// conversation record where it is ahead, never past `send_seq`.
-    fn refresh_peer_cursor(&mut self, peer: &CorrespondenceLabel) {
-        let _step = Step::start(format!("cursor read of {}", tag(peer)));
+    /// Read the correspondent's control once, where this side has messages
+    /// it does not know collected, and take its reach and cursor as a watched
+    /// control change is taken.
+    fn catch_up_peer_control(&mut self, peer: &CorrespondenceLabel) {
+        match self.store.load_conv(peer) {
+            Ok(Some(state)) if state.send_seq > state.peer_collected => {}
+            Ok(_) => return,
+            Err(_) => {
+                self.records.health.store_failures += 1;
+                return;
+            }
+        }
+        let _step = Step::start(format!("control catch-up of {}", tag(peer)));
         match flows::peer_control(&self.store, &mut self.records, peer) {
             Ok(Some(control)) => {
                 self.note_reach(peer, &control.reach);
-                let cursor = control.collected_cursor;
-                let recorded = self.store.update_conv(peer, |state| {
-                    let cursor = cursor.min(state.send_seq);
-                    if cursor > state.peer_collected {
-                        state.peer_collected = cursor;
-                    }
-                });
-                if recorded.is_err() {
-                    self.records.health.store_failures += 1;
-                }
+                self.take_peer_cursor(peer, control.collected_cursor);
             }
             Ok(None) => {}
             Err(e) => note_failure(&mut self.records.health, &e),
         }
+    }
+
+    /// Take the correspondent's published `cursor` into the conversation
+    /// record where it is ahead, never past `send_seq`.
+    fn take_peer_cursor(&mut self, peer: &CorrespondenceLabel, cursor: u64) {
+        let recorded = self.store.update_conv(peer, |state| {
+            let cursor = cursor.min(state.send_seq);
+            if cursor > state.peer_collected {
+                state.peer_collected = cursor;
+            }
+        });
+        if recorded.is_err() {
+            self.records.health.store_failures += 1;
+        }
+    }
+
+    /// Publish the cursor of each conversation a watched message left owed,
+    /// with the control write alone: no ring is read. The cursor written is
+    /// the one the store holds now, so every message recorded since the note
+    /// rides this write, and a conversation already published writes nothing.
+    fn publish_owed_cursors(&mut self) {
+        let owed: Vec<CorrespondenceLabel> = self.publish_owed.drain().collect();
+        for peer in owed {
+            if self.stopping() {
+                return;
+            }
+            match flows::publish_cursor(&self.store, &mut self.records, &peer) {
+                Ok(published) => crate::vtrace!(
+                    "dm runner: cursor of {} {}",
+                    tag(&peer),
+                    if published {
+                        "published"
+                    } else {
+                        "already published"
+                    }
+                ),
+                Err(
+                    FlowError::DeletePending
+                    | FlowError::AwaitingAcceptance
+                    | FlowError::Store(StoreError::MissingConversation),
+                ) => {}
+                Err(e) => note_failure(&mut self.records.health, &e),
+            }
+        }
+    }
+
+    /// Collect a conversation just established at the next wake. Reading the
+    /// correspondent's channel is what registers the watch on it, so a
+    /// conversation established by push alone is watched from here rather than
+    /// from the next sweep.
+    fn collect_established(&mut self, peer: CorrespondenceLabel) {
+        self.collect_now.insert(peer);
+        self.catch_up.insert(peer);
+    }
+
+    /// Collect each conversation a watched change or an establishment asked
+    /// for, where it is still established, not being deleted and not blocked.
+    async fn collect_asked(&mut self) -> Result<(), Halt> {
+        let asked: Vec<CorrespondenceLabel> = self.collect_now.drain().collect();
+        for peer in asked {
+            self.check_stop()?;
+            let catch_up = self.catch_up.remove(&peer);
+            let conv = match self.load_one(&peer) {
+                Ok(Some(conv)) => conv,
+                Ok(None) | Err(()) => continue,
+            };
+            let Some(blocked) = self.readable_block_list() else {
+                continue;
+            };
+            if conv.state.awaiting_acceptance
+                || conv.state.acceptance_pending
+                || conv.state.delete_pending
+                || blocked.is_blocked(&conv.state.peer_identity_pk)
+            {
+                continue;
+            }
+            crate::vtrace!("dm runner: {} collected at once, asked for", tag(&peer));
+            self.collect_conversation(&conv, catch_up).await?;
+            self.serve_queued().await?;
+        }
+        Ok(())
     }
 
     /// Emit [`RunnerEvent::Delivered`] where the correspondent's cursor has
@@ -4490,6 +4699,7 @@ impl<R: RunnerRecords> Runner<R> {
                 continue;
             }
             self.note_reach(&peer, &acceptance.peer_reach);
+            self.collect_established(peer);
             self.emit(RunnerEvent::Accepted { peer }).await?;
             match self.store.load_conv(&peer) {
                 Ok(Some(state)) => {

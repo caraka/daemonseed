@@ -27,6 +27,17 @@
 //!   [`daemonseed_core::dm::push`] with the block list read from the store. An
 //!   acceptance is recognised from the pushed bytes alone, over
 //!   [`core_push::NoNetwork`]. A route death is handed to the runner.
+//! - **Watched changes.** A change Veilid reports on the correspondent's
+//!   channel is applied from the bytes the report carries, with no read of the
+//!   record store: a control subkey is opened under the conversation's
+//!   control key and its reach and cursor handed to the runner, and a ring
+//!   slot is taken as a pushed one is, with no answer to send. A change that
+//!   carries no value, a slot past the next sequence, one that does not open,
+//!   and a change the queue had no room for, have the runner collect that
+//!   conversation instead. A dead watch is handed to the runner, which
+//!   registers it again and collects the conversation. The conversation is
+//!   found by the lookup key of the channel it reads, from an index of the
+//!   conversations the roster last listed.
 //!
 //! The lane and the runner share the [`Store`], whose per-conversation lock
 //! orders their writes. A flow that loads a conversation record, makes
@@ -74,6 +85,22 @@ pub(super) enum LaneNote {
     },
     /// Private routes of this node that died, by id.
     RoutesDied(Vec<String>),
+    /// The watch on the correspondent's channel read under this lookup key
+    /// died, and the runner registers it again and collects the conversation.
+    WatchDied([u8; HELLO_LOOKUP_KEY_LEN]),
+    /// The correspondent's control subkey, opened from a watched change: the
+    /// runner takes in its reach and cursor as it does an acceptance's.
+    PeerControl {
+        peer: CorrespondenceLabel,
+        reach: Reach,
+        cursor: u64,
+    },
+    /// A watched change the lane could not apply from its bytes: the runner
+    /// collects this conversation at its next wake.
+    CollectNow(CorrespondenceLabel),
+    /// A message recorded from a watched change, which sends no answer back:
+    /// the runner publishes this conversation's cursor at its next wake.
+    PublishCursor(CorrespondenceLabel),
     /// A block or unblock applied to the stored list, and what the store
     /// answered.
     Blocked {
@@ -101,6 +128,9 @@ pub(super) struct LaneShare {
     routed: Arc<std::sync::Mutex<HashMap<CorrespondenceLabel, usize>>>,
     /// Set once the event stream has no reader.
     events_gone: Arc<AtomicBool>,
+    /// The conversation reading each incoming channel, by lookup key, as the
+    /// roster last listed them.
+    readers: Arc<std::sync::Mutex<HashMap<[u8; HELLO_LOOKUP_KEY_LEN], CorrespondenceLabel>>>,
     /// Commits refused as conflicting before any is attempted, for tests.
     #[cfg(test)]
     pub(super) forced_conflicts: Arc<std::sync::atomic::AtomicUsize>,
@@ -132,6 +162,7 @@ impl LaneShare {
             commit: Arc::default(),
             routed: Arc::default(),
             events_gone: Arc::default(),
+            readers: Arc::default(),
             #[cfg(test)]
             forced_conflicts: Arc::default(),
         }
@@ -248,6 +279,33 @@ impl LaneShare {
         *locked(&self.routed).entry(*peer).or_default() += 1;
     }
 
+    /// Take `convs` as the conversations reading their incoming channels.
+    pub(super) fn set_readers(&self, convs: &[LoadedConv]) {
+        *locked(&self.readers) = convs
+            .iter()
+            .filter(|conv| conv.state.incoming_lookup_key != NO_LOOKUP_KEY)
+            .map(|conv| (conv.state.incoming_lookup_key, conv.peer))
+            .collect();
+    }
+
+    /// The conversation that reads the channel at `lookup_key`, and its stored
+    /// state, loaded alone. A conversation the index names whose record no
+    /// longer reads that channel is none.
+    pub(super) fn reader_of(
+        &self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> Option<(CorrespondenceLabel, ConvState)> {
+        let peer = *locked(&self.readers).get(lookup_key)?;
+        match self.store.load_conv(&peer) {
+            Ok(Some(state)) if state.incoming_lookup_key == *lookup_key => Some((peer, state)),
+            Ok(_) => None,
+            Err(_) => {
+                self.count(|health| health.store_failures += 1);
+                None
+            }
+        }
+    }
+
     /// A send to `peer` the lane handed the runner has been committed there,
     /// or refused.
     pub(super) fn routed_done(&self, peer: &CorrespondenceLabel) {
@@ -351,7 +409,10 @@ impl Lane {
                     }
                 }
                 LaneWake::Push(None) => self.inbound = None,
-                LaneWake::Push(Some(inbound)) => self.serve_push(inbound).await,
+                LaneWake::Push(Some(inbound)) => {
+                    self.serve_push(inbound).await;
+                    self.serve_missed();
+                }
             }
         }
         for command in backlog {
@@ -478,6 +539,7 @@ impl Lane {
     async fn emit_roster(&self) {
         match self.share.store.load() {
             Ok(loaded) => {
+                self.share.set_readers(&loaded.convs);
                 if let Some(inbound) = &self.inbound {
                     inbound.set_known(
                         loaded
@@ -550,6 +612,16 @@ impl Lane {
             PushInbound::RoutesDied(dead) => {
                 let _ = self.notes.send(LaneNote::RoutesDied(dead));
             }
+            PushInbound::Changed {
+                lookup_key,
+                first_subkey,
+                single,
+                dead,
+                value,
+            } => {
+                self.watch_changed(lookup_key, first_subkey, single, dead, value)
+                    .await;
+            }
             PushInbound::Call {
                 id,
                 message,
@@ -571,6 +643,160 @@ impl Lane {
                         self.share.count(|health| health.pushes_dropped += 1);
                     }
                 }
+            }
+        }
+    }
+
+    /// Take a change Veilid reported on a watched channel, from the bytes it
+    /// carries, without reading the record store.
+    async fn watch_changed(
+        &self,
+        lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
+        first_subkey: u32,
+        single: bool,
+        dead: bool,
+        value: Option<(u32, Vec<u8>)>,
+    ) {
+        let short = crate::dm::watch::channel_tag(&lookup_key);
+        if dead {
+            crate::vtrace!("dm watch: the watch on {short} died");
+            let _ = self.notes.send(LaneNote::WatchDied(lookup_key));
+            return;
+        }
+        let Some((peer, state)) = self.share.reader_of(&lookup_key) else {
+            crate::vtrace!(
+                "dm watch: change on {short}, a channel no conversation reads, subkey {first_subkey}, dropped"
+            );
+            return;
+        };
+        let applied = match value {
+            Some((_, bytes)) if single && first_subkey == u32::from(channel::CONTROL_SUBKEY) => {
+                self.control_changed(peer, &state, &bytes)
+            }
+            Some((_, bytes)) if single => match u16::try_from(first_subkey) {
+                Ok(subkey) => self.slot_changed(peer, &lookup_key, subkey, &bytes).await,
+                Err(_) => false,
+            },
+            Some(_) | None => false,
+        };
+        if !applied {
+            crate::vtrace!(
+                "dm watch: change {} subkey {first_subkey} not applied from its bytes, collecting",
+                tag(&peer)
+            );
+            let _ = self.notes.send(LaneNote::CollectNow(peer));
+        }
+    }
+
+    /// Open a changed control subkey of `peer`'s channel and hand its reach and
+    /// cursor to the runner. `true` where nothing is left to collect for it:
+    /// the control opened, or the conversation is not one that takes it.
+    fn control_changed(&self, peer: CorrespondenceLabel, state: &ConvState, bytes: &[u8]) -> bool {
+        if state.delete_pending || state.awaiting_acceptance || state.acceptance_pending {
+            crate::vtrace!(
+                "dm watch: control of {} changed while it is not established, ignored",
+                tag(&peer)
+            );
+            return true;
+        }
+        let Some(blocked) = read_block_list(&self.share.store) else {
+            return false;
+        };
+        if blocked.is_blocked(&state.peer_identity_pk) {
+            crate::vtrace!(
+                "dm watch: {} is blocked, its control is ignored",
+                tag(&peer)
+            );
+            return true;
+        }
+        let Some(key) = state.peer_control_key.as_ref() else {
+            return false;
+        };
+        match channel::open_control_with_key(key, bytes) {
+            Ok(control) => {
+                crate::vtrace!(
+                    "dm watch: control of {} changed, cursor {}",
+                    tag(&peer),
+                    control.collected_cursor
+                );
+                let _ = self.notes.send(LaneNote::PeerControl {
+                    peer,
+                    reach: control.reach,
+                    cursor: control.collected_cursor,
+                });
+                true
+            }
+            Err(_) => {
+                crate::vtrace!("dm watch: control of {} does not open", tag(&peer));
+                false
+            }
+        }
+    }
+
+    /// Take a changed ring slot of `peer`'s channel as a pushed one is, with
+    /// no answer to send. `true` where nothing is left to collect for it.
+    async fn slot_changed(
+        &self,
+        peer: CorrespondenceLabel,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        subkey: u16,
+        bytes: &[u8],
+    ) -> bool {
+        let Some(blocked) = read_block_list(&self.share.store) else {
+            return false;
+        };
+        let taken = core_push::take_message(
+            &self.share.store,
+            |identity| blocked.is_blocked(identity),
+            lookup_key,
+            subkey,
+            bytes,
+        );
+        match taken {
+            Ok(Taken::Recorded {
+                peer, seq, message, ..
+            }) => {
+                crate::vtrace!("dm watch: {} sequence {seq} recorded", tag(&peer));
+                self.share.emit_bodies(peer, seq, vec![message]).await;
+                let _ = self.notes.send(LaneNote::PublishCursor(peer));
+                true
+            }
+            Ok(Taken::Blocked { peer }) => {
+                crate::vtrace!("dm watch: {} is blocked, its slot is ignored", tag(&peer));
+                true
+            }
+            // Already recorded, by a push or a collection.
+            Ok(Taken::Duplicate { .. }) => true,
+            Ok(Taken::Ahead { .. } | Taken::Dropped) => false,
+            Err(e) => {
+                crate::vtrace!(
+                    "dm watch: a slot of {} failed, {:?}",
+                    tag(&peer),
+                    refusal_for(&e)
+                );
+                self.share.count(|health| note_failure(health, &e));
+                false
+            }
+        }
+    }
+
+    /// Hand the runner what the queue refused of the watched changes: a death
+    /// to register again, and a conversation to collect for any other change.
+    fn serve_missed(&self) {
+        let Some(inbound) = &self.inbound else {
+            return;
+        };
+        for (lookup_key, dead) in inbound.take_missed() {
+            let short = crate::dm::watch::channel_tag(&lookup_key);
+            if dead {
+                crate::vtrace!("dm watch: the watch on {short} died, the report was not queued");
+                let _ = self.notes.send(LaneNote::WatchDied(lookup_key));
+            } else if let Some((peer, _)) = self.share.reader_of(&lookup_key) {
+                crate::vtrace!(
+                    "dm watch: a change on {} was not queued, collecting",
+                    tag(&peer)
+                );
+                let _ = self.notes.send(LaneNote::CollectNow(peer));
             }
         }
     }

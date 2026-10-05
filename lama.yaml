@@ -327,13 +327,15 @@ capabilities:
       scheduler. `runner` is the task a front end spawns to drive one
       identity's conversations over that record store: `RunnerCommand` in,
       `RunnerEvent` out. `push` carries pushes to and from a correspondent's
-      private route, and `view` is the view model a front end renders.
+      private route, `watch` routes changes on watched channel records to the
+      runner, and `view` is the view model a front end renders.
     crate: daemonseed-veilid-net
     modules:
       - daemonseed_veilid_net::dm::records
       - daemonseed_veilid_net::dm::push
       - daemonseed_veilid_net::dm::runner
       - daemonseed_veilid_net::dm::view
+      - daemonseed_veilid_net::dm::watch
     iscs: [C39, C40, C41, C42, C43, C45, C103, C104, C107, C108, C109, C110, A-C21, A-C24]
 
   - category: "Wire schema (proto)"

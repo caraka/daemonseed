@@ -450,8 +450,10 @@ impl<R: RunnerRecords> Runner<R> {
         self.republish_controls().await
     }
 
-    /// Admit message pushes for the channels of `convs` and no others.
+    /// Admit message pushes for the channels of `convs` and no others, and
+    /// have the live lane find each of `convs` by the channel it reads.
     pub(super) fn admit_pushes_for(&self, convs: &[LoadedConv]) {
+        self.lane.set_readers(convs);
         if let Some(admission) = &self.push.admission {
             admission.set_known(
                 convs

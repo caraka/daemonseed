@@ -6,11 +6,16 @@
 //! network through a [`PushTransport`]: an `app_call` to a correspondent's
 //! private-route blob, the allocation of this node's own route, and the answer
 //! to a call it received. Calls addressed to the runner arrive on the
-//! [`PushParts::inbound`] queue, beside notice of this node's routes dying.
+//! [`PushParts::inbound`] queue, beside notice of this node's routes dying and
+//! of changes to the channel records it watches ([`crate::dm::watch`]).
 //! That queue admits a message push only for a channel the runner reads, and
 //! at most [`PUSH_PER_CHANNEL`] per channel and [`PUSH_ACCEPTANCES`]
 //! acceptances at a time; a sender's own route is not known to the receiver,
-//! so the channel a push names is what it is counted against.
+//! so the channel a push names is what it is counted against. Watched changes
+//! hold at most [`CHANGES_PER_CHANNEL`] places per channel and
+//! [`CHANGES_QUEUED`] in all, so a burst of them leaves the rest of the queue
+//! to pushes; a change refused a place is kept as missed against its channel,
+//! and the receiver reads the conversation instead.
 //! Every push starts with [`daemonseed_core::dm::push::PUSH_TAG`], which is how
 //! the actor tells one from every other `app_call` it serves.
 //!
@@ -106,6 +111,22 @@ pub enum PushInbound {
     },
     /// Private routes this node held have died, by id.
     RoutesDied(Vec<String>),
+    /// A watched channel record this node reads changed, as Veilid reported
+    /// the change.
+    Changed {
+        /// The lookup key the channel is read under.
+        lookup_key: [u8; HELLO_LOOKUP_KEY_LEN],
+        /// The first subkey that changed; 0 where none is named.
+        first_subkey: u32,
+        /// Whether exactly one subkey changed.
+        single: bool,
+        /// Whether the report says the watch died: no subkeys named, or no
+        /// reports left on the watch.
+        dead: bool,
+        /// The sequence number and bytes of the first subkey, where Veilid
+        /// carried them, which it does only where one subkey changed.
+        value: Option<(u32, Vec<u8>)>,
+    },
 }
 
 /// Everything a runner needs to push and be pushed to.
@@ -122,11 +143,19 @@ pub const PUSH_PER_CHANNEL: usize = 4;
 /// Acceptance pushes held queued at most; one more is shed.
 pub const PUSH_ACCEPTANCES: usize = 4;
 
-/// What a queued call is counted against.
+/// Watched changes held queued at most, over every channel. The rest of
+/// [`PUSH_QUEUE`] stays open to calls whatever the watches report.
+pub const CHANGES_QUEUED: usize = 16;
+
+/// Watched changes on one channel held queued at most.
+pub const CHANGES_PER_CHANNEL: usize = 4;
+
+/// What a queued entry is counted against.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Charge {
     Channel([u8; HELLO_LOOKUP_KEY_LEN]),
     Acceptance,
+    Change([u8; HELLO_LOOKUP_KEY_LEN]),
 }
 
 /// The kind and channel a call's bytes name, read without decoding the rest.
@@ -147,6 +176,11 @@ struct Admission {
     /// Channels this side reads, which a message push must name.
     known: std::collections::HashSet<[u8; HELLO_LOOKUP_KEY_LEN]>,
     queued: std::collections::HashMap<Charge, usize>,
+    /// Watched changes queued, over every channel.
+    changes: usize,
+    /// Channels with a watched change that was not queued, and whether one of
+    /// those reported the watch dead.
+    missed: std::collections::BTreeMap<[u8; HELLO_LOOKUP_KEY_LEN], bool>,
     shed: u64,
 }
 
@@ -155,7 +189,39 @@ impl Admission {
         match charge {
             Charge::Channel(_) => PUSH_PER_CHANNEL,
             Charge::Acceptance => PUSH_ACCEPTANCES,
+            Charge::Change(_) => CHANGES_PER_CHANNEL,
         }
+    }
+
+    /// Count `charge` as queued where it has room, `false` where it has none.
+    fn take_place(&mut self, charge: Charge) -> bool {
+        if matches!(charge, Charge::Change(_)) && self.changes >= CHANGES_QUEUED {
+            return false;
+        }
+        let queued = self.queued.entry(charge).or_default();
+        if *queued >= Self::cap(charge) {
+            return false;
+        }
+        *queued += 1;
+        if matches!(charge, Charge::Change(_)) {
+            self.changes += 1;
+        }
+        true
+    }
+
+    /// Release the place [`Self::take_place`] counted for `charge`.
+    fn free_place(&mut self, charge: Charge) {
+        if let Some(queued) = self.queued.get_mut(&charge) {
+            *queued = queued.saturating_sub(1);
+        }
+        if matches!(charge, Charge::Change(_)) {
+            self.changes = self.changes.saturating_sub(1);
+        }
+    }
+
+    /// Note a watched change on `lookup_key` that was not queued.
+    fn miss(&mut self, lookup_key: [u8; HELLO_LOOKUP_KEY_LEN], dead: bool) {
+        *self.missed.entry(lookup_key).or_default() |= dead;
     }
 }
 
@@ -196,38 +262,58 @@ fn lock(admission: &Mutex<Admission>) -> std::sync::MutexGuard<'_, Admission> {
 
 impl PushOutbox {
     /// Queue `inbound` where it is admitted; `false` where it was shed or the
-    /// queue is full or gone. A route death is always offered.
+    /// queue is full or gone. A route death is always offered. A watched
+    /// channel's change is queued while its channel holds fewer than
+    /// [`CHANGES_PER_CHANNEL`] and all channels fewer than [`CHANGES_QUEUED`];
+    /// one that is not queued is kept as missed, by channel, for
+    /// [`PushInbox::take_missed`], and is not counted as shed.
     pub fn offer(&self, inbound: PushInbound) -> bool {
         let charge = match &inbound {
             PushInbound::RoutesDied(_) => None,
+            PushInbound::Changed {
+                lookup_key, dead, ..
+            } => {
+                let mut admission = lock(&self.admission);
+                if !admission.take_place(Charge::Change(*lookup_key)) {
+                    admission.miss(*lookup_key, *dead);
+                    return false;
+                }
+                Some(Charge::Change(*lookup_key))
+            }
             PushInbound::Call { message, .. } => {
                 let mut admission = lock(&self.admission);
                 let charge = charge_of(message).filter(|charge| match charge {
                     Charge::Channel(key) => admission.known.contains(key),
                     Charge::Acceptance => true,
+                    Charge::Change(_) => false,
                 });
                 let Some(charge) = charge else {
                     admission.shed += 1;
                     return false;
                 };
-                let queued = admission.queued.entry(charge).or_default();
-                if *queued >= Admission::cap(charge) {
+                if !admission.take_place(charge) {
                     admission.shed += 1;
                     return false;
                 }
-                *queued += 1;
                 Some(charge)
             }
+        };
+        let missed = match &inbound {
+            PushInbound::Changed {
+                lookup_key, dead, ..
+            } => Some((*lookup_key, *dead)),
+            PushInbound::RoutesDied(_) | PushInbound::Call { .. } => None,
         };
         if self.tx.try_send(inbound).is_ok() {
             return true;
         }
         let mut admission = lock(&self.admission);
         if let Some(charge) = charge {
-            if let Some(queued) = admission.queued.get_mut(&charge) {
-                *queued = queued.saturating_sub(1);
+            admission.free_place(charge);
+            match missed {
+                Some((lookup_key, dead)) => admission.miss(lookup_key, dead),
+                None => admission.shed += 1,
             }
-            admission.shed += 1;
         }
         false
     }
@@ -235,12 +321,13 @@ impl PushOutbox {
 
 impl PushInbox {
     fn taken(&self, inbound: &PushInbound) {
-        if let PushInbound::Call { message, .. } = inbound {
-            if let Some(charge) = charge_of(message) {
-                if let Some(queued) = lock(&self.admission).queued.get_mut(&charge) {
-                    *queued = queued.saturating_sub(1);
-                }
-            }
+        let charge = match inbound {
+            PushInbound::Call { message, .. } => charge_of(message),
+            PushInbound::Changed { lookup_key, .. } => Some(Charge::Change(*lookup_key)),
+            PushInbound::RoutesDied(_) => None,
+        };
+        if let Some(charge) = charge {
+            lock(&self.admission).free_place(charge);
         }
     }
 
@@ -262,6 +349,19 @@ impl PushInbox {
     /// name to be queued.
     pub fn set_known(&self, known: impl IntoIterator<Item = [u8; HELLO_LOOKUP_KEY_LEN]>) {
         lock(&self.admission).known = known.into_iter().collect();
+    }
+
+    /// The channels with a watched change that was not queued since the last
+    /// call, each once, with whether one of those changes reported the watch
+    /// dead.
+    ///
+    /// A change is refused only while an entry it would have followed is still
+    /// queued, so a receiver that calls this after taking each entry learns of
+    /// every refused change.
+    pub fn take_missed(&self) -> Vec<([u8; HELLO_LOOKUP_KEY_LEN], bool)> {
+        std::mem::take(&mut lock(&self.admission).missed)
+            .into_iter()
+            .collect()
     }
 
     /// How many calls have been shed since the queue was made.
@@ -684,5 +784,98 @@ mod tests {
         assert!(inbox.try_recv().is_some());
         assert!(outbox.offer(message(1)), "a taken push frees its place");
         assert!(outbox.offer(PushInbound::RoutesDied(Vec::new())));
+    }
+
+    fn changed(key: u8, dead: bool) -> PushInbound {
+        PushInbound::Changed {
+            lookup_key: [key; HELLO_LOOKUP_KEY_LEN],
+            first_subkey: 1,
+            single: true,
+            dead,
+            value: Some((1, vec![key; 8])),
+        }
+    }
+
+    /// A burst of watched changes holds at most its share of the queue, so
+    /// message pushes queued after it still get in; every change refused is
+    /// handed back once as missed, a death as a death, and a taken change
+    /// frees its place.
+    #[test]
+    fn a_burst_of_changes_leaves_room_for_pushes() {
+        let (outbox, mut inbox) = push_queue();
+        let channels: Vec<[u8; HELLO_LOOKUP_KEY_LEN]> =
+            (1..=40u8).map(|key| [key; HELLO_LOOKUP_KEY_LEN]).collect();
+        inbox.set_known(channels.iter().copied());
+        let mut refused = std::collections::BTreeSet::new();
+        let mut burst = 0;
+        for key in (1..=40u8).flat_map(|key| [key; 3]) {
+            if outbox.offer(changed(key, false)) {
+                burst += 1;
+            } else {
+                refused.insert([key; HELLO_LOOKUP_KEY_LEN]);
+            }
+        }
+        assert_eq!(burst, CHANGES_QUEUED, "the burst holds its share only");
+        let pushed = (1..=40u8)
+            .flat_map(|key| [key; PUSH_PER_CHANNEL])
+            .filter(|key| outbox.offer(message(*key)))
+            .count();
+        assert_eq!(
+            pushed,
+            PUSH_QUEUE - CHANGES_QUEUED,
+            "every place the burst left is open to pushes"
+        );
+        assert!(
+            !outbox.offer(changed(1, true)),
+            "a death in a full queue is refused"
+        );
+        refused.insert([1; HELLO_LOOKUP_KEY_LEN]);
+
+        let missed = inbox.take_missed();
+        assert!(!missed.is_empty());
+        assert_eq!(
+            missed.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            refused.iter().copied().collect::<Vec<_>>(),
+            "one entry per channel with a refused change"
+        );
+        let dead: Vec<_> = missed.iter().filter(|(_, dead)| *dead).collect();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].0, [1; HELLO_LOOKUP_KEY_LEN], "the death is kept");
+        assert!(inbox.take_missed().is_empty(), "missed is handed back once");
+        assert_eq!(
+            inbox.shed(),
+            (40 * PUSH_PER_CHANNEL - pushed) as u64,
+            "only the pushes refused are counted as shed"
+        );
+
+        let (mut changes, mut calls) = (0, 0);
+        while let Some(inbound) = inbox.try_recv() {
+            match inbound {
+                PushInbound::Changed { .. } => changes += 1,
+                PushInbound::Call { .. } => calls += 1,
+                PushInbound::RoutesDied(_) => {}
+            }
+        }
+        assert_eq!(
+            (changes, calls),
+            (CHANGES_QUEUED, PUSH_QUEUE - CHANGES_QUEUED)
+        );
+        assert!(
+            outbox.offer(changed(1, false)),
+            "a taken change frees its place"
+        );
+    }
+
+    /// One channel cannot hold more than its share of the changes queued.
+    #[test]
+    fn one_channel_holds_its_share_of_changes() {
+        let (outbox, inbox) = push_queue();
+        let admitted = (0..10).filter(|_| outbox.offer(changed(7, false))).count();
+        assert_eq!(admitted, CHANGES_PER_CHANNEL);
+        assert!(outbox.offer(changed(8, false)), "another channel has room");
+        assert_eq!(
+            inbox.take_missed(),
+            vec![([7; HELLO_LOOKUP_KEY_LEN], false)]
+        );
     }
 }

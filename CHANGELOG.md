@@ -30,6 +30,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-veilid-net`: `dm::push` — `PushTransport` (with `release`), `PushParts`, `PushInbound`, `OwnRoute`, `push_queue` / `PushOutbox` / `PushInbox` (per-channel and acceptance admission caps `PUSH_PER_CHANNEL`, `PUSH_ACCEPTANCES`); shed calls counted in `HealthCounters::pushes_dropped`; direct-message runners push messages and acceptances over `app_call` to the correspondent's route, answer pushes addressed to them, and republish their route on route change; `RunnerRecords::take_push`; `HealthCounters::pushes_dropped` / `pushes_expired`; `NoteHandle` for the runner's own identity sets the handle it publishes.
 - `daemonseed-core`: `flows::commit_message`, `flows::Committed`, `FlowError::Conflict`, `dm::push::NoNetwork`, `dm::push::TAKE_ATTEMPTS`.
 - `daemonseed-core`: `Store::sweep_orphaned_outboxes`, which the direct-message runner calls once at startup.
+- `daemonseed-veilid-net`: `HealthCounters::watch_failures` counts channel watches that failed to register, re-register or cancel; `RunnerRecords::take_watch_failures`.
 
 ### Changed
 

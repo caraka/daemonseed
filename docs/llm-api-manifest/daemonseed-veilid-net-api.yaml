@@ -157,8 +157,8 @@ modules:
       The direct-message runner: per identity, one tokio task that owns a record
       store and a daemonseed_core::dm::store::Store at <profile_root>/dm-store,
       calls daemonseed_core::dm::flows one call at a time, serves RunnerCommands
-      between flow calls and emits RunnerEvents, on a collection tick, a repair
-      poll and an advert poll; and a second task, the live lane, sharing the
+      between flow calls and emits RunnerEvents, on a drop-scan tick, a
+      collection sweep, a repair poll and an advert poll; and a second task, the live lane, sharing the
       Store, that reads the command queue, serves RunnerCommand::Send at once
       (seal, persist the outbox entry, commit, push) unless an earlier send to
       the conversation is the first task's to commit, applies Block and Unblock
@@ -193,14 +193,35 @@ modules:
       channel PushInbox::set_known names, at most PUSH_PER_CHANNEL (4) per
       channel and PUSH_ACCEPTANCES (4) acceptances queued, counting the rest in
       PushInbox::shed(); PushInbox::recv / try_recv;
-      PushInbound { Call { id, message, received } | RoutesDied(Vec<String>) }.
+      PushInbound { Call { id, message, received } | RoutesDied(Vec<String>) |
+      Changed { lookup_key, first_subkey: u32, single: bool, dead: bool, value:
+      Option<(u32, Vec<u8>)> } }; RoutesDied is always offered. Changed is
+      queued at most CHANGES_PER_CHANNEL (4) per channel and CHANGES_QUEUED
+      (16) in all; a refused change is not counted as shed and is returned once
+      per channel by PushInbox::take_missed() -> Vec<(lookup_key, dead: bool)>.
       The actor hands every app_call starting with
-      daemonseed_core::dm::push::PUSH_TAG, and every route death, to the runner
-      whose VeilidRecords was built last; other app_calls go to the share serve
-      lane. PUSH_CALL_TIMEOUT 15 s, PUSH_ANSWER_WINDOW 5 s, PUSH_QUEUE 64.
+      daemonseed_core::dm::push::PUSH_TAG, every route death, and every value
+      change on a watched channel record, to the runner whose VeilidRecords was
+      built last; other app_calls go to the share serve lane. PUSH_CALL_TIMEOUT
+      15 s, PUSH_ANSWER_WINDOW 5 s, PUSH_QUEUE 64.
     no_std: false
     depends_on:
       - daemonseed_veilid_net::dm::runner
+  - name: daemonseed_veilid_net::dm::watch
+    description: >-
+      Veilid watches on the channel records a node reads. The first read-only
+      open of a correspondent's channel registers one watch over subkeys 0..=63;
+      a channel the node owns is never watched. A value change on a watched
+      record becomes PushInbound::Changed and reaches no rendezvous event. The
+      runner applies a changed control subkey (reach and cursor) or the next
+      ring slot from the reported bytes with no record read, and collects the
+      conversation for any other change. A dead watch is registered again and
+      its conversation collected; a conversation's delete cancels its watch.
+      WATCH_OFF_ENV ("DAEMONSEED_DM_WATCH_OFF"), set to 1 before the node
+      starts, turns registration off for the run.
+    no_std: false
+    depends_on:
+      - daemonseed_veilid_net::dm::push
   - name: daemonseed_veilid_net::dm::view
     description: >-
       The direct-message view model a front end draws from: DmState folds each
@@ -442,12 +463,17 @@ types:
     module: daemonseed_veilid_net::dm::runner
     kind: trait
     description: >-
-      daemonseed_core::dm::flows::Records plus inspect_channel, inspect_advert and
+      daemonseed_core::dm::flows::Records plus take_watch_failures() -> u64 (watch
+      failures since the last call, default 0), inspect_channel, inspect_advert and
       inspect_drop (a SubkeyReport per subkey of a channel, advert or drop
       record), publish_advert, erase_channel (a failed erase leaves the channel
       open), open_existing_channel(&mut self, &ChannelOwnerSeed, u16) ->
       Result<Option<lookup key>, RecordError> (opens without creating, None where
-      this node holds no such record; the default calls open_channel) and
+      this node holds no such record; the default calls open_channel),
+      rewatch_channel(&mut self, &lookup key) -> Result<(), RecordError> (registers
+      a dead watch again; default Ok, watching nothing),
+      unwatch_channel(&mut self, &lookup key) -> Result<(), RecordError> (cancels
+      the watch, as a delete does; default Ok) and
       write_counts, take_push(&mut self) -> Option<PushParts> (default None; the
       runner takes it once at startup and pushes only with one), the associated fn
       classify(&RecordError) -> RecordFailure (default Refused) that decides the
@@ -486,11 +512,12 @@ types:
     module: daemonseed_veilid_net::dm::runner
     kind: struct
     description: >-
-      tick (collection interval before ±20 % jitter, default DEFAULT_TICK 60 s;
-      a collection pass reads every established conversation, then scans the
-      drop where a conversation awaits acceptance or DROP_SCAN_TICKS (5)
-      jittered ticks have passed since the last scan, then previews the requests
-      that scan surfaced) and grace (the longest RunnerHandle::shutdown waits, default DEFAULT_GRACE
+      tick (before ±20 % jitter, default DEFAULT_TICK 60 s: the drop is scanned
+      every tick while a first contact awaits acceptance and every
+      DROP_SCAN_TICKS (5) ticks otherwise, then the requests it surfaced are
+      previewed; the first collection pass runs one tick after startup, and each
+      later one 40 to 60 min after the last, reading every established
+      conversation) and grace (the longest RunnerHandle::shutdown waits, default DEFAULT_GRACE
       10 s). Implements Default. clamped() holds tick within MIN_TICK (1 ms) and
       MAX_TICK (24 h); spawn_runner applies it.
   - name: RunnerHandle
@@ -611,7 +638,10 @@ types:
       drop slot) and previews_failed (contact request previews that failed; such a
       request is not previewed again and its accept reads the network) and
       slots_unopened (ring reads that stopped at a slot whose message does not
-      open; each is traced with its sequence, subkey and error).
+      open; each is traced with its sequence, subkey and error) and
+      watch_failures (channel watches that failed to register, to register again
+      after the watch died, or to cancel; a registration after which Veilid holds
+      no watch has failed).
   - name: ShutdownOutcome
     module: daemonseed_veilid_net::dm::runner
     kind: enum

@@ -856,6 +856,16 @@ impl VeilidNet {
         // the push tag is how one is told from a share fetch.
         let push_lane: crate::dm::push::PushLane = Arc::new(Mutex::new(None));
         let push_lane_cb = push_lane.clone();
+        // A change on a channel record the DM layer watches goes to the same
+        // lane, and never to the rendezvous mapping below.
+        let dm_watches = crate::dm::watch::ChannelWatches::new(crate::dm::watch::off_from_env());
+        if dm_watches.is_off() {
+            crate::vtrace!(
+                "dm watch: registration off for this run ({} is set)",
+                crate::dm::watch::WATCH_OFF_ENV
+            );
+        }
+        let dm_watches_cb = dm_watches.clone();
         let update_callback: Arc<dyn Fn(VeilidUpdate) + Send + Sync> = Arc::new(
             move |u: VeilidUpdate| match u {
                 VeilidUpdate::AppCall(call)
@@ -906,6 +916,11 @@ impl VeilidNet {
                         });
                     }
                     let _ = ev_tx_cb.send(VeilidNetEvent::RouteChanged);
+                }
+                VeilidUpdate::ValueChange(change) => {
+                    if let Some(ev) = route_value_change(change, &dm_watches_cb, &push_lane_cb) {
+                        let _ = ev_tx_cb.send(ev);
+                    }
                 }
                 other => {
                     if let Some(ev) = map_update(other) {
@@ -989,6 +1004,7 @@ impl VeilidNet {
             cmd_weak,
             write_latency.clone(),
             push_lane,
+            dm_watches,
         ));
         Ok((
             VeilidNetHandle {
@@ -1015,6 +1031,7 @@ async fn actor_loop(
     cmd_weak: mpsc::WeakSender<Command>,
     write_latency: Arc<AtomicU64>,
     push_lane: crate::dm::push::PushLane,
+    dm_watches: crate::dm::watch::ChannelWatches<RecordKey>,
 ) {
     // Cache of opened rendezvous records (owner seed → post-reopen key):
     // open_or_create costs a fresh ~6–10 s open per publish/subscribe, so once a
@@ -1493,6 +1510,7 @@ async fn actor_loop(
                         rc.clone(),
                         &push_lane,
                     )),
+                    watches: dm_watches.clone(),
                 });
             }
             Command::Shutdown {
@@ -2699,6 +2717,23 @@ async fn send_sealed(rc: &RoutingContext, route: RouteId, sealed: Vec<u8>) -> Re
         .map_err(|e| VeilidNetError::Send(e.to_string()))
 }
 
+/// Hand a value change to the direct-messaging inbox on `lane` where its record
+/// is a channel `watches` holds, and to [`map_update`] otherwise. A change the
+/// inbox takes reaches no other consumer.
+fn route_value_change(
+    change: Box<veilid_core::VeilidValueChange>,
+    watches: &crate::dm::watch::ChannelWatches<RecordKey>,
+    lane: &crate::dm::push::PushLane,
+) -> Option<VeilidNetEvent> {
+    match crate::dm::watch::claim(watches, change) {
+        Ok(inbound) => {
+            crate::dm::push::offer(lane, inbound);
+            None
+        }
+        Err(change) => map_update(VeilidUpdate::ValueChange(change)),
+    }
+}
+
 /// Map a raw `VeilidUpdate` to a typed event (`None` = ignored).
 fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
     match u {
@@ -2713,8 +2748,9 @@ fn map_update(u: VeilidUpdate) -> Option<VeilidNetEvent> {
         }),
         // `RouteChange` is intercepted in the update callback (it drives advert
         // refresh + emits `RouteChanged` directly), so it never reaches here.
-        // A watched rendezvous record changed. We only watch rendezvous records
-        // (circles + public rooms / lobby), so a value-bearing change is an
+        // A watched rendezvous record changed. The direct-messaging channel
+        // watches are taken out first (`route_value_change`), so what reaches here
+        // is a rendezvous record (circles + public rooms / lobby): a value-bearing change is an
         // inbound sealed item — surface its bytes (the app opens it with the
         // circle key or `PublicRoomKey`). An empty change (no value) means the
         // watch died; report it as ValueChanged.
@@ -2798,6 +2834,63 @@ mod tests {
         )
         .expect("the identity")
         .veilid_node_seed
+    }
+
+    /// A change on a watched channel record goes to the direct-messaging inbox
+    /// and not to the rendezvous mapping; a change on any other record goes to
+    /// the rendezvous mapping and not to the inbox.
+    #[test]
+    fn a_watched_channel_change_reaches_the_inbox_and_nothing_else() {
+        use crate::dm::push::{push_queue, PushInbound};
+        use crate::dm::watch::tests::{change, record};
+        use veilid_core::ValueSubkeyRangeSet;
+
+        let watches = crate::dm::watch::ChannelWatches::new(false);
+        watches.registered(record(1), [1; 32]);
+        let (outbox, mut inbox) = push_queue();
+        let lane: crate::dm::push::PushLane = Arc::new(Mutex::new(Some(outbox)));
+
+        let watched = route_value_change(
+            change(record(1), ValueSubkeyRangeSet::single(4), 9, Some(b"slot")),
+            &watches,
+            &lane,
+        );
+        assert!(
+            watched.is_none(),
+            "a watched record's change reaches no event: {watched:?}"
+        );
+        let mut taken = Vec::new();
+        while let Some(inbound) = inbox.try_recv() {
+            taken.push(inbound);
+        }
+        assert_eq!(taken.len(), 1, "one inbox entry: {taken:?}");
+        assert!(
+            matches!(
+                &taken[0],
+                PushInbound::Changed {
+                    lookup_key,
+                    first_subkey: 4,
+                    single: true,
+                    dead: false,
+                    value: Some((7, bytes)),
+                } if *lookup_key == [1; 32] && bytes == b"slot"
+            ),
+            "{taken:?}"
+        );
+
+        let lobby = route_value_change(
+            change(record(2), ValueSubkeyRangeSet::single(4), 9, Some(b"room")),
+            &watches,
+            &lane,
+        );
+        assert!(
+            matches!(&lobby, Some(VeilidNetEvent::Inbound { bytes }) if bytes == b"room"),
+            "an unwatched record's change is the rendezvous event: {lobby:?}"
+        );
+        assert!(
+            inbox.try_recv().is_none(),
+            "an unwatched record's change reaches no inbox"
+        );
     }
 
     /// Veilid runs with its device encryption key protected: without a profile

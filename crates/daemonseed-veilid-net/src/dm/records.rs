@@ -134,12 +134,15 @@ use daemonseed_core::identity::keys::{DmChannelRootSecret, SignKeypair};
 use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::oneshot;
-use veilid_core::{KeyPair, RoutingContext, ValueSeqNum, VeilidAPI};
+use veilid_core::{
+    KeyPair, RecordKey, RoutingContext, ValueSeqNum, ValueSubkeyRangeSet, VeilidAPI,
+};
 use zeroize::Zeroizing;
 
 use crate::actor::{funnel_record_key, gated_bounded_get_timed, GetTiming, ProdWrite};
 use crate::dht_gate::DhtGate;
 use crate::dm::runner::{RecordFailure, RunnerConfig, RunnerParts, RunnerRecords, SubkeyReport};
+use crate::dm::watch::{channel_tag, ChannelWatches};
 use crate::error::{Result, VeilidNetError};
 use crate::identity;
 use crate::rendezvous::{self, RecordShape, RendezvousHandle};
@@ -171,6 +174,7 @@ pub struct VeilidRecordsParts {
     pub(crate) transport: Transport,
     pub(crate) sched: WriteSchedulerHandle<ProdWrite>,
     pub(crate) push: Option<crate::dm::push::PushParts>,
+    pub(crate) watches: ChannelWatches<RecordKey>,
 }
 
 /// Why a [`VeilidRecords`] would not build, or would not bridge a call.
@@ -516,6 +520,12 @@ pub struct VeilidRecords {
     drop_pass: DropPass,
     /// The push lane, until a runner takes it.
     push: Option<crate::dm::push::PushParts>,
+    /// The node's watched channel records, which a read-only open of a
+    /// correspondent's channel adds to.
+    watches: ChannelWatches<RecordKey>,
+    /// Watch registrations made by channel reads that failed, until
+    /// [`RunnerRecords::take_watch_failures`] takes them.
+    watch_failures: std::sync::atomic::AtomicU64,
 }
 
 impl core::fmt::Debug for VeilidRecords {
@@ -541,6 +551,8 @@ impl VeilidRecords {
             own_channels: HashMap::new(),
             drop_pass: DropPass::default(),
             push: parts.push,
+            watches: parts.watches,
+            watch_failures: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1072,6 +1084,74 @@ fn ok<T>(_: &T) -> &'static str {
     "ok"
 }
 
+/// The subkeys a channel watch covers: every subkey of the record, the control
+/// subkey and the message slots alike.
+fn channel_watch_range() -> ValueSubkeyRangeSet {
+    ValueSubkeyRangeSet::single_range(0, u32::from(CHANNEL_SUBKEYS) - 1)
+}
+
+/// Ask Veilid to watch the open channel `record` over every subkey, with no
+/// expiration and no count, holding an un-gated permit across the call as every
+/// `watch_dht_values` site does. Whether Veilid holds a watch on the record
+/// afterwards. The call records the wanted watch and returns; Veilid reaches a
+/// storage node for it, and renews it, in the background.
+async fn register_watch(transport: &Transport, record: &RecordKey) -> Result<bool> {
+    let _ungated = transport.gate.acquire_ungated().await;
+    transport
+        .rc
+        .watch_dht_values(record.clone(), Some(channel_watch_range()), None, None)
+        .await
+        .map_err(|e| VeilidNetError::from_veilid("watch", e, VeilidNetError::Routing))
+}
+
+/// Watch the correspondent's channel `record`, just opened read-only under
+/// `lookup_key`, and note it in `watches` where Veilid holds the watch.
+///
+/// A registration that fails, or after which Veilid holds no watch, leaves the
+/// record unwatched, is traced and adds one to `failures`; the next read of
+/// the channel tries again, and the read that called this goes ahead either
+/// way.
+async fn watch_channel(
+    transport: &Transport,
+    watches: &ChannelWatches<RecordKey>,
+    failures: &std::sync::atomic::AtomicU64,
+    record: &RecordKey,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+) {
+    let registered = register_watch(transport, record).await;
+    note_registration(registered, watches, failures, record, lookup_key);
+}
+
+/// Take what a watch registration on `record` answered: a watch Veilid holds
+/// goes into `watches`, and one it does not hold, or a registration that
+/// failed, adds one to `failures`.
+fn note_registration<K: Eq + core::hash::Hash + Clone, E: core::fmt::Display>(
+    registered: core::result::Result<bool, E>,
+    watches: &ChannelWatches<K>,
+    failures: &std::sync::atomic::AtomicU64,
+    record: &K,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+) {
+    match registered {
+        Ok(true) => watches.registered(record.clone(), *lookup_key),
+        Ok(false) => {
+            let short = channel_tag(lookup_key);
+            crate::vtrace!("dm watch: registration of {short} not held by Veilid");
+            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(e) => {
+            let short = channel_tag(lookup_key);
+            crate::vtrace!("dm watch: registration of {short} failed ({e})");
+            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// The failures `failures` holds, leaving it at zero.
+fn take_failures(failures: &std::sync::atomic::AtomicU64) -> u64 {
+    failures.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The record kind and subkey one batched write addresses, for its trace.
 fn batch_target(write: &BatchWrite<'_>) -> (&'static str, &'static str, u32) {
     match *write {
@@ -1254,18 +1334,23 @@ impl Records for VeilidRecords {
     /// [`CHANNEL_SUBKEYS`] for one it only reads. The two are the same number
     /// for every channel the flows open; holding the recorded one is what keeps
     /// that a fact about the record rather than an assumption about the layer.
+    ///
+    /// The first read that opens a channel this side does not own also
+    /// registers a watch on it over every subkey, unless registration is off
+    /// for the run (`crate::dm::watch`). A channel this side owns is never
+    /// watched.
     fn read_channel(
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
         subkey: u16,
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
         traced_read("channel", Some(u32::from(subkey)), |stats| {
-            let shape = self
-                .own_channels
-                .get(lookup_key)
-                .map(|own| own.shape)
-                .map_or_else(|| shape_of(CHANNEL_SUBKEYS), Ok)?;
+            let own = self.own_channels.get(lookup_key).map(|own| own.shape);
+            let shape = own.map_or_else(|| shape_of(CHANNEL_SUBKEYS), Ok)?;
+            let own = own.is_some();
             let transport = &self.transport;
+            let watches = &self.watches;
+            let watch_failures = &self.watch_failures;
             let lookup_key = *lookup_key;
             let subkey = u32::from(subkey);
             block(retry_transient("dm records channel read", || async move {
@@ -1290,6 +1375,16 @@ impl Records for VeilidRecords {
                 let Some(handle) = handle else {
                     return Ok(None);
                 };
+                if watches.wants(handle.key(), own) {
+                    watch_channel(
+                        transport,
+                        watches,
+                        watch_failures,
+                        handle.key(),
+                        &lookup_key,
+                    )
+                    .await;
+                }
                 get_subkey(&transport.gate, &transport.rc, &handle, subkey, stats).await
             }))
             .map_err(RecordError::new)
@@ -1526,8 +1621,76 @@ impl RunnerRecords for VeilidRecords {
         VeilidRecords::write_counts(self)
     }
 
+    /// Register the watch again on the record the watch map holds for
+    /// `lookup_key`. A record the map does not hold, which is every record
+    /// where registration is off, is left alone.
+    fn rewatch_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> core::result::Result<(), RecordError> {
+        traced(
+            "watch",
+            "channel",
+            None,
+            || {
+                let Some(record) = self.watches.record_of(lookup_key) else {
+                    return Ok(());
+                };
+                if block(register_watch(&self.transport, &record)).map_err(RecordError::new)? {
+                    self.watches.reregistered(lookup_key);
+                    Ok(())
+                } else {
+                    Err(RecordError::new(VeilidNetError::Routing(
+                        "watch: Veilid holds no watch on the record".to_owned(),
+                    )))
+                }
+            },
+            ok,
+        )
+    }
+
+    /// Cancel the watch on the record the watch map holds for `lookup_key`,
+    /// then drop it from the map. Where the cancel fails the record stays in
+    /// the map, so a change Veilid still reports reaches the direct-messaging
+    /// inbox, which reads no conversation from it, and not the rendezvous
+    /// mapping.
+    fn unwatch_channel(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> core::result::Result<(), RecordError> {
+        traced(
+            "unwatch",
+            "channel",
+            None,
+            || {
+                let Some(record) = self.watches.record_of(lookup_key) else {
+                    return Ok(());
+                };
+                let transport = &self.transport;
+                block(async {
+                    let _ungated = transport.gate.acquire_ungated().await;
+                    transport
+                        .rc
+                        .cancel_dht_watch(record, None)
+                        .await
+                        .map_err(|e| {
+                            VeilidNetError::from_veilid("cancel watch", e, VeilidNetError::Routing)
+                        })
+                })
+                .map_err(RecordError::new)?;
+                self.watches.forget(lookup_key);
+                Ok(())
+            },
+            ok,
+        )
+    }
+
     fn take_push(&mut self) -> Option<crate::dm::push::PushParts> {
         self.push.take()
+    }
+
+    fn take_watch_failures(&mut self) -> u64 {
+        take_failures(&self.watch_failures)
     }
 }
 
@@ -1982,7 +2145,7 @@ where
 /// covers the seconds a node spends unroutable after an attach as
 /// [`TRANSIENT_ATTEMPTS`] does, and with each inspect bounded at
 /// [`rendezvous::SWEEP_GET_TIMEOUT`] keeps a pass whose scan never answers
-/// under a minute, inside one collection interval.
+/// under a minute, inside one tick.
 const SCAN_ATTEMPTS: u32 = 3;
 
 /// How many passes in a row a drop scan that does not answer defers before a
@@ -2333,6 +2496,30 @@ mod tests {
     use super::*;
 
     use crate::actor::gated_bounded_get;
+
+    /// A registration Veilid does not hold, and one that fails, each add one
+    /// to the failure count `take_failures` hands over once and then clears;
+    /// one Veilid holds goes into the watches and adds nothing.
+    #[test]
+    fn a_failed_watch_registration_is_counted_and_taken_once() {
+        let watches = ChannelWatches::<u32>::new(false);
+        let failures = std::sync::atomic::AtomicU64::new(0);
+        let lookup_key = [0x31u8; HELLO_LOOKUP_KEY_LEN];
+        note_registration::<_, String>(Ok(true), &watches, &failures, &7, &lookup_key);
+        assert_eq!(watches.lookup_of(&7), Some(lookup_key), "the watch is held");
+        note_registration::<_, String>(Ok(false), &watches, &failures, &8, &lookup_key);
+        note_registration(
+            Err("refused".to_owned()),
+            &watches,
+            &failures,
+            &9,
+            &lookup_key,
+        );
+        assert_eq!(take_failures(&failures), 2, "each failure counted once");
+        assert_eq!(take_failures(&failures), 0, "and taken once");
+        assert_eq!(watches.lookup_of(&8), None);
+        assert_eq!(watches.lookup_of(&9), None);
+    }
 
     /// How a failure is classified, from the code that produces it rather than
     /// from its text: an open Veilid answers with `Timeout` (which is also what
@@ -3686,6 +3873,7 @@ mod tests {
                 "same_local_refusal".to_owned(),
                 "write_counts".to_owned(),
                 "take_push".to_owned(),
+                "take_watch_failures".to_owned(),
             ],
             "only the methods that make no network call are untraced"
         );
