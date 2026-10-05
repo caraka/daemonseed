@@ -9783,9 +9783,8 @@ async fn a_delete_of_an_unopened_channel_is_finished() {
 
 /// Setting a correspondent's route names what it did to the route held, with
 /// the conversation's tag: taken where none was held, replaced by a different
-/// one, unchanged by the same one, dropped by none, and nothing where none was
-/// held and none was given. The replaced line is the one a relaunched
-/// correspondent's new route is timed by.
+/// one, unchanged by the same one, kept when none was given, and none held
+/// where none was held and none was given.
 #[test]
 fn setting_a_peer_route_traces_each_route_change() {
     use push_hooks::{route_change, route_line, RouteChange};
@@ -9795,7 +9794,7 @@ fn setting_a_peer_route_traces_each_route_change() {
         (None, Some(&a), RouteChange::Taken, "taken"),
         (Some(&a), Some(&b), RouteChange::Replaced, "replaced"),
         (Some(&a), Some(&a), RouteChange::Unchanged, "unchanged"),
-        (Some(&a), None, RouteChange::Dropped, "dropped"),
+        (Some(&a), None, RouteChange::Kept, "held route kept"),
         (None, None, RouteChange::NoneHeld, "none held"),
     ];
     let mut lines = HashSet::new();
@@ -9811,4 +9810,23 @@ fn setting_a_peer_route_traces_each_route_change() {
         route_line(&peer, RouteChange::Replaced),
         format!("dm push: route of {} replaced", tag(&peer))
     );
+}
+
+/// A reach that carries no route leaves the route held for its correspondent
+/// in place, so a stale copy of a control cannot cost a live push path; a
+/// route that differs still replaces it.
+#[test]
+fn a_reach_without_a_route_keeps_the_held_route() {
+    let (push, _) = push_hooks::PushState::new(None);
+    let share = push.share.clone();
+    let peer = CorrespondenceLabel::mint().expect("a label");
+    let other = CorrespondenceLabel::mint().expect("a label");
+    let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
+    share.set_peer_route(&peer, Some(a.clone()));
+    share.set_peer_route(&peer, None);
+    assert!(share.holds_route(&peer), "a routeless reach kept the route");
+    share.set_peer_route(&peer, Some(b));
+    assert!(share.holds_route(&peer), "a new route replaced it");
+    share.set_peer_route(&other, None);
+    assert!(!share.holds_route(&other), "no route is invented");
 }

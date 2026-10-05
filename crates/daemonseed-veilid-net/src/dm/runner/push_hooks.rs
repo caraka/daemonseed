@@ -108,8 +108,11 @@ impl PushShare {
         });
     }
 
-    /// Take `route` as `peer`'s, or none, releasing the route held before
-    /// where it changes.
+    /// Take `route` as `peer`'s, releasing the route held before where it
+    /// changes. No route leaves the one held in place: a reach read without a
+    /// route may be an older copy of the correspondent's control, and a held
+    /// route is dropped only when a push on it goes unanswered
+    /// ([`Self::forget_route`]).
     pub(super) fn set_peer_route(&self, peer: &CorrespondenceLabel, route: Option<Vec<u8>>) {
         let (old, change) = {
             let mut routes = self.routes();
@@ -118,7 +121,7 @@ impl PushShare {
                 Some(route) => routes
                     .insert(*peer, route.clone())
                     .filter(|old| *old != route),
-                None => routes.remove(peer),
+                None => None,
             };
             (old, change)
         };
@@ -159,8 +162,8 @@ pub(super) enum RouteChange {
     Replaced,
     /// The route given is the one already held.
     Unchanged,
-    /// No route was given, and the one held was removed.
-    Dropped,
+    /// No route was given, and the one held was kept.
+    Kept,
     /// No route was given and none was held.
     NoneHeld,
 }
@@ -171,7 +174,7 @@ pub(super) fn route_change(held: Option<&Vec<u8>>, route: Option<&Vec<u8>>) -> R
         (None, Some(_)) => RouteChange::Taken,
         (Some(held), Some(route)) if held == route => RouteChange::Unchanged,
         (Some(_), Some(_)) => RouteChange::Replaced,
-        (Some(_), None) => RouteChange::Dropped,
+        (Some(_), None) => RouteChange::Kept,
         (None, None) => RouteChange::NoneHeld,
     }
 }
@@ -183,7 +186,7 @@ pub(super) fn route_line(peer: &CorrespondenceLabel, change: RouteChange) -> Str
         RouteChange::Taken => format!("dm push: route of {peer} taken"),
         RouteChange::Replaced => format!("dm push: route of {peer} replaced"),
         RouteChange::Unchanged => format!("dm push: route of {peer} unchanged"),
-        RouteChange::Dropped => format!("dm push: route of {peer} dropped"),
+        RouteChange::Kept => format!("dm push: no route of {peer} given, held route kept"),
         RouteChange::NoneHeld => format!("dm push: no route of {peer} given, none held"),
     }
 }
