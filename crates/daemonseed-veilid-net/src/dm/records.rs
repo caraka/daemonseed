@@ -117,6 +117,7 @@
 //! loop would want an asynchronous trait in `daemonseed-core` instead, and
 //! taking one later changes this module and no caller of it.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -136,7 +137,7 @@ use tokio::sync::oneshot;
 use veilid_core::{KeyPair, RoutingContext, ValueSeqNum, VeilidAPI};
 use zeroize::Zeroizing;
 
-use crate::actor::{funnel_record_key, gated_bounded_get, ProdWrite};
+use crate::actor::{funnel_record_key, gated_bounded_get_timed, GetTiming, ProdWrite};
 use crate::dht_gate::DhtGate;
 use crate::dm::runner::{RecordFailure, RunnerConfig, RunnerParts, RunnerRecords, SubkeyReport};
 use crate::error::{Result, VeilidNetError};
@@ -861,14 +862,16 @@ fn read_subkey(
     owner_seed: &[u8; 32],
     subkeys: u16,
     subkey: u32,
+    stats: &ReadStats,
 ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
     let shape = shape_of(subkeys)?;
     let owner = &owner_keypair(owner_seed)?;
     block(retry_transient("dm records read", || async move {
+        stats.attempt();
         let Some(handle) = open_for_read(transport, owner, shape).await? else {
             return Ok(None);
         };
-        get_subkey(&transport.gate, &transport.rc, &handle, subkey).await
+        get_subkey(&transport.gate, &transport.rc, &handle, subkey, stats).await
     }))
     .map_err(RecordError::new)
 }
@@ -961,6 +964,82 @@ fn traced_to<T>(
     result
 }
 
+/// Where one read's time went, gathered as it runs and added to its trace
+/// line: how long its GETs waited for a read permit, how long they then ran,
+/// how many attempts the read made, and the sequence number of the value it
+/// found.
+#[derive(Default)]
+struct ReadStats {
+    permit_wait: Cell<Duration>,
+    get: Cell<Duration>,
+    attempts: Cell<u32>,
+    seq: Cell<Option<u32>>,
+}
+
+impl ReadStats {
+    /// Count one attempt of the read.
+    fn attempt(&self) {
+        self.attempts.set(self.attempts.get().saturating_add(1));
+    }
+
+    /// Add one GET's permit wait and run time.
+    fn add_get(&self, timing: GetTiming) {
+        self.permit_wait
+            .set(self.permit_wait.get().saturating_add(timing.permit_wait));
+        self.get.set(self.get.get().saturating_add(timing.get));
+    }
+}
+
+/// The trace line of one read: [`call_line`] with the read's permit wait, GET
+/// time and attempt count, and the sequence number of the value found.
+fn read_line(
+    kind: &str,
+    subkey: Option<u32>,
+    ms: u128,
+    outcome: &str,
+    stats: &ReadStats,
+) -> String {
+    let seq = match stats.seq.get() {
+        Some(seq) => format!(", seq {seq}"),
+        None => String::new(),
+    };
+    format!(
+        "{}, permit wait {} ms, get {} ms, attempts {}{seq}",
+        call_line("read", kind, subkey, ms, outcome),
+        stats.permit_wait.get().as_millis(),
+        stats.get.get().as_millis(),
+        stats.attempts.get(),
+    )
+}
+
+/// Run one read and trace it once, through `sink`, with [`read_line`].
+fn traced_read_to(
+    sink: &mut dyn FnMut(&str),
+    kind: &str,
+    subkey: Option<u32>,
+    run: impl FnOnce(&ReadStats) -> core::result::Result<Option<Vec<u8>>, RecordError>,
+) -> core::result::Result<Option<Vec<u8>>, RecordError> {
+    let stats = ReadStats::default();
+    let started = std::time::Instant::now();
+    let result = run(&stats);
+    let ms = started.elapsed().as_millis();
+    let line = match &result {
+        Ok(value) => read_line(kind, subkey, ms, found(value), &stats),
+        Err(e) => read_line(kind, subkey, ms, &format!("failed, {e}"), &stats),
+    };
+    sink(&line);
+    result
+}
+
+/// Run one read and trace it once.
+fn traced_read(
+    kind: &str,
+    subkey: Option<u32>,
+    run: impl FnOnce(&ReadStats) -> core::result::Result<Option<Vec<u8>>, RecordError>,
+) -> core::result::Result<Option<Vec<u8>>, RecordError> {
+    traced_read_to(&mut |line| crate::vtrace!("{line}"), kind, subkey, run)
+}
+
 /// Run one record call and trace it once.
 fn traced<T>(
     call: &str,
@@ -1007,13 +1086,15 @@ impl Records for VeilidRecords {
         owner: &AdvertOwnerSeed,
         subkeys: u16,
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
-        traced(
-            "read",
-            "advert",
-            Some(ADVERT_SUBKEY),
-            || read_subkey(&self.transport, owner.as_bytes(), subkeys, ADVERT_SUBKEY),
-            found,
-        )
+        traced_read("advert", Some(ADVERT_SUBKEY), |stats| {
+            read_subkey(
+                &self.transport,
+                owner.as_bytes(),
+                subkeys,
+                ADVERT_SUBKEY,
+                stats,
+            )
+        })
     }
 
     /// Read one drop slot, skipping the read where the network says the slot
@@ -1047,13 +1128,9 @@ impl Records for VeilidRecords {
                 )
             },
             || {
-                traced(
-                    "read",
-                    "drop",
-                    Some(u32::from(slot)),
-                    || read_subkey(transport, &owner_seed, subkeys, u32::from(slot)),
-                    found,
-                )
+                traced_read("drop", Some(u32::from(slot)), |stats| {
+                    read_subkey(transport, &owner_seed, subkeys, u32::from(slot), stats)
+                })
             },
         )
     }
@@ -1182,46 +1259,41 @@ impl Records for VeilidRecords {
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
         subkey: u16,
     ) -> core::result::Result<Option<Vec<u8>>, RecordError> {
-        traced(
-            "read",
-            "channel",
-            Some(u32::from(subkey)),
-            || {
-                let shape = self
-                    .own_channels
-                    .get(lookup_key)
-                    .map(|own| own.shape)
-                    .map_or_else(|| shape_of(CHANNEL_SUBKEYS), Ok)?;
-                let transport = &self.transport;
-                let lookup_key = *lookup_key;
-                let subkey = u32::from(subkey);
-                block(retry_transient("dm records channel read", || async move {
-                    let owner = identity::owner_public_key(&lookup_key);
-                    let handle = {
-                        let record_lock = rendezvous::record_lock(&transport.record_locks, &owner);
-                        let _open_guard = record_lock.lock().await;
-                        rendezvous::open_cached_optional(
-                            &transport.opened,
-                            &rendezvous::cached_record_id(&owner, shape),
-                            rendezvous::open_read_only(
-                                &transport.gate,
-                                &transport.api,
-                                &transport.rc,
-                                &lookup_key,
-                                shape,
-                            ),
-                        )
-                        .await?
-                    };
-                    let Some(handle) = handle else {
-                        return Ok(None);
-                    };
-                    get_subkey(&transport.gate, &transport.rc, &handle, subkey).await
-                }))
-                .map_err(RecordError::new)
-            },
-            found,
-        )
+        traced_read("channel", Some(u32::from(subkey)), |stats| {
+            let shape = self
+                .own_channels
+                .get(lookup_key)
+                .map(|own| own.shape)
+                .map_or_else(|| shape_of(CHANNEL_SUBKEYS), Ok)?;
+            let transport = &self.transport;
+            let lookup_key = *lookup_key;
+            let subkey = u32::from(subkey);
+            block(retry_transient("dm records channel read", || async move {
+                stats.attempt();
+                let owner = identity::owner_public_key(&lookup_key);
+                let handle = {
+                    let record_lock = rendezvous::record_lock(&transport.record_locks, &owner);
+                    let _open_guard = record_lock.lock().await;
+                    rendezvous::open_cached_optional(
+                        &transport.opened,
+                        &rendezvous::cached_record_id(&owner, shape),
+                        rendezvous::open_read_only(
+                            &transport.gate,
+                            &transport.api,
+                            &transport.rc,
+                            &lookup_key,
+                            shape,
+                        ),
+                    )
+                    .await?
+                };
+                let Some(handle) = handle else {
+                    return Ok(None);
+                };
+                get_subkey(&transport.gate, &transport.rc, &handle, subkey, stats).await
+            }))
+            .map_err(RecordError::new)
+        })
     }
 
     /// Write one subkey of the channel at `lookup_key`.
@@ -1685,13 +1757,19 @@ async fn get_subkey(
     rc: &RoutingContext,
     handle: &RendezvousHandle,
     subkey: u32,
+    stats: &ReadStats,
 ) -> Result<Option<Vec<u8>>> {
-    let got = gated_bounded_get(
+    let (got, timing) = gated_bounded_get_timed(
         gate,
         "dm records",
         rc.get_dht_value(handle.key().clone(), subkey, true),
     )
-    .await?;
+    .await;
+    stats.add_get(timing);
+    let got = got?;
+    stats
+        .seq
+        .set(got.as_ref().and_then(|v| v.seq().to_option()));
     Ok(got
         .map(|v| v.data().to_vec())
         .filter(|bytes| !bytes.is_empty()))
@@ -2253,6 +2331,8 @@ fn shape_of(subkeys: u16) -> core::result::Result<RecordShape, RecordError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::actor::gated_bounded_get;
 
     /// How a failure is classified, from the code that produces it rather than
     /// from its text: an open Veilid answers with `Timeout` (which is also what
@@ -3480,6 +3560,66 @@ mod tests {
         assert!(lines.iter().all(|line| line.ends_with(" ms")), "{lines:?}");
     }
 
+    /// A traced read's line splits its time into the wait for a read permit
+    /// and the GET itself, counts its attempts, and names the sequence number
+    /// of the value it found. Each number is distinct, so a line that printed
+    /// one field in place of another, or left one out, fails.
+    #[test]
+    fn a_traced_read_names_permit_wait_get_time_and_attempts() {
+        let mut lines = Vec::new();
+        let read = traced_read_to(
+            &mut |line| lines.push(line.to_owned()),
+            "channel",
+            Some(0),
+            |stats| {
+                stats.attempt();
+                stats.add_get(GetTiming {
+                    permit_wait: Duration::from_millis(5),
+                    get: Duration::from_millis(7),
+                });
+                stats.attempt();
+                stats.add_get(GetTiming {
+                    permit_wait: Duration::from_millis(6),
+                    get: Duration::from_millis(9),
+                });
+                stats.seq.set(Some(4));
+                Ok(Some(vec![1u8]))
+            },
+        );
+        assert!(read.is_ok());
+        let failed = traced_read_to(
+            &mut |line| lines.push(line.to_owned()),
+            "drop",
+            Some(7),
+            |stats| {
+                stats.attempt();
+                Err(RecordError::new(RecordsError::ChannelNotOpened))
+            },
+        );
+        assert!(failed.is_err());
+        assert_eq!(lines.len(), 2, "one line per read: {lines:?}");
+        let found = &lines[0];
+        assert!(
+            found.starts_with("dm records: read channel subkey 0: found in "),
+            "{found}"
+        );
+        for part in ["permit wait 11 ms", "get 16 ms", "attempts 2", "seq 4"] {
+            assert!(found.contains(part), "{part:?} is missing from {found}");
+        }
+        let refused = &lines[1];
+        assert!(
+            refused.starts_with("dm records: read drop subkey 7: failed, "),
+            "{refused}"
+        );
+        for part in ["permit wait 0 ms", "get 0 ms", "attempts 1"] {
+            assert!(refused.contains(part), "{part:?} is missing from {refused}");
+        }
+        assert!(
+            !refused.contains("seq"),
+            "a read that found nothing names no sequence number: {refused}"
+        );
+    }
+
     /// The methods of `impl_header`'s block in `source` whose body names none
     /// of `tracers`, by name. Nested blocks are skipped over by brace depth.
     fn untraced_methods(source: &str, impl_header: &str, tracers: &[&str]) -> Vec<String> {
@@ -3526,7 +3666,7 @@ mod tests {
     /// the only methods without a trace are the four that make none.
     #[test]
     fn every_record_call_is_traced() {
-        let tracers = ["traced(", "call_line("];
+        let tracers = ["traced(", "traced_read(", "call_line("];
         let probe = "impl Records for X {\n    fn a(&self) {\n        traced(1)\n    }\n    fn b(&self) {\n        if x { y() }\n    }\n}";
         assert_eq!(
             untraced_methods(probe, "impl Records for X", &tracers),

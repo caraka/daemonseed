@@ -1929,11 +1929,38 @@ pub(crate) async fn gated_bounded_get<T, E: ReadError>(
     what: &str,
     get: impl std::future::Future<Output = std::result::Result<T, E>>,
 ) -> Result<T> {
-    let got = {
+    gated_bounded_get_timed(gate, what, get).await.0
+}
+
+/// Where one gated GET's time went: waiting for a read permit, then the GET
+/// itself under its bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GetTiming {
+    /// From the call to the read permit being granted.
+    pub(crate) permit_wait: Duration,
+    /// From the permit being granted to the GET answering or being abandoned.
+    pub(crate) get: Duration,
+}
+
+/// [`gated_bounded_get`], also returning how long the read waited for its
+/// permit and how long the GET then ran, whatever the outcome.
+pub(crate) async fn gated_bounded_get_timed<T, E: ReadError>(
+    gate: &Arc<DhtGate>,
+    what: &str,
+    get: impl std::future::Future<Output = std::result::Result<T, E>>,
+) -> (Result<T>, GetTiming) {
+    let asked = std::time::Instant::now();
+    let (got, timing) = {
         let _read_permit = gate.acquire_read().await;
-        tokio::time::timeout(rendezvous::SWEEP_GET_TIMEOUT, get).await
+        let permitted = std::time::Instant::now();
+        let got = tokio::time::timeout(rendezvous::SWEEP_GET_TIMEOUT, get).await;
+        let timing = GetTiming {
+            permit_wait: permitted.duration_since(asked),
+            get: permitted.elapsed(),
+        };
+        (got, timing)
     };
-    match got {
+    let result = match got {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(match e.failure() {
             crate::error::VeilidFailure::TimedOut => {
@@ -1946,7 +1973,8 @@ pub(crate) async fn gated_bounded_get<T, E: ReadError>(
             "{what}: GET exceeded {}s, abandoned",
             rendezvous::SWEEP_GET_TIMEOUT.as_secs()
         ))),
-    }
+    };
+    (result, timing)
 }
 
 /// The funnel's FIFO and coalescing scope for a record: the owner's **public

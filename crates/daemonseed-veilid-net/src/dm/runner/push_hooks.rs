@@ -91,6 +91,11 @@ impl PushShare {
         Some(pusher)
     }
 
+    /// Whether a route is held for `peer`.
+    pub(super) fn holds_route(&self, peer: &CorrespondenceLabel) -> bool {
+        self.routes().contains_key(peer)
+    }
+
     /// Answer the call `id` with `answer`, on its own task.
     pub(super) fn answer(&self, id: u64, answer: [u8; core_push::ANSWER_LEN]) {
         let Some(transport) = self.transport.clone() else {
@@ -106,13 +111,18 @@ impl PushShare {
     /// Take `route` as `peer`'s, or none, releasing the route held before
     /// where it changes.
     pub(super) fn set_peer_route(&self, peer: &CorrespondenceLabel, route: Option<Vec<u8>>) {
-        let old = match route {
-            Some(route) => self
-                .routes()
-                .insert(*peer, route.clone())
-                .filter(|old| *old != route),
-            None => self.routes().remove(peer),
+        let (old, change) = {
+            let mut routes = self.routes();
+            let change = route_change(routes.get(peer), route.as_ref());
+            let old = match route {
+                Some(route) => routes
+                    .insert(*peer, route.clone())
+                    .filter(|old| *old != route),
+                None => routes.remove(peer),
+            };
+            (old, change)
         };
+        crate::vtrace!("{}", route_line(peer, change));
         if let (Some(old), Some(transport)) = (old, &self.transport) {
             transport.release(&old);
         }
@@ -128,9 +138,53 @@ impl PushShare {
                 _ => None,
             }
         };
+        if held.is_some() {
+            crate::vtrace!(
+                "dm push: route of {} dropped, a push on it went unanswered",
+                tag(&unanswered.peer)
+            );
+        }
         if let (Some(held), Some(transport)) = (held, &self.transport) {
             transport.release(&held);
         }
+    }
+}
+
+/// What setting a correspondent's route did to the route held for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RouteChange {
+    /// A route was given where none was held.
+    Taken,
+    /// A route was given that differs from the one held.
+    Replaced,
+    /// The route given is the one already held.
+    Unchanged,
+    /// No route was given, and the one held was removed.
+    Dropped,
+    /// No route was given and none was held.
+    NoneHeld,
+}
+
+/// What giving `route` for a correspondent holding `held` does.
+pub(super) fn route_change(held: Option<&Vec<u8>>, route: Option<&Vec<u8>>) -> RouteChange {
+    match (held, route) {
+        (None, Some(_)) => RouteChange::Taken,
+        (Some(held), Some(route)) if held == route => RouteChange::Unchanged,
+        (Some(_), Some(_)) => RouteChange::Replaced,
+        (Some(_), None) => RouteChange::Dropped,
+        (None, None) => RouteChange::NoneHeld,
+    }
+}
+
+/// The trace line of a [`RouteChange`] for `peer`.
+pub(super) fn route_line(peer: &CorrespondenceLabel, change: RouteChange) -> String {
+    let peer = tag(peer);
+    match change {
+        RouteChange::Taken => format!("dm push: route of {peer} taken"),
+        RouteChange::Replaced => format!("dm push: route of {peer} replaced"),
+        RouteChange::Unchanged => format!("dm push: route of {peer} unchanged"),
+        RouteChange::Dropped => format!("dm push: route of {peer} dropped"),
+        RouteChange::NoneHeld => format!("dm push: no route of {peer} given, none held"),
     }
 }
 

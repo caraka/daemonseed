@@ -9780,3 +9780,35 @@ async fn a_delete_of_an_unopened_channel_is_finished() {
     assert_eq!((calls.open_channel, calls.open_existing), (1, 1));
     assert!(finished(&aw.stop().await));
 }
+
+/// Setting a correspondent's route names what it did to the route held, with
+/// the conversation's tag: taken where none was held, replaced by a different
+/// one, unchanged by the same one, dropped by none, and nothing where none was
+/// held and none was given. The replaced line is the one a relaunched
+/// correspondent's new route is timed by.
+#[test]
+fn setting_a_peer_route_traces_each_route_change() {
+    use push_hooks::{route_change, route_line, RouteChange};
+    let peer = CorrespondenceLabel::mint().expect("a label");
+    let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
+    let cases = [
+        (None, Some(&a), RouteChange::Taken, "taken"),
+        (Some(&a), Some(&b), RouteChange::Replaced, "replaced"),
+        (Some(&a), Some(&a), RouteChange::Unchanged, "unchanged"),
+        (Some(&a), None, RouteChange::Dropped, "dropped"),
+        (None, None, RouteChange::NoneHeld, "none held"),
+    ];
+    let mut lines = HashSet::new();
+    for (held, route, change, word) in cases {
+        assert_eq!(route_change(held, route), change, "{word}");
+        let line = route_line(&peer, change);
+        assert!(line.contains(&tag(&peer)), "{line} names the conversation");
+        assert!(line.contains(word), "{line} says {word}");
+        lines.insert(line);
+    }
+    assert_eq!(lines.len(), cases.len(), "every outcome has its own line");
+    assert_eq!(
+        route_line(&peer, RouteChange::Replaced),
+        format!("dm push: route of {} replaced", tag(&peer))
+    );
+}

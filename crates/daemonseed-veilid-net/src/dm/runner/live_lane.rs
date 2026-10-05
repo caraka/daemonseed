@@ -191,6 +191,18 @@ impl LaneShare {
                 committed.subkey,
                 &committed.slot,
             );
+        } else if !self.push.holds_route(peer) {
+            crate::vtrace!(
+                "dm lane: sequence {} on {} not pushed, no route held",
+                committed.seq,
+                tag(peer)
+            );
+        } else {
+            crate::vtrace!(
+                "dm lane: sequence {} on {} not pushed, no push transport or control key",
+                committed.seq,
+                tag(peer)
+            );
         }
         Ok(committed.seq)
     }
