@@ -523,6 +523,9 @@ pub struct VeilidRecords {
     /// The node's watched channel records, which a read-only open of a
     /// correspondent's channel adds to.
     watches: ChannelWatches<RecordKey>,
+    /// Whether a read of a correspondent's channel registers a watch on it
+    /// ([`RunnerRecords::watch_reads`]).
+    watch_reads: bool,
     /// Watch registrations made by channel reads that failed, until
     /// [`RunnerRecords::take_watch_failures`] takes them.
     watch_failures: std::sync::atomic::AtomicU64,
@@ -552,6 +555,7 @@ impl VeilidRecords {
             drop_pass: DropPass::default(),
             push: parts.push,
             watches: parts.watches,
+            watch_reads: true,
             watch_failures: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1348,6 +1352,7 @@ impl Records for VeilidRecords {
             let own = self.own_channels.get(lookup_key).map(|own| own.shape);
             let shape = own.map_or_else(|| shape_of(CHANNEL_SUBKEYS), Ok)?;
             let own = own.is_some();
+            let watch = self.watch_reads;
             let transport = &self.transport;
             let watches = &self.watches;
             let watch_failures = &self.watch_failures;
@@ -1375,7 +1380,7 @@ impl Records for VeilidRecords {
                 let Some(handle) = handle else {
                     return Ok(None);
                 };
-                if watches.wants(handle.key(), own) {
+                if watch && watches.wants(handle.key(), own) {
                     watch_channel(
                         transport,
                         watches,
@@ -1687,6 +1692,10 @@ impl RunnerRecords for VeilidRecords {
 
     fn take_push(&mut self) -> Option<crate::dm::push::PushParts> {
         self.push.take()
+    }
+
+    fn watch_reads(&mut self, on: bool) {
+        self.watch_reads = on;
     }
 
     fn take_watch_failures(&mut self) -> u64 {
@@ -3850,7 +3859,7 @@ mod tests {
     }
 
     /// Every record store method that reaches the network traces its call:
-    /// the only methods without a trace are the four that make none.
+    /// the only methods without a trace are the ones that make none.
     #[test]
     fn every_record_call_is_traced() {
         let tracers = ["traced(", "traced_read(", "call_line("];
@@ -3873,6 +3882,7 @@ mod tests {
                 "same_local_refusal".to_owned(),
                 "write_counts".to_owned(),
                 "take_push".to_owned(),
+                "watch_reads".to_owned(),
                 "take_watch_failures".to_owned(),
             ],
             "only the methods that make no network call are untraced"

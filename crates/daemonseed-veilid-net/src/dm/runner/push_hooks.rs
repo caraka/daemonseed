@@ -143,6 +143,15 @@ impl PushShare {
         }
     }
 
+    /// Forget the route held for `peer` and release it, as a conversation's
+    /// teardown does.
+    pub(super) fn forget_peer(&self, peer: &CorrespondenceLabel) {
+        let held = self.routes().remove(peer);
+        if let (Some(held), Some(transport)) = (held, &self.transport) {
+            transport.release(&held);
+        }
+    }
+
     /// Forget and release the route `unanswered` was pushed on, where it is
     /// still the one held for its correspondent.
     fn forget_route(&self, unanswered: &Unanswered) {

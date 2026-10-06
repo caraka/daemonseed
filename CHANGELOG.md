@@ -31,6 +31,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-core`: `flows::commit_message`, `flows::Committed`, `FlowError::Conflict`, `dm::push::NoNetwork`, `dm::push::TAKE_ATTEMPTS`.
 - `daemonseed-core`: `Store::sweep_orphaned_outboxes`, which the direct-message runner calls once at startup.
 - `daemonseed-veilid-net`: `HealthCounters::watch_failures` counts channel watches that failed to register, re-register or cancel; `RunnerRecords::take_watch_failures`.
+- `daemonseed-core`: `dm::push::PushRoute`, `route_tag`, `ROUTE_TAG_LEN`, `AnswerKey::route_tag`, `domain::DM_PUSH_ROUTE`; a message push carries its route with a tag under the sender's control key, `take_message` takes the pushed route and `Taken::Recorded::route` holds it only where the tag matches (wire change to push kind 4). `daemonseed-veilid-net`: `RunnerRecords::watch_reads`; drop scans and request previews register no channel watch, a deleted conversation's correspondent route is released, and a change on a channel whose watch was just cancelled is dropped.
 
 ### Changed
 

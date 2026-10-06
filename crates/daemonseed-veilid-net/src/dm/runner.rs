@@ -358,6 +358,15 @@ pub trait RunnerRecords: Records {
         Ok(())
     }
 
+    /// Whether a read of a correspondent's channel registers a watch on it,
+    /// on until set off. A drop scan and a contact request's preview read with
+    /// it off, so a request that is never accepted leaves no watch behind; the
+    /// channel is watched once its conversation is established and collected.
+    /// The default watches nothing.
+    fn watch_reads(&mut self, on: bool) {
+        let _ = on;
+    }
+
     /// How many watch registrations made by channel reads failed, or left
     /// Veilid holding no watch, since this was last asked. The read goes
     /// ahead either way, so the failure is not the read's; the runner counts
@@ -3128,14 +3137,19 @@ impl<R: RunnerRecords> Runner<R> {
                 signer: &self.signer,
                 channel_root: &self.channel_root,
             };
-            match flows::collect_slot(
+            // A hello names a channel that becomes a conversation's only once
+            // accepted, so reading it registers no watch.
+            self.records.inner.watch_reads(false);
+            let collected = flows::collect_slot(
                 &self.store,
                 &mut self.records,
                 &me,
                 &self.advert_keys,
                 |identity| blocked.is_blocked(identity),
                 slot,
-            ) {
+            );
+            self.records.inner.watch_reads(true);
+            match collected {
                 Ok(Some(one)) => surfaced.push(one),
                 Ok(None) => {}
                 Err(e) => {
@@ -3590,14 +3604,13 @@ impl<R: RunnerRecords> Runner<R> {
                 }
                 Ok(())
             }
-            live_lane::LaneNote::PeerControl {
-                peer,
-                reach,
-                cursor,
-            } => {
-                self.note_reach(&peer, &reach);
-                self.take_peer_cursor(&peer, cursor);
-                self.report_delivery(&peer).await
+            live_lane::LaneNote::PeerControls => {
+                for (peer, (reach, cursor)) in self.lane.peer_controls.take() {
+                    self.note_reach(&peer, &reach);
+                    self.take_peer_cursor(&peer, cursor);
+                    self.report_delivery(&peer).await?;
+                }
+                Ok(())
             }
             live_lane::LaneNote::CollectNow(peer) => {
                 self.collect_now.insert(peer);
@@ -4072,6 +4085,7 @@ impl<R: RunnerRecords> Runner<R> {
             }
         }
         self.records.reopen_pending.remove(&erase.lookup_key);
+        self.push.share.forget_peer(peer);
         self.repairs.remove(peer);
         self.delivered.remove(peer);
         Ok(())
@@ -4193,7 +4207,9 @@ impl<R: RunnerRecords> Runner<R> {
             crate::vtrace!("dm runner: preview of request {} starts", id.serial);
             let started = std::time::Instant::now();
             self.records.traced = Some("preview");
+            self.records.inner.watch_reads(false);
             let read = flows::preview(&mut self.records, &me, request);
+            self.records.inner.watch_reads(true);
             self.records.traced = None;
             let ms = started.elapsed().as_millis();
             let preview = match read {

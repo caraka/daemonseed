@@ -478,7 +478,9 @@ types:
       rewatch_channel(&mut self, &lookup key) -> Result<(), RecordError> (registers
       a dead watch again; default Ok, watching nothing),
       unwatch_channel(&mut self, &lookup key) -> Result<(), RecordError> (cancels
-      the watch, as a delete does; default Ok) and
+      the watch, as a delete does; default Ok), watch_reads(&mut self, bool)
+      (whether a read of a correspondent's channel registers a watch; the runner
+      turns it off for a drop scan slot and a request preview; default no-op) and
       write_counts, take_push(&mut self) -> Option<PushParts> (default None; the
       runner takes it once at startup and pushes only with one), the associated fn
       classify(&RecordError) -> RecordFailure (default Refused) that decides the

@@ -353,6 +353,8 @@ struct Watching {
     rewatched: Vec<[u8; HELLO_LOOKUP_KEY_LEN]>,
     /// Every channel whose watch was cancelled, in order.
     unwatched: Vec<[u8; HELLO_LOOKUP_KEY_LEN]>,
+    /// Whether reads register no watch, as the runner asks for a preview.
+    reads_unwatched: bool,
 }
 
 /// A record store over a shared [`Dht`] and one [`Node`], counting every call.
@@ -444,8 +446,11 @@ impl Fake {
             .records
             .keys()
             .any(|(kind, name, _)| *kind == CHANNEL && name == lookup_key);
-        let own = self.watching().own.contains(lookup_key);
-        if exists && self.watches.wants(lookup_key, own) {
+        let (own, unwatched) = {
+            let watching = self.watching();
+            (watching.own.contains(lookup_key), watching.reads_unwatched)
+        };
+        if exists && !unwatched && self.watches.wants(lookup_key, own) {
             {
                 let mut faults = self.faults();
                 if faults.failed_registrations > 0 {
@@ -851,6 +856,10 @@ impl RunnerRecords for Fake {
             self.watches.reregistered(lookup_key);
         }
         Ok(())
+    }
+
+    fn watch_reads(&mut self, on: bool) {
+        self.watching().reads_unwatched = !on;
     }
 
     fn take_watch_failures(&mut self) -> u64 {
@@ -1455,6 +1464,61 @@ async fn a_held_request_is_previewed_before_any_accept() {
         Vec::new(),
         "a preview stored a correspondence"
     );
+}
+
+/// Previewing contact requests registers no watch on any requester's channel:
+/// a request that is never accepted leaves nothing watched behind it.
+#[tokio::test(start_paused = true)]
+async fn previewing_requests_registers_no_watch() {
+    let dht = network();
+    let b = Profile::new();
+    let b_fake = Fake::on(&dht);
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    let mut initiators = Vec::new();
+    for _ in 0..3 {
+        let a = Profile::new();
+        let a_fake = Fake::on(&dht);
+        let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+        aw.wait_for("the initiator's startup", is_health).await;
+        aw.send(RunnerCommand::FirstContact {
+            token: CommandToken(1),
+            peer_identity_pk: b.pk.clone(),
+            body: b"a first body".to_vec(),
+        })
+        .await;
+        aw.wait_for("the first contact", sent(1)).await;
+        initiators.push((a, aw));
+    }
+    for (a, _) in &initiators {
+        let surfaced = bw
+            .wait_for("B's contact request", request_from(&a.pk))
+            .await;
+        let request = request_id(&bw.seen[surfaced]);
+        bw.wait_for("B's preview", |event| {
+            matches!(event, RunnerEvent::RequestPreview { request: r, .. } if *r == request)
+        })
+        .await;
+    }
+    let previews = bw
+        .seen
+        .iter()
+        .filter(|event| matches!(event, RunnerEvent::RequestPreview { .. }))
+        .count();
+    assert_eq!(previews, 3, "every request was previewed");
+    assert!(
+        b_fake.calls().channel_reads > 0,
+        "the previews read the requesters' channels"
+    );
+    assert_eq!(
+        b_fake.watching().registered,
+        Vec::<[u8; HELLO_LOOKUP_KEY_LEN]>::new(),
+        "no watch was registered by a preview"
+    );
+    assert!(finished(&bw.stop().await));
+    for (_, aw) in initiators {
+        assert!(finished(&aw.stop().await));
+    }
 }
 
 /// An accept of a previewed request reads nothing from the network before its
@@ -10260,6 +10324,80 @@ fn a_reach_without_a_route_keeps_the_held_route() {
     assert!(!share.holds_route(&other), "no route is invented");
 }
 
+/// While the runner takes none, the controls opened for a correspondent wait
+/// as one entry, behind a single wake for all correspondents, holding the
+/// newest reach and the highest cursor. Once the runner has taken them, the
+/// next control wakes it again.
+#[test]
+fn opened_controls_wait_as_one_entry_per_correspondent_behind_one_wake() {
+    let (notes, mut queued) = mpsc::unbounded_channel();
+    let controls = live_lane::PeerControls::default();
+    let peer = CorrespondenceLabel::mint().expect("a label");
+    let other = CorrespondenceLabel::mint().expect("a label");
+    let reach = |byte: u8| daemonseed_core::dm::channel::Reach {
+        route: Some(vec![byte; 4]),
+        handle: None,
+    };
+    for (byte, cursor) in [(1, 3), (2, 9), (3, 5)] {
+        controls.note(&notes, peer, reach(byte), cursor);
+    }
+    controls.note(&notes, other, reach(4), 1);
+    let mut wakes = 0;
+    while let Ok(note) = queued.try_recv() {
+        assert!(matches!(note, live_lane::LaneNote::PeerControls));
+        wakes += 1;
+    }
+    assert_eq!(wakes, 1, "one wake for every control held");
+    let held = controls.take();
+    assert_eq!(held.len(), 2, "one entry per correspondent");
+    assert_eq!(
+        held[&peer],
+        (reach(3), 9),
+        "the newest reach, the highest cursor"
+    );
+    assert_eq!(held[&other], (reach(4), 1));
+    controls.note(&notes, peer, reach(5), 10);
+    assert!(
+        matches!(queued.try_recv(), Ok(live_lane::LaneNote::PeerControls)),
+        "a control after the runner took them wakes it again"
+    );
+}
+
+/// Forgetting a correspondent drops the route held for it and releases that
+/// route on the transport once; the route held for another correspondent
+/// stays, and forgetting one with no route held releases nothing.
+#[test]
+fn forgetting_a_peer_drops_and_releases_its_route() {
+    let board = Arc::new(Mutex::new(Board::default()));
+    let (outbox, inbox) = push_queue();
+    let (push, _) = push_hooks::PushState::new(Some(PushParts {
+        transport: Arc::new(FakePush {
+            board: Arc::clone(&board),
+            inbound: outbox,
+        }),
+        inbound: inbox,
+    }));
+    let share = push.share.clone();
+    let peer = CorrespondenceLabel::mint().expect("a label");
+    let other = CorrespondenceLabel::mint().expect("a label");
+    let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
+    share.set_peer_route(&peer, Some(a.clone()));
+    share.set_peer_route(&other, Some(b));
+    share.forget_peer(&peer);
+    assert!(!share.holds_route(&peer), "the route is no longer held");
+    assert!(
+        share.holds_route(&other),
+        "another correspondent's route stays"
+    );
+    assert_eq!(board.lock().unwrap().released, vec![a], "released once");
+    share.forget_peer(&peer);
+    assert_eq!(
+        board.lock().unwrap().released.len(),
+        1,
+        "nothing more to release"
+    );
+}
+
 // ── channel watches ─────────────────────────────────────────────────────────
 
 /// A read of a correspondent's channel registers one watch on it however often
@@ -11296,11 +11434,19 @@ async fn a_recorded_push_carrying_a_route_replaces_the_held_route() {
     k.board.lock().unwrap().down = false;
     let renewed = b"route-of-b-from-a-push".to_vec();
     assert_ne!(kept_route(&k.a, &k.a_peer), Some(renewed.clone()));
+    let lookup_key = k.b.outgoing_lookup_key(&k.a);
+    let b_key = conv_of(&k.b, &b_peer)
+        .own_control_key
+        .expect("B's control key");
     let push = daemonseed_core::dm::push::Push::Message {
-        lookup_key: k.b.outgoing_lookup_key(&k.a),
+        lookup_key,
         subkey: channel::slot_for(1),
         slot,
-        route: Some(renewed.clone()),
+        route: Some(daemonseed_core::dm::push::PushRoute {
+            tag: daemonseed_core::dm::push::route_tag(&b_key, &lookup_key, 1, &renewed)
+                .expect("a tag"),
+            route: renewed.clone(),
+        }),
     }
     .encode()
     .expect("fits");
@@ -11332,6 +11478,98 @@ async fn a_recorded_push_carrying_a_route_replaces_the_held_route() {
         || board.lock().unwrap().released.contains(&renewed),
     )
     .await;
+}
+
+/// Deleting a conversation forgets the route held for its correspondent and
+/// releases it on the transport, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_forgets_and_releases_the_correspondents_route() {
+    let (mut k, _) = establish_pushed().await;
+    let b_route = kept_route(&k.a, &k.a_peer).expect("A keeps B's route");
+    assert!(
+        !k.board.lock().unwrap().released.contains(&b_route),
+        "B's route is held before the delete"
+    );
+    k.aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(51),
+        peer: k.a_peer,
+    })
+    .await;
+    k.aw.wait_for(
+        "the delete's answer",
+        |event| matches!(event, RunnerEvent::Deleted { token, .. } if token.0 == 51),
+    )
+    .await;
+    let released = k
+        .board
+        .lock()
+        .unwrap()
+        .released
+        .iter()
+        .filter(|route| **route == b_route)
+        .count();
+    assert_eq!(released, 1, "B's route is released once");
+    assert_eq!(kept_route(&k.a, &k.a_peer), None, "no route is kept");
+}
+
+/// A message push whose route is not tagged under the sender's control key
+/// for that message is recorded, and its route is neither held nor kept: the
+/// next push goes to the route held before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recorded_push_with_an_untagged_route_leaves_the_held_route() {
+    let (mut k, b_peer) = establish_pushed().await;
+    // Neither side takes the other's message from a watched change, so B
+    // records A's reply from its push alone and A's delivery is the answer.
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    let slot = b_sends_unpushed(&mut k, b_peer, 3, 1, b"with a foreign route").await;
+    k.board.lock().unwrap().down = false;
+    let kept = kept_route(&k.a, &k.a_peer);
+    assert!(kept.is_some(), "A keeps B's route");
+    let foreign = b"route-of-someone-else".to_vec();
+    let lookup_key = k.b.outgoing_lookup_key(&k.a);
+    // Tagged under a key that is not B's: A's own control key.
+    let not_b = conv_of(&k.a, &k.a_peer)
+        .own_control_key
+        .expect("A's control key");
+    let push = daemonseed_core::dm::push::Push::Message {
+        lookup_key,
+        subkey: channel::slot_for(1),
+        slot,
+        route: Some(daemonseed_core::dm::push::PushRoute {
+            tag: daemonseed_core::dm::push::route_tag(&not_b, &lookup_key, 1, &foreign)
+                .expect("a tag"),
+            route: foreign.clone(),
+        }),
+    }
+    .encode()
+    .expect("fits");
+    let answer = call_a(&k, push).await.expect("A answers the push");
+    assert!(answer.starts_with(daemonseed_core::dm::push::RECORDED));
+    k.aw.wait_for(
+        "the message at A",
+        message(k.a_peer, 1, b"with a foreign route"),
+    )
+    .await;
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        kept,
+        "the route kept beside the conversation is unchanged"
+    );
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(9),
+        peer: k.a_peer,
+        body: b"back".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(9)).await;
+    k.aw.wait_for("delivery of A's send", delivered(k.a_peer, 1))
+        .await;
+    assert!(
+        !k.board.lock().unwrap().released.contains(&foreign),
+        "no push was made to the untagged route"
+    );
 }
 
 /// A cursor publish that fails on the network is tried again within seconds

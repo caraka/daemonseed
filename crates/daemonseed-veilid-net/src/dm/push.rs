@@ -41,7 +41,7 @@ use daemonseed_core::dm::advert::AdvertOwnerSeed;
 use daemonseed_core::dm::channel::{self, ChannelOwnerSeed};
 use daemonseed_core::dm::drop::{DropOwnerSeed, HELLO_LOOKUP_KEY_LEN};
 use daemonseed_core::dm::flows::{AcceptanceWrites, BatchWrite, RecordError, Records};
-use daemonseed_core::dm::push::{answer_matches, AnswerKey, Push, ANSWER_LEN};
+use daemonseed_core::dm::push::{answer_matches, AnswerKey, Push, PushRoute, ANSWER_LEN};
 use daemonseed_core::storage::dm_store::CorrespondenceLabel;
 use tokio::sync::mpsc;
 use veilid_core::{OperationId, RouteId, RoutingContext, Target, VeilidAPI};
@@ -565,25 +565,33 @@ impl Pusher {
         subkey: u16,
         bytes: &[u8],
     ) {
-        let expected = channel::MessageHeader::decode(bytes)
-            .ok()
-            .zip(self.answer_key.as_deref())
-            .and_then(|((header, _), key)| {
-                Some((header.seq, key.answer(lookup_key, header.seq).ok()?))
-            });
-        if let Some((seq, expected)) = expected {
-            self.start(
-                peer,
-                Some(seq),
-                &Push::Message {
-                    lookup_key: *lookup_key,
-                    subkey,
-                    slot: bytes.to_vec(),
-                    route: self.own_route.clone(),
-                },
-                expected,
-            );
-        }
+        let Some(key) = self.answer_key.as_deref() else {
+            return;
+        };
+        let Ok((header, _)) = channel::MessageHeader::decode(bytes) else {
+            return;
+        };
+        let seq = header.seq;
+        let Ok(expected) = key.answer(lookup_key, seq) else {
+            return;
+        };
+        let route = self.own_route.as_ref().and_then(|route| {
+            Some(PushRoute {
+                tag: key.route_tag(lookup_key, seq, route).ok()?,
+                route: route.clone(),
+            })
+        });
+        self.start(
+            peer,
+            Some(seq),
+            &Push::Message {
+                lookup_key: *lookup_key,
+                subkey,
+                slot: bytes.to_vec(),
+                route,
+            },
+            expected,
+        );
     }
 
     /// Push the sealed control subkey `control` of the channel at

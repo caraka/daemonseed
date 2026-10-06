@@ -94,13 +94,10 @@ pub(super) enum LaneNote {
     /// The watch on the correspondent's channel read under this lookup key
     /// died, and the runner registers it again and collects the conversation.
     WatchDied([u8; HELLO_LOOKUP_KEY_LEN]),
-    /// The correspondent's control subkey, opened from a watched change: the
-    /// runner takes in its reach and cursor as it does an acceptance's.
-    PeerControl {
-        peer: CorrespondenceLabel,
-        reach: Reach,
-        cursor: u64,
-    },
+    /// Correspondents' control subkeys were opened, from a watched change or
+    /// a reach notice: the runner takes in the reach and cursor
+    /// [`PeerControls`] holds for each, as it does an acceptance's.
+    PeerControls,
     /// A watched change the lane could not apply from its bytes: the runner
     /// collects this conversation at its next wake.
     CollectNow(CorrespondenceLabel),
@@ -114,6 +111,44 @@ pub(super) enum LaneNote {
         block: bool,
         updated: Result<BlockList, BlockListFailure>,
     },
+}
+
+/// The reach and cursor of each correspondent whose control the lane opened
+/// and the runner has not yet taken in: the newest reach, and the highest
+/// cursor. One [`LaneNote::PeerControls`] wakes the runner for all of them,
+/// however many controls arrive before it takes them.
+#[derive(Clone, Default)]
+pub(super) struct PeerControls(Arc<std::sync::Mutex<HashMap<CorrespondenceLabel, (Reach, u64)>>>);
+
+impl PeerControls {
+    /// Hold `reach` for `peer` in place of the one held, and the higher of
+    /// `cursor` and the cursor held, and wake the runner on `notes` where
+    /// nothing was held for anyone.
+    pub(super) fn note(
+        &self,
+        notes: &mpsc::UnboundedSender<LaneNote>,
+        peer: CorrespondenceLabel,
+        reach: Reach,
+        cursor: u64,
+    ) {
+        let wake = {
+            let mut held = locked(&self.0);
+            let wake = held.is_empty();
+            let cursor = held
+                .get(&peer)
+                .map_or(cursor, |(_, held)| cursor.max(*held));
+            held.insert(peer, (reach, cursor));
+            wake
+        };
+        if wake {
+            let _ = notes.send(LaneNote::PeerControls);
+        }
+    }
+
+    /// Take every reach and cursor held.
+    pub(super) fn take(&self) -> HashMap<CorrespondenceLabel, (Reach, u64)> {
+        std::mem::take(&mut *locked(&self.0))
+    }
 }
 
 /// What the runner and the lane both hold.
@@ -137,6 +172,8 @@ pub(super) struct LaneShare {
     /// The conversation reading each incoming channel, by lookup key, as the
     /// roster last listed them.
     readers: Arc<std::sync::Mutex<HashMap<[u8; HELLO_LOOKUP_KEY_LEN], CorrespondenceLabel>>>,
+    /// Correspondents' controls opened and not yet taken in by the runner.
+    pub(super) peer_controls: PeerControls,
     /// Commits refused as conflicting before any is attempted, for tests.
     #[cfg(test)]
     pub(super) forced_conflicts: Arc<std::sync::atomic::AtomicUsize>,
@@ -169,6 +206,7 @@ impl LaneShare {
             routed: Arc::default(),
             events_gone: Arc::default(),
             readers: Arc::default(),
+            peer_controls: PeerControls::default(),
             #[cfg(test)]
             forced_conflicts: Arc::default(),
         }
@@ -738,11 +776,12 @@ impl Lane {
                     tag(&peer),
                     control.collected_cursor
                 );
-                let _ = self.notes.send(LaneNote::PeerControl {
+                self.share.peer_controls.note(
+                    &self.notes,
                     peer,
-                    reach: control.reach,
-                    cursor: control.collected_cursor,
-                });
+                    control.reach,
+                    control.collected_cursor,
+                );
                 true
             }
             Err(_) => {
@@ -770,6 +809,7 @@ impl Lane {
             lookup_key,
             subkey,
             bytes,
+            None,
         );
         match taken {
             Ok(Taken::Recorded {
@@ -848,6 +888,7 @@ impl Lane {
             lookup_key,
             *subkey,
             slot,
+            route.as_ref(),
         );
         match taken {
             Ok(Taken::Recorded {
@@ -855,9 +896,10 @@ impl Lane {
                 seq,
                 message,
                 answer,
+                route,
             }) => {
                 if let Some(route) = route {
-                    self.share.hold_route(&peer, route);
+                    self.share.hold_route(&peer, &route);
                 }
                 self.share.push.answer(id, answer);
                 crate::vtrace!("dm push: {} sequence {seq} recorded", tag(&peer));
@@ -922,11 +964,12 @@ impl Lane {
                     tag(&peer),
                     control.collected_cursor
                 );
-                let _ = self.notes.send(LaneNote::PeerControl {
+                self.share.peer_controls.note(
+                    &self.notes,
                     peer,
-                    reach: control.reach,
-                    cursor: control.collected_cursor,
-                });
+                    control.reach,
+                    control.collected_cursor,
+                );
             }
             Ok(core_push::ReachTaken::Blocked { peer }) => {
                 crate::vtrace!(

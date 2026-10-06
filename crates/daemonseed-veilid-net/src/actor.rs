@@ -2718,18 +2718,21 @@ async fn send_sealed(rc: &RoutingContext, route: RouteId, sealed: Vec<u8>) -> Re
 }
 
 /// Hand a value change to the direct-messaging inbox on `lane` where its record
-/// is a channel `watches` holds, and to [`map_update`] otherwise. A change the
-/// inbox takes reaches no other consumer.
+/// is a channel `watches` holds, drop it where its record is a channel whose
+/// watch was just cancelled, and hand it to [`map_update`] otherwise. A change
+/// the inbox takes reaches no other consumer.
 fn route_value_change(
     change: Box<veilid_core::VeilidValueChange>,
     watches: &crate::dm::watch::ChannelWatches<RecordKey>,
     lane: &crate::dm::push::PushLane,
 ) -> Option<VeilidNetEvent> {
     match crate::dm::watch::claim(watches, change) {
-        Ok(inbound) => {
+        Ok(Some(inbound)) => {
             crate::dm::push::offer(lane, inbound);
             None
         }
+        // A change on a channel whose watch was just cancelled.
+        Ok(None) => None,
         Err(change) => map_update(VeilidUpdate::ValueChange(change)),
     }
 }
@@ -2890,6 +2893,47 @@ mod tests {
         assert!(
             inbox.try_recv().is_none(),
             "an unwatched record's change reaches no inbox"
+        );
+    }
+
+    /// A change on a channel record whose watch was just cancelled, as one
+    /// Veilid had in flight at the cancel arrives, reaches neither the inbox nor
+    /// the rendezvous mapping; a record never watched still reaches the
+    /// rendezvous mapping.
+    #[test]
+    fn a_change_on_a_channel_just_unwatched_reaches_no_consumer() {
+        use crate::dm::push::push_queue;
+        use crate::dm::watch::tests::{change, record};
+        use veilid_core::ValueSubkeyRangeSet;
+
+        let watches = crate::dm::watch::ChannelWatches::new(false);
+        watches.registered(record(1), [1; 32]);
+        assert_eq!(watches.forget(&[1; 32]), Some(record(1)));
+        let (outbox, mut inbox) = push_queue();
+        let lane: crate::dm::push::PushLane = Arc::new(Mutex::new(Some(outbox)));
+
+        let late = route_value_change(
+            change(record(1), ValueSubkeyRangeSet::single(4), 9, Some(b"slot")),
+            &watches,
+            &lane,
+        );
+        assert!(
+            late.is_none(),
+            "a change on a channel just unwatched reaches no event: {late:?}"
+        );
+        assert!(
+            inbox.try_recv().is_none(),
+            "a change on a channel just unwatched reaches no inbox"
+        );
+
+        let lobby = route_value_change(
+            change(record(2), ValueSubkeyRangeSet::single(4), 9, Some(b"room")),
+            &watches,
+            &lane,
+        );
+        assert!(
+            matches!(&lobby, Some(VeilidNetEvent::Inbound { bytes }) if bytes == b"room"),
+            "a record never watched is the rendezvous event: {lobby:?}"
         );
     }
 

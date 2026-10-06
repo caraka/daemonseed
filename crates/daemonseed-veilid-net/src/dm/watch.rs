@@ -11,6 +11,10 @@
 //! nothing else. A change on any other record goes to the rendezvous
 //! mapping.
 //!
+//! A record whose watch was cancelled stays known for `RETIRED_FOR` after,
+//! so a change Veilid reported before the cancel took effect is dropped here
+//! rather than reaching the rendezvous mapping as a record of its own.
+//!
 //! Only records this node reads are watched: this node writes its own
 //! channels, so a change to one is never news to it. One watch
 //! is registered per record, over every subkey, because Veilid holds one watch
@@ -28,11 +32,20 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use daemonseed_core::dm::drop::HELLO_LOOKUP_KEY_LEN;
 use veilid_core::{RecordKey, VeilidValueChange};
 
 use crate::dm::push::PushInbound;
+
+/// How long a record stays known after its watch is cancelled, during which a
+/// change reported on it is dropped.
+pub(crate) const RETIRED_FOR: Duration = Duration::from_secs(300);
+
+/// The most records known as cancelled at once; the one cancelled longest ago
+/// gives way to a newer one.
+pub(crate) const RETIRED_MAX: usize = 256;
 
 /// The environment variable that, set to `1` before the node starts, turns
 /// channel watch registration off for the whole run.
@@ -63,6 +76,8 @@ pub(crate) fn channel_tag(lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> String {
 #[derive(Debug)]
 pub(crate) struct ChannelWatches<K> {
     watched: Arc<Mutex<HashMap<K, [u8; HELLO_LOOKUP_KEY_LEN]>>>,
+    /// Records whose watch was cancelled, and when.
+    retired: Arc<Mutex<HashMap<K, Instant>>>,
     off: bool,
 }
 
@@ -70,6 +85,7 @@ impl<K> Clone for ChannelWatches<K> {
     fn clone(&self) -> Self {
         Self {
             watched: Arc::clone(&self.watched),
+            retired: Arc::clone(&self.retired),
             off: self.off,
         }
     }
@@ -80,12 +96,17 @@ impl<K: Eq + Hash + Clone> ChannelWatches<K> {
     pub(crate) fn new(off: bool) -> Self {
         Self {
             watched: Arc::default(),
+            retired: Arc::default(),
             off,
         }
     }
 
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<K, [u8; HELLO_LOOKUP_KEY_LEN]>> {
         self.watched.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn retired(&self) -> std::sync::MutexGuard<'_, HashMap<K, Instant>> {
+        self.retired.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether registration is off.
@@ -101,6 +122,7 @@ impl<K: Eq + Hash + Clone> ChannelWatches<K> {
 
     /// Note `record`, read under `lookup_key`, as watched.
     pub(crate) fn registered(&self, record: K, lookup_key: [u8; HELLO_LOOKUP_KEY_LEN]) {
+        self.retired().remove(&record);
         self.map().insert(record, lookup_key);
         let short = channel_tag(&lookup_key);
         crate::vtrace!("dm watch: registered {short}");
@@ -126,13 +148,39 @@ impl<K: Eq + Hash + Clone> ChannelWatches<K> {
     }
 
     /// Stop treating the record read under `lookup_key` as watched, returning
-    /// it where it was.
+    /// it where it was. The record is known as cancelled for [`RETIRED_FOR`].
     pub(crate) fn forget(&self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> Option<K> {
+        self.forget_at(lookup_key, Instant::now())
+    }
+
+    fn forget_at(&self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], now: Instant) -> Option<K> {
         let record = self.record_of(lookup_key)?;
         self.map().remove(&record);
+        {
+            let mut retired = self.retired();
+            retired.retain(|_, at| now.saturating_duration_since(*at) < RETIRED_FOR);
+            if retired.len() >= RETIRED_MAX {
+                let oldest = retired
+                    .iter()
+                    .min_by_key(|(_, at)| **at)
+                    .map(|(record, _)| record.clone());
+                if let Some(oldest) = oldest {
+                    retired.remove(&oldest);
+                }
+            }
+            retired.insert(record.clone(), now);
+        }
         let short = channel_tag(lookup_key);
         crate::vtrace!("dm watch: removed {short}");
         Some(record)
+    }
+
+    /// Whether the watch on `record` was cancelled less than [`RETIRED_FOR`]
+    /// before `now`.
+    fn is_retired_at(&self, record: &K, now: Instant) -> bool {
+        self.retired()
+            .get(record)
+            .is_some_and(|at| now.saturating_duration_since(*at) < RETIRED_FOR)
     }
 
     /// How many records are watched.
@@ -142,8 +190,9 @@ impl<K: Eq + Hash + Clone> ChannelWatches<K> {
     }
 }
 
-/// The inbox entry a value change on a watched channel record becomes, or the
-/// change itself where its record is not watched.
+/// The inbox entry a value change on a watched channel record becomes, `None`
+/// where the record's watch was cancelled less than [`RETIRED_FOR`] ago, or
+/// the change itself where its record is neither.
 ///
 /// The value is passed on as Veilid reports it: present only for the first
 /// subkey, and only where a single subkey changed. An empty subkey set or a
@@ -151,11 +200,15 @@ impl<K: Eq + Hash + Clone> ChannelWatches<K> {
 pub(crate) fn claim(
     watches: &ChannelWatches<RecordKey>,
     change: Box<VeilidValueChange>,
-) -> Result<PushInbound, Box<VeilidValueChange>> {
+) -> Result<Option<PushInbound>, Box<VeilidValueChange>> {
     let Some(lookup_key) = watches.lookup_of(&change.key) else {
+        if watches.is_retired_at(&change.key, Instant::now()) {
+            crate::vtrace!("dm watch: a change on a channel no longer watched, dropped");
+            return Ok(None);
+        }
         return Err(change);
     };
-    Ok(PushInbound::Changed {
+    Ok(Some(PushInbound::Changed {
         lookup_key,
         first_subkey: change.subkeys.nth_subkey(0).unwrap_or(0),
         single: change.subkeys.len() == 1,
@@ -163,7 +216,7 @@ pub(crate) fn claim(
         value: change
             .value
             .map(|value| (u32::from(value.seq()), value.data().to_vec())),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -242,6 +295,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_forgotten_record_is_known_as_cancelled_for_a_while_and_within_a_bound() {
+        let watches = ChannelWatches::<u16>::new(false);
+        let start = Instant::now();
+        watches.registered(1, [1; HELLO_LOOKUP_KEY_LEN]);
+        assert!(!watches.is_retired_at(&1, start), "a watched record");
+        assert_eq!(
+            watches.forget_at(&[1; HELLO_LOOKUP_KEY_LEN], start),
+            Some(1)
+        );
+        assert!(watches.is_retired_at(&1, start + RETIRED_FOR / 2));
+        assert!(!watches.is_retired_at(&1, start + RETIRED_FOR), "expired");
+        watches.registered(1, [1; HELLO_LOOKUP_KEY_LEN]);
+        assert!(
+            !watches.is_retired_at(&1, start),
+            "a record watched again is not cancelled"
+        );
+
+        let max = u16::try_from(RETIRED_MAX).expect("a small bound");
+        for record in 2..max + 3 {
+            let mut lookup_key = [0; HELLO_LOOKUP_KEY_LEN];
+            lookup_key[..2].copy_from_slice(&record.to_be_bytes());
+            watches.registered(record, lookup_key);
+            let at = start + Duration::from_millis(u64::from(record));
+            assert_eq!(watches.forget_at(&lookup_key, at), Some(record));
+        }
+        let now = start + Duration::from_secs(1);
+        assert_eq!(
+            watches.retired().len(),
+            RETIRED_MAX,
+            "held within the bound"
+        );
+        assert!(!watches.is_retired_at(&2, now), "the oldest gave way");
+        assert!(watches.is_retired_at(&(max + 2), now), "the newest is held");
+    }
+
+    #[test]
     fn a_change_on_a_watched_record_is_claimed_with_its_shape() {
         let watches = ChannelWatches::new(false);
         let lookup_key = [3; HELLO_LOOKUP_KEY_LEN];
@@ -251,13 +340,13 @@ pub(crate) mod tests {
             &watches,
             change(record(3), ValueSubkeyRangeSet::single(5), 10, Some(b"slot")),
         );
-        let Ok(PushInbound::Changed {
+        let Ok(Some(PushInbound::Changed {
             lookup_key: claimed,
             first_subkey,
             single,
             dead,
             value,
-        }) = single
+        })) = single
         else {
             panic!("a watched record's change is claimed: {single:?}");
         };
@@ -273,13 +362,13 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 several,
-                Ok(PushInbound::Changed {
+                Ok(Some(PushInbound::Changed {
                     first_subkey: 2,
                     single: false,
                     dead: false,
                     value: None,
                     ..
-                })
+                }))
             ),
             "{several:?}"
         );
@@ -290,7 +379,7 @@ pub(crate) mod tests {
         ] {
             let died = claim(&watches, change(record(3), subkeys, count, None));
             assert!(
-                matches!(died, Ok(PushInbound::Changed { dead: true, .. })),
+                matches!(died, Ok(Some(PushInbound::Changed { dead: true, .. }))),
                 "{died:?}"
             );
         }

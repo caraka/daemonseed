@@ -21,7 +21,9 @@
 //!
 //! A message push may carry the sender's current private route after the slot,
 //! so every delivered push refreshes the receiver's view of how the sender is
-//! reached. A reach notice carries the sender's sealed control subkey alone,
+//! reached. The route carries a tag made under the sender's control key for
+//! that message ([`route_tag`]), and is handed on only where the tag matches.
+//! A reach notice carries the sender's sealed control subkey alone,
 //! the same bytes its channel record holds: it is opened under the control key
 //! the conversation holds for the sender, so only the correspondent can make
 //! one that is taken, and only the correspondent can answer one.
@@ -92,6 +94,48 @@ pub fn answer(
     Ok(out)
 }
 
+/// Bytes of the tag a message push carries over the sender's route.
+pub const ROUTE_TAG_LEN: usize = 32;
+
+/// The tag over `route` carried with sequence `seq` of the channel at
+/// `lookup_key`: `HKDF-Expand(HKDF-Extract(DM_PUSH_ANSWER_SALT, control_key),
+/// DM_PUSH_ROUTE ‖ lp(lookup_key) ‖ BE64(seq) ‖ lp(route))`.
+///
+/// `control_key` is the pushing side's control key, as for [`answer`], so a
+/// tag that matches was made by the correspondent, for that route and that
+/// message.
+pub fn route_tag(
+    control_key: &ControlKey,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    seq: u64,
+    route: &[u8],
+) -> Result<[u8; ROUTE_TAG_LEN], FlowError> {
+    let hkdf = HkdfSha384::extract(Some(domain::DM_PUSH_ANSWER_SALT), control_key.as_bytes())
+        .map_err(|e| FlowError::Channel(ChannelError::Kdf(e)))?;
+    let mut info =
+        Vec::with_capacity(domain::DM_PUSH_ROUTE.len() + 24 + HELLO_LOOKUP_KEY_LEN + route.len());
+    info.extend_from_slice(domain::DM_PUSH_ROUTE);
+    crate::dm::push_lp(&mut info, lookup_key);
+    info.extend_from_slice(&seq.to_be_bytes());
+    crate::dm::push_lp(&mut info, route);
+    let tag = derive_boxed_seed::<ROUTE_TAG_LEN>(&hkdf, &info)
+        .map_err(|e| FlowError::Channel(ChannelError::Kdf(e)))?;
+    let mut out = [0u8; ROUTE_TAG_LEN];
+    out.copy_from_slice(tag.as_slice());
+    Ok(out)
+}
+
+/// A sender's private-route blob as a message push carries it, with the tag
+/// that binds it to the message ([`route_tag`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushRoute {
+    /// The route blob: non-empty and at most [`channel::REACH_ROUTE_MAX_LEN`]
+    /// bytes.
+    pub route: Vec<u8>,
+    /// [`route_tag`] over `route` at the pushed message's sequence.
+    pub tag: [u8; ROUTE_TAG_LEN],
+}
+
 /// A copy of a conversation's control key held to check answers with, by a
 /// caller outside this crate that cannot copy the key itself.
 pub struct AnswerKey(ControlKey);
@@ -110,6 +154,16 @@ impl AnswerKey {
     ) -> Result<[u8; ANSWER_LEN], FlowError> {
         answer(&self.0, lookup_key, seq)
     }
+
+    /// [`route_tag`] under this key.
+    pub fn route_tag(
+        &self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        seq: u64,
+        route: &[u8],
+    ) -> Result<[u8; ROUTE_TAG_LEN], FlowError> {
+        route_tag(&self.0, lookup_key, seq, route)
+    }
 }
 
 impl core::fmt::Debug for AnswerKey {
@@ -121,7 +175,13 @@ impl core::fmt::Debug for AnswerKey {
 /// Whether `got` is `expected`, compared in time independent of where they
 /// differ.
 pub fn answer_matches(expected: &[u8; ANSWER_LEN], got: &[u8]) -> bool {
-    if got.len() != ANSWER_LEN {
+    same_bytes(expected, got)
+}
+
+/// Whether `got` is `expected`, compared in time independent of where they
+/// differ.
+fn same_bytes(expected: &[u8], got: &[u8]) -> bool {
+    if got.len() != expected.len() {
         return false;
     }
     let mut diff = 0u8;
@@ -147,10 +207,9 @@ pub enum Push {
         subkey: u16,
         /// The slot's bytes.
         slot: Vec<u8>,
-        /// The sender's current private-route blob, where it has one it can
-        /// publish: non-empty and at most [`channel::REACH_ROUTE_MAX_LEN`]
-        /// bytes.
-        route: Option<Vec<u8>>,
+        /// The sender's current private route, where it has one it can
+        /// publish, with its tag.
+        route: Option<PushRoute>,
     },
     /// The sender's sealed control subkey, sent to the route it holds for
     /// the receiver so the receiver learns the sender's reach without
@@ -182,7 +241,8 @@ pub enum Push {
 impl Push {
     /// Encode: [`PUSH_TAG`] ‖ kind ‖ lookup key, then for a message without
     /// a route, kind 1, `BE16(subkey) ‖ slot`; for a message with one, kind 4,
-    /// `BE16(subkey) ‖ lp(slot) ‖ lp(route)`; for a reach notice, kind 3,
+    /// `BE16(subkey) ‖ lp(slot) ‖ lp(route) ‖ tag`, the tag
+    /// [`ROUTE_TAG_LEN`] bytes; for a reach notice, kind 3,
     /// `lp(control)`; and for an acceptance, kind 2, `BE16(hello_slot) ‖
     /// lp(hello) ‖ lp(control) ‖ BE16(reply_subkey) ‖ lp(reply)`. A route
     /// that is empty or longer than [`channel::REACH_ROUTE_MAX_LEN`] is left
@@ -196,13 +256,14 @@ impl Push {
                 subkey,
                 slot,
                 route,
-            } => match route.as_deref().filter(|route| publishable(route)) {
+            } => match route.as_ref().filter(|route| publishable(&route.route)) {
                 Some(route) => {
                     out.push(KIND_MESSAGE_WITH_ROUTE);
                     out.extend_from_slice(lookup_key);
                     out.extend_from_slice(&subkey.to_be_bytes());
                     crate::dm::push_lp(&mut out, slot);
-                    crate::dm::push_lp(&mut out, route);
+                    crate::dm::push_lp(&mut out, &route.route);
+                    out.extend_from_slice(&route.tag);
                 }
                 None => {
                     out.push(KIND_MESSAGE);
@@ -241,7 +302,8 @@ impl Push {
 
     /// Decode a push, or `None` for bytes that are not one: another tag, an
     /// unknown kind, a field that runs out, trailing bytes, a route that is
-    /// empty or longer than [`channel::REACH_ROUTE_MAX_LEN`], or a control
+    /// empty or longer than [`channel::REACH_ROUTE_MAX_LEN`] or has no whole
+    /// tag after it, or a control
     /// that is empty or longer than [`channel::SEALED_CONTROL_MAX_LEN`].
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         let rest = bytes.strip_prefix(PUSH_TAG.as_slice())?;
@@ -262,11 +324,16 @@ impl Push {
                 let (subkey, rest) = take_u16(rest)?;
                 let (slot, rest) = take_lp(rest)?;
                 let (route, rest) = take_lp(rest)?;
+                let (tag, rest) = rest.split_at_checked(ROUTE_TAG_LEN)?;
+                let tag: [u8; ROUTE_TAG_LEN] = tag.try_into().ok()?;
                 (rest.is_empty() && publishable(route)).then(|| Self::Message {
                     lookup_key,
                     subkey,
                     slot: slot.to_vec(),
-                    route: Some(route.to_vec()),
+                    route: Some(PushRoute {
+                        route: route.to_vec(),
+                        tag,
+                    }),
                 })
             }
             KIND_REACH => {
@@ -334,6 +401,10 @@ pub enum Taken {
         message: ReceivedMessage,
         /// The answer that reports it persisted ([`answer`]).
         answer: [u8; ANSWER_LEN],
+        /// The route the push carried, where its tag is [`route_tag`] at
+        /// `seq` under the correspondent's control key. A route with any other
+        /// tag is left out and the message is recorded all the same.
+        route: Option<Vec<u8>>,
     },
     /// From a correspondent `is_blocked` holds. Nothing was read or changed.
     Blocked {
@@ -368,6 +439,8 @@ pub enum Taken {
 /// that does not open under the conversation's key schedule changes nothing,
 /// and a message this returns is persisted as read before it is returned. The
 /// cursor reaches the record store with the next [`flows::publish_cursor`].
+/// `route` is the route the push carried, handed back in [`Taken::Recorded`]
+/// only where its tag matches.
 ///
 /// Where the conversation record changes between the load and the commit
 /// ([`FlowError::Conflict`]), nothing is recorded and the push is taken again
@@ -379,10 +452,11 @@ pub fn take_message(
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     subkey: u16,
     slot: &[u8],
+    route: Option<&PushRoute>,
 ) -> Result<Taken, FlowError> {
     let mut attempts = 1;
     loop {
-        match take_message_once(store, &is_blocked, lookup_key, subkey, slot) {
+        match take_message_once(store, &is_blocked, lookup_key, subkey, slot, route) {
             Err(FlowError::Conflict) if attempts < TAKE_ATTEMPTS => attempts += 1,
             taken => return taken,
         }
@@ -398,6 +472,7 @@ fn take_message_once(
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     subkey: u16,
     slot: &[u8],
+    route: Option<&PushRoute>,
 ) -> Result<Taken, FlowError> {
     if lookup_key == &[0u8; HELLO_LOOKUP_KEY_LEN] {
         return Ok(Taken::Dropped);
@@ -438,12 +513,22 @@ fn take_message_once(
         slot,
     };
     match flows::collect_step(store, &mut one, &peer) {
-        Ok(RingStep::Message { seq, message, .. }) => Ok(Taken::Recorded {
-            peer,
-            seq,
-            message,
-            answer: answer(peer_control_key, lookup_key, seq)?,
-        }),
+        Ok(RingStep::Message { seq, message, .. }) => {
+            let route = match route {
+                Some(route) => {
+                    let expected = route_tag(peer_control_key, lookup_key, seq, &route.route)?;
+                    same_bytes(&expected, &route.tag).then(|| route.route.clone())
+                }
+                None => None,
+            };
+            Ok(Taken::Recorded {
+                peer,
+                seq,
+                message,
+                answer: answer(peer_control_key, lookup_key, seq)?,
+                route,
+            })
+        }
         // The cursor moved past this sequence since the check above.
         Ok(RingStep::End) => Ok(Taken::Duplicate { peer }),
         Ok(RingStep::Unopened(_))
@@ -805,4 +890,43 @@ impl<R: Records> Records for NoErase<'_, R> {
             })
             .collect()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn module() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+    }
+
+    /// **Known-answer vectors, computed outside this crate from the preimages
+    /// [`answer`] and [`route_tag`] document.** A round trip cannot see a
+    /// change that is uniformly wrong, such as a dropped length prefix or an
+    /// edited label, because the pusher and the receiver would still agree
+    /// with each other while agreeing with no other implementation.
+    #[test]
+    fn known_answer_answer_and_route_tag() {
+        module();
+        let key = ControlKey::from_bytes(&[0x5au8; 32]);
+        let lookup_key = [0x44u8; HELLO_LOOKUP_KEY_LEN];
+        let route: Vec<u8> = (1u8..=40).collect();
+        assert_eq!(
+            hex::encode(answer(&key, &lookup_key, 7).unwrap()),
+            KAT_ANSWER
+        );
+        assert_eq!(
+            hex::encode(route_tag(&key, &lookup_key, 7, &route).unwrap()),
+            KAT_ROUTE_TAG
+        );
+    }
+
+    /// `answer` under a control key of 32 `0x5a` bytes, a lookup key of 32
+    /// `0x44` bytes and sequence 7: [`RECORDED`] followed by the 32-byte code.
+    const KAT_ANSWER: &str =
+        "6473646d7073683101d6962141e2a8e6aa2d15bd1aa40051c9fed1ad61ea932642d74ee6f4c1557780";
+
+    /// `route_tag` under the same key, lookup key and sequence, over a route
+    /// of the 40 bytes `0x01` to `0x28`.
+    const KAT_ROUTE_TAG: &str = "34bb7a1894b51facf8148dbeffebaf959e36a9328085a2ad853bf3e8df5234ff";
 }

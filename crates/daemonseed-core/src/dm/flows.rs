@@ -9359,7 +9359,7 @@ mod tests {
 
     // ── push delivery ───────────────────────────────────────────────────────
 
-    use crate::dm::push::{self as push_plane, Push, Taken};
+    use crate::dm::push::{self as push_plane, Push, PushRoute, Taken};
 
     /// B sends `body` on an established conversation and the slot it wrote is
     /// taken back off the network, as a push that outran the write would find
@@ -9406,14 +9406,17 @@ mod tests {
         let lookup = a_reads(&a, &peer_a);
         let before = a.store().load_conv(&peer_a).unwrap().unwrap().my_collected;
         let (subkey, slot) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"pushed", 51);
-        match push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot).expect("take")
+        match push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot, None)
+            .expect("take")
         {
             Taken::Recorded {
                 peer,
                 seq,
                 message,
                 answer,
+                route,
             } => {
+                assert_eq!(route, None, "no route was pushed");
                 assert_eq!(peer, peer_a);
                 assert_eq!(seq, before);
                 assert_eq!(message.body, b"pushed".to_vec());
@@ -9470,7 +9473,7 @@ mod tests {
         let (second_subkey, second) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"two", 62);
         let before = a.store().load_conv(&peer_a).unwrap().unwrap();
         assert!(matches!(
-            push_plane::take_message(&a.store(), |_| false, &lookup, second_subkey, &second)
+            push_plane::take_message(&a.store(), |_| false, &lookup, second_subkey, &second, None)
                 .unwrap(),
             Taken::Ahead { .. }
         ));
@@ -9479,11 +9482,13 @@ mod tests {
             before.my_collected
         );
         assert!(matches!(
-            push_plane::take_message(&a.store(), |_| false, &lookup, first_subkey, &first).unwrap(),
+            push_plane::take_message(&a.store(), |_| false, &lookup, first_subkey, &first, None)
+                .unwrap(),
             Taken::Recorded { .. }
         ));
         assert!(matches!(
-            push_plane::take_message(&a.store(), |_| false, &lookup, first_subkey, &first).unwrap(),
+            push_plane::take_message(&a.store(), |_| false, &lookup, first_subkey, &first, None)
+                .unwrap(),
             Taken::Duplicate { .. }
         ));
         assert_eq!(
@@ -9509,7 +9514,8 @@ mod tests {
         let last = forged.len() - 1;
         forged[last] ^= 1;
         assert!(matches!(
-            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &forged).unwrap(),
+            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &forged, None)
+                .unwrap(),
             Taken::Dropped
         ));
         assert!(matches!(
@@ -9518,7 +9524,8 @@ mod tests {
                 |_| false,
                 &[0x77; HELLO_LOOKUP_KEY_LEN],
                 subkey,
-                &slot
+                &slot,
+                None
             )
             .unwrap(),
             Taken::Dropped
@@ -9529,9 +9536,80 @@ mod tests {
         );
         // The control: the genuine slot is taken.
         assert!(matches!(
-            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot).unwrap(),
+            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot, None).unwrap(),
             Taken::Recorded { .. }
         ));
+    }
+
+    /// A pushed message's route is handed on only where its tag was made under
+    /// the sender's control key, for that route and that message: a route
+    /// tagged under another key, at another sequence, over another route, or
+    /// with no tag made at all is left out, and its message is recorded all
+    /// the same.
+    #[test]
+    fn a_pushed_route_is_handed_on_only_under_the_senders_tag() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup = a_reads(&a, &peer_a);
+        let b_state = b.store().load_conv(&accepted.peer).unwrap().unwrap();
+        let b_key = b_state.own_control_key.as_ref().expect("B's control key");
+        let stranger = channel::ControlKey::from_bytes(&[0x33; 32]);
+        let route = vec![0x5a; 64];
+        type TagAt<'a> = Box<dyn Fn(u64) -> [u8; push_plane::ROUTE_TAG_LEN] + 'a>;
+        let tags: [(&str, TagAt<'_>); 4] = [
+            (
+                "another key",
+                Box::new(|seq| push_plane::route_tag(&stranger, &lookup, seq, &route).unwrap()),
+            ),
+            (
+                "another sequence",
+                Box::new(|seq| push_plane::route_tag(b_key, &lookup, seq + 1, &route).unwrap()),
+            ),
+            (
+                "another route",
+                Box::new(|seq| push_plane::route_tag(b_key, &lookup, seq, &[0x5b; 64]).unwrap()),
+            ),
+            ("no tag", Box::new(|_| [0; push_plane::ROUTE_TAG_LEN])),
+        ];
+        let mut seed = 91;
+        for (case, tag) in &tags {
+            seed += 1;
+            let (subkey, slot) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"routed", seed);
+            let seq = channel::MessageHeader::decode(&slot).unwrap().0.seq;
+            let pushed = PushRoute {
+                route: route.clone(),
+                tag: tag(seq),
+            };
+            match push_plane::take_message(
+                &a.store(),
+                |_| false,
+                &lookup,
+                subkey,
+                &slot,
+                Some(&pushed),
+            )
+            .unwrap()
+            {
+                Taken::Recorded { route, .. } => assert_eq!(route, None, "{case}"),
+                other => panic!("{case}: the message is recorded, got {other:?}"),
+            }
+        }
+        // The control: the tag B makes for the route at the message's
+        // sequence hands the route on.
+        let (subkey, slot) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"routed", 99);
+        let seq = channel::MessageHeader::decode(&slot).unwrap().0.seq;
+        let pushed = PushRoute {
+            route: route.clone(),
+            tag: push_plane::AnswerKey::new(b_key)
+                .route_tag(&lookup, seq, &route)
+                .unwrap(),
+        };
+        match push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot, Some(&pushed))
+            .unwrap()
+        {
+            Taken::Recorded { route: taken, .. } => assert_eq!(taken, Some(route.clone())),
+            other => panic!("the message is recorded, got {other:?}"),
+        }
     }
 
     /// A's first contact and B's acceptance, B's writes all refused so that
@@ -9725,7 +9803,8 @@ mod tests {
         let before = a.store().load_conv(&peer_a).unwrap().unwrap().my_collected;
         let b_pk = *b.pk();
         assert!(matches!(
-            push_plane::take_message(&a.store(), |pk| pk == &b_pk, &lookup, subkey, &slot).unwrap(),
+            push_plane::take_message(&a.store(), |pk| pk == &b_pk, &lookup, subkey, &slot, None)
+                .unwrap(),
             Taken::Blocked { .. }
         ));
         assert_eq!(
@@ -9734,7 +9813,7 @@ mod tests {
         );
         // The control: unblocked, the same push is recorded.
         assert!(matches!(
-            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot).unwrap(),
+            push_plane::take_message(&a.store(), |_| false, &lookup, subkey, &slot, None).unwrap(),
             Taken::Recorded { .. }
         ));
 
@@ -9847,17 +9926,21 @@ mod tests {
         assert_eq!(too_big.encode(), None);
     }
 
-    /// A message push carrying the sender's route survives its encoding, and
-    /// one encoded without a route still decodes, with none; a route that runs
-    /// out, is empty, is longer than a control record carries, or is followed
-    /// by more bytes is refused.
+    /// A message push carrying the sender's route and its tag survives its
+    /// encoding, and one encoded without a route still decodes, with none; a
+    /// route that runs out, is empty, is longer than a control record carries,
+    /// has no whole tag after it, or is followed by more bytes is refused.
     #[test]
     fn a_message_push_carries_the_senders_route() {
+        let tag = [0x5c; push_plane::ROUTE_TAG_LEN];
         let with_route = Push::Message {
             lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
             subkey: 9,
             slot: vec![1, 2, 3],
-            route: Some(vec![0xab; 742]),
+            route: Some(PushRoute {
+                route: vec![0xab; 742],
+                tag,
+            }),
         };
         let bytes = with_route.encode().expect("fits");
         assert_eq!(Push::decode(&bytes), Some(with_route));
@@ -9885,6 +9968,7 @@ mod tests {
             out.extend_from_slice(&9u16.to_be_bytes());
             crate::dm::push_lp(&mut out, &[1, 2, 3]);
             crate::dm::push_lp(&mut out, route);
+            out.extend_from_slice(&tag);
             out.extend_from_slice(extra);
             out
         };
@@ -9892,6 +9976,8 @@ mod tests {
         assert!(Push::decode(&with_route_bytes(&[7; 16], &[])).is_some());
         let mut truncated = with_route_bytes(&[7; 16], &[]);
         truncated.pop();
+        assert_eq!(Push::decode(&truncated), None, "a tag that runs out");
+        truncated.truncate(truncated.len() - push_plane::ROUTE_TAG_LEN);
         assert_eq!(Push::decode(&truncated), None, "a route that runs out");
         assert_eq!(
             Push::decode(&with_route_bytes(&[], &[])),
@@ -9901,7 +9987,7 @@ mod tests {
         assert_eq!(
             Push::decode(&with_route_bytes(&[7; 16], &[0])),
             None,
-            "bytes after the route"
+            "bytes after the tag"
         );
         let longest = vec![7; channel::REACH_ROUTE_MAX_LEN];
         assert!(
@@ -9919,7 +10005,7 @@ mod tests {
             lookup_key: [3; HELLO_LOOKUP_KEY_LEN],
             subkey: 9,
             slot: vec![1, 2, 3],
-            route: Some(over),
+            route: Some(PushRoute { route: over, tag }),
         };
         assert_eq!(left_out.encode(), Some(old));
     }

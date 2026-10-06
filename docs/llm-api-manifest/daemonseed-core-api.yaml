@@ -1254,12 +1254,13 @@ modules:
       insert_drop_slot(&DropOwnerSeed, slot, Vec<u8>) seed a cache, and
       CachedRecords answers drop-slot reads from it.
       Sub-module dm::push: Push { Message { lookup_key, subkey, slot, route:
-      Option<Vec<u8>> } | Reach { lookup_key, control } | Acceptance {
+      Option<PushRoute> } | Reach { lookup_key, control } | Acceptance {
       lookup_key, hello_slot, hello, control, reply_subkey, reply } } with
       encode() -> Option<Vec<u8>> (None above PUSH_MAX_LEN = 32 KiB; kind 1 a
-      message without a route, kind 4 one with lp(slot) and lp(route), kind 3 a
-      reach notice, kind 2 an acceptance) and decode(&[u8]) -> Option<Push>,
-      which refuses a route that is empty or over REACH_ROUTE_MAX_LEN and a
+      message without a route, kind 4 one with lp(slot), lp(route) and the
+      ROUTE_TAG_LEN (32) byte tag, kind 3 a reach notice, kind 2 an acceptance)
+      and decode(&[u8]) -> Option<Push>, which refuses a route that is empty or
+      over REACH_ROUTE_MAX_LEN or has no whole tag after it, and a
       control that is empty or over SEALED_CONTROL_MAX_LEN; PUSH_TAG (8 bytes every push starts with),
       RECORDED (the prefix of an answer), is_push(&[u8]) -> bool.
       answer(&ControlKey, lookup_key, seq) -> Result<[u8; ANSWER_LEN],
@@ -1267,10 +1268,17 @@ modules:
       side's control key (DM_PUSH_ANSWER_SALT / DM_PUSH_ANSWER);
       answer_matches(expected, got) compares in constant time; AnswerKey::new(
       &ControlKey).answer(lookup_key, seq) for callers outside the crate.
-      take_message(store, is_blocked, lookup_key, subkey, slot) ->
-      Result<Taken, FlowError> takes a pushed slot only as the next sequence of
-      an established conversation, through collect_step: Taken { Recorded {
-      peer, seq, message, answer } | Blocked { peer } | Duplicate { peer } |
+      PushRoute { route: Vec<u8>, tag: [u8; ROUTE_TAG_LEN] }; route_tag(
+      &ControlKey, lookup_key, seq, route) -> Result<[u8; ROUTE_TAG_LEN],
+      FlowError> is a 32-byte HKDF code under the pushing side's control key
+      (DM_PUSH_ANSWER_SALT / DM_PUSH_ROUTE) over lp(lookup_key), BE64(seq) and
+      lp(route); AnswerKey::route_tag(lookup_key, seq, route) for callers
+      outside the crate. take_message(store, is_blocked, lookup_key, subkey,
+      slot, Option<&PushRoute>) -> Result<Taken, FlowError> takes a pushed slot
+      only as the next sequence of an established conversation, through
+      collect_step: Taken { Recorded { peer, seq, message, answer, route:
+      Option<Vec<u8>> (the pushed route where its tag is route_tag at seq under
+      the correspondent's control key) } | Blocked { peer } | Duplicate { peer } |
       Ahead { peer } | Dropped }; a commit that conflicts is taken again from a
       fresh load, TAKE_ATTEMPTS (4) times in all. take_reach(store, is_blocked,
       lookup_key, control) -> Result<ReachTaken, FlowError> opens a reach

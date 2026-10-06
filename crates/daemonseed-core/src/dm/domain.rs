@@ -239,6 +239,13 @@ dm_labels! {
     /// lookup key and the sequence pushed follow it, each length-prefixed, so an
     /// answer names one message of one conversation. FROZEN.
     DM_PUSH_ANSWER = b"daemonseed/dm/push/answer/v1";
+
+    /// HKDF-Expand `info` prefix for the tag a message push carries over the
+    /// sender's route, under the same extraction as [`DM_PUSH_ANSWER`]. The
+    /// pushing side's channel lookup key, length-prefixed, the sequence pushed,
+    /// eight bytes big-endian, and the route, length-prefixed, follow it, so a
+    /// tag names one route for one message of one conversation. FROZEN.
+    DM_PUSH_ROUTE = b"daemonseed/dm/push/route/v1";
 }
 
 #[cfg(test)]
@@ -291,6 +298,7 @@ mod tests {
         assert_eq!(DM_CHANNEL_CK, b"daemonseed/dm/channel/ck/v1");
         assert_eq!(DM_PUSH_ANSWER_SALT, b"daemonseed/dm/push/answer-salt/v1");
         assert_eq!(DM_PUSH_ANSWER, b"daemonseed/dm/push/answer/v1");
+        assert_eq!(DM_PUSH_ROUTE, b"daemonseed/dm/push/route/v1");
     }
 
     /// No label is a prefix of another.
@@ -368,7 +376,7 @@ mod tests {
     /// to peers.
     #[test]
     fn every_label_matches_its_pre_migration_value() {
-        let pinned: [(&[u8], &[u8]); 30] = [
+        let pinned: [(&[u8], &[u8]); 31] = [
             (DM_ADVERT_OWNER, b"daemonseed/dm/advert/owner/v1".as_slice()),
             (DM_ADVERT_SALT, b"daemonseed/dm/advert/salt/v1".as_slice()),
             (DM_ADVERT_SIG, b"daemonseed/dm/advert/sig/v1".as_slice()),
@@ -438,6 +446,7 @@ mod tests {
                 b"daemonseed/dm/push/answer-salt/v1".as_slice(),
             ),
             (DM_PUSH_ANSWER, b"daemonseed/dm/push/answer/v1".as_slice()),
+            (DM_PUSH_ROUTE, b"daemonseed/dm/push/route/v1".as_slice()),
         ];
         assert_eq!(
             pinned.len(),
