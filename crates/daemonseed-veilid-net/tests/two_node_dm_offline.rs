@@ -1118,6 +1118,7 @@ async fn c_forges(
             closed: false,
             generation: conv.state.generation,
             reach: Default::default(),
+            serial: 0,
         },
     )
     .expect("the forged control seals");

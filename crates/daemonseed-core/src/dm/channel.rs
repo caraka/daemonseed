@@ -188,8 +188,8 @@ pub const REACH_ROUTE_MAX_LEN: usize = 4096;
 pub const REACH_HANDLE_MAX_LEN: usize = 256;
 
 /// Bytes a sealed control subkey takes at its largest: an opening, a cursor,
-/// the closed flag, the generation and the longest [`Reach`], under the AEAD
-/// envelope.
+/// the closed flag, the generation, the longest [`Reach`] and the serial,
+/// under the AEAD envelope.
 pub const SEALED_CONTROL_MAX_LEN: usize = ENVELOPE_OVERHEAD
     + 8
     + OPENING_LEN
@@ -199,7 +199,8 @@ pub const SEALED_CONTROL_MAX_LEN: usize = ENVELOPE_OVERHEAD
     + 8
     + REACH_ROUTE_MAX_LEN
     + 8
-    + REACH_HANDLE_MAX_LEN;
+    + REACH_HANDLE_MAX_LEN
+    + 8;
 
 const _: () = assert!(
     SEALED_CONTROL_MAX_LEN <= CHANNEL_SUBKEY_LEN,
@@ -1127,12 +1128,17 @@ pub struct Control {
     /// How the writer can be reached directly. A record without the field
     /// reads as no route and no handle.
     pub reach: Reach,
+    /// The writer's reach serial, which rises whenever its reach changes, so
+    /// a reader can refuse an older reach replayed after a newer one. A
+    /// record without the field reads as 0.
+    pub serial: u64,
 }
 
 impl Control {
     /// Encode the control record: `lp(opening) ‖ BE64(collected_cursor) ‖
-    /// closed ‖ BE64(generation) ‖ lp(route) ‖ lp(handle)`, the opening,
-    /// route and handle fields empty when absent and the flag one byte.
+    /// closed ‖ BE64(generation) ‖ lp(route) ‖ lp(handle) ‖ BE64(serial)`, the
+    /// opening, route and handle fields empty when absent and the flag one
+    /// byte.
     ///
     /// A route longer than [`REACH_ROUTE_MAX_LEN`] or a handle longer than
     /// [`REACH_HANDLE_MAX_LEN`] is written as absent.
@@ -1157,6 +1163,7 @@ impl Control {
         out.extend_from_slice(&self.generation.to_be_bytes());
         push_lp(&mut out, route);
         push_lp(&mut out, handle.as_bytes());
+        out.extend_from_slice(&self.serial.to_be_bytes());
         out
     }
 
@@ -1165,11 +1172,12 @@ impl Control {
     ///
     /// A record that ends at the flag is one written without the generation
     /// and reach fields, and reads as generation 0 with no route and no
-    /// handle.
+    /// handle. A record that ends at the handle reads as serial 0.
     ///
     /// Fails closed with [`ChannelError::Malformed`] on bytes that run out, a
     /// flag byte that is neither zero nor one, a route or handle over its
-    /// bound, a handle that is not UTF-8, or trailing bytes past the handle.
+    /// bound, a handle that is not UTF-8, a serial that runs out, or trailing
+    /// bytes past the serial.
     pub fn decode(bytes: &[u8]) -> Result<Self, ChannelError> {
         let mut reader = Reader::new(bytes);
         let opening_field = reader.take_lp()?;
@@ -1179,8 +1187,8 @@ impl Control {
             1 => true,
             _ => return Err(ChannelError::Malformed),
         };
-        let (generation, reach) = if reader.bytes.is_empty() {
-            (0, Reach::default())
+        let (generation, reach, serial) = if reader.bytes.is_empty() {
+            (0, Reach::default(), 0)
         } else {
             let generation = u64::from_be_bytes(reader.take_array::<8>()?);
             let route = reader.take_lp()?;
@@ -1193,7 +1201,12 @@ impl Control {
                 route: (!route.is_empty()).then(|| route.to_vec()),
                 handle: (!handle.is_empty()).then(|| handle.to_owned()),
             };
-            (generation, reach)
+            let serial = if reader.bytes.is_empty() {
+                0
+            } else {
+                u64::from_be_bytes(reader.take_array::<8>()?)
+            };
+            (generation, reach, serial)
         };
         if !reader.rest().is_empty() {
             return Err(ChannelError::Malformed);
@@ -1209,6 +1222,7 @@ impl Control {
             closed,
             generation,
             reach,
+            serial,
         })
     }
 }
@@ -1890,7 +1904,7 @@ mod tests {
             ..Control::default()
         }
         .encode();
-        let last = bad_handle.len() - 1;
+        let last = bad_handle.len() - 1 - 8;
         bad_handle[last] = 0xff;
         assert_eq!(
             Control::decode(&bad_handle).unwrap_err(),
@@ -1899,16 +1913,25 @@ mod tests {
 
         // A route over its bound.
         let mut long_route = Control::default().encode();
-        long_route.truncate(long_route.len() - 16);
+        long_route.truncate(long_route.len() - 24);
         long_route.extend_from_slice(&((REACH_ROUTE_MAX_LEN + 1) as u64).to_be_bytes());
         long_route.extend(core::iter::repeat_n(7u8, REACH_ROUTE_MAX_LEN + 1));
+        long_route.extend_from_slice(&0u64.to_be_bytes());
         long_route.extend_from_slice(&0u64.to_be_bytes());
         assert_eq!(
             Control::decode(&long_route).unwrap_err(),
             ChannelError::Malformed
         );
 
-        // Trailing bytes past the handle.
+        // A serial that runs out.
+        let mut short_serial = Control::default().encode();
+        short_serial.truncate(short_serial.len() - 3);
+        assert_eq!(
+            Control::decode(&short_serial).unwrap_err(),
+            ChannelError::Malformed
+        );
+
+        // Trailing bytes past the serial.
         let mut trailing = Control {
             opening: None,
             collected_cursor: 3,
@@ -1951,9 +1974,15 @@ mod tests {
                 route: Some(vec![0x5a; REACH_ROUTE_MAX_LEN]),
                 handle: Some("alice#0123456789ab".to_owned()),
             },
+            serial: 0x0fed_cba9_8765_4321,
         };
         let sealed = seal_control(&ss, &control).unwrap();
         assert!(sealed.len() <= SEALED_CONTROL_MAX_LEN);
+        let mut without_serial = control.encode();
+        without_serial.truncate(without_serial.len() - 8);
+        let read = Control::decode(&without_serial).unwrap();
+        assert_eq!(read.serial, 0, "a record ending at the handle is serial 0");
+        assert_eq!(read.reach, control.reach);
         assert_eq!(open_control(&ss, &sealed).unwrap(), control);
     }
 

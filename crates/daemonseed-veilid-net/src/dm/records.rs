@@ -1628,7 +1628,9 @@ impl RunnerRecords for VeilidRecords {
 
     /// Register the watch again on the record the watch map holds for
     /// `lookup_key`. A record the map does not hold, which is every record
-    /// where registration is off, is left alone.
+    /// where registration is off, is left alone. Where the registration
+    /// fails, or Veilid holds no watch after it, the record is dropped from
+    /// the map, so the next read of the channel registers it afresh.
     fn rewatch_channel(
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
@@ -1641,9 +1643,14 @@ impl RunnerRecords for VeilidRecords {
                 let Some(record) = self.watches.record_of(lookup_key) else {
                     return Ok(());
                 };
-                if block(register_watch(&self.transport, &record)).map_err(RecordError::new)? {
+                let registered = block(register_watch(&self.transport, &record));
+                if matches!(registered, Ok(true)) {
                     self.watches.reregistered(lookup_key);
-                    Ok(())
+                    return Ok(());
+                }
+                self.watches.forget(lookup_key);
+                if let Err(e) = registered {
+                    Err(RecordError::new(e))
                 } else {
                     Err(RecordError::new(VeilidNetError::Routing(
                         "watch: Veilid holds no watch on the record".to_owned(),

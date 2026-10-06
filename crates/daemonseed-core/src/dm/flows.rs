@@ -615,6 +615,7 @@ fn finish_first_contact<R: Records>(
         .own_control_key
         .as_ref()
         .ok_or(FlowError::Incomplete("control key of its own"))?;
+    let (own_reach, own_serial) = store.reach_with_serial();
     let control = channel::seal_control_with_key(
         own_control_key,
         &Control {
@@ -622,7 +623,8 @@ fn finish_first_contact<R: Records>(
             collected_cursor: 0,
             closed: false,
             generation: state.generation,
-            reach: store.reach(),
+            reach: own_reach,
+            serial: own_serial,
         },
     )?;
     // The opening and sequence 0 are one step, and neither needs the other on
@@ -958,6 +960,9 @@ pub struct ContactRequest {
     pub generation: u64,
     /// How the correspondent can be reached, as its control subkey says.
     pub reach: Reach,
+    /// The reach serial the same control subkey carries: the serial the
+    /// correspondent issued `reach` at.
+    pub reach_serial: u64,
 }
 
 impl core::fmt::Debug for ContactRequest {
@@ -1127,6 +1132,7 @@ pub fn collect_slot<R: Records>(
             cursor,
             generation: control.generation,
             reach: control.reach,
+            serial: control.serial,
         },
         shared_secret,
         slot,
@@ -1173,6 +1179,7 @@ fn settle<R: Records>(
             slot,
         )?;
         acceptance.peer_reach = heard.reach;
+        acceptance.peer_reach_serial = heard.serial;
         return Ok(Surfaced::Accepted(acceptance));
     }
     // A hello naming the channel this side already reads is the correspondent
@@ -1193,12 +1200,14 @@ fn settle<R: Records>(
 
 /// What a verified hello's channel said in its control subkey, beside the
 /// opening: the cursor it published, the generation the correspondent derived
-/// its channel under, and how it can be reached.
+/// its channel under, how it can be reached, and the reach serial it issued
+/// that at.
 struct Heard {
     opening: ChannelOpening,
     cursor: u64,
     generation: u64,
     reach: Reach,
+    serial: u64,
 }
 
 /// Draw a conversation generation from `fill`.
@@ -1226,6 +1235,7 @@ fn contact_request(
         shared_secret,
         generation: heard.generation,
         reach: heard.reach,
+        reach_serial: heard.serial,
     }
 }
 
@@ -1662,6 +1672,7 @@ fn finish_accept<R: Records>(
         .ok_or(FlowError::Incomplete("channel opening of its own"))?;
     let opening = ChannelOpening::decode(opening_bytes.as_slice())?;
     let advert_serial = opening.advert_serial;
+    let (own_reach, own_serial) = store.reach_with_serial();
     let control = channel::seal_control_with_key(
         own_control_key,
         &Control {
@@ -1674,7 +1685,8 @@ fn finish_accept<R: Records>(
             collected_cursor: state.my_collected,
             closed: false,
             generation: state.generation,
-            reach: store.reach(),
+            reach: own_reach,
+            serial: own_serial,
         },
     )?;
     // The hello back, sealed now for a fresh placement so that its bytes can
@@ -2088,6 +2100,9 @@ pub struct Acceptance {
     pub peer_cursor: u64,
     /// How the correspondent can be reached, as the same control record says.
     pub peer_reach: Reach,
+    /// The reach serial the same control record carries: the serial the
+    /// correspondent issued `peer_reach` at.
+    pub peer_reach_serial: u64,
     /// Any reply already in the correspondent's ring, in sequence order.
     pub messages: Vec<ReceivedMessage>,
     /// The slot the ring read stopped at because its message does not open
@@ -2167,6 +2182,7 @@ pub fn recognise_acceptance<R: Records>(
         lookup_key: *lookup_key,
         peer_cursor,
         peer_reach: Reach::default(),
+        peer_reach_serial: 0,
         messages: read.messages,
         unopened: read.unopened,
     })
@@ -2701,6 +2717,7 @@ pub fn publish_cursor<R: Records>(
         .own_opening
         .as_ref()
         .ok_or(FlowError::Incomplete("channel opening of its own"))?;
+    let (own_reach, own_serial) = store.reach_with_serial();
     let control = channel::seal_control_with_key(
         key,
         &Control {
@@ -2708,7 +2725,8 @@ pub fn publish_cursor<R: Records>(
             collected_cursor: collected,
             closed: false,
             generation: state.generation,
-            reach: store.reach(),
+            reach: own_reach,
+            serial: own_serial,
         },
     )?;
     records.write_channel(
@@ -8695,6 +8713,7 @@ mod tests {
             shared_secret: AdvertSharedSecret::from_bytes(&[0x23u8; ml_kem::SHARED_SECRET_LEN]),
             generation: 0,
             reach: Reach::default(),
+            reach_serial: 0,
         };
         let mut entropy = Seeded::at(909);
         assert!(matches!(
@@ -9075,6 +9094,7 @@ mod tests {
             shared_secret: AdvertSharedSecret::from_bytes(from_c.shared_secret.as_bytes()),
             generation: from_c.generation,
             reach: Reach::default(),
+            reach_serial: 0,
         };
 
         let store_b = b.store();
@@ -10122,7 +10142,7 @@ mod tests {
             handle: None,
         };
         let store_a = a.store();
-        store_a.set_reach(reach_a.clone());
+        store_a.set_reach(reach_a.clone()).unwrap();
         let mut entropy = Seeded::at(4_242);
         let outcome = first_contact(
             &store_a,
@@ -10139,8 +10159,14 @@ mod tests {
             request.reach, reach_a,
             "the acceptor reads the initiator's reach"
         );
+        assert_eq!(
+            request.reach_serial,
+            store_a.reach_serial(),
+            "and the serial it was issued at"
+        );
+        assert_ne!(request.reach_serial, 0);
         let store_b = b.store();
-        store_b.set_reach(reach_b.clone());
+        store_b.set_reach(reach_b.clone()).unwrap();
         let mut entropy = Seeded::at(909);
         accept(
             &store_b,
@@ -10162,6 +10188,12 @@ mod tests {
             acceptance.peer_reach, reach_b,
             "the initiator reads the acceptor's reach"
         );
+        assert_eq!(
+            acceptance.peer_reach_serial,
+            store_b.reach_serial(),
+            "and the serial it was issued at"
+        );
+        assert_ne!(acceptance.peer_reach_serial, 0);
         // A collection batch's cursor write carries the reach too.
         let peer_a = opened_peer(&outcome);
         let moved = Reach {
@@ -10169,7 +10201,7 @@ mod tests {
             handle: None,
         };
         let peer_b = store_b.load().unwrap().convs[0].peer;
-        store_b.set_reach(moved.clone());
+        store_b.set_reach(moved.clone()).unwrap();
         let mut entropy = Seeded::at(5);
         send_message(
             &store_a,

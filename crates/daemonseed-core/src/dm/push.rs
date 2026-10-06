@@ -19,10 +19,13 @@
 //! not erased by a pushed recognition: the next scan finds it and erases it as
 //! already collected.
 //!
-//! A message push may carry the sender's current private route after the slot,
-//! so every delivered push refreshes the receiver's view of how the sender is
-//! reached. The route carries a tag made under the sender's control key for
-//! that message ([`route_tag`]), and is handed on only where the tag matches.
+//! A message push may carry the sender's current private route after the slot.
+//! The route carries a tag made under the sender's control key for that
+//! message ([`route_tag`]), and is handed on only where the tag matches. A
+//! receiver does not take it as the sender's route: a route is taken only from
+//! a control subkey, which carries the serial the route was issued at
+//! ([`crate::dm::store::Store::take_reach`]), so a message pushed before the
+//! sender's route changed cannot put the old route back.
 //! A reach notice carries the sender's sealed control subkey alone,
 //! the same bytes its channel record holds: it is opened under the control key
 //! the conversation holds for the sender, so only the correspondent can make
@@ -403,7 +406,9 @@ pub enum Taken {
         answer: [u8; ANSWER_LEN],
         /// The route the push carried, where its tag is [`route_tag`] at
         /// `seq` under the correspondent's control key. A route with any other
-        /// tag is left out and the message is recorded all the same.
+        /// tag is left out and the message is recorded all the same. It
+        /// carries no reach serial, so it is not one to take as the
+        /// correspondent's route.
         route: Option<Vec<u8>>,
     },
     /// From a correspondent `is_blocked` holds. Nothing was read or changed.

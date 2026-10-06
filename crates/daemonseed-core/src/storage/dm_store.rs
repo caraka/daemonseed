@@ -8,9 +8,11 @@
 //! [`RecordKind::Provisional`], a handshake still in progress;
 //! [`RecordKind::Outbox`], what has been sent and is not yet settled;
 //! [`RecordKind::ReceiveCursor`], how far reading has got; and
-//! [`RecordKind::ContactCache`], what is known about the correspondent. One
-//! further kind belongs to the profile rather than to any correspondence:
-//! [`RecordKind::BlockList`], the identities the user refuses.
+//! [`RecordKind::ContactCache`], what is known about the correspondent. Three
+//! further kinds belong to the profile rather than to any correspondence:
+//! [`RecordKind::BlockList`], the identities the user refuses;
+//! [`RecordKind::AdvertKeys`], the advert KEM state; and
+//! [`RecordKind::ReachSerial`], the last reach serial this node issued.
 //!
 //! **Message content is here only while a message is in flight**, inside an
 //! outbox entry awaiting collection. Once that entry settles or gives up the
@@ -151,7 +153,7 @@ use crate::dm::block_list::BLOCK_LIST_CAPACITY;
 use crate::dm::contact_cache::CONTACT_RECORD_LEN;
 use crate::dm::store::{
     ADVERT_KEYS_RECORD_LEN, CONV_OUTBOX_RECORD_LEN, CONV_RECORD_LEN, HANDLE_RECORD_LEN,
-    ROUTE_RECORD_LEN,
+    REACH_SERIAL_RECORD_LEN, ROUTE_RECORD_LEN,
 };
 use crate::dm::{LEN_PREFIX, domain, push_lp, unpad};
 use crate::storage::atomic_file::{
@@ -359,6 +361,15 @@ pub enum RecordKind {
     /// made to it after a relaunch. Advisory: a push on it that goes
     /// unanswered removes it. [`crate::dm::store`] owns the encoding.
     CorrespondentRoute,
+    /// The last reach serial this node issued, so a serial issued after a
+    /// relaunch is above every one its correspondents applied, whatever the
+    /// clock says. [`crate::dm::store`] owns the encoding.
+    ///
+    /// Profile-scoped, for [`RecordKind::BlockList`]'s reason: one reach
+    /// serves every correspondence. Created empty by every [`DmStore::open`],
+    /// and an empty payload is what [`crate::dm::store::Store::open`] reads as
+    /// "no serial issued yet".
+    ReachSerial,
 }
 
 /// Whether a [`RecordKind`] belongs to one correspondence or to the profile.
@@ -383,7 +394,7 @@ impl RecordKind {
     /// records filters on [`RecordKind::scope`] rather than walking this
     /// directly — [`DmStore::present_unlocked`] is that filter and is the only
     /// enumeration a caller needs.
-    pub const ALL: [RecordKind; 11] = [
+    pub const ALL: [RecordKind; 12] = [
         RecordKind::Resume,
         RecordKind::Provisional,
         RecordKind::Outbox,
@@ -395,6 +406,7 @@ impl RecordKind {
         RecordKind::ConversationOutbox,
         RecordKind::CorrespondentHandle,
         RecordKind::CorrespondentRoute,
+        RecordKind::ReachSerial,
     ];
 
     /// The stable string form, for local persistence.
@@ -419,6 +431,7 @@ impl RecordKind {
             RecordKind::ConversationOutbox => "conversation-outbox",
             RecordKind::CorrespondentHandle => "correspondent-handle",
             RecordKind::CorrespondentRoute => "correspondent-route",
+            RecordKind::ReachSerial => "reach-serial",
         }
     }
 
@@ -454,6 +467,7 @@ impl RecordKind {
             RecordKind::ConversationOutbox => "conversation-outbox.bin",
             RecordKind::CorrespondentHandle => "correspondent-handle.bin",
             RecordKind::CorrespondentRoute => "correspondent-route.bin",
+            RecordKind::ReachSerial => "reach-serial.bin",
         }
     }
 
@@ -479,6 +493,7 @@ impl RecordKind {
             RecordKind::ConversationOutbox => CONV_OUTBOX_RECORD_LEN,
             RecordKind::CorrespondentHandle => HANDLE_RECORD_LEN,
             RecordKind::CorrespondentRoute => ROUTE_RECORD_LEN,
+            RecordKind::ReachSerial => REACH_SERIAL_RECORD_LEN,
         }
     }
 
@@ -519,6 +534,7 @@ impl RecordKind {
             RecordKind::ConversationOutbox => 9,
             RecordKind::CorrespondentHandle => 10,
             RecordKind::CorrespondentRoute => 11,
+            RecordKind::ReachSerial => 12,
         }
     }
 
@@ -553,7 +569,9 @@ impl RecordKind {
             | RecordKind::ConversationOutbox
             | RecordKind::CorrespondentHandle
             | RecordKind::CorrespondentRoute => RecordScope::Correspondence,
-            RecordKind::BlockList | RecordKind::AdvertKeys => RecordScope::Profile,
+            RecordKind::BlockList | RecordKind::AdvertKeys | RecordKind::ReachSerial => {
+                RecordScope::Profile
+            }
         }
     }
 }
@@ -1771,6 +1789,26 @@ impl Locked<'_> {
     pub fn present(&self) -> Result<Vec<RecordKind>, DmStoreError> {
         self.store.present_unlocked(&self.label)
     }
+
+    /// Make every record of this correspondence that reads now durable, by
+    /// fsyncing its directory.
+    ///
+    /// A [`Self::replace`] that failed with
+    /// [`AtomicReplaceError::LandedNotDurable`] left its new bytes readable but
+    /// able to revert on power loss; after this returns `Ok`, they cannot. A
+    /// caller that is about to tell someone else a record it read is in place
+    /// calls this first.
+    pub fn sync(&self) -> Result<(), DmStoreError> {
+        self.sync_with(&RealDurability)
+    }
+
+    /// [`Self::sync`] through `durability`, the barrier a test can observe
+    /// or fail.
+    fn sync_with<D: Durability>(&self, durability: &D) -> Result<(), DmStoreError> {
+        durability
+            .sync_dir(&self.dir)
+            .map_err(|e| DmStoreError::io(&self.dir, e))
+    }
 }
 
 /// The profile's own records, with the profile lock held.
@@ -2605,7 +2643,8 @@ mod tests {
                 | RecordKind::Conversation
                 | RecordKind::ConversationOutbox
                 | RecordKind::CorrespondentHandle
-                | RecordKind::CorrespondentRoute => {}
+                | RecordKind::CorrespondentRoute
+                | RecordKind::ReachSerial => {}
             }
         }
         let mut names: Vec<_> = RecordKind::ALL.iter().map(|k| k.file_name()).collect();
@@ -2680,12 +2719,14 @@ mod tests {
         );
         assert_eq!(HANDLE_RECORD_LEN, 287);
         assert_eq!(RecordKind::CorrespondentRoute.capacity(), ROUTE_RECORD_LEN);
-        assert_eq!(ROUTE_RECORD_LEN, 4_127);
+        assert_eq!(ROUTE_RECORD_LEN, 4_135);
+        assert_eq!(RecordKind::ReachSerial.capacity(), REACH_SERIAL_RECORD_LEN);
+        assert_eq!(REACH_SERIAL_RECORD_LEN, 37);
 
         // Every kind, with no exemption: the cursor's exemption is what #389
         // removed, so a loop that filtered any kind out would be the shape of
         // the defect rather than a test of the fix.
-        assert_eq!(RecordKind::ALL.len(), 11, "the loop must cover every kind");
+        assert_eq!(RecordKind::ALL.len(), 12, "the loop must cover every kind");
         for kind in RecordKind::ALL {
             assert_eq!(
                 kind.on_disk_len(),
@@ -2715,6 +2756,7 @@ mod tests {
         assert_eq!(RecordKind::ConversationOutbox.aad_tag(), 9);
         assert_eq!(RecordKind::CorrespondentHandle.aad_tag(), 10);
         assert_eq!(RecordKind::CorrespondentRoute.aad_tag(), 11);
+        assert_eq!(RecordKind::ReachSerial.aad_tag(), 12);
         let mut tags: Vec<_> = RecordKind::ALL.iter().map(|k| k.aad_tag()).collect();
         tags.sort_unstable();
         tags.dedup();
@@ -3605,8 +3647,8 @@ mod tests {
         // of this test that notices the enum changing shape.
         assert_eq!(
             seen.len(),
-            11,
-            "eleven kinds, eleven distinct stable strings"
+            12,
+            "twelve kinds, twelve distinct stable strings"
         );
         assert_eq!(RecordKind::from_stable_str("resume.bin"), None);
         assert_eq!(RecordKind::from_stable_str("nope"), None);
@@ -3704,7 +3746,7 @@ mod tests {
     /// is reachable, and this test says plainly that it is only that half.
     #[test]
     fn every_kind_survives_the_hop_from_error_to_trust_event() {
-        assert_eq!(RecordKind::ALL.len(), 11, "one case per kind");
+        assert_eq!(RecordKind::ALL.len(), 12, "one case per kind");
         for kind in RecordKind::ALL {
             for scrubbed in [false, true] {
                 let err = DmStoreError::ErasureBlocked {
@@ -4195,6 +4237,61 @@ mod tests {
                 .is_none(),
             "the record should be gone"
         );
+    }
+
+    /// `Locked::sync` drives the real directory barrier, exactly one, and
+    /// against the correspondence's own directory; a barrier that fails is
+    /// returned. An fsync leaves no filesystem trace, so the barrier is
+    /// observed through the `Durability` seam it is routed through.
+    #[test]
+    fn sync_drives_one_real_barrier_on_the_correspondence_directory() {
+        use crate::storage::atomic_file::{dir_syncs, file_syncs};
+        use std::sync::Mutex;
+
+        struct Recorder {
+            dirs: Mutex<Vec<PathBuf>>,
+            fail: bool,
+        }
+        impl Durability for Recorder {
+            fn sync_file(&self, _: &std::fs::File) -> std::io::Result<()> {
+                panic!("sync makes no file barrier");
+            }
+            fn sync_dir(&self, dir: &Path) -> std::io::Result<()> {
+                self.dirs.lock().unwrap().push(dir.to_path_buf());
+                if self.fail {
+                    return Err(std::io::Error::other("the barrier failed"));
+                }
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let l = label(65);
+        let own_dir = tmp.path().join("dm").join(l.dir_name());
+        s.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Provisional, b"ss0"))
+            .unwrap();
+
+        let files_before = file_syncs();
+        let dirs_before = dir_syncs();
+        s.critical_section::<_, DmStoreError>(&l, |g| g.sync())
+            .unwrap();
+        #[cfg(unix)]
+        assert_eq!(dir_syncs() - dirs_before, 1, "one real directory barrier");
+        // A directory cannot be opened as a file here, so the barrier is none.
+        #[cfg(not(unix))]
+        assert_eq!(dir_syncs(), dirs_before, "no directory barrier");
+        assert_eq!(file_syncs(), files_before, "no file barrier");
+
+        for fail in [false, true] {
+            let recorder = Recorder {
+                dirs: Mutex::new(Vec::new()),
+                fail,
+            };
+            let synced = s.critical_section::<_, DmStoreError>(&l, |g| g.sync_with(&recorder));
+            assert_eq!(*recorder.dirs.lock().unwrap(), vec![own_dir.clone()]);
+            assert_eq!(synced.is_err(), fail, "a failed barrier is returned");
+        }
     }
 
     /// The fsync between the scrub and the unlink is the difference between an
@@ -4878,7 +4975,7 @@ mod tests {
         // about the bound vacuous.
         assert_eq!(
             RecordKind::ALL.len(),
-            11,
+            12,
             "the sweep below must not be empty"
         );
         assert!(

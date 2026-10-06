@@ -237,12 +237,13 @@ modules:
       file per correspondence-scoped RecordKind (Resume, Provisional, Outbox,
       ReceiveCursor, ContactCache, Conversation, ConversationOutbox,
       CorrespondentHandle, CorrespondentRoute) inside it,
-      and one fixed-size file per profile-scoped kind (BlockList, AdvertKeys) at
-      the store
+      and one fixed-size file per profile-scoped kind (BlockList, AdvertKeys,
+      ReachSerial) at the store
       root. DmStore::open derives the seal key from the profile at-rest key
       (HKDF-SHA384 under DM_STORE_SALT/DM_STORE_SEAL) and sweeps orphaned temp
       siblings. critical_section holds an flock across the whole closure and
-      yields a Locked guard carrying read/replace/delete/present, so a
+      yields a Locked guard carrying read/replace/delete/present/sync (sync
+      fsyncs the correspondence's directory), so a
       read-modify-write cannot be written without the lock; entering one
       establishes the correspondence on disk. read_unlocked and present_unlocked
       answer without the lock and create nothing. correspondences() ->
@@ -1015,10 +1016,11 @@ modules:
       returning ChannelError::Signature, ChannelError::Recipient,
       ChannelError::LookupKey and ChannelError::AdvertSerial { expected, found } as
       distinct failures. Control { opening: Option<ChannelOpening>, collected_cursor,
-      closed, generation: u64, reach: Reach } (Default) encodes as lp(opening) ||
-      BE64(collected_cursor) || closed(1) || BE64(generation) || lp(route) ||
-      lp(handle); a record ending at the flag decodes as generation 0 with
-      Reach::default(). Reach { route: Option<Vec<u8>> (at most
+      closed, generation: u64, reach: Reach, serial: u64 } (Default) encodes as
+      lp(opening) || BE64(collected_cursor) || closed(1) || BE64(generation) ||
+      lp(route) || lp(handle) || BE64(serial); a record ending at the flag decodes
+      as generation 0 with Reach::default(), and one ending at the handle as
+      serial 0. Reach { route: Option<Vec<u8>> (at most
       REACH_ROUTE_MAX_LEN = 4096), handle: Option<String> (at most
       REACH_HANDLE_MAX_LEN = 256) }; an over-long field encodes as absent;
       Reach::verified_handle(writer_identity_pk) -> Option<String> returns the
@@ -1084,8 +1086,20 @@ modules:
       Sub-module dm::store is the layer's on-disk state, over
       storage::dm_store. Store::open(root, at_rest_key) -> Result<Store, StoreError>
       opens it and records() borrows the record store beneath.
-      set_reach(Reach) and reach() -> Reach hold, in memory only, the route and
-      handle every control record a flow writes carries.
+      set_reach(Reach) -> Result<SetReach, StoreError> sets the route and handle
+      every control record a flow writes carries; reach() -> Reach,
+      reach_serial() -> u64 and reach_with_serial() -> (Reach, u64) (one read)
+      give them and their serial, 0 where none was ever issued. A set_reach that
+      changes the reach issues the next serial, max(last issued + 1, current
+      Unix time in ms, last written + 1), writes it to RecordKind::ReachSerial
+      (REACH_SERIAL_RECORD_LEN bytes, one record per profile) and holds the new
+      pair only once written; on an error the pair held before stays and the
+      next set_reach writes again. SetReach is Unchanged, Issued or
+      IssuedOverUndecodable (a record that did not decode, or did not read as
+      NotAuthentic, WrongFileLen or ErasureInterrupted, was overwritten; with
+      no serial in memory and the clock behind, the serial issued over it can
+      be lower than one issued before). Other read errors are returned.
+      Store::open reads the last serial back, an unreadable record as none.
       record_handle(&label, &str) -> Result<bool, StoreError> keeps the
       correspondent's last roster handle (at most HANDLE_MAX_LEN bytes) as
       RecordKind::CorrespondentHandle, refused without a conversation record;
@@ -1094,13 +1108,35 @@ modules:
       and counts every outbox left with no
       conversation record; a client calls it once at startup, before anything else
       uses the store, and an ordinary load leaves such an outbox in place.
-      record_route(&label, &[u8]) -> Result<bool, StoreError> keeps
-      the correspondent's last private route (non-empty, at most
-      REACH_ROUTE_MAX_LEN bytes; any other is not kept) as
-      RecordKind::CorrespondentRoute (ROUTE_RECORD_LEN bytes), refused without a
-      conversation record; forget_route(&label, &[u8]) -> Result<bool,
-      StoreError> removes it only where it is that route; route(&label) reads it
-      and LoadedConv::route carries it; delete_conv removes it.
+      RecordKind::CorrespondentRoute (ROUTE_RECORD_LEN bytes) holds the
+      correspondent's last private route and the highest reach serial applied for
+      it. take_reach(&label, serial: u64, &Reach, hold: FnOnce(ReachTake)) ->
+      Result<ReachApplied, StoreError> is the only door that writes either, in
+      one critical section of the correspondence: it compares the serial,
+      writes route and serial in one record write, calls hold with the outcome,
+      then keeps the reach's handle where the reach is applied, the handle
+      names the correspondent's identity and differs from the one recorded.
+      ReachTake is Newer where serial is above the one held (the serial moves,
+      and the route where it is non-empty and at most REACH_ROUTE_MAX_LEN
+      bytes), Same at the serial held (the route is kept where none is), Older
+      below it (nothing changes); ReachTake::applied() is Newer or Same.
+      ReachApplied { take: ReachTake, handle_changed: bool, handle_error:
+      Option<StoreError> }; faults() -> u64 counts handle_error. A route record
+      that will not read, including one that does not authenticate or is not
+      its size, is returned as an error before anything is written and without
+      calling hold; one that authenticates and is its size but does not decode
+      reads as no route at serial 0. A handle record that will not read or
+      write leaves the take standing and is reported as handle_error.
+      Refused without a conversation record, without calling hold. with_route(&label,
+      FnOnce(Option<&[u8]>, u64) -> R) -> Result<R, StoreError> hands the route
+      kept and its serial to a closure inside the same section.
+      forget_route(&label, &[u8], forget: FnOnce()) -> Result<bool, StoreError>
+      removes the route only where it is that route, keeping the serial, and
+      calls forget inside the section either way; route(&label) reads it and
+      LoadedConv::route carries it; reach_serial_of(&label) -> Result<u64,
+      StoreError> reads the serial (0 where none); sync_correspondence(&label)
+      -> Result<(), StoreError> fsyncs the correspondence's directory
+      (Locked::sync); delete_conv removes the record.
       persist_advert_keys(&AdvertSnapshot) and load_advert_keys() ->
       Result<Option<AdvertSnapshot>, StoreError> carry the advert KEM secrets and
       serial as RecordKind::AdvertKeys, one record per profile; an empty payload is
@@ -1246,7 +1282,9 @@ modules:
       Store::reach(). peer_control(store, records, peer) ->
       Result<Option<Control>, FlowError> reads the correspondent's control
       subkey (peer_cursor maps it to the cursor). ContactRequest carries
-      generation: u64 and reach: Reach; Acceptance carries peer_reach: Reach.
+      generation: u64, reach: Reach and reach_serial: u64; Acceptance carries
+      peer_reach: Reach and peer_reach_serial: u64, the serial the same control
+      record carries.
       Records::offer_acceptance(&mut self, &AcceptanceWrites) (default no-op) is
       offered a fresh acceptance's writes { peer, lookup_key, control,
       reply_subkey, reply, hello_slot, hello } before the first is written.
@@ -1278,7 +1316,8 @@ modules:
       only as the next sequence of an established conversation, through
       collect_step: Taken { Recorded { peer, seq, message, answer, route:
       Option<Vec<u8>> (the pushed route where its tag is route_tag at seq under
-      the correspondent's control key) } | Blocked { peer } | Duplicate { peer } |
+      the correspondent's control key; it carries no reach serial and is not
+      taken as the correspondent's route) } | Blocked { peer } | Duplicate { peer } |
       Ahead { peer } | Dropped }; a commit that conflicts is taken again from a
       fresh load, TAKE_ATTEMPTS (4) times in all. take_reach(store, is_blocked,
       lookup_key, control) -> Result<ReachTaken, FlowError> opens a reach

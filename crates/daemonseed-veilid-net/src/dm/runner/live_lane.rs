@@ -26,13 +26,19 @@
 //!   answered here, while it is inside [`PUSH_ANSWER_WINDOW`], through
 //!   [`daemonseed_core::dm::push`] with the block list read from the store. An
 //!   acceptance is recognised from the pushed bytes alone, over
-//!   [`core_push::NoNetwork`]. A route a message push carries replaces the
-//!   one held for its correspondent once the message is recorded. A reach
-//!   notice is opened under the conversation's control key and, where its
-//!   reach is newer than the one applied, answered, and its reach and cursor
-//!   handed to the runner as a watched control's are; any other is not
-//!   answered. A route death is handed to the
-//!   runner.
+//!   [`core_push::NoNetwork`], and its route taken only where the serial its
+//!   control carries is at or above the one applied: above it, the route
+//!   replaces the one kept; at it, the route is kept again where none is. A
+//!   route a message push carries is not taken: it carries no reach serial. A
+//!   reach notice is opened under the conversation's control key and, where
+//!   its reach is at or above the one applied, taken the same way, the notice
+//!   answered, and its handle and cursor handed to the runner as a watched
+//!   control's are; one at the serial already applied is answered only once
+//!   the correspondence's records are durable
+//!   ([`Store::sync_correspondence`]), and any other is not answered. Every
+//!   take goes through [`Store::take_reach`], whose `hold` callback, run
+//!   inside the correspondence's critical section, holds the route in
+//!   memory. A route death is handed to the runner.
 //! - **Watched changes.** A change Veilid reports on the correspondent's
 //!   channel is applied from the bytes the report carries, with no read of the
 //!   record store: a control subkey is opened under the conversation's
@@ -66,7 +72,7 @@ use daemonseed_core::dm::channel::Reach;
 use daemonseed_core::dm::push::{self as core_push, Push, Taken};
 use tokio::sync::oneshot;
 
-use super::push_hooks::PushShare;
+use super::push_hooks::{PushShare, Took};
 use crate::dm::push::{PushInbound, PushInbox, PUSH_ANSWER_WINDOW};
 
 /// How many times a send is committed where the conversation record changed
@@ -82,11 +88,14 @@ pub(super) enum LaneNote {
         peer: CorrespondenceLabel,
         seq: u64,
     },
-    /// An acceptance taken from a push, persisted and reported, whose
-    /// correspondent's reach and cursor the runner takes in.
+    /// An acceptance taken from a push, persisted and reported. `reach` is the
+    /// correspondent's reach, without its route, and the serial it was issued
+    /// at, where that serial was at or above the one applied when the lane
+    /// took it; the runner takes its handle in where the serial is still the
+    /// one applied.
     Accepted {
         peer: CorrespondenceLabel,
-        reach: Reach,
+        reach: Option<(Reach, u64)>,
         unopened: Option<flows::Unopened>,
     },
     /// Private routes of this node that died, by id.
@@ -113,30 +122,45 @@ pub(super) enum LaneNote {
     },
 }
 
+/// A correspondent's reach and the serial it was issued at.
+pub(super) type SerialReach = (Reach, u64);
+
+/// What the lane holds for one correspondent whose control it opened and the
+/// runner has not yet taken in: the reach of the highest serial taken, if
+/// any, and the highest cursor.
+pub(super) type HeldControl = (Option<SerialReach>, u64);
+
 /// The reach and cursor of each correspondent whose control the lane opened
-/// and the runner has not yet taken in: the newest reach, and the highest
-/// cursor. One [`LaneNote::PeerControls`] wakes the runner for all of them,
-/// however many controls arrive before it takes them.
+/// and the runner has not yet taken in: the reach of the highest serial, and
+/// the highest cursor. One [`LaneNote::PeerControls`] wakes the runner for
+/// all of them, however many controls arrive before it takes them.
 #[derive(Clone, Default)]
-pub(super) struct PeerControls(Arc<std::sync::Mutex<HashMap<CorrespondenceLabel, (Reach, u64)>>>);
+pub(super) struct PeerControls(Arc<std::sync::Mutex<HashMap<CorrespondenceLabel, HeldControl>>>);
 
 impl PeerControls {
-    /// Hold `reach` for `peer` in place of the one held, and the higher of
-    /// `cursor` and the cursor held, and wake the runner on `notes` where
-    /// nothing was held for anyone.
+    /// Hold the higher of `cursor` and the cursor held for `peer`, and
+    /// `reach`, where it is given and its serial is at or above that of the
+    /// reach held. A control whose reach was older than the one applied gives
+    /// none, and leaves the reach held in place. Wake the runner on `notes`
+    /// where nothing was held for anyone.
     pub(super) fn note(
         &self,
         notes: &mpsc::UnboundedSender<LaneNote>,
         peer: CorrespondenceLabel,
-        reach: Reach,
+        reach: Option<SerialReach>,
         cursor: u64,
     ) {
         let wake = {
             let mut held = locked(&self.0);
             let wake = held.is_empty();
-            let cursor = held
-                .get(&peer)
-                .map_or(cursor, |(_, held)| cursor.max(*held));
+            let (reach, cursor) = match (held.remove(&peer), reach) {
+                (Some((Some(kept), held)), Some(given)) if given.1 < kept.1 => {
+                    (Some(kept), cursor.max(held))
+                }
+                (Some((_, held)), Some(given)) => (Some(given), cursor.max(held)),
+                (Some((kept, held)), None) => (kept, cursor.max(held)),
+                (None, reach) => (reach, cursor),
+            };
             held.insert(peer, (reach, cursor));
             wake
         };
@@ -146,7 +170,7 @@ impl PeerControls {
     }
 
     /// Take every reach and cursor held.
-    pub(super) fn take(&self) -> HashMap<CorrespondenceLabel, (Reach, u64)> {
+    pub(super) fn take(&self) -> HashMap<CorrespondenceLabel, HeldControl> {
         std::mem::take(&mut *locked(&self.0))
     }
 }
@@ -332,13 +356,54 @@ impl LaneShare {
             .collect();
     }
 
-    /// Hold `route` as `peer`'s, and keep it beside the conversation.
-    fn hold_route(&self, peer: &CorrespondenceLabel, route: &[u8]) {
-        self.push.set_peer_route(peer, Some(route.to_vec()));
-        match self.store.record_route(peer, route) {
-            Ok(_) | Err(StoreError::MissingConversation) => {}
-            Err(_) => self.count(|health| health.store_failures += 1),
+    /// Take the reach `peer`'s correspondent issued at `serial`, carrying
+    /// `route`, through [`Store::take_reach`], which compares the serial,
+    /// writes the route and serial, and holds `route` at `serial` in memory
+    /// where it took the reach ([`Took::Newer`] or [`Took::Same`]), all in one
+    /// critical section of the correspondence. A reach older than the one
+    /// applied changes nothing, in memory or on disk. The handle is left for
+    /// the runner. A store that will not answer counts one store failure and
+    /// answers [`Took::Failed`]. The reach carries no handle, so a take that
+    /// stood reports no fault
+    /// ([`ReachApplied::faults`](daemonseed_core::dm::store::ReachApplied::faults)).
+    fn take_peer_reach(
+        &self,
+        peer: &CorrespondenceLabel,
+        serial: u64,
+        route: Option<&[u8]>,
+    ) -> Took {
+        let reach = Reach {
+            route: route.map(<[u8]>::to_vec),
+            handle: None,
+        };
+        let mut released = None;
+        let taken = self.store.take_reach(peer, serial, &reach, |take| {
+            if take.applied() {
+                released = self.push.hold_route(peer, reach.route.clone(), serial);
+            }
+        });
+        self.push.release(released);
+        match taken {
+            Ok(taken) => Took::from(taken.take),
+            Err(StoreError::MissingConversation) => Took::Older,
+            Err(_) => {
+                self.count(|health| health.store_failures += 1);
+                Took::Failed
+            }
         }
+    }
+
+    /// Make the records of `peer`'s correspondence that read now durable
+    /// ([`Store::sync_correspondence`]) before a reach found already applied
+    /// is answered: the record found may be one whose write landed and was not
+    /// yet durable. [`Took::Same`] where it is done; [`Took::Failed`], with
+    /// one store failure counted, where it is not.
+    fn durable_same(&self, peer: &CorrespondenceLabel) -> Took {
+        if self.store.sync_correspondence(peer).is_err() {
+            self.count(|health| health.store_failures += 1);
+            return Took::Failed;
+        }
+        Took::Same
     }
 
     /// The conversation that reads the channel at `lookup_key`, and its stored
@@ -776,12 +841,22 @@ impl Lane {
                     tag(&peer),
                     control.collected_cursor
                 );
-                self.share.peer_controls.note(
-                    &self.notes,
-                    peer,
-                    control.reach,
-                    control.collected_cursor,
-                );
+                // The cursor is taken whatever the serial; the reach only
+                // where it is not older than the one applied.
+                let reach = self
+                    .share
+                    .take_peer_reach(&peer, control.serial, control.reach.route.as_deref())
+                    .applied()
+                    .then_some((
+                        Reach {
+                            route: None,
+                            handle: control.reach.handle,
+                        },
+                        control.serial,
+                    ));
+                self.share
+                    .peer_controls
+                    .note(&self.notes, peer, reach, control.collected_cursor);
                 true
             }
             Err(_) => {
@@ -891,16 +966,16 @@ impl Lane {
             route.as_ref(),
         );
         match taken {
+            // The route a message push carries has no reach serial, so it is
+            // not taken: a message pushed before the correspondent's route
+            // changed would otherwise put the old route back.
             Ok(Taken::Recorded {
                 peer,
                 seq,
                 message,
                 answer,
-                route,
+                route: _,
             }) => {
-                if let Some(route) = route {
-                    self.share.hold_route(&peer, &route);
-                }
                 self.share.push.answer(id, answer);
                 crate::vtrace!("dm push: {} sequence {seq} recorded", tag(&peer));
                 self.share.emit_bodies(peer, seq, vec![message]).await;
@@ -932,9 +1007,13 @@ impl Lane {
     }
 
     /// Take a reach notice: the correspondent's control subkey, opened under
-    /// the conversation's control key. One that opens and carries a reach
-    /// newer than the one applied is answered, its route held, and its reach
-    /// and cursor handed to the runner; any other is dropped unanswered.
+    /// the conversation's control key. One that opens and carries a reach at
+    /// or above the serial applied is taken, its route held, the notice
+    /// answered, and its handle and cursor handed to the runner; one at the
+    /// serial applied is answered only once the correspondence's records are
+    /// durable. One below it is dropped unanswered and counted. One the store
+    /// failed to take, or whose records could not be made durable, is dropped
+    /// unanswered, counted once as a store failure.
     fn take_reach(&self, id: u64, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN], control: &[u8]) {
         let Some(blocked) = read_block_list(&self.share.store) else {
             crate::vtrace!("dm push: the block list will not read, a reach notice is dropped");
@@ -953,10 +1032,33 @@ impl Lane {
                 control,
                 answer,
             }) => {
-                // Held before the answer, so a send made once the notice is
-                // answered is pushed to the new route.
-                if let Some(route) = &control.reach.route {
-                    self.share.hold_route(&peer, route);
+                // Taken, and its route held, before the answer, so a send made
+                // once the notice is answered is pushed to the new route.
+                let took = match self.share.take_peer_reach(
+                    &peer,
+                    control.serial,
+                    control.reach.route.as_deref(),
+                ) {
+                    Took::Same => self.share.durable_same(&peer),
+                    took => took,
+                };
+                match took {
+                    Took::Newer | Took::Same => {}
+                    Took::Older => {
+                        crate::vtrace!(
+                            "dm push: reach notice of {} is older than the reach applied, dropped",
+                            tag(&peer)
+                        );
+                        self.share.count(|health| health.pushes_dropped += 1);
+                        return;
+                    }
+                    Took::Failed => {
+                        crate::vtrace!(
+                            "dm push: reach notice of {} not taken, the store failed",
+                            tag(&peer)
+                        );
+                        return;
+                    }
                 }
                 self.share.push.answer(id, answer);
                 crate::vtrace!(
@@ -964,10 +1066,14 @@ impl Lane {
                     tag(&peer),
                     control.collected_cursor
                 );
+                let reach = Reach {
+                    route: None,
+                    handle: control.reach.handle,
+                };
                 self.share.peer_controls.note(
                     &self.notes,
                     peer,
-                    control.reach,
+                    Some((reach, control.serial)),
                     control.collected_cursor,
                 );
             }
@@ -1030,12 +1136,18 @@ impl Lane {
             }
         };
         let peer = acceptance.peer;
-        // The route is held before the answer and the event, so a send the
-        // front end makes on `Accepted` is pushed. The runner notes the reach
-        // again when it serves the note below, which changes nothing here.
-        self.share
-            .push
-            .set_peer_route(&peer, acceptance.peer_reach.route.clone());
+        // The route is taken against the serial the correspondent's control
+        // carries, and held and kept before the answer and the event, so a
+        // send the front end makes on `Accepted` is pushed, and a relaunch
+        // straight after it still has the route. A newer reach already
+        // applied keeps its route and its handle. The runner takes the handle
+        // of a reach taken here when it serves the note below, where its
+        // serial is still the one applied.
+        let took = self.share.take_peer_reach(
+            &peer,
+            acceptance.peer_reach_serial,
+            acceptance.peer_reach.route.as_deref(),
+        );
         self.share.push.answer(id, answer);
         crate::vtrace!("dm push: {} acceptance recognised", tag(&peer));
         self.share.emit(RunnerEvent::Accepted { peer }).await;
@@ -1051,9 +1163,16 @@ impl Lane {
             Ok(None) | Err(_) => self.share.count(|health| health.store_failures += 1),
         }
         self.emit_roster().await;
+        // Handed on without its route, which the take above already holds.
         let _ = self.notes.send(LaneNote::Accepted {
             peer,
-            reach: acceptance.peer_reach,
+            reach: took.applied().then_some((
+                Reach {
+                    route: None,
+                    handle: acceptance.peer_reach.handle,
+                },
+                acceptance.peer_reach_serial,
+            )),
             unopened: acceptance.unopened,
         });
     }

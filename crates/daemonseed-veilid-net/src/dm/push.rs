@@ -26,9 +26,10 @@
 //! wait for the write. An answer the correspondent can make only with the conversation's control key
 //! ([`daemonseed_core::dm::push::answer`]) reports the message delivered; any
 //! other outcome forgets the correspondent's route and changes nothing else.
-//! A message push carries this node's own current route, so the correspondent
-//! holds it; a reach notice carries this node's sealed control subkey alone,
-//! and its answer is checked the same way.
+//! A message push carries this node's own current route with a tag over it;
+//! the correspondent checks the tag and does not take the route, which reaches
+//! it through this node's control subkey. A reach notice carries this node's
+//! sealed control subkey alone, and its answer is checked the same way.
 //!
 //! Serves FC1.
 
@@ -549,8 +550,8 @@ pub(crate) struct Pusher {
     /// This side's control key for the conversation, which a message push's
     /// answer is checked under.
     pub(crate) answer_key: Option<Arc<AnswerKey>>,
-    /// This node's own current route, which a message push carries so the
-    /// correspondent holds it.
+    /// This node's own current route, which a message push carries with its
+    /// tag. The correspondent does not take it as this node's route.
     pub(crate) own_route: Option<Vec<u8>>,
 }
 

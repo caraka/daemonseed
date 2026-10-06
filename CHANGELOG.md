@@ -32,6 +32,8 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-core`: `Store::sweep_orphaned_outboxes`, which the direct-message runner calls once at startup.
 - `daemonseed-veilid-net`: `HealthCounters::watch_failures` counts channel watches that failed to register, re-register or cancel; `RunnerRecords::take_watch_failures`.
 - `daemonseed-core`: `dm::push::PushRoute`, `route_tag`, `ROUTE_TAG_LEN`, `AnswerKey::route_tag`, `domain::DM_PUSH_ROUTE`; a message push carries its route with a tag under the sender's control key, `take_message` takes the pushed route and `Taken::Recorded::route` holds it only where the tag matches (wire change to push kind 4). `daemonseed-veilid-net`: `RunnerRecords::watch_reads`; drop scans and request previews register no channel watch, a deleted conversation's correspondent route is released, and a change on a channel whose watch was just cancelled is dropped.
+- `daemonseed-core`: `Store::take_reach` takes a correspondent's reach and answers `ReachApplied` and `ReachTake`; `Store::with_route` reads the kept route with its serial; `Store::sync_correspondence` and `Locked::sync` make a correspondence's records durable; `Store::reach_serial_of` reads the serial applied; the correspondent-route record holds the serial (record version 2) (on-disk change).
+- `daemonseed-core`: `RecordKind::ReachSerial` holds the last reach serial this node issued, which `Store::open` reads back; `Store::set_reach` answers `SetReach` and holds a new serial only once it is written; `Store::reach_with_serial` reads the reach and its serial together (on-disk change).
 
 ### Changed
 
@@ -55,6 +57,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-veilid-net`: the direct-message runner serves queued commands between the network calls of a drop scan, collection pass, preview or repair instead of after the pass; a scan drops requests a command served meanwhile accepted or blocked, and a collection re-reads a conversation a command changed.
 - `daemonseed-core`: loading the direct-message store keeps the first outbox entry of a conversation being created; the startup sweep removes orphaned outboxes.
 - `daemonseed-veilid-net`: a block applied during a collection pass stops that pass recording the blocked correspondent's messages.
+- `daemonseed-veilid-net`: a reach notice at the serial already applied is answered; a route forgotten after an unanswered push is kept again from a control at the serial applied; a control with an older reach leaves a newer reach not yet taken in place; a route or handle is held only at the reach serial applied.
 
 ### Added
 

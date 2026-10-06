@@ -279,6 +279,9 @@ struct Faults {
     gate_control: Option<Arc<Gate>>,
     /// Hold every channel inspect at this gate.
     gate_inspect_channel: Option<Arc<Gate>>,
+    /// Fail this many re-registrations of a dead watch, as Veilid does when
+    /// it holds no watch after the call.
+    failed_rewatches: usize,
     /// Fail this many watch registrations made by channel reads, as Veilid
     /// does when it holds no watch after the call.
     failed_registrations: usize,
@@ -853,6 +856,18 @@ impl RunnerRecords for Fake {
     ) -> Result<(), RecordError> {
         if self.watches.record_of(lookup_key).is_some() {
             self.watching().rewatched.push(*lookup_key);
+            let failed = {
+                let mut faults = self.faults();
+                let failed = faults.failed_rewatches > 0;
+                faults.failed_rewatches = faults.failed_rewatches.saturating_sub(1);
+                failed
+            };
+            if failed {
+                self.watches.forget(lookup_key);
+                return Err(RecordError::new(std::io::Error::other(
+                    "Veilid holds no watch on the record",
+                )));
+            }
             self.watches.reregistered(lookup_key);
         }
         Ok(())
@@ -1573,6 +1588,33 @@ async fn an_accept_after_a_fresh_preview_reads_nothing_before_it_writes() {
 fn reopen_store(profile: &Profile) -> Store {
     Store::open(profile.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN])
         .expect("reopen the store")
+}
+
+/// A reach taken on disk alone, as a second store on the same profile takes
+/// it: [`Store::take_reach`] with `route`, no handle, and nothing held in
+/// memory.
+trait ApplyReach {
+    fn apply_reach(
+        &self,
+        peer: &CorrespondenceLabel,
+        serial: u64,
+        route: Option<&[u8]>,
+    ) -> Result<ReachTake, StoreError>;
+}
+
+impl ApplyReach for Store {
+    fn apply_reach(
+        &self,
+        peer: &CorrespondenceLabel,
+        serial: u64,
+        route: Option<&[u8]>,
+    ) -> Result<ReachTake, StoreError> {
+        let reach = daemonseed_core::dm::channel::Reach {
+            route: route.map(<[u8]>::to_vec),
+            handle: None,
+        };
+        Ok(self.take_reach(peer, serial, &reach, |_| {})?.take)
+    }
 }
 
 /// A request surfaced again keeps its preview while it names the same channel,
@@ -7644,6 +7686,8 @@ struct Board {
     down: bool,
     /// Calls made.
     calls: usize,
+    /// The route of each call made, in order.
+    called: Vec<Vec<u8>>,
     /// Answers sent.
     replies: usize,
     /// Answer every call with the bare recorded tag, as a node that is not the
@@ -7676,6 +7720,7 @@ impl PushTransport for FakePush {
             let target = {
                 let mut board = board.lock().expect("the board lock");
                 board.calls += 1;
+                board.called.push(route.clone());
                 if board.down {
                     return Err(PushError("the transport is down".to_owned()));
                 }
@@ -7871,6 +7916,162 @@ async fn an_acceptance_is_pushed_and_recognised_before_its_writes_complete() {
         .await;
     assert!(k.board.lock().unwrap().calls >= 1);
     let _ = (&k.dht, &k.b);
+}
+
+/// The route a pushed acceptance carries is kept beside the conversation by
+/// the time `Accepted` is reported, so a runner stopped at once still has it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pushed_acceptances_route_is_kept_before_it_is_reported() {
+    let mut k = knock(no_collection()).await;
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    let b_route = route_blob(&k, 0);
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        Some(b_route),
+        "B's route is kept when the acceptance is reported"
+    );
+}
+
+/// How many calls `board` has had made to `route`.
+fn calls_to(board: &Arc<Mutex<Board>>, route: &[u8]) -> usize {
+    board
+        .lock()
+        .unwrap()
+        .called
+        .iter()
+        .filter(|called| called.as_slice() == route)
+        .count()
+}
+
+/// An acceptance whose reach is older than one already applied for its
+/// sender is recognised, and the route of the newer reach stays kept: an
+/// acceptance's route is taken only where the reach serial its control
+/// carries is above the one applied, and nothing pushes to the acceptance's
+/// route afterwards. A conversation takes no reach notice before its
+/// acceptance is recognised, so the newer reach is applied through the store
+/// call a reach notice is taken by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_acceptance_does_not_replace_the_route_of_a_newer_reach() {
+    let mut k = knock(no_collection()).await;
+    let newer = b"route-of-a-newer-reach".to_vec();
+    assert_eq!(
+        reopen_store(&k.a)
+            .apply_reach(&k.a_peer, NOTICE_SERIAL, Some(&newer))
+            .expect("the store writes"),
+        ReachTake::Newer,
+        "the newer reach is applied"
+    );
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("B's acceptance", sent(2)).await;
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    let b_route = route_blob(&k, 0);
+    assert_ne!(b_route, newer);
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        Some(newer.clone()),
+        "the acceptance put back no older route when it was reported"
+    );
+    settled(&k.a_fake).await;
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        Some(newer.clone()),
+        "nor once the runner served it"
+    );
+    let before = calls_to(&k.board, &b_route);
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(9),
+        peer: k.a_peer,
+        body: b"after the acceptance".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(9)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        calls_to(&k.board, &b_route),
+        before,
+        "no push went to the acceptance's route"
+    );
+}
+
+/// The `#` part of a handle that names `pk`.
+fn handle_hash(pk: &[u8]) -> String {
+    daemonseed_core::handle::Handle::from_pubkey(None, pk)
+        .unwrap()
+        .hash_prefix()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// An acceptance whose reach is older than one already applied for its
+/// sender leaves the handle of the newer reach kept: an acceptance's handle is
+/// taken only where its route is, on the same serial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_acceptance_does_not_replace_the_handle_of_a_newer_reach() {
+    let mut k = knock(no_collection()).await;
+    let hash = handle_hash(k.b.pk.as_slice());
+    let (newer, carried) = (format!("bobby#{hash}"), format!("bob#{hash}"));
+    {
+        let store = reopen_store(&k.a);
+        assert_eq!(
+            store
+                .apply_reach(&k.a_peer, NOTICE_SERIAL, Some(b"route-of-a-newer-reach"))
+                .expect("the store writes"),
+            ReachTake::Newer
+        );
+        assert!(store
+            .record_handle(&k.a_peer, &newer)
+            .expect("the store writes"));
+    }
+    k.bw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: k.b.pk.clone(),
+        handle: carried.clone(),
+    })
+    .await;
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("B's acceptance", sent(2)).await;
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    // The control: B's acceptance carried the handle B set.
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(
+        &k.dht,
+        &k.b.outgoing_lookup_key(&k.a),
+        channel::CONTROL_SUBKEY,
+    );
+    assert_eq!(
+        channel::open_control_with_key(&key, &control)
+            .expect("opens")
+            .reach
+            .handle,
+        Some(carried.clone()),
+        "B's control carries the handle it set"
+    );
+    settled(&k.a_fake).await;
+    assert_eq!(
+        reopen_store(&k.a)
+            .handle(&k.a_peer)
+            .expect("the store reads"),
+        Some(newer),
+        "the older acceptance replaced no handle"
+    );
 }
 
 /// Establish a conversation between two runners with push lanes, the
@@ -8712,7 +8913,10 @@ async fn a_forged_handle_in_a_control_record_is_not_recorded() {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>()
     };
+    // Above any serial B wrote, and rising with each record written here.
+    let serial = std::cell::Cell::new(u64::MAX / 2);
     let write_handle = |handle: String| {
+        serial.set(serial.get() + 1);
         let control = Control {
             opening: Some(
                 ChannelOpening::decode(state.own_opening.as_ref().unwrap().as_slice()).unwrap(),
@@ -8724,6 +8928,7 @@ async fn a_forged_handle_in_a_control_record_is_not_recorded() {
                 route: None,
                 handle: Some(handle),
             },
+            serial: serial.get(),
         };
         let sealed =
             channel::seal_control_with_key(state.own_control_key.as_ref().unwrap(), &control)
@@ -10305,6 +10510,51 @@ fn setting_a_peer_route_traces_each_route_change() {
     );
 }
 
+/// The route map holds each route beside its serial and refuses an older one:
+/// where R2 is held at S2 and R1 is then given at S1, R2 stays held and is not
+/// released. At an equal serial a route is taken only where none is held.
+#[test]
+fn an_older_route_held_last_does_not_replace_a_newer_one() {
+    let board = Arc::new(Mutex::new(Board::default()));
+    let (outbox, inbox) = push_queue();
+    let (push, _) = push_hooks::PushState::new(Some(PushParts {
+        transport: Arc::new(FakePush {
+            board: Arc::clone(&board),
+            inbound: outbox,
+        }),
+        inbound: inbox,
+    }));
+    let share = push.share.clone();
+    let peer = CorrespondenceLabel::mint().expect("a label");
+    let (r1, r2, r3) = (vec![1u8; 4], vec![2u8; 4], vec![3u8; 4]);
+    share.set_peer_route(&peer, Some(r2.clone()), 12);
+    share.set_peer_route(&peer, Some(r1.clone()), 10);
+    assert_eq!(share.route_of(&peer), Some((r2.clone(), 12)), "R2 stays");
+    share.set_peer_route(&peer, Some(r3.clone()), 12);
+    assert_eq!(
+        share.route_of(&peer),
+        Some((r2.clone(), 12)),
+        "a route at an equal serial does not replace one held"
+    );
+    assert!(
+        board.lock().unwrap().released.is_empty(),
+        "R2 was not released"
+    );
+    share.forget_peer(&peer);
+    share.set_peer_route(&peer, Some(r2.clone()), 12);
+    assert_eq!(
+        share.route_of(&peer),
+        Some((r2.clone(), 12)),
+        "at an equal serial a route is taken where none is held"
+    );
+    share.set_peer_route(&peer, Some(r3.clone()), 13);
+    assert_eq!(
+        share.route_of(&peer),
+        Some((r3, 13)),
+        "a newer one replaces it"
+    );
+}
+
 /// A reach that carries no route leaves the route held for its correspondent
 /// in place, so a stale copy of a control cannot cost a live push path; a
 /// route that differs still replaces it.
@@ -10315,12 +10565,12 @@ fn a_reach_without_a_route_keeps_the_held_route() {
     let peer = CorrespondenceLabel::mint().expect("a label");
     let other = CorrespondenceLabel::mint().expect("a label");
     let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
-    share.set_peer_route(&peer, Some(a.clone()));
-    share.set_peer_route(&peer, None);
+    share.set_peer_route(&peer, Some(a.clone()), 1);
+    share.set_peer_route(&peer, None, 2);
     assert!(share.holds_route(&peer), "a routeless reach kept the route");
-    share.set_peer_route(&peer, Some(b));
+    share.set_peer_route(&peer, Some(b), 3);
     assert!(share.holds_route(&peer), "a new route replaced it");
-    share.set_peer_route(&other, None);
+    share.set_peer_route(&other, None, 1);
     assert!(!share.holds_route(&other), "no route is invented");
 }
 
@@ -10339,9 +10589,9 @@ fn opened_controls_wait_as_one_entry_per_correspondent_behind_one_wake() {
         handle: None,
     };
     for (byte, cursor) in [(1, 3), (2, 9), (3, 5)] {
-        controls.note(&notes, peer, reach(byte), cursor);
+        controls.note(&notes, peer, Some((reach(byte), u64::from(byte))), cursor);
     }
-    controls.note(&notes, other, reach(4), 1);
+    controls.note(&notes, other, Some((reach(4), 4)), 1);
     let mut wakes = 0;
     while let Ok(note) = queued.try_recv() {
         assert!(matches!(note, live_lane::LaneNote::PeerControls));
@@ -10352,15 +10602,49 @@ fn opened_controls_wait_as_one_entry_per_correspondent_behind_one_wake() {
     assert_eq!(held.len(), 2, "one entry per correspondent");
     assert_eq!(
         held[&peer],
-        (reach(3), 9),
+        (Some((reach(3), 3)), 9),
         "the newest reach, the highest cursor"
     );
-    assert_eq!(held[&other], (reach(4), 1));
-    controls.note(&notes, peer, reach(5), 10);
+    assert_eq!(held[&other], (Some((reach(4), 4)), 1));
+    controls.note(&notes, peer, Some((reach(5), 5)), 10);
     assert!(
         matches!(queued.try_recv(), Ok(live_lane::LaneNote::PeerControls)),
         "a control after the runner took them wakes it again"
     );
+}
+
+/// A control whose reach is older than the one applied gives no reach, and a
+/// reach at a lower serial than the one held is not taken: either moves the
+/// cursor held up and leaves in place the fresh reach an earlier control left
+/// for the runner, which would otherwise be lost, because that reach's serial
+/// is already applied. With nothing held, it leaves no reach and its cursor.
+#[test]
+fn a_control_with_no_fresh_reach_keeps_the_reach_held() {
+    let (notes, _queued) = mpsc::unbounded_channel();
+    let controls = live_lane::PeerControls::default();
+    let peer = CorrespondenceLabel::mint().expect("a label");
+    let other = CorrespondenceLabel::mint().expect("a label");
+    let fresh = daemonseed_core::dm::channel::Reach {
+        route: None,
+        handle: Some("fresh#000000000000".to_owned()),
+    };
+    let older = daemonseed_core::dm::channel::Reach {
+        route: None,
+        handle: Some("older#000000000000".to_owned()),
+    };
+    controls.note(&notes, peer, Some((fresh.clone(), 9)), 3);
+    controls.note(&notes, peer, None, 7);
+    controls.note(&notes, peer, Some((older, 8)), 4);
+    controls.note(&notes, peer, None, 5);
+    controls.note(&notes, other, None, 2);
+    let held = controls.take();
+    assert_eq!(held.len(), 2, "one entry per correspondent");
+    assert_eq!(
+        held[&peer],
+        (Some((fresh, 9)), 7),
+        "the fresh reach is kept, with the highest cursor"
+    );
+    assert_eq!(held[&other], (None, 2), "no reach is invented");
 }
 
 /// Forgetting a correspondent drops the route held for it and releases that
@@ -10381,8 +10665,8 @@ fn forgetting_a_peer_drops_and_releases_its_route() {
     let peer = CorrespondenceLabel::mint().expect("a label");
     let other = CorrespondenceLabel::mint().expect("a label");
     let (a, b) = (vec![1u8; 4], vec![2u8; 4]);
-    share.set_peer_route(&peer, Some(a.clone()));
-    share.set_peer_route(&other, Some(b));
+    share.set_peer_route(&peer, Some(a.clone()), 1);
+    share.set_peer_route(&other, Some(b), 1);
     share.forget_peer(&peer);
     assert!(!share.holds_route(&peer), "the route is no longer held");
     assert!(
@@ -10718,10 +11002,10 @@ async fn a_dead_watch_catches_up_on_the_cursor_it_missed() {
     assert!(finished(&s.bw.stop().await));
 }
 
-/// The control: a sweep collects the ring and reads no control, even with a
-/// message outstanding whose cursor B has published.
+/// A sweep with a message outstanding whose cursor B has published reads B's
+/// control once and reports the message delivered.
 #[tokio::test(start_paused = true)]
-async fn a_sweep_reads_no_control() {
+async fn a_sweep_reads_the_control_of_an_outstanding_conversation() {
     let mut s = establish(RunnerConfig::default()).await;
     b_publishes_unseen_by_a(&mut s).await;
     let (ends, reads) = (s.a_fake.calls().ring_ends, s.a_fake.calls().control_reads);
@@ -10729,9 +11013,11 @@ async fn a_sweep_reads_no_control() {
     assert!(s.a_fake.calls().ring_ends > ends, "a sweep ran");
     assert_eq!(
         s.a_fake.calls().control_reads,
-        reads,
-        "the sweep read no control"
+        reads + 1,
+        "the sweep read the control once"
     );
+    s.aw.wait_for("delivery after the sweep", delivered(s.a_peer, 1))
+        .await;
     assert!(finished(&s.aw.stop().await));
     assert!(finished(&s.bw.stop().await));
 }
@@ -11066,6 +11352,113 @@ async fn a_watched_change_of_several_subkeys_collects() {
         .await;
 }
 
+/// A change carrying no value, arriving while a message of A's is
+/// outstanding, has A read B's control as well as its ring, so the cursor B
+/// published is taken and the message reported delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_without_a_value_catches_up_on_the_control() {
+    let (mut k, b_peer) = establish_pushed().await;
+    quiet_a(&k).await;
+    a_sends_unseen_delivery(&mut k, b_peer, b"to B", 2).await;
+    let reads = k.a_fake.calls().control_reads;
+    assert!(a_inbound(&k).offer(PushInbound::Changed {
+        lookup_key: k.b.outgoing_lookup_key(&k.a),
+        first_subkey: 0,
+        single: false,
+        dead: false,
+        value: None,
+    }));
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 1)).await;
+    assert!(
+        k.a_fake.calls().control_reads > reads,
+        "the delivery came from a control read"
+    );
+}
+
+/// A dead watch whose registration again fails is no longer treated as
+/// watched, so the collection that follows registers it afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_rewatch_is_registered_again_by_the_next_read() {
+    let (k, _) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    if k.a_fake.watches.lookup_of(&incoming).is_none() {
+        k.a_fake.watch_after_read(&incoming);
+    }
+    quiet_a(&k).await;
+    let before = watches_on(&k.a_fake, &incoming);
+    k.a_fake.faults().failed_rewatches = 1;
+    assert!(a_inbound(&k).offer(PushInbound::Changed {
+        lookup_key: incoming,
+        first_subkey: 0,
+        single: false,
+        dead: true,
+        value: None,
+    }));
+    let fake = k.a_fake.clone();
+    wait_until(
+        "the watch is registered again",
+        Duration::from_secs(30),
+        || watches_on(&fake, &incoming) > before,
+    )
+    .await;
+    assert_eq!(k.a_fake.watching().rewatched, vec![incoming]);
+    assert_eq!(k.a_fake.watches.lookup_of(&incoming), Some(incoming));
+}
+
+/// A failed watch registration moves `watch_failures`: a dead watch whose
+/// registration again fails, and the registration the collection that
+/// follows makes, failing in turn, are each counted once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_watch_registration_is_counted() {
+    let (mut k, _) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    if k.a_fake.watches.lookup_of(&incoming).is_none() {
+        k.a_fake.watch_after_read(&incoming);
+    }
+    quiet_a(&k).await;
+    k.aw.drain();
+    let last_failures = |seen: &[RunnerEvent]| {
+        seen.iter()
+            .rev()
+            .find_map(|event| match event {
+                RunnerEvent::Health(health) => Some(health.watch_failures),
+                _ => None,
+            })
+            .unwrap_or(0)
+    };
+    assert_eq!(last_failures(&k.aw.seen), 0, "no watch has failed yet");
+    {
+        let mut faults = k.a_fake.faults();
+        faults.failed_rewatches = 1;
+        faults.failed_registrations = 1;
+    }
+    let reads = k.a_fake.calls().channel_reads;
+    assert!(a_inbound(&k).offer(PushInbound::Changed {
+        lookup_key: incoming,
+        first_subkey: 0,
+        single: false,
+        dead: true,
+        value: None,
+    }));
+    a_reads_past(&k, reads).await;
+    k.aw.wait_for(
+        "both failures reported",
+        |event| matches!(event, RunnerEvent::Health(health) if health.watch_failures >= 2),
+    )
+    .await;
+    settled(&k.a_fake).await;
+    k.aw.drain();
+    assert_eq!(k.a_fake.watching().rewatched, vec![incoming]);
+    assert_eq!(
+        k.a_fake.faults().failed_registrations,
+        0,
+        "a read registered"
+    );
+    assert_eq!(last_failures(&k.aw.seen), 2, "each failure counted once");
+}
+
 /// A dead watch is registered again and the conversation collected, so a
 /// message written while the watch was dead is shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11198,17 +11591,23 @@ async fn a_sends_unseen_delivery(
     (control, key)
 }
 
-/// `control` opened under `key`, with its route replaced by `route`, sealed
-/// again under `key`, as a reach notice on the channel at `lookup_key`.
-fn reach_notice(
+/// A reach serial above any a runner writes from the clock.
+const NOTICE_SERIAL: u64 = u64::MAX / 2;
+
+/// `control` opened under `key`, with its route replaced by `route` and its
+/// serial by `serial`, sealed again under `key`, as a reach notice on the
+/// channel at `lookup_key`.
+fn reach_notice_at(
     lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     control: &[u8],
     open_key: &channel::ControlKey,
     seal_key: &channel::ControlKey,
     route: &[u8],
+    serial: u64,
 ) -> (Vec<u8>, Vec<u8>) {
     let mut opened = channel::open_control_with_key(open_key, control).expect("opens");
     opened.reach.route = Some(route.to_vec());
+    opened.serial = serial;
     let sealed = channel::seal_control_with_key(seal_key, &opened).expect("seals");
     let notice = daemonseed_core::dm::push::Push::Reach {
         lookup_key: *lookup_key,
@@ -11217,6 +11616,310 @@ fn reach_notice(
     .encode()
     .expect("fits");
     (notice, sealed)
+}
+
+/// [`reach_notice_at`] at [`NOTICE_SERIAL`].
+fn reach_notice(
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    control: &[u8],
+    open_key: &channel::ControlKey,
+    seal_key: &channel::ControlKey,
+    route: &[u8],
+) -> (Vec<u8>, Vec<u8>) {
+    reach_notice_at(
+        lookup_key,
+        control,
+        open_key,
+        seal_key,
+        route,
+        NOTICE_SERIAL,
+    )
+}
+
+/// A reach notice replayed after a newer one is refused: the newer route is
+/// still held, and still kept beside the conversation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_older_reach_notice_is_refused() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (control, key) = a_sends_unseen_delivery(&mut k, b_peer, b"to B", 2).await;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let (r1, r2) = (b"route-r1".to_vec(), b"route-r2".to_vec());
+    let (n1, _) = reach_notice_at(&incoming, &control, &key, &key, &r1, NOTICE_SERIAL);
+    let (n2, _) = reach_notice_at(&incoming, &control, &key, &key, &r2, NOTICE_SERIAL + 1);
+    call_a(&k, n1.clone()).await.expect("A answers N1");
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(r1.clone()));
+    call_a(&k, n2).await.expect("A answers N2");
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(r2.clone()));
+    let _ = call_a(&k, n1).await;
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        Some(r2.clone()),
+        "the replay changed nothing kept"
+    );
+    assert_pushes_to(&k, &r1, &r2, b"after the replay").await;
+}
+
+/// A reach notice at the serial a watched change of the same control already
+/// applied is answered with the answer its pusher checks, so the pusher keeps
+/// the route, and nothing is applied again; one at a lower serial is not
+/// answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reach_notice_at_the_serial_already_applied_is_answered_and_a_lower_one_is_not() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (control, key) = a_sends_unseen_delivery(&mut k, b_peer, b"to B", 2).await;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let watched = b"route-watched".to_vec();
+    let (notice, sealed) =
+        reach_notice_at(&incoming, &control, &key, &key, &watched, NOTICE_SERIAL);
+    assert!(a_inbound(&k).offer(slot_change(&k, channel::CONTROL_SUBKEY, sealed.clone())));
+    wait_until(
+        "the watched control's route kept",
+        Duration::from_secs(30),
+        || kept_route(&k.a, &k.a_peer) == Some(watched.clone()),
+    )
+    .await;
+
+    let answer = call_a(&k, notice)
+        .await
+        .expect("A answers the notice of the serial applied");
+    let expected = daemonseed_core::dm::push::AnswerKey::new(&key)
+        .answer(
+            &incoming,
+            daemonseed_core::dm::push::reach_seq(&sealed).unwrap(),
+        )
+        .unwrap();
+    assert!(daemonseed_core::dm::push::answer_matches(
+        &expected, &answer
+    ));
+
+    let replies = k.board.lock().unwrap().replies;
+    let older = b"route-older".to_vec();
+    let (notice, _) = reach_notice_at(&incoming, &control, &key, &key, &older, NOTICE_SERIAL - 1);
+    assert!(
+        call_a(&k, notice).await.is_err(),
+        "the notice of a lower serial is answered"
+    );
+    assert_eq!(k.board.lock().unwrap().replies, replies, "not answered");
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        Some(watched),
+        "neither notice changed the kept route"
+    );
+}
+
+/// A watched control at a serial below the one a reach notice applied does not
+/// replace the route the notice gave: that route stays held and kept, and the
+/// next message is pushed to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watched_control_older_than_the_applied_reach_keeps_the_route_held() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (control, key) = a_sends_unseen_delivery(&mut k, b_peer, b"to B", 2).await;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let (r1, r2) = (b"route-r1".to_vec(), b"route-r2".to_vec());
+    let (n2, _) = reach_notice_at(&incoming, &control, &key, &key, &r2, NOTICE_SERIAL + 1);
+    call_a(&k, n2).await.expect("A answers the notice");
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(r2.clone()));
+
+    let (_, sealed_r1) = reach_notice_at(&incoming, &control, &key, &key, &r1, NOTICE_SERIAL);
+    assert!(a_inbound(&k).offer(slot_change(&k, channel::CONTROL_SUBKEY, sealed_r1)));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    settled(&k.a_fake).await;
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        Some(r2.clone()),
+        "the older control left R2 kept"
+    );
+
+    let before = k.board.lock().unwrap().called.len();
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(9),
+        peer: k.a_peer,
+        body: b"after the older control".to_vec(),
+    })
+    .await;
+    let board = Arc::clone(&k.board);
+    wait_until("A pushed its send", Duration::from_secs(30), || {
+        board.lock().unwrap().called.len() > before
+    })
+    .await;
+    let called = k.board.lock().unwrap().called[before..].to_vec();
+    assert!(!called.is_empty());
+    assert!(
+        called.iter().all(|route| *route == r2),
+        "the send was pushed to {called:?}, not to R2 alone"
+    );
+}
+
+/// A sends `body`, and its push goes to `held` rather than `replaced`: neither
+/// route is served, so the push fails and releases the route it was made on,
+/// and `replaced` is released only once, when `held` replaced it.
+async fn assert_pushes_to(k: &Knocked, replaced: &[u8], held: &[u8], body: &[u8]) {
+    let calls = k.board.lock().unwrap().calls;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(9),
+        peer: k.a_peer,
+        body: body.to_vec(),
+    })
+    .await;
+    let board = Arc::clone(&k.board);
+    wait_until("A pushed its send", Duration::from_secs(30), || {
+        board.lock().unwrap().calls > calls
+    })
+    .await;
+    wait_until(
+        "the failed push released its route",
+        Duration::from_secs(30),
+        || {
+            board
+                .lock()
+                .unwrap()
+                .released
+                .iter()
+                .any(|route| route == held)
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let released = k.board.lock().unwrap().released.clone();
+    let count = |route: &[u8]| released.iter().filter(|r| r.as_slice() == route).count();
+    assert_eq!(count(held), 1, "the push went to the held route");
+    assert_eq!(count(replaced), 1, "no push went to the replaced route");
+}
+
+/// With the runner busy, a watched control carrying R1 and then a pushed
+/// message carrying R2 leave R1 held and kept once the runner has served what
+/// the lane handed it: the route a message push carries has no reach serial
+/// and is not taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watched_control_served_late_keeps_its_route_over_a_pushed_one() {
+    let (mut k, b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    let slot = b_sends_unpushed(&mut k, b_peer, 3, 1, b"with R2").await;
+    k.board.lock().unwrap().down = false;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let b_key = conv_of(&k.b, &b_peer)
+        .own_control_key
+        .expect("B's control key");
+    let (r1, r2) = (b"route-r1".to_vec(), b"route-r2".to_vec());
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (_, sealed_r1) = reach_notice_at(&incoming, &control, &b_key, &b_key, &r1, NOTICE_SERIAL);
+    // The runner is held inside a record-store call while the lane takes both.
+    let held = hold_ring_read(&k.a_fake, incoming).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    assert!(a_inbound(&k).offer(slot_change(&k, channel::CONTROL_SUBKEY, sealed_r1)));
+    let push = daemonseed_core::dm::push::Push::Message {
+        lookup_key: incoming,
+        subkey: channel::slot_for(1),
+        slot,
+        route: Some(daemonseed_core::dm::push::PushRoute {
+            tag: daemonseed_core::dm::push::route_tag(&b_key, &incoming, 1, &r2).expect("a tag"),
+            route: r2.clone(),
+        }),
+    }
+    .encode()
+    .expect("fits");
+    let answer = call_a(&k, push).await.expect("A answers the push");
+    assert!(answer.starts_with(daemonseed_core::dm::push::RECORDED));
+    held.release();
+    k.aw.wait_for("the message at A", message(k.a_peer, 1, b"with R2"))
+        .await;
+    settled(&k.a_fake).await;
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(r1.clone()), "R1 is kept");
+    assert_pushes_only_to(&k, &r1, &r2, b"back").await;
+}
+
+/// With the runner busy, a watched control carrying a fresh reach and then
+/// one at a lower serial leave the fresh reach's handle stored once the runner
+/// has served what the lane handed it: the stale control hands on no reach,
+/// so it does not replace the fresh one with an empty one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_watched_control_does_not_empty_a_fresh_reach_held_for_the_runner() {
+    let (k, b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let b_key = conv_of(&k.b, &b_peer)
+        .own_control_key
+        .expect("B's control key");
+    let fresh = format!("bobby#{}", handle_hash(k.b.pk.as_slice()));
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let sealed_at = |serial: u64, handle: Option<String>| {
+        let mut opened = channel::open_control_with_key(&b_key, &control).expect("opens");
+        opened.reach.handle = handle;
+        opened.serial = serial;
+        channel::seal_control_with_key(&b_key, &opened).expect("seals")
+    };
+    let held = hold_ring_read(&k.a_fake, incoming).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    assert!(a_inbound(&k).offer(slot_change(
+        &k,
+        channel::CONTROL_SUBKEY,
+        sealed_at(NOTICE_SERIAL, Some(fresh.clone())),
+    )));
+    let (a, peer) = (&k.a, k.a_peer);
+    wait_until("the fresh reach applied", Duration::from_secs(30), || {
+        reopen_store(a).reach_serial_of(&peer).ok() == Some(NOTICE_SERIAL)
+    })
+    .await;
+    assert!(a_inbound(&k).offer(slot_change(
+        &k,
+        channel::CONTROL_SUBKEY,
+        sealed_at(NOTICE_SERIAL - 1, None),
+    )));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    held.release();
+    settled(&k.a_fake).await;
+    assert_eq!(
+        reopen_store(&k.a)
+            .handle(&k.a_peer)
+            .expect("the store reads"),
+        Some(fresh),
+        "the fresh reach's handle is stored"
+    );
+}
+
+/// A sends `body`, and its push goes to `held` and never to `never`: `held` is
+/// not served, so the push fails and releases it.
+async fn assert_pushes_only_to(k: &Knocked, held: &[u8], never: &[u8], body: &[u8]) {
+    let before = calls_to(&k.board, never);
+    let calls = k.board.lock().unwrap().calls;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(9),
+        peer: k.a_peer,
+        body: body.to_vec(),
+    })
+    .await;
+    let board = Arc::clone(&k.board);
+    wait_until("A pushed its send", Duration::from_secs(30), || {
+        board.lock().unwrap().calls > calls
+    })
+    .await;
+    wait_until(
+        "the failed push released its route",
+        Duration::from_secs(30),
+        || {
+            board
+                .lock()
+                .unwrap()
+                .released
+                .iter()
+                .any(|route| route == held)
+        },
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        calls_to(&k.board, held) >= 1,
+        "the push went to the held route"
+    );
+    assert_eq!(
+        calls_to(&k.board, never),
+        before,
+        "no push went to the route that was not taken"
+    );
 }
 
 /// A reach notice from the correspondent, sealed under its control key, is
@@ -11413,71 +12116,784 @@ async fn a_relaunch_pushes_its_first_send_to_the_kept_route_without_a_read() {
     assert_ne!(a_route, old_a_route, "A allocated a new route");
     assert_eq!(
         kept_route(&k.b, &b_peer).as_deref(),
-        Some(a_route.as_slice()),
-        "B keeps the route the push carried"
+        Some(old_a_route.as_slice()),
+        "the route a message push carries is not taken"
     );
     assert_eq!(relaunched.calls().control_writes, 0, "no control rewritten");
     held.release();
     aw.wait_for("A's send", sent(7)).await;
+    let (b, peer) = (&k.b, b_peer);
+    wait_until(
+        "B keeps the route A's control gives once the reopen ends",
+        Duration::from_secs(30),
+        || kept_route(b, &peer).as_deref() == Some(a_route.as_slice()),
+    )
+    .await;
     assert!(finished(&aw.stop().await));
 }
 
-/// A message push that carries its sender's route, once recorded, replaces
-/// the route held and kept for the sender, so the next push goes to it.
+/// A message push carrying the route its sender held before a newer reach
+/// notice was taken is recorded, and the route the notice gave stays held and
+/// kept: the route a message push carries has no reach serial, so a push made
+/// before the sender's route changed cannot put the old route back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_recorded_push_carrying_a_route_replaces_the_held_route() {
+async fn a_late_message_push_does_not_put_back_the_route_a_newer_reach_notice_replaced() {
     let (mut k, b_peer) = establish_pushed().await;
     // Each change to a watched channel of B's is offered by hand.
     k.a_fake.faults().hand_fed_watches = true;
     quiet_a(&k).await;
-    let slot = b_sends_unpushed(&mut k, b_peer, 3, 1, b"with a route").await;
+    let old = kept_route(&k.a, &k.a_peer).expect("A keeps B's route");
+    let slot = b_sends_unpushed(&mut k, b_peer, 3, 1, b"sent before the move").await;
     k.board.lock().unwrap().down = false;
-    let renewed = b"route-of-b-from-a-push".to_vec();
-    assert_ne!(kept_route(&k.a, &k.a_peer), Some(renewed.clone()));
     let lookup_key = k.b.outgoing_lookup_key(&k.a);
     let b_key = conv_of(&k.b, &b_peer)
         .own_control_key
         .expect("B's control key");
+    let moved = b"route-of-b-after-the-move".to_vec();
+    let control = channel_bytes(&k.dht, &lookup_key, channel::CONTROL_SUBKEY);
+    let (notice, _) = reach_notice(&lookup_key, &control, &b_key, &b_key, &moved);
+    call_a(&k, notice)
+        .await
+        .expect("A answers the reach notice");
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(moved.clone()));
+
     let push = daemonseed_core::dm::push::Push::Message {
         lookup_key,
         subkey: channel::slot_for(1),
         slot,
         route: Some(daemonseed_core::dm::push::PushRoute {
-            tag: daemonseed_core::dm::push::route_tag(&b_key, &lookup_key, 1, &renewed)
-                .expect("a tag"),
-            route: renewed.clone(),
+            tag: daemonseed_core::dm::push::route_tag(&b_key, &lookup_key, 1, &old).expect("a tag"),
+            route: old.clone(),
         }),
     }
     .encode()
     .expect("fits");
     let answer = call_a(&k, push).await.expect("A answers the push");
     assert!(answer.starts_with(daemonseed_core::dm::push::RECORDED));
-    k.aw.wait_for("the message at A", message(k.a_peer, 1, b"with a route"))
-        .await;
+    k.aw.wait_for(
+        "the message at A",
+        message(k.a_peer, 1, b"sent before the move"),
+    )
+    .await;
     assert_eq!(
         kept_route(&k.a, &k.a_peer),
-        Some(renewed.clone()),
-        "the route the push carried is kept"
+        Some(moved.clone()),
+        "the late push put no route back"
     );
-    let calls = k.board.lock().unwrap().calls;
+    assert_pushes_only_to(&k, &moved, &old, b"back").await;
+}
+
+/// A route forgotten after an unanswered push is held and kept again by the
+/// correspondent's control at the serial already applied: that control is the
+/// reach the route was taken from, so taking it again moves nothing backwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forgotten_route_is_taken_again_from_a_control_at_the_serial_applied() {
+    let (mut k, _b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    let b_route = kept_route(&k.a, &k.a_peer).expect("A keeps B's route");
+    let serial = reopen_store(&k.a)
+        .reach_serial_of(&k.a_peer)
+        .expect("the store reads");
+    k.board.lock().unwrap().down = true;
     k.aw.send(RunnerCommand::Send {
-        token: CommandToken(9),
+        token: CommandToken(3),
         peer: k.a_peer,
-        body: b"back".to_vec(),
+        body: b"unanswered".to_vec(),
     })
     .await;
-    k.aw.wait_for("A's send", sent(9)).await;
+    k.aw.wait_for("A's send", sent(3)).await;
     let board = Arc::clone(&k.board);
-    wait_until("A pushed its send", Duration::from_secs(30), || {
-        board.lock().unwrap().calls > calls
+    wait_until("A forgot B's route", Duration::from_secs(30), || {
+        board.lock().unwrap().released.contains(&b_route)
+    })
+    .await;
+    let (a, peer) = (&k.a, k.a_peer);
+    wait_until(
+        "the kept route is forgotten",
+        Duration::from_secs(30),
+        || kept_route(a, &peer).is_none(),
+    )
+    .await;
+    k.board.lock().unwrap().down = false;
+
+    // B's control as the record store holds it: the reach already applied.
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let opened = channel::open_control_with_key(&key, &control).expect("opens");
+    assert_eq!(
+        opened.serial, serial,
+        "the control is at the serial applied"
+    );
+    assert_eq!(opened.reach.route.as_deref(), Some(b_route.as_slice()));
+    assert!(a_inbound(&k).offer(slot_change(&k, channel::CONTROL_SUBKEY, control)));
+    wait_until("the route is kept again", Duration::from_secs(30), || {
+        kept_route(a, &peer).as_deref() == Some(b_route.as_slice())
+    })
+    .await;
+    assert_eq!(
+        reopen_store(&k.a).reach_serial_of(&k.a_peer).unwrap(),
+        serial,
+        "the serial did not move"
+    );
+    let before = calls_to(&k.board, &b_route);
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"pushed again".to_vec(),
     })
     .await;
     wait_until(
-        "the push went to the route it was given",
+        "A pushed to B's route again",
         Duration::from_secs(30),
-        || board.lock().unwrap().released.contains(&renewed),
+        || calls_to(&board, &b_route) > before,
     )
     .await;
+}
+
+/// A correspondent's control, as A's lane would open it from a watched change,
+/// with its handle replaced by `handle` and its serial by `serial`, sealed again.
+fn b_control_at(
+    k: &Knocked,
+    b_peer: &CorrespondenceLabel,
+    serial: u64,
+    handle: Option<String>,
+) -> Vec<u8> {
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let b_key = conv_of(&k.b, b_peer)
+        .own_control_key
+        .expect("B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let mut opened = channel::open_control_with_key(&b_key, &control).expect("opens");
+    opened.reach.handle = handle;
+    opened.serial = serial;
+    channel::seal_control_with_key(&b_key, &opened).expect("seals")
+}
+
+/// A handle lost between the write of its reach's serial and the write of the
+/// handle is kept again by a control at that serial: the reach is the one
+/// applied, so its handle is taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_lost_at_the_serial_applied_is_restored_by_a_control_at_that_serial() {
+    let (k, b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    let handle = format!("bobby#{}", handle_hash(k.b.pk.as_slice()));
+    let control = b_control_at(&k, &b_peer, NOTICE_SERIAL, Some(handle.clone()));
+    // The serial reached disk and the handle did not.
+    let route = kept_route(&k.a, &k.a_peer);
+    assert_eq!(
+        reopen_store(&k.a)
+            .apply_reach(&k.a_peer, NOTICE_SERIAL, route.as_deref())
+            .unwrap(),
+        ReachTake::Newer
+    );
+    assert_ne!(
+        reopen_store(&k.a).handle(&k.a_peer).unwrap(),
+        Some(handle.clone()),
+        "the handle is not yet kept"
+    );
+    assert!(a_inbound(&k).offer(slot_change(&k, channel::CONTROL_SUBKEY, control)));
+    let (a, peer) = (&k.a, k.a_peer);
+    let wanted = Some(handle);
+    wait_until("the handle is kept", Duration::from_secs(30), || {
+        reopen_store(a).handle(&peer).unwrap() == wanted
+    })
+    .await;
+}
+
+/// An acceptance the lane took at its serial, whose note the runner serves
+/// only after a newer reach was applied and its handle kept, leaves the newer
+/// handle kept: the runner keeps a handed-over handle only while its serial is
+/// the one applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_acceptance_note_does_not_replace_the_handle_of_a_newer_reach() {
+    let mut k = knock(real_clock()).await;
+    let hash = handle_hash(k.b.pk.as_slice());
+    let (newer, carried) = (format!("bobby#{hash}"), format!("bob#{hash}"));
+    // The runner is held inside a drop read while the lane takes the
+    // acceptance and queues its note.
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.a_fake.faults().gate_drop = Some(Arc::clone(&held));
+    held.reached().await;
+    k.bw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: k.b.pk.clone(),
+        handle: carried.clone(),
+    })
+    .await;
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("B's acceptance", sent(2)).await;
+    let (a, peer) = (&k.a, k.a_peer);
+    wait_until(
+        "the lane took the acceptance",
+        Duration::from_secs(30),
+        || reopen_store(a).reach_serial_of(&peer).unwrap_or(0) != 0,
+    )
+    .await;
+    let taken = reopen_store(&k.a).reach_serial_of(&k.a_peer).unwrap();
+    assert!(taken < NOTICE_SERIAL);
+    assert_eq!(
+        reopen_store(&k.a).handle(&k.a_peer).unwrap(),
+        None,
+        "the runner has not served the note"
+    );
+    {
+        // A newer reach, applied and its handle kept, as a control read the
+        // runner served first would leave it.
+        let store = reopen_store(&k.a);
+        assert_eq!(
+            store
+                .apply_reach(&k.a_peer, NOTICE_SERIAL, Some(b"route-of-a-newer-reach"))
+                .unwrap(),
+            ReachTake::Newer
+        );
+        assert!(store.record_handle(&k.a_peer, &newer).unwrap());
+    }
+    k.a_fake.faults().gate_drop = None;
+    held.release();
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    settled(&k.a_fake).await;
+    assert_eq!(
+        reopen_store(&k.a).handle(&k.a_peer).unwrap(),
+        Some(newer),
+        "the queued note replaced no handle"
+    );
+}
+
+/// An acceptance the lane took, whose route is forgotten before the runner
+/// serves the acceptance's note, stays forgotten: the note hands on the reach
+/// without its route, so the runner's take of it at the serial applied keeps
+/// no route again. B's control write is held throughout, so no read of B's
+/// control can give the route back either. The acceptance carries B's handle,
+/// which only the runner's take of the note writes, in the same section as
+/// any route it keeps, so the handle on disk marks the note served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_route_forgotten_before_the_acceptance_note_is_served_is_not_kept_again() {
+    let k = knock(real_clock()).await;
+    let handle = format!("bob#{}", handle_hash(k.b.pk.as_slice()));
+    let control_held = Arc::new(Gate::default());
+    let _release_control = ReleaseOnDrop(Arc::clone(&control_held));
+    k.b_fake.faults().gate_control = Some(Arc::clone(&control_held));
+    // The runner is held inside a drop read while the lane takes the
+    // acceptance and queues its note.
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.a_fake.faults().gate_drop = Some(Arc::clone(&held));
+    held.reached().await;
+    k.bw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: k.b.pk.clone(),
+        handle: handle.clone(),
+    })
+    .await;
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    control_held.reached().await;
+    let (a, peer) = (&k.a, k.a_peer);
+    wait_until(
+        "the lane took the acceptance",
+        Duration::from_secs(30),
+        || kept_route(a, &peer).is_some(),
+    )
+    .await;
+    let taken = kept_route(&k.a, &k.a_peer).expect("the lane kept the route");
+    // Forgotten, as an unanswered push on it leaves it.
+    assert!(reopen_store(&k.a)
+        .forget_route(&k.a_peer, &taken, || {})
+        .unwrap());
+    assert_eq!(
+        reopen_store(&k.a).handle(&k.a_peer).unwrap(),
+        None,
+        "the note is not yet served"
+    );
+    k.a_fake.faults().gate_drop = None;
+    held.release();
+    let wanted = Some(handle);
+    wait_until(
+        "the runner served the acceptance's note",
+        Duration::from_secs(30),
+        || reopen_store(a).handle(&peer).ok().flatten() == wanted,
+    )
+    .await;
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        None,
+        "the note kept no route again"
+    );
+}
+
+/// An acceptance found in a drop scan whose reach is older than one already
+/// applied leaves the route and handle of the newer reach kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scanned_acceptance_does_not_replace_the_route_or_handle_of_a_newer_reach() {
+    let mut k = knock(real_clock()).await;
+    let hash = handle_hash(k.b.pk.as_slice());
+    let (newer_handle, carried) = (format!("bobby#{hash}"), format!("bob#{hash}"));
+    let newer = b"route-of-a-newer-reach".to_vec();
+    {
+        let store = reopen_store(&k.a);
+        assert_eq!(
+            store
+                .apply_reach(&k.a_peer, NOTICE_SERIAL, Some(&newer))
+                .unwrap(),
+            ReachTake::Newer
+        );
+        assert!(store.record_handle(&k.a_peer, &newer_handle).unwrap());
+    }
+    // No push reaches A, so A finds the acceptance by scanning its drop.
+    k.board.lock().unwrap().down = true;
+    k.bw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: k.b.pk.clone(),
+        handle: carried,
+    })
+    .await;
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("B's acceptance", sent(2)).await;
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    settled(&k.a_fake).await;
+    assert_eq!(k.board.lock().unwrap().replies, 0, "no push was answered");
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        Some(newer),
+        "the newer route stays"
+    );
+    assert_eq!(
+        reopen_store(&k.a).handle(&k.a_peer).unwrap(),
+        Some(newer_handle),
+        "the newer handle stays"
+    );
+}
+
+/// Puts a directory's permissions back when dropped.
+struct ModeRestore(std::path::PathBuf, u32);
+
+impl Drop for ModeRestore {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+    }
+}
+
+/// A reach notice the store fails to take is not answered, is not counted as
+/// a dropped push, and is counted once as a store failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reach_notice_the_store_fails_to_take_is_neither_answered_nor_counted_dropped() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut k, _b_peer) = establish_pushed_with(real_clock()).await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    let kept = kept_route(&k.a, &k.a_peer);
+    let last = |seen: &[RunnerEvent]| {
+        seen.iter()
+            .rev()
+            .find_map(|event| match event {
+                RunnerEvent::Health(h) => Some((h.store_failures, h.pushes_dropped)),
+                _ => None,
+            })
+            .unwrap_or((0, 0))
+    };
+    k.aw.drain();
+    let (failures, dropped) = last(&k.aw.seen);
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (notice, _) = reach_notice(&incoming, &control, &key, &key, b"route-not-taken");
+    let dir = walk(&k.a.root.path().join(STORE_DIR))
+        .into_iter()
+        .find(|path| path.file_name().and_then(|n| n.to_str()) == Some("conversation.bin"))
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .expect("the conversation's directory");
+    let replies = k.board.lock().unwrap().replies;
+    let from = k.aw.seen.len();
+    {
+        let _restore = ModeRestore(dir.clone(), 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(
+            call_a(&k, notice).await.is_err(),
+            "the notice is not answered"
+        );
+        k.aw.wait_from(
+            from,
+            "the failure counted",
+            |event| matches!(event, RunnerEvent::Health(h) if h.store_failures > failures),
+        )
+        .await;
+    }
+    assert_eq!(k.board.lock().unwrap().replies, replies, "not answered");
+    settled(&k.a_fake).await;
+    k.aw.drain();
+    let (now_failures, now_dropped) = last(&k.aw.seen);
+    assert_eq!(
+        now_failures,
+        failures + 1,
+        "counted once as a store failure"
+    );
+    assert_eq!(now_dropped, dropped, "not counted as a dropped push");
+    assert_eq!(kept_route(&k.a, &k.a_peer), kept, "nothing was taken");
+}
+
+/// The store failures and dropped pushes the last health report in `seen`
+/// counted.
+fn last_counts(seen: &[RunnerEvent]) -> (u64, u64) {
+    seen.iter()
+        .rev()
+        .find_map(|event| match event {
+            RunnerEvent::Health(h) => Some((h.store_failures, h.pushes_dropped)),
+            _ => None,
+        })
+        .unwrap_or((0, 0))
+}
+
+/// A reach notice at the serial already applied, whose record may have
+/// landed without being made durable, is answered only once the
+/// correspondence's records are durable: where the directory barrier fails,
+/// here because the correspondence's directory cannot be opened while its
+/// records still open by name, the notice is not answered, not counted as a
+/// dropped push, and counted once as a store failure; the next one, whose
+/// barrier holds, is answered. Every write into that directory fails too
+/// while it cannot be opened, since an atomic write makes its parent
+/// directory durable, so A's runner collects only every 600 s and nothing but
+/// the notice touches the directory meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reach_notice_at_the_serial_applied_is_answered_only_once_durable() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut k, _b_peer) = establish_pushed_with(no_collection()).await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    let landed = b"route-of-a-landed-write".to_vec();
+    // The reach is on disk, as a take whose rename landed and whose directory
+    // was not yet made durable leaves it.
+    assert_eq!(
+        reopen_store(&k.a)
+            .apply_reach(&k.a_peer, NOTICE_SERIAL, Some(&landed))
+            .unwrap(),
+        ReachTake::Newer
+    );
+    settled(&k.a_fake).await;
+    k.aw.drain();
+    let (failures, dropped) = last_counts(&k.aw.seen);
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (notice, _) = reach_notice_at(&incoming, &control, &key, &key, &landed, NOTICE_SERIAL);
+    let dir = walk(&k.a.root.path().join(STORE_DIR))
+        .into_iter()
+        .find(|path| path.file_name().and_then(|n| n.to_str()) == Some("conversation.bin"))
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
+        .expect("the conversation's directory");
+    let replies = k.board.lock().unwrap().replies;
+    let from = k.aw.seen.len();
+    {
+        let _restore = ModeRestore(dir.clone(), 0o700);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+        if std::fs::File::open(&dir).is_ok() {
+            println!("skipped: this process opens a directory of mode 0o300");
+            return;
+        }
+        assert!(
+            call_a(&k, notice.clone()).await.is_err(),
+            "the notice is not answered"
+        );
+    }
+    // A's runner reports its counters once it serves something; unblocking
+    // an identity it never blocked writes nothing into the correspondence.
+    k.aw.send(RunnerCommand::Unblock {
+        peer: Profile::new().pk.clone(),
+    })
+    .await;
+    k.aw.wait_from(
+        from,
+        "the failure counted",
+        |event| matches!(event, RunnerEvent::Health(h) if h.store_failures > failures),
+    )
+    .await;
+    assert_eq!(k.board.lock().unwrap().replies, replies, "not answered");
+    settled(&k.a_fake).await;
+    k.aw.drain();
+    let (now_failures, now_dropped) = last_counts(&k.aw.seen);
+    assert_eq!(
+        now_failures,
+        failures + 1,
+        "counted once as a store failure"
+    );
+    assert_eq!(now_dropped, dropped, "not counted as a dropped push");
+    assert!(
+        call_a(&k, notice).await.is_ok(),
+        "answered once the barrier holds"
+    );
+}
+
+/// A reach serial that could not be written is written again from the
+/// schedule, with the reach unchanged since, and the reach is then published:
+/// the reach-serial record holds a serial above the last one written, the
+/// correspondent takes a reach notice at that serial, and the control record
+/// carries the handle the failed write was for. A's runner collects only
+/// every 600 s, so nothing but the retry's own wake writes the serial within
+/// the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owed_reach_serial_is_written_from_the_schedule() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut k, b_peer) = establish_pushed_with(no_collection()).await;
+    k.b_fake.faults().hand_fed_watches = true;
+    let root = k.a.root.path().join(STORE_DIR);
+    let written = reopen_store(&k.a).reach_serial();
+    assert!(written > 0, "a serial was written at launch");
+    k.aw.drain();
+    let (failures, _) = last_counts(&k.aw.seen);
+    let handle = format!("anna#{}", handle_hash(k.a.pk.as_slice()));
+    let from = k.aw.seen.len();
+    {
+        let _restore = ModeRestore(root.clone(), 0o700);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        k.aw.send(RunnerCommand::NoteHandle {
+            peer_identity_pk: k.a.pk.clone(),
+            handle: handle.clone(),
+        })
+        .await;
+        k.aw.wait_from(
+            from,
+            "the failed write counted",
+            |event| matches!(event, RunnerEvent::Health(h) if h.store_failures > failures),
+        )
+        .await;
+    }
+    // Read back well inside the first retry's wait.
+    assert_eq!(
+        reopen_store(&k.a).reach_serial(),
+        written,
+        "the serial was not written"
+    );
+    let a = &k.a;
+    wait_until(
+        "the owed serial is written",
+        Duration::from_secs(30),
+        || reopen_store(a).reach_serial() > written,
+    )
+    .await;
+    let owed = reopen_store(&k.a).reach_serial();
+    let b = &k.b;
+    wait_until(
+        "B took a reach notice at the owed serial",
+        Duration::from_secs(30),
+        || reopen_store(b).reach_serial_of(&b_peer).unwrap_or(0) == owed,
+    )
+    .await;
+    let incoming = k.a.outgoing_lookup_key(&k.b);
+    let key = conv_of(&k.b, &b_peer)
+        .peer_control_key
+        .expect("B holds A's control key");
+    let (dht, wanted) = (Arc::clone(&k.dht), Some(handle));
+    wait_until(
+        "the control carries the handle",
+        Duration::from_secs(30),
+        || {
+            let bytes = channel_bytes(&dht, &incoming, channel::CONTROL_SUBKEY);
+            channel::open_control_with_key(&key, &bytes)
+                .map(|control| control.reach.handle)
+                .ok()
+                == Some(wanted.clone())
+        },
+    )
+    .await;
+}
+
+/// This node's reach-serial record that will not read, and a reach serial
+/// that will not write, each count one store failure where the reach is set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_or_unwritten_reach_serial_counts_one_store_failure_each() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut k, _b_peer) = establish_pushed_with(no_collection()).await;
+    let root = k.a.root.path().join(STORE_DIR);
+    settled(&k.a_fake).await;
+    k.aw.drain();
+    let (failures, _) = last_counts(&k.aw.seen);
+    let handle = |name: &str| format!("{name}#{}", handle_hash(k.a.pk.as_slice()));
+
+    std::fs::write(root.join("reach-serial.bin"), b"short").unwrap();
+    let before = reopen_store(&k.a).reach_serial();
+    assert_eq!(before, 0, "the record does not read");
+    k.aw.send(RunnerCommand::NoteHandle {
+        peer_identity_pk: k.a.pk.clone(),
+        handle: handle("anna"),
+    })
+    .await;
+    let a = &k.a;
+    wait_until("the record is overwritten", Duration::from_secs(30), || {
+        reopen_store(a).reach_serial() > 0
+    })
+    .await;
+    settled(&k.a_fake).await;
+    k.aw.drain();
+    let (overwritten, _) = last_counts(&k.aw.seen);
+    assert_eq!(overwritten, failures + 1, "the overwrite counted once");
+
+    let written = reopen_store(&k.a).reach_serial();
+    {
+        let _restore = ModeRestore(root.clone(), 0o700);
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let from = k.aw.seen.len();
+        k.aw.send(RunnerCommand::NoteHandle {
+            peer_identity_pk: k.a.pk.clone(),
+            handle: handle("annie"),
+        })
+        .await;
+        k.aw.wait_from(
+            from,
+            "the failed write counted",
+            |event| matches!(event, RunnerEvent::Health(h) if h.store_failures > overwritten),
+        )
+        .await;
+        settled(&k.a_fake).await;
+        k.aw.drain();
+    }
+    // Read back well inside the first retry's wait.
+    assert_eq!(reopen_store(&k.a).reach_serial(), written, "not written");
+    let (unwritten, _) = last_counts(&k.aw.seen);
+    assert_eq!(unwritten, overwritten + 1, "the failed write counted once");
+}
+
+/// A route forgotten after an unanswered push is held again in memory by the
+/// runner's own read of the correspondent's control at the serial applied,
+/// with no control offered to the lane: the next send is pushed to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runner_holds_a_forgotten_route_again_from_a_control_at_the_serial_applied() {
+    let (mut k, _b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    let b_route = kept_route(&k.a, &k.a_peer).expect("A keeps B's route");
+    k.board.lock().unwrap().down = true;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"unanswered".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(3)).await;
+    let board = Arc::clone(&k.board);
+    wait_until("A forgot B's route", Duration::from_secs(30), || {
+        board.lock().unwrap().released.contains(&b_route)
+    })
+    .await;
+    let (a, peer) = (&k.a, k.a_peer);
+    wait_until(
+        "the kept route is forgotten",
+        Duration::from_secs(30),
+        || kept_route(a, &peer).is_none(),
+    )
+    .await;
+    k.board.lock().unwrap().down = false;
+    // A change with no value: the runner collects and reads the control; the
+    // lane takes nothing.
+    let reads = k.a_fake.calls().control_reads;
+    assert!(a_inbound(&k).offer(PushInbound::Changed {
+        lookup_key: k.b.outgoing_lookup_key(&k.a),
+        first_subkey: u32::from(channel::CONTROL_SUBKEY),
+        single: true,
+        dead: false,
+        value: None,
+    }));
+    let fake = k.a_fake.clone();
+    wait_until(
+        "the runner read the control",
+        Duration::from_secs(30),
+        || fake.calls().control_reads > reads,
+    )
+    .await;
+    wait_until("the route is kept again", Duration::from_secs(30), || {
+        kept_route(a, &peer).as_deref() == Some(b_route.as_slice())
+    })
+    .await;
+    settled(&k.a_fake).await;
+    let before = calls_to(&k.board, &b_route);
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"pushed again".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(4)).await;
+    wait_until(
+        "A pushed to B's route again",
+        Duration::from_secs(30),
+        || calls_to(&board, &b_route) > before,
+    )
+    .await;
+}
+
+/// A block the live lane applies while the runner is reading the blocked
+/// correspondent's ring stops that reading at the next slot: the message read
+/// before the block is reported, and the ones after it are not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lane_block_stops_the_collection_of_the_blocked_correspondent_between_slots() {
+    let (mut k, b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    b_sends_unpushed(&mut k, b_peer, 3, 1, b"before the block").await;
+    b_sends_unpushed(&mut k, b_peer, 4, 2, b"after the block").await;
+    b_sends_unpushed(&mut k, b_peer, 5, 3, b"after it too").await;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let held = hold_ring_read(&k.a_fake, incoming).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.aw.send(RunnerCommand::Block {
+        peer: k.b.pk.clone(),
+    })
+    .await;
+    // The lane applies the block to the store while the runner is held; the
+    // runner reports it once it serves the lane's note.
+    let (a, b_pk) = (&k.a, k.b.pk.clone());
+    wait_until(
+        "the lane applied the block",
+        Duration::from_secs(30),
+        || read_block_list(&reopen_store(a)).is_some_and(|list| list.is_blocked(&b_pk)),
+    )
+    .await;
+    held.release();
+    k.aw.wait_for(
+        "the message read before the block",
+        message(k.a_peer, 1, b"before the block"),
+    )
+    .await;
+    settled(&k.a_fake).await;
+    k.aw.drain();
+    let later: Vec<&RunnerEvent> =
+        k.aw.seen
+            .iter()
+            .filter(|event| matches!(event, RunnerEvent::Message { seq: 2 | 3, .. }))
+            .collect();
+    assert!(
+        later.is_empty(),
+        "nothing after the block is reported: {later:?}"
+    );
+    assert!(
+        k.a_fake.faults().gated_ring_reads.len() == 1,
+        "one ring slot was read: {:?}",
+        k.a_fake.faults().gated_ring_reads
+    );
 }
 
 /// Deleting a conversation forgets the route held for its correspondent and

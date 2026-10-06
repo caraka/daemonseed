@@ -209,7 +209,7 @@ use daemonseed_core::dm::flows::{
     RecordError, Records, Surfaced,
 };
 use daemonseed_core::dm::store::{
-    ConvState, LoadedConv, OutboxEntry, OutstandingHello, Store, StoreError,
+    ConvState, LoadedConv, OutboxEntry, OutstandingHello, ReachTake, SetReach, Store, StoreError,
 };
 use daemonseed_core::identity::keys::{DmChannelRootSecret, SignKeypair, IDENTITY_PK_LEN};
 use daemonseed_core::storage::dm_store::{CorrespondenceLabel, DmStoreError, RecordKind};
@@ -349,7 +349,9 @@ pub trait RunnerRecords: Records {
 
     /// Register again the watch on the correspondent's channel at
     /// `lookup_key`, which the store reported dead. A channel the store does
-    /// not watch is left alone. The default watches nothing.
+    /// not watch is left alone. Where the registration fails the channel is
+    /// no longer treated as watched, so its next read registers it. The
+    /// default watches nothing.
     fn rewatch_channel(
         &mut self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
@@ -2270,12 +2272,14 @@ fn closed_control(state: &ConvState, marker: ClosedMarker) -> Option<Vec<u8>> {
 /// the opening, the cursor last published, the generation and the reach the
 /// store holds.
 fn current_control(store: &Store, state: &ConvState) -> Option<Vec<u8>> {
+    let (reach, serial) = store.reach_with_serial();
     own_control(state, |opening| Control {
         opening: Some(opening),
         collected_cursor: state.cursor_published,
         closed: false,
         generation: state.generation,
-        reach: store.reach(),
+        reach,
+        serial,
     })
 }
 
@@ -2309,9 +2313,6 @@ struct Runner<R> {
     /// correspondent's control: just established, or watched again after the
     /// watch died, so a control change may have landed while none was live.
     catch_up: HashSet<CorrespondenceLabel>,
-    /// Whether the first collection after startup has run, which catches up on
-    /// every correspondent's control written while this node was off.
-    startup_collected: bool,
     next_tick: Instant,
     next_advert_poll: Instant,
     /// When a collection pass next scans the drop where no conversation awaits
@@ -2475,7 +2476,6 @@ impl<R: RunnerRecords> Runner<R> {
             collect_now: HashSet::new(),
             publish_owed: HashMap::new(),
             catch_up: HashSet::new(),
-            startup_collected: false,
             next_tick: now + jittered(config.tick),
             next_advert_poll: now + advert::next_poll_interval_os(),
             next_drop_scan: now,
@@ -2818,6 +2818,7 @@ impl<R: RunnerRecords> Runner<R> {
             .map(|repair| repair.due)
             .chain(self.publish_owed.values().map(|owed| owed.due))
             .chain(self.push.route_retry_due())
+            .chain(self.push.reach_retry_due())
             .chain(
                 self.records
                     .reopen_pending
@@ -3590,7 +3591,12 @@ impl<R: RunnerRecords> Runner<R> {
                 if let Some(unopened) = &unopened {
                     self.note_unopened(&peer, unopened);
                 }
-                self.note_reach(&peer, &reach);
+                // The lane took the route against its serial, and hands on
+                // the reach, without its route, only where it took it; its
+                // handle is kept while that serial is still the one applied.
+                if let Some((reach, serial)) = &reach {
+                    let _ = self.take_reach(&peer, reach, *serial);
+                }
                 self.collect_established(peer);
                 self.report_delivery(&peer).await
             }
@@ -3606,14 +3612,21 @@ impl<R: RunnerRecords> Runner<R> {
             }
             live_lane::LaneNote::PeerControls => {
                 for (peer, (reach, cursor)) in self.lane.peer_controls.take() {
-                    self.note_reach(&peer, &reach);
+                    // The lane took the route against its serial; the handle
+                    // is kept while that serial is still the one applied.
+                    if let Some((reach, serial)) = &reach {
+                        let _ = self.take_reach(&peer, reach, *serial);
+                    }
                     self.take_peer_cursor(&peer, cursor);
                     self.report_delivery(&peer).await?;
                 }
                 Ok(())
             }
             live_lane::LaneNote::CollectNow(peer) => {
+                // The change may have been the control, which the ring does
+                // not show.
                 self.collect_now.insert(peer);
+                self.catch_up.insert(peer);
                 Ok(())
             }
             live_lane::LaneNote::PublishCursor(peer) => {
@@ -3881,8 +3894,8 @@ impl<R: RunnerRecords> Runner<R> {
                 if let Some(unopened) = &accepted.unopened {
                     self.note_unopened(&accepted.peer, unopened);
                 }
-                if let Some(reach) = self.held_reach(&request) {
-                    self.note_reach(&accepted.peer, &reach);
+                if let Some((reach, serial)) = self.held_reach(&request) {
+                    let _ = self.take_reach(&accepted.peer, &reach, serial);
                 }
                 self.requests.remove(&request);
                 let peer = accepted.peer;
@@ -4136,6 +4149,7 @@ impl<R: RunnerRecords> Runner<R> {
         self.preview_requests().await?;
         self.serve_queued().await?;
         self.retry_route().await?;
+        self.retry_owed_reach().await?;
         self.retry_reopens().await?;
         self.write_owed_controls().await?;
         self.collect_asked().await?;
@@ -4331,9 +4345,6 @@ impl<R: RunnerRecords> Runner<R> {
             crate::vtrace!("dm runner: collection done, the store would not load");
             return Ok(());
         };
-        // The first collection after startup catches up on what was written
-        // while this node was off; every later one is a sweep of the rings.
-        let catch_up = !std::mem::replace(&mut self.startup_collected, true);
         // How many commands and lane notes had been served when the
         // conversations and the block list were read: anything served since,
         // here or inside an earlier conversation's collection, may have
@@ -4391,7 +4402,10 @@ impl<R: RunnerRecords> Runner<R> {
             {
                 continue;
             }
-            self.collect_conversation(conv, catch_up).await?;
+            // Every sweep also reads the correspondent's control where a
+            // message of this side's is outstanding, which takes a cursor
+            // published while no watch reported it.
+            self.collect_conversation(conv, true).await?;
             collected += 1;
         }
         crate::vtrace!(
@@ -4522,7 +4536,9 @@ impl<R: RunnerRecords> Runner<R> {
         let _step = Step::start(format!("control catch-up of {}", tag(peer)));
         match flows::peer_control(&self.store, &mut self.records, peer) {
             Ok(Some(control)) => {
-                self.note_reach(peer, &control.reach);
+                // An older reach than the one applied is not taken; the
+                // cursor is.
+                let _ = self.take_reach(peer, &control.reach, control.serial);
                 self.take_peer_cursor(peer, control.collected_cursor);
             }
             Ok(None) => {}
@@ -4766,7 +4782,7 @@ impl<R: RunnerRecords> Runner<R> {
             {
                 continue;
             }
-            self.note_reach(&peer, &acceptance.peer_reach);
+            let _ = self.take_reach(&peer, &acceptance.peer_reach, acceptance.peer_reach_serial);
             self.collect_established(peer);
             self.emit(RunnerEvent::Accepted { peer }).await?;
             match self.store.load_conv(&peer) {

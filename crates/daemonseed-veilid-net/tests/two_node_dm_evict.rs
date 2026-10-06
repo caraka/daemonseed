@@ -1540,6 +1540,7 @@ async fn a_rewrites(records: &mut VeilidRecords, state: &Path, notes: &mut Notes
                 closed: false,
                 generation: conv.state.generation,
                 reach: Default::default(),
+                serial: 0,
             },
         )
         .expect("the control reseals");

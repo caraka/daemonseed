@@ -127,12 +127,25 @@ const ROUTE_MAGIC: &[u8] = b"daemonseed/dm/store/rout/v1\0";
 
 /// The version byte a correspondent-route record carries after its magic,
 /// carried apart for [`CONV_RECORD_VERSION`]'s reason.
-const ROUTE_RECORD_VERSION: u8 = 1;
+const ROUTE_RECORD_VERSION: u8 = 2;
 
 /// Bytes a correspondent-route record occupies, and so
 /// [`RecordKind::CorrespondentRoute`]'s bucket: the route's length, then
-/// [`REACH_ROUTE_MAX_LEN`] bytes holding it and zeros after it.
-pub const ROUTE_RECORD_LEN: usize = ROUTE_MAGIC.len() + 1 + 2 + REACH_ROUTE_MAX_LEN;
+/// [`REACH_ROUTE_MAX_LEN`] bytes holding it and zeros after it, then the
+/// highest reach serial applied for the correspondent.
+pub const ROUTE_RECORD_LEN: usize = ROUTE_MAGIC.len() + 1 + 2 + REACH_ROUTE_MAX_LEN + 8;
+
+/// The magic heading the reach-serial record.
+const REACH_SERIAL_MAGIC: &[u8] = b"daemonseed/dm/store/rser/v1\0";
+
+/// The version byte the reach-serial record carries after its magic, carried
+/// apart for [`CONV_RECORD_VERSION`]'s reason.
+const REACH_SERIAL_RECORD_VERSION: u8 = 1;
+
+/// Bytes the reach-serial record occupies, and so
+/// [`RecordKind::ReachSerial`]'s bucket: the last reach serial this node
+/// issued.
+pub const REACH_SERIAL_RECORD_LEN: usize = REACH_SERIAL_MAGIC.len() + 1 + 8;
 
 /// The order [`Store::delete_conv`] removes a correspondence's records in.
 const DELETE_ORDER: [RecordKind; 4] = [
@@ -152,6 +165,29 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn refuse_next_outbox_delete() {
     REFUSE_OUTBOX_DELETE.with(|refuse| refuse.set(true));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by the next [`Store::take_reach`] on this thread, before it
+    /// enters the correspondence's critical section.
+    static BEFORE_TAKE_SECTION: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Run `f` once, at the start of the next [`Store::take_reach`] made on this
+/// thread, before it enters the correspondence's critical section.
+#[cfg(test)]
+pub(crate) fn before_next_take_section(f: impl FnOnce() + 'static) {
+    BEFORE_TAKE_SECTION.with(|slot| *slot.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
+fn before_take_section() {
+    let f = BEFORE_TAKE_SECTION.with(|slot| slot.borrow_mut().take());
+    if let Some(f) = f {
+        f();
+    }
 }
 
 #[cfg(test)]
@@ -523,7 +559,7 @@ pub struct LoadedConv {
     /// record does not decode.
     pub handle: Option<String>,
     /// The private route the correspondent last gave
-    /// ([`Store::record_route`]), or `None` where none is held or its record
+    /// ([`Store::take_reach`]), or `None` where none is held or its record
     /// does not decode.
     pub route: Option<Vec<u8>>,
 }
@@ -538,12 +574,75 @@ pub struct Loaded {
     pub convs: Vec<LoadedConv>,
 }
 
+/// How a reach handed to [`Store::take_reach`] stood against the highest
+/// reach serial applied for its correspondent.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReachTake {
+    /// Above it: the reach was taken, and its serial is now the one applied.
+    Newer,
+    /// At it: the reach already applied. Its route was kept where none was.
+    Same,
+    /// Below it: an older reach, and nothing changed.
+    Older,
+}
+
+impl ReachTake {
+    /// Whether the reach is the one applied now: [`ReachTake::Newer`] or
+    /// [`ReachTake::Same`].
+    pub fn applied(self) -> bool {
+        matches!(self, ReachTake::Newer | ReachTake::Same)
+    }
+}
+
+/// What [`Store::take_reach`] did.
+#[must_use]
+#[derive(Debug)]
+pub struct ReachApplied {
+    /// How the reach's serial stood against the one applied.
+    pub take: ReachTake,
+    /// Whether the reach's handle was written: it is the one applied, its
+    /// handle names the correspondent's identity, and it differs from the
+    /// handle recorded.
+    pub handle_changed: bool,
+    /// Why the handle record would not read or write, where the reach is the
+    /// one applied and its handle was to be compared or written. The take
+    /// stands: its route and serial are written and `hold` was called.
+    pub handle_error: Option<StoreError>,
+}
+
+impl ReachApplied {
+    /// How many records the take found it could not read or write once it
+    /// stood: one where the handle record failed, otherwise none.
+    pub fn faults(&self) -> u64 {
+        u64::from(self.handle_error.is_some())
+    }
+}
+
+/// What [`Store::set_reach`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetReach {
+    /// The reach was the one held, and nothing was issued or written.
+    Unchanged,
+    /// A new serial was issued and written, and the reach is held at it.
+    Issued,
+    /// As [`SetReach::Issued`], over a reach-serial record that did not read
+    /// or did not decode and was overwritten. The serial may be lower than
+    /// one issued before that record was lost ([`Store::set_reach`]).
+    IssuedOverUndecodable,
+}
+
 /// The direct-messaging layer's disk.
 pub struct Store {
     inner: DmStore,
-    /// This node's [`Reach`], held in memory only: every control record a flow
-    /// writes carries it, and nothing of it reaches the disk.
-    reach: std::sync::Mutex<Reach>,
+    /// This node's [`Reach`] and the last reach serial it issued. Every
+    /// control record a flow writes carries both. The reach is held in memory
+    /// only; the serial is also kept in [`RecordKind::ReachSerial`], and read
+    /// back from it at open.
+    reach: std::sync::Mutex<(Reach, u64)>,
+    /// The time a new reach serial is taken from, in milliseconds since the
+    /// Unix epoch.
+    clock: fn() -> u64,
 }
 
 impl core::fmt::Debug for Store {
@@ -553,24 +652,109 @@ impl core::fmt::Debug for Store {
 }
 
 impl Store {
-    /// Open the store under `root`, sealed under the profile's at-rest key.
+    /// Open the store under `root`, sealed under the profile's at-rest key,
+    /// and read back the last reach serial this node issued.
+    ///
+    /// A reach-serial record that is absent, empty, unreadable or undecodable
+    /// is read as no serial issued, so opening never fails on it: a store
+    /// under the wrong key still opens and refuses at its reads. The next
+    /// [`Store::set_reach`] reads the record again under the profile lock and
+    /// reports a record it cannot read.
     pub fn open(
         root: impl Into<PathBuf>,
         at_rest_key: &[u8; AEAD_KEY_LEN],
     ) -> Result<Self, StoreError> {
+        Self::open_with_clock(root, at_rest_key, wall_clock_ms)
+    }
+
+    /// [`Store::open`], taking new reach serials from `clock` rather than the
+    /// system clock.
+    pub(crate) fn open_with_clock(
+        root: impl Into<PathBuf>,
+        at_rest_key: &[u8; AEAD_KEY_LEN],
+        clock: fn() -> u64,
+    ) -> Result<Self, StoreError> {
+        let inner = DmStore::open(root, at_rest_key)?;
+        let issued = inner
+            .read_profile_unlocked(RecordKind::ReachSerial)
+            .ok()
+            .flatten()
+            .and_then(|bytes| decode_reach_serial(&bytes).ok())
+            .unwrap_or(0);
         Ok(Self {
-            inner: DmStore::open(root, at_rest_key)?,
-            reach: std::sync::Mutex::new(Reach::default()),
+            inner,
+            reach: std::sync::Mutex::new((Reach::default(), issued)),
+            clock,
         })
     }
 
-    /// The route and handle every control record written from now on carries.
-    /// Held in memory for the life of this value and never written to disk.
-    pub fn set_reach(&self, reach: Reach) {
-        *self
+    /// Make `reach` the route and handle every control record written from
+    /// now on carries, at a new serial.
+    ///
+    /// Where `reach` is the reach already held this does nothing. Otherwise a
+    /// new serial is issued: the current time in milliseconds, or one past the
+    /// last serial issued where that is not higher, the last one read from
+    /// [`RecordKind::ReachSerial`] under the profile lock as well as from
+    /// memory. The serial is written to that record first, and `reach` and
+    /// its serial are held only once the write has succeeded, so a serial is
+    /// never published that a relaunch could issue again.
+    ///
+    /// Where the record will not read or write, the error is returned and the
+    /// reach and serial held before are kept: control records go on carrying
+    /// that pair. The write is owed, and the next call with a reach other than
+    /// the one held, `reach` again included, makes it.
+    ///
+    /// A record that does not decode, and one that will not read because it
+    /// does not authenticate, is not the record's size or carries the erasure
+    /// sentinel, is treated as absent and overwritten;
+    /// [`SetReach::IssuedOverUndecodable`] reports it. Any other read error,
+    /// I/O among them, is returned. Such a record holds no floor: where memory
+    /// holds none either, as after a relaunch, and the clock reads behind the
+    /// last serial issued, the serial issued over it is lower than one already
+    /// published, because no local record of that serial survives.
+    pub fn set_reach(&self, reach: Reach) -> Result<SetReach, StoreError> {
+        let mut held = self
             .reach
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = reach;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if held.0 == reach {
+            return Ok(SetReach::Unchanged);
+        }
+        let now = (self.clock)();
+        let floor = held.1;
+        let (next, undecodable) = self.inner.profile_critical_section::<_, StoreError>(|g| {
+            let (persisted, undecodable) = match g.read(RecordKind::ReachSerial) {
+                Ok(Some(bytes)) if !bytes.is_empty() => match decode_reach_serial(&bytes) {
+                    Ok(serial) => (serial, false),
+                    Err(_) => (0, true),
+                },
+                Ok(Some(_) | None) => (0, false),
+                Err(
+                    DmStoreError::NotAuthentic { .. }
+                    | DmStoreError::WrongFileLen { .. }
+                    | DmStoreError::ErasureInterrupted { .. },
+                ) => (0, true),
+                Err(e) => return Err(e.into()),
+            };
+            let next = now.max(floor.max(persisted).saturating_add(1));
+            g.replace(RecordKind::ReachSerial, &encode_reach_serial(next))?;
+            Ok((next, undecodable))
+        })?;
+        *held = (reach, next);
+        Ok(if undecodable {
+            SetReach::IssuedOverUndecodable
+        } else {
+            SetReach::Issued
+        })
+    }
+
+    /// The route and handle every control record carries now, and the serial
+    /// they were issued at, read together.
+    pub fn reach_with_serial(&self) -> (Reach, u64) {
+        self.reach
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// The route and handle [`Store::set_reach`] last set, or none.
@@ -578,7 +762,18 @@ impl Store {
         self.reach
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
             .clone()
+    }
+
+    /// The last reach serial issued: 0 where none has been, on this store or
+    /// in an earlier open of it, and higher after each [`Store::set_reach`]
+    /// that changed the reach.
+    pub fn reach_serial(&self) -> u64 {
+        self.reach
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1
     }
 
     /// The record store beneath, for a caller that needs to name a
@@ -818,6 +1013,12 @@ impl Store {
     /// Refuses [`StoreError::MissingConversation`] where `peer` holds no
     /// conversation record, so no handle is kept for a correspondence that
     /// does not exist. The conversation record is only read.
+    ///
+    /// A roster's handle carries no reach serial, so there is no serial to
+    /// compare it with: the comparison with the handle recorded and the write
+    /// are one critical section, the same lock [`Store::take_reach`] keeps a
+    /// reach's handle under, and whichever of the two writes last is the
+    /// handle recorded. Neither decides from a read made outside its section.
     pub fn record_handle(
         &self,
         peer: &CorrespondenceLabel,
@@ -844,52 +1045,226 @@ impl Store {
             .critical_section::<_, StoreError>(peer, read_handle)
     }
 
-    /// Record `route` as the private route `peer`'s correspondent last gave,
-    /// where it differs from the one recorded, and return whether it was
-    /// written. A route that is empty or longer than [`REACH_ROUTE_MAX_LEN`]
-    /// is not kept.
+    /// Take a reach `peer`'s correspondent issued at `serial`: its route and
+    /// its handle, either of which may be absent. Say how its serial stands
+    /// against the highest one applied for it, and whether its handle was
+    /// written.
+    ///
+    /// **The only door that writes a correspondent's route, and the one
+    /// through which a reach's handle is kept.** Everything happens in one
+    /// critical section of the correspondence: the serial is compared, the
+    /// route and serial are written together in one replace of the route
+    /// record, `hold` is called with the outcome, and the handle is compared
+    /// and written. A route therefore never lands without the serial it was
+    /// issued at, and no other take of the same correspondent, by this process
+    /// or another, lands between the comparison and the writes. A reach below
+    /// the serial applied changes nothing: an older reach arriving late cannot
+    /// put back a route or a handle a newer one replaced.
+    ///
+    /// - Above the serial applied ([`ReachTake::Newer`]): the serial moves to
+    ///   it, and the route to the reach's route where it is non-empty and at
+    ///   most [`REACH_ROUTE_MAX_LEN`] bytes; any other leaves the route kept.
+    /// - At the serial applied ([`ReachTake::Same`]): it is the reach already
+    ///   applied, so its route is kept where no route is, as after
+    ///   [`Store::forget_route`]; a route already kept is left as it is.
+    /// - Below it ([`ReachTake::Older`]): nothing changes.
+    ///
+    /// Where the reach is the one applied ([`ReachTake::applied`]), its handle
+    /// is kept where it names the correspondent's identity
+    /// ([`Reach::verified_handle`]) and differs from the one recorded, cut as
+    /// [`Store::record_handle`] cuts it.
+    ///
+    /// `hold` is called inside the section, once the route record is written
+    /// and before the handle is, with the outcome. A caller that keeps a copy
+    /// of the correspondent's route in memory updates it there, so the copy
+    /// moves in the same order as the record and never against a stale view
+    /// of it. `hold` must not call back into this store. It is not called
+    /// where the route record will not read or write.
+    ///
+    /// A route record that will not read, including one that does not
+    /// authenticate or is not the record's size, is an error, returned before
+    /// anything is written: the serial it held is the floor, and nothing
+    /// written over it could be checked against that floor. A route record
+    /// that authenticates and is the record's size but does not decode reads
+    /// as no route at serial 0, as no record does, and is not an error.
+    ///
+    /// A handle record that will not read or write once `hold` was called
+    /// leaves the take standing, and [`ReachApplied::handle_error`] carries
+    /// the error.
     ///
     /// Refuses [`StoreError::MissingConversation`] where `peer` holds no
-    /// conversation record. The conversation record is only read.
-    pub fn record_route(
+    /// conversation record, without calling `hold`. The conversation record
+    /// is only read.
+    ///
+    /// No other door writes either half of the route record alone. Neither of
+    /// these compiles:
+    ///
+    /// ```compile_fail
+    /// # use daemonseed_core::dm::store::Store;
+    /// # use daemonseed_core::storage::dm_store::CorrespondenceLabel;
+    /// # fn f(store: &Store, peer: &CorrespondenceLabel) {
+    /// let _ = store.record_route(peer, &[1]);
+    /// # }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use daemonseed_core::dm::store::Store;
+    /// # use daemonseed_core::storage::dm_store::CorrespondenceLabel;
+    /// # fn f(store: &Store, peer: &CorrespondenceLabel) {
+    /// let _ = store.apply_reach_serial(peer, 1);
+    /// # }
+    /// ```
+    ///
+    /// while the same call through this door does:
+    ///
+    /// ```
+    /// # use daemonseed_core::dm::channel::Reach;
+    /// # use daemonseed_core::dm::store::Store;
+    /// # use daemonseed_core::storage::dm_store::CorrespondenceLabel;
+    /// # fn f(store: &Store, peer: &CorrespondenceLabel) {
+    /// let reach = Reach { route: Some(vec![1]), handle: None };
+    /// let _ = store.take_reach(peer, 1, &reach, |_| {});
+    /// # }
+    /// ```
+    pub fn take_reach(
         &self,
         peer: &CorrespondenceLabel,
-        route: &[u8],
-    ) -> Result<bool, StoreError> {
+        serial: u64,
+        reach: &Reach,
+        hold: impl FnOnce(ReachTake),
+    ) -> Result<ReachApplied, StoreError> {
+        #[cfg(test)]
+        before_take_section();
+        self.inner.critical_section::<_, StoreError>(peer, |g| {
+            let state = read_conv(g)?.ok_or(StoreError::MissingConversation)?;
+            let (held_route, held_serial) = read_route_record(g)?;
+            let route = reach
+                .route
+                .as_deref()
+                .filter(|route| !route.is_empty() && route.len() <= REACH_ROUTE_MAX_LEN);
+            let take = if serial < held_serial {
+                ReachTake::Older
+            } else if serial == held_serial {
+                if let (None, Some(route)) = (&held_route, route) {
+                    g.replace(RecordKind::CorrespondentRoute, &encode_route(route, serial))?;
+                }
+                ReachTake::Same
+            } else {
+                let route = route.or(held_route.as_deref()).unwrap_or(&[]);
+                g.replace(RecordKind::CorrespondentRoute, &encode_route(route, serial))?;
+                ReachTake::Newer
+            };
+            hold(take);
+            let handle = take
+                .applied()
+                .then(|| reach.verified_handle(state.peer_identity_pk.as_slice()))
+                .flatten();
+            let written: Result<bool, StoreError> = handle.map_or(Ok(false), |handle| {
+                let handle = cut_handle(&handle);
+                if read_handle(g)?.as_deref() == Some(handle) {
+                    return Ok(false);
+                }
+                g.replace(RecordKind::CorrespondentHandle, &encode_handle(handle))?;
+                Ok(true)
+            });
+            let (handle_changed, handle_error) = match written {
+                Ok(changed) => (changed, None),
+                Err(e) => (false, Some(e)),
+            };
+            Ok(ReachApplied {
+                take,
+                handle_changed,
+                handle_error,
+            })
+        })
+    }
+
+    /// [`Store::take_reach`] for a reach carrying `route` and no handle, with
+    /// nothing held in memory.
+    #[cfg(test)]
+    pub(crate) fn apply_reach(
+        &self,
+        peer: &CorrespondenceLabel,
+        serial: u64,
+        route: Option<&[u8]>,
+    ) -> Result<ReachTake, StoreError> {
+        let reach = Reach {
+            route: route.map(<[u8]>::to_vec),
+            handle: None,
+        };
+        Ok(self.take_reach(peer, serial, &reach, |_| {})?.take)
+    }
+
+    /// Hand the route kept for `peer`'s correspondent and the reach serial
+    /// applied for it to `hold`, read together inside the correspondence's
+    /// critical section, so no [`Store::take_reach`] lands between the read
+    /// and whatever `hold` does with the pair. `hold` must not call back into
+    /// this store.
+    ///
+    /// Refuses [`StoreError::MissingConversation`] where `peer` holds no
+    /// conversation record, without calling `hold`.
+    pub fn with_route<R>(
+        &self,
+        peer: &CorrespondenceLabel,
+        hold: impl FnOnce(Option<&[u8]>, u64) -> R,
+    ) -> Result<R, StoreError> {
         self.inner.critical_section::<_, StoreError>(peer, |g| {
             if read_conv(g)?.is_none() {
                 return Err(StoreError::MissingConversation);
             }
-            if route.is_empty() || route.len() > REACH_ROUTE_MAX_LEN {
-                return Ok(false);
-            }
-            if read_route(g)?.as_deref() == Some(route) {
-                return Ok(false);
-            }
-            g.replace(RecordKind::CorrespondentRoute, &encode_route(route))?;
-            Ok(true)
+            let (route, serial) = read_route_record(g)?;
+            Ok(hold(route.as_deref(), serial))
         })
     }
 
+    /// Make every record of `peer`'s correspondence that reads now durable
+    /// ([`Locked::sync`]). A caller about to answer for a reach that
+    /// [`Store::take_reach`] found already applied calls this first: the
+    /// record it found may be one whose write landed and was not yet durable.
+    pub fn sync_correspondence(&self, peer: &CorrespondenceLabel) -> Result<(), StoreError> {
+        self.inner
+            .critical_section::<_, StoreError>(peer, |g| Ok(g.sync()?))
+    }
+
+    /// The highest reach serial [`Store::take_reach`] took for `peer`'s
+    /// correspondent, or 0.
+    pub fn reach_serial_of(&self, peer: &CorrespondenceLabel) -> Result<u64, StoreError> {
+        self.inner
+            .critical_section::<_, StoreError>(peer, |g| Ok(read_route_record(g)?.1))
+    }
+
     /// Remove the route recorded for `peer`'s correspondent where it is
-    /// `route`, and return whether it was removed. A route recorded since is
-    /// kept. Nothing else of the correspondence is touched.
+    /// `route`, keeping the reach serial applied, and return whether it was
+    /// removed. A route recorded since is kept. Nothing else of the
+    /// correspondence is touched.
+    ///
+    /// `forget` is called inside the correspondence's critical section, after
+    /// the record is read and any removal written, whether or not the record
+    /// held `route`, so a caller forgets its copy of the route in memory in
+    /// the same order as every [`Store::take_reach`]. `forget` must not call
+    /// back into this store. It is not called where the section is not
+    /// entered or the record will not read or write.
     pub fn forget_route(
         &self,
         peer: &CorrespondenceLabel,
         route: &[u8],
+        forget: impl FnOnce(),
     ) -> Result<bool, StoreError> {
         self.inner.critical_section::<_, StoreError>(peer, |g| {
-            if read_route(g)?.as_deref() != Some(route) {
-                return Ok(false);
+            let (held, serial) = read_route_record(g)?;
+            let removed = held.as_deref() == Some(route);
+            if removed && serial == 0 {
+                g.delete(RecordKind::CorrespondentRoute)?;
+            } else if removed {
+                g.replace(RecordKind::CorrespondentRoute, &encode_route(&[], serial))?;
             }
-            g.delete(RecordKind::CorrespondentRoute)?;
-            Ok(true)
+            forget();
+            Ok(removed)
         })
     }
 
     /// The route recorded for `peer`'s correspondent by
-    /// [`Store::record_route`], or `None` where none was, or its record does
+    /// [`Store::take_reach`], or `None` where none was, or its record does
     /// not decode.
     pub fn route(&self, peer: &CorrespondenceLabel) -> Result<Option<Vec<u8>>, StoreError> {
         self.inner
@@ -1201,45 +1576,81 @@ fn read_handle(g: &mut Locked<'_>) -> Result<Option<String>, StoreError> {
     Ok(decode_handle(&bytes).ok())
 }
 
-/// The correspondent-route record under an open guard, or `None` where there
-/// is none or it does not decode, for [`read_handle`]'s reason: the route is
-/// only an address to try.
+/// The system clock in milliseconds since the Unix epoch, or 0 where it reads
+/// before the epoch.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
+/// Encode the reach-serial record: the last reach serial this node issued.
+pub(crate) fn encode_reach_serial(serial: u64) -> Vec<u8> {
+    let mut w = Writer::with_capacity(REACH_SERIAL_RECORD_LEN);
+    w.bytes(REACH_SERIAL_MAGIC);
+    w.u8(REACH_SERIAL_RECORD_VERSION);
+    w.u64(serial);
+    w.0.to_vec()
+}
+
+/// Decode the reach-serial record into the serial it holds.
+pub(crate) fn decode_reach_serial(bytes: &[u8]) -> Result<u64, StoreError> {
+    let mut r = Reader::new(bytes, RecordKind::ReachSerial);
+    r.header_version(REACH_SERIAL_MAGIC, REACH_SERIAL_RECORD_VERSION)?;
+    let serial = r.u64()?;
+    r.finish()?;
+    Ok(serial)
+}
+
 /// The correspondent-route record under an open guard, or `None` where there
 /// is none or it does not decode, for [`read_handle`]'s reason: the route is
 /// only an address to try.
 fn read_route(g: &mut Locked<'_>) -> Result<Option<Vec<u8>>, StoreError> {
-    let Some(bytes) = read_finishing_delete(g, RecordKind::CorrespondentRoute)? else {
-        return Ok(None);
-    };
-    Ok(decode_route(&bytes).ok())
+    Ok(read_route_record(g)?.0)
 }
 
-/// Encode a correspondent-route record. `route` is at most
-/// [`REACH_ROUTE_MAX_LEN`] bytes.
-pub(crate) fn encode_route(route: &[u8]) -> Zeroizing<Vec<u8>> {
+/// The route and reach serial a correspondent-route record holds: no route
+/// and serial 0 where there is no record or it does not decode.
+fn read_route_record(g: &mut Locked<'_>) -> Result<(Option<Vec<u8>>, u64), StoreError> {
+    let Some(bytes) = read_finishing_delete(g, RecordKind::CorrespondentRoute)? else {
+        return Ok((None, 0));
+    };
+    Ok(decode_route(&bytes).unwrap_or((None, 0)))
+}
+
+/// Encode a correspondent-route record: `route`, empty for none, at most
+/// [`REACH_ROUTE_MAX_LEN`] bytes, and the reach serial applied.
+pub(crate) fn encode_route(route: &[u8], serial: u64) -> Zeroizing<Vec<u8>> {
     let route = &route[..route.len().min(REACH_ROUTE_MAX_LEN)];
     let mut w = Writer::with_capacity(ROUTE_RECORD_LEN);
     w.bytes(ROUTE_MAGIC);
     w.u8(ROUTE_RECORD_VERSION);
     w.u16(route.len() as u16);
     w.padded(route, REACH_ROUTE_MAX_LEN);
+    w.bytes(&serial.to_be_bytes());
     w.0
 }
 
-/// Decode a correspondent-route record. A record holding an empty route is
-/// refused, as no route is ever recorded empty.
-pub(crate) fn decode_route(bytes: &[u8]) -> Result<Vec<u8>, StoreError> {
+/// Decode a correspondent-route record into its route, `None` where it holds
+/// none, and its reach serial.
+pub(crate) fn decode_route(bytes: &[u8]) -> Result<(Option<Vec<u8>>, u64), StoreError> {
     let mut r = Reader::new(bytes, RecordKind::CorrespondentRoute);
     r.header_version(ROUTE_MAGIC, ROUTE_RECORD_VERSION)?;
     let len = usize::from(r.u16()?);
     let field = r.take(REACH_ROUTE_MAX_LEN)?;
     let route = field
         .get(..len)
-        .filter(|route| !route.is_empty())
         .ok_or_else(|| r.corrupt("the route's length runs past its field"))?
         .to_vec();
+    let serial = u64::from_be_bytes(
+        r.take(8)?
+            .try_into()
+            .map_err(|_| r.corrupt("the serial runs out"))?,
+    );
     r.finish()?;
-    Ok(route)
+    Ok(((!route.is_empty()).then_some(route), serial))
 }
 
 /// `handle`, cut to at most [`HANDLE_MAX_LEN`] bytes at a character boundary.
@@ -3504,7 +3915,7 @@ mod tests {
             let store = Store::open(tmp.path(), &at_rest_key(0x4b)).unwrap();
             assert!(
                 matches!(
-                    store.record_route(&peer, &first),
+                    store.apply_reach(&peer, 1, Some(&first)),
                     Err(StoreError::MissingConversation)
                 ),
                 "no route is kept for a correspondence with no conversation"
@@ -3515,32 +3926,55 @@ mod tests {
             store.persist_outbox(&peer, 1, &[0x7e; 64], NOW).unwrap();
             assert!(store.record_handle(&peer, "anna").unwrap());
             assert_eq!(store.load().unwrap().convs[0].route, None);
-            assert!(store.record_route(&peer, &first).unwrap(), "first write");
-            assert!(!store.record_route(&peer, &first).unwrap(), "unchanged");
-            assert!(
-                !store.record_route(&peer, &[]).unwrap(),
-                "an empty route is not kept"
+            assert_eq!(
+                store.apply_reach(&peer, 10, Some(&first)).unwrap(),
+                ReachTake::Newer,
+                "first write"
+            );
+            assert_eq!(
+                store.apply_reach(&peer, 10, Some(&first)).unwrap(),
+                ReachTake::Same,
+                "the serial already applied"
+            );
+            assert_eq!(
+                store.apply_reach(&peer, 11, Some(&[])).unwrap(),
+                ReachTake::Newer,
+                "an empty route moves the serial"
             );
             let over = vec![0x33; REACH_ROUTE_MAX_LEN + 1];
-            assert!(
-                !store.record_route(&peer, &over).unwrap(),
-                "a route longer than a control record carries is not kept"
+            assert_eq!(
+                store.apply_reach(&peer, 12, Some(&over)).unwrap(),
+                ReachTake::Newer,
+                "an over-long route moves the serial"
+            );
+            assert_eq!(
+                store.route(&peer).unwrap().as_deref(),
+                Some(first.as_slice()),
+                "neither an empty nor an over-long route is kept"
             );
         }
         let store = Store::open(tmp.path(), &at_rest_key(0x4b)).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded.convs.len(), 1);
         assert_eq!(loaded.convs[0].route.as_deref(), Some(first.as_slice()));
+        assert_eq!(store.reach_serial_of(&peer).unwrap(), 12);
         let state_before = format!("{:?}", loaded.convs[0].state);
         let outbox_before = loaded.convs[0].outstanding_outbox.clone();
 
-        assert!(store.record_route(&peer, &second).unwrap(), "changed");
+        assert_eq!(
+            store.apply_reach(&peer, 13, Some(&second)).unwrap(),
+            ReachTake::Newer,
+            "changed"
+        );
         assert!(
-            !store.forget_route(&peer, &first).unwrap(),
+            !store.forget_route(&peer, &first, || {}).unwrap(),
             "a route no longer held is not forgotten"
         );
         assert_eq!(store.route(&peer).unwrap(), Some(second.clone()));
-        assert!(store.forget_route(&peer, &second).unwrap(), "forgotten");
+        assert!(
+            store.forget_route(&peer, &second, || {}).unwrap(),
+            "forgotten"
+        );
         assert_eq!(store.route(&peer).unwrap(), None);
 
         let loaded = store.load().unwrap();
@@ -3552,7 +3986,10 @@ mod tests {
         assert_eq!(conv.outstanding_outbox.len(), 1);
         assert_eq!(conv.handle.as_deref(), Some("anna"));
 
-        assert!(store.record_route(&peer, &first).unwrap());
+        assert_eq!(
+            store.apply_reach(&peer, 14, Some(&first)).unwrap(),
+            ReachTake::Newer
+        );
         store.delete_conv(&peer).unwrap();
         assert_eq!(
             store.route(&peer).unwrap(),
@@ -3565,15 +4002,16 @@ mod tests {
     /// that does not decode reads as no route rather than failing the load.
     #[test]
     fn a_route_record_is_one_size_and_an_undecodable_one_is_no_route() {
-        assert_eq!(encode_route(&[1]).len(), ROUTE_RECORD_LEN);
+        assert_eq!(encode_route(&[1], 0).len(), ROUTE_RECORD_LEN);
         assert_eq!(
-            encode_route(&[1; REACH_ROUTE_MAX_LEN]).len(),
+            encode_route(&[1; REACH_ROUTE_MAX_LEN], 9).len(),
             ROUTE_RECORD_LEN
         );
         assert_eq!(
-            decode_route(&encode_route(&[5; 300])).unwrap(),
-            vec![5; 300]
+            decode_route(&encode_route(&[5; 300], 7)).unwrap(),
+            (Some(vec![5; 300]), 7)
         );
+        assert_eq!(decode_route(&encode_route(&[], 7)).unwrap(), (None, 7));
         let (a, _b) = pair();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(0x4c)).unwrap();
@@ -3590,6 +4028,606 @@ mod tests {
         let loaded = store.load().unwrap();
         assert_eq!(loaded.convs.len(), 1, "the conversation still loads");
         assert_eq!(loaded.convs[0].route, None);
+    }
+
+    /// A reach is taken whole or not at all: [`Store::take_reach`] writes the
+    /// route and its serial together, so what reads back is always a route
+    /// beside the serial it was issued at, and a reach at or below the serial
+    /// applied, arriving after a newer one, leaves the newer route in place.
+    #[test]
+    fn a_reach_writes_its_route_and_serial_together_and_an_older_one_changes_nothing() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = label(0x5a);
+        let (old, new) = (vec![0x61; 300], vec![0x62; 400]);
+        let store = Store::open(tmp.path(), &at_rest_key(0x5b)).unwrap();
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        let read_back = |store: &Store| {
+            (
+                store.route(&peer).unwrap(),
+                store.reach_serial_of(&peer).unwrap(),
+            )
+        };
+
+        assert_eq!(
+            store.apply_reach(&peer, 5, Some(&old)).unwrap(),
+            ReachTake::Newer
+        );
+        assert_eq!(read_back(&store), (Some(old.clone()), 5));
+        assert_eq!(
+            store.apply_reach(&peer, 9, Some(&new)).unwrap(),
+            ReachTake::Newer
+        );
+        assert_eq!(read_back(&store), (Some(new.clone()), 9));
+
+        // The older reach arriving late, at a lower serial and at the same
+        // one: neither moves the route nor the serial.
+        assert_eq!(
+            store.apply_reach(&peer, 5, Some(&old)).unwrap(),
+            ReachTake::Older
+        );
+        assert_eq!(
+            store.apply_reach(&peer, 9, Some(&old)).unwrap(),
+            ReachTake::Same
+        );
+        assert_eq!(read_back(&store), (Some(new.clone()), 9));
+
+        // A newer reach naming no route moves the serial and keeps the route.
+        assert_eq!(
+            store.apply_reach(&peer, 12, None).unwrap(),
+            ReachTake::Newer
+        );
+        assert_eq!(read_back(&store), (Some(new.clone()), 12));
+
+        // The pair survives a reopen as written.
+        drop(store);
+        let store = Store::open(tmp.path(), &at_rest_key(0x5b)).unwrap();
+        assert_eq!(read_back(&store), (Some(new.clone()), 12));
+        assert_eq!(store.load().unwrap().convs[0].route, Some(new));
+    }
+
+    /// A reach at the serial already applied is that same reach: where its
+    /// route was forgotten it is kept again, at the same serial, and where a
+    /// route is kept it changes nothing.
+    #[test]
+    fn a_reach_at_the_serial_applied_puts_back_a_forgotten_route_and_changes_nothing_else() {
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = label(0x5d);
+        let (live, other) = (vec![0x71; 200], vec![0x72; 200]);
+        let store = Store::open(tmp.path(), &at_rest_key(0x5e)).unwrap();
+        store
+            .create_conv(&peer, &conv_state(&a, 1, 0, 0, None))
+            .unwrap();
+        let read_back = |store: &Store| {
+            (
+                store.route(&peer).unwrap(),
+                store.reach_serial_of(&peer).unwrap(),
+            )
+        };
+        assert_eq!(
+            store.apply_reach(&peer, 9, Some(&live)).unwrap(),
+            ReachTake::Newer
+        );
+        assert!(store.forget_route(&peer, &live, || {}).unwrap());
+        assert_eq!(read_back(&store), (None, 9), "forgotten, the serial kept");
+
+        assert_eq!(
+            store.apply_reach(&peer, 9, Some(&live)).unwrap(),
+            ReachTake::Same
+        );
+        assert_eq!(read_back(&store), (Some(live.clone()), 9), "kept again");
+        assert_eq!(
+            store.apply_reach(&peer, 9, Some(&other)).unwrap(),
+            ReachTake::Same
+        );
+        assert_eq!(
+            read_back(&store),
+            (Some(live.clone()), 9),
+            "a route already kept is not replaced at the same serial"
+        );
+        assert_eq!(store.apply_reach(&peer, 8, None).unwrap(), ReachTake::Older);
+        assert_eq!(read_back(&store), (Some(live), 9));
+    }
+
+    /// The clock a store under test issues reach serials from: well ahead of
+    /// [`clock_behind`].
+    fn clock_ahead() -> u64 {
+        5_000_000
+    }
+
+    /// The clock a relaunch whose clock went backwards issues from.
+    fn clock_behind() -> u64 {
+        1_000
+    }
+
+    fn reach_at(route: u8) -> Reach {
+        Reach {
+            route: Some(vec![route; 32]),
+            handle: None,
+        }
+    }
+
+    /// A serial issued after a reopen whose clock is behind the last serial
+    /// issued is still above it: the last one is kept on disk and read back
+    /// at open.
+    #[test]
+    fn a_reach_serial_issued_after_a_reopen_with_the_clock_behind_is_higher() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let issued = {
+            let store =
+                Store::open_with_clock(tmp.path(), &at_rest_key(0x5c), clock_ahead).unwrap();
+            assert_eq!(store.reach_serial(), 0, "nothing issued yet");
+            store.set_reach(reach_at(1)).unwrap();
+            let issued = store.reach_serial();
+            assert_eq!(issued, clock_ahead());
+            store.set_reach(reach_at(1)).unwrap();
+            assert_eq!(
+                store.reach_serial(),
+                issued,
+                "an unchanged reach issues nothing"
+            );
+            issued
+        };
+
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x5c), clock_behind).unwrap();
+        assert_eq!(store.reach_serial(), issued, "read back at open");
+        store.set_reach(reach_at(2)).unwrap();
+        assert!(
+            store.reach_serial() > issued,
+            "{} issued after {issued}",
+            store.reach_serial()
+        );
+        // Positive control: the clock this store reads is behind, so the
+        // serial above did not come from it.
+        assert!(clock_behind() < issued);
+
+        // And the higher serial is what the next open reads.
+        let next = store.reach_serial();
+        drop(store);
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x5c), clock_behind).unwrap();
+        assert_eq!(store.reach_serial(), next);
+    }
+
+    /// A serial whose write fails is not held: control records go on carrying
+    /// the reach and serial written before, and the next call makes the write
+    /// and holds the new pair, which a reopen reads back.
+    #[test]
+    fn a_reach_serial_that_is_not_written_is_not_held() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x5f), clock_behind).unwrap();
+        assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
+        let written = store.reach_with_serial();
+        assert_eq!(written, (reach_at(1), clock_behind()));
+
+        let mode = |bits| std::fs::Permissions::from_mode(bits);
+        std::fs::set_permissions(tmp.path(), mode(0o500)).unwrap();
+        let refused = store.set_reach(reach_at(2));
+        std::fs::set_permissions(tmp.path(), mode(0o700)).unwrap();
+        assert!(refused.is_err(), "the write was refused: {refused:?}");
+        assert_eq!(
+            store.reach_with_serial(),
+            written,
+            "the pair held before is the one carried"
+        );
+
+        assert_eq!(store.set_reach(reach_at(2)).unwrap(), SetReach::Issued);
+        let (reach, serial) = store.reach_with_serial();
+        assert_eq!(reach, reach_at(2));
+        assert!(serial > written.1);
+        drop(store);
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x5f), clock_behind).unwrap();
+        assert_eq!(store.reach_serial(), serial, "the owed write was made");
+    }
+
+    /// A reach-serial record that does not decode is treated as absent and
+    /// overwritten with a serial above the one held in memory and the clock,
+    /// and the call says so.
+    #[test]
+    fn an_undecodable_reach_serial_record_is_overwritten_and_reported() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x60), clock_ahead).unwrap();
+        assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
+        let held = store.reach_serial();
+        store
+            .records()
+            .profile_critical_section::<_, DmStoreError>(|g| {
+                g.replace(RecordKind::ReachSerial, b"not a reach serial")
+            })
+            .unwrap();
+        assert_eq!(
+            store.set_reach(reach_at(2)).unwrap(),
+            SetReach::IssuedOverUndecodable
+        );
+        assert_eq!(store.reach_serial(), held + 1, "above the serial held");
+        let written = store
+            .records()
+            .read_profile_unlocked(RecordKind::ReachSerial)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_reach_serial(&written).unwrap(), held + 1);
+
+        // Opened over a record that does not decode, memory holds nothing, so
+        // the clock gives the serial.
+        drop(store);
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x60), clock_behind).unwrap();
+        store
+            .records()
+            .profile_critical_section::<_, DmStoreError>(|g| {
+                g.replace(RecordKind::ReachSerial, b"not a reach serial")
+            })
+            .unwrap();
+        let reopened =
+            Store::open_with_clock(tmp.path(), &at_rest_key(0x60), clock_behind).unwrap();
+        assert_eq!(reopened.reach_serial(), 0);
+        assert_eq!(
+            reopened.set_reach(reach_at(3)).unwrap(),
+            SetReach::IssuedOverUndecodable
+        );
+        assert_eq!(reopened.reach_serial(), clock_behind());
+    }
+
+    /// Two stores open on one root each issue a serial above the last one the
+    /// other wrote, whatever each holds in memory.
+    #[test]
+    fn two_stores_on_one_root_issue_rising_serials() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let a = Store::open_with_clock(tmp.path(), &at_rest_key(0x61), clock_behind).unwrap();
+        let b = Store::open_with_clock(tmp.path(), &at_rest_key(0x61), clock_behind).unwrap();
+        a.set_reach(reach_at(1)).unwrap();
+        b.set_reach(reach_at(2)).unwrap();
+        assert!(
+            b.reach_serial() > a.reach_serial(),
+            "{} issued after {}",
+            b.reach_serial(),
+            a.reach_serial()
+        );
+    }
+
+    /// A reach-serial record that will not read, because it does not
+    /// authenticate or is not the record's size, is overwritten as an
+    /// undecodable one is, and the call says so.
+    #[test]
+    fn an_unreadable_reach_serial_record_is_overwritten_and_reported() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x62), clock_ahead).unwrap();
+        assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
+
+        // Sealed under another key: the record does not authenticate.
+        let other = Store::open_with_clock(tmp.path(), &at_rest_key(0x63), clock_ahead).unwrap();
+        assert!(matches!(
+            other
+                .records()
+                .read_profile_unlocked(RecordKind::ReachSerial),
+            Err(DmStoreError::NotAuthentic { .. })
+        ));
+        assert_eq!(
+            other.set_reach(reach_at(2)).unwrap(),
+            SetReach::IssuedOverUndecodable
+        );
+
+        // Cut short: the record is not its size.
+        let path = tmp.path().join("reach-serial.bin");
+        assert!(path.is_file(), "the record is at {path:?}");
+        std::fs::write(&path, b"short").unwrap();
+        assert!(matches!(
+            store
+                .records()
+                .read_profile_unlocked(RecordKind::ReachSerial),
+            Err(DmStoreError::WrongFileLen { .. })
+        ));
+        let held = store.reach_serial();
+        assert_eq!(
+            store.set_reach(reach_at(3)).unwrap(),
+            SetReach::IssuedOverUndecodable
+        );
+        assert_eq!(store.reach_serial(), held + 1, "above the serial held");
+        let written = store
+            .records()
+            .read_profile_unlocked(RecordKind::ReachSerial)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_reach_serial(&written).unwrap(), held + 1);
+    }
+
+    /// A reach's handle is compared with the serial applied and written in one
+    /// critical section: a newer reach and its handle, taken by another store
+    /// on the same root just before the section, are kept, and the older
+    /// reach's handle is not written over them.
+    #[test]
+    fn a_newer_handle_taken_just_before_a_reachs_section_is_kept() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let (a, _b) = pair();
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = label(0x64);
+        let store = Store::open(tmp.path(), &at_rest_key(0x65)).unwrap();
+        store
+            .create_conv(&peer, &conv_state(&a, 0, 0, 0, None))
+            .unwrap();
+        let hash: String = crate::handle::Handle::from_pubkey(None, identity_pk(0x7e).as_slice())
+            .unwrap()
+            .hash_prefix()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let reach = |route: Option<u8>, name: &str| Reach {
+            route: route.map(|byte| vec![byte; 16]),
+            handle: Some(format!("{name}#{hash}")),
+        };
+        let taken = store
+            .take_reach(&peer, 5, &reach(Some(1), "first"), |_| {})
+            .unwrap();
+        assert_eq!(taken.take, ReachTake::Newer);
+        assert!(taken.handle_changed, "the handle is kept");
+
+        let other = std::sync::Arc::new(Store::open(tmp.path(), &at_rest_key(0x65)).unwrap());
+        let newer = std::sync::Arc::clone(&other);
+        let newer_reach = reach(Some(2), "newer");
+        before_next_take_section(move || {
+            let taken = newer.take_reach(&peer, 9, &newer_reach, |_| {}).unwrap();
+            assert_eq!(taken.take, ReachTake::Newer);
+            assert!(taken.handle_changed);
+        });
+        let mut held = None;
+        let late = store
+            .take_reach(&peer, 5, &reach(None, "late"), |take| held = Some(take))
+            .unwrap();
+        assert_eq!(
+            store.handle(&peer).unwrap(),
+            Some(format!("newer#{hash}")),
+            "the newer handle is kept"
+        );
+        assert!(!late.handle_changed);
+        assert_eq!(store.route(&peer).unwrap(), Some(vec![2; 16]));
+        assert_eq!(store.reach_serial_of(&peer).unwrap(), 9);
+        assert_eq!(late.take, ReachTake::Older, "the newer reach landed first");
+        assert_eq!(held, Some(ReachTake::Older), "hold saw the same outcome");
+    }
+
+    /// A store holding a conversation for `peer`, its correspondent's
+    /// identity `identity_pk(0x7e)`, and a reach builder whose handle names
+    /// that identity.
+    fn store_with_reach(
+        tmp: &tempfile::TempDir,
+        peer: &CorrespondenceLabel,
+        key: u8,
+    ) -> (Store, impl Fn(Option<u8>, &str) -> Reach) {
+        let (a, _b) = pair();
+        let store = Store::open(tmp.path(), &at_rest_key(key)).unwrap();
+        store
+            .create_conv(peer, &conv_state(&a, 0, 0, 0, None))
+            .unwrap();
+        let hash: String = crate::handle::Handle::from_pubkey(None, identity_pk(0x7e).as_slice())
+            .unwrap()
+            .hash_prefix()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let reach = move |route: Option<u8>, name: &str| Reach {
+            route: route.map(|byte| vec![byte; 16]),
+            handle: Some(format!("{name}#{hash}")),
+        };
+        (store, reach)
+    }
+
+    /// The path of `peer`'s `kind` record under `tmp`.
+    fn record_path(
+        tmp: &tempfile::TempDir,
+        peer: &CorrespondenceLabel,
+        kind: RecordKind,
+    ) -> std::path::PathBuf {
+        tmp.path()
+            .join(hex::encode(peer.as_bytes()))
+            .join(kind.file_name())
+    }
+
+    /// A handle record that will not read leaves the take standing: the
+    /// route and serial are written, `hold` sees the take, and the handle's
+    /// failure is reported beside it rather than as the take's.
+    #[test]
+    fn a_handle_record_that_will_not_read_is_reported_beside_the_take() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = label(0x66);
+        let (store, reach) = store_with_reach(&tmp, &peer, 0x67);
+        let taken = store
+            .take_reach(&peer, 5, &reach(Some(1), "first"), |_| {})
+            .unwrap();
+        assert!(taken.handle_changed, "the handle is kept");
+        std::fs::write(
+            record_path(&tmp, &peer, RecordKind::CorrespondentHandle),
+            b"short",
+        )
+        .unwrap();
+
+        let mut held = None;
+        let taken = store
+            .take_reach(&peer, 9, &reach(Some(2), "newer"), |take| held = Some(take))
+            .expect("the take stands");
+        assert_eq!(taken.take, ReachTake::Newer);
+        assert_eq!(held, Some(ReachTake::Newer), "hold saw the take");
+        assert!(!taken.handle_changed);
+        assert!(matches!(
+            taken.handle_error,
+            Some(StoreError::Store(DmStoreError::WrongFileLen { .. }))
+        ));
+        assert_eq!(taken.faults(), 1, "one record failed");
+        assert_eq!(store.route(&peer).unwrap(), Some(vec![2; 16]));
+        assert_eq!(store.reach_serial_of(&peer).unwrap(), 9);
+    }
+
+    /// A route record that will not read, because it does not authenticate
+    /// or is not the record's size, is refused: the take is an error, `hold`
+    /// is not called, and the record's bytes are left as they were, so an
+    /// older reach is never written where the serial it would be checked
+    /// against cannot be read.
+    #[test]
+    fn an_unreadable_route_record_is_refused_and_nothing_is_written() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let peer = label(0x68);
+        let (store, reach) = store_with_reach(&tmp, &peer, 0x69);
+        let _ = store
+            .take_reach(&peer, 5, &reach(Some(1), "first"), |_| {})
+            .unwrap();
+        let route = record_path(&tmp, &peer, RecordKind::CorrespondentRoute);
+        let handle = record_path(&tmp, &peer, RecordKind::CorrespondentHandle);
+        let handle_before = std::fs::read(&handle).unwrap();
+
+        // Not the record's size.
+        std::fs::write(&route, b"short").unwrap();
+        let mut held = false;
+        let taken = store.take_reach(&peer, 3, &reach(Some(2), "older"), |_| held = true);
+        assert!(
+            matches!(
+                taken,
+                Err(StoreError::Store(DmStoreError::WrongFileLen { .. }))
+            ),
+            "{taken:?}"
+        );
+        assert!(!held, "hold is not called");
+        assert_eq!(std::fs::read(&route).unwrap(), b"short", "nothing written");
+        assert_eq!(std::fs::read(&handle).unwrap(), handle_before);
+
+        // Sealed under another key: it does not authenticate.
+        let other = Store::open(tmp.path(), &at_rest_key(0x6a)).unwrap();
+        other
+            .records()
+            .critical_section::<_, DmStoreError>(&peer, |g| {
+                g.replace(RecordKind::CorrespondentRoute, &encode_route(&[3; 16], 7))
+            })
+            .unwrap();
+        let sealed = std::fs::read(&route).unwrap();
+        let taken = store.take_reach(&peer, 4, &reach(Some(4), "older"), |_| held = true);
+        assert!(
+            matches!(
+                taken,
+                Err(StoreError::Store(DmStoreError::NotAuthentic { .. }))
+            ),
+            "{taken:?}"
+        );
+        assert!(!held, "hold is not called");
+        assert_eq!(std::fs::read(&route).unwrap(), sealed, "nothing written");
+        assert_eq!(std::fs::read(&handle).unwrap(), handle_before);
+    }
+
+    /// Whether this process is refused a file whose mode grants nothing. A
+    /// process that bypasses file permissions, such as one run as root, is
+    /// not, and a test that relies on the refusal skips.
+    fn modes_enforced(tmp: &tempfile::TempDir) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = tmp.path().join("mode-probe");
+        std::fs::write(&probe, b"probe").unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let enforced = std::fs::File::open(&probe).is_err();
+        std::fs::remove_file(&probe).unwrap();
+        if !enforced {
+            println!("skipped: this process is not refused a file of mode 0o000");
+        }
+        enforced
+    }
+
+    /// A route record that fails to read for any other reason, here a
+    /// permission refused, is an error, and nothing is written over it.
+    #[test]
+    fn a_route_record_read_error_is_returned_and_nothing_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        if !modes_enforced(&tmp) {
+            return;
+        }
+        let peer = label(0x6b);
+        let (store, reach) = store_with_reach(&tmp, &peer, 0x6c);
+        let _ = store
+            .take_reach(&peer, 5, &reach(Some(1), "first"), |_| {})
+            .unwrap();
+        let route = record_path(&tmp, &peer, RecordKind::CorrespondentRoute);
+        let before = std::fs::read(&route).unwrap();
+        std::fs::set_permissions(&route, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut held = false;
+        let taken = store.take_reach(&peer, 9, &reach(Some(2), "first"), |_| held = true);
+        std::fs::set_permissions(&route, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            matches!(taken, Err(StoreError::Store(DmStoreError::Io { .. }))),
+            "{taken:?}"
+        );
+        assert!(!held, "hold is not called");
+        assert_eq!(std::fs::read(&route).unwrap(), before, "nothing written");
+    }
+
+    /// A reach-serial record left by an erase cut short is overwritten as an
+    /// unreadable one is, and the call says so.
+    #[test]
+    fn an_interrupted_erase_of_the_reach_serial_record_is_overwritten_and_reported() {
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x6d), clock_ahead).unwrap();
+        assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
+        let held = store.reach_serial();
+        let path = tmp.path().join("reach-serial.bin");
+        let mut erased = vec![0u8; RecordKind::ReachSerial.on_disk_len()];
+        erased[..crate::storage::dm_store::ERASURE_SENTINEL.len()]
+            .copy_from_slice(crate::storage::dm_store::ERASURE_SENTINEL);
+        std::fs::write(&path, &erased).unwrap();
+        assert!(matches!(
+            store
+                .records()
+                .read_profile_unlocked(RecordKind::ReachSerial),
+            Err(DmStoreError::ErasureInterrupted { .. })
+        ));
+        assert_eq!(
+            store.set_reach(reach_at(2)).unwrap(),
+            SetReach::IssuedOverUndecodable
+        );
+        assert_eq!(store.reach_serial(), held + 1, "above the serial held");
+    }
+
+    /// A reach-serial record that fails to read for any other reason, here a
+    /// permission refused, is an error, the reach held before is kept, and
+    /// nothing is written over the record.
+    #[test]
+    fn a_reach_serial_read_error_is_returned_and_nothing_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let tmp = tempfile::tempdir().unwrap();
+        if !modes_enforced(&tmp) {
+            return;
+        }
+        let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x6e), clock_ahead).unwrap();
+        assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
+        let held = store.reach_with_serial();
+        let path = tmp.path().join("reach-serial.bin");
+        let before = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = store.set_reach(reach_at(2));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            matches!(refused, Err(StoreError::Store(DmStoreError::Io { .. }))),
+            "{refused:?}"
+        );
+        assert_eq!(store.reach_with_serial(), held, "the pair held is kept");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+    }
+
+    /// The reach-serial record is one size and round trips; one carrying
+    /// another version is refused.
+    #[test]
+    fn the_reach_serial_record_is_one_size_and_round_trips() {
+        assert_eq!(encode_reach_serial(0).len(), REACH_SERIAL_RECORD_LEN);
+        assert_eq!(encode_reach_serial(u64::MAX).len(), REACH_SERIAL_RECORD_LEN);
+        assert_eq!(decode_reach_serial(&encode_reach_serial(77)).unwrap(), 77);
+        let mut other = encode_reach_serial(77);
+        other[REACH_SERIAL_MAGIC.len()] = REACH_SERIAL_RECORD_VERSION + 1;
+        assert!(decode_reach_serial(&other).is_err());
     }
 
     /// A handle past [`HANDLE_MAX_LEN`] is kept cut at a character boundary,

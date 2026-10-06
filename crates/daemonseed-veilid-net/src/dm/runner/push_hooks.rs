@@ -9,9 +9,17 @@
 //! schedule, [`ROUTE_RETRY_FIRST`] after the failure and twice as long after
 //! each further failure, up to [`ROUTE_RETRY_CAP`], for as long as the runner
 //! runs without a route. A correspondent's route is learned from every
-//! control subkey of theirs the runner opens, from a reach notice and from a
-//! message push that carries it, and is kept beside the conversation
-//! ([`Store::record_route`]), so a relaunch starts with the routes it held. A
+//! control subkey of theirs the runner opens, whether read from the record
+//! store, handed over in a reach notice or carried by an acceptance, where the
+//! reach serial that control carries is at or above the one applied: above
+//! it, the route replaces the one kept; at it, the route is kept again where
+//! none is. The route is kept beside the conversation in the same write as
+//! that serial ([`Store::take_reach`]), and held in memory beside the same
+//! serial from inside that write's critical section, so the copy in memory
+//! moves in the order the record does and a late copy of an older control
+//! cannot put back a route a newer one replaced. A forgotten route leaves its
+//! serial behind in memory as on disk. The route a message push carries is
+//! not taken: it has no serial. A relaunch starts with the routes it held. A
 //! kept route is only an address to try: a push on it that goes unanswered
 //! forgets it, in memory and on disk, until the correspondent gives one again.
 //!
@@ -52,18 +60,32 @@ struct RouteRetry {
     wait: Duration,
 }
 
+/// Each correspondent's route, where one is held, beside the highest reach
+/// serial applied for it. A forgotten route leaves its serial behind, as the
+/// floor below which no route is taken.
+type PeerRoutes = HashMap<CorrespondenceLabel, (Option<Vec<u8>>, u64)>;
+
 /// What the runner and the live lane both push with: the transport, the
 /// routes of this side's correspondents, and where an unanswered push names
 /// its correspondent.
 #[derive(Clone)]
 pub(super) struct PushShare {
     pub(super) transport: Option<Arc<dyn PushTransport>>,
-    peer_routes: Arc<std::sync::Mutex<HashMap<CorrespondenceLabel, Vec<u8>>>>,
+    /// Each correspondent's route, beside the highest reach serial applied
+    /// for it. Changed from inside the correspondence's critical section of
+    /// the store ([`Store::take_reach`], [`Store::with_route`],
+    /// [`Store::forget_route`]), so it moves in the order the route record
+    /// does, with two exceptions outside any section: a conversation's
+    /// teardown removes its entry ([`Self::forget_peer`]) once its records
+    /// are deleted, and a route an unanswered push was made on is forgotten
+    /// ([`Self::forget_route`]) where the store's call failed before its
+    /// section forgot it.
+    peer_routes: Arc<std::sync::Mutex<PeerRoutes>>,
     unanswered: mpsc::UnboundedSender<Unanswered>,
 }
 
 impl PushShare {
-    fn routes(&self) -> std::sync::MutexGuard<'_, HashMap<CorrespondenceLabel, Vec<u8>>> {
+    fn routes(&self) -> std::sync::MutexGuard<'_, PeerRoutes> {
         self.peer_routes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -96,7 +118,7 @@ impl PushShare {
     ) -> Option<Pusher> {
         let state = store.load_conv(peer).ok()??;
         let key = state.own_control_key.as_ref()?;
-        let route = self.routes().get(peer).cloned();
+        let route = self.routes().get(peer).and_then(|(route, _)| route.clone());
         let mut pusher = self.pusher(route.as_ref(), events)?;
         pusher.answer_key = Some(Arc::new(core_push::AnswerKey::new(key)));
         pusher.own_route = store.reach().route;
@@ -105,7 +127,17 @@ impl PushShare {
 
     /// Whether a route is held for `peer`.
     pub(super) fn holds_route(&self, peer: &CorrespondenceLabel) -> bool {
-        self.routes().contains_key(peer)
+        self.routes()
+            .get(peer)
+            .is_some_and(|(route, _)| route.is_some())
+    }
+
+    /// The route held for `peer` and the reach serial applied for it.
+    #[cfg(test)]
+    pub(super) fn route_of(&self, peer: &CorrespondenceLabel) -> Option<(Vec<u8>, u64)> {
+        let routes = self.routes();
+        let (route, serial) = routes.get(peer)?;
+        Some((route.clone()?, *serial))
     }
 
     /// Answer the call `id` with `answer`, on its own task.
@@ -120,45 +152,96 @@ impl PushShare {
         });
     }
 
-    /// Take `route` as `peer`'s, releasing the route held before where it
-    /// changes. No route leaves the one held in place: a reach read without a
-    /// route may be an older copy of the correspondent's control, and a held
-    /// route is dropped only when a push on it goes unanswered
-    /// ([`Self::forget_route`]).
-    pub(super) fn set_peer_route(&self, peer: &CorrespondenceLabel, route: Option<Vec<u8>>) {
+    /// Hold `route`, issued at reach serial `serial`, as `peer`'s, and return
+    /// the route held before where this replaced it, for the caller to
+    /// [`Self::release`] once it has left the store's critical section.
+    ///
+    /// Called from inside the correspondence's critical section, with a reach
+    /// [`Store::take_reach`] found applied, or with the route and serial
+    /// [`Store::with_route`] read. A route replaces one held at a lower
+    /// serial, and is taken at an equal serial only where no route is held: a
+    /// route at an equal serial is the same reach. Nothing below the serial
+    /// held is taken, including after the route was forgotten, whose serial
+    /// stays as the floor. No route leaves the one held in place and raises
+    /// the serial: a reach read without a route may be an older copy of the
+    /// correspondent's control, and a held route is dropped only when a push
+    /// on it goes unanswered ([`Self::forget_route`]).
+    pub(super) fn hold_route(
+        &self,
+        peer: &CorrespondenceLabel,
+        route: Option<Vec<u8>>,
+        serial: u64,
+    ) -> Option<Vec<u8>> {
         let (old, change) = {
             let mut routes = self.routes();
-            let change = route_change(routes.get(peer), route.as_ref());
+            let (held, floor) = match routes.get(peer) {
+                Some((held, floor)) => (held.clone(), Some(*floor)),
+                None => (None, None),
+            };
+            let newer = floor.is_none_or(|floor| serial > floor);
+            let takes = newer || (floor == Some(serial) && held.is_none());
+            let change = match route_change(held.as_ref(), route.as_ref()) {
+                RouteChange::Replaced | RouteChange::Taken if !takes => RouteChange::Older,
+                change => change,
+            };
             let old = match route {
-                Some(route) => routes
-                    .insert(*peer, route.clone())
-                    .filter(|old| *old != route),
-                None => None,
+                Some(route) if takes => {
+                    routes.insert(*peer, (Some(route.clone()), serial));
+                    held.filter(|old| *old != route)
+                }
+                _ => {
+                    if newer {
+                        routes.insert(*peer, (held, serial));
+                    }
+                    None
+                }
             };
             (old, change)
         };
         crate::vtrace!("{}", route_line(peer, change));
-        if let (Some(old), Some(transport)) = (old, &self.transport) {
-            transport.release(&old);
+        old
+    }
+
+    /// [`Self::hold_route`], releasing the route it replaced, outside any
+    /// critical section of the store.
+    #[cfg(test)]
+    pub(super) fn set_peer_route(
+        &self,
+        peer: &CorrespondenceLabel,
+        route: Option<Vec<u8>>,
+        serial: u64,
+    ) {
+        let old = self.hold_route(peer, route, serial);
+        self.release(old);
+    }
+
+    /// Release `route` on the transport, where one is given.
+    pub(super) fn release(&self, route: Option<Vec<u8>>) {
+        if let (Some(route), Some(transport)) = (route, &self.transport) {
+            transport.release(&route);
         }
     }
 
-    /// Forget the route held for `peer` and release it, as a conversation's
-    /// teardown does.
+    /// Forget the route held for `peer`, and its serial, and release it, as a
+    /// conversation's teardown does.
     pub(super) fn forget_peer(&self, peer: &CorrespondenceLabel) {
-        let held = self.routes().remove(peer);
-        if let (Some(held), Some(transport)) = (held, &self.transport) {
-            transport.release(&held);
-        }
+        let held = self.routes().remove(peer).and_then(|(route, _)| route);
+        self.release(held);
     }
 
-    /// Forget and release the route `unanswered` was pushed on, where it is
-    /// still the one held for its correspondent.
-    fn forget_route(&self, unanswered: &Unanswered) {
+    /// Forget the route `unanswered` was pushed on, where it is still the one
+    /// held for its correspondent, keeping the serial it was held at as the
+    /// floor, and return it for the caller to [`Self::release`]. Called from
+    /// inside the correspondence's critical section ([`Store::forget_route`]),
+    /// and outside it where that call failed before its section forgot the
+    /// route.
+    pub(super) fn forget_route(&self, unanswered: &Unanswered) -> Option<Vec<u8>> {
         let held = {
             let mut routes = self.routes();
-            match routes.get(&unanswered.peer) {
-                Some(route) if *route == unanswered.route => routes.remove(&unanswered.peer),
+            match routes.get_mut(&unanswered.peer) {
+                Some((route, _)) if route.as_deref() == Some(unanswered.route.as_slice()) => {
+                    route.take()
+                }
                 _ => None,
             }
         };
@@ -168,9 +251,7 @@ impl PushShare {
                 tag(&unanswered.peer)
             );
         }
-        if let (Some(held), Some(transport)) = (held, &self.transport) {
-            transport.release(&held);
-        }
+        held
     }
 }
 
@@ -187,6 +268,44 @@ pub(super) enum RouteChange {
     Kept,
     /// No route was given and none was held.
     NoneHeld,
+    /// A route was given that differs from the one held, at a serial at or
+    /// below the one held, or below the serial of a route forgotten, and was
+    /// not taken.
+    Older,
+}
+
+/// How a reach the runner or the lane handed to [`Store::take_reach`] fared.
+#[must_use]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Took {
+    /// Above the serial applied: taken, and its serial is now the one applied.
+    Newer,
+    /// At the serial applied: the reach already applied, its route kept where
+    /// none was.
+    Same,
+    /// Below the serial applied, or for a correspondence the store does not
+    /// hold: nothing changed.
+    Older,
+    /// The store failed to answer: nothing is known to have changed.
+    Failed,
+}
+
+impl Took {
+    /// Whether the reach is the one applied now, so its route may be held and
+    /// its handle kept.
+    pub(super) fn applied(self) -> bool {
+        matches!(self, Took::Newer | Took::Same)
+    }
+}
+
+impl From<ReachTake> for Took {
+    fn from(taken: ReachTake) -> Self {
+        match taken {
+            ReachTake::Newer => Took::Newer,
+            ReachTake::Same => Took::Same,
+            ReachTake::Older => Took::Older,
+        }
+    }
 }
 
 /// What giving `route` for a correspondent holding `held` does.
@@ -209,6 +328,7 @@ pub(super) fn route_line(peer: &CorrespondenceLabel, change: RouteChange) -> Str
         RouteChange::Unchanged => format!("dm push: route of {peer} unchanged"),
         RouteChange::Kept => format!("dm push: no route of {peer} given, held route kept"),
         RouteChange::NoneHeld => format!("dm push: no route of {peer} given, none held"),
+        RouteChange::Older => format!("dm push: an older route of {peer} given, held route kept"),
     }
 }
 
@@ -219,6 +339,9 @@ pub(super) struct PushState {
     own_route: Option<OwnRoute>,
     /// Where the last allocation failed, the next attempt.
     route_retry: Option<RouteRetry>,
+    /// Where the reach serial of this node's current reach was not written,
+    /// the next attempt to write it.
+    reach_retry: Option<RouteRetry>,
     own_handle: Option<String>,
     unanswered_rx: mpsc::UnboundedReceiver<Unanswered>,
     /// A stored handle changed since the roster was last reported.
@@ -245,6 +368,7 @@ impl PushState {
             admission: inbound.as_ref().map(PushInbox::admission),
             own_route: None,
             route_retry: None,
+            reach_retry: None,
             own_handle: None,
             unanswered_rx,
             roster_due: false,
@@ -273,6 +397,12 @@ impl PushState {
         self.route_retry.map(|retry| retry.due)
     }
 
+    /// When the next attempt to write an owed reach serial is due, where one
+    /// is owed.
+    pub(super) fn reach_retry_due(&self) -> Option<Instant> {
+        self.reach_retry.map(|retry| retry.due)
+    }
+
     fn reach(&self) -> Reach {
         Reach {
             route: self.own_route.as_ref().map(|route| route.blob.clone()),
@@ -290,10 +420,22 @@ impl<R: RunnerRecords> Runner<R> {
         if let Ok(convs) = self.load_convs() {
             self.admit_pushes_for(&convs);
             for conv in &convs {
-                if conv.route.is_some() {
-                    self.push
-                        .share
-                        .set_peer_route(&conv.peer, conv.route.clone());
+                if conv.route.is_none() {
+                    continue;
+                }
+                // The route kept and its serial are read as one pair, inside
+                // the section every take of the live lane also runs in.
+                let share = &self.push.share;
+                let mut released = None;
+                let seeded = self.store.with_route(&conv.peer, |route, serial| {
+                    if route.is_some() {
+                        released = share.hold_route(&conv.peer, route.map(<[u8]>::to_vec), serial);
+                    }
+                });
+                share.release(released);
+                match seeded {
+                    Ok(()) | Err(StoreError::MissingConversation) => {}
+                    Err(_) => self.records.health.store_failures += 1,
                 }
             }
         }
@@ -335,7 +477,7 @@ impl<R: RunnerRecords> Runner<R> {
         if self.push.own_route.is_none() {
             return;
         }
-        self.store.set_reach(self.push.reach());
+        self.set_own_reach();
         let Ok(convs) = self.load_convs() else {
             return;
         };
@@ -390,8 +532,8 @@ impl<R: RunnerRecords> Runner<R> {
 
     /// Ask `transport` for a route and hold it, or hold none and try again
     /// `wait` from now. Whether a route was allocated. The reach the store
-    /// holds names the route from here on, so a message pushed before the
-    /// control subkeys are rewritten carries it.
+    /// holds names the route from here on, and correspondents learn it from
+    /// the reach notices and the control subkeys written with it.
     async fn allocate_route(&mut self, transport: &dyn PushTransport, wait: Duration) -> bool {
         let allocated = match transport.new_route().await {
             Ok(route) => {
@@ -413,7 +555,7 @@ impl<R: RunnerRecords> Runner<R> {
                 false
             }
         };
-        self.store.set_reach(self.push.reach());
+        self.set_own_reach();
         allocated
     }
 
@@ -425,7 +567,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// command or lane note is served from inside another, and the exception
     /// is stated at [`Runner::serve_queued`].
     async fn republish_controls(&mut self) -> Result<(), Halt> {
-        self.store.set_reach(self.push.reach());
+        self.set_own_reach();
         let Ok(convs) = self.load_convs() else {
             return Ok(());
         };
@@ -538,32 +680,116 @@ impl<R: RunnerRecords> Runner<R> {
         }
     }
 
-    /// Hold what a correspondent's control subkey said of how it is reached:
-    /// its route, kept beside the conversation, and its handle where the
-    /// handle names its identity.
-    pub(super) fn note_reach(&mut self, peer: &CorrespondenceLabel, reach: &Reach) {
-        self.push.share.set_peer_route(peer, reach.route.clone());
-        if let Some(route) = &reach.route {
-            match self.store.record_route(peer, route) {
-                Ok(_) | Err(StoreError::MissingConversation) => {}
-                Err(_) => self.records.health.store_failures += 1,
+    /// Set this node's route and handle as the reach every control record
+    /// written from now on carries ([`Store::set_reach`]). A serial that could
+    /// not be written, or a reach-serial record overwritten because it did not
+    /// read or decode, counts a store failure. A serial that could not be
+    /// written is owed: control records carry the reach and serial held
+    /// before until a later call writes it, and [`Self::retry_owed_reach`]
+    /// makes that call from the schedule, [`ROUTE_RETRY_FIRST`] after the
+    /// failure and twice as long after each further failure, up to
+    /// [`ROUTE_RETRY_CAP`].
+    fn set_own_reach(&mut self) {
+        match self.store.set_reach(self.push.reach()) {
+            Ok(SetReach::Unchanged | SetReach::Issued) => self.push.reach_retry = None,
+            Ok(SetReach::IssuedOverUndecodable) => {
+                self.push.reach_retry = None;
+                crate::vtrace!("dm push: the reach-serial record did not read, overwritten");
+                self.records.health.store_failures += 1;
             }
-        }
-        let Ok(Some(state)) = self.store.load_conv(peer) else {
-            return;
-        };
-        if let Some(handle) = reach.verified_handle(state.peer_identity_pk.as_slice()) {
-            match self.store.record_handle(peer, &handle) {
-                Ok(changed) => self.push.roster_due |= changed,
-                Err(_) => self.records.health.store_failures += 1,
+            Err(e) => {
+                crate::vtrace!(
+                    "dm push: the reach serial was not written ({e}), the reach held before stays"
+                );
+                self.records.health.store_failures += 1;
+                if self.push.reach_retry.is_none() {
+                    self.push.reach_retry = Some(RouteRetry {
+                        due: Instant::now() + ROUTE_RETRY_FIRST,
+                        wait: ROUTE_RETRY_FIRST,
+                    });
+                }
             }
         }
     }
 
-    /// The reach a held contact request's correspondent published.
-    pub(super) fn held_reach(&self, request: &ContactRequestId) -> Option<Reach> {
+    /// Write the reach serial owed since a [`Self::set_own_reach`] failed,
+    /// where the attempt is due, and push and republish the reach once it is
+    /// written. Nothing where none is owed.
+    pub(super) async fn retry_owed_reach(&mut self) -> Result<(), Halt> {
+        let Some(retry) = self.push.reach_retry else {
+            return Ok(());
+        };
+        if Instant::now() < retry.due {
+            return Ok(());
+        }
+        self.check_stop()?;
+        self.push.reach_retry = None;
+        self.set_own_reach();
+        if self.push.reach_retry.is_some() {
+            let wait = retry.wait.saturating_mul(2).min(ROUTE_RETRY_CAP);
+            self.push.reach_retry = Some(RouteRetry {
+                due: Instant::now() + wait,
+                wait,
+            });
+            return Ok(());
+        }
+        crate::vtrace!("dm push: the owed reach serial was written, republishing");
+        self.push_reach_notices();
+        self.republish_controls().await
+    }
+
+    /// Take the reach a correspondent's control subkey gave at `serial`
+    /// through [`Store::take_reach`]: in one critical section of the
+    /// correspondence the serial is compared, the route and serial are
+    /// written, the route is held in memory where the store took the reach
+    /// ([`Took::Newer`] or [`Took::Same`]), and the handle is kept where it
+    /// names the correspondent's identity. A reach older than the one applied
+    /// changes nothing. A handle kept has the roster reported. A take that
+    /// stood while the handle record would not read or write counts one store
+    /// failure
+    /// ([`ReachApplied::faults`](daemonseed_core::dm::store::ReachApplied::faults));
+    /// one the store refused counts one and answers [`Took::Failed`].
+    ///
+    /// A reach the live lane already took, handed over for its handle from
+    /// an acceptance, a watched control or a reach notice, comes here without
+    /// its route, and keeps its handle only while its serial is still the one
+    /// applied.
+    pub(super) fn take_reach(
+        &mut self,
+        peer: &CorrespondenceLabel,
+        reach: &Reach,
+        serial: u64,
+    ) -> Took {
+        let share = &self.push.share;
+        let mut released = None;
+        let taken = self.store.take_reach(peer, serial, reach, |take| {
+            if take.applied() {
+                released = share.hold_route(peer, reach.route.clone(), serial);
+            }
+        });
+        share.release(released);
+        match taken {
+            Ok(taken) => {
+                self.push.roster_due |= taken.handle_changed;
+                if let Some(e) = &taken.handle_error {
+                    crate::vtrace!("dm push: handle of {} not kept ({e})", tag(peer));
+                }
+                self.records.health.store_failures += taken.faults();
+                Took::from(taken.take)
+            }
+            Err(StoreError::MissingConversation) => Took::Older,
+            Err(_) => {
+                self.records.health.store_failures += 1;
+                Took::Failed
+            }
+        }
+    }
+
+    /// The reach a held contact request's correspondent published, and the
+    /// reach serial it published it at.
+    pub(super) fn held_reach(&self, request: &ContactRequestId) -> Option<(Reach, u64)> {
         match self.requests.get(request).map(|entry| &entry.held) {
-            Some(Held::Request(held)) => Some(held.reach.clone()),
+            Some(Held::Request(held)) => Some((held.reach.clone(), held.reach_serial)),
             _ => None,
         }
     }
@@ -574,8 +800,22 @@ impl<R: RunnerRecords> Runner<R> {
     /// gives a route again. A route the correspondent has given since is kept,
     /// and nothing else of the conversation changes.
     pub(super) fn forget_route(&mut self, unanswered: &Unanswered) {
-        self.push.share.forget_route(unanswered);
-        match self.store.forget_route(&unanswered.peer, &unanswered.route) {
+        // Forgotten in memory inside the correspondence's section, in the
+        // order of every take, and outside it where the section failed.
+        let share = &self.push.share;
+        let mut released = None;
+        let mut forgotten = false;
+        let removed = self
+            .store
+            .forget_route(&unanswered.peer, &unanswered.route, || {
+                released = share.forget_route(unanswered);
+                forgotten = true;
+            });
+        if !forgotten {
+            released = share.forget_route(unanswered);
+        }
+        share.release(released);
+        match removed {
             Ok(true) => {
                 crate::vtrace!("dm push: kept route of {} forgotten", tag(&unanswered.peer))
             }
