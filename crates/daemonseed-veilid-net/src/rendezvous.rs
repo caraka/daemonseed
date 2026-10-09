@@ -839,6 +839,87 @@ pub async fn publish_at_subkey(
     .map_err(|e| write_failure("set_dht_value", e))
 }
 
+/// Write `sealed` to a specific subkey of a record this node is the only
+/// writer of, writing again where the network keeps another value instead.
+///
+/// [`publish_at_subkey`] leaves the outcome to the sequence numbers, which is
+/// right for a record several writers share: the network keeps the highest,
+/// so a stale writer never replaces a newer value. On a record with one writer
+/// a value the network keeps instead of this write's can only be one this
+/// writer put there earlier, under the same owner key and a sequence number
+/// this node's local copy has not seen, so writing over it loses nothing.
+/// [`write_until_kept`] does that, and reports a write the network never
+/// takes as a refusal rather than as written.
+///
+/// Same guards as [`publish_at_subkey`].
+pub async fn publish_sole_writer_subkey(
+    rc: &RoutingContext,
+    handle: &RendezvousHandle,
+    owner: &KeyPair,
+    subkey: u32,
+    sealed: Vec<u8>,
+) -> Result<()> {
+    check_write_cap(sealed.len(), handle.shape())?;
+    check_subkey_range(subkey, handle.shape())?;
+    write_until_kept(subkey, sealed, |value| async {
+        rc.set_dht_value(
+            handle.key().clone(),
+            subkey,
+            value,
+            Some(write_options(owner)),
+        )
+        .await
+        .map(|kept| kept.map(|kept| kept.data().to_vec()))
+    })
+    .await
+}
+
+/// How many times [`write_until_kept`] writes a subkey whose network copy
+/// holds other bytes before it reports the write refused.
+const KEPT_WRITE_ATTEMPTS: u32 = 3;
+
+/// Write `sealed` through `set` until the network keeps it, at most
+/// [`KEPT_WRITE_ATTEMPTS`] times.
+///
+/// `set` performs one `set_dht_value` and yields what Veilid answers: nothing,
+/// or the value the network kept where it kept one instead of the value sent
+/// (`veilid-core-0.5.7 src/storage_manager/set_value.rs`,
+/// `process_outbound_set_value_result_locked`). Veilid numbers a write from
+/// this node's local copy of the subkey, starting at zero where it holds none,
+/// so a node without the earlier value numbers its write at or below the
+/// network's and the network keeps what it had. Veilid stores that kept value
+/// locally as it answers, so the next write is numbered above it and is taken.
+///
+/// A kept value equal to `sealed` is this write's own value and counts as
+/// taken. Where every attempt is answered with other bytes the write is
+/// reported as [`VeilidNetError::Send`], a refusal, so a caller never counts as
+/// written a subkey whose network copy holds other bytes. Split out from
+/// [`publish_sole_writer_subkey`] so the decision is testable without a
+/// network.
+async fn write_until_kept<F, Fut>(subkey: u32, sealed: Vec<u8>, mut set: F) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> Fut,
+    Fut: Future<Output = std::result::Result<Option<Vec<u8>>, veilid_core::VeilidAPIError>>,
+{
+    for attempt in 1..=KEPT_WRITE_ATTEMPTS {
+        match set(sealed.clone())
+            .await
+            .map_err(|e| write_failure("set_dht_value", e))?
+        {
+            None => return Ok(()),
+            Some(kept) if kept == sealed => return Ok(()),
+            Some(_) => {
+                crate::vtrace!(
+                    "set_dht_value: subkey {subkey} kept other bytes (attempt {attempt} of {KEPT_WRITE_ATTEMPTS})"
+                );
+            }
+        }
+    }
+    Err(VeilidNetError::Send(format!(
+        "set_dht_value: the network kept other bytes at subkey {subkey} over {KEPT_WRITE_ATTEMPTS} writes"
+    )))
+}
+
 /// The options every write here passes: the caller's own writer, and Veilid's
 /// default for offline handling, which is to keep a value the node could not
 /// put out and flush it later.
@@ -1352,6 +1433,80 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+
+    /// Run [`write_until_kept`] for `sealed` against a set call that answers
+    /// with `answers` in order, the last one repeated, returning the outcome
+    /// and how many writes were made.
+    async fn kept_write(sealed: &[u8], answers: &[Option<Vec<u8>>]) -> (Result<()>, usize) {
+        assert!(!answers.is_empty(), "a fake set call needs an answer");
+        let mut calls = 0usize;
+        let outcome = write_until_kept(7, sealed.to_vec(), |value| {
+            assert_eq!(value, sealed, "every attempt writes the same bytes");
+            let answer = answers[calls.min(answers.len() - 1)].clone();
+            calls += 1;
+            std::future::ready(Ok(answer))
+        })
+        .await;
+        (outcome, calls)
+    }
+
+    /// A write the network answers with other bytes is made again, and the
+    /// second write, which the network takes, is the outcome.
+    #[tokio::test]
+    async fn a_write_answered_with_other_bytes_is_written_again() {
+        let ours = b"ours".to_vec();
+        let (outcome, calls) = kept_write(&ours, &[Some(b"theirs".to_vec()), None]).await;
+        assert!(outcome.is_ok(), "the second write is taken: {outcome:?}");
+        assert_eq!(calls, 2, "one write refused, one taken");
+    }
+
+    /// A write the network answers with other bytes every time is reported as
+    /// a refusal after a bounded number of writes.
+    #[tokio::test]
+    async fn a_write_always_answered_with_other_bytes_is_refused() {
+        let ours = b"ours".to_vec();
+        let (outcome, calls) = kept_write(&ours, &[Some(b"theirs".to_vec())]).await;
+        assert!(
+            matches!(outcome, Err(VeilidNetError::Send(_))),
+            "a write the network never takes is a refusal: {outcome:?}"
+        );
+        assert_eq!(calls, 3, "the writes are bounded");
+    }
+
+    /// A write answered with its own bytes is taken at once.
+    #[tokio::test]
+    async fn a_write_answered_with_its_own_bytes_is_taken_at_once() {
+        let ours = b"ours".to_vec();
+        let (outcome, calls) = kept_write(&ours, &[Some(ours.clone()), None]).await;
+        assert!(outcome.is_ok(), "its own bytes: {outcome:?}");
+        assert_eq!(calls, 1, "its own bytes are not written again");
+    }
+
+    /// A write answered with nothing is taken at once.
+    #[tokio::test]
+    async fn a_write_answered_with_nothing_is_taken_at_once() {
+        let ours = b"ours".to_vec();
+        let (outcome, calls) = kept_write(&ours, &[None]).await;
+        assert!(outcome.is_ok(), "nothing: {outcome:?}");
+        assert_eq!(calls, 1, "a write answered with nothing is not made again");
+    }
+
+    /// A set call that fails is reported as that failure, without another
+    /// write.
+    #[tokio::test]
+    async fn a_failed_write_is_not_written_again() {
+        let mut calls = 0usize;
+        let outcome = write_until_kept(7, b"ours".to_vec(), |_| {
+            calls += 1;
+            std::future::ready(Err(veilid_core::VeilidAPIError::Timeout))
+        })
+        .await;
+        assert!(
+            matches!(outcome, Err(VeilidNetError::TimedOut(_))),
+            "the failure is classed as it was: {outcome:?}"
+        );
+        assert_eq!(calls, 1);
+    }
 
     /// A write leaves Veilid's offline handling at its default, and that
     /// default is to keep and queue.

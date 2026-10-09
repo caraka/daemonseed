@@ -3448,10 +3448,38 @@ impl<R: RunnerRecords> Runner<R> {
         }
     }
 
+    /// Whether the network's copy of a channel slot holds bytes other than
+    /// `entry`'s ciphertext.
+    ///
+    /// A write that the network answered with another value under the same
+    /// subkey leaves that value on the network and in this node's copy at one
+    /// sequence number, which no sequence comparison tells apart from an
+    /// intact slot. A read that fails decides nothing and is counted where the
+    /// store refused.
+    fn channel_slot_holds_other_bytes(
+        &mut self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        entry: &OutboxEntry,
+    ) -> bool {
+        // The channel is this side's own, which a read must not watch, and a
+        // channel this run has not reopened reads as a correspondent's.
+        self.records.inner.watch_reads(false);
+        let read = self
+            .records
+            .read_channel(lookup_key, channel::slot_for(entry.seq));
+        self.records.inner.watch_reads(true);
+        match read {
+            Ok(held) => held.as_deref() != Some(entry.ciphertext.as_slice()),
+            Err(_) => false,
+        }
+    }
+
     /// Rewrite this side's channel where the network has lost it: the control
     /// subkey, resealed from the conversation record, and every outstanding
-    /// message slot, from the outbox. Nothing is looked at for a conversation
-    /// whose delete is under way.
+    /// message slot, from the outbox. The one outstanding slot at the
+    /// correspondent's cursor, the slot its reader stops at, is also read and
+    /// rewritten where it holds other bytes. Nothing is looked at for a
+    /// conversation whose delete is under way.
     /// Returns the sequences of `entries` whose slot the network holds once
     /// the repair is done: found there, or written.
     fn rewrite_evicted(&mut self, state: &ConvState, entries: &[OutboxEntry]) -> Vec<u64> {
@@ -3491,9 +3519,17 @@ impl<R: RunnerRecords> Runner<R> {
             let subkey = channel::slot_for(entry.seq);
             let report = report_at(&reports, usize::from(subkey));
             if !behind(report) {
-                if report.network_seq.is_some() {
-                    held.push(entry.seq);
+                if report.network_seq.is_none() {
+                    continue;
                 }
+                let at_cursor = entry.seq == state.peer_collected && !report.pending;
+                if at_cursor
+                    && self.channel_slot_holds_other_bytes(&lookup_key, entry)
+                    && self.rewrite_slot(&lookup_key, entry).is_err()
+                {
+                    continue;
+                }
+                held.push(entry.seq);
             } else if self.rewrite_slot(&lookup_key, entry).is_ok() {
                 held.push(entry.seq);
             }

@@ -899,8 +899,12 @@ impl Lane {
                 crate::vtrace!("dm watch: {} is blocked, its slot is ignored", tag(&peer));
                 true
             }
-            // Already recorded, by a push or a collection.
-            Ok(Taken::Duplicate { .. }) => true,
+            // Already recorded, by a push or a collection; the cursor is
+            // published in case that recording has not published it yet.
+            Ok(Taken::Duplicate { peer }) => {
+                let _ = self.notes.send(LaneNote::PublishCursor(peer));
+                true
+            }
             Ok(Taken::Ahead { .. } | Taken::Dropped) => false,
             Err(e) => {
                 crate::vtrace!(
@@ -979,6 +983,7 @@ impl Lane {
                 self.share.push.answer(id, answer);
                 crate::vtrace!("dm push: {} sequence {seq} recorded", tag(&peer));
                 self.share.emit_bodies(peer, seq, vec![message]).await;
+                let _ = self.notes.send(LaneNote::PublishCursor(peer));
             }
             Ok(Taken::Blocked { peer }) => {
                 crate::vtrace!("dm push: {} is blocked, its push is dropped", tag(&peer));

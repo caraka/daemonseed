@@ -707,6 +707,7 @@ impl VeilidRecords {
             what: What::Subkey {
                 subkey: u32::from(subkey),
                 value: bytes.to_vec(),
+                sole_writer: true,
             },
         };
         Ok((*lookup_key, channel_write_kind(subkey), write))
@@ -1806,7 +1807,16 @@ pub(crate) struct RecordWrite {
 /// What a [`RecordWrite`] does to the record it names.
 enum What {
     /// Set one subkey. An empty value is an erasure of that subkey.
-    Subkey { subkey: u32, value: Vec<u8> },
+    Subkey {
+        subkey: u32,
+        value: Vec<u8>,
+        /// Whether this node is the record's only writer: a channel, written
+        /// under a key only its owner holds, and never an advert or a drop,
+        /// whose keys anyone can derive. Only a sole writer's write is made
+        /// again where the network keeps another value
+        /// ([`rendezvous::publish_sole_writer_subkey`]).
+        sole_writer: bool,
+    },
     /// Delete the record from this node's local store.
     Delete,
 }
@@ -1848,7 +1858,11 @@ impl RecordWrite {
         // the funnel and one charge against § Write budget, however many times
         // the transport had to be asked.
         match self.what {
-            What::Subkey { subkey, value } => {
+            What::Subkey {
+                subkey,
+                value,
+                sole_writer,
+            } => {
                 retry_transient("dm records write", || async {
                     let handle = rendezvous::open_cached(
                         opened,
@@ -1856,8 +1870,19 @@ impl RecordWrite {
                         rendezvous::open_or_create(gate, api, rc, &self.owner, self.shape),
                     )
                     .await?;
-                    rendezvous::publish_at_subkey(rc, &handle, &self.owner, subkey, value.clone())
+                    let value = value.clone();
+                    if sole_writer {
+                        rendezvous::publish_sole_writer_subkey(
+                            rc,
+                            &handle,
+                            &self.owner,
+                            subkey,
+                            value,
+                        )
                         .await
+                    } else {
+                        rendezvous::publish_at_subkey(rc, &handle, &self.owner, subkey, value).await
+                    }
                 })
                 .await
             }
@@ -1994,6 +2019,7 @@ fn subkey_write(
             what: What::Subkey {
                 subkey,
                 value: value.to_vec(),
+                sole_writer: false,
             },
         },
     ))
@@ -2798,6 +2824,16 @@ mod tests {
             write.shape.o_cnt(),
             DROP_SUBKEYS,
             "the shape carries the count the caller named"
+        );
+        assert!(
+            matches!(
+                write.what,
+                What::Subkey {
+                    sole_writer: false,
+                    ..
+                }
+            ),
+            "a record whose key anyone derives is not written as its sole writer"
         );
     }
 
@@ -3719,7 +3755,7 @@ mod tests {
     /// `None` where it writes no subkey.
     fn at_subkey(write: &RecordWrite) -> Option<(u32, usize)> {
         match &write.what {
-            What::Subkey { subkey, value } => Some((*subkey, value.len())),
+            What::Subkey { subkey, value, .. } => Some((*subkey, value.len())),
             What::Delete => None,
         }
     }

@@ -133,6 +133,16 @@ impl Dht {
         );
         self.put(key, vec![0x5a; 16]);
     }
+
+    /// Other bytes in a held subkey at the sequence number it already holds,
+    /// so no node's report tells it apart from the subkey it replaced.
+    fn replace(&mut self, key: Key, bytes: Vec<u8>) {
+        let held = self
+            .records
+            .get_mut(&key)
+            .expect("a replacement names a held subkey");
+        held.0 = bytes;
+    }
 }
 
 /// One node's local copies: the sequence number and bytes of every subkey it
@@ -3656,6 +3666,231 @@ async fn a_restart_rewrites_only_lost_subkeys_and_delivers_each_message_once() {
     assert!(finished(&bw.stop().await));
 }
 
+/// The slot at the correspondent's cursor is rewritten from the outbox where
+/// the network holds other bytes there at the number this node's copy holds.
+/// A slot holding the outbox bytes is not rewritten, and other bytes at a slot
+/// past the cursor are not looked for. Nothing is rewritten while the slot is
+/// queued for the flush or where its read fails.
+#[tokio::test(start_paused = true)]
+async fn the_slot_at_the_cursor_holding_other_bytes_is_rewritten_from_the_outbox() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        mut aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    for (token, body) in [(20u64, b"m1"), (21, b"m2")] {
+        aw.send(RunnerCommand::Send {
+            token: CommandToken(token),
+            peer: a_peer,
+            body: body.to_vec(),
+        })
+        .await;
+        aw.wait_for("the send", sent(token)).await;
+    }
+    assert!(finished(&aw.stop().await));
+
+    let intact = a_fake.restart();
+    let mut aw = a.spawn(&intact, RunnerConfig::default());
+    let at = aw.wait_for("the roster", is_roster).await;
+    let rows = roster(&aw.seen[at]);
+    assert!(!rows.is_empty());
+    assert_eq!(
+        rows[0].peer_collected, 1,
+        "the correspondent's cursor is m1"
+    );
+    aw.wait_for("the restart", is_health).await;
+    assert_eq!(
+        intact.calls().ring_writes,
+        0,
+        "a slot holding the outbox bytes is not rewritten"
+    );
+    assert!(finished(&aw.stop().await));
+
+    let lookup_key = a.outgoing_lookup_key(&b);
+    let at_cursor = (CHANNEL, lookup_key, channel::slot_for(1));
+    let past_cursor = (CHANNEL, lookup_key, channel::slot_for(2));
+    let other = vec![0x5a; 16];
+    let ours = {
+        let mut net = dht.lock().expect("the network lock");
+        let ours = net.records[&at_cursor].0.clone();
+        assert_ne!(ours, other);
+        net.replace(at_cursor, other.clone());
+        net.replace(past_cursor, other.clone());
+        ours
+    };
+
+    let queued = a_fake.restart();
+    queued.faults().pending = true;
+    let mut aw = a.spawn(&queued, RunnerConfig::default());
+    aw.wait_for("the restart with the slots queued", is_health)
+        .await;
+    assert!(queued.calls().inspect_channel >= 1);
+    assert_eq!(
+        queued.calls().ring_writes,
+        0,
+        "a slot still queued for the flush is left to it"
+    );
+    assert!(finished(&aw.stop().await));
+
+    let unread = a_fake.restart();
+    unread.faults().fail_channel_reads = true;
+    let mut aw = a.spawn(&unread, RunnerConfig::default());
+    aw.wait_for("the restart unable to read", is_health).await;
+    assert!(unread.calls().inspect_channel >= 1);
+    assert_eq!(
+        unread.calls().ring_writes,
+        0,
+        "a read that fails rewrites nothing"
+    );
+    assert!(finished(&aw.stop().await));
+
+    let replaced = a_fake.restart();
+    let mut aw = a.spawn(&replaced, RunnerConfig::default());
+    aw.wait_for("the restart over replaced slots", is_health)
+        .await;
+    assert_eq!(
+        replaced.calls().ring_writes,
+        1,
+        "only the slot at the cursor is rewritten"
+    );
+    {
+        let net = dht.lock().expect("the network lock");
+        assert_eq!(
+            net.records[&at_cursor].0, ours,
+            "the slot at the cursor holds the outbox bytes again"
+        );
+        assert_eq!(
+            net.records[&past_cursor].0, other,
+            "a slot past the cursor is left as it is"
+        );
+    }
+    assert!(finished(&aw.stop().await));
+}
+
+/// The repair's read of the slot at the correspondent's cursor registers no
+/// watch on this side's own channel, also where the launch's reopen of the
+/// channel failed and a read takes it for a correspondent's.
+#[tokio::test(start_paused = true)]
+async fn the_repair_read_of_an_own_slot_registers_no_watch() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        mut aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(20),
+        peer: a_peer,
+        body: b"m1".to_vec(),
+    })
+    .await;
+    aw.wait_for("the send", sent(20)).await;
+    assert!(finished(&aw.stop().await));
+
+    let lookup_key = a.outgoing_lookup_key(&b);
+    let at_cursor = (CHANNEL, lookup_key, channel::slot_for(1));
+    dht.lock()
+        .expect("the network lock")
+        .replace(at_cursor, vec![0x5a; 16]);
+    let relaunched = relaunch_owning(&a_fake, false);
+    {
+        let mut faults = relaunched.faults();
+        faults.plan.push((CHANNEL, Op::Open, Fault::TimedOut));
+        faults.channel_writes = Some(Vec::new());
+    }
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the relaunch", is_health).await;
+    assert!(
+        relaunched
+            .faults()
+            .channel_writes
+            .as_ref()
+            .expect("writes are logged")
+            .contains(&(lookup_key, channel::slot_for(1))),
+        "the repair read the slot and found other bytes there"
+    );
+    assert!(
+        !relaunched.watching().registered.contains(&lookup_key),
+        "no watch is registered on this side's own channel"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A send whose first slot write failed is not answered while the slot at the
+/// correspondent's cursor holds other bytes at the number this node's copy
+/// holds and their rewrite fails, and is answered once the rewrite goes
+/// through.
+#[tokio::test(start_paused = true)]
+async fn a_send_is_not_answered_while_its_slot_holds_other_bytes() {
+    let Scene {
+        dht,
+        a,
+        b,
+        a_fake,
+        mut aw,
+        bw,
+        a_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&bw.stop().await));
+    let lookup_key = a.outgoing_lookup_key(&b);
+    let at_cursor = (CHANNEL, lookup_key, channel::slot_for(1));
+    let other = vec![0x5a; 16];
+    {
+        let seq = dht
+            .lock()
+            .expect("the network lock")
+            .put(at_cursor, other.clone());
+        a_fake
+            .node
+            .lock()
+            .expect("the node lock")
+            .local
+            .insert(at_cursor, (seq, other.clone()));
+    }
+    a_fake
+        .faults()
+        .plan
+        .extend([(CHANNEL, Op::Write, Fault::Refused); 64]);
+    aw.send(RunnerCommand::Send {
+        token: CommandToken(20),
+        peer: a_peer,
+        body: b"m1".to_vec(),
+    })
+    .await;
+    tokio::time::sleep(delivery::POLL_INTERVAL_MAX + Duration::from_secs(60)).await;
+    aw.drain();
+    assert!(
+        a_fake.calls().ring_writes >= 2,
+        "the send's write and the repair's rewrite were both made"
+    );
+    assert!(
+        !aw.seen.iter().any(sent(20)),
+        "a send whose slot holds other bytes is not answered"
+    );
+
+    a_fake.faults().plan.clear();
+    aw.wait_for("the send once its slot is rewritten", sent(20))
+        .await;
+    assert_ne!(
+        dht.lock().expect("the network lock").records[&at_cursor].0,
+        other,
+        "the slot holds the outbox bytes"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
 /// A subkey Veilid still has queued for its flush is not rewritten, and nothing
 /// is written by an inspect that could not ask the network. A lost slot is
 /// rewritten, and so is every outstanding subkey of a channel the network holds
@@ -5785,6 +6020,7 @@ async fn a_send_issued_during_a_collection_writes_before_the_next_conversation()
         a,
         b,
         a_fake,
+        b_fake,
         mut aw,
         bw,
         a_peer,
@@ -5830,6 +6066,11 @@ async fn a_send_issued_during_a_collection_writes_before_the_next_conversation()
     collect_by_change(&a_fake, from_b);
     collect_by_change(&a_fake, from_c);
     held.reached().await;
+    // B's cursor publish is held, so A's held read does not find the message
+    // collected when it resumes, and A still owes the slot write.
+    let publishing = Arc::new(Gate::default());
+    b_fake.faults().gate_control = Some(Arc::clone(&publishing));
+    let _publish = ReleaseOnDrop(Arc::clone(&publishing));
     aw.send(RunnerCommand::Send {
         token: CommandToken(42),
         peer: a_peer,
@@ -5879,6 +6120,7 @@ async fn a_send_issued_during_a_collection_writes_before_the_next_conversation()
         write < next,
         "the send waited for the next conversation: {trail:?}"
     );
+    publishing.release();
     assert!(finished(&aw.stop().await));
     assert!(finished(&bw.stop().await));
     assert!(finished(&cw.stop().await));
@@ -9111,6 +9353,11 @@ async fn a_send_while_the_runner_is_held_is_pushed_at_once_and_written_after() {
     let (mut k, b_peer) = establish_pushed().await;
     let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
     let _release = ReleaseOnDrop(Arc::clone(&held));
+    // A's cursor publish is held, so B's held read does not find the message
+    // collected when it resumes, and B still owes the slot write.
+    let publishing = Arc::new(Gate::default());
+    k.a_fake.faults().gate_control = Some(Arc::clone(&publishing));
+    let _publish = ReleaseOnDrop(Arc::clone(&publishing));
     let writes = k.b_fake.calls().ring_writes;
     k.bw.send(RunnerCommand::Send {
         token: CommandToken(7),
@@ -9166,6 +9413,59 @@ async fn a_send_while_the_runner_is_held_is_pushed_at_once_and_written_after() {
             .map(|(bytes, _)| bytes.clone()),
         Some(entry.ciphertext),
         "the slot holds the committed outbox bytes"
+    );
+}
+
+/// A send whose correspondent publishes its cursor past the message before
+/// the held runner resumes is reported sent with no slot write, and its outbox
+/// entry is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_collected_before_the_held_runner_resumes_is_sent_unwritten() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let held = hold_ring_read(&k.b_fake, k.a.outgoing_lookup_key(&k.b)).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let writes = k.b_fake.calls().ring_writes;
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(7),
+        peer: b_peer,
+        body: b"from a held B".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("B's message at A", message(k.a_peer, 1, b"from a held B"))
+        .await;
+    let key = conv_of(&k.a, &k.a_peer)
+        .own_control_key
+        .expect("A's control key");
+    let outgoing = k.a.outgoing_lookup_key(&k.b);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bytes = channel_bytes(&k.dht, &outgoing, channel::CONTROL_SUBKEY);
+            if channel::open_control_with_key(&key, &bytes).is_ok_and(|c| c.collected_cursor == 2) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A published cursor 2");
+    held.release();
+    k.bw.wait_for("B's send", sent(7)).await;
+    assert_eq!(
+        k.b_fake.calls().ring_writes,
+        writes,
+        "no slot is written for a message already collected"
+    );
+    let owed = reopen_store(&k.b)
+        .load()
+        .expect("B's store loads")
+        .convs
+        .into_iter()
+        .find(|conv| conv.peer == b_peer)
+        .expect("B's conversation")
+        .outstanding_outbox;
+    assert!(
+        owed.iter().all(|entry| entry.seq != 1),
+        "the collected message's outbox entry is gone: {owed:?}"
     );
 }
 
@@ -10016,6 +10316,9 @@ async fn unopened(opens: usize, send_from_b: bool) -> Unopened {
         b_peer,
         ..
     } = establish(RunnerConfig::default()).await;
+    // A is stopped before B sends, so the message is A's to collect at the
+    // relaunch and its cursor is not yet published.
+    assert!(finished(&aw.stop().await));
     if send_from_b {
         bw.send(RunnerCommand::Send {
             token: CommandToken(30),
@@ -10026,7 +10329,6 @@ async fn unopened(opens: usize, send_from_b: bool) -> Unopened {
         bw.wait_for("B's send", sent(30)).await;
     }
     assert!(finished(&bw.stop().await));
-    assert!(finished(&aw.stop().await));
     let lookup_key = a.outgoing_lookup_key(&b);
     let relaunched = relaunch_owning(&a_fake, false);
     relaunched.faults().plan.extend(std::iter::repeat_n(
@@ -12986,6 +13288,87 @@ async fn a_recorded_push_with_an_untagged_route_leaves_the_held_route() {
         !k.board.lock().unwrap().released.contains(&foreign),
         "no push was made to the untagged route"
     );
+}
+
+/// A message recorded from a push has its cursor published soon after,
+/// without waiting for a collection pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pushed_message_has_its_cursor_published() {
+    let (mut k, b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    let reads = k.a_fake.calls().channel_reads;
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: b_peer,
+        body: b"pushed to A".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("the message at A", message(k.a_peer, 1, b"pushed to A"))
+        .await;
+    let a_state = conv_of(&k.a, &k.a_peer);
+    let key = a_state.own_control_key.expect("A's control key");
+    let outgoing = k.a.outgoing_lookup_key(&k.b);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bytes = channel_bytes(&k.dht, &outgoing, channel::CONTROL_SUBKEY);
+            if channel::open_control_with_key(&key, &bytes).is_ok_and(|c| c.collected_cursor == 2) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A published cursor 2");
+    assert_eq!(
+        k.a_fake.calls().channel_reads,
+        reads,
+        "no collection published the cursor"
+    );
+}
+
+/// A watched slot change for a message already recorded publishes the
+/// cursor a collection recorded it under and left unpublished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watched_slot_already_recorded_publishes_an_unpublished_cursor() {
+    let (mut k, b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    quiet_a(&k).await;
+    let bytes = b_sends_unpushed(&mut k, b_peer, 3, 1, b"collected").await;
+    // The collection's cursor publish is refused, and a collection leaves a
+    // refused publish to the next collection.
+    k.a_fake
+        .faults()
+        .plan
+        .push((CHANNEL, Op::Write, Fault::Refused));
+    assert!(a_inbound(&k).offer(PushInbound::Changed {
+        lookup_key: k.b.outgoing_lookup_key(&k.a),
+        first_subkey: 0,
+        single: false,
+        dead: false,
+        value: None,
+    }));
+    k.aw.wait_for("the message at A", message(k.a_peer, 1, b"collected"))
+        .await;
+    settled(&k.a_fake).await;
+    assert!(k.a_fake.faults().plan.is_empty(), "the publish was refused");
+    let a_state = conv_of(&k.a, &k.a_peer);
+    assert_eq!(a_state.my_collected, 2, "A collected the message");
+    assert!(a_state.cursor_published < 2, "the cursor is unpublished");
+    let key = a_state.own_control_key.expect("A's control key");
+    let outgoing = k.a.outgoing_lookup_key(&k.b);
+    assert!(a_inbound(&k).offer(slot_change(&k, channel::slot_for(1), bytes)));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bytes = channel_bytes(&k.dht, &outgoing, channel::CONTROL_SUBKEY);
+            if channel::open_control_with_key(&key, &bytes).is_ok_and(|c| c.collected_cursor == 2) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A published cursor 2");
 }
 
 /// A cursor publish that fails on the network is tried again within seconds
