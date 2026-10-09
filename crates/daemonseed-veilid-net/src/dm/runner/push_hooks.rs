@@ -42,8 +42,13 @@ use daemonseed_core::dm::channel::Reach;
 use daemonseed_core::dm::push as core_push;
 
 use crate::dm::push::{
-    Admitting, OwnRoute, PushInbox, PushParts, PushTransport, Pusher, Unanswered,
+    Admitting, KeptUnanswered, OwnRoute, PushInbox, PushParts, PushTransport, Pusher, Unanswered,
 };
+
+/// How many unanswered pushes in a row on one route are kept because their
+/// messages were collected. The next one drops the route, which is then taken
+/// to answer nothing.
+const KEPT_UNANSWERED_MAX: u32 = 2;
 
 /// How long after a failed route allocation the runner first tries again.
 const ROUTE_RETRY_FIRST: Duration = Duration::from_secs(5);
@@ -82,6 +87,7 @@ pub(super) struct PushShare {
     /// section forgot it.
     peer_routes: Arc<std::sync::Mutex<PeerRoutes>>,
     unanswered: mpsc::UnboundedSender<Unanswered>,
+    kept: KeptUnanswered,
 }
 
 impl PushShare {
@@ -105,7 +111,32 @@ impl PushShare {
             unanswered: self.unanswered.clone(),
             answer_key: None,
             own_route: None,
+            kept: Arc::clone(&self.kept),
         })
+    }
+
+    /// Count `unanswered`, a push whose message was collected, as kept on its
+    /// route, and say whether the route is kept: at most
+    /// [`KEPT_UNANSWERED_MAX`] such pushes in a row on one route are. A route
+    /// other than the one counted starts the count again.
+    fn keep_unanswered(&self, unanswered: &Unanswered) -> bool {
+        let mut kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = kept
+            .entry(unanswered.peer)
+            .or_insert_with(|| (unanswered.route.clone(), 0));
+        if count.0 != unanswered.route {
+            *count = (unanswered.route.clone(), 0);
+        }
+        if count.1 < KEPT_UNANSWERED_MAX {
+            count.1 += 1;
+            true
+        } else {
+            kept.remove(&unanswered.peer);
+            false
+        }
     }
 
     /// What a message push to `peer` is made with, where its route and this
@@ -364,6 +395,7 @@ impl PushState {
                 transport,
                 peer_routes: Arc::default(),
                 unanswered,
+                kept: Arc::default(),
             },
             admission: inbound.as_ref().map(PushInbox::admission),
             own_route: None,
@@ -799,7 +831,26 @@ impl<R: RunnerRecords> Runner<R> {
     /// message to its correspondent is not pushed until the correspondent
     /// gives a route again. A route the correspondent has given since is kept,
     /// and nothing else of the conversation changes.
+    ///
+    /// A push whose message the correspondent has since collected (for an
+    /// acceptance push, its reply) keeps its route: the push reached the correspondent and only its answer was
+    /// lost. At most [`KEPT_UNANSWERED_MAX`] such pushes in a row on one route
+    /// keep it, so a route that answers nothing is dropped all the same.
     pub(super) fn forget_route(&mut self, unanswered: &Unanswered) {
+        if self.unanswered_but_collected(unanswered) {
+            if self.push.share.keep_unanswered(unanswered) {
+                crate::vtrace!(
+                    "dm push: a push on {} went unanswered, its message was collected, route kept",
+                    tag(&unanswered.peer)
+                );
+                return;
+            }
+            crate::vtrace!(
+                "dm push: a push on {} went unanswered, its message was collected, \
+                 route dropped after {KEPT_UNANSWERED_MAX} kept in a row",
+                tag(&unanswered.peer)
+            );
+        }
         // Forgotten in memory inside the correspondence's section, in the
         // order of every take, and outside it where the section failed.
         let share = &self.push.share;
@@ -821,6 +872,25 @@ impl<R: RunnerRecords> Runner<R> {
             }
             Ok(false) => {}
             Err(_) => self.records.health.store_failures += 1,
+        }
+    }
+
+    /// Whether `unanswered` is a message or acceptance push whose message the
+    /// correspondent has collected: the conversation's stored cursor is past
+    /// its sequence.
+    /// A reach notice, a conversation the store does not hold, and a store
+    /// read that fails say no, the last counted where the store refused.
+    fn unanswered_but_collected(&mut self, unanswered: &Unanswered) -> bool {
+        let Some(seq) = unanswered.seq else {
+            return false;
+        };
+        match self.store.load_conv(&unanswered.peer) {
+            Ok(Some(state)) => state.peer_collected > seq,
+            Ok(None) => false,
+            Err(_) => {
+                self.records.health.store_failures += 1;
+                false
+            }
         }
     }
 

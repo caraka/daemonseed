@@ -9024,10 +9024,12 @@ async fn a_failed_push_forgets_and_releases_the_route() {
 
 /// A push that goes unanswered after the runner has gone idle releases the
 /// correspondent's route at once, with no command or collection to wake the
-/// runner, and not at its next collection.
+/// runner, and not at its next collection. The correspondent is stopped, so
+/// its cursor never covers the message.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unanswered_push_releases_the_route_while_the_runner_is_idle() {
     let (mut k, _) = establish_pushed().await;
+    assert!(finished(&k.bw.stop().await));
     let b_route = {
         let board = k.board.lock().unwrap();
         let mut routes: Vec<_> = board.routes.keys().cloned().collect();
@@ -9047,7 +9049,8 @@ async fn an_unanswered_push_releases_the_route_while_the_runner_is_idle() {
         body: b"one".to_vec(),
     })
     .await;
-    k.aw.wait_for("A's send", sent(3)).await;
+    let at = k.aw.wait_for("A's send", sent(3)).await;
+    let seq = sent_seq(&k.aw.seen[at]);
     held.reached().await;
     // What the send handed the runner is served before the push fails.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -9061,6 +9064,174 @@ async fn an_unanswered_push_releases_the_route_while_the_runner_is_idle() {
         board.lock().unwrap().released.contains(&b_route)
     })
     .await;
+    assert!(
+        conv_of(&k.a, &k.a_peer).peer_collected <= seq,
+        "the message is not collected"
+    );
+    assert_eq!(kept_route(&k.a, &k.a_peer), None, "the kept route is gone");
+}
+
+/// A sends `body` with its push held and failing, waits until B has
+/// collected the message and A has taken B's cursor past it, then lets the
+/// push fail, returning once the failed call has been made. The held push is
+/// made at all only where A still holds B's route.
+async fn unanswered_after_collection(k: &mut Knocked, token: u64, body: &'static [u8]) {
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let calls = {
+        let mut board = k.board.lock().unwrap();
+        board.down = true;
+        board.hold_calls = Some(Arc::clone(&held));
+        board.calls
+    };
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(token),
+        peer: k.a_peer,
+        body: body.to_vec(),
+    })
+    .await;
+    let at = k.aw.wait_for("A's send", sent(token)).await;
+    let seq = sent_seq(&k.aw.seen[at]);
+    tokio::time::timeout(AT_ONCE, held.reached())
+        .await
+        .expect("the send is pushed on B's route");
+    let (a, a_peer) = (&k.a, k.a_peer);
+    wait_until(
+        "A took B's cursor past the message",
+        Duration::from_secs(30),
+        || conv_of(a, &a_peer).peer_collected > seq,
+    )
+    .await;
+    k.board.lock().unwrap().hold_calls = None;
+    held.release();
+    let board = Arc::clone(&k.board);
+    wait_until("the push was made and failed", AT_ONCE, || {
+        board.lock().unwrap().calls > calls
+    })
+    .await;
+}
+
+/// A message push that goes unanswered after its correspondent has collected
+/// the message keeps the route it was made on, and the next send is pushed
+/// on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_push_whose_message_was_collected_keeps_the_route() {
+    let (mut k, _) = establish_pushed().await;
+    let b_route = route_blob(&k, 0);
+    unanswered_after_collection(&mut k, 3, b"one").await;
+    let board = Arc::clone(&k.board);
+
+    let calls = {
+        let mut board = k.board.lock().unwrap();
+        board.down = false;
+        board.calls
+    };
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"two".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's second send", sent(4)).await;
+    wait_until("the second send was pushed", AT_ONCE, || {
+        board.lock().unwrap().calls > calls
+    })
+    .await;
+    assert!(
+        !k.board.lock().unwrap().released.contains(&b_route),
+        "the route is kept"
+    );
+    assert_eq!(
+        kept_route(&k.a, &k.a_peer),
+        Some(b_route),
+        "the kept route stays"
+    );
+}
+
+/// Unanswered pushes whose messages were collected keep their route at most
+/// twice in a row: the third drops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_third_unanswered_push_in_a_row_drops_the_route_though_collected() {
+    let (mut k, _) = establish_pushed().await;
+    let b_route = route_blob(&k, 0);
+    unanswered_after_collection(&mut k, 3, b"one").await;
+    unanswered_after_collection(&mut k, 4, b"two").await;
+    unanswered_after_collection(&mut k, 5, b"three").await;
+    let board = Arc::clone(&k.board);
+    wait_until("A released B's route", AT_ONCE, || {
+        board.lock().unwrap().released.contains(&b_route)
+    })
+    .await;
+    assert_eq!(kept_route(&k.a, &k.a_peer), None, "the kept route is gone");
+}
+
+/// An acceptance push that goes unanswered after the correspondent has
+/// collected the acceptance's reply keeps the route it was made on, as a
+/// message push does, and the acceptor's next send is pushed on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_acceptance_whose_reply_was_collected_keeps_the_route() {
+    let mut k = knock(real_clock()).await;
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let calls = {
+        let mut board = k.board.lock().unwrap();
+        board.down = true;
+        board.hold_calls = Some(Arc::clone(&held));
+        board.calls
+    };
+    k.bw.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request: k.request,
+        reply: b"the reply".to_vec(),
+    })
+    .await;
+    tokio::time::timeout(AT_ONCE, held.reached())
+        .await
+        .expect("the acceptance is pushed");
+    let at = k.bw.wait_for("B's acceptance", sent(2)).await;
+    let b_peer = sent_peer(&k.bw.seen[at]);
+    k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
+    let (b, peer) = (&k.b, b_peer);
+    wait_until(
+        "B took A's cursor past the reply",
+        Duration::from_secs(30),
+        || conv_of(b, &peer).peer_collected > 0,
+    )
+    .await;
+    let a_route = kept_route(&k.b, &b_peer).expect("B keeps A's route");
+    k.board.lock().unwrap().hold_calls = None;
+    held.release();
+    let board = Arc::clone(&k.board);
+    wait_until("the push was made and failed", AT_ONCE, || {
+        board.lock().unwrap().calls > calls
+    })
+    .await;
+
+    let calls = {
+        let mut board = k.board.lock().unwrap();
+        board.down = false;
+        board.calls
+    };
+    k.bw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: b_peer,
+        body: b"after the acceptance".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("B's send", sent(3)).await;
+    wait_until("B's send was pushed", AT_ONCE, || {
+        board.lock().unwrap().calls > calls
+    })
+    .await;
+    assert!(
+        !k.board.lock().unwrap().released.contains(&a_route),
+        "the route is kept"
+    );
+    assert_eq!(
+        kept_route(&k.b, &b_peer),
+        Some(a_route),
+        "the kept route stays"
+    );
 }
 
 /// A store failure on the push receive path drops the push and is counted as
@@ -10981,6 +11152,36 @@ fn forgetting_a_peer_drops_and_releases_its_route() {
         board.lock().unwrap().released.len(),
         1,
         "nothing more to release"
+    );
+}
+
+/// A route forgotten after an unanswered push leaves its serial behind: a
+/// route at a lower serial arriving afterwards is not taken, and the same
+/// reach at that serial is.
+#[test]
+fn a_forgotten_route_keeps_its_serial_as_the_floor() {
+    let (push, _) = push_hooks::PushState::new(None);
+    let share = push.share.clone();
+    let peer = CorrespondenceLabel::mint().expect("a label");
+    let (r1, r2) = (vec![1u8; 4], vec![2u8; 4]);
+    share.set_peer_route(&peer, Some(r2.clone()), 12);
+    let forgotten = share.forget_route(&crate::dm::push::Unanswered {
+        peer,
+        route: r2.clone(),
+        seq: None,
+    });
+    assert_eq!(forgotten, Some(r2.clone()), "the route held is forgotten");
+    assert!(!share.holds_route(&peer));
+    share.set_peer_route(&peer, Some(r1), 10);
+    assert!(
+        !share.holds_route(&peer),
+        "a route below the forgotten one's serial is not taken"
+    );
+    share.set_peer_route(&peer, Some(r2.clone()), 12);
+    assert_eq!(
+        share.route_of(&peer),
+        Some((r2, 12)),
+        "the reach at that serial is taken again"
     );
 }
 

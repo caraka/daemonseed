@@ -532,16 +532,25 @@ impl PushTransport for VeilidPush {
     }
 }
 
-/// What a push is made with: the transport, the correspondent's route, and
-/// where its outcome goes.
+/// A push that went unanswered: its correspondent, the route it was made on,
+/// so only that route is forgotten, and what it pushed.
 #[derive(Clone)]
-/// A push that went unanswered: its correspondent, and the route it was made
-/// on, so only that route is forgotten.
 pub(crate) struct Unanswered {
     pub(crate) peer: CorrespondenceLabel,
     pub(crate) route: Vec<u8>,
+    /// The sequence of the message pushed, an acceptance's reply included, or
+    /// `None` for a reach notice.
+    pub(crate) seq: Option<u64>,
 }
 
+/// Per correspondent, the route its pushes were last kept on although
+/// unanswered, because their messages were collected, and how many such
+/// pushes in a row it was kept for. A push answered on that route clears it.
+pub(crate) type KeptUnanswered =
+    Arc<Mutex<std::collections::HashMap<CorrespondenceLabel, (Vec<u8>, u32)>>>;
+
+/// What a push is made with: the transport, the correspondent's route, and
+/// where its outcome goes.
 pub(crate) struct Pusher {
     pub(crate) transport: Arc<dyn PushTransport>,
     pub(crate) route: Vec<u8>,
@@ -553,6 +562,8 @@ pub(crate) struct Pusher {
     /// This node's own current route, which a message push carries with its
     /// tag. The correspondent does not take it as this node's route.
     pub(crate) own_route: Option<Vec<u8>>,
+    /// The kept unanswered pushes an answered push clears.
+    pub(crate) kept: KeptUnanswered,
 }
 
 impl Pusher {
@@ -598,7 +609,8 @@ impl Pusher {
     /// Push the sealed control subkey `control` of the channel at
     /// `lookup_key` as a reach notice, on its own task, where this pusher
     /// holds the key its answer is checked under. An unanswered notice
-    /// forgets the route it was made on, as an unanswered message does.
+    /// forgets the route it was made on, as an unanswered message does until
+    /// its correspondent has collected it.
     pub(crate) fn push_reach(
         &self,
         peer: CorrespondenceLabel,
@@ -640,6 +652,7 @@ impl Pusher {
         let events = self.events.clone();
         let unanswered = self.unanswered.clone();
         let route = self.route.clone();
+        let kept = Arc::clone(&self.kept);
         let what = match seq {
             Some(seq) => format!("sequence {seq}"),
             None => String::from("reach notice"),
@@ -652,6 +665,14 @@ impl Pusher {
                         "dm push: {what} recorded after {} ms",
                         started.elapsed().as_millis()
                     );
+                    {
+                        let mut kept = kept
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if kept.get(&peer).is_some_and(|(on, _)| *on == route) {
+                            kept.remove(&peer);
+                        }
+                    }
                     if let Some(seq) = seq {
                         let _ = events
                             .send(RunnerEvent::Delivered {
@@ -667,7 +688,7 @@ impl Pusher {
                         started.elapsed().as_millis(),
                         outcome.err()
                     );
-                    let _ = unanswered.send(Unanswered { peer, route });
+                    let _ = unanswered.send(Unanswered { peer, route, seq });
                 }
             }
         });
