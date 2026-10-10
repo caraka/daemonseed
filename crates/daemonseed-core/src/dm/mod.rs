@@ -9,9 +9,8 @@
 //! online. No handshake round-trip, no session, no new transport.
 //!
 //! `docs/design/direct-messaging.md` is implemented by [`advert`], [`mod@drop`],
-//! [`channel`], [`chain`], [`store`], [`delivery`] and [`flows`]. [`block_list`],
-//! [`contact_cache`] and [`domain`] are counted outside the layer by
-//! `cargo xtask dm-size`.
+//! [`channel`], [`chain`], [`store`], [`delivery`] and [`flows`], alongside
+//! [`block_list`], [`contact_cache`] and [`domain`].
 
 /// Append a `u64` big-endian length prefix and the bytes.
 ///

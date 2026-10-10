@@ -50,7 +50,7 @@ daemonseed/
 │       └── daemonseed-gui-api.yaml
 │
 └── xtask/                                  workspace task runner: gen-proto, check-proto,
-                                            check-manifests, check-ui-strings, dm-size,
+                                            check-manifests, check-ui-strings,
                                             isc-coverage, install-hooks, gate, release-gate
 ```
 
