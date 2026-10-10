@@ -3365,7 +3365,7 @@ async fn leave_an_acceptance_pending() -> (Profile, Profile, Fake) {
 
 /// B, relaunched with an acceptance pending after `prepare` changes its block
 /// list, surfaces no message across startup and the repair polls that follow,
-/// shows the conversation pending throughout, and still holds the acceptance
+/// shows the conversation accepting throughout, and still holds the acceptance
 /// pending once stopped. Returns what the relaunch reported.
 async fn a_pending_acceptance_stays_pending(prepare: fn(&Profile, &Profile)) -> Vec<RunnerEvent> {
     let (a, b, b_fake) = leave_an_acceptance_pending().await;
@@ -3376,8 +3376,8 @@ async fn a_pending_acceptance_stays_pending(prepare: fn(&Profile, &Profile)) -> 
     bw.drain();
     let rows = roster(&bw.seen[0]);
     assert!(
-        rows.len() == 1 && rows[0].state == ConversationState::Pending,
-        "the relaunch shows the conversation pending: {:?}",
+        rows.len() == 1 && rows[0].state == ConversationState::Accepting,
+        "the relaunch shows the conversation accepting: {:?}",
         bw.seen
     );
     assert!(
@@ -12803,6 +12803,23 @@ async fn a_relaunch_forgets_the_kept_route_when_a_newer_reach_names_none() {
         "nothing was pushed to the kept route"
     );
     assert!(finished(&aw.stop().await));
+}
+
+/// The roster lists a conversation whose first contact from this side awaits
+/// acceptance as pending, one whose acceptance of the correspondent's first
+/// contact has not finished as accepting, and one with neither as established.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_roster_tells_a_first_contact_awaiting_acceptance_from_an_acceptance_under_way() {
+    let (k, _) = establish_pushed().await;
+    let mut convs = reopen_store(&k.a).load().expect("the store reads").convs;
+    assert_eq!(convs.len(), 1);
+    assert_eq!(summaries(&convs)[0].state, ConversationState::Established);
+    convs[0].state.awaiting_acceptance = true;
+    convs[0].state.acceptance_pending = false;
+    assert_eq!(summaries(&convs)[0].state, ConversationState::Pending);
+    convs[0].state.awaiting_acceptance = false;
+    convs[0].state.acceptance_pending = true;
+    assert_eq!(summaries(&convs)[0].state, ConversationState::Accepting);
 }
 
 /// A push that fails at once on a route B no longer serves drops it, and the

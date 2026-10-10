@@ -99,13 +99,23 @@ pub fn notice_text(notice: DmNotice) -> String {
     }
 }
 
+/// The line under the thread of a first contact this side sent, until the
+/// correspondent accepts it.
+const REQUEST_SENT_NOTE: &str =
+    "Request sent. It may take a couple of minutes to reach them, or until they next come online.";
+
 /// The line under the thread: why nothing can be sent to a blocked person, or
-/// why the last message, acceptance or block did not go.
+/// why the last message, acceptance or block did not go, or, failing both,
+/// that this side's first contact awaits acceptance.
 fn thread_note(thread: &DmThreadView) -> &'static str {
     if thread.blocked {
         "You blocked them, so you can't send them messages."
+    } else if let Some(refusal) = thread.refusal {
+        refusal_text(refusal)
+    } else if thread.awaiting_acceptance {
+        REQUEST_SENT_NOTE
     } else {
-        thread.refusal.map_or("", refusal_text)
+        ""
     }
 }
 
@@ -594,6 +604,86 @@ mod tests {
             uncollected: 0,
             handle: None,
         }])
+    }
+
+    /// A state whose first contact to `tag` the runner reported sent, under the
+    /// returned label, with its thread selected.
+    fn sent_first_contact(tag: u8) -> (GuiState, CorrespondenceLabel) {
+        let mut st = GuiState::lobby_only();
+        st.start_dm_with(pk(tag));
+        assert!(st.send_dm("hello"));
+        let [RunnerCommand::FirstContact { token, .. }] = st.take_pending_dm()[..] else {
+            panic!("expected one first contact");
+        };
+        let peer = label();
+        st.on_dm_event(&RunnerEvent::Sent {
+            token,
+            peer,
+            seq: 0,
+        });
+        (st, peer)
+    }
+
+    /// A roster listing the conversation with `tag` under `peer` in `state`.
+    fn listed(peer: CorrespondenceLabel, tag: u8, state: ConversationState) -> RunnerEvent {
+        RunnerEvent::Roster(vec![ConversationSummary {
+            peer,
+            peer_identity_pk: pk(tag),
+            state,
+            peer_collected: 0,
+            uncollected: 1,
+            handle: None,
+        }])
+    }
+
+    /// The line under the selected thread.
+    fn note_of(st: &GuiState) -> &'static str {
+        thread_note(&st.dm_thread_view().expect("the thread is selected"))
+    }
+
+    /// The line under a sent first contact's thread says the request is on its
+    /// way while the roster lists it pending, and says nothing once it is
+    /// established or while the conversation is an acceptance under way; a
+    /// refusal shown there wins over it.
+    #[test]
+    fn a_sent_first_contact_notes_the_request_until_it_is_established() {
+        let (mut st, peer) = sent_first_contact(4);
+        st.on_dm_event(&listed(peer, 4, ConversationState::Pending));
+        assert_eq!(note_of(&st), REQUEST_SENT_NOTE);
+        st.on_dm_event(&listed(peer, 4, ConversationState::Established));
+        assert_eq!(note_of(&st), "");
+
+        let (mut st, peer) = sent_first_contact(5);
+        st.on_dm_event(&listed(peer, 5, ConversationState::Accepting));
+        assert_eq!(note_of(&st), "");
+
+        let (mut st, peer) = sent_first_contact(6);
+        st.on_dm_event(&listed(peer, 6, ConversationState::Pending));
+        assert!(st.send_dm("again"));
+        let [RunnerCommand::Send { token, .. }] = st.take_pending_dm()[..] else {
+            panic!("expected one send");
+        };
+        st.on_dm_event(&RunnerEvent::Refused {
+            token: Some(token),
+            reason: Refusal::AwaitingAcceptance,
+        });
+        assert_eq!(note_of(&st), refusal_text(Refusal::AwaitingAcceptance));
+        assert_ne!(note_of(&st), REQUEST_SENT_NOTE);
+
+        let (mut st, peer) = sent_first_contact(7);
+        st.on_dm_event(&listed(peer, 7, ConversationState::Pending));
+        assert_eq!(note_of(&st), REQUEST_SENT_NOTE);
+        st.on_dm_event(&RunnerEvent::Accepted { peer });
+        assert_eq!(note_of(&st), "", "the acceptance ends the note");
+
+        let (mut st, peer) = sent_first_contact(8);
+        st.on_dm_event(&listed(peer, 8, ConversationState::Pending));
+        st.on_dm_event(&RunnerEvent::BlockList(vec![pk(8)]));
+        assert_eq!(
+            note_of(&st),
+            "You blocked them, so you can't send them messages.",
+            "a block wins over the note"
+        );
     }
 
     /// A message sent five minutes ago and collected now.

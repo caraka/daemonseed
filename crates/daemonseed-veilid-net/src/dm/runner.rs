@@ -662,12 +662,15 @@ impl core::fmt::Debug for RunnerCommand {
     }
 }
 
-/// Whether a conversation's own first contact has been accepted.
+/// Whether a conversation is open in both directions, and if not, which side
+/// it waits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationState {
-    /// This side's first contact is awaiting acceptance, or this side's
-    /// acceptance of the correspondent's has not finished.
+    /// This side's first contact is awaiting the correspondent's acceptance.
     Pending,
+    /// This side's acceptance of the correspondent's first contact has not
+    /// finished.
+    Accepting,
     /// Both directions are open.
     Established,
 }
@@ -678,7 +681,7 @@ pub struct ConversationSummary {
     pub peer: CorrespondenceLabel,
     /// The correspondent's identity public key.
     pub peer_identity_pk: IdentityPk,
-    /// Pending or established.
+    /// Pending, accepting or established.
     pub state: ConversationState,
     /// The correspondent's cursor over this side's messages: every sequence
     /// below it has been collected.
@@ -2207,8 +2210,10 @@ fn summaries(convs: &[LoadedConv]) -> Vec<ConversationSummary> {
         .map(|conv| ConversationSummary {
             peer: conv.peer,
             peer_identity_pk: conv.state.peer_identity_pk.clone(),
-            state: if conv.state.awaiting_acceptance || conv.state.acceptance_pending {
+            state: if conv.state.awaiting_acceptance {
                 ConversationState::Pending
+            } else if conv.state.acceptance_pending {
+                ConversationState::Accepting
             } else {
                 ConversationState::Established
             },

@@ -1339,6 +1339,7 @@ fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
             match correspondence.state {
                 Some(ConversationState::Established) => "established",
                 Some(ConversationState::Pending) => "pending acceptance",
+                Some(ConversationState::Accepting) => "accepting",
                 None => "state not stated",
             }
         };

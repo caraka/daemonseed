@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use daemonseed_veilid_net::dm::runner::{
-    CommandToken, IdentityPk, Refusal, RunnerCommand, RunnerEvent,
+    CommandToken, ConversationState, IdentityPk, Refusal, RunnerCommand, RunnerEvent,
 };
 use daemonseed_veilid_net::dm::view::{
     DmCorrespondence, DmOutstanding, DmState, DmThreadRow, FirstContactBlocked, dm_fingerprint,
@@ -211,6 +211,9 @@ pub struct DmThreadView {
     pub blocking: bool,
     /// The correspondent is blocked, which is why nothing can be sent.
     pub blocked: bool,
+    /// The roster lists this conversation as this side's first contact
+    /// awaiting the correspondent's acceptance.
+    pub awaiting_acceptance: bool,
 }
 
 /// A message this session composed, from the moment it was queued.
@@ -1324,6 +1327,7 @@ impl GuiState {
                 rows,
                 can_send: false,
                 blocked,
+                awaiting_acceptance: false,
             });
         }
         let correspondence = dm.state.correspondences.get(peer);
@@ -1373,6 +1377,8 @@ impl GuiState {
             can_send,
             blocking: false,
             blocked,
+            awaiting_acceptance: correspondence
+                .is_some_and(|c| c.state == Some(ConversationState::Pending)),
         })
     }
 }

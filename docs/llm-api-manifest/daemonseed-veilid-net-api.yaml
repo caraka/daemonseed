@@ -602,16 +602,17 @@ types:
     module: daemonseed_veilid_net::dm::runner
     kind: struct
     description: >-
-      One roster row: peer, peer_identity_pk, state (ConversationState Pending or
-      Established), peer_collected (the correspondent's cursor), uncollected
+      One roster row: peer, peer_identity_pk, state (ConversationState Pending,
+      Accepting or Established), peer_collected (the correspondent's cursor), uncollected
       (send_seq minus that cursor) and handle (Option<String>, the handle stored by
       NoteHandle).
   - name: ConversationState
     module: daemonseed_veilid_net::dm::runner
     kind: enum
     description: >-
-      Pending (this side's first contact awaits acceptance, or this side's
-      acceptance of the correspondent's has not finished) or Established.
+      Pending (this side's first contact awaits acceptance), Accepting (this
+      side's acceptance of the correspondent's first contact has not finished)
+      or Established.
   - name: CommandToken
     module: daemonseed_veilid_net::dm::runner
     kind: struct
