@@ -424,6 +424,8 @@ work lives in the maintainer's own planning notes, not here.
   and reports the finish with a `Roster`. Launch passes and collection skip a marked conversation, a command on one
   is refused `UnknownConversation`, and a hello for one is not counted in `hellos_unsettled`. `RunnerRecords` gains
   `open_existing_channel`, and `VeilidRecords::erase_channel` keeps the channel open when the erase fails.
+- `daemonseed-veilid-net`: `VeilidNetHandle::resweep_rendezvous` returns when its backlog sweep has finished, not when the record opens, so the GUI and TUI steady resweeps run one sweep at a time instead of accumulating sweeps on the read pool
+- `daemonseed-veilid-net`: every `ValueChange` update is traced with its record, subkeys, watch count and value size
 - Record opens release their un-gated permit and the caller's record lock on timeout instead of holding both across an unanswered open (#430)
 - `daemonseed-tui`: a graceful close publishes a LEAVE tombstone for every joined circle as well as
   the lobby, each sealed under its own circle key and posted to that circle's presence record,
