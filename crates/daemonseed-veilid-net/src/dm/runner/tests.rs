@@ -1858,9 +1858,10 @@ async fn a_message_after_the_preview_reaches_the_thread_after_the_first() {
 }
 
 /// A pass reads the established conversations before it scans the drop: with
-/// the scan due on every pass, because a first contact awaits acceptance, and
-/// the scan held at its first read, a message already written to an
-/// established conversation is reported while the scan is still held.
+/// the scan due at the first collection, because a first contact awaits
+/// acceptance and startup ends after both are due, and the scan held at its
+/// first read, a message already written to an established conversation is
+/// reported while the scan is still held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pass_collects_its_conversations_before_a_slow_drop_scan() {
     let config = RunnerConfig {
@@ -1905,7 +1906,18 @@ async fn a_pass_collects_its_conversations_before_a_slow_drop_scan() {
     let held = Arc::new(Gate::default());
     let _release = ReleaseOnDrop(Arc::clone(&held));
     a_fake.faults().gate_drop_scan = Some((a.drop_name(), 1, Arc::clone(&held)));
+    // The first collection and the next scan are drawn apart, so the scan may
+    // fall due first and run with no collection before it. Startup is held at
+    // its channel repair, after its scan, until both are due: the first pass
+    // is then a collection with the scan due.
+    let startup = Arc::new(Gate::default());
+    let _release_startup = ReleaseOnDrop(Arc::clone(&startup));
+    a_fake.faults().gate_inspect_channel = Some(Arc::clone(&startup));
     let mut aw = a.spawn(&a_fake, config);
+    startup.reached().await;
+    tokio::time::sleep(config.tick * 2).await;
+    a_fake.faults().gate_inspect_channel = None;
+    startup.release();
     aw.wait_for("A's startup", is_health).await;
     aw.wait_for("B's message at A", message(a_peer, 1, b"while A was away"))
         .await;
