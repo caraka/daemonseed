@@ -901,7 +901,7 @@ impl Lane {
             }
             // Already recorded, by a push or a collection; the cursor is
             // published in case that recording has not published it yet.
-            Ok(Taken::Duplicate { peer }) => {
+            Ok(Taken::Duplicate { peer, .. }) => {
                 let _ = self.notes.send(LaneNote::PublishCursor(peer));
                 true
             }
@@ -989,8 +989,19 @@ impl Lane {
                 crate::vtrace!("dm push: {} is blocked, its push is dropped", tag(&peer));
                 self.share.count(|health| health.pushes_dropped += 1);
             }
-            Ok(Taken::Duplicate { peer }) => {
-                crate::vtrace!("dm push: {} duplicate ignored", tag(&peer));
+            // Already recorded, from a watched change or an earlier push. The
+            // last sequence recorded is answered as that recording would have
+            // been, so the sender keeps the route it pushed on; an older one
+            // is not answered.
+            Ok(Taken::Duplicate {
+                peer,
+                answer: Some(answer),
+            }) => {
+                self.share.push.answer(id, answer);
+                crate::vtrace!("dm push: {} duplicate answered", tag(&peer));
+            }
+            Ok(Taken::Duplicate { peer, answer: None }) => {
+                crate::vtrace!("dm push: {} older duplicate ignored", tag(&peer));
             }
             Ok(Taken::Ahead { peer }) => {
                 crate::vtrace!(

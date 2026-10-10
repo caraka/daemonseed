@@ -1317,7 +1317,9 @@ modules:
       collect_step: Taken { Recorded { peer, seq, message, answer, route:
       Option<Vec<u8>> (the pushed route where its tag is route_tag at seq under
       the correspondent's control key; it carries no reach serial and is not
-      taken as the correspondent's route) } | Blocked { peer } | Duplicate { peer } |
+      taken as the correspondent's route) } | Blocked { peer } | Duplicate { peer,
+      answer: Option (the answer at seq where seq is the last recorded sequence,
+      else None) } |
       Ahead { peer } | Dropped }; a commit that conflicts is taken again from a
       fresh load, TAKE_ATTEMPTS (4) times in all. take_reach(store, is_blocked,
       lookup_key, control) -> Result<ReachTaken, FlowError> opens a reach

@@ -12,7 +12,9 @@
 //! A pushed message is taken only as the next sequence the conversation
 //! expects, and through the same ring read and the same persist that
 //! collection uses ([`crate::dm::flows::collect_batch`]); a sequence already
-//! collected or ahead of the next is ignored and left to the record store. A
+//! collected changes nothing and, where it is the last sequence recorded, is
+//! answered as its first push was; an older one, and one ahead of the next,
+//! is ignored and left to the record store. A
 //! pushed acceptance runs the recognition a drop scan runs
 //! ([`crate::dm::flows::collect_slot`]) over a [`ReadCache`] holding the pushed
 //! bytes, so every check a scan makes is made. The collected hello back is
@@ -420,6 +422,10 @@ pub enum Taken {
     Duplicate {
         /// The conversation.
         peer: CorrespondenceLabel,
+        /// Where the sequence is the last one recorded, the answer that
+        /// reports it persisted ([`answer`]), as its first push was answered;
+        /// `None` for any older sequence, which is left unanswered.
+        answer: Option<[u8; ANSWER_LEN]>,
     },
     /// A sequence past the next one expected, left to the record store.
     /// Nothing was changed.
@@ -445,7 +451,9 @@ pub enum Taken {
 /// and a message this returns is persisted as read before it is returned. The
 /// cursor reaches the record store with the next [`flows::publish_cursor`].
 /// `route` is the route the push carried, handed back in [`Taken::Recorded`]
-/// only where its tag matches.
+/// only where its tag matches. A slot naming a sequence already collected is
+/// [`Taken::Duplicate`], carrying the answer that sequence's first push was
+/// given where it is the last sequence recorded, and none otherwise.
 ///
 /// Where the conversation record changes between the load and the commit
 /// ([`FlowError::Conflict`]), nothing is recorded and the push is taken again
@@ -504,7 +512,13 @@ fn take_message_once(
         return Ok(Taken::Dropped);
     };
     if header.seq < state.my_collected {
-        return Ok(Taken::Duplicate { peer });
+        return duplicate(
+            peer,
+            peer_control_key,
+            lookup_key,
+            header.seq,
+            state.my_collected,
+        );
     }
     if header.seq > state.my_collected {
         return Ok(Taken::Ahead { peer });
@@ -517,6 +531,10 @@ fn take_message_once(
         subkey,
         slot,
     };
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_PUSHED_STEP.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     match flows::collect_step(store, &mut one, &peer) {
         Ok(RingStep::Message { seq, message, .. }) => {
             let route = match route {
@@ -535,13 +553,52 @@ fn take_message_once(
             })
         }
         // The cursor moved past this sequence since the check above.
-        Ok(RingStep::End) => Ok(Taken::Duplicate { peer }),
+        Ok(RingStep::End) => {
+            let collected = store
+                .load_conv(&peer)?
+                .map_or(header.seq, |state| state.my_collected);
+            duplicate(peer, peer_control_key, lookup_key, header.seq, collected)
+        }
         Ok(RingStep::Unopened(_))
         | Err(FlowError::DeletePending)
         | Err(FlowError::AwaitingAcceptance)
         | Err(FlowError::Store(StoreError::MissingConversation)) => Ok(Taken::Dropped),
         Err(e) => Err(e),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by [`take_message`] between its check of the expected
+    /// sequence and its ring read, so a test can land a recording in that gap.
+    static BEFORE_PUSHED_STEP: core::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Run `hook` once, in the next [`take_message`] on this thread, between its
+/// check of the expected sequence and its ring read.
+#[cfg(test)]
+pub(crate) fn before_next_pushed_step(hook: impl FnOnce() + 'static) {
+    BEFORE_PUSHED_STEP.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// [`Taken::Duplicate`] for a slot naming `seq`, below `collected`: answered
+/// only where `seq` is the last sequence recorded, the one a push that lost a
+/// race to a watched change or a ring read names. The header naming `seq` is
+/// not authenticated, so the answer of an older sequence is not given.
+fn duplicate(
+    peer: CorrespondenceLabel,
+    control_key: &ControlKey,
+    lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    seq: u64,
+    collected: u64,
+) -> Result<Taken, FlowError> {
+    let answer = if seq.checked_add(1) == Some(collected) {
+        Some(answer(control_key, lookup_key, seq)?)
+    } else {
+        None
+    };
+    Ok(Taken::Duplicate { peer, answer })
 }
 
 /// What [`take_reach`] did with a reach notice.

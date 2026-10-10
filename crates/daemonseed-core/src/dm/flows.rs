@@ -9483,9 +9483,10 @@ mod tests {
     }
 
     /// ISC-C108 — a duplicate push and a push ahead of the next sequence change
-    /// nothing, and the ahead one is collected from the network in order.
+    /// nothing, the duplicate carries the answer its first push was given, and
+    /// the ahead one is collected from the network in order.
     #[test]
-    fn a_duplicate_or_ahead_push_is_ignored() {
+    fn a_duplicate_or_ahead_push_changes_nothing() {
         let (a, b, mut net) = scene();
         let (peer_a, accepted) = round_trip(&a, &b, &mut net);
         let lookup = a_reads(&a, &peer_a);
@@ -9501,16 +9502,23 @@ mod tests {
             a.store().load_conv(&peer_a).unwrap().unwrap().my_collected,
             before.my_collected
         );
-        assert!(matches!(
+        let Taken::Recorded { answer, .. } =
             push_plane::take_message(&a.store(), |_| false, &lookup, first_subkey, &first, None)
-                .unwrap(),
-            Taken::Recorded { .. }
-        ));
-        assert!(matches!(
+                .unwrap()
+        else {
+            panic!("the first push is recorded");
+        };
+        let Taken::Duplicate { answer: again, .. } =
             push_plane::take_message(&a.store(), |_| false, &lookup, first_subkey, &first, None)
-                .unwrap(),
-            Taken::Duplicate { .. }
-        ));
+                .unwrap()
+        else {
+            panic!("the second push is a duplicate");
+        };
+        assert_eq!(
+            again,
+            Some(answer),
+            "a duplicate of the last sequence is answered as its first push"
+        );
         assert_eq!(
             a.store().load_conv(&peer_a).unwrap().unwrap().my_collected,
             before.my_collected + 1
@@ -9519,6 +9527,80 @@ mod tests {
         net.channels.insert((lookup, second_subkey), second);
         let batch = collect_batch(&a.store(), &mut net, &peer_a).expect("collect");
         assert_eq!(batch.bodies(), vec![b"two".to_vec()]);
+    }
+
+    /// ISC-C108 — a duplicate push is answered only for the last sequence
+    /// recorded: a duplicate of an older one carries no answer.
+    #[test]
+    fn only_a_duplicate_of_the_last_recorded_sequence_is_answered() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup = a_reads(&a, &peer_a);
+        let (first_subkey, first) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"one", 63);
+        let (second_subkey, second) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"two", 64);
+        let store = a.store();
+        let take = |subkey, slot: &[u8]| {
+            push_plane::take_message(&store, |_| false, &lookup, subkey, slot, None).unwrap()
+        };
+        assert!(matches!(take(first_subkey, &first), Taken::Recorded { .. }));
+        let Taken::Recorded { answer, .. } = take(second_subkey, &second) else {
+            panic!("the second push is recorded");
+        };
+        let collected = store.load_conv(&peer_a).unwrap().unwrap().my_collected;
+        assert!(
+            matches!(
+                take(first_subkey, &first),
+                Taken::Duplicate { answer: None, .. }
+            ),
+            "an older duplicate is not answered"
+        );
+        let Taken::Duplicate { answer: last, .. } = take(second_subkey, &second) else {
+            panic!("a duplicate of the last sequence");
+        };
+        assert_eq!(last, Some(answer), "the last duplicate is answered");
+        assert_eq!(
+            store.load_conv(&peer_a).unwrap().unwrap().my_collected,
+            collected,
+            "nothing changed"
+        );
+    }
+
+    /// ISC-C108 — a push whose sequence is recorded between its check of the
+    /// expected sequence and its ring read is a duplicate of the last sequence
+    /// recorded, and is answered as that recording was.
+    #[test]
+    fn a_push_recorded_meanwhile_is_answered_as_the_last_duplicate() {
+        let (a, b, mut net) = scene();
+        let (peer_a, accepted) = round_trip(&a, &b, &mut net);
+        let lookup = a_reads(&a, &peer_a);
+        let (subkey, slot) = b_sends_unwritten(&b, &mut net, &accepted.peer, b"raced", 65);
+        let store = std::rc::Rc::new(a.store());
+        let before = store.load_conv(&peer_a).unwrap().unwrap().my_collected;
+        let recorded = std::rc::Rc::new(core::cell::Cell::new(None));
+        {
+            let (store, recorded, slot) = (store.clone(), recorded.clone(), slot.clone());
+            push_plane::before_next_pushed_step(move || {
+                let taken =
+                    push_plane::take_message(&store, |_| false, &lookup, subkey, &slot, None)
+                        .unwrap();
+                let Taken::Recorded { answer, .. } = taken else {
+                    panic!("the recording in the gap: {taken:?}");
+                };
+                recorded.set(Some(answer));
+            });
+        }
+        let taken =
+            push_plane::take_message(&store, |_| false, &lookup, subkey, &slot, None).unwrap();
+        let recorded = recorded.get().expect("the gap's recording ran");
+        assert!(
+            matches!(taken, Taken::Duplicate { answer: Some(answer), .. } if answer == recorded),
+            "answered as the recording: {taken:?}"
+        );
+        assert_eq!(
+            store.load_conv(&peer_a).unwrap().unwrap().my_collected,
+            before + 1,
+            "recorded once"
+        );
     }
 
     /// ISC-C108 — a push that does not open under the conversation, or names
