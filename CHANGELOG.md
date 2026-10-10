@@ -45,6 +45,7 @@ work lives in the maintainer's own planning notes, not here.
 ### Fixed
 
 - `daemonseed-gui`: a handle set mid-session reaches the direct-message runner at once, which rewrites the control subkey of every established conversation with it, instead of at the next connect.
+- `daemonseed-veilid-net`: at startup the direct-message runner reads each established correspondent's control subkey before it pushes anything, and pushes to the route that control names instead of a route kept from an earlier run; a collection reads the correspondent's control where no route is held for it.
 - `daemonseed-veilid-net`: a direct-message runner whose route allocation fails tries again 5 seconds later, doubling the wait up to 2 minutes, until a route is allocated and published, instead of leaving pushes to it off until restart.
 - `daemonseed-veilid-net`: a send committed while the runner rewrites control subkeys has its slot written before the next conversation's rewrite, instead of after the last one.
 - `daemonseed-veilid-net`: a contact request whose identity is blocked while a drop scan is under way is not surfaced again by that scan.

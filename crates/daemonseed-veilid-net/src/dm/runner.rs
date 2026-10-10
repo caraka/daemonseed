@@ -33,8 +33,11 @@
 //! ## Startup
 //!
 //! Once the store has loaded, the task reports the [`RunnerEvent::Roster`],
-//! admits message pushes from every established correspondent, holds the
-//! routes it kept for them and allocates this node's route, reopens every
+//! admits message pushes from every established correspondent, allocates
+//! this node's route, reads each correspondent's control subkey, one at a
+//! time, and holds the route it names, or the route kept from an earlier run
+//! where that read fails or gives no newer reach and the live lane took none
+//! meanwhile, reopens every
 //! channel this side owns, pushes a reach notice to every route it holds and
 //! rewrites every control subkey with the route, finishes every conversation delete a
 //! previous run marked and did not finish, restores or mints the advert keys and
@@ -66,10 +69,10 @@
 //!   collection is a sweep for anything those missed. A conversation just
 //!   established, and one with a watched change this node cannot apply, is
 //!   collected at once; the first read of a correspondent's channel is what
-//!   watches it. The first collection after startup, the one at
-//!   establishment and the one after a dead watch is registered again also
-//!   read the correspondent's control once where messages are outstanding,
-//!   for a cursor written while no watch was live; a sweep does not.
+//!   watches it. Every collection also reads the correspondent's control
+//!   once where messages are outstanding, for a cursor written while no
+//!   watch was live, and, where this node has a push transport and holds no
+//!   route for the correspondent, for a route given since.
 //!   Collection only reads.
 //! - **Drop scan**, every [`RunnerConfig::tick`] jittered by ±20 % while a
 //!   first contact of this node's awaits acceptance, whose answer arrives in
@@ -425,6 +428,21 @@ pub trait RunnerRecords: Records {
     fn forced_conflicts(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         Arc::default()
     }
+}
+
+/// What [`Runner::read_peer_control`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlRead {
+    /// The control's reach was above the one applied, and was taken.
+    Newer,
+    /// No control, or one whose reach was not above the one applied, or a
+    /// read that failed other than on the local store: a conversation failure
+    /// (a control that will not open, or a conversation missing its
+    /// correspondent's control key), a read the network refused, or a
+    /// conversation that is gone.
+    NotNewer,
+    /// The local store failed, and the failure was counted.
+    StoreFailed,
 }
 
 /// How a failed record store call failed.
@@ -4558,27 +4576,54 @@ impl<R: RunnerRecords> Runner<R> {
     }
 
     /// Read the correspondent's control once, where this side has messages
-    /// it does not know collected, and take its reach and cursor as a watched
+    /// it does not know collected, or has a push transport and holds no route
+    /// for the correspondent, and take its reach and cursor as a watched
     /// control change is taken.
     fn catch_up_peer_control(&mut self, peer: &CorrespondenceLabel) {
         match self.store.load_conv(peer) {
             Ok(Some(state)) if state.send_seq > state.peer_collected => {}
+            Ok(Some(_))
+                if self.push.share.transport.is_some() && !self.push.share.holds_route(peer) => {}
             Ok(_) => return,
             Err(_) => {
                 self.records.health.store_failures += 1;
                 return;
             }
         }
+        self.read_peer_control(peer);
+    }
+
+    /// Read the correspondent's control once and take its cursor, and its
+    /// reach where the reach's serial is at or above the one applied: above
+    /// it, the reach replaces the one applied; at it, the reach is the one
+    /// already applied, so its route is held again where none is and its
+    /// handle kept. Says whether the reach was above the one applied, and
+    /// whether the local store failed, a failure this counts.
+    fn read_peer_control(&mut self, peer: &CorrespondenceLabel) -> ControlRead {
         let _step = Step::start(format!("control catch-up of {}", tag(peer)));
         match flows::peer_control(&self.store, &mut self.records, peer) {
             Ok(Some(control)) => {
                 // An older reach than the one applied is not taken; the
                 // cursor is.
-                let _ = self.take_reach(peer, &control.reach, control.serial);
+                let took = self.take_reach(peer, &control.reach, control.serial);
                 self.take_peer_cursor(peer, control.collected_cursor);
+                match took {
+                    push_hooks::Took::Newer => ControlRead::Newer,
+                    push_hooks::Took::Failed => ControlRead::StoreFailed,
+                    push_hooks::Took::Same | push_hooks::Took::Older => ControlRead::NotNewer,
+                }
             }
-            Ok(None) => {}
-            Err(e) => note_failure(&mut self.records.health, &e),
+            Ok(None) | Err(FlowError::Store(StoreError::MissingConversation)) => {
+                ControlRead::NotNewer
+            }
+            Err(e) => {
+                note_failure(&mut self.records.health, &e);
+                if matches!(e, FlowError::Store(_)) {
+                    ControlRead::StoreFailed
+                } else {
+                    ControlRead::NotNewer
+                }
+            }
         }
     }
 

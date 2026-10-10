@@ -182,7 +182,13 @@ modules:
       held), answers a reach notice at the serial applied only after
       Store::sync_correspondence, retries a reach serial it could not write
       from its schedule, keeps each correspondent's route with
-      the conversation across relaunches, pushes a reach notice to every held
+      the conversation across relaunches, at launch allocates its route and
+      then reads each established or accepting correspondent's control subkey
+      before any push and holds the route it names (the kept route, read with
+      its serial in one critical section, where the read fails or names no
+      newer reach),
+      reads it again in a collection where no route is held and keeps its route
+      again at the serial applied, pushes a reach notice to every held
       route at launch and on each route renewal before the control rewrite,
       forgets a route (held and kept) whose push goes unanswered, reports
       Delivered on an answer of RECORDED followed by the code computed under the

@@ -19,9 +19,16 @@
 //! moves in the order the record does and a late copy of an older control
 //! cannot put back a route a newer one replaced. A forgotten route leaves its
 //! serial behind in memory as on disk. The route a message push carries is
-//! not taken: it has no serial. A relaunch starts with the routes it held. A
-//! kept route is only an address to try: a push on it that goes unanswered
-//! forgets it, in memory and on disk, until the correspondent gives one again.
+//! not taken: it has no serial. At launch, before any push, the runner reads
+//! the control subkey of every established correspondent and holds the route
+//! it names where its reach is newer than the one applied; where the read
+//! fails or the reach is no newer, it holds the kept route, read with its
+//! serial in one critical section ([`Store::with_route`]), so a route a reach
+//! notice or an acceptance gave meanwhile is the one held. A held route is
+//! only an address to try: a push on it that goes unanswered forgets it, in
+//! memory and on disk, and the next collection of the conversation reads the
+//! correspondent's control, whose route is kept again where its serial is the
+//! one applied and taken where it is newer.
 //!
 //! Once this node holds a route, at launch and whenever it is replaced, and
 //! before the control subkeys are rewritten with it, the runner pushes a
@@ -339,6 +346,18 @@ impl From<ReachTake> for Took {
     }
 }
 
+/// Whether startup reads the correspondent's control for `state` before it
+/// holds a route: an established conversation, or one whose acceptance this
+/// side has not finished, that is not being deleted and whose correspondent's
+/// channel and control key this side holds.
+fn reads_peer_control(state: &ConvState) -> bool {
+    !state.delete_pending
+        && !state.awaiting_acceptance
+        && state.outgoing_lookup_key != NO_LOOKUP_KEY
+        && state.incoming_lookup_key != NO_LOOKUP_KEY
+        && state.peer_control_key.is_some()
+}
+
 /// What giving `route` for a correspondent holding `held` does.
 pub(super) fn route_change(held: Option<&Vec<u8>>, route: Option<&Vec<u8>>) -> RouteChange {
     match (held, route) {
@@ -444,19 +463,64 @@ impl PushState {
 }
 
 impl<R: RunnerRecords> Runner<R> {
-    /// Admit message pushes from every established conversation, and allocate
-    /// this node's route where it has a push transport. Nothing is written to
-    /// the network, so neither waits on a channel reopen:
+    /// Admit message pushes from every established conversation, and, where
+    /// this node has a push transport, allocate this node's route and then
+    /// hold each correspondent's.
+    ///
+    /// The route held is the one the correspondent's control subkey names,
+    /// read here once per established conversation, one at a time, where
+    /// that control's reach is newer than the one applied; a newer reach
+    /// naming no route forgets the route kept. Where the read fails, or the
+    /// reach is not newer, the route kept is held with its own serial, the
+    /// two read together inside the critical section the live lane's takes
+    /// also run in. A read that failed on the local store counts one store
+    /// failure, and the route kept is still held where it reads, as it does
+    /// after a failed write; the pair's own failure is not counted again. A
+    /// missing conversation holds nothing and is not a store failure. Nothing
+    /// is written to the
+    /// network, so none of this waits on a channel reopen:
     /// [`Self::publish_route`] publishes the route once the channels are open.
     pub(super) async fn start_push(&mut self) -> Result<(), Halt> {
-        if let Ok(convs) = self.load_convs() {
-            self.admit_pushes_for(&convs);
+        let convs = self.load_convs().ok();
+        if let Some(convs) = &convs {
+            self.admit_pushes_for(convs);
+        }
+        // This node's route does not wait on the reads, so it is ready once
+        // they end.
+        if let Some(transport) = self.push.share.transport.clone() {
+            self.allocate_route(transport.as_ref(), ROUTE_RETRY_FIRST)
+                .await;
+        }
+        if let Some(convs) = convs {
+            let reads = self.push.share.transport.is_some();
             for conv in &convs {
-                if conv.route.is_none() {
-                    continue;
-                }
+                self.check_stop()?;
+                let read = if reads && reads_peer_control(&conv.state) {
+                    self.read_peer_control(&conv.peer)
+                } else {
+                    ControlRead::NotNewer
+                };
+                let counted = match read {
+                    ControlRead::Newer => {
+                        if let Some(kept) = &conv.route {
+                            if !self.push.share.holds_route(&conv.peer)
+                                && self.store.forget_route(&conv.peer, kept, || {}).is_err()
+                            {
+                                self.records.health.store_failures += 1;
+                            }
+                        }
+                        continue;
+                    }
+                    // Counted once, by the read. A failed write leaves the
+                    // record readable, so the pair below is still read; a
+                    // failed read fails it again, and that is not counted.
+                    ControlRead::StoreFailed => true,
+                    ControlRead::NotNewer => false,
+                };
                 // The route kept and its serial are read as one pair, inside
-                // the section every take of the live lane also runs in.
+                // the section every take of the live lane also runs in, so a
+                // route the lane took meanwhile, from a reach notice or an
+                // acceptance, is the one held, whichever lands first.
                 let share = &self.push.share;
                 let mut released = None;
                 let seeded = self.store.with_route(&conv.peer, |route, serial| {
@@ -467,13 +531,10 @@ impl<R: RunnerRecords> Runner<R> {
                 share.release(released);
                 match seeded {
                     Ok(()) | Err(StoreError::MissingConversation) => {}
+                    Err(_) if counted => {}
                     Err(_) => self.records.health.store_failures += 1,
                 }
             }
-        }
-        if let Some(transport) = self.push.share.transport.clone() {
-            self.allocate_route(transport.as_ref(), ROUTE_RETRY_FIRST)
-                .await;
         }
         Ok(())
     }
@@ -830,7 +891,10 @@ impl<R: RunnerRecords> Runner<R> {
     /// memory and where it is kept beside the conversation, so the next
     /// message to its correspondent is not pushed until the correspondent
     /// gives a route again. A route the correspondent has given since is kept,
-    /// and nothing else of the conversation changes.
+    /// and nothing else of the conversation changes. The next collection of
+    /// the conversation reads the correspondent's control, which gives the
+    /// route back where its serial is the one applied, and a new one where it
+    /// is newer.
     ///
     /// A push whose message the correspondent has since collected (for an
     /// acceptance push, its reply) keeps its route: the push reached the correspondent and only its answer was
