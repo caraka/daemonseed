@@ -1231,9 +1231,9 @@ functions:
     returns:
       type: "Result<()>"
       description: >-
-        Ok once the re-sweep is dispatched; re-swept items arrive as Inbound and are
-        deduped downstream. A PublicOnly owner whose record is absent is Ok with nothing
-        swept.
+        Ok once the re-sweep has finished; the sweep runs off the actor loop, re-swept
+        items arrive as Inbound and are deduped downstream. A PublicOnly owner whose
+        record is absent is Ok at once with nothing swept.
   - name: VeilidNetHandle::repair_rendezvous
     module: daemonseed_veilid_net::actor
     description: Re-establish a rendezvous record's session under its record_lock — invalidate the open-cache entry, re-open, re-watch, and full re-sweep. Re-swept backlog arrives as VeilidNetEvent::Inbound.
