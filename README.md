@@ -1,6 +1,6 @@
 # daemonseed
 
-Federated end-to-end-encrypted communication and file-sharing protocol. Pure Rust.
+Peer-to-peer end-to-end-encrypted communication and file-sharing protocol. Pure Rust.
 
 Private phase. See [`AGENTS.md`](AGENTS.md) for the working context, conventions, and per-commit discipline. AI agents discovering the project surface should start at [`lama.yaml`](lama.yaml) at the repository root.
 
@@ -58,9 +58,9 @@ The `tui` (ratatui) and `gui` (Slint) crates are the product surfaces; their int
 
 ## Status
 
-Current release: **v0.36.3** — alpha (post-MVP). The transport is now the Veilid DHT: the relay server is retired and daemonseed runs fully serverless, peer-to-peer — the public Lobby and circle chat, member presence, in-band share discovery/transfer, and operator announcements/MOTD all ride the DHT, end-to-end encrypted. See `CHANGELOG.md` for per-release detail.
+Current release: **v0.37.0** — alpha (post-MVP). daemonseed runs fully serverless and peer-to-peer over the Veilid DHT: the public Lobby and circle chat, member presence, in-band share discovery/transfer, operator announcements/MOTD and direct messages. Circle chat and direct messages are end-to-end encrypted; the public Lobby is open by design. See `CHANGELOG.md` for per-release detail.
 
-The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track; direct messaging is planned.
+The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track.
 
 ## License
 

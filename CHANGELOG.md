@@ -24,6 +24,8 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+## [v0.37.0] — 2026-10-16
+
 ### Added
 
 - `daemonseed-veilid-net`: `HealthCounters::watch_failures` counts channel watches that failed to register, re-register or cancel; `RunnerRecords::take_watch_failures`.

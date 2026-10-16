@@ -12,13 +12,12 @@ lama: "0.1"
 
 library:
   name: daemonseed
-  version: "0.36.3"
+  version: "0.37.0"
   description: >-
-    Federated end-to-end-encrypted communication and file-sharing
-    protocol. Pure-Rust backend, CNSA 2.0 baseline crypto via the
-    oxicrypt sibling crate, gRPC-over-HTTP/2 wire (prost + tonic),
-    AGPL-3.0 code with Apache-2.0/MIT dual-licensed schema. Designed
-    against the GFW-survivable bar per Wu et al., USENIX Security 2023.
+    Peer-to-peer end-to-end-encrypted communication and file-sharing
+    over the Veilid DHT. Pure Rust, CNSA 2.0 baseline crypto via the
+    oxicrypt sibling crate, protobuf (prost) messages, AGPL-3.0 code
+    with Apache-2.0/MIT dual-licensed schema.
   repository: "https://github.com/caraka/daemonseed"
   languages:
     - rust
