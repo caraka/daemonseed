@@ -1604,12 +1604,19 @@ fn note_own_handle(dm: Option<&DmSession>, signing: Option<&Arc<SignKeypair>>, h
     let (Some(session), Some(signing)) = (dm, signing) else {
         return;
     };
-    let own = RunnerCommand::NoteHandle {
-        peer_identity_pk: Box::new(*signing.public_key()),
-        handle: handle.to_owned(),
-    };
+    let own = own_handle_note(signing, handle);
     if session.commands.send(own).is_err() {
         daemonseed_veilid_net::vtrace!("gui dm: own handle not taken");
+    }
+}
+
+/// The runner command that names `display` as `signing`'s own handle, in the
+/// `<name>#<12 hex>` form whose hash names that key: the runner publishes an own
+/// handle only in that form.
+fn own_handle_note(signing: &SignKeypair, display: &str) -> RunnerCommand {
+    RunnerCommand::NoteHandle {
+        peer_identity_pk: Box::new(*signing.public_key()),
+        handle: crate::net::canonical_wire_handle(display, signing.public_key()),
     }
 }
 
@@ -1804,7 +1811,7 @@ async fn dm_runner_over_veilid(
         dm_channel_root,
         at_rest_key,
     } = *keys;
-    let own_pk = Box::new(*signing.public_key());
+    let own_note = own_handle.map(|handle| own_handle_note(&signing, &handle));
     match RunnerParts::<VeilidRecords>::over_veilid(
         parts,
         signing,
@@ -1817,14 +1824,10 @@ async fn dm_runner_over_veilid(
             daemonseed_veilid_net::vtrace!("gui dm: runner started");
             let runner = spawn_runner(parts);
             // The runner publishes this side's own handle to correspondents.
-            if let Some(handle) = own_handle {
-                let own = RunnerCommand::NoteHandle {
-                    peer_identity_pk: own_pk,
-                    handle,
-                };
-                if runner.send(own).await.is_err() {
-                    daemonseed_veilid_net::vtrace!("gui dm: own handle not taken");
-                }
+            if let Some(own) = own_note
+                && runner.send(own).await.is_err()
+            {
+                daemonseed_veilid_net::vtrace!("gui dm: own handle not taken");
             }
             Some(runner)
         }
@@ -9290,12 +9293,12 @@ mod tests {
         let (fetch_tx, _fetch_rx) = unbounded_channel();
         let (confirm_tx, _confirm_rx) = unbounded_channel();
         let (self_tx, _self_rx) = unbounded_channel();
-        let mut my_handle = "alice#000000000000".to_owned();
+        let mut my_handle = "alice".to_owned();
         let mut shares = ShareState::new();
         shares.signing = Some(Arc::clone(&me));
         handle_command(
             NetCommand::SetMyHandle {
-                handle: "alicia#000000000000".to_owned(),
+                handle: "alicia".to_owned(),
             },
             &evt_tx,
             &self_tx,
@@ -9313,18 +9316,52 @@ mod tests {
         )
         .await;
 
-        assert_eq!(my_handle, "alicia#000000000000");
+        assert_eq!(my_handle, "alicia");
         match queued.try_recv() {
             Ok(RunnerCommand::NoteHandle {
                 peer_identity_pk,
                 handle,
             }) => {
                 assert_eq!(peer_identity_pk.as_slice(), me.public_key().as_slice());
-                assert_eq!(handle, "alicia#000000000000");
+                // The runner publishes only a handle whose hash names its own
+                // key, so the bare display name goes out in that form.
+                let hash = daemonseed_core::handle::Handle::from_pubkey(None, me.public_key())
+                    .unwrap()
+                    .hash_prefix()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                assert_eq!(handle, format!("alicia#{hash}"));
             }
             other => panic!("expected the own handle note, got {other:?}"),
         }
         assert!(queued.try_recv().is_err(), "one note");
+    }
+
+    /// Both places the GUI names its own handle to the runner (a mid-session
+    /// rename and the runner's start) build the note here: a bare name and one
+    /// carrying another key's hash both go out with this key's hash.
+    #[test]
+    fn an_own_handle_note_carries_this_keys_hash() {
+        let me = dm_test_identity().signing;
+        let hash = daemonseed_core::handle::Handle::from_pubkey(None, me.public_key())
+            .unwrap()
+            .hash_prefix()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        for given in ["alicia", "alicia#000000000000"] {
+            match own_handle_note(&me, given) {
+                RunnerCommand::NoteHandle {
+                    peer_identity_pk,
+                    handle,
+                } => {
+                    assert_eq!(peer_identity_pk.as_slice(), me.public_key().as_slice());
+                    assert_eq!(handle, format!("alicia#{hash}"), "from {given:?}");
+                }
+                other => panic!("expected an own handle note, got {other:?}"),
+            }
+        }
     }
 
     /// With no runner, a command is answered as the runner answers one it

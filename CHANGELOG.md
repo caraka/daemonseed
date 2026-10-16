@@ -174,6 +174,7 @@ work lives in the maintainer's own planning notes, not here.
 ### Fixed
 
 - `daemonseed-gui`: The Lobby, Announcements and share-folder text name no host, and circle details show the name and fingerprint. (#486)
+- `daemonseed-gui`: A correspondent's direct-message view shows the sender's name from the sender's own handle.
 - `daemonseed-veilid-net`: a block applied during a collection pass stops that pass recording the blocked correspondent's messages.
 - `daemonseed-veilid-net`: a reach notice at the serial already applied is answered; a route forgotten after an unanswered push is kept again from a control at the serial applied; a control with an older reach leaves a newer reach not yet taken in place; a route or handle is held only at the reach serial applied.
 - `daemonseed-core`: loading the direct-message store keeps the first outbox entry of a conversation being created; the startup sweep removes orphaned outboxes.
