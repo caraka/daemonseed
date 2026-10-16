@@ -657,7 +657,7 @@ export component AppWindow inherits Window {
     in property <string> motd;
     in property <[AnnouncementRow]> announcements;
     in-out property <string> announce-status;
-    in property <string> announcements-empty-hint: "No announcements from this relay yet.";
+    in property <string> announcements-empty-hint: "No announcements yet.";
     callback announcements-tab-opened();
     // ── Signer-gated composer (#92 / D3) — shown ONLY when the local stable
     // identity key is on the relay's published whitelist. `can-compose` is set
@@ -700,14 +700,11 @@ export component AppWindow inherits Window {
     out property <bool> chat-at-bottom:
         root.scroll-y <= -(root.chat-content-h - chat-area.height) + 24px;
     in-out property <bool> sheet-open: false;
-    // #36 circle-detail name vectors, set from `GuiState` for the active circle (all
-    // blank for the Lobby, which has no net contract → the vector rows hide). The
-    // three are distinct on purpose: `circle-name` is the chosen display name;
-    // `circle-relay-label` is the relay-scoped adj-noun label (matches only between
-    // members on the SAME relay); `circle-fingerprint` is the relay-independent
-    // `#<12hex>` — the universal out-of-band verification vector.
+    // #36 circle-detail name vectors, set from `GuiState` for the active circle (both
+    // blank for the Lobby, which has no net contract → the vector rows hide):
+    // `circle-name` is the circle's display name; `circle-fingerprint` is the
+    // phrase-keyed `#<12hex>` — the out-of-band verification vector.
     in property <string> circle-name;
-    in property <string> circle-relay-label;
     in property <string> circle-fingerprint;
     // #115 circle-phrase reveal (evil-maid-gated) + leave-circle confirm. The phrase
     // is the circle's shared secret, so it is revealed ONLY after Rust verifies the
@@ -1258,7 +1255,6 @@ export component AppWindow inherits Window {
                                 HorizontalLayout {
                                     height: 28px; spacing: 10px;
                                     Text { text: "Announcements"; color: #e4e8ee; font-size: 15px; vertical-alignment: center; }
-                                    Text { text: "· this relay"; color: #4d5560; font-size: 11px; vertical-alignment: center; }
                                     Text { text: root.announce-status; color: #5b6472; font-size: 12px; vertical-alignment: center; }
                                     Rectangle { }
                                     PillButton { label: "Refresh"; w: 96px; clicked => { root.announcements-tab-opened(); } }
@@ -1556,7 +1552,7 @@ export component AppWindow inherits Window {
             Text { text: "end-to-end encrypted"; color: #6fb3a4; font-size: 12px; }
             Text { text: "members — identity only, no presence"; color: #5b6472; font-size: 12px; }
 
-            // ── #36 name vectors (hidden for the Lobby — all three blank) ──
+            // ── #36 name vectors (hidden for the Lobby — both blank) ──
             VerticalLayout {
                 // #176: `visible:` not `if` — an `if` tears down this subtree when the
                 // circle-name prop flips to "" on leave, re-entering Slint's partial
@@ -1565,12 +1561,6 @@ export component AppWindow inherits Window {
                 spacing: 2px;
                 Text { text: "Name"; color: #5b6472; font-size: 11px; }
                 Text { text: root.circle-name; color: #cfd5dd; font-size: 13px; }
-            }
-            VerticalLayout {
-                visible: root.circle-relay-label != ""; // #176: visible-gate, see above
-                spacing: 2px;
-                Text { text: "Relay name (matches only on this relay)"; color: #5b6472; font-size: 11px; wrap: word-wrap; }
-                Text { text: root.circle-relay-label; color: #cfd5dd; font-size: 13px; }
             }
             VerticalLayout {
                 visible: root.circle-fingerprint != ""; // #176: visible-gate, see above
@@ -2045,7 +2035,7 @@ export component AppWindow inherits Window {
                 PillButton { label: "Close"; w: 70px; clicked => { root.publish-open = false; } }
             }
             Text {
-                text: "Pick a folder to share on the relay. It serves from disk for this session — closing the app or Unpublish stops it.";
+                text: "Pick a folder to share. It serves from disk for this session — closing the app or Unpublish stops it.";
                 color: #8b93a1; font-size: 13px; wrap: word-wrap;
             }
 

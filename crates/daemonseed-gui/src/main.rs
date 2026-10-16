@@ -25,7 +25,7 @@
 //! overlay (with a fixture share set, no relay); `--show-rename` opens the
 //! rename-identity overlay prefilled with a sample name (#66);
 //! `--show-circle-detail` materializes a circle, applies a synthetic rendezvous,
-//! and slides the context sheet open showing the three name vectors (#36).
+//! and slides the context sheet open showing the two name vectors (#36).
 
 // The windowed (`desktop`) build must not spawn a console. Without this attribute the
 // GUI links as a console-subsystem executable and Windows attaches a stray terminal
@@ -364,31 +364,25 @@ fn apply_view_preserving_draft(ui: &AppWindow, c: &CircleState, active: i32) {
     ui.set_scroll_y(c.scroll_y);
 }
 
-/// #36: push the active circle's three name vectors into the context-sheet props.
+/// #36: push the active circle's two name vectors into the context-sheet props.
 ///
-/// All three are blank for the Lobby (no net contract), which hides the sheet's
-/// vector rows. The three are deliberately distinct: `circle-name` is the chosen
-/// display name (`circle.name`); `circle-relay-label` is the relay-SCOPED adj-noun
-/// label (`GuiState::circle_deterministic_label_of` — `default_circle_label` once
-/// the rendezvous is known, the fingerprint before), which compares only between
-/// members on the SAME relay; `circle-fingerprint` is the relay-INDEPENDENT
-/// `#<12hex>` (`GuiState::circle_fingerprint_of`), the universal out-of-band
-/// verification vector. The label and the fingerprint diverge once connected.
+/// Both are blank for the Lobby (no net contract), which hides the sheet's vector
+/// rows. `circle-name` is the circle's display name (`circle.name`);
+/// `circle-fingerprint` is the phrase-keyed `#<12hex>`
+/// (`GuiState::circle_fingerprint_of`), the out-of-band verification vector.
 /// Display-only — never mutates state.
 fn apply_circle_detail(ui: &AppWindow, st: &GuiState, idx: usize) {
-    // The chosen name is shown only for a real circle (a net contract present), so
-    // the Lobby's sheet stays blank — matching the relay-label/fingerprint accessors,
-    // which already return `None` for the Lobby.
+    // The name is shown only for a real circle (a net contract present), so the
+    // Lobby's sheet stays blank — matching the fingerprint accessor, which already
+    // returns `None` for the Lobby.
     let name = st
         .metas()
         .get(idx)
         .filter(|c| c.net.is_some())
         .map(|c| c.name.clone())
         .unwrap_or_default();
-    let relay = st.circle_deterministic_label_of(idx).unwrap_or_default();
     let fp = st.circle_fingerprint_of(idx).unwrap_or_default();
     ui.set_circle_name(SharedString::from(name));
-    ui.set_circle_relay_label(SharedString::from(relay));
     ui.set_circle_fingerprint(SharedString::from(fp));
     // #115: the active circle changed, so a previously-revealed join phrase must not
     // linger into a different circle's sheet — clear it (re-auth to reveal again).
@@ -2743,9 +2737,9 @@ fn main() {
     // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
     // placeholder (the live path runs on the CircleJoined event, which needs a relay).
     let show_joined_label = args.iter().any(|a| a == "--joined-label");
-    // #36 fixture: materialize a circle, apply a synthetic relay rendezvous (so the
-    // relay-scoped label diverges from the universal fingerprint), populate the three
-    // name vectors, and slide the context sheet open so the PNG shows all three.
+    // #36 fixture: materialize a circle, apply a synthetic rendezvous (so the name
+    // becomes the adj-noun label), populate the two name vectors, and slide the
+    // context sheet open so the PNG shows both.
     let show_circle_detail = args.iter().any(|a| a == "--show-circle-detail");
     // Offscreen fixture render of the populated Shares-tab browse tree (no relay):
     // injects a synthetic catalog + one expanded/previewed share so the PNG shows the
@@ -3135,7 +3129,7 @@ fn main() {
         // composer affordance is present; `--show-announcements` leaves it read-only.
         ui.set_active_tab(3);
         let view = AnnouncementsView {
-            motd: Some("Welcome — relay maintenance Sunday 02:00-03:00 UTC".to_string()),
+            motd: Some("Welcome — maintenance window Sunday 02:00-03:00 UTC".to_string()),
             posts: vec![
                 state::AnnouncementRow {
                     topic: "releases".to_string(),
