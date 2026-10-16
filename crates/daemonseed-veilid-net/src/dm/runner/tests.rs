@@ -6048,7 +6048,8 @@ async fn a_send_issued_during_a_collection_writes_before_the_next_conversation()
         body: b"to C".to_vec(),
     })
     .await;
-    aw.wait_for("A's first contact to C", sent(40)).await;
+    let at = aw.wait_for("A's first contact to C", sent(40)).await;
+    let a_peer_c = sent_peer(&aw.seen[at]);
     let at = cw.wait_for("C's request", request_from(&a.pk)).await;
     cw.send(RunnerCommand::Accept {
         token: CommandToken(41),
@@ -6066,6 +6067,10 @@ async fn a_send_issued_during_a_collection_writes_before_the_next_conversation()
     let (from_b, from_c) = (b.outgoing_lookup_key(&a), c.outgoing_lookup_key(&a));
     assert_ne!(from_b, from_c, "the trail tells the channels apart");
     a_fake.faults().hand_fed_watches = true;
+    // Each establishment collection ends with its cursor publish: wait for
+    // both, and the reads after them, before the trail is recorded.
+    cursor_caught_up(&a, &a_peer).await;
+    cursor_caught_up(&a, &a_peer_c).await;
     settled(&a_fake).await;
     let held = Arc::new(Gate::default());
     let _release = ReleaseOnDrop(Arc::clone(&held));
@@ -6089,7 +6094,7 @@ async fn a_send_issued_during_a_collection_writes_before_the_next_conversation()
         body: b"during the collection".to_vec(),
     })
     .await;
-    committed(&a, &a_peer, 2).await;
+    committed(&mut aw, &a, &a_peer, 2).await;
     held.release();
     aw.wait_for("A's send", sent(42)).await;
     tokio::time::timeout(Duration::from_secs(60), async {
@@ -6379,7 +6384,7 @@ async fn a_send_issued_during_a_drop_scan_writes_before_the_scan_ends() {
         body: b"during the scan".to_vec(),
     })
     .await;
-    committed(&b, &b_peer, 2).await;
+    committed(&mut bw, &b, &b_peer, 2).await;
     held.release();
     bw.wait_for("B's send", sent(40)).await;
     // The scan resumes after the send is answered; wait for its next read.
@@ -8354,8 +8359,12 @@ async fn establish_pushed_with(config: RunnerConfig) -> (Knocked, Correspondence
     k.aw.wait_for("A's acceptance", accepted(k.a_peer)).await;
     k.bw.wait_for("B's reply delivered by A's answer", delivered(b_peer, 0))
         .await;
-    // Each side collects the conversation once at establishment: let both
-    // collections end before a test counts what either side does.
+    // Each side collects the conversation once at establishment, and that
+    // collection's last write is its cursor publish: wait for both publishes,
+    // then for the reads that follow them, before a test counts what either
+    // side does.
+    cursor_caught_up(&k.a, &k.a_peer).await;
+    cursor_caught_up(&k.b, &b_peer).await;
     settled(&k.a_fake).await;
     settled(&k.b_fake).await;
     (k, b_peer)
@@ -8458,6 +8467,21 @@ async fn settled(fake: &Fake) -> usize {
     })
     .await
     .expect("the runner stops reading channels")
+}
+
+/// Wait until `profile` has published its cursor over every message it has
+/// collected from `peer`.
+async fn cursor_caught_up(profile: &Profile, peer: &CorrespondenceLabel) {
+    within(Duration::from_secs(30), "the cursor publish", async {
+        loop {
+            let state = conv_of(profile, peer);
+            if state.cursor_published >= 1 && state.cursor_published == state.my_collected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }
 
 /// ISC-C104 — when this node's route dies the runner allocates another and
@@ -8593,6 +8617,32 @@ async fn a_send_committed_during_a_control_rewrite_is_written_before_it_ends() {
     let at = k.aw.wait_for("A's first contact to C", sent(3)).await;
     let a_peer_c = sent_peer(&k.aw.seen[at]);
     let at = cw.wait_for("C's request", request_from(&k.a.pk)).await;
+    // C's channel to A is derived from the generation A drew for its first
+    // contact, which A has stored by now.
+    let c_channel = Fake::lookup_key(
+        &channel::derive_owner_seed(
+            &c.keys().dm_channel_root,
+            &k.a.pk,
+            conv_of(&k.a, &a_peer_c).generation,
+        )
+        .expect("the channel owner seed"),
+    );
+    // Hold A's collection of C at establishment twice: at its slot read, past
+    // the moment A reports the acceptance, and at its read of C's control,
+    // after the cursor publish and before the pass returns. A quiet second
+    // passes at each hold, as it does when the runner is slow under load, and
+    // the state each hold leaves is asserted. The cursor wait and the wait for
+    // the queued command below then keep that pass out of the control writes
+    // the test logs.
+    let read_held = Arc::new(Gate::default());
+    let _read_release = ReleaseOnDrop(Arc::clone(&read_held));
+    let post_held = Arc::new(Gate::default());
+    let _post_release = ReleaseOnDrop(Arc::clone(&post_held));
+    {
+        let mut faults = k.a_fake.faults();
+        faults.gate_ring_read = Some((c_channel, Arc::clone(&read_held)));
+        faults.gate_channel_read = Some((vec![c_channel], 1, Arc::clone(&post_held)));
+    }
     cw.send(RunnerCommand::Accept {
         token: CommandToken(4),
         request: request_id(&cw.seen[at]),
@@ -8602,9 +8652,59 @@ async fn a_send_committed_during_a_control_rewrite_is_written_before_it_ends() {
     cw.wait_for("C's acceptance", sent(4)).await;
     k.aw.wait_for("A's acceptance by C", accepted(a_peer_c))
         .await;
-    // The collection at establishment publishes A's cursor over C's reply;
-    // let it end before control writes are logged.
+    read_held.reached().await;
     settled(&k.a_fake).await;
+    assert_eq!(
+        conv_of(&k.a, &a_peer_c).cursor_published,
+        0,
+        "A's cursor to C is unpublished while its collection is held"
+    );
+    // While the collection is held, queue for the runner a command it refuses
+    // at once. The live lane hands a runner command over before it reads the
+    // next command, so the lane's own refusal of a delete sent after it shows
+    // it is queued. The runner serves it at the first point after the
+    // collection where it serves queued work, which is where a route death
+    // offered too early would be served from inside the collection's pass.
+    // B's establishment collection published its cursor before C's first
+    // contact was sent, so it was taken off the runner's list of collections
+    // asked for before C was put on it, and this pass collects C alone.
+    // Two properties of the runner make the refusal a fence for the route
+    // death offered after it. Serving queued work drains lane notes before
+    // commands and does not go back to notes after serving a command, so a
+    // note offered after the refusal is not served in the same call. Nothing
+    // the pass does after its collections serves queued work within this
+    // test: every later step waits for a tick, a drop scan, an advert poll or
+    // a repair, each due minutes away.
+    k.aw.send(RunnerCommand::Accept {
+        token: CommandToken(6),
+        request: ContactRequestId {
+            epoch: 0,
+            serial: 1,
+        },
+        reply: b"to nobody".to_vec(),
+    })
+    .await;
+    k.aw.send(RunnerCommand::DeleteConversation {
+        token: CommandToken(7),
+        peer: CorrespondenceLabel::mint().expect("a label"),
+    })
+    .await;
+    k.aw.wait_for("the lane's refusal of the delete", refused(7))
+        .await;
+    read_held.release();
+    // The second hold is past the cursor publish, so it holds the read of C's
+    // control and not a second slot read.
+    cursor_caught_up(&k.a, &a_peer_c).await;
+    post_held.reached().await;
+    settled(&k.a_fake).await;
+    k.aw.drain();
+    assert!(
+        !k.aw.seen.iter().any(refused(6)),
+        "the queued command waits while the pass is held after the publish"
+    );
+    post_held.release();
+    k.aw.wait_for("the queued command, served after the pass", refused(6))
+        .await;
     let route = published_route(&k.dht, &conv_of(&k.a, &k.a_peer)).expect("A's route");
     let a_inbound = k.board.lock().unwrap().routes[&route].1.clone();
 
@@ -8630,7 +8730,7 @@ async fn a_send_committed_during_a_control_rewrite_is_written_before_it_ends() {
         message(b_peer, 1, b"during the rewrite"),
     )
     .await;
-    committed(&k.a, &k.a_peer, 2).await;
+    committed(&mut k.aw, &k.a, &k.a_peer, 2).await;
     held.release();
     k.aw.wait_for("A's send", sent(5)).await;
     let to_b = conv_of(&k.a, &k.a_peer).outgoing_lookup_key;
@@ -8717,7 +8817,9 @@ async fn an_own_handle_change_is_republished_to_every_conversation_at_once() {
     k.aw.wait_for("A's acceptance by C", accepted(a_peer_c))
         .await;
     // The collection at establishment publishes A's cursor over C's reply;
-    // let it end before control writes are counted.
+    // wait for that write, and the reads after it, before control writes are
+    // counted.
+    cursor_caught_up(&k.a, &a_peer_c).await;
     settled(&k.a_fake).await;
 
     let store = Store::open(k.a.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).unwrap();
@@ -9402,16 +9504,31 @@ async fn a_forged_handle_in_a_control_record_is_not_recorded() {
 // ── the live lane ───────────────────────────────────────────────────────────
 
 /// Wait on the real clock until `profile`'s conversation `peer` has committed
-/// sends up to `send_seq`, and then for the live lane to hand the send to the
-/// runner, which it does directly after the commit.
-async fn committed(profile: &Profile, peer: &CorrespondenceLabel, send_seq: u64) {
+/// sends up to `send_seq`, and then until the live lane has handed the send
+/// to the runner. The lane queues that handover before it reads its next
+/// command, so its own refusal of a delete sent afterwards shows it is queued.
+async fn committed(
+    watch: &mut Watch,
+    profile: &Profile,
+    peer: &CorrespondenceLabel,
+    send_seq: u64,
+) {
     within(Duration::from_secs(10), "the send's commit", async {
         while conv_of(profile, peer).send_seq < send_seq {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let token = 1_000_000 + send_seq;
+    watch
+        .send(RunnerCommand::DeleteConversation {
+            token: CommandToken(token),
+            peer: CorrespondenceLabel::mint().expect("a label"),
+        })
+        .await;
+    watch
+        .wait_for("the lane's refusal after the send", refused(token))
+        .await;
 }
 
 /// Hold `fake`'s next ring read of the channel at `lookup_key`, have its
@@ -10167,7 +10284,7 @@ async fn sends_during_a_collection_do_not_make_it_read_again() {
         })
         .await;
     }
-    committed(&k.b, &b_peer, 3).await;
+    committed(&mut k.bw, &k.b, &b_peer, 3).await;
     held.release();
     k.bw.wait_for("A's message at B", message(b_peer, 1, b"read once"))
         .await;
