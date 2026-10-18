@@ -549,8 +549,116 @@ pub(crate) struct Unanswered {
 pub(crate) type KeptUnanswered =
     Arc<Mutex<std::collections::HashMap<CorrespondenceLabel, (Vec<u8>, u32)>>>;
 
+/// One push of a run ([`Pusher::push_slots`]): the message's sequence, the
+/// encoded push, and the answer that reports it recorded.
+type RunCall = (u64, Vec<u8>, [u8; ANSWER_LEN]);
+
+/// Per correspondent, the run of pushes ([`Pusher::push_slots`]) entered last
+/// ([`enter_run`]).
+pub(crate) type Runs = Arc<Mutex<RunMap>>;
+
+/// What [`Runs`] holds.
+type RunMap = std::collections::HashMap<CorrespondenceLabel, RunEntry>;
+
+/// Shared by every run of one correspondent entered while another was still
+/// entered: held across each push a run makes, beside the highest sequence a
+/// run has had recorded, so the runs of one correspondent push one at a time
+/// and none pushes a sequence another had recorded.
+type Turn = Arc<tokio::sync::Mutex<Option<u64>>>;
+
+/// A run of pushes entered in [`Runs`].
+pub(crate) struct RunEntry {
+    /// The route the run is made on.
+    route: Vec<u8>,
+    /// Where a message push to the correspondent on that route joins the run
+    /// ([`Pusher::push_slot`]). Unbounded, and bounded all the same by the
+    /// ring: a message is committed only while fewer than
+    /// [`channel::RING_SLOTS`] are uncollected, and a message joins only from
+    /// the one push its send makes; a slot rewritten from the outbox is
+    /// written without a push.
+    queue: mpsc::UnboundedSender<RunCall>,
+    /// Set when a run entered for the correspondent after this one takes it
+    /// over ([`Pusher::push_slots`]), which stops this one at its next push.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    turn: Turn,
+}
+
+/// A run of pushes entered in [`Runs`] and not yet started
+/// ([`Pusher::push_slots`]). The run entered before it goes on until this one
+/// takes it over. Dropped unstarted, it leaves [`Runs`], and any push that
+/// joined it is left to the record store. The runner drops a run unstarted
+/// only where no transport is held, so none can have joined.
+pub(crate) struct RunSlot {
+    runs: Runs,
+    peer: CorrespondenceLabel,
+    route: Vec<u8>,
+    queue: mpsc::UnboundedSender<RunCall>,
+    joined: Option<mpsc::UnboundedReceiver<RunCall>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    turn: Turn,
+    /// What stops the run entered before this one, set once this one takes
+    /// it over.
+    before: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl RunSlot {
+    /// The route the run is made on.
+    pub(crate) fn route(&self) -> &[u8] {
+        &self.route
+    }
+}
+
+impl Drop for RunSlot {
+    fn drop(&mut self) {
+        if let Some(joined) = &mut self.joined {
+            leave_run(&mut locked_runs(&self.runs), &self.peer, &self.queue);
+            if joined.try_recv().is_ok() {
+                crate::vtrace!(
+                    "dm push: a run not started, pushes that joined it left to the record store"
+                );
+            }
+        }
+    }
+}
+
+/// Enter a run of pushes to `peer` on `route` in `runs`, from where a message
+/// push to `peer` on `route` joins it. The run entered for `peer` before it,
+/// if any, is stopped at its next push once this one takes it over
+/// ([`Pusher::push_slots`]). Everything that joined the run stopped was
+/// committed before this one reads what it pushes, so it is among what this
+/// one pushes where it is still uncollected.
+pub(crate) fn enter_run(runs: &Runs, peer: CorrespondenceLabel, route: Vec<u8>) -> RunSlot {
+    let mut map = locked_runs(runs);
+    let (turn, before) = match map.get(&peer) {
+        Some(before) => (Arc::clone(&before.turn), Some(Arc::clone(&before.stop))),
+        None => (Turn::default(), None),
+    };
+    let (queue, joined) = mpsc::unbounded_channel();
+    let stop = Arc::<std::sync::atomic::AtomicBool>::default();
+    map.insert(
+        peer,
+        RunEntry {
+            route: route.clone(),
+            queue: queue.clone(),
+            stop: Arc::clone(&stop),
+            turn: Arc::clone(&turn),
+        },
+    );
+    RunSlot {
+        runs: Arc::clone(runs),
+        peer,
+        route,
+        queue,
+        joined: Some(joined),
+        stop,
+        turn,
+        before,
+    }
+}
+
 /// What a push is made with: the transport, the correspondent's route, and
 /// where its outcome goes.
+#[derive(Clone)]
 pub(crate) struct Pusher {
     pub(crate) transport: Arc<dyn PushTransport>,
     pub(crate) route: Vec<u8>,
@@ -564,12 +672,18 @@ pub(crate) struct Pusher {
     pub(crate) own_route: Option<Vec<u8>>,
     /// The kept unanswered pushes an answered push clears.
     pub(crate) kept: KeptUnanswered,
+    /// The runs of pushes in flight, which a message push on a run's route
+    /// joins.
+    pub(crate) runs: Runs,
 }
 
 impl Pusher {
     /// Push the ring slot `bytes`, written to `subkey` of the channel at
     /// `lookup_key`, on its own task, where it decodes as a message and this
-    /// pusher holds the key its answer is checked under.
+    /// pusher holds the key its answer is checked under. Where a run of
+    /// pushes to `peer` is in flight on this pusher's route
+    /// ([`Self::push_slots`]), the push joins it instead and is made after
+    /// the run's earlier sequences, as the receiver takes them.
     pub(crate) fn push_slot(
         &self,
         peer: CorrespondenceLabel,
@@ -577,33 +691,211 @@ impl Pusher {
         subkey: u16,
         bytes: &[u8],
     ) {
-        let Some(key) = self.answer_key.as_deref() else {
+        let Some((seq, push, expected)) = self.message(lookup_key, subkey, bytes) else {
             return;
         };
-        let Ok((header, _)) = channel::MessageHeader::decode(bytes) else {
+        {
+            let runs = locked_runs(&self.runs);
+            if let (Some(run), Some(encoded)) = (runs.get(&peer), push.encode()) {
+                if run.route == self.route && run.queue.send((seq, encoded, expected)).is_ok() {
+                    crate::vtrace!("dm push: sequence {seq} joins the run of pushes in flight");
+                    return;
+                }
+            }
+        }
+        self.start(peer, Some(seq), &push, expected);
+    }
+
+    /// Start the run `slot` entered ([`enter_run`]) on its route: push the
+    /// ring slots `slots` returns, each written to its subkey of the channel
+    /// at `lookup_key`, then every push that joined the run, one after
+    /// another on one task, each once the one before it is answered. Each
+    /// answered push is reported as [`RunnerEvent::Delivered`]. `slots` is
+    /// called once the run is entered, so a message committed before is among
+    /// them and one committed after joins the run ([`Self::push_slot`]). A
+    /// sequence at or below one this run recorded, or one recorded by a run
+    /// entered while this one or a run before it was still entered, is not
+    /// pushed again: those runs share one [`Turn`]. Slots are taken in the
+    /// order given, up to the first that does not decode as a message or
+    /// encode as a push; the cut is traced, and the slots from it on are left
+    /// to the record store, since the receiver would take none of them before
+    /// the one cut.
+    ///
+    /// Where `slots` gives slots, empty or not, this run takes over the run
+    /// entered before it, which is stopped at its next push and leaves
+    /// everything it holds to this one. Where `slots` gives none, because the
+    /// store would not, the run before it goes on beside this one, one push at
+    /// a time between them, since nothing read here covers what it holds.
+    ///
+    /// A push that joined the run is judged as a send's push is: the first
+    /// not answered as recorded goes on the unanswered queue, which judges
+    /// the route on it, ends the run, and leaves the pushes after it to the
+    /// record store. One of the run's own slots not answered as recorded ends
+    /// the run without forgetting the route, since the receiver leaves a
+    /// sequence older than the last it collected unanswered and the slot may
+    /// be one it has; its message and the slots after it are left to the
+    /// record store. Where the run is still the one entered for the
+    /// correspondent, the pushes that joined it are then made one after
+    /// another, each judged as above. Where a later run was entered
+    /// meanwhile, they are left to that one, whose slots are read after they
+    /// were committed.
+    pub(crate) fn push_slots(
+        &self,
+        mut slot: RunSlot,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        slots: impl FnOnce() -> Option<Vec<(u16, Vec<u8>)>>,
+    ) {
+        let Some(mut joined) = slot.joined.take() else {
             return;
         };
+        let read = slots();
+        if read.is_some() {
+            if let Some(before) = slot.before.take() {
+                before.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let read = read.unwrap_or_default();
+        let mut calls = std::collections::VecDeque::with_capacity(read.len());
+        for (subkey, bytes) in &read {
+            let call = self
+                .message(lookup_key, *subkey, bytes)
+                .and_then(|(seq, push, expected)| Some((seq, push.encode()?, expected)));
+            let Some(call) = call else {
+                crate::vtrace!(
+                    "dm push: a slot does not decode or is too large to push, it and {} after it \
+                     left to the record store",
+                    read.len() - calls.len() - 1
+                );
+                break;
+            };
+            calls.push_back(call);
+        }
+        let mut pusher = self.clone();
+        pusher.route = slot.route.clone();
+        let (runs, peer, queue) = (Arc::clone(&slot.runs), slot.peer, slot.queue.clone());
+        let (stop, turn) = (Arc::clone(&slot.stop), Arc::clone(&slot.turn));
+        tokio::spawn(async move {
+            let stopped = || stop.load(std::sync::atomic::Ordering::SeqCst);
+            let mut calls = calls;
+            // Whether the run's own slots are done and what it pushes now
+            // joined it, after it has left `runs`.
+            let mut as_sends = false;
+            loop {
+                let ((seq, bytes, expected), joined_call) = match calls.pop_front() {
+                    Some(call) => (call, as_sends),
+                    None if as_sends => return,
+                    None => {
+                        // Under the lock a joining push is sent under, so a
+                        // push either joins before the run leaves or finds it
+                        // gone and is made on its own.
+                        let mut map = locked_runs(&runs);
+                        match joined.try_recv() {
+                            Ok(call) => (call, true),
+                            Err(_) => {
+                                leave_run(&mut map, &peer, &queue);
+                                return;
+                            }
+                        }
+                    }
+                };
+                let mut recorded = turn.lock().await;
+                if stopped() {
+                    crate::vtrace!("dm push: a run stopped, a later run of the route took it over");
+                    return;
+                }
+                if recorded.is_some_and(|recorded| seq <= recorded) {
+                    continue;
+                }
+                let started = Instant::now();
+                match pusher.transport.call(pusher.route.clone(), bytes).await {
+                    Ok(answer) if answer_matches(&expected, &answer) => {
+                        *recorded = Some(seq);
+                        drop(recorded);
+                        crate::vtrace!(
+                            "dm push: sequence {seq} recorded in a run after {} ms",
+                            started.elapsed().as_millis()
+                        );
+                        clear_kept(&pusher.kept, &peer, &pusher.route);
+                        let _ = pusher
+                            .events
+                            .send(RunnerEvent::Delivered {
+                                peer,
+                                through_seq: seq,
+                            })
+                            .await;
+                    }
+                    outcome if joined_call => {
+                        drop(recorded);
+                        crate::vtrace!(
+                            "dm push: sequence {seq} not recorded after {} ms, \
+                             it and the rest left to the record store ({:?})",
+                            started.elapsed().as_millis(),
+                            outcome.err()
+                        );
+                        let _ = pusher.unanswered.send(Unanswered {
+                            peer,
+                            route: pusher.route.clone(),
+                            seq: Some(seq),
+                        });
+                        leave_run(&mut locked_runs(&runs), &peer, &queue);
+                        return;
+                    }
+                    outcome => {
+                        drop(recorded);
+                        crate::vtrace!(
+                            "dm push: sequence {seq} not recorded in a run after {} ms, \
+                             left to the record store ({:?})",
+                            started.elapsed().as_millis(),
+                            outcome.err()
+                        );
+                        // Decided under the lock a later run is entered
+                        // under: either this run is still the one entered and
+                        // leaves with what joined it, or a later run, which
+                        // reads its slots after these were committed, has
+                        // them.
+                        let mut map = locked_runs(&runs);
+                        if !map
+                            .get(&peer)
+                            .is_some_and(|run| run.queue.same_channel(&queue))
+                        {
+                            return;
+                        }
+                        map.remove(&peer);
+                        calls = std::iter::from_fn(|| joined.try_recv().ok()).collect();
+                        as_sends = true;
+                    }
+                }
+            }
+        });
+    }
+
+    /// The sequence of the ring slot `bytes`, written to `subkey` of the
+    /// channel at `lookup_key`, its push, and the answer that reports it
+    /// recorded, where it decodes as a message and this pusher holds the key
+    /// its answer is checked under.
+    fn message(
+        &self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+        subkey: u16,
+        bytes: &[u8],
+    ) -> Option<(u64, Push, [u8; ANSWER_LEN])> {
+        let key = self.answer_key.as_deref()?;
+        let (header, _) = channel::MessageHeader::decode(bytes).ok()?;
         let seq = header.seq;
-        let Ok(expected) = key.answer(lookup_key, seq) else {
-            return;
-        };
+        let expected = key.answer(lookup_key, seq).ok()?;
         let route = self.own_route.as_ref().and_then(|route| {
             Some(PushRoute {
                 tag: key.route_tag(lookup_key, seq, route).ok()?,
                 route: route.clone(),
             })
         });
-        self.start(
-            peer,
-            Some(seq),
-            &Push::Message {
-                lookup_key: *lookup_key,
-                subkey,
-                slot: bytes.to_vec(),
-                route,
-            },
-            expected,
-        );
+        let push = Push::Message {
+            lookup_key: *lookup_key,
+            subkey,
+            slot: bytes.to_vec(),
+            route,
+        };
+        Some((seq, push, expected))
     }
 
     /// Push the sealed control subkey `control` of the channel at
@@ -665,14 +957,7 @@ impl Pusher {
                         "dm push: {what} recorded after {} ms",
                         started.elapsed().as_millis()
                     );
-                    {
-                        let mut kept = kept
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if kept.get(&peer).is_some_and(|(on, _)| *on == route) {
-                            kept.remove(&peer);
-                        }
-                    }
+                    clear_kept(&kept, &peer, &route);
                     if let Some(seq) = seq {
                         let _ = events
                             .send(RunnerEvent::Delivered {
@@ -692,6 +977,38 @@ impl Pusher {
                 }
             }
         });
+    }
+}
+
+/// [`Runs`], locked.
+fn locked_runs(runs: &Runs) -> std::sync::MutexGuard<'_, RunMap> {
+    runs.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Remove the run whose queue is `queue` from `runs`, where it is still the
+/// one entered for `peer`.
+fn leave_run(
+    runs: &mut RunMap,
+    peer: &CorrespondenceLabel,
+    queue: &mpsc::UnboundedSender<RunCall>,
+) {
+    if runs
+        .get(peer)
+        .is_some_and(|run| run.queue.same_channel(queue))
+    {
+        runs.remove(peer);
+    }
+}
+
+/// Clear the unanswered pushes kept for `peer` where they were kept on
+/// `route`, which has now answered one.
+fn clear_kept(kept: &KeptUnanswered, peer: &CorrespondenceLabel, route: &[u8]) {
+    let mut kept = kept
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if kept.get(peer).is_some_and(|(on, _)| on.as_slice() == route) {
+        kept.remove(peer);
     }
 }
 

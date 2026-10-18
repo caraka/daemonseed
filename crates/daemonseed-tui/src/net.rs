@@ -39,6 +39,7 @@ use daemonseed_core::storage::seeds::{AEAD_KEY_LEN, IndexKey};
 use daemonseed_core::trust_events::TrustEventKey;
 use daemonseed_proto::v1 as wire;
 use daemonseed_veilid_net::dm::runner::{RunnerCommand, RunnerEvent};
+use daemonseed_veilid_net::dm::unavailable::DmUnavailable;
 use tokio::sync::mpsc;
 use zeroize::Zeroizing;
 
@@ -425,6 +426,18 @@ pub struct ShareManifestEntry {
     pub chunk_count: u32,
 }
 
+/// A room whose record the app keeps a session with, as [`NetEvent::RoomReach`] names
+/// it. The app turns it into the name the user knows the room by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoomRecord {
+    /// The lobby's chat.
+    Lobby,
+    /// The lobby's public share list.
+    LobbyShares,
+    /// The circle with this per-session `circle_id`.
+    Circle(u64),
+}
+
 /// An event from the network actor back to the UI. Plain data — folded into
 /// [`crate::app::App`] by `on_net_event` with no runtime dependency.
 ///
@@ -497,6 +510,11 @@ pub enum NetEvent {
     /// Joining the default public room failed (no live session or subscribe
     /// error). Non-fatal: the connection itself is up.
     PublicRoomJoinFailed { message: String },
+    /// Whether the app can read `room`'s record. `reachable: false` when a repair of the
+    /// room's lost record session failed, or when consecutive ordinary re-reads got no
+    /// answer to any read; `reachable: true` once a repair completes or a re-read gets
+    /// an answer to at least one read.
+    RoomReach { room: RoomRecord, reachable: bool },
     /// A verified public-room message arrived (ISC-S25 / ISC-C57). Only messages
     /// whose provenance signature verified are emitted (ISC-A-S17).
     PublicRoomMessage {
@@ -700,6 +718,10 @@ pub enum NetEvent {
     /// The direct-messaging runner stopped. Nothing reports until a later
     /// connect with a started node starts another.
     DmStopped,
+    /// Direct messaging cannot run on this connection: no runner started, or
+    /// the last one ended with an error or panicked. Carries the cause the
+    /// pane's line is worded from and the redacted error text shown beneath it.
+    DmUnavailable(DmUnavailable),
     /// A close is still waiting for the direct-messaging runner to stop after
     /// [`DM_CLOSE_NOTICE_AFTER`]. Sent at most once per close.
     DmCloseSlow,

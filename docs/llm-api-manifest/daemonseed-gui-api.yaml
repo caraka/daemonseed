@@ -64,7 +64,21 @@ library:
 # awaiting the previous runner's task end before the next starts. Each runner they
 # stop, whether running or produced by a start still in flight, is reported by one
 # `NetEvent::DmStopped`; with no runner running or starting they report nothing. A
-# runner that ends on its own is also reported by one `NetEvent::DmStopped`.
+# runner that ends on its own is also reported by one `NetEvent::DmStopped`. A
+# runner that ends with an error or panics, a start or end task that panics, and
+# a connect that has keys but cannot start a runner are each reported by
+# `NetEvent::DmUnavailable(DmUnavailable)`, carrying a `DmUnavailableCause` and
+# the redacted error text, after any `DmStopped`, and traced. Keys that fail to
+# derive are traced by `GuiState::dm_session_keys`, which marks the state
+# unavailable itself with `DmUnavailableCause::Internal`. Either way
+# `GuiState::dm_notice` is then `DmNotice::Unavailable(cause)` until a runner
+# reports its roster, worded by `dm_ui::unavailable_text`, and
+# `GuiState::dm_notice_detail` is the error text, shown selectable beneath the
+# notice with a Copy button for every cause but `NotConnected`. With no profile
+# unlocked there are no keys and nothing is reported. While the runner's last
+# `RunnerEvent::Advert` says not published, `dm_notice` is
+# `DmNotice::NotReachable` where no other notice
+# applies. A runner's first roster clears the notice the previous one left.
 # `GracefulClose` then waits for that stop before its transport steps and its ack,
 # up to `net::DM_CLOSE_CAP` (30 s); a stop still running after
 # `net::DM_CLOSE_NOTICE_AFTER` (500 ms) emits `NetEvent::DmCloseSlow` once, which
@@ -76,13 +90,46 @@ library:
 # and the selected thread. A room or conversation row shows the unread dot while it
 # is unread and its chat or thread is not in the main pane, whether or not it is the
 # active room or selected item; a section header's dot sums its rows. A message
-# composed here is drawn after the thread rows sent no later than the second it was
-# composed in. For `RunnerEvent::StartedOver`, `on_dm_event` appends
+# composed here is drawn after the thread rows placed no later than the commit time
+# `RunnerEvent::Sent` reports for it, or, until that report, the time it was
+# composed, and its age is read from that same time; a sent row not composed here
+# ages from its reported commit time. For `RunnerEvent::StartedOver`, `on_dm_event` appends
 # `TrustEventKey::DmCorrespondentStateLost` to `GuiState::trust_log`, the audit
 # log. A queued command `NetHandle::dm` cannot hand over, because the network
 # thread is gone, is folded back as `RunnerEvent::Refused { reason:
 # Refusal::ShuttingDown }`, and losing the network thread folds as
 # `NetEvent::DmStopped` does, once.
+# `NetEvent::RoomReach { room: net::RoomRecord, reachable }` reports whether a
+# room's record can be read (`RoomRecord`: Lobby, LobbyShares, Announcements,
+# Circle(circle_id)): false after a failed repair of its lost session, a repair
+# with no read answered, or two consecutive ordinary re-reads with no read
+# answered; true after a complete repair, or a repair or re-read with at least
+# one read answered. A repair dispatched before its record's latest re-read, or
+# before the latest Connect, reports nothing.
+# `GuiState::set_room_reach` keeps the set, cleared on `NetEvent::Connected`, and
+# `GuiState::reach_notice` / `room_reach_notice` give the line "Can't reach <name>
+# right now. Retrying.", naming a circle by its rail label and showing nothing for a
+# circle no longer in the rail. The line shows under the tab strip on the tab that
+# reads that record, and an unreachable circle's rail row says so in place of its
+# subtitle.
+# A circle is joining until `NetEvent::CircleJoined` or
+# `NetEvent::CircleJoinFailed { circle_id, reason }` arrives for it
+# (`GuiState::is_joining`): its rail row reads "Joining…" in place of its subtitle,
+# the chat tab shows `GuiState::joining_notice` ("Joining <name>…"), and while it is
+# the active circle the composer and Send are disabled (`GuiState::can_send`). A
+# join that ends for good (`CircleJoinFailed`: its keys could not be derived, the
+# subscribe was refused for a reason a retry cannot fix, or there is no connection,
+# as for every circle a Connect that could not connect was to re-join) leaves the circle with
+# `GuiState::join_failure`: its row reads "Couldn't join", the chat tab shows
+# "Couldn't join <name>: <reason>", the reason cut to one line, and the composer
+# and Send stay disabled, until a later `CircleJoined`. A circle that has not
+# joined shows no reach line. When the active circle on the chat tab first joins,
+# the composer takes keyboard focus, unless a dialog, sheet, overlay or the startup
+# mask covers the window. Joining a phrase whose circle is already in
+# the rail (`GuiState::index_of_phrase`) switches to that circle.
+# `NetEvent::CircleError` sets the status line to `GuiState::circle_error_status`
+# ("circle <name>: <reason>", or "circle: <reason>" for an unknown id), and
+# `CircleJoined` replaces that circle's error with "connected · veilid".
 # This manifest grows only if the GUI ever exposes reusable library components.
 modules: []
 public_types: []

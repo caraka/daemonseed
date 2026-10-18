@@ -1,0 +1,12 @@
+profile_id = "ce9bcf17-bbc0-45b6-a084-a2a58c8bdfc9"
+biometric_unlock = false
+autostart = false
+
+[argon2]
+memory_kib = 19456
+iterations = 2
+parallelism = 1
+
+[bootstrap]
+server_id = "relay#aabbccddeeff"
+address = "127.0.0.1:443"

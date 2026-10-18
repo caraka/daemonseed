@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use daemonseed_veilid_net::dm::runner::{
     CommandToken, ConversationState, IdentityPk, Refusal, RunnerCommand, RunnerEvent,
 };
+use daemonseed_veilid_net::dm::unavailable::{DmUnavailable, DmUnavailableCause};
 use daemonseed_veilid_net::dm::view::{
     DmCorrespondence, DmOutstanding, DmState, DmThreadRow, FirstContactBlocked, dm_fingerprint,
     dm_name,
@@ -29,6 +30,9 @@ pub const DM_ACCEPT_REPLY: &str = "message accepted";
 /// A one-line notice for the Direct messages area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmNotice {
+    /// Direct messaging cannot run, for this cause: no runner started, or the
+    /// last one ended with an error or panicked. Shown until a runner reports.
+    Unavailable(DmUnavailableCause),
     /// The runner cannot read its block list, so no request arrives and no
     /// conversation is collected until it reads again. Shown while it lasts.
     BlockListUnreadable,
@@ -47,6 +51,10 @@ pub enum DmNotice {
     /// A first message found that person's request waiting, so the draft was
     /// dropped and the request opened; accepting it opens the conversation.
     MovedToRequest,
+    /// The runner's last advert pass found this side's advert not on the
+    /// network, so nobody can send it a first contact. Shown while it lasts,
+    /// beneath any other notice.
+    NotReachable,
 }
 
 /// One of the rail's two sections. At most one is open at a time.
@@ -168,9 +176,9 @@ pub struct DmMessageRow {
     /// How far an outgoing message got; `None` on a received one.
     pub status: Option<DmMessageStatus>,
     /// The time the row's age is read from, in Unix milliseconds: the
-    /// correspondent's send time on a received message, the time it was
-    /// composed on one composed here, and `None` on a message this session
-    /// did not compose.
+    /// correspondent's send time on a received message, and on one sent from
+    /// here the time the runner committed it, or, until the runner reports
+    /// that, the time it was composed.
     pub at_ms: Option<i64>,
 }
 
@@ -234,8 +242,8 @@ struct Composed {
     /// opened.
     opens_conversation: bool,
     /// How many thread rows not composed here the conversation held when it
-    /// was composed: it is drawn after them, and after every later one sent no
-    /// later than the second it was composed in.
+    /// was composed: it is drawn after them, and after every later one that
+    /// reached the thread no later than it was composed.
     after: usize,
     /// Its sequence number, once the runner reports it held.
     seq: Option<u64>,
@@ -243,6 +251,9 @@ struct Composed {
     refusal: Option<Refusal>,
     /// When it was composed, by this side's clock (Unix ms).
     composed_at_ms: i64,
+    /// When the runner committed it, by the runner's clock (Unix ms), once the
+    /// runner reports it held.
+    sent_at_ms: Option<u64>,
 }
 
 impl Composed {
@@ -432,6 +443,7 @@ impl GuiDm {
             seq: None,
             refusal: None,
             composed_at_ms: now_unix_ms(),
+            sent_at_ms: None,
         });
     }
 
@@ -653,20 +665,28 @@ fn activity_marks(state: &DmState) -> BTreeMap<IdentityPk, (usize, u64)> {
 
 /// Whether a composed message goes above `row`. A row this side sent, where the
 /// message has its sequence, goes by sequence alone: one direction is always in
-/// sequence order, whatever time a row carries. Otherwise the row was sent in a
-/// later whole second than the message was composed in. A correspondent's time
-/// is carried to the second, so both are compared at that grain.
+/// sequence order, whatever time a row carries. Otherwise the row reached the
+/// thread later than the message was sent: a received row when this side
+/// collected it, whatever the correspondent's stamp says, and a sent row when
+/// it was sent. The message was sent when the runner reports it committed, by
+/// the clock the runner also reads receipt times from, and until that report,
+/// when it was composed.
 fn composed_before(m: &Composed, row: &DmThreadRow) -> bool {
     if let (DmThreadRow::Sent { seq, .. }, Some(mine)) = (row, m.seq) {
         return mine < *seq;
     }
     let row_ms = match row {
-        DmThreadRow::Received { sent_at_ms, .. } | DmThreadRow::Sent { sent_at_ms, .. } => {
-            *sent_at_ms
-        }
+        DmThreadRow::Received { received_at_ms, .. } => *received_at_ms,
+        DmThreadRow::Sent { sent_at_ms, .. } => *sent_at_ms,
     };
-    let composed_ms = u64::try_from(m.composed_at_ms).unwrap_or(0);
-    row_ms / 1000 > composed_ms / 1000
+    row_ms > composed_sent_at(m)
+}
+
+/// When a composed message was sent, in Unix ms: when the runner committed it,
+/// or, until the runner reports that, when it was composed.
+fn composed_sent_at(m: &Composed) -> u64 {
+    m.sent_at_ms
+        .unwrap_or_else(|| u64::try_from(m.composed_at_ms).unwrap_or(0))
 }
 
 /// A thread row as the thread view draws it, `delivered` saying which of this
@@ -681,7 +701,11 @@ fn thread_row(delivered: impl Fn(u64) -> bool) -> impl Fn(&DmThreadRow) -> DmMes
             status: None,
             at_ms: Some(unix_ms_i64(*sent_at_ms)),
         },
-        DmThreadRow::Sent { seq, body, .. } => DmMessageRow {
+        DmThreadRow::Sent {
+            seq,
+            body,
+            sent_at_ms,
+        } => DmMessageRow {
             outgoing: true,
             body: body.clone().unwrap_or_else(|| format!("message {seq}")),
             status: Some(if delivered(*seq) {
@@ -689,7 +713,7 @@ fn thread_row(delivered: impl Fn(u64) -> bool) -> impl Fn(&DmThreadRow) -> DmMes
             } else {
                 DmMessageStatus::Sent
             }),
-            at_ms: None,
+            at_ms: Some(unix_ms_i64(*sent_at_ms)),
         },
     }
 }
@@ -718,13 +742,27 @@ impl GuiState {
         }
         let now = now_unix_ms();
         let dm = &mut self.dm;
+        // A roster from a runner that was not reporting, or after messaging was
+        // marked unavailable, opens a new session: a notice the last one left
+        // no longer applies.
+        if matches!(event, RunnerEvent::Roster(_))
+            && (!dm.state.running || dm.state.unavailable.is_some())
+        {
+            dm.notice = None;
+        }
         let before = activity_marks(&dm.state);
         let folded = dm.state.fold(event, now);
         match event {
-            RunnerEvent::Sent { token, seq, .. } => {
+            RunnerEvent::Sent {
+                token,
+                seq,
+                sent_at,
+                ..
+            } => {
                 if let Some(m) = dm.composed_mut(*token) {
                     m.seq = Some(*seq);
                     m.refusal = None;
+                    m.sent_at_ms = Some(*sent_at);
                 }
             }
             RunnerEvent::Refused {
@@ -784,7 +822,8 @@ impl GuiState {
             | RunnerEvent::Delivered { .. }
             | RunnerEvent::Accepted { .. }
             | RunnerEvent::BlockListUnreadable
-            | RunnerEvent::Health(_) => {}
+            | RunnerEvent::Health(_)
+            | RunnerEvent::Advert { .. } => {}
         }
         if let Some((draft, reason)) = folded.refused_accept {
             dm.accept_refused.insert(draft.from, reason);
@@ -845,6 +884,13 @@ impl GuiState {
         dm.reconcile();
     }
 
+    /// Direct messaging cannot run on this connection, for the reason `why`
+    /// gives. The notice stands until a runner reports.
+    pub fn on_dm_unavailable(&mut self, why: DmUnavailable) {
+        self.dm.state.mark_unavailable(why);
+        self.dm.reconcile();
+    }
+
     /// Drain the commands queued for the runner, oldest first. The binary
     /// forwards each with `NetHandle::dm`.
     pub fn take_pending_dm(&mut self) -> Vec<RunnerCommand> {
@@ -858,14 +904,34 @@ impl GuiState {
         &self.dm.state
     }
 
-    /// The notice the Direct messages area shows: the block list being
-    /// unreadable while it lasts, else the last notice an event or action left.
+    /// The notice the Direct messages area shows: messaging being unavailable,
+    /// else the block list being unreadable, while either lasts; else the last
+    /// notice an event or action left; else this side's advert not being on
+    /// the network, while that lasts.
     pub fn dm_notice(&self) -> Option<DmNotice> {
-        if self.dm.state.block_list_unknown {
+        let state = &self.dm.state;
+        if let Some(why) = &state.unavailable {
+            Some(DmNotice::Unavailable(why.cause()))
+        } else if state.block_list_unknown {
             Some(DmNotice::BlockListUnreadable)
-        } else {
+        } else if self.dm.notice.is_some() {
             self.dm.notice
+        } else if state.advert_unpublished {
+            Some(DmNotice::NotReachable)
+        } else {
+            None
         }
+    }
+
+    /// The error text shown beneath the Direct messages notice while messaging
+    /// is unavailable for a cause that names an error, redacted when it was
+    /// built. `None` otherwise, and while not connected.
+    pub fn dm_notice_detail(&self) -> Option<&str> {
+        self.dm
+            .state
+            .unavailable
+            .as_ref()
+            .and_then(DmUnavailable::shown_detail)
     }
 
     /// The name the rail and the thread header give `peer`: the handle any
@@ -1338,7 +1404,7 @@ impl GuiState {
             outgoing: true,
             body: m.body.clone(),
             status: Some(composed_status(m, delivered)),
-            at_ms: Some(m.composed_at_ms),
+            at_ms: Some(unix_ms_i64(composed_sent_at(m))),
         };
         let draw = thread_row(delivered);
         let mut next = composed.iter().peekable();
@@ -1393,6 +1459,12 @@ mod tests {
     use daemonseed_veilid_net::dm::runner::{
         CommandToken, ContactRequestId, ConversationState, ConversationSummary, HealthCounters,
     };
+
+    /// This moment in Unix milliseconds, as a runner reports a send committed
+    /// at.
+    fn test_now_ms() -> u64 {
+        u64::try_from(now_unix_ms()).expect("a clock past the epoch")
+    }
 
     fn pk(tag: u8) -> IdentityPk {
         Box::new([tag; IDENTITY_PK_LEN])
@@ -1597,6 +1669,7 @@ mod tests {
             token,
             peer: label(),
             seq: 0,
+            sent_at: test_now_ms(),
         });
         let thread = st.dm_thread_view().expect("the selection followed");
         assert_eq!(thread.key, conversation(4));
@@ -1703,6 +1776,7 @@ mod tests {
             token,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         let thread = st.dm_thread_view().expect("the selection followed");
         assert_eq!(thread.key, conversation(3));
@@ -1775,6 +1849,7 @@ mod tests {
             token,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         let thread = st.dm_thread_view().expect("the selection followed");
         assert_eq!(thread.key, conversation(3));
@@ -1938,6 +2013,7 @@ mod tests {
             token,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         st.on_dm_event(&roster(&[(peer, 3, ConversationState::Pending)]));
         let kinds: Vec<DmItemKind> = st
@@ -2011,6 +2087,7 @@ mod tests {
             token: first,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         st.on_dm_event(&RunnerEvent::Delivered {
             peer,
@@ -2047,6 +2124,7 @@ mod tests {
             token,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         st.on_dm_event(&RunnerEvent::Delivered {
             peer,
@@ -2220,6 +2298,7 @@ mod tests {
                 token: CommandToken(99),
                 peer,
                 seq: 0,
+                sent_at: test_now_ms(),
             },
             RunnerEvent::Delivered {
                 peer,
@@ -2440,16 +2519,18 @@ mod tests {
         assert_eq!(dm_age_text(0, now), "1970-01-01");
     }
 
-    /// A message this side sent that this session did not compose has no known
-    /// time, so it carries no age, while a received one does.
+    /// A message this side sent that this session did not compose ages from the
+    /// commit time the runner reports for it, as a received one ages from its
+    /// sender's stamp.
     #[test]
-    fn a_sent_message_not_composed_here_has_no_age() {
+    fn a_sent_message_not_composed_here_ages_from_its_commit_time() {
         let (mut st, peer) = with_conversation(4);
         st.select_dm_item(&conversation(4));
         st.on_dm_event(&RunnerEvent::Sent {
             token: CommandToken(999),
             peer,
             seq: 0,
+            sent_at: 3_000,
         });
         st.on_dm_event(&RunnerEvent::Message {
             from: peer,
@@ -2461,7 +2542,7 @@ mod tests {
         let thread = st.dm_thread_view().expect("the conversation is selected");
         let times: Vec<(bool, Option<i64>)> =
             thread.rows.iter().map(|r| (r.outgoing, r.at_ms)).collect();
-        assert_eq!(times, [(false, Some(1_000)), (true, None)]);
+        assert_eq!(times, [(false, Some(1_000)), (true, Some(3_000))]);
     }
 
     /// The token and body of the one command `st` queued.
@@ -2503,6 +2584,7 @@ mod tests {
             token: second,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         assert_eq!(
             thread_rows(&st),
@@ -2648,6 +2730,7 @@ mod tests {
             token: c,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         st.on_dm_event(&RunnerEvent::Refused {
             token: Some(a),
@@ -2657,11 +2740,12 @@ mod tests {
         assert_eq!(bodies, ["a", "b", "c"]);
     }
 
-    /// A thread is in conversation order: a reply sent before a message
-    /// composed here, and heard of after it, is drawn above it, and one sent
-    /// after it below.
+    /// A thread is in conversation order by this side's clock: replies
+    /// collected after a message composed here are drawn below it, whenever
+    /// their senders stamped them, because messages that cross in flight go
+    /// in the order they arrived.
     #[test]
-    fn a_reply_sent_before_a_composed_message_is_drawn_above_it() {
+    fn replies_collected_after_a_composed_message_are_drawn_below_it() {
         let (mut st, peer) = with_conversation(1);
         st.select_dm_item(&conversation(1));
         assert!(st.send_dm("mine"));
@@ -2670,6 +2754,7 @@ mod tests {
             token: mine,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         let now = u64::try_from(now_unix_ms()).expect("a clock past the epoch");
         for (seq, body, sent_at) in [(0, "earlier", now - 60_000), (1, "later", now + 60_000)] {
@@ -2682,7 +2767,67 @@ mod tests {
             });
         }
         let bodies: Vec<String> = thread_rows(&st).into_iter().map(|(b, _)| b).collect();
-        assert_eq!(bodies, ["earlier", "mine", "later"]);
+        assert_eq!(bodies, ["mine", "earlier", "later"]);
+    }
+
+    /// A reply from a correspondent whose clock is an hour behind, collected
+    /// after a message composed here, is drawn after it, and its age reads
+    /// from its stamp.
+    #[test]
+    fn a_reply_from_a_clock_an_hour_behind_is_drawn_after_what_it_answers() {
+        let (mut st, peer) = with_conversation(1);
+        st.select_dm_item(&conversation(1));
+        assert!(st.send_dm("question"));
+        let question = only_token(&mut st);
+        st.on_dm_event(&RunnerEvent::Sent {
+            token: question,
+            peer,
+            seq: 0,
+            sent_at: test_now_ms(),
+        });
+        let now = u64::try_from(now_unix_ms()).expect("a clock past the epoch");
+        let stamp = now + 1_000 - 60 * 60 * 1000;
+        st.on_dm_event(&RunnerEvent::Message {
+            from: peer,
+            seq: 0,
+            body: b"answer".to_vec(),
+            sent_at: stamp,
+            received_at: now + 1_000,
+        });
+        let thread = st.dm_thread_view().expect("selected");
+        let bodies: Vec<&str> = thread.rows.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, ["question", "answer"]);
+        assert_eq!(thread.rows[1].at_ms, Some(unix_ms_i64(stamp)));
+    }
+
+    /// A message composed here is placed, and aged, by the time the runner
+    /// committed it, the clock the runner reads receipt times from: a reply the
+    /// runner collected after that commit is drawn below it even where this
+    /// side's clock read later when the message was composed.
+    #[test]
+    fn a_composed_message_is_placed_by_the_runners_commit_time() {
+        let (mut st, peer) = with_conversation(1);
+        st.select_dm_item(&conversation(1));
+        assert!(st.send_dm("question"));
+        let question = only_token(&mut st);
+        let now = test_now_ms();
+        st.on_dm_event(&RunnerEvent::Sent {
+            token: question,
+            peer,
+            seq: 0,
+            sent_at: now - 10_000,
+        });
+        st.on_dm_event(&RunnerEvent::Message {
+            from: peer,
+            seq: 0,
+            body: b"answer".to_vec(),
+            sent_at: now - 6_000,
+            received_at: now - 5_000,
+        });
+        let thread = st.dm_thread_view().expect("selected");
+        let bodies: Vec<&str> = thread.rows.iter().map(|r| r.body.as_str()).collect();
+        assert_eq!(bodies, ["question", "answer"]);
+        assert_eq!(thread.rows[0].at_ms, Some(unix_ms_i64(now - 10_000)));
     }
 
     /// An unreadable block list is a notice while it lasts.
@@ -2694,6 +2839,143 @@ mod tests {
         assert_eq!(st.dm_notice(), Some(DmNotice::BlockListUnreadable));
         st.on_dm_event(&RunnerEvent::BlockList(Vec::new()));
         assert_eq!(st.dm_notice(), None);
+    }
+
+    /// Messaging being unavailable is a notice that stands, with no message
+    /// pending and across the stop that preceded it, until a runner reports.
+    #[test]
+    fn unavailable_messaging_is_a_notice_until_a_runner_reports() {
+        let mut st = GuiState::lobby_only();
+        st.on_dm_stopped();
+        assert_eq!(st.dm_notice(), None, "a clean stop left a notice");
+        let failed = Some(DmNotice::Unavailable(DmUnavailableCause::RunnerFailed));
+        st.on_dm_unavailable(DmUnavailable::new(
+            DmUnavailableCause::RunnerFailed,
+            "advert keys: the entropy source failed",
+        ));
+        assert_eq!(st.dm_notice(), failed);
+        assert_eq!(
+            st.dm_notice_detail(),
+            Some("advert keys: the entropy source failed")
+        );
+        st.on_dm_stopped();
+        assert_eq!(st.dm_notice(), failed);
+        st.on_dm_event(&RunnerEvent::BlockListUnreadable);
+        assert_eq!(st.dm_notice(), failed);
+        st.on_dm_event(&roster(&[]));
+        assert_eq!(st.dm_notice(), Some(DmNotice::BlockListUnreadable));
+        assert_eq!(st.dm_notice_detail(), None, "a roster left the detail");
+        st.on_dm_event(&RunnerEvent::BlockList(Vec::new()));
+        assert_eq!(st.dm_notice(), None);
+    }
+
+    /// Each cause of messaging being unavailable is its own notice. Not being
+    /// connected shows no detail; every other cause shows its redacted error.
+    #[test]
+    fn each_unavailable_cause_is_its_own_notice_with_its_detail() {
+        let cases = [
+            (DmUnavailableCause::NotConnected, "no Veilid node", None),
+            (
+                DmUnavailableCause::StoreUnopened,
+                "no profile root",
+                Some("no profile root"),
+            ),
+            (
+                DmUnavailableCause::RunnerFailed,
+                "direct-message store: /home/alice/dm/lock is a symlink",
+                Some("direct-message store: <path> is a symlink"),
+            ),
+            (
+                DmUnavailableCause::Internal,
+                "the runner panicked",
+                Some("the runner panicked"),
+            ),
+        ];
+        for (cause, detail, shown) in cases {
+            let mut st = GuiState::lobby_only();
+            st.on_dm_unavailable(DmUnavailable::new(cause, detail));
+            assert_eq!(st.dm_notice(), Some(DmNotice::Unavailable(cause)));
+            assert_eq!(st.dm_notice_detail(), shown, "for {cause:?}");
+        }
+    }
+
+    /// A notice the last runner left is gone once a new runner reports, so it
+    /// does not hide that runner's own condition.
+    #[test]
+    fn a_new_runner_clears_the_last_runners_notice() {
+        let mut st = GuiState::lobby_only();
+        st.on_dm_event(&roster(&[]));
+        st.start_dm_with(pk(3));
+        assert!(st.send_dm("hello"));
+        st.on_dm_stopped();
+        assert_eq!(st.dm_notice(), Some(DmNotice::NotSent { count: 1 }));
+        st.on_dm_event(&roster(&[]));
+        st.on_dm_event(&RunnerEvent::Advert { published: false });
+        assert_eq!(st.dm_notice(), Some(DmNotice::NotReachable));
+    }
+
+    /// The last action's notice shows above an unpublished advert's.
+    #[test]
+    fn an_action_notice_shows_above_an_unpublished_advert() {
+        let mut st = GuiState::lobby_only();
+        let peer = pk(4);
+        st.on_dm_event(&roster(&[]));
+        st.on_dm_event(&RunnerEvent::Advert { published: false });
+        assert_eq!(st.dm_notice(), Some(DmNotice::NotReachable));
+        st.start_dm_with(peer.clone());
+        st.on_dm_event(&RunnerEvent::ContactRequest {
+            request: request_id(1),
+            from: peer,
+        });
+        assert!(!st.send_dm("hi"));
+        assert_eq!(st.dm_notice(), Some(DmNotice::MovedToRequest));
+        // A roster from the same runner leaves the notice alone.
+        st.on_dm_event(&roster(&[]));
+        assert_eq!(st.dm_notice(), Some(DmNotice::MovedToRequest));
+    }
+
+    /// A runner that reports after messaging was marked unavailable, while the
+    /// state still reads running, opens a new session: the last runner's notice
+    /// is gone.
+    #[test]
+    fn a_roster_after_unavailable_clears_the_last_runners_notice() {
+        let mut st = GuiState::lobby_only();
+        let peer = pk(4);
+        st.on_dm_event(&roster(&[]));
+        st.start_dm_with(peer.clone());
+        st.on_dm_event(&RunnerEvent::ContactRequest {
+            request: request_id(1),
+            from: peer,
+        });
+        assert!(!st.send_dm("hi"));
+        assert_eq!(st.dm_notice(), Some(DmNotice::MovedToRequest));
+        // No stop is reported, so the state still reads running.
+        st.on_dm_unavailable(DmUnavailable::new(
+            DmUnavailableCause::Internal,
+            "the runner's start or end task panicked",
+        ));
+        assert!(st.dm_state().running);
+        st.on_dm_event(&roster(&[]));
+        assert_eq!(st.dm_notice(), None);
+    }
+
+    /// This side's advert not being on the network is a notice while it
+    /// lasts, and goes with the runner.
+    #[test]
+    fn an_unpublished_advert_is_a_notice_while_it_lasts() {
+        let mut st = GuiState::lobby_only();
+        st.on_dm_event(&roster(&[]));
+        st.on_dm_event(&RunnerEvent::Advert { published: false });
+        assert_eq!(st.dm_notice(), Some(DmNotice::NotReachable));
+        st.on_dm_event(&RunnerEvent::Advert { published: true });
+        assert_eq!(st.dm_notice(), None);
+        st.on_dm_event(&RunnerEvent::Advert { published: false });
+        st.on_dm_stopped();
+        assert_eq!(
+            st.dm_notice(),
+            None,
+            "the advert notice outlived the runner"
+        );
     }
 
     /// A draft to a blocked person cannot send, and says so.

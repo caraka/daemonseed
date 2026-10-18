@@ -28,7 +28,18 @@
 //! only an address to try: a push on it that goes unanswered forgets it, in
 //! memory and on disk, and the next collection of the conversation reads the
 //! correspondent's control, whose route is kept again where its serial is the
-//! one applied and taken where it is newer.
+//! one applied and taken where it is newer. Each time a reach notice or a
+//! control read gives a route that replaces the route held, or one taken
+//! after a route was forgotten, the messages committed to that correspondent
+//! and not yet collected are pushed on it in sequence order, so a message
+//! whose push failed on a route the correspondent no longer serves does not
+//! wait for a collection of the record store. So is every route held at
+//! launch, from the read of the correspondent's control or the route kept, so
+//! a message committed before the launch is pushed too. The route a first
+//! acceptance gives is held without such a push. Each run of these pushes is
+//! made on the route that started it, from the cursor of the control that
+//! gave the route where the store has not taken it yet, and a send made on
+//! that route while the run lasts joins it.
 //!
 //! Once this node holds a route, at launch and whenever it is replaced, and
 //! before the control subkeys are rewritten with it, the runner pushes a
@@ -49,13 +60,85 @@ use daemonseed_core::dm::channel::Reach;
 use daemonseed_core::dm::push as core_push;
 
 use crate::dm::push::{
-    Admitting, KeptUnanswered, OwnRoute, PushInbox, PushParts, PushTransport, Pusher, Unanswered,
+    enter_run, Admitting, KeptUnanswered, OwnRoute, PushInbox, PushParts, PushTransport, Pusher,
+    RunSlot, Runs, Unanswered,
 };
 
 /// How many unanswered pushes in a row on one route are kept because their
 /// messages were collected. The next one drops the route, which is then taken
 /// to answer nothing.
 const KEPT_UNANSWERED_MAX: u32 = 2;
+
+/// Hooks run where a take has learned a route, before the run of pushes it
+/// starts, by correspondent.
+#[cfg(test)]
+#[allow(clippy::type_complexity)]
+static BEFORE_RUN: std::sync::Mutex<
+    Option<HashMap<CorrespondenceLabel, Box<dyn FnOnce() + Send>>>,
+> = std::sync::Mutex::new(None);
+
+/// Run `hook` once, where a take next learns a route for `peer`, before the
+/// run of pushes it starts.
+#[cfg(test)]
+pub(super) fn before_run(peer: CorrespondenceLabel, hook: Box<dyn FnOnce() + Send>) {
+    BEFORE_RUN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(HashMap::new)
+        .insert(peer, hook);
+}
+
+/// Correspondents whose next run reads its outbox as a store that will not
+/// load does.
+#[cfg(test)]
+static FAILED_RUN_READS: std::sync::Mutex<Vec<CorrespondenceLabel>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Have the next run of pushes to `peer` find the store will not load its
+/// outbox.
+#[cfg(test)]
+pub(super) fn fail_next_run_read(peer: CorrespondenceLabel) {
+    FAILED_RUN_READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(peer);
+}
+
+/// Whether a read [`fail_next_run_read`] set for `peer` is still to fail.
+#[cfg(test)]
+pub(super) fn run_read_left_to_fail(peer: &CorrespondenceLabel) -> bool {
+    FAILED_RUN_READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(peer)
+}
+
+/// Whether [`fail_next_run_read`] was set for `peer`, clearing it.
+#[cfg(test)]
+fn run_read_fails(peer: &CorrespondenceLabel) -> bool {
+    let mut failing = FAILED_RUN_READS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = failing.iter().position(|failing| failing == peer);
+    at.map(|at| failing.remove(at)).is_some()
+}
+
+/// Run the hook `before_run` set for `peer`, where one is set.
+pub(super) fn run_before_run(peer: &CorrespondenceLabel) {
+    #[cfg(test)]
+    {
+        let hook = BEFORE_RUN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|hooks| hooks.remove(peer));
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    #[cfg(not(test))]
+    let _ = peer;
+}
 
 /// How long after a failed route allocation the runner first tries again.
 const ROUTE_RETRY_FIRST: Duration = Duration::from_secs(5);
@@ -95,6 +178,7 @@ pub(super) struct PushShare {
     peer_routes: Arc<std::sync::Mutex<PeerRoutes>>,
     unanswered: mpsc::UnboundedSender<Unanswered>,
     kept: KeptUnanswered,
+    runs: Runs,
 }
 
 impl PushShare {
@@ -119,6 +203,7 @@ impl PushShare {
             answer_key: None,
             own_route: None,
             kept: Arc::clone(&self.kept),
+            runs: Arc::clone(&self.runs),
         })
     }
 
@@ -154,10 +239,21 @@ impl PushShare {
         peer: &CorrespondenceLabel,
         events: &mpsc::Sender<RunnerEvent>,
     ) -> Option<Pusher> {
+        let route = self.routes().get(peer).and_then(|(route, _)| route.clone());
+        self.pusher_on(store, peer, events, route.as_ref())
+    }
+
+    /// [`Self::pusher_for`] on `route` in place of the route held.
+    fn pusher_on(
+        &self,
+        store: &Store,
+        peer: &CorrespondenceLabel,
+        events: &mpsc::Sender<RunnerEvent>,
+        route: Option<&Vec<u8>>,
+    ) -> Option<Pusher> {
         let state = store.load_conv(peer).ok()??;
         let key = state.own_control_key.as_ref()?;
-        let route = self.routes().get(peer).and_then(|(route, _)| route.clone());
-        let mut pusher = self.pusher(route.as_ref(), events)?;
+        let mut pusher = self.pusher(route, events)?;
         pusher.answer_key = Some(Arc::new(core_push::AnswerKey::new(key)));
         pusher.own_route = store.reach().route;
         Some(pusher)
@@ -192,7 +288,13 @@ impl PushShare {
 
     /// Hold `route`, issued at reach serial `serial`, as `peer`'s, and return
     /// the route held before where this replaced it, for the caller to
-    /// [`Self::release`] once it has left the store's critical section.
+    /// [`Self::release`] once it has left the store's critical section,
+    /// beside the run of pushes on `route` entered for `peer` ([`Run`]),
+    /// where `route` was taken where none was held or replaced the one held,
+    /// and `repush` asks for one. The run is entered before the route is held,
+    /// under the same lock, so a send that finds the route joins the run. The
+    /// caller starts it ([`Self::push_outstanding`]) once outside the store's
+    /// section, or drops it, which leaves it.
     ///
     /// Called from inside the correspondence's critical section, with a reach
     /// [`Store::take_reach`] found applied, or with the route and serial
@@ -209,8 +311,9 @@ impl PushShare {
         peer: &CorrespondenceLabel,
         route: Option<Vec<u8>>,
         serial: u64,
-    ) -> Option<Vec<u8>> {
-        let (old, change) = {
+        repush: Repush,
+    ) -> (Option<Vec<u8>>, Option<Run>) {
+        let (old, change, run) = {
             let mut routes = self.routes();
             let (held, floor) = match routes.get(peer) {
                 Some((held, floor)) => (held.clone(), Some(*floor)),
@@ -221,6 +324,15 @@ impl PushShare {
             let change = match route_change(held.as_ref(), route.as_ref()) {
                 RouteChange::Replaced | RouteChange::Taken if !takes => RouteChange::Older,
                 change => change,
+            };
+            let run = match (&route, change) {
+                (Some(route), RouteChange::Taken | RouteChange::Replaced) => {
+                    repush.wants(floor.is_some()).map(|collected| Run {
+                        slot: enter_run(&self.runs, *peer, route.clone()),
+                        collected,
+                    })
+                }
+                _ => None,
             };
             let old = match route {
                 Some(route) if takes => {
@@ -234,10 +346,10 @@ impl PushShare {
                     None
                 }
             };
-            (old, change)
+            (old, change, run)
         };
         crate::vtrace!("{}", route_line(peer, change));
-        old
+        (old, run)
     }
 
     /// [`Self::hold_route`], releasing the route it replaced, outside any
@@ -249,7 +361,7 @@ impl PushShare {
         route: Option<Vec<u8>>,
         serial: u64,
     ) {
-        let old = self.hold_route(peer, route, serial);
+        let (old, _) = self.hold_route(peer, route, serial, Repush::Renewed(0));
         self.release(old);
     }
 
@@ -258,6 +370,104 @@ impl PushShare {
         if let (Some(route), Some(transport)) = (route, &self.transport) {
             transport.release(&route);
         }
+    }
+
+    /// Start `run`: push every message of `peer`'s outstanding outbox whose
+    /// sequence is at or above the run's `collected`, in sequence order, on
+    /// the run's route ([`Pusher::push_slots`]), where the conversation is
+    /// established and not being deleted, then every send that joined the
+    /// run. The outbox the store loads holds only sequences at or above the
+    /// collected position it has taken, so that position is left out too.
+    /// `collected` is the cursor of the control that gave the route, which the
+    /// store may not have taken yet; the receiver leaves a push of a sequence
+    /// older than the last it collected unanswered, and that would end the
+    /// run before the first message it has not collected. Where the store will
+    /// not load the outbox, the run pushes only what joined it and does not
+    /// take over the run before it.
+    ///
+    /// Called once for each route a take learned ([`Repush`]), outside any
+    /// critical section of the store, so a message whose push failed on a
+    /// route the correspondent no longer serves reaches it on the new one
+    /// rather than waiting for a collection of the record store. The receiver
+    /// takes only the sequence it expects next, so the pushes keep the order
+    /// of the sequences.
+    pub(super) fn push_outstanding(
+        &self,
+        store: &Store,
+        peer: &CorrespondenceLabel,
+        events: &mpsc::Sender<RunnerEvent>,
+        run: Run,
+    ) {
+        let Run { slot, collected } = run;
+        let route = slot.route().to_vec();
+        // Enough for the pushes that joined the run, which come encoded. With
+        // no transport no push can have joined.
+        let Some(bare) = self.pusher(Some(&route), events) else {
+            return;
+        };
+        let state = match store.load_conv(peer) {
+            Ok(state) => state,
+            Err(e) => {
+                crate::vtrace!(
+                    "dm push: outstanding messages of {} not pushed, the store would not load ({e})",
+                    tag(peer)
+                );
+                None
+            }
+        };
+        let full = state
+            .as_ref()
+            .and_then(|_| self.pusher_on(store, peer, events, Some(&route)));
+        let (Some(state), Some(pusher)) = (state, full) else {
+            // Nothing read to push: what joined the run is pushed all the
+            // same, and the run before this one, which nothing here covers,
+            // goes on.
+            bare.push_slots(slot, &NO_LOOKUP_KEY, || None);
+            return;
+        };
+        let pushes = !state.delete_pending
+            && !state.awaiting_acceptance
+            && !state.acceptance_pending
+            && state.outgoing_lookup_key != NO_LOOKUP_KEY
+            && state.peer_collected.max(collected) < state.send_seq;
+        // Read once the run is entered, so a message committed meanwhile is
+        // either among these or joins the run.
+        let slots = || {
+            if !pushes {
+                return Some(Vec::new());
+            }
+            let loaded = store.load();
+            #[cfg(test)]
+            let loaded = if run_read_fails(peer) {
+                Err(StoreError::MissingConversation)
+            } else {
+                loaded
+            };
+            let conv = match loaded {
+                Ok(loaded) => loaded.convs.into_iter().find(|conv| conv.peer == *peer),
+                Err(e) => {
+                    crate::vtrace!(
+                        "dm push: outstanding messages of {} not pushed, the store would not load ({e})",
+                        tag(peer)
+                    );
+                    return None;
+                }
+            };
+            let slots: Vec<(u16, Vec<u8>)> = conv
+                .map(|conv| conv.outstanding_outbox)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|entry| entry.seq >= collected)
+                .map(|entry| (channel::slot_for(entry.seq), entry.ciphertext))
+                .collect();
+            crate::vtrace!(
+                "dm push: {} outstanding messages of {} pushed on a route learned",
+                slots.len(),
+                tag(peer)
+            );
+            Some(slots)
+        };
+        pusher.push_slots(slot, &state.outgoing_lookup_key, slots);
     }
 
     /// Forget the route held for `peer`, and its serial, and release it, as a
@@ -310,6 +520,42 @@ pub(super) enum RouteChange {
     /// below the one held, or below the serial of a route forgotten, and was
     /// not taken.
     Older,
+}
+
+/// A run of pushes [`PushShare::hold_route`] entered on the route it took,
+/// beside the cursor of the control that gave the route, for
+/// [`PushShare::push_outstanding`] to start.
+pub(super) struct Run {
+    slot: RunSlot,
+    collected: u64,
+}
+
+/// Whether a take that learns a route pushes the correspondent's outstanding
+/// messages on it ([`PushShare::push_outstanding`]), and the cursor of the
+/// control that gave the route, `0` where none came with it.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Repush {
+    /// Only where an entry was held for the correspondent before: a route
+    /// held, a route forgotten, or a reach applied without one. The first
+    /// route of a correspondent, from an acceptance, comes with the
+    /// correspondent's reply to what this side sent.
+    Renewed(u64),
+    /// Wherever a route is learned: a read at launch, where every route is
+    /// the first, and a message committed before the launch may still wait
+    /// for its push.
+    Learned(u64),
+}
+
+impl Repush {
+    /// The cursor to push from, where a route learned with an entry held
+    /// before (`renewed`) or without one is pushed on.
+    fn wants(self, renewed: bool) -> Option<u64> {
+        match self {
+            Repush::Renewed(collected) if renewed => Some(collected),
+            Repush::Renewed(_) => None,
+            Repush::Learned(collected) => Some(collected),
+        }
+    }
 }
 
 /// How a reach the runner or the lane handed to [`Store::take_reach`] fared.
@@ -415,6 +661,7 @@ impl PushState {
                 peer_routes: Arc::default(),
                 unanswered,
                 kept: Arc::default(),
+                runs: Arc::default(),
             },
             admission: inbound.as_ref().map(PushInbox::admission),
             own_route: None,
@@ -496,7 +743,7 @@ impl<R: RunnerRecords> Runner<R> {
             for conv in &convs {
                 self.check_stop()?;
                 let read = if reads && reads_peer_control(&conv.state) {
-                    self.read_peer_control(&conv.peer)
+                    self.read_peer_control(&conv.peer, true)
                 } else {
                     ControlRead::NotNewer
                 };
@@ -521,14 +768,24 @@ impl<R: RunnerRecords> Runner<R> {
                 // the section every take of the live lane also runs in, so a
                 // route the lane took meanwhile, from a reach notice or an
                 // acceptance, is the one held, whichever lands first.
+                // A route the read took is held already and gives none here.
                 let share = &self.push.share;
                 let mut released = None;
+                let mut run = None;
                 let seeded = self.store.with_route(&conv.peer, |route, serial| {
                     if route.is_some() {
-                        released = share.hold_route(&conv.peer, route.map(<[u8]>::to_vec), serial);
+                        (released, run) = share.hold_route(
+                            &conv.peer,
+                            route.map(<[u8]>::to_vec),
+                            serial,
+                            Repush::Learned(0),
+                        );
                     }
                 });
                 share.release(released);
+                if let Some(run) = run {
+                    share.push_outstanding(&self.store, &conv.peer, &self.events, run);
+                }
                 match seeded {
                     Ok(()) | Err(StoreError::MissingConversation) => {}
                     Err(_) if counted => {}
@@ -836,7 +1093,9 @@ impl<R: RunnerRecords> Runner<R> {
     /// correspondence the serial is compared, the route and serial are
     /// written, the route is held in memory where the store took the reach
     /// ([`Took::Newer`] or [`Took::Same`]), and the handle is kept where it
-    /// names the correspondent's identity. A reach older than the one applied
+    /// names the correspondent's identity. A route learned there has the
+    /// messages outstanding to `peer` pushed on it once that section is left,
+    /// where `repush` says so ([`PushShare::push_outstanding`]). A reach older than the one applied
     /// changes nothing. A handle kept has the roster reported. A take that
     /// stood while the handle record would not read or write counts one store
     /// failure
@@ -852,15 +1111,21 @@ impl<R: RunnerRecords> Runner<R> {
         peer: &CorrespondenceLabel,
         reach: &Reach,
         serial: u64,
+        repush: Repush,
     ) -> Took {
         let share = &self.push.share;
         let mut released = None;
+        let mut run = None;
         let taken = self.store.take_reach(peer, serial, reach, |take| {
             if take.applied() {
-                released = share.hold_route(peer, reach.route.clone(), serial);
+                (released, run) = share.hold_route(peer, reach.route.clone(), serial, repush);
             }
         });
         share.release(released);
+        run_before_run(peer);
+        if let Some(run) = run {
+            share.push_outstanding(&self.store, peer, &self.events, run);
+        }
         match taken {
             Ok(taken) => {
                 self.push.roster_due |= taken.handle_changed;

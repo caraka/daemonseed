@@ -111,8 +111,14 @@
 //!   the write fails at once and is left to the repair. The channel is dropped
 //!   from the schedule once its conversation's delete is under way.
 //!
-//! The schedule reads [`tokio::time`], so a paused test clock drives it, and the
-//! wall-clock time the flows and events see advances with it.
+//! The schedule reads [`tokio::time`], so a paused test clock drives it. The
+//! wall-clock time the flows and events see, a message's send stamp and its
+//! receipt time among them, is the system clock, read afresh each time (unit
+//! tests drive it from [`tokio::time`] instead). Within a run it is never
+//! earlier than a time already read, except after the system clock steps back
+//! by more than five minutes, which it follows. Advert rotation, key retention
+//! and delivery back-off read the system clock as it is, so a clock that was
+//! wrong and is corrected leaves none of them on the wrong time.
 //!
 //! ## What counts as lost
 //!
@@ -196,7 +202,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -227,6 +233,21 @@ use crate::dm::records::WriteCountsSnapshot;
 /// The drop scan's interval while a first contact awaits acceptance, and the
 /// wait before the first collection after startup, before jitter.
 pub const DEFAULT_TICK: Duration = Duration::from_secs(60);
+
+/// How many ticks after a channel's watch is registered the conversation is
+/// collected again. A launch registers the watch with its read of the
+/// correspondent's control, and the first collection comes about a jittered
+/// tick later; two jittered ticks always come after that collection, so the
+/// follow-up adds a read where the watch registered at launch may not yet
+/// have been live, and still comes long before the next scheduled collection.
+const FOLLOW_UP_TICKS: u32 = 2;
+
+/// How many times a channel whose watch was registered has its conversation
+/// looked up for the follow-up collection ([`FOLLOW_UP_TICKS`]) while the
+/// conversation's stored state will not load, a jittered tick apart. After
+/// the last failed try the follow-up is dropped and traced; the scheduled
+/// collections still read the channel.
+const FOLLOW_UP_LOOKUP_TRIES: u32 = 5;
 
 /// How many ticks, before jitter, a drop scan waits after the last one, where
 /// no conversation awaits acceptance.
@@ -380,6 +401,17 @@ pub trait RunnerRecords: Records {
         0
     }
 
+    /// The lookup keys of the correspondents' channels whose watch a read
+    /// registered since this was last asked, a channel watched again after
+    /// its watch was cancelled included, and of those whose dead watch
+    /// [`Self::rewatch_channel`] registered again. A watch registered answers
+    /// before Veilid holds it on a storage node, so a write landing between
+    /// the read that registered it and that moment raises no change. The
+    /// default watches nothing.
+    fn take_registered_watches(&mut self) -> Vec<[u8; HELLO_LOOKUP_KEY_LEN]> {
+        Vec::new()
+    }
+
     /// Stop watching the correspondent's channel at `lookup_key`, as a
     /// conversation's teardown does. Where cancelling the watch fails, the
     /// channel stays watched. The default watches nothing.
@@ -427,6 +459,41 @@ pub trait RunnerRecords: Records {
     #[cfg(test)]
     fn forced_conflicts(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         Arc::default()
+    }
+
+    /// Whether a due rotation of the advert keys fails, as one whose fresh
+    /// keypair could not be drawn does. A rotation not yet due is unaffected.
+    #[cfg(test)]
+    fn fails_advert_rotation(&self) -> bool {
+        false
+    }
+
+    /// Whether an advert poll fails to decide, as one whose canonical advert
+    /// could not be signed does.
+    #[cfg(test)]
+    fn fails_advert_poll(&self) -> bool {
+        false
+    }
+
+    /// Whether the write of the advert's published mark fails, as a store
+    /// that cannot write does.
+    #[cfg(test)]
+    fn fails_advert_mark(&self) -> bool {
+        false
+    }
+
+    /// Whether reading the advert keys back after their update fails, as a
+    /// store that cannot read does.
+    #[cfg(test)]
+    fn fails_advert_keys_reload(&self) -> bool {
+        false
+    }
+
+    /// A system clock the test sets, in Unix milliseconds, for the runner to
+    /// read in place of the one a unit test runs on.
+    #[cfg(test)]
+    fn wall_clock(&self) -> Option<Arc<AtomicU64>> {
+        None
     }
 }
 
@@ -917,6 +984,14 @@ pub enum RunnerEvent {
         peer: CorrespondenceLabel,
         /// Its sequence number.
         seq: u64,
+        /// When this side committed it, by this runner's clock, in Unix
+        /// milliseconds. For a message sent in a conversation this is the time
+        /// the commit read, whose whole seconds its outbox entry records and
+        /// the message carries sealed. For a first contact or an acceptance's
+        /// reply it is the time the outbox entry records, in whole seconds, or,
+        /// once the correspondent has collected it, the time the attempt that
+        /// reports it read, in whole seconds.
+        sent_at: u64,
     },
     /// A conversation was deleted.
     Deleted {
@@ -947,6 +1022,14 @@ pub enum RunnerEvent {
     },
     /// The counters, once at startup and then when they change.
     Health(HealthCounters),
+    /// Whether this side's advert is on the network as far as the last advert
+    /// pass could tell: after the pass at startup where it could tell, and then
+    /// whenever a later pass finds otherwise. Nobody can send this side a
+    /// first contact while `published` is false.
+    Advert {
+        /// The network holds the current advert, or a write of it was taken.
+        published: bool,
+    },
     /// Every identity the block list holds, in ascending byte order: once at
     /// startup, straight after the first [`RunnerEvent::Roster`]; after each
     /// [`RunnerCommand::Block`] and [`RunnerCommand::Unblock`] the store
@@ -976,7 +1059,12 @@ impl core::fmt::Debug for RunnerEvent {
             } => write!(f, "RequestPreview({request:?}, {})", messages.len()),
             Self::StartedOver { request, .. } => write!(f, "StartedOver({request:?})"),
             Self::Message { from, seq, .. } => write!(f, "Message({from:?}, {seq})"),
-            Self::Sent { token, peer, seq } => write!(f, "Sent({token:?}, {peer:?}, {seq})"),
+            Self::Sent {
+                token,
+                peer,
+                seq,
+                sent_at,
+            } => write!(f, "Sent({token:?}, {peer:?}, {seq}, at {sent_at})"),
             Self::Deleted { token, peer } => write!(f, "Deleted({token:?}, {peer:?})"),
             Self::Delivered { peer, through_seq } => {
                 write!(f, "Delivered({peer:?}, {through_seq})")
@@ -984,6 +1072,7 @@ impl core::fmt::Debug for RunnerEvent {
             Self::Accepted { peer } => write!(f, "Accepted({peer:?})"),
             Self::Refused { token, reason } => write!(f, "Refused({token:?}, {reason:?})"),
             Self::Health(counters) => f.debug_tuple("Health").field(counters).finish(),
+            Self::Advert { published } => write!(f, "Advert(published: {published})"),
             Self::BlockListUnreadable => f.write_str("BlockListUnreadable"),
             Self::BlockList(identities) => write!(f, "BlockList({} identities)", identities.len()),
         }
@@ -1293,6 +1382,7 @@ async fn run<R: RunnerRecords>(
         if runner.stopping() {
             break Ok(());
         }
+        runner.follow_up_registered_watches();
         let due = runner.next_due();
         let wake = tokio::select! {
             biased;
@@ -1407,6 +1497,48 @@ fn retain_newest(requests: &mut BTreeMap<ContactRequestId, HeldRequest>, cap: us
     u64::try_from(over).unwrap_or(u64::MAX)
 }
 
+/// Whether the current key of `keys` became current more than
+/// [`advert::CLOCK_SKEW_SECS`] after `now`, in Unix seconds, as one made while
+/// the system clock was that far ahead did.
+///
+/// A correspondent whose clock reads `now` accepts an advert from its key's
+/// start less [`advert::CLOCK_SKEW_SECS`], so it refuses the advert of such a
+/// key and has encapsulated to none of them. A key less far ahead may already
+/// have a hello encapsulated to it.
+fn current_key_beyond_skew(keys: &AdvertKeys, now: u64) -> bool {
+    keys.not_before() > now.saturating_add(advert::CLOCK_SKEW_SECS)
+}
+
+/// Rotate `keys` when a rotation is due at `now`, in Unix seconds, or where the
+/// current key became current too far after `now` for any correspondent to
+/// have used it ([`current_key_beyond_skew`]).
+///
+/// Such a key was made while the system clock was ahead. It is replaced at once
+/// by a fresh key current from `now`, and dropped: no correspondent whose clock
+/// is right could have encapsulated to it. The key that was current before it
+/// stays retained, retired no later than `now`, so a hello encapsulated to it
+/// still opens. A key ahead of `now` by less is kept, and rotates on its
+/// schedule.
+fn rotate_advert(
+    keys: &mut AdvertKeys,
+    now: u64,
+    fill: impl FnMut(&mut [u8]) -> Result<(), ()>,
+) -> Result<advert::Rotation, AdvertError> {
+    if !current_key_beyond_skew(keys, now) {
+        return keys.rotate_if_due(now, fill);
+    }
+    let before = keys.snapshot();
+    keys.rotate_now(now, fill)?;
+    let mut after = keys.snapshot();
+    after.previous = before.previous.map(|retained| advert::RetiredSnapshot {
+        retired_at: retained.retired_at.min(now),
+        ..retained
+    });
+    *keys = AdvertKeys::restore(after);
+    keys.prune(now);
+    Ok(advert::Rotation::Rotated)
+}
+
 /// When a conversation's outstanding records are next looked at.
 struct Repair {
     /// When the conversation was first seen with something outstanding, in
@@ -1416,31 +1548,124 @@ struct Repair {
     due: Instant,
 }
 
-/// Wall-clock time that advances with [`tokio::time`].
-#[derive(Clone, Copy)]
+/// How far a reading of the system clock may fall behind the time a [`Clock`]
+/// holds before the clock takes the reading instead: five minutes, in
+/// milliseconds.
+///
+/// A step back within it, as a time service makes when it trims a fast clock,
+/// keeps message stamps and receipt times in order. A larger one is a
+/// correction of a clock that was wrong, and holding the wrong time would keep
+/// every stamp in the future until real time caught up with it.
+const CLOCK_REANCHOR_MS: u64 = 5 * 60 * 1000;
+
+/// How often the runner compares its advert key's start with the system clock
+/// ([`Runner::check_advert_clock`]).
+const CLOCK_CHECK_INTERVAL: Duration = Duration::from_millis(CLOCK_REANCHOR_MS);
+
+/// The wall-clock time the runner reads, in Unix time.
+///
+/// Every reading takes the system clock afresh, so a step of the system clock
+/// and the time a machine spent suspended are both seen at the next reading.
+///
+/// Two readings are kept apart. [`Self::now_ms`], the time message stamps and
+/// receipt times take, is never earlier than one before it in the same run by
+/// less than [`CLOCK_REANCHOR_MS`]: a system clock stepped back by less reads as
+/// the latest time already read until it passes that time again, and one stepped
+/// back by more is followed at once. Clones share that latest time, so the runner
+/// and its live lane never disagree about which way time has moved.
+/// [`Self::system_secs`], the time advert rotation, key retention and delivery
+/// back-off are decided by, is the system clock as read, so a mistaken time is
+/// left behind as soon as the system clock is right again.
+#[derive(Clone)]
 struct Clock {
-    wall_ms: u64,
-    started: Instant,
+    /// The latest reading, in Unix milliseconds.
+    held_ms: Arc<AtomicU64>,
+    source: WallSource,
+}
+
+/// Where a [`Clock`] reads the time from.
+#[derive(Clone)]
+enum WallSource {
+    /// The system clock.
+    System,
+    /// The system clock at start, advanced by [`tokio::time`], so a paused
+    /// test clock drives the wall time the flows and events see.
+    #[cfg(test)]
+    Tokio { wall_ms: u64, started: Instant },
+    /// A time the test sets, in Unix milliseconds.
+    #[cfg(test)]
+    Fixed(Arc<AtomicU64>),
+}
+
+/// The system clock in Unix milliseconds, with a time before the epoch read as
+/// the epoch.
+fn system_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+impl WallSource {
+    fn read_ms(&self) -> u64 {
+        match self {
+            Self::System => system_ms(),
+            #[cfg(test)]
+            Self::Tokio { wall_ms, started } => {
+                let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                wall_ms.saturating_add(elapsed)
+            }
+            #[cfg(test)]
+            Self::Fixed(ms) => ms.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The source a runner's clock reads outside unit tests: the system clock.
+fn production_source() -> WallSource {
+    WallSource::System
 }
 
 impl Clock {
     fn start() -> Self {
-        let wall_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-        Self {
-            wall_ms,
+        #[cfg(not(test))]
+        let source = production_source();
+        #[cfg(test)]
+        let source = WallSource::Tokio {
+            wall_ms: system_ms(),
             started: Instant::now(),
+        };
+        Self::over(source)
+    }
+
+    fn over(source: WallSource) -> Self {
+        Self {
+            held_ms: Arc::new(AtomicU64::new(0)),
+            source,
         }
     }
 
+    /// The time a message stamp or a receipt time takes, in Unix milliseconds.
     fn now_ms(&self) -> u64 {
-        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.wall_ms.saturating_add(elapsed)
+        let read = self.source.read_ms();
+        let taken = self
+            .held_ms
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                (read > held || held - read > CLOCK_REANCHOR_MS).then_some(read)
+            });
+        match taken {
+            Ok(_) => read,
+            Err(held) => held,
+        }
     }
 
+    /// [`Self::now_ms`] in Unix seconds.
     fn now_secs(&self) -> u64 {
         self.now_ms() / 1000
+    }
+
+    /// The system clock as read, in Unix seconds, which nothing holds.
+    fn system_secs(&self) -> u64 {
+        self.source.read_ms() / 1000
     }
 }
 
@@ -2137,6 +2362,17 @@ fn collection_interval() -> Duration {
     delivery::next_poll_interval_os(0, 0)
 }
 
+/// Schedule `peer`'s follow-up collection at `due`, or keep the one already
+/// scheduled where it is later ([`Runner::follow_up_registered_watches`]).
+fn schedule_follow_up(
+    follow_ups: &mut HashMap<CorrespondenceLabel, Instant>,
+    peer: CorrespondenceLabel,
+    due: Instant,
+) {
+    let at = follow_ups.entry(peer).or_insert(due);
+    *at = (*at).max(due);
+}
+
 /// `tick`, moved by up to [`TICK_JITTER_PERCENT`] either way.
 ///
 /// The position in that band is where a draw from
@@ -2333,11 +2569,26 @@ struct Runner<R> {
     /// meanwhile ride the same write.
     publish_owed: HashMap<CorrespondenceLabel, OwedPublish>,
     /// Conversations whose next asked-for collection also catches up on the
-    /// correspondent's control: just established, or watched again after the
-    /// watch died, so a control change may have landed while none was live.
+    /// correspondent's control: just established, watched again after the
+    /// watch died, or due a follow-up after their channel's watch registered
+    /// ([`Runner::ask_due_follow_ups`]), so a control change may have landed
+    /// while none was live.
     catch_up: HashSet<CorrespondenceLabel>,
+    /// Conversations whose channel's watch was registered, and when they are
+    /// collected again, with a catch-up, for a write that landed before the
+    /// watch was live ([`Runner::follow_up_registered_watches`]).
+    follow_ups: HashMap<CorrespondenceLabel, Instant>,
+    /// Channels whose watch was registered and whose conversation could not
+    /// be looked up, because its stored state would not load: when the
+    /// lookup is tried again, and how many tries have failed. Their follow-up
+    /// is scheduled once a lookup succeeds, and dropped after
+    /// [`FOLLOW_UP_LOOKUP_TRIES`] failed tries.
+    unresolved_watches: HashMap<[u8; HELLO_LOOKUP_KEY_LEN], (Instant, u32)>,
     next_tick: Instant,
     next_advert_poll: Instant,
+    /// When the runner next compares the advert key's start with the system
+    /// clock ([`Self::check_advert_clock`]).
+    next_clock_check: Instant,
     /// When a collection pass next scans the drop where no conversation awaits
     /// acceptance.
     next_drop_scan: Instant,
@@ -2348,6 +2599,9 @@ struct Runner<R> {
     /// Whether the network answers in the current pass, once asked.
     answering: Option<bool>,
     health_reported: HealthCounters,
+    /// The advert state last reported in a [`RunnerEvent::Advert`], or `None`
+    /// before the first.
+    advert_reported: Option<bool>,
     /// Whether the runner holds a readable block list, so a failure after a
     /// success is reported once and a success after a failure is reported too.
     /// Starts `true`. Set `false` at startup where the stored list will not read,
@@ -2368,9 +2622,10 @@ struct Runner<R> {
     lane: live_lane::LaneShare,
     /// What the live lane hands the runner besides commands.
     lane_notes: mpsc::UnboundedReceiver<live_lane::LaneNote>,
-    /// Sends whose first slot write failed, by conversation and sequence, each
-    /// answered once the repair has the slot on the network.
-    unwritten: HashMap<(CorrespondenceLabel, u64), CommandToken>,
+    /// Sends whose first slot write failed, by conversation and sequence, with
+    /// the time each one's commit read, in Unix milliseconds, each answered
+    /// once the repair has the slot on the network.
+    unwritten: HashMap<(CorrespondenceLabel, u64), (CommandToken, u64)>,
     /// The live lane's task, and what ends it when dropped.
     lane_task: Option<(tokio::sync::oneshot::Sender<()>, JoinHandle<()>)>,
     /// Whether startup has finished, before which no command is served.
@@ -2408,7 +2663,12 @@ impl<R: RunnerRecords> Runner<R> {
             config,
         } = parts;
         let (push, inbound) = push_hooks::PushState::new(records.take_push());
+        #[cfg(not(test))]
         let clock = Clock::start();
+        #[cfg(test)]
+        let clock = records
+            .wall_clock()
+            .map_or_else(Clock::start, |ms| Clock::over(WallSource::Fixed(ms)));
         let store = Arc::new(Store::open(profile_root.join(STORE_DIR), &at_rest_key)?);
         drop(at_rest_key);
         // Before the live lane starts: once it runs, an outbox with no
@@ -2428,7 +2688,7 @@ impl<R: RunnerRecords> Runner<R> {
             Arc::clone(&channel_root),
             events.clone(),
             push.share.clone(),
-            clock,
+            clock.clone(),
         );
         #[cfg(test)]
         let lane = lane.with_forced_conflicts(records.forced_conflicts());
@@ -2457,7 +2717,7 @@ impl<R: RunnerRecords> Runner<R> {
         let (advert_keys, minted) = match loaded.advert_keys {
             Some(snapshot) => (AdvertKeys::restore(snapshot), false),
             None => {
-                let keys = AdvertKeys::new(clock.now_secs(), os_fill)?;
+                let keys = AdvertKeys::new(clock.system_secs(), os_fill)?;
                 store.persist_advert_keys(&keys.snapshot())?;
                 (keys, true)
             }
@@ -2499,13 +2759,17 @@ impl<R: RunnerRecords> Runner<R> {
             collect_now: HashSet::new(),
             publish_owed: HashMap::new(),
             catch_up: HashSet::new(),
+            follow_ups: HashMap::new(),
+            unresolved_watches: HashMap::new(),
             next_tick: now + jittered(config.tick),
             next_advert_poll: now + advert::next_poll_interval_os(),
+            next_clock_check: now + CLOCK_CHECK_INTERVAL,
             next_drop_scan: now,
             last_scan: None,
             last_scan_partial: false,
             answering: None,
             health_reported: HealthCounters::default(),
+            advert_reported: None,
             block_list_known: true,
             block_list_failure_counted: false,
             commands: runner_commands,
@@ -2548,7 +2812,8 @@ impl<R: RunnerRecords> Runner<R> {
         runner.reopen_channels(convs)?;
         runner.publish_route().await?;
         runner.resume_deletes().await?;
-        runner.refresh_advert(minted);
+        let advert = runner.refresh_advert(minted);
+        runner.report_advert(advert).await?;
         runner.answering = None;
         runner.scan_drop().await?;
         for conv in runner.store.load()?.convs {
@@ -2690,7 +2955,11 @@ impl<R: RunnerRecords> Runner<R> {
                 tokens.push(token);
             }
         }
-        tokens.extend(std::mem::take(&mut self.unwritten).into_values());
+        tokens.extend(
+            std::mem::take(&mut self.unwritten)
+                .into_values()
+                .map(|(token, _)| token),
+        );
         for token in tokens {
             if self
                 .refuse(Some(token), Refusal::ShuttingDown)
@@ -2840,6 +3109,8 @@ impl<R: RunnerRecords> Runner<R> {
             .values()
             .map(|repair| repair.due)
             .chain(self.publish_owed.values().map(|owed| owed.due))
+            .chain(self.follow_ups.values().copied())
+            .chain(self.unresolved_watches.values().map(|(retry, _)| *retry))
             .chain(self.push.route_retry_due())
             .chain(self.push.reach_retry_due())
             .chain(
@@ -2852,6 +3123,7 @@ impl<R: RunnerRecords> Runner<R> {
             .fold(
                 self.next_tick
                     .min(self.next_advert_poll)
+                    .min(self.next_clock_check)
                     .min(self.next_drop_scan),
                 Instant::min,
             )
@@ -3019,42 +3291,124 @@ impl<R: RunnerRecords> Runner<R> {
         }
     }
 
+    /// Bring the advert poll forward to now where the current advert key became
+    /// current too far after the system clock's time for any correspondent to
+    /// have used it ([`current_key_beyond_skew`]), as one made while the clock
+    /// was ahead did, so its replacement ([`rotate_advert`]) is published once
+    /// the clock is right rather than at the next poll.
+    fn check_advert_clock(&mut self) {
+        let now = self.clock.system_secs();
+        if current_key_beyond_skew(&self.advert_keys, now) {
+            self.next_advert_poll = Instant::now();
+        }
+    }
+
     /// Rotate the advert when due and publish it where it is new, or where the
     /// network's copy is missing or differs.
-    fn refresh_advert(&mut self, minted: bool) {
+    ///
+    /// Returns whether the network holds the current advert as far as this
+    /// pass can tell: `Some(true)` where the bytes read back are the current
+    /// advert or a rewrite was taken, `Some(false)` where a due rotation
+    /// failed, an advert could not be built or a poll could not decide, a
+    /// rewrite was not taken, the advert keys would not be written or read
+    /// back, or, where nothing was rewritten, a record read failed, and
+    /// `None` where the pass could not tell, as where only the sequence
+    /// numbers decided it with every read answered.
+    ///
+    /// The answer is about the network, so a local fault that leaves the
+    /// network's copy current does not change it: a rewrite taken after a
+    /// failed read is reported as published, and so is an advert confirmed or
+    /// rewritten whose published mark would not be written, a store failure
+    /// that is counted and traced. Advert keys that would not be written or
+    /// read back, and a mark the store refuses as naming no key it built,
+    /// report the advert unpublished whatever the network holds: the store
+    /// may hold a key this pass's advert is not of, or a rotation that was
+    /// due and not recorded, so the copy on the network may not be the
+    /// current key's. A failed rotation ends the pass: the current key is
+    /// past its rotation, so no copy of its advert counts as published.
+    fn refresh_advert(&mut self, minted: bool) -> Option<bool> {
         let _step = Step::start(String::from("advert refresh"));
         let owner = match advert::derive_owner_seed(self.signer.public_key()) {
             Ok(owner) => owner,
             Err(_) => {
                 self.records.health.advert_failures += 1;
-                return;
+                return Some(false);
             }
         };
         let mut rewrite = None;
+        let mut intact = false;
+        let mut unbuilt = false;
+        // Whether a record read failed.
+        let mut failed = false;
+        // Whether the advert keys would not be written or read back, so the
+        // advert this pass holds may not be the current key's.
+        let mut keys_failed = false;
         if minted {
             rewrite = self.canonical_advert();
+            if rewrite.is_none() {
+                return Some(false);
+            }
         } else {
-            let now = self.clock.now_secs();
-            match self
-                .store
-                .update_advert_keys(|keys| keys.rotate_if_due(now, os_fill))
-            {
+            let now = self.clock.system_secs();
+            #[cfg(test)]
+            let fails_rotation = self.records.inner.fails_advert_rotation();
+            #[cfg(not(test))]
+            let fails_rotation = false;
+            match self.store.update_advert_keys(|keys| {
+                let due_at = keys
+                    .not_before()
+                    .saturating_add(advert::ROTATION_PERIOD_SECS);
+                if fails_rotation && now >= due_at {
+                    Err(advert::AdvertError::Signature)
+                } else {
+                    rotate_advert(keys, now, os_fill)
+                }
+            }) {
                 Ok(Ok(rotation)) => {
                     // A reload that fails leaves the keys last loaded, which at
                     // worst republishes and re-marks a key already published.
-                    match self.store.load_advert_keys() {
+                    let loaded = self.store.load_advert_keys();
+                    #[cfg(test)]
+                    let loaded = if self.records.inner.fails_advert_keys_reload() {
+                        Err(StoreError::MissingConversation)
+                    } else {
+                        loaded
+                    };
+                    match loaded {
                         Ok(Some(snapshot)) => self.advert_keys = AdvertKeys::restore(snapshot),
-                        Ok(None) | Err(_) => self.records.health.store_failures += 1,
+                        Ok(None) | Err(_) => {
+                            crate::vtrace!(
+                                "dm runner: the advert keys would not be read back, \
+                                 the advert is reported unpublished"
+                            );
+                            self.records.health.store_failures += 1;
+                            keys_failed = true;
+                        }
                     }
                     if rotation.happened() {
                         rewrite = self.canonical_advert();
+                        unbuilt = rewrite.is_none();
                     }
                 }
-                Ok(Err(_)) => self.records.health.advert_failures += 1,
-                Err(_) => self.records.health.store_failures += 1,
+                Ok(Err(_)) => {
+                    self.records.health.advert_failures += 1;
+                    return Some(false);
+                }
+                Err(_) => {
+                    crate::vtrace!(
+                        "dm runner: the advert keys would not be written, \
+                         the advert is reported unpublished"
+                    );
+                    self.records.health.store_failures += 1;
+                    keys_failed = true;
+                }
             }
             if rewrite.is_none() {
-                if let Ok(reports) = self.records.inspect_advert(&owner) {
+                let inspected = self.records.inspect_advert(&owner);
+                if inspected.is_err() {
+                    failed = true;
+                }
+                if let Ok(reports) = inspected {
                     let report = report_at(&reports, advert::ADVERT_SUBKEY as usize);
                     if !report.pending {
                         let observed = InspectReport {
@@ -3064,16 +3418,25 @@ impl<R: RunnerRecords> Runner<R> {
                         // The bytes, not only the numbers: a record whose numbers
                         // match can still hold an advert of a key a reset has
                         // since rotated away. A read that fails leaves the report
-                        // to decide.
-                        let fetched = self
-                            .records
-                            .read_advert(&owner, advert::ADVERT_SUBKEYS)
-                            .ok()
-                            .flatten();
-                        match self
-                            .advert_keys
-                            .on_poll(&self.signer, &observed, fetched.as_deref())
+                        // to decide whether to rewrite.
+                        let fetched = match self.records.read_advert(&owner, advert::ADVERT_SUBKEYS)
                         {
+                            Ok(fetched) => fetched,
+                            Err(_) => {
+                                failed = true;
+                                None
+                            }
+                        };
+                        let polled =
+                            self.advert_keys
+                                .on_poll(&self.signer, &observed, fetched.as_deref());
+                        #[cfg(test)]
+                        let polled = if self.records.inner.fails_advert_poll() {
+                            Err(advert::AdvertError::Signature)
+                        } else {
+                            polled
+                        };
+                        match polled {
                             Ok(actions) => {
                                 rewrite = actions
                                     .into_iter()
@@ -3081,38 +3444,93 @@ impl<R: RunnerRecords> Runner<R> {
                                     .map(|AdvertAction::Rewrite(bytes)| bytes);
                                 // With bytes to compare, no rewrite means the
                                 // network holds the current key's advert: it is
-                                // confirmed published. The mark only moves forward,
-                                // so marking again on each intact poll changes
+                                // confirmed published, whether or not the mark
+                                // is written. The mark only moves forward, so
+                                // marking again on each intact poll changes
                                 // nothing.
-                                if rewrite.is_none() && fetched.is_some() {
-                                    self.mark_advert_published();
+                                intact = rewrite.is_none() && fetched.is_some();
+                                if intact && !self.mark_advert_published() {
+                                    keys_failed = true;
                                 }
                             }
-                            Err(_) => self.records.health.advert_failures += 1,
+                            Err(_) => {
+                                self.records.health.advert_failures += 1;
+                                unbuilt = true;
+                            }
                         }
                     }
                 }
             }
         }
-        if let Some(bytes) = rewrite {
-            if self.stopping() {
-                return;
-            }
-            if self.records.publish_advert(&owner, &bytes).is_ok() {
-                self.mark_advert_published();
-            }
+        let Some(bytes) = rewrite else {
+            return if unbuilt || failed || keys_failed {
+                Some(false)
+            } else if intact {
+                Some(true)
+            } else {
+                None
+            };
+        };
+        if self.stopping() {
+            return None;
         }
+        if self.records.publish_advert(&owner, &bytes).is_ok() {
+            // A failed read before the rewrite is answered by the rewrite, and
+            // a mark that would not be written leaves the network's copy as
+            // it is; keys that would not be written or read back, or a serial
+            // the store refuses, are not answered.
+            let current = self.mark_advert_published();
+            Some(current && !keys_failed)
+        } else {
+            Some(false)
+        }
+    }
+
+    /// Emit [`RunnerEvent::Advert`] where `published` is known and differs from
+    /// the last report.
+    async fn report_advert(&mut self, published: Option<bool>) -> Result<(), Halt> {
+        let Some(published) = published else {
+            return Ok(());
+        };
+        if self.advert_reported == Some(published) {
+            return Ok(());
+        }
+        self.advert_reported = Some(published);
+        if !published {
+            crate::vtrace!("dm runner: own advert not published");
+        }
+        self.emit(RunnerEvent::Advert { published }).await
     }
 
     /// Record the current advert key as confirmed published, which is what lets
     /// a reset rotate past it. The store refuses a serial above its own current
     /// key's, which names no advert this profile built; that is counted as a
-    /// local refusal.
-    fn mark_advert_published(&mut self) {
-        match self.store.mark_advert_published(self.advert_keys.serial()) {
-            Ok(()) => {}
-            Err(StoreError::UnbuiltAdvertSerial { .. }) => self.records.health.local_refusals += 1,
-            Err(_) => self.records.health.store_failures += 1,
+    /// local refusal, and `false` is returned: the advert this pass holds is
+    /// not of the store's current key. A mark that is not written for any
+    /// other reason is traced and counted, and `true` is returned, since the
+    /// advert is still the current key's and the network's copy is as it was.
+    fn mark_advert_published(&mut self) -> bool {
+        #[cfg(test)]
+        let fails = self.records.inner.fails_advert_mark();
+        #[cfg(not(test))]
+        let fails = false;
+        let marked = if fails {
+            Err(StoreError::MissingConversation)
+        } else {
+            self.store.mark_advert_published(self.advert_keys.serial())
+        };
+        match marked {
+            Ok(()) => true,
+            Err(StoreError::UnbuiltAdvertSerial { .. }) => {
+                crate::vtrace!("dm runner: the advert's published mark was refused");
+                self.records.health.local_refusals += 1;
+                false
+            }
+            Err(e) => {
+                crate::vtrace!("dm runner: the advert's published mark was not written ({e})");
+                self.records.health.store_failures += 1;
+                true
+            }
         }
     }
 
@@ -3569,18 +3987,24 @@ impl<R: RunnerRecords> Runner<R> {
         held: &[u64],
         outstanding: &[OutboxEntry],
     ) -> Result<(), Halt> {
-        let settled: Vec<(u64, CommandToken)> = self
+        let settled: Vec<(u64, CommandToken, u64)> = self
             .unwritten
             .iter()
             .filter(|((at, seq), _)| {
                 *at == peer
                     && (held.contains(seq) || !outstanding.iter().any(|entry| entry.seq == *seq))
             })
-            .map(|((_, seq), token)| (*seq, *token))
+            .map(|((_, seq), (token, sent_at))| (*seq, *token, *sent_at))
             .collect();
-        for (seq, token) in settled {
+        for (seq, token, sent_at) in settled {
             self.unwritten.remove(&(peer, seq));
-            self.emit(RunnerEvent::Sent { token, peer, seq }).await?;
+            self.emit(RunnerEvent::Sent {
+                token,
+                peer,
+                seq,
+                sent_at,
+            })
+            .await?;
         }
         Ok(())
     }
@@ -3598,12 +4022,15 @@ impl<R: RunnerRecords> Runner<R> {
     /// Write the slot of the message `seq` a send committed to `peer`, from
     /// its outbox entry, and answer `token`: [`RunnerEvent::Sent`] once the
     /// write completes, or where the correspondent has already collected the
-    /// message and its entry is gone.
+    /// message and its entry is gone. `sent_at` is the time the commit read, in
+    /// Unix milliseconds, whose whole seconds its outbox entry records, and the
+    /// answer carries it.
     async fn write_committed(
         &mut self,
         token: CommandToken,
         peer: CorrespondenceLabel,
         seq: u64,
+        sent_at: u64,
     ) -> Result<(), Halt> {
         let conv = match self.load_one(&peer) {
             Ok(Some(conv)) if !conv.state.delete_pending => conv,
@@ -3625,22 +4052,47 @@ impl<R: RunnerRecords> Runner<R> {
                     "dm runner: slot write on {} failed, seq {seq}, left to the repair ({e})",
                     tag(&peer)
                 );
-                self.unwritten.insert((peer, seq), token);
+                self.unwritten.insert((peer, seq), (token, sent_at));
                 return Ok(());
             }
         }
         crate::vtrace!("dm runner: send on {} done, seq {seq}", tag(&peer));
-        self.emit(RunnerEvent::Sent { token, peer, seq }).await
+        self.emit(RunnerEvent::Sent {
+            token,
+            peer,
+            seq,
+            sent_at,
+        })
+        .await
+    }
+
+    /// When this side committed its message `seq` to `peer`, in Unix
+    /// milliseconds: the time the message's outbox entry records, or `fallback`,
+    /// in Unix seconds, where the entry is gone, as once the correspondent has
+    /// collected the message, or the store would not load.
+    fn outbox_sent_at(&mut self, peer: &CorrespondenceLabel, seq: u64, fallback: u64) -> u64 {
+        let recorded = self.load_one(peer).ok().flatten().and_then(|conv| {
+            conv.outstanding_outbox
+                .iter()
+                .find(|entry| entry.seq == seq)
+                .map(|entry| entry.sent_at)
+        });
+        recorded.unwrap_or(fallback).saturating_mul(1000)
     }
 
     /// Serve one thing the live lane handed on.
     async fn serve_lane_note(&mut self, note: live_lane::LaneNote) -> Result<(), Halt> {
         match note {
-            live_lane::LaneNote::Committed { token, peer, seq } => {
+            live_lane::LaneNote::Committed {
+                token,
+                peer,
+                seq,
+                sent_at,
+            } => {
                 if self.stopping() {
                     return self.refuse(Some(token), Refusal::ShuttingDown).await;
                 }
-                self.write_committed(token, peer, seq).await
+                self.write_committed(token, peer, seq, sent_at).await
             }
             live_lane::LaneNote::Accepted {
                 peer,
@@ -3654,7 +4106,7 @@ impl<R: RunnerRecords> Runner<R> {
                 // the reach, without its route, only where it took it; its
                 // handle is kept while that serial is still the one applied.
                 if let Some((reach, serial)) = &reach {
-                    let _ = self.take_reach(&peer, reach, *serial);
+                    let _ = self.take_reach(&peer, reach, *serial, Repush::Renewed(0));
                 }
                 self.collect_established(peer);
                 self.report_delivery(&peer).await
@@ -3674,7 +4126,7 @@ impl<R: RunnerRecords> Runner<R> {
                     // The lane took the route against its serial; the handle
                     // is kept while that serial is still the one applied.
                     if let Some((reach, serial)) = &reach {
-                        let _ = self.take_reach(&peer, reach, *serial);
+                        let _ = self.take_reach(&peer, reach, *serial, Repush::Renewed(cursor));
                     }
                     self.take_peer_cursor(&peer, cursor);
                     self.report_delivery(&peer).await?;
@@ -3710,11 +4162,13 @@ impl<R: RunnerRecords> Runner<R> {
             self.repairs.remove(&conv.peer);
             return;
         }
-        let now = self.clock.now_secs();
+        let now = self.clock.system_secs();
+        // A start recorded while the system clock was ahead is moved back to
+        // now, so the back-off is not put off until real time reaches it.
         let since_secs = self
             .repairs
             .get(&conv.peer)
-            .map_or(now, |repair| repair.since_secs);
+            .map_or(now, |repair| repair.since_secs.min(now));
         let due = Instant::now() + delivery::next_poll_interval_os(since_secs, now);
         self.repairs.insert(conv.peer, Repair { since_secs, due });
     }
@@ -3722,7 +4176,7 @@ impl<R: RunnerRecords> Runner<R> {
     /// Put a conversation on the repair schedule if it is not on it.
     fn ensure_repair(&mut self, peer: CorrespondenceLabel) {
         if !self.repairs.contains_key(&peer) {
-            let now = self.clock.now_secs();
+            let now = self.clock.system_secs();
             let due = Instant::now() + delivery::next_poll_interval_os(now, now);
             self.repairs.insert(
                 peer,
@@ -3806,10 +4260,15 @@ impl<R: RunnerRecords> Runner<R> {
                 self.delivered.entry(peer).or_insert(0);
                 self.ensure_repair(peer);
                 self.scan_drop_sooner();
+                // A resumed first contact keeps the time its first attempt
+                // committed message 0 at, or, once the correspondent has
+                // collected it, takes the time this attempt read.
+                let sent_at = self.outbox_sent_at(&peer, 0, now);
                 self.emit(RunnerEvent::Sent {
                     token,
                     peer,
                     seq: 0,
+                    sent_at,
                 })
                 .await?;
                 self.emit_roster().await
@@ -3847,7 +4306,7 @@ impl<R: RunnerRecords> Runner<R> {
             );
         }
         match sent {
-            Ok(seq) => self.write_committed(token, peer, seq).await,
+            Ok((seq, sent_at)) => self.write_committed(token, peer, seq, sent_at).await,
             Err(FlowError::AwaitingAcceptance) if matches!(self.store.load_conv(&peer), Ok(Some(state)) if state.acceptance_pending) => {
                 self.refuse(Some(token), Refusal::AcceptanceUnfinished)
                     .await
@@ -3954,7 +4413,7 @@ impl<R: RunnerRecords> Runner<R> {
                     self.note_unopened(&accepted.peer, unopened);
                 }
                 if let Some((reach, serial)) = self.held_reach(&request) {
-                    let _ = self.take_reach(&accepted.peer, &reach, serial);
+                    let _ = self.take_reach(&accepted.peer, &reach, serial, Repush::Renewed(0));
                 }
                 self.requests.remove(&request);
                 let peer = accepted.peer;
@@ -3963,10 +4422,12 @@ impl<R: RunnerRecords> Runner<R> {
                 self.emit_bodies(peer, first, accepted.messages).await?;
                 // The reply is sequence 0 of this side's direction on every
                 // path through an acceptance.
+                let sent_at = self.outbox_sent_at(&peer, 0, now);
                 self.emit(RunnerEvent::Sent {
                     token,
                     peer,
                     seq: 0,
+                    sent_at,
                 })
                 .await?;
                 self.ensure_repair(peer);
@@ -4211,6 +4672,7 @@ impl<R: RunnerRecords> Runner<R> {
         self.retry_owed_reach().await?;
         self.retry_reopens().await?;
         self.write_owed_controls().await?;
+        self.ask_due_follow_ups();
         self.collect_asked().await?;
         self.publish_owed_cursors();
         if Instant::now() >= self.next_tick {
@@ -4224,9 +4686,14 @@ impl<R: RunnerRecords> Runner<R> {
             self.preview_requests().await?;
             self.serve_queued().await?;
         }
+        if Instant::now() >= self.next_clock_check {
+            self.check_advert_clock();
+            self.next_clock_check = Instant::now() + CLOCK_CHECK_INTERVAL;
+        }
         if Instant::now() >= self.next_advert_poll {
             self.check_stop()?;
-            self.refresh_advert(false);
+            let advert = self.refresh_advert(false);
+            self.report_advert(advert).await?;
             self.next_advert_poll = Instant::now() + advert::next_poll_interval_os();
             self.serve_queued().await?;
         }
@@ -4595,7 +5062,7 @@ impl<R: RunnerRecords> Runner<R> {
                 return;
             }
         }
-        self.read_peer_control(peer);
+        self.read_peer_control(peer, false);
     }
 
     /// Read the correspondent's control once and take its cursor, and its
@@ -4603,14 +5070,23 @@ impl<R: RunnerRecords> Runner<R> {
     /// it, the reach replaces the one applied; at it, the reach is the one
     /// already applied, so its route is held again where none is and its
     /// handle kept. Says whether the reach was above the one applied, and
-    /// whether the local store failed, a failure this counts.
-    fn read_peer_control(&mut self, peer: &CorrespondenceLabel) -> ControlRead {
+    /// whether the local store failed, a failure this counts. A route the
+    /// reach gives has the messages outstanding to `peer` pushed on it from
+    /// the control's cursor: at `launch` wherever the route is taken, and
+    /// otherwise where it replaces a route held or one forgotten
+    /// ([`push_hooks::Repush`]).
+    fn read_peer_control(&mut self, peer: &CorrespondenceLabel, launch: bool) -> ControlRead {
         let _step = Step::start(format!("control catch-up of {}", tag(peer)));
         match flows::peer_control(&self.store, &mut self.records, peer) {
             Ok(Some(control)) => {
                 // An older reach than the one applied is not taken; the
                 // cursor is.
-                let took = self.take_reach(peer, &control.reach, control.serial);
+                let repush = if launch {
+                    Repush::Learned(control.collected_cursor)
+                } else {
+                    Repush::Renewed(control.collected_cursor)
+                };
+                let took = self.take_reach(peer, &control.reach, control.serial, repush);
                 self.take_peer_cursor(peer, control.collected_cursor);
                 match took {
                     push_hooks::Took::Newer => ControlRead::Newer,
@@ -4701,6 +5177,89 @@ impl<R: RunnerRecords> Runner<R> {
                     }
                 }
             }
+        }
+    }
+
+    /// Put a collection of each conversation whose channel's watch a read
+    /// registered since the last call on the schedule, [`FOLLOW_UP_TICKS`]
+    /// jittered ticks from now. The watch is not live on a storage node when
+    /// its registration answers, so a write landing after the read that
+    /// registered it and before it is live raises no change, and would wait
+    /// for the next scheduled collection. A conversation already scheduled
+    /// takes the later moment, so the follow-up comes after the latest
+    /// registration has had time to go live. A channel whose conversation
+    /// could not be looked up, because its stored state would not load, is
+    /// looked up again a jittered tick later, up to
+    /// [`FOLLOW_UP_LOOKUP_TRIES`] tries in all.
+    fn follow_up_registered_watches(&mut self) {
+        let now = Instant::now();
+        let mut registered: Vec<([u8; HELLO_LOOKUP_KEY_LEN], u32)> = self
+            .unresolved_watches
+            .iter()
+            .filter(|(_, (retry, _))| *retry <= now)
+            .map(|(lookup_key, (_, failed))| (*lookup_key, *failed))
+            .collect();
+        for (lookup_key, _) in &registered {
+            self.unresolved_watches.remove(lookup_key);
+        }
+        registered.extend(
+            self.records
+                .inner
+                .take_registered_watches()
+                .into_iter()
+                .map(|lookup_key| (lookup_key, 0)),
+        );
+        for (lookup_key, failed) in registered {
+            let peer = match self.lane.loaded_reader_of(&lookup_key) {
+                Ok(Some((peer, _))) => peer,
+                Ok(None) => {
+                    crate::vtrace!(
+                        "dm runner: a registered watch names no conversation, no follow-up"
+                    );
+                    continue;
+                }
+                Err(()) => {
+                    let failed = failed + 1;
+                    if failed >= FOLLOW_UP_LOOKUP_TRIES {
+                        crate::vtrace!(
+                            "dm runner: a registered watch's conversation would not load \
+                             after {failed} tries, no follow-up"
+                        );
+                        continue;
+                    }
+                    crate::vtrace!(
+                        "dm runner: a registered watch's conversation would not load, \
+                         its follow-up waits for the next try"
+                    );
+                    self.unresolved_watches
+                        .entry(lookup_key)
+                        .or_insert((now + jittered(self.config.tick), failed));
+                    continue;
+                }
+            };
+            let due = Instant::now() + jittered(self.config.tick * FOLLOW_UP_TICKS);
+            schedule_follow_up(&mut self.follow_ups, peer, due);
+        }
+    }
+
+    /// Ask, with a catch-up, for the collection of each conversation whose
+    /// follow-up ([`Self::follow_up_registered_watches`]) is due.
+    fn ask_due_follow_ups(&mut self) {
+        let now = Instant::now();
+        let due: Vec<CorrespondenceLabel> = self
+            .follow_ups
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in due {
+            self.follow_ups.remove(&peer);
+            crate::vtrace!(
+                "dm runner: {} collected again after its watch registered",
+                tag(&peer)
+            );
+            self.collect_now.insert(peer);
+            self.catch_up.insert(peer);
         }
     }
 
@@ -4868,7 +5427,12 @@ impl<R: RunnerRecords> Runner<R> {
             {
                 continue;
             }
-            let _ = self.take_reach(&peer, &acceptance.peer_reach, acceptance.peer_reach_serial);
+            let _ = self.take_reach(
+                &peer,
+                &acceptance.peer_reach,
+                acceptance.peer_reach_serial,
+                Repush::Renewed(0),
+            );
             self.collect_established(peer);
             self.emit(RunnerEvent::Accepted { peer }).await?;
             match self.store.load_conv(&peer) {
@@ -4945,6 +5509,8 @@ impl<R: RunnerRecords> Runner<R> {
 
 mod live_lane;
 mod push_hooks;
+
+use push_hooks::Repush;
 
 #[cfg(test)]
 mod tests;

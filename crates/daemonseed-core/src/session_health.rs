@@ -95,7 +95,8 @@ impl SweepHealthInput {
     /// yielded nothing (`found == 0`), and at least one GET errored (`failed > 0`) — a
     /// dead-session signature, distinct from a merely empty record. A dead watch
     /// (L2) counts the same. Any populated slot, or a clean pass with zero GET errors,
-    /// is a *successful* pass (`!is_failed_pass`) and resets the streak.
+    /// is not failed; [`SessionHealthTracker::observe`] treats such a pass as a
+    /// success that resets the streak, unless it attempted no reads.
     ///
     /// **Public** so the §RS-4 manual-Refresh fold arm can reuse the exact failed-pass
     /// predicate (CRSH-ISC-16): a Refresh-armed record re-establishes on a single failed
@@ -193,10 +194,16 @@ impl<K: Eq + Hash + Clone> SessionHealthTracker<K> {
     /// [`RepairDecision::RepairDue`] in calm weather (latched, so at-most-once per
     /// episode) or [`RepairDecision::Suppressed`] while elevated (the streak is kept, so
     /// calm resumes — never cancels). A successful pass resets the counter and clears
-    /// the latch.
+    /// the latch. A pass that attempted no reads, over a watch not known dead, changes
+    /// neither: it is not evidence the session is serving.
     pub fn observe(&mut self, key: K, input: SweepHealthInput) -> RepairDecision {
         let base_k = self.k_threshold;
         let entry = self.records.entry(key).or_default();
+        // A pass that read nothing, over a watch not known dead, says nothing about
+        // the session: the streak and a due repair stay as they were.
+        if input.attempted == 0 && !matches!(input.watch, WatchState::Dead) {
+            return RepairDecision::NotDue;
+        }
         if !input.is_failed_pass() {
             // Successful pass: the session is serving. Reset the streak, clear the latch
             // (a healed record must be able to re-arm if it dies again), and reset the
@@ -354,6 +361,35 @@ mod tests {
         assert_eq!(
             tracker.observe(key, failed(Weather::Calm)),
             RepairDecision::NotDue
+        );
+    }
+
+    /// A pass that attempted no reads neither ends a streak nor clears a due repair.
+    #[test]
+    fn a_pass_with_no_reads_leaves_the_streak_and_a_due_repair() {
+        let no_reads = SweepHealthInput {
+            attempted: 0,
+            failed: 0,
+            found: 0,
+            watch: WatchState::Unknown,
+            weather: Weather::Calm,
+        };
+        let mut tracker: SessionHealthTracker<u64> = SessionHealthTracker::new();
+        let key = 2u64;
+        assert_eq!(
+            tracker.observe(key, failed(Weather::Calm)),
+            RepairDecision::NotDue
+        );
+        assert_eq!(tracker.observe(key, no_reads), RepairDecision::NotDue);
+        assert_eq!(
+            tracker.observe(key, failed(Weather::Calm)),
+            RepairDecision::RepairDue,
+            "a pass with no reads ended the streak"
+        );
+        assert_eq!(tracker.observe(key, no_reads), RepairDecision::NotDue);
+        assert!(
+            tracker.is_repair_due(&key),
+            "a pass with no reads cleared the due repair"
         );
     }
 

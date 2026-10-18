@@ -72,7 +72,7 @@ use daemonseed_core::dm::channel::Reach;
 use daemonseed_core::dm::push::{self as core_push, Push, Taken};
 use tokio::sync::oneshot;
 
-use super::push_hooks::{PushShare, Took};
+use super::push_hooks::{PushShare, Repush, Took};
 use crate::dm::push::{PushInbound, PushInbox, PUSH_ANSWER_WINDOW};
 
 /// How many times a send is committed where the conversation record changed
@@ -82,11 +82,13 @@ const COMMIT_ATTEMPTS: usize = 4;
 /// What the lane hands the runner.
 pub(super) enum LaneNote {
     /// A message committed and pushed, whose slot the runner writes before it
-    /// answers `token`.
+    /// answers `token`. `sent_at` is the time the commit read, in Unix
+    /// milliseconds, whose whole seconds its outbox entry records.
     Committed {
         token: CommandToken,
         peer: CorrespondenceLabel,
         seq: u64,
+        sent_at: u64,
     },
     /// An acceptance taken from a push, persisted and reported. `reach` is the
     /// correspondent's reach, without its route, and the serial it was issued
@@ -258,14 +260,19 @@ impl LaneShare {
     /// correspondent's route is known. The slot is not written. A commit whose
     /// conversation record changed under it is made again from a fresh load,
     /// at most [`COMMIT_ATTEMPTS`] times in all.
+    ///
+    /// Returns the message's sequence and the time the commit read, in Unix
+    /// milliseconds, whose whole seconds its outbox entry records.
     pub(super) fn commit_send(
         &self,
         peer: &CorrespondenceLabel,
         body: &[u8],
-    ) -> Result<u64, FlowError> {
+    ) -> Result<(u64, u64), FlowError> {
         let _one_at_a_time = locked(&self.commit);
         let mut attempts = 1;
-        let committed = loop {
+        let (committed, sent_at) = loop {
+            let now_ms = self.clock.now_ms();
+            let now = now_ms / 1000;
             #[cfg(test)]
             let forced = self
                 .forced_conflicts
@@ -276,11 +283,11 @@ impl LaneShare {
             let attempt = if forced {
                 Err(FlowError::Conflict)
             } else {
-                flows::commit_message(&self.store, peer, body, os_fill, self.clock.now_secs())
+                flows::commit_message(&self.store, peer, body, os_fill, now)
             };
             match attempt {
                 Err(FlowError::Conflict) if attempts < COMMIT_ATTEMPTS => attempts += 1,
-                committed => break committed?,
+                committed => break (committed?, now_ms),
             }
         };
         if let Some(pusher) = self.push.pusher_for(&self.store, peer, &self.events) {
@@ -303,7 +310,7 @@ impl LaneShare {
                 tag(peer)
             );
         }
-        Ok(committed.seq)
+        Ok((committed.seq, sent_at))
     }
 
     /// Emit `event`. A closed event stream has no reader left, and the lane
@@ -360,7 +367,9 @@ impl LaneShare {
     /// `route`, through [`Store::take_reach`], which compares the serial,
     /// writes the route and serial, and holds `route` at `serial` in memory
     /// where it took the reach ([`Took::Newer`] or [`Took::Same`]), all in one
-    /// critical section of the correspondence. A reach older than the one
+    /// critical section of the correspondence. A route learned there has the
+    /// messages outstanding to `peer` pushed on it once that section is left,
+    /// where `repush` says so ([`PushShare::push_outstanding`]). A reach older than the one
     /// applied changes nothing, in memory or on disk. The handle is left for
     /// the runner. A store that will not answer counts one store failure and
     /// answers [`Took::Failed`]. The reach carries no handle, so a take that
@@ -371,18 +380,27 @@ impl LaneShare {
         peer: &CorrespondenceLabel,
         serial: u64,
         route: Option<&[u8]>,
+        repush: Repush,
     ) -> Took {
         let reach = Reach {
             route: route.map(<[u8]>::to_vec),
             handle: None,
         };
         let mut released = None;
+        let mut run = None;
         let taken = self.store.take_reach(peer, serial, &reach, |take| {
             if take.applied() {
-                released = self.push.hold_route(peer, reach.route.clone(), serial);
+                (released, run) = self
+                    .push
+                    .hold_route(peer, reach.route.clone(), serial, repush);
             }
         });
         self.push.release(released);
+        super::push_hooks::run_before_run(peer);
+        if let Some(run) = run {
+            self.push
+                .push_outstanding(&self.store, peer, &self.events, run);
+        }
         match taken {
             Ok(taken) => Took::from(taken.take),
             Err(StoreError::MissingConversation) => Took::Older,
@@ -413,13 +431,31 @@ impl LaneShare {
         &self,
         lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
     ) -> Option<(CorrespondenceLabel, ConvState)> {
-        let peer = *locked(&self.readers).get(lookup_key)?;
-        match self.store.load_conv(&peer) {
-            Ok(Some(state)) if state.incoming_lookup_key == *lookup_key => Some((peer, state)),
-            Ok(_) => None,
+        self.loaded_reader_of(lookup_key).ok().flatten()
+    }
+
+    /// [`Self::reader_of`], with a conversation whose stored state would not
+    /// load told apart from none: `Err`, with one store failure counted.
+    pub(super) fn loaded_reader_of(
+        &self,
+        lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN],
+    ) -> Result<Option<(CorrespondenceLabel, ConvState)>, ()> {
+        let Some(peer) = locked(&self.readers).get(lookup_key).copied() else {
+            return Ok(None);
+        };
+        let loaded = self.store.load_conv(&peer);
+        #[cfg(test)]
+        let loaded = if reader_load_fails(lookup_key) {
+            Err(StoreError::MissingConversation)
+        } else {
+            loaded
+        };
+        match loaded {
+            Ok(Some(state)) if state.incoming_lookup_key == *lookup_key => Ok(Some((peer, state))),
+            Ok(_) => Ok(None),
             Err(_) => {
                 self.count(|health| health.store_failures += 1);
-                None
+                Err(())
             }
         }
     }
@@ -435,6 +471,45 @@ impl LaneShare {
             }
         }
     }
+}
+
+/// Channels whose next lookup of the conversation reading them finds the
+/// stored state will not load.
+#[cfg(test)]
+static FAILED_READER_LOADS: std::sync::Mutex<Vec<[u8; HELLO_LOOKUP_KEY_LEN]>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Have the next lookup of the conversation reading the channel at
+/// `lookup_key` ([`LaneShare::loaded_reader_of`]) find its stored state will
+/// not load.
+#[cfg(test)]
+pub(super) fn fail_next_reader_load(lookup_key: [u8; HELLO_LOOKUP_KEY_LEN]) {
+    FAILED_READER_LOADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(lookup_key);
+}
+
+/// How many of the loads [`fail_next_reader_load`] set for `lookup_key` are
+/// still to fail.
+#[cfg(test)]
+pub(super) fn reader_loads_left_to_fail(lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> usize {
+    FAILED_READER_LOADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|failing| *failing == lookup_key)
+        .count()
+}
+
+/// Whether [`fail_next_reader_load`] was set for `lookup_key`, clearing it.
+#[cfg(test)]
+fn reader_load_fails(lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) -> bool {
+    let mut failing = FAILED_READER_LOADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = failing.iter().position(|failing| failing == lookup_key);
+    at.map(|at| failing.remove(at)).is_some()
 }
 
 /// Whether `peer`'s conversation is an acceptance still being finished.
@@ -688,9 +763,14 @@ impl Lane {
         }
         crate::vtrace!("dm lane: send on {} starts", tag(&peer));
         match self.share.commit_send(&peer, &body) {
-            Ok(seq) => {
+            Ok((seq, sent_at)) => {
                 crate::vtrace!("dm lane: send on {} committed, seq {seq}", tag(&peer));
-                let _ = self.notes.send(LaneNote::Committed { token, peer, seq });
+                let _ = self.notes.send(LaneNote::Committed {
+                    token,
+                    peer,
+                    seq,
+                    sent_at,
+                });
                 None
             }
             Err(FlowError::AwaitingAcceptance) if acceptance_pending(&self.share.store, &peer) => {
@@ -845,7 +925,12 @@ impl Lane {
                 // where it is not older than the one applied.
                 let reach = self
                     .share
-                    .take_peer_reach(&peer, control.serial, control.reach.route.as_deref())
+                    .take_peer_reach(
+                        &peer,
+                        control.serial,
+                        control.reach.route.as_deref(),
+                        Repush::Renewed(control.collected_cursor),
+                    )
                     .applied()
                     .then_some((
                         Reach {
@@ -1054,6 +1139,7 @@ impl Lane {
                     &peer,
                     control.serial,
                     control.reach.route.as_deref(),
+                    Repush::Renewed(control.collected_cursor),
                 ) {
                     Took::Same => self.share.durable_same(&peer),
                     took => took,
@@ -1163,6 +1249,7 @@ impl Lane {
             &peer,
             acceptance.peer_reach_serial,
             acceptance.peer_reach.route.as_deref(),
+            Repush::Renewed(0),
         );
         self.share.push.answer(id, answer);
         crate::vtrace!("dm push: {} acceptance recognised", tag(&peer));

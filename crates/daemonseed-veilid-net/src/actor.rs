@@ -225,7 +225,7 @@ enum Command {
     /// record and resets its session-health tracker at dispatch.
     RepairRendezvous {
         owner: RendezvousOwner,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<rendezvous::RepairOutcome>>,
     },
     /// Resolve a rendezvous record's deterministic [`RecordKey`] from its `owner` —
     /// local crypto only, no network round-trip. Feeds the frontend's map from
@@ -555,7 +555,16 @@ impl VeilidNetHandle {
     /// the two methods above, a record that cannot be found is an error here: a
     /// repair re-establishes a session that was working, so its absence is a failure
     /// to report rather than a state to wait out.
-    pub async fn repair_rendezvous(&self, owner: RendezvousOwner) -> Result<()> {
+    ///
+    /// Answers once the repair has finished. A repair that re-opened and re-watched the
+    /// record is [`rendezvous::RepairOutcome::Complete`] only when every slot read of its
+    /// re-sweep succeeded, and [`rendezvous::RepairOutcome::Partial`] otherwise. A
+    /// request for a record whose repair is already running is answered
+    /// [`rendezvous::RepairOutcome::AlreadyRunning`] at once.
+    pub async fn repair_rendezvous(
+        &self,
+        owner: RendezvousOwner,
+    ) -> Result<rendezvous::RepairOutcome> {
         self.send(|reply| Command::RepairRendezvous { owner, reply })
             .await?
     }
@@ -1244,7 +1253,7 @@ async fn actor_loop(
                     let mut set = repair_in_flight.lock().unwrap_or_else(|e| e.into_inner());
                     if !set.insert(owner_id) {
                         // A repair for this record is already in flight — skip, don't spawn.
-                        let _ = reply.send(Ok(()));
+                        let _ = reply.send(Ok(rendezvous::RepairOutcome::AlreadyRunning));
                         continue;
                     }
                 }
@@ -2255,6 +2264,8 @@ async fn open_for_resweep(
 /// re-establishing a session that was working, so a record that is now unreachable
 /// is a failure to report. It classifies transient, which is right: the frontend
 /// clears the record's tracker at dispatch and re-detects on the next cycle.
+///
+/// A re-sweep with any failed slot read returns [`rendezvous::RepairOutcome::Partial`].
 async fn repair_rendezvous(
     api: &VeilidAPI,
     rc: &RoutingContext,
@@ -2263,7 +2274,7 @@ async fn repair_rendezvous(
     record_locks: &rendezvous::RecordLocks,
     gate: &Arc<DhtGate>,
     owner: &RendezvousOwner,
-) -> Result<()> {
+) -> Result<rendezvous::RepairOutcome> {
     crate::vtrace!("repair_rendezvous: re-establishing dead record session");
     let resolved = owner.resolve()?;
     let owner_key = resolved.public_key();
@@ -2304,13 +2315,9 @@ async fn repair_rendezvous(
                     rendezvous::RecordShape::RENDEZVOUS,
                 )
                 .await?
+                // Not traced here: the error is the repair's result, which the caller
+                // of `VeilidNetHandle::repair_rendezvous` receives and traces.
                 .ok_or_else(|| {
-                    // Traced here because the caller is fire-and-forget: nothing
-                    // downstream reads this error, so without a trace a repair that
-                    // cannot find the record leaves no evidence anywhere.
-                    crate::vtrace!(
-                        "repair_rendezvous: read-only re-open found no record -> Err (transient)"
-                    );
                     VeilidNetError::Routing(
                         "the rendezvous record was not found on repair re-open".to_owned(),
                     )
@@ -2327,16 +2334,19 @@ async fn repair_rendezvous(
         },
         // sweep: full 0..o_cnt re-sweep, per-GET read permits (WB-5.1 / I5″.2), awaited under
         // the lock. No SweepHealth emission (the frontend owns the tracker reset).
-        |handle| rendezvous::sweep_collect(gate, rc, handle, ev_tx),
+        |handle| async move {
+            let swept = rendezvous::sweep_collect(gate, rc, handle, ev_tx).await;
+            crate::vtrace!(
+                "repair_rendezvous: re-established ({} slot(s) re-swept, {} attempted, {} failed)",
+                swept.found,
+                swept.attempted,
+                swept.failed
+            );
+            swept
+        },
     )
     .await?;
-    crate::vtrace!(
-        "repair_rendezvous: re-established ({} slot(s) re-swept, {} attempted, {} failed) -> Ok",
-        outcome.found,
-        outcome.attempted,
-        outcome.failed
-    );
-    Ok(())
+    Ok(outcome)
 }
 
 /// Min interval between RouteChanged-triggered advert refreshes — coalesces route

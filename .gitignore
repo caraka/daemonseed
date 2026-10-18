@@ -43,3 +43,7 @@ daemonseed.toml
 
 # Convention: place isolated test profiles here (ISC-C35 multi-instance via cd)
 /.test-profiles/
+
+# Committed test fixtures are profile files on purpose.
+!crates/*/tests/fixtures/**/daemonseed.toml
+!crates/*/tests/fixtures/**/*.dseed

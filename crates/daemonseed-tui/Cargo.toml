@@ -22,7 +22,10 @@ path = "src/main.rs"
 # UI framework (MIT/Apache-2.0). ratatui 0.29 bundles crossterm under its
 # default features and re-exports it as `ratatui::crossterm`, so the TUI needs
 # no separate backend dep and no version-skew risk.
-ratatui = { workspace = true }
+# `unstable-rendered-line-info` provides `Paragraph::line_count`, which the chat
+# panes use to count the screen rows a wrapped line takes, with the same word
+# wrapper that draws it, so they can show their newest rows.
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 
 # Domain logic + reused client stack. The TUI depends on daemonseed-cli to
 # reuse the proven connect / identity-proof / C22-trust client flow rather than

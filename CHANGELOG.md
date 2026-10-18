@@ -24,6 +24,38 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+### Added
+
+- GUI: added Copy to the right-click menu of a direct message.
+
+### Changed
+
+- Direct messages: ordered a conversation by this side's send and receive times.
+- GUI: showed a circle as joining or unable to join, named the circle in join errors, and closed its message box while joining. (#490)
+- GUI: switched to a circle already in the list when its phrase was entered again, and retried its join if it had failed.
+- GUI and TUI: stated why direct messages stopped, with the error text minus recognised personal paths and key-like text, and the GUI added a Copy button for it.
+- GUI and TUI: stated when others cannot yet reach you for direct messages.
+- GUI: opened setup and unlock in a small window and reopened the main window at its saved size or the default size, maximized if it was closed maximized or the size exceeds the screen.
+- Docs: marked the project status as beta.
+
+### Fixed
+
+- TUI: showed the newest lines in chat panes. (#491)
+- Direct messages: corrected the send time of messages sent after the computer slept.
+- GUI: showed the send time of a direct message sent from another session.
+- Direct messages: checked a new conversation again within minutes.
+- Direct messages: resent unsent messages when the other person's new connection was learned and on relaunch.
+- GUI and TUI: showed when a room cannot be reached and is retrying. (#409)
+- GUI and TUI: refused a circle or lobby join when its key could not be derived, and showed the error. (#424)
+- GUI: focused the message box when the startup overlay closed with no dialog open and when the active circle finished joining, and kept focus in an open dialog.
+- TUI: shortened a status message too wide for the bar with an ellipsis. (#399)
+- Display names: refused text-direction control characters. (#488)
+- Dependencies: updated rustls (RUSTSEC-2026-0285, -0346, -0348, -0349), h2 (RUSTSEC-2026-0258), crossbeam-epoch (RUSTSEC-2026-0204) and rustls-webpki.
+
+### Removed
+
+- Core: removed `SignKeypair::from_halves`. (#413)
+
 ## [v0.37.0] — 2026-10-16
 
 ### Added

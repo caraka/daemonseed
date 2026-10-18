@@ -38,6 +38,7 @@ use daemonseed_core::presence::{LiveMember, PresenceChange};
 use daemonseed_core::share_catalog::ShareListing;
 use daemonseed_core::storage::seeds::AEAD_KEY_LEN;
 use daemonseed_veilid_net::dm::runner::{IdentityPk, RunnerCommand, RunnerEvent};
+use daemonseed_veilid_net::dm::unavailable::DmUnavailable;
 use tokio::sync::mpsc;
 
 /// The wire-facing name for an auto-republished share (#41):
@@ -108,8 +109,9 @@ pub enum NetCommand {
     /// `rejoin_circles` is the set of persisted circles to silently
     /// re-join once the session is live — `(gui_circle_id, phrase)` pairs read
     /// from the at-rest blob. Re-joined AFTER the lobby auto-join so each has a
-    /// live session; failures surface per-circle (`CircleError`) and never abort
-    /// the connect. Empty for the ephemeral / no-profile path.
+    /// live session; failures surface per-circle (`CircleError`, or
+    /// `CircleJoinFailed` for a join that cannot succeed) and never abort the
+    /// connect. Empty for the ephemeral / no-profile path.
     Connect {
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
@@ -312,6 +314,20 @@ pub enum RootKind {
     Dir(String),
 }
 
+/// A room whose record the app keeps a session with, as [`NetEvent::RoomReach`] names
+/// it. The UI turns it into the name the user knows the room by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoomRecord {
+    /// The Lobby's chat.
+    Lobby,
+    /// The Lobby's public share list.
+    LobbyShares,
+    /// The announcements and message of the day.
+    Announcements,
+    /// The circle with this GUI-assigned `circle_id`.
+    Circle(u64),
+}
+
 /// An event from the network actor to the UI thread.
 #[derive(Debug, Clone)]
 pub enum NetEvent {
@@ -342,9 +358,14 @@ pub enum NetEvent {
         /// a local echo uses `now_unix_ms()`.
         sent_unix_ms: i64,
     },
-    /// A non-fatal error to surface (join/send failure). The connection itself
-    /// may still be up.
+    /// A non-fatal error to surface: a refused lobby join or a failed send. The
+    /// connection itself may still be up.
     Error { reason: String },
+    /// Whether the app can read `room`'s record. `reachable: false` when a repair of the
+    /// room's lost record session failed, or when consecutive ordinary re-reads got no
+    /// answer to any read; `reachable: true` once a repair completes or a re-read gets
+    /// an answer to at least one read.
+    RoomReach { room: RoomRecord, reachable: bool },
     /// A circle subscribe stream is live; chat can flow. `circle_id` is the
     /// GUI-assigned tag from the originating [`NetCommand::JoinCircle`]; `asset_addr`
     /// is the relay rendezvous the circle resolved to, from which the UI derives the
@@ -369,6 +390,10 @@ pub enum NetEvent {
     /// A non-fatal circle error (join/send failure) tagged with the circle it
     /// concerns. The connection itself may still be up.
     CircleError { circle_id: u64, reason: String },
+    /// The join of `circle_id` ended for good: its keys could not be derived, or the
+    /// network refused the subscribe for a reason a retry cannot fix. `reason` is the
+    /// error text. No retry is scheduled.
+    CircleJoinFailed { circle_id: u64, reason: String },
     /// A share is now published and served; `share_id` is client-minted (opaque).
     /// `root` is the published directory path — carried back so the GUI can persist
     /// it for auto-republish and key Unpublish on it.
@@ -471,6 +496,10 @@ pub enum NetEvent {
     /// The direct-messaging runner stopped. Nothing reports until a later
     /// connect with a started node starts another.
     DmStopped,
+    /// Direct messaging cannot run on this connection: no runner started, or
+    /// the last one ended with an error or panicked. Carries the cause the
+    /// notice is worded from and the redacted error text shown beneath it.
+    DmUnavailable(DmUnavailable),
     /// A close is still waiting for the direct-messaging runner to stop after
     /// [`DM_CLOSE_NOTICE_AFTER`]. Sent at most once per close.
     DmCloseSlow,

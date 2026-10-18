@@ -78,6 +78,9 @@ pub(crate) struct ChannelWatches<K> {
     watched: Arc<Mutex<HashMap<K, [u8; HELLO_LOOKUP_KEY_LEN]>>>,
     /// Records whose watch was cancelled, and when.
     retired: Arc<Mutex<HashMap<K, Instant>>>,
+    /// The lookup keys of channels registered, or registered again, since
+    /// [`Self::take_registered`] last took them.
+    registered: Arc<Mutex<Vec<[u8; HELLO_LOOKUP_KEY_LEN]>>>,
     off: bool,
 }
 
@@ -86,6 +89,7 @@ impl<K> Clone for ChannelWatches<K> {
         Self {
             watched: Arc::clone(&self.watched),
             retired: Arc::clone(&self.retired),
+            registered: Arc::clone(&self.registered),
             off: self.off,
         }
     }
@@ -97,6 +101,7 @@ impl<K: Eq + Hash + Clone> ChannelWatches<K> {
         Self {
             watched: Arc::default(),
             retired: Arc::default(),
+            registered: Arc::default(),
             off,
         }
     }
@@ -120,16 +125,39 @@ impl<K: Eq + Hash + Clone> ChannelWatches<K> {
         !own && !self.off && !self.map().contains_key(record)
     }
 
-    /// Note `record`, read under `lookup_key`, as watched.
+    /// Note `record`, read under `lookup_key`, as watched, and hold
+    /// `lookup_key` for [`Self::take_registered`].
     pub(crate) fn registered(&self, record: K, lookup_key: [u8; HELLO_LOOKUP_KEY_LEN]) {
         self.retired().remove(&record);
         self.map().insert(record, lookup_key);
+        self.registered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(lookup_key);
         let short = channel_tag(&lookup_key);
         crate::vtrace!("dm watch: registered {short}");
     }
 
-    /// Note the watch on the record read under `lookup_key` registered again.
+    /// The lookup keys of the channels registered ([`Self::registered`]) or
+    /// registered again ([`Self::reregistered`]) since this was last called,
+    /// in order.
+    pub(crate) fn take_registered(&self) -> Vec<[u8; HELLO_LOOKUP_KEY_LEN]> {
+        std::mem::take(
+            &mut *self
+                .registered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Note the watch on the record read under `lookup_key` registered again,
+    /// and hold `lookup_key` for [`Self::take_registered`]: a watch registered
+    /// again is no more live at once than a first one.
     pub(crate) fn reregistered(&self, lookup_key: &[u8; HELLO_LOOKUP_KEY_LEN]) {
+        self.registered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(*lookup_key);
         let short = channel_tag(lookup_key);
         crate::vtrace!("dm watch: re-registered {short}");
     }

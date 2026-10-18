@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 use daemonseed_core::handle::strip_handle_hash;
 use daemonseed_veilid_net::dm::runner::{IdentityPk, Refusal, RunnerCommand, RunnerEvent};
+use daemonseed_veilid_net::dm::unavailable::DmUnavailableCause;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::state::GuiState;
@@ -75,9 +76,28 @@ pub fn refusal_text(refusal: Refusal) -> &'static str {
     }
 }
 
+/// What the line under the Direct messages header says while messaging is
+/// unavailable for `cause`.
+pub fn unavailable_text(cause: DmUnavailableCause) -> &'static str {
+    match cause {
+        DmUnavailableCause::NotConnected => "Direct messages will start once you're connected.",
+        DmUnavailableCause::StoreUnopened => {
+            "Direct messages couldn't start because your saved conversations couldn't be opened."
+        }
+        DmUnavailableCause::RunnerFailed => {
+            "Direct messages stopped because of an error. Restart the app to try again."
+        }
+        DmUnavailableCause::Internal => {
+            "Direct messages stopped because of an internal error. Restart the app to try again."
+        }
+    }
+}
+
 /// What the line under the Direct messages header says.
 pub fn notice_text(notice: DmNotice) -> String {
     match notice {
+        DmNotice::Unavailable(cause) => unavailable_text(cause).to_owned(),
+        DmNotice::NotReachable => "Others can't reach you for direct messages yet.".to_owned(),
         DmNotice::BlockListUnreadable => {
             "Your block list can't be read, so requests and messages are paused.".to_owned()
         }
@@ -185,6 +205,9 @@ pub fn apply_rail_sections(ui: &AppWindow, st: &GuiState) {
     }
     ui.set_dm_notice(SharedString::from(
         st.dm_notice().map(notice_text).unwrap_or_default(),
+    ));
+    ui.set_dm_notice_detail(SharedString::from(
+        st.dm_notice_detail().unwrap_or_default(),
     ));
     ui.set_chats_open(st.rail_section_open(RailSection::Chats));
     ui.set_dms_open(st.rail_section_open(RailSection::DirectMessages));
@@ -516,10 +539,18 @@ mod tests {
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
     use slint::platform::{Key, WindowEvent};
 
+    use daemonseed_veilid_net::dm::unavailable::DmUnavailable;
+
     use super::*;
     use crate::net::{NetEvent, RosterEntry};
     use crate::share_browser::ShareBrowser;
     use crate::{GuiPlatform, H, W, apply_net_event, build_ui, render_png};
+
+    /// This moment in Unix milliseconds, as a runner reports a send committed
+    /// at.
+    fn test_now_ms() -> u64 {
+        u64::try_from(now_unix_ms()).expect("a clock past the epoch")
+    }
 
     /// The window as production builds it, on the offscreen software platform,
     /// with the state it was built over.
@@ -528,6 +559,7 @@ mod tests {
         state: Rc<RefCell<GuiState>>,
         browser: Rc<RefCell<ShareBrowser>>,
         window: Rc<MinimalSoftwareWindow>,
+        net: Rc<RefCell<crate::net::NetHandle>>,
     }
 
     impl App {
@@ -562,7 +594,7 @@ mod tests {
                 let _ = slint::platform::set_platform(Box::new(GuiPlatform {
                     window: window.clone(),
                 }));
-                let (ui, state, _net, browser) = build_ui(None);
+                let (ui, state, net, browser) = build_ui(None);
                 ui.show().expect("show");
                 window.set_size(slint::PhysicalSize::new(W, H));
                 f(&App {
@@ -570,6 +602,7 @@ mod tests {
                     state,
                     browser,
                     window,
+                    net,
                 });
             })
             .expect("spawn the window thread")
@@ -620,6 +653,7 @@ mod tests {
             token,
             peer,
             seq: 0,
+            sent_at: test_now_ms(),
         });
         (st, peer)
     }
@@ -1100,8 +1134,9 @@ mod tests {
     }
 
     /// The window's message model carries each message's caption: its age by
-    /// its sender's clock and its status. The captions age with time alone,
-    /// with no new event, and a row whose time is unknown has only its status.
+    /// its sender's clock, or for a message sent from here by when the runner
+    /// committed it, and its status. The captions age with time alone, with no
+    /// new event.
     #[test]
     fn thread_captions_show_ages_and_advance_with_time() {
         with_app(|app| {
@@ -1131,17 +1166,20 @@ mod tests {
                 token,
                 peer,
                 seq: 1,
+                sent_at: test_now_ms(),
             });
-            // Sent from another session: no time is known here.
+            // Sent from another session an hour ago: its age is read from the
+            // commit time the runner reports.
             app.dm_event(RunnerEvent::Sent {
                 token: daemonseed_veilid_net::dm::runner::CommandToken(999),
                 peer,
                 seq: 7,
+                sent_at: u64::try_from(now - 3_600_000).unwrap(),
             });
-            assert_eq!(captions(app), ["3h", "now · sent", "sent"]);
+            assert_eq!(captions(app), ["3h", "now · sent", "1h · sent"]);
 
             refresh_dm_ages(&app.ui, &app.state.borrow(), now + 2 * 3_600_000 + 60_000);
-            assert_eq!(captions(app), ["5h", "2h · sent", "sent"]);
+            assert_eq!(captions(app), ["5h", "2h · sent", "3h · sent"]);
             let rail: Vec<SharedString> = app.ui.get_dm_rows().iter().map(|r| r.age).collect();
             assert_eq!(rail, ["2h"]);
         });
@@ -1471,15 +1509,17 @@ mod tests {
             app.ui.invoke_roster_start_dm();
             app.ui
                 .invoke_send_dm("Hi Cora, it's me from the Lobby.".into());
+            // The roster's handles are noted to the runner ahead of the send.
             let token = match app.state.borrow_mut().take_pending_dm().as_slice() {
-                [RunnerCommand::FirstContact { token, .. }] => *token,
-                other => panic!("expected one first contact, got {other:?}"),
+                [.., RunnerCommand::FirstContact { token, .. }] => *token,
+                other => panic!("expected a first contact last, got {other:?}"),
             };
             let cora = label();
             app.dm_event(RunnerEvent::Sent {
                 token,
                 peer: cora,
                 seq: 0,
+                sent_at: test_now_ms(),
             });
             app.dm_event(RunnerEvent::Delivered {
                 peer: cora,
@@ -1489,8 +1529,8 @@ mod tests {
             app.ui
                 .invoke_send_dm("Are you coming to the meetup on Friday?".into());
             let token = match app.state.borrow_mut().take_pending_dm().as_slice() {
-                [RunnerCommand::Send { token, .. }] => *token,
-                other => panic!("expected one send, got {other:?}"),
+                [.., RunnerCommand::Send { token, .. }] => *token,
+                other => panic!("expected a send last, got {other:?}"),
             };
             app.dm_event(RunnerEvent::Refused {
                 token: Some(token),
@@ -1661,6 +1701,753 @@ mod tests {
             assert!(app.ui.get_dm_is_request());
             assert_eq!(app.ui.get_dm_refusal(), refusal_text(Refusal::Network));
             shot("13-dm-accept-refused.png");
+
+            // (14) Messaging stopped with an error, its text selectable beneath,
+            // with the conversations scrolled back to their first row so any
+            // overlap of the box and the list would show.
+            let unavailable = |detail: &str| {
+                apply_net_event(
+                    &app.ui,
+                    &app.state,
+                    &app.browser,
+                    NetEvent::DmUnavailable(DmUnavailable::new(
+                        DmUnavailableCause::RunnerFailed,
+                        detail,
+                    )),
+                );
+                let at = slint::LogicalPosition::new(120.0, 560.0);
+                let window = app.ui.window();
+                window.dispatch_event(WindowEvent::PointerMoved { position: at });
+                window.dispatch_event(WindowEvent::PointerScrolled {
+                    position: at,
+                    delta_x: 0.0,
+                    delta_y: 4000.0,
+                });
+                window.dispatch_event(WindowEvent::PointerMoved {
+                    position: slint::LogicalPosition::new(560.0, 400.0),
+                });
+                assert_eq!(app.ui.get_dm_list_offset(), 0.0);
+                assert_eq!(app.ui.get_dm_notice_detail(), detail);
+            };
+            unavailable(
+                "direct-message store: dm store I/O failed on block-list.bin: \
+                 permission denied (os error 13)",
+            );
+            shot("14-dm-unavailable-detail.png");
+
+            // (15) A long error stays within five lines and scrolls in its box.
+            unavailable(
+                &"direct-message store: the conversation record did not decode. ".repeat(8),
+            );
+            shot("15-dm-unavailable-long-detail.png");
+        });
+    }
+
+    /// Each cause of messaging being unavailable reaches the window as its own
+    /// line, with the redacted error text beneath it for every cause but not
+    /// being connected.
+    #[test]
+    fn each_unavailable_cause_shows_its_line_and_detail() {
+        with_app(|app| {
+            let cases = [
+                (
+                    DmUnavailableCause::NotConnected,
+                    "no Veilid node",
+                    "Direct messages will start once you're connected.",
+                    "",
+                ),
+                (
+                    DmUnavailableCause::StoreUnopened,
+                    "refused locally: C:\\Users\\alice\\AppData\\dm",
+                    "Direct messages couldn't start because your saved conversations couldn't be opened.",
+                    "refused locally: <path>",
+                ),
+                (
+                    DmUnavailableCause::RunnerFailed,
+                    "direct-message store: /home/alice/dm/lock is a symlink",
+                    "Direct messages stopped because of an error. Restart the app to try again.",
+                    "direct-message store: <path> is a symlink",
+                ),
+                (
+                    DmUnavailableCause::Internal,
+                    "the runner panicked",
+                    "Direct messages stopped because of an internal error. Restart the app to try again.",
+                    "the runner panicked",
+                ),
+            ];
+            for (cause, detail, line, shown) in cases {
+                apply_net_event(
+                    &app.ui,
+                    &app.state,
+                    &app.browser,
+                    NetEvent::DmUnavailable(DmUnavailable::new(cause, detail)),
+                );
+                assert_eq!(app.ui.get_dm_notice(), line, "for {cause:?}");
+                assert_eq!(app.ui.get_dm_notice_detail(), shown, "for {cause:?}");
+            }
+            // A runner that reports clears both.
+            app.dm_event(RunnerEvent::Roster(Vec::new()));
+            assert_eq!(app.ui.get_dm_notice(), "");
+            assert_eq!(app.ui.get_dm_notice_detail(), "");
+        });
+    }
+
+    /// Mark `room`'s record unreadable or readable again, the way the drain does.
+    fn room_reach(app: &App, room: crate::net::RoomRecord, reachable: bool) {
+        apply_net_event(
+            &app.ui,
+            &app.state,
+            &app.browser,
+            NetEvent::RoomReach { room, reachable },
+        );
+    }
+
+    /// A circle that cannot be reached says so on its rail row and on its chat tab,
+    /// under the label its row shows, and both clear once it is reachable again.
+    #[test]
+    fn an_unreachable_circle_shows_on_its_row_and_its_chat() {
+        use crate::net::RoomRecord;
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            circle_joined(app, 1);
+            app.ui.invoke_switch_circle(1);
+            let label = app
+                .ui
+                .get_circles()
+                .row_data(1)
+                .expect("the circle row")
+                .name;
+            assert_eq!(app.ui.get_reach_room(), "", "control: reachable at first");
+
+            room_reach(app, RoomRecord::Circle(1), false);
+            let rows: Vec<bool> = app.ui.get_circles().iter().map(|c| c.unreachable).collect();
+            assert_eq!(rows, [false, true, false], "only that circle's row");
+            assert_eq!(
+                app.ui.get_reach_room(),
+                format!("Can't reach {label} right now. Retrying.")
+            );
+
+            room_reach(app, RoomRecord::Circle(1), true);
+            assert!(app.ui.get_circles().iter().all(|c| !c.unreachable));
+            assert_eq!(app.ui.get_reach_room(), "");
+        });
+    }
+
+    /// Draws a circle that cannot be reached, as its chat tab and rail row show it,
+    /// to `reach-shots` under the temporary directory. Run with `--ignored`.
+    #[test]
+    #[ignore = "writes PNG files; run on demand with --ignored"]
+    fn reach_screenshots() {
+        use crate::net::RoomRecord;
+        with_app(|app| {
+            let dir = std::env::temp_dir().join("reach-shots");
+            std::fs::create_dir_all(&dir).expect("create the shot directory");
+            two_rooms_two_conversations(app);
+            apply_net_event(
+                &app.ui,
+                &app.state,
+                &app.browser,
+                NetEvent::CircleJoined {
+                    circle_id: 1,
+                    asset_addr: daemonseed_core::cot::AssetAddr::from_bytes(
+                        [7u8; daemonseed_core::cot::ASSET_ADDR_LEN],
+                    ),
+                },
+            );
+            app.ui.invoke_switch_circle(1);
+            room_message(app, 1);
+            room_reach(app, RoomRecord::Circle(1), false);
+            let path = dir.join("reconnect-circle.png");
+            render_png(&app.window, path.to_str().expect("a UTF-8 path"));
+        });
+    }
+
+    /// Report that circle `circle_id` joined, the way the drain does.
+    fn circle_joined(app: &App, circle_id: u64) {
+        apply_net_event(
+            &app.ui,
+            &app.state,
+            &app.browser,
+            NetEvent::CircleJoined {
+                circle_id,
+                asset_addr: daemonseed_core::cot::AssetAddr::from_bytes(
+                    [7u8; daemonseed_core::cot::ASSET_ADDR_LEN],
+                ),
+            },
+        );
+    }
+
+    /// Report an error for circle `circle_id`, the way the drain does.
+    fn circle_error(app: &App, circle_id: u64, reason: &str) {
+        apply_net_event(
+            &app.ui,
+            &app.state,
+            &app.browser,
+            NetEvent::CircleError {
+                circle_id,
+                reason: reason.into(),
+            },
+        );
+    }
+
+    /// The label rail row `idx` shows.
+    fn row_name(app: &App, idx: usize) -> SharedString {
+        app.ui.get_circles().row_data(idx).expect("the row").name
+    }
+
+    /// Each room row's joining flag, in rail order.
+    fn room_joining(app: &App) -> Vec<bool> {
+        app.ui.get_circles().iter().map(|c| c.joining).collect()
+    }
+
+    /// An error for a circle that is not on screen names that circle on the status
+    /// line, by the label its rail row shows. An id no circle has keeps the
+    /// generic line.
+    #[test]
+    fn a_circle_error_names_the_circle_it_is_about() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            circle_joined(app, 2);
+            app.ui.invoke_switch_circle(1);
+            let other = row_name(app, 2);
+            assert!(!other.starts_with('#'), "control: the joined label");
+
+            circle_error(app, 2, "the network refused the subscribe");
+            assert_eq!(
+                app.ui.get_connection_status(),
+                format!("circle {other}: the network refused the subscribe")
+            );
+
+            circle_error(app, 99, "no such circle");
+            assert_eq!(app.ui.get_connection_status(), "circle: no such circle");
+        });
+    }
+
+    /// The composer and Send stay closed while the active circle has not joined,
+    /// and open once it has. The Lobby is always open.
+    #[test]
+    fn the_composer_opens_only_once_the_active_circle_has_joined() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            assert!(app.ui.get_can_send(), "control: the Lobby takes messages");
+            app.ui.invoke_focus_composer();
+            press(app, "a".into());
+            assert_eq!(app.ui.get_draft(), "a", "control: the Lobby composer types");
+            app.ui.set_draft("".into());
+
+            app.ui.invoke_switch_circle(1);
+            assert!(
+                !app.ui.get_can_send(),
+                "a circle still joining takes messages"
+            );
+            app.ui.invoke_focus_composer();
+            press(app, "b".into());
+            assert_eq!(app.ui.get_draft(), "", "a key reached a closed composer");
+            app.ui.set_draft("held".into());
+            app.ui.invoke_send_message("held".into());
+            assert_eq!(
+                app.ui.get_draft(),
+                "held",
+                "Send ran for a circle still joining"
+            );
+            app.ui.set_draft("".into());
+
+            circle_joined(app, 1);
+            assert!(app.ui.get_can_send(), "the joined circle stays closed");
+            app.ui.invoke_focus_composer();
+            press(app, "c".into());
+            assert_eq!(
+                app.ui.get_draft(),
+                "c",
+                "the joined circle's composer types"
+            );
+            app.ui.invoke_send_message("c".into());
+            assert_eq!(app.ui.get_draft(), "", "a send clears the composer");
+
+            app.ui.invoke_switch_circle(2);
+            assert!(!app.ui.get_can_send(), "the other circle has not joined");
+        });
+    }
+
+    /// A circle shows that it is joining from the moment it is added, still shows it
+    /// after a join refused for a reason that may pass while the retry waits, and
+    /// stops once it has joined. The join clears the circle's error from the status
+    /// line, and only that circle's.
+    #[test]
+    fn a_circle_shows_it_is_joining_until_it_joins() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            assert_eq!(room_joining(app), [false, true, true], "both circles join");
+            assert_eq!(
+                app.ui.get_joining_room(),
+                "",
+                "control: the Lobby is joined"
+            );
+
+            app.ui.invoke_switch_circle(1);
+            let pending = row_name(app, 1);
+            assert_eq!(app.ui.get_joining_room(), format!("Joining {pending}…"));
+
+            circle_error(app, 1, "the network refused the subscribe");
+            assert_eq!(
+                room_joining(app),
+                [false, true, true],
+                "a refusal keeps it joining"
+            );
+            assert_eq!(app.ui.get_joining_room(), format!("Joining {pending}…"));
+            assert_eq!(
+                app.ui.get_connection_status(),
+                format!("circle {pending}: the network refused the subscribe")
+            );
+
+            circle_joined(app, 1);
+            assert_eq!(room_joining(app), [false, false, true]);
+            assert_eq!(app.ui.get_joining_room(), "");
+            assert_eq!(
+                app.ui.get_connection_status(),
+                "connected · veilid",
+                "the stale error stayed after the join"
+            );
+
+            // Another circle's error stays when this one joins again.
+            circle_error(app, 2, "the network refused the subscribe");
+            let other = app.ui.get_connection_status();
+            circle_joined(app, 1);
+            assert_eq!(app.ui.get_connection_status(), other);
+        });
+    }
+
+    /// A circle that has never joined shows that it is joining, not that it cannot
+    /// be reached. Once joined, the unreachable state it was given shows.
+    #[test]
+    fn joining_wins_over_unreachable() {
+        use crate::net::RoomRecord;
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            app.ui.invoke_switch_circle(1);
+            room_reach(app, RoomRecord::Circle(1), false);
+            let row = app.ui.get_circles().row_data(1).expect("the circle row");
+            assert!(row.joining && !row.unreachable, "the row shows unreachable");
+            assert_eq!(app.ui.get_reach_room(), "", "the chat shows unreachable");
+            assert_ne!(app.ui.get_joining_room(), "");
+
+            circle_joined(app, 1);
+            let row = app.ui.get_circles().row_data(1).expect("the circle row");
+            assert!(!row.joining && row.unreachable);
+            assert_eq!(
+                app.ui.get_reach_room(),
+                format!("Can't reach {} right now. Retrying.", row.name)
+            );
+            assert_eq!(app.ui.get_joining_room(), "");
+        });
+    }
+
+    /// Draws a circle still joining after a join refused for a reason that may pass,
+    /// as its chat tab and rail row show it, to `joining-shots` under the temporary
+    /// directory. Run with `--ignored`.
+    #[test]
+    #[ignore = "writes PNG files; run on demand with --ignored"]
+    fn joining_screenshots() {
+        with_app(|app| {
+            let dir = std::env::temp_dir().join("joining-shots");
+            std::fs::create_dir_all(&dir).expect("create the shot directory");
+            two_rooms_two_conversations(app);
+            circle_joined(app, 2);
+            app.ui.invoke_switch_circle(1);
+            circle_error(app, 1, "the network refused the subscribe");
+            let path = dir.join("joining-circle.png");
+            render_png(&app.window, path.to_str().expect("a UTF-8 path"));
+        });
+    }
+
+    /// Report that the join of circle `circle_id` ended for good, the way the drain
+    /// does.
+    fn circle_join_failed(app: &App, circle_id: u64, reason: &str) {
+        apply_net_event(
+            &app.ui,
+            &app.state,
+            &app.browser,
+            NetEvent::CircleJoinFailed {
+                circle_id,
+                reason: reason.into(),
+            },
+        );
+    }
+
+    /// Each room row's could-not-join flag, in rail order.
+    fn room_join_failed(app: &App) -> Vec<bool> {
+        app.ui.get_circles().iter().map(|c| c.join_failed).collect()
+    }
+
+    /// A circle whose join ended for good stops showing that it is joining: its row
+    /// says it could not join, its chat names it and the reason, and its composer and
+    /// Send stay closed. A later join clears all of it.
+    #[test]
+    fn a_circle_whose_join_ends_for_good_says_why_until_it_joins() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            app.ui.invoke_switch_circle(1);
+            let name = row_name(app, 1);
+            assert_eq!(app.ui.get_joining_room(), format!("Joining {name}…"));
+            assert!(
+                !app.ui.get_joining_failed(),
+                "control: joining is no failure"
+            );
+
+            circle_join_failed(app, 1, "subscribe failed: refused for good");
+            assert_eq!(room_joining(app), [false, false, true]);
+            assert_eq!(room_join_failed(app), [false, true, false]);
+            assert_eq!(
+                app.ui.get_joining_room(),
+                format!("Couldn't join {name}: subscribe failed: refused for good")
+            );
+            assert!(app.ui.get_joining_failed());
+            assert!(
+                !app.ui.get_can_send(),
+                "a circle that could not join takes messages"
+            );
+            app.ui.invoke_focus_composer();
+            press(app, "a".into());
+            assert_eq!(app.ui.get_draft(), "", "a key reached a closed composer");
+
+            app.ui.invoke_switch_circle(2);
+            assert_eq!(
+                app.ui.get_joining_room(),
+                format!("Joining {}…", row_name(app, 2)),
+                "the failure followed the user to another circle"
+            );
+            assert!(!app.ui.get_joining_failed());
+            app.ui.invoke_switch_circle(1);
+
+            circle_joined(app, 1);
+            assert_eq!(room_join_failed(app), [false, false, false]);
+            assert_eq!(app.ui.get_joining_room(), "");
+            assert!(!app.ui.get_joining_failed());
+            assert!(app.ui.get_can_send(), "the joined circle stays closed");
+        });
+    }
+
+    /// Joining a phrase whose circle is already in the rail switches to that circle
+    /// and adds no row.
+    #[test]
+    fn joining_a_phrase_already_joined_switches_to_its_circle() {
+        with_app(|app| {
+            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let phrase = "abandon ability able about above absent absorb abstract absurd abuse access accident";
+            app.ui.invoke_submit_join(phrase.into());
+            assert_eq!(
+                app.ui.get_circles().row_count(),
+                2,
+                "control: the join adds a row"
+            );
+            assert_eq!(app.ui.get_active(), 1);
+            app.ui.invoke_switch_circle(0);
+            assert_eq!(app.ui.get_active(), 0);
+
+            app.ui.invoke_open_join();
+            app.ui.invoke_submit_join(format!(" {phrase} ").into());
+            assert_eq!(
+                app.ui.get_circles().row_count(),
+                2,
+                "the phrase added a second row for its circle"
+            );
+            assert_eq!(
+                app.ui.get_active(),
+                1,
+                "the join did not switch to the circle"
+            );
+            assert!(!app.ui.get_join_open(), "the join overlay stayed open");
+        });
+    }
+
+    /// When the active circle on the chat tab joins, its composer takes the keys. A
+    /// circle already joined that reports joining again leaves the focus where it is.
+    #[test]
+    fn the_composer_takes_the_keys_when_the_active_circle_joins() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            app.ui.invoke_switch_circle(1);
+            slint::platform::update_timers_and_animations();
+            press(app, "a".into());
+            assert_eq!(
+                app.ui.get_draft(),
+                "",
+                "control: the joining composer is closed"
+            );
+
+            circle_joined(app, 1);
+            slint::platform::update_timers_and_animations();
+            press(app, "b".into());
+            assert_eq!(
+                app.ui.get_draft(),
+                "b",
+                "the composer did not take the keys"
+            );
+
+            app.ui.invoke_open_join();
+            slint::platform::update_timers_and_animations();
+            press(app, "c".into());
+            assert_eq!(
+                app.ui.get_join_phrase(),
+                "c",
+                "control: the join field has the keys"
+            );
+            circle_joined(app, 1);
+            slint::platform::update_timers_and_animations();
+            press(app, "d".into());
+            assert_eq!(
+                app.ui.get_join_phrase(),
+                "cd",
+                "a repeated join took the keys from the join field"
+            );
+            assert_eq!(app.ui.get_draft(), "b");
+        });
+    }
+
+    /// A circle that joins for the first time while a dialog or overlay is open
+    /// leaves the keys where they are.
+    #[test]
+    fn a_first_join_under_an_overlay_leaves_the_focus_alone() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            app.ui.invoke_switch_circle(1);
+            slint::platform::update_timers_and_animations();
+            app.ui.invoke_open_join();
+            slint::platform::update_timers_and_animations();
+            press(app, "c".into());
+            assert_eq!(
+                app.ui.get_join_phrase(),
+                "c",
+                "control: the join field has the keys"
+            );
+
+            circle_joined(app, 1);
+            slint::platform::update_timers_and_animations();
+            press(app, "d".into());
+            assert_eq!(
+                app.ui.get_join_phrase(),
+                "cd",
+                "the first join took the keys from the join field"
+            );
+            assert_eq!(app.ui.get_draft(), "");
+        });
+    }
+
+    /// A circle that joins for the first time while the startup mask covers the
+    /// window leaves the keys where they are, so typing under the mask goes into
+    /// no hidden field.
+    #[test]
+    fn a_first_join_under_the_startup_mask_leaves_the_focus_alone() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            app.ui.invoke_switch_circle(1);
+            slint::platform::update_timers_and_animations();
+            app.ui.set_startup_overlay_open(true);
+
+            circle_joined(app, 1);
+            slint::platform::update_timers_and_animations();
+            press(app, "d".into());
+            assert_eq!(
+                app.ui.get_draft(),
+                "",
+                "the composer took the keys under the startup mask"
+            );
+        });
+    }
+
+    /// When the startup mask closes over the chat of a circle that joined beneath
+    /// it, the composer takes the keys.
+    #[test]
+    fn the_composer_takes_the_keys_when_the_startup_mask_closes() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            app.ui.invoke_switch_circle(1);
+            slint::platform::update_timers_and_animations();
+            app.ui.set_startup_overlay_open(true);
+            circle_joined(app, 1);
+            slint::platform::update_timers_and_animations();
+            press(app, "d".into());
+            assert_eq!(app.ui.get_draft(), "", "control: no field has the keys");
+
+            app.ui.set_startup_overlay_open(false);
+            slint::platform::update_timers_and_animations();
+            press(app, "e".into());
+            assert_eq!(
+                app.ui.get_draft(),
+                "e",
+                "the composer did not take the keys when the mask closed"
+            );
+        });
+    }
+
+    /// A dialog open when the startup mask closes keeps the keys: the composer
+    /// behind it does not take them. Each dialog is checked on its own.
+    #[test]
+    fn a_dialog_open_when_the_startup_mask_closes_keeps_the_keys() {
+        let dialogs = [
+            "new",
+            "rename",
+            "phrase-prompt",
+            "leave-confirm",
+            "palette",
+            "about",
+            "publish",
+            "sheet",
+            "desktop-prompt",
+        ];
+        for dialog in dialogs {
+            with_app(move |app| {
+                two_rooms_two_conversations(app);
+                app.ui.invoke_switch_circle(1);
+                slint::platform::update_timers_and_animations();
+                app.ui.set_startup_overlay_open(true);
+                circle_joined(app, 1);
+                slint::platform::update_timers_and_animations();
+                match dialog {
+                    "new" => app.ui.set_new_open(true),
+                    "rename" => app.ui.set_rename_open(true),
+                    "phrase-prompt" => app.ui.set_phrase_prompt_open(true),
+                    "leave-confirm" => app.ui.set_leave_confirm_open(true),
+                    "palette" => app.ui.set_palette_open(true),
+                    "about" => app.ui.set_about_open(true),
+                    "publish" => app.ui.set_publish_open(true),
+                    "sheet" => app.ui.set_sheet_open(true),
+                    _ => app.ui.set_desktop_prompt_open(true),
+                }
+                slint::platform::update_timers_and_animations();
+
+                app.ui.set_startup_overlay_open(false);
+                slint::platform::update_timers_and_animations();
+                press(app, "e".into());
+                assert_eq!(
+                    app.ui.get_draft(),
+                    "",
+                    "the composer took the keys from the {dialog} dialog when the mask closed"
+                );
+            });
+        }
+    }
+
+    /// With the Join dialog and a dialog above it both open when the startup mask
+    /// closes, the Join phrase field does not take the keys from the dialog above.
+    #[test]
+    fn the_join_field_does_not_take_the_keys_from_a_dialog_above_it() {
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            app.ui.set_startup_overlay_open(true);
+            app.ui.set_join_open(true);
+            app.ui.set_desktop_prompt_open(true);
+            slint::platform::update_timers_and_animations();
+
+            app.ui.set_startup_overlay_open(false);
+            slint::platform::update_timers_and_animations();
+            press(app, "e".into());
+            assert_eq!(
+                app.ui.get_join_phrase(),
+                "",
+                "the Join field took the keys from the dialog above it"
+            );
+        });
+    }
+
+    /// Fold the next join failure the network thread reports, the way the drain
+    /// does, and return the circle it names, or `None` if none arrives within five
+    /// seconds.
+    fn fold_next_join_failure(app: &App) -> Option<u64> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let event = app
+                .net
+                .borrow_mut()
+                .try_recv()
+                .expect("the network thread is running");
+            match event {
+                Some(NetEvent::CircleJoinFailed { circle_id, reason }) => {
+                    circle_join_failed(app, circle_id, &reason);
+                    return Some(circle_id);
+                }
+                Some(_) => {}
+                None => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// Joining the phrase of a circle whose join ended for good starts its join
+    /// again: the circle shows that it is joining, and its join is sent once more.
+    /// With no connection, each join ends for good.
+    #[test]
+    fn joining_the_phrase_of_a_failed_circle_joins_it_again() {
+        with_app(|app| {
+            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let phrase = "abandon ability able about above absent absorb abstract absurd abuse access accident";
+            app.ui.invoke_submit_join(phrase.into());
+            let circle_id = fold_next_join_failure(app).expect("a join failure arrived");
+            assert_eq!(
+                room_join_failed(app),
+                [false, true],
+                "control: the join with no connection ended for good"
+            );
+            app.ui.invoke_switch_circle(0);
+
+            app.ui.invoke_open_join();
+            app.ui.invoke_submit_join(phrase.into());
+            assert_eq!(app.ui.get_circles().row_count(), 2);
+            assert_eq!(app.ui.get_active(), 1);
+            assert_eq!(room_join_failed(app), [false, false], "the failure stayed");
+            assert_eq!(room_joining(app), [false, true]);
+            assert_eq!(
+                fold_next_join_failure(app),
+                Some(circle_id),
+                "the join was not sent again"
+            );
+            assert_eq!(room_join_failed(app), [false, true]);
+        });
+    }
+
+    /// A new connection clears every room's reach state, through the event the
+    /// drain folds: the chat line and the row both go.
+    #[test]
+    fn a_new_connection_clears_the_reach_state() {
+        use crate::net::RoomRecord;
+        with_app(|app| {
+            two_rooms_two_conversations(app);
+            circle_joined(app, 1);
+            app.ui.invoke_switch_circle(1);
+            room_reach(app, RoomRecord::Circle(1), false);
+            assert_ne!(app.ui.get_reach_room(), "", "control: the line shows");
+            let row = app.ui.get_circles().row_data(1).expect("the circle row");
+            assert!(row.unreachable, "control: the row shows unreachable");
+
+            apply_net_event(&app.ui, &app.state, &app.browser, NetEvent::Connected);
+            assert_eq!(app.ui.get_reach_room(), "");
+            assert_eq!(app.ui.get_circles().row_count(), 3);
+            assert!(app.ui.get_circles().iter().all(|c| !c.unreachable));
+        });
+    }
+
+    /// Draws a circle whose join ended for good, as its chat tab and rail row show
+    /// it, to `joining-shots` under the temporary directory. Run with `--ignored`.
+    #[test]
+    #[ignore = "writes PNG files; run on demand with --ignored"]
+    fn join_failed_screenshots() {
+        with_app(|app| {
+            let dir = std::env::temp_dir().join("joining-shots");
+            std::fs::create_dir_all(&dir).expect("create the shot directory");
+            two_rooms_two_conversations(app);
+            circle_joined(app, 2);
+            app.ui.invoke_switch_circle(1);
+            circle_join_failed(
+                app,
+                1,
+                "subscribe failed: the network refused the record for good",
+            );
+            let path = dir.join("join-failed.png");
+            render_png(&app.window, path.to_str().expect("a UTF-8 path"));
         });
     }
 }

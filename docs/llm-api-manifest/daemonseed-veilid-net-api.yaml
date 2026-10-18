@@ -243,6 +243,11 @@ modules:
     no_std: false
     depends_on:
       - daemonseed_veilid_net::dm::push
+  - name: daemonseed_veilid_net::dm::unavailable
+    description: >-
+      Why direct messaging cannot run, as a typed cause with the error text
+      behind it, redacted of filesystem paths and key-like tokens when built.
+    no_std: false
   - name: daemonseed_veilid_net::dm::view
     description: >-
       The direct-message view model a front end draws from: DmState folds each
@@ -320,6 +325,14 @@ types:
       The engine's terminal outcome the frontend folds — Complete{files,bytes},
       TransientFailed (retain + mark Unresolved + park), IntegrityFailed (staging
       destroyed + poison flag; no mark/park), LocalFailed (retain; surface only).
+  - name: RepairOutcome
+    module: daemonseed_veilid_net::rendezvous
+    kind: enum
+    description: >-
+      How a repair that re-opened and re-watched a record ended — Complete (every
+      slot read of the re-sweep succeeded), Partial { attempted: u32, failed: u32 }
+      (that many of the attempted slot reads failed), AlreadyRunning (a repair of
+      the same record was in flight, so nothing was done). RepairOutcome::of_sweep(&SweepOutcome) maps a re-sweep.
   - name: VeilidNet
     module: daemonseed_veilid_net::actor
     kind: struct
@@ -493,6 +506,9 @@ types:
       this node holds no such record; the default calls open_channel),
       rewatch_channel(&mut self, &lookup key) -> Result<(), RecordError> (registers
       a dead watch again; default Ok, watching nothing),
+      take_registered_watches(&mut self) -> Vec<lookup key> (the lookup keys of
+      channels whose watch a read registered, or rewatch_channel registered again,
+      since the last call; default empty),
       unwatch_channel(&mut self, &lookup key) -> Result<(), RecordError> (cancels
       the watch, as a delete does; default Ok), watch_reads(&mut self, bool)
       (whether a read of a correspondent's channel registers a watch; the runner
@@ -573,11 +589,23 @@ types:
       RequestPreview{request, messages: Vec<ReceivedMessage>, read_at (Unix ms)},
       StartedOver{request, from}, Message{from, seq, body, sent_at (Unix ms, the
       sender's clock, carried inside the message's encryption), received_at (Unix
-      ms, stamped by the runner)} — emitted as each ring slot opens, once the
-      store has recorded it read, Sent{token, peer, seq}, Deleted{token, peer},
+      ms, the system clock as the runner read it, never earlier within a run than
+      a time it already read except after the system clock steps back by more
+      than five minutes, which it follows)} — emitted as each ring slot opens,
+      once the store has recorded it read, Sent{token, peer, seq, sent_at (Unix
+      ms, on the clock received_at is read from: the time an established send's
+      commit read; for a first contact or an acceptance's reply the time its
+      outbox entry records, in whole seconds, or the attempt's time once the
+      entry is collected)}, Deleted{token, peer},
       Delivered{peer, through_seq}, Accepted{peer}, Refused{token:
       Option<CommandToken>, reason: Refusal}, Health(HealthCounters),
-      BlockList(Vec<IdentityPk>), BlockListUnreadable. Every command with a token
+      Advert{published: bool}, BlockList(Vec<IdentityPk>), BlockListUnreadable.
+      Advert reports whether this side's advert is on the network as far as an
+      advert pass could tell: after the startup pass where it could tell, then
+      whenever a later pass finds otherwise. published is true where the bytes
+      read back are the current advert or a rewrite was taken, and false where
+      an advert could not be built or a rewrite was not taken; a pass decided by
+      sequence numbers alone reports nothing. Every command with a token
       is answered by Sent, Deleted or Refused. Health is emitted once at startup
       and then when a counter changes, at most once per scheduled wake. BlockList
       lists every blocked identity in ascending byte order: once at startup
@@ -973,7 +1001,11 @@ types:
     kind: struct
     description: >-
       The direct-messaging state one session has accumulated from runner events:
-      running (bool — a runner is reporting), requests (Vec<DmContactRequest>, one
+      running (bool — a runner is reporting), unavailable (Option<DmUnavailable> —
+      set by mark_unavailable(DmUnavailable) when no runner could start or the last
+      one ended with an error or panicked, cleared by the next Roster), advert_unpublished (bool — set by
+      Advert{published: false}, cleared by Advert{published: true} and by stop),
+      requests (Vec<DmContactRequest>, one
       per identity, oldest first, at most DM_REQUEST_CAP), correspondences
       (BTreeMap<IdentityPk, DmCorrespondence>), labels (BTreeMap<CorrespondenceLabel,
       IdentityPk>), outstanding (BTreeMap<CommandToken, DmOutstanding>), blocked
@@ -990,6 +1022,28 @@ types:
       outstanding bodies oldest first; accepting(&ContactRequestId) -> bool; stop() ->
       usize clears what the runner held and returns how many messages went unanswered.
       Debug prints no body and no identity key.
+  - name: DmUnavailableCause
+    module: daemonseed_veilid_net::dm::unavailable
+    kind: enum
+    description: >-
+      Why direct messaging cannot run, as a front end words it: NotConnected (no
+      Veilid node), StoreUnopened (the record store could not be opened or built,
+      or no profile root), RunnerFailed (the runner ended with an error), Internal
+      (a runner or start/end task panic, or direct-message keys that did not
+      derive). Copy.
+  - name: DmUnavailable
+    module: daemonseed_veilid_net::dm::unavailable
+    kind: struct
+    description: >-
+      A DmUnavailableCause with the redacted text of the error behind it. new(cause,
+      detail: &str) redacts the detail with redact_detail;
+      with_redactions(cause, detail: &str, literals: &[&str]) also replaces each
+      literal, less the path separators that end it, of two or more characters,
+      other than one made only of dots, with
+      "<path>" where it stands as a whole path component, longest first, before
+      redact_detail; both drop the detail for NotConnected. cause() ->
+      DmUnavailableCause; detail() -> &str (empty for NotConnected); shown_detail()
+      -> Option<&str> is None for NotConnected or empty text, else the detail.
   - name: DmCorrespondence
     module: daemonseed_veilid_net::dm::view
     kind: struct
@@ -997,9 +1051,9 @@ types:
       One conversation as the runner has reported it: label (Option<CorrespondenceLabel>),
       state (Option<ConversationState>), peer_collected (u64 — the roster's cursor),
       delivered_through (Option<u64>), thread (Vec<DmThreadRow> in conversation
-      order: each direction in sequence order, the two interleaved by send time to
-      the whole second, a row heard of later going after one sent in the same
-      second), refusal (Option<Refusal>
+      order: each direction in sequence order, the two interleaved by this side's
+      clock, a Received row by received_at_ms and a Sent row by sent_at_ms, a row
+      heard of later going after one held at the same millisecond), refusal (Option<Refusal>
       — cleared by a send that goes through), last_activity (u64). delivered(seq) -> bool
       is true below peer_collected or at or below delivered_through.
   - name: DmThreadRow
@@ -1009,9 +1063,13 @@ types:
       One row of a conversation's thread: Received { seq, body, sent_at_ms,
       received_at_ms } or Sent { seq, body: Option<String>, sent_at_ms }, body None
       for a message this session did not compose. A Received sent_at_ms is the
-      sender's time, held at received_at_ms when the sender's clock put it later;
-      a Sent sent_at_ms is this side's clock when the runner reported it sent, or
-      first listed it where this session did not send it.
+      sender's time, held at received_at_ms when the sender's clock put it later,
+      and sets only the shown age; received_at_ms is this side's collection time
+      (a preview's read_at for a previewed message) and sets the row's place. A
+      Sent sent_at_ms is the commit time RunnerEvent::Sent reports, raised for an
+      acceptance's reply to the latest place time already in the thread, or, for
+      the first message of a refused first contact that left a conversation, when
+      that conversation was first listed; it sets the row's place.
     variants: ["Received { seq, body, sent_at_ms, received_at_ms }", "Sent { seq, body, sent_at_ms }"]
   - name: DmContactRequest
     module: daemonseed_veilid_net::dm::view
@@ -1051,6 +1109,24 @@ types:
 # ─────────────────────────────────────────────────────────────────────
 
 functions:
+  # ── dm::unavailable ──────────────────────────────────────────────────
+  - name: redact_detail
+    module: daemonseed_veilid_net::dm::unavailable
+    description: >-
+      Error text with every absolute, home-relative or Windows path that begins a
+      word and the home directory replaced by "<path>", and every run of 32 or more
+      hex/base64 characters that holds a digit, is all hex, mixes upper and lower
+      case, or holds 40 or more letters and digits in a row replaced by
+      "<redacted>".
+    signature: "pub fn redact_detail(text: &str) -> String"
+    parameters:
+      - name: text
+        type: "&str"
+        direction: in
+        description: The error text to redact.
+    returns:
+      type: String
+      description: The redacted text.
   # ── dm::view ─────────────────────────────────────────────────────────
   - name: dm_fingerprint
     module: daemonseed_veilid_net::dm::view
@@ -1244,18 +1320,21 @@ functions:
   - name: VeilidNetHandle::repair_rendezvous
     module: daemonseed_veilid_net::actor
     description: Re-establish a rendezvous record's session under its record_lock — invalidate the open-cache entry, re-open, re-watch, and full re-sweep. Re-swept backlog arrives as VeilidNetEvent::Inbound.
-    signature: "pub async fn repair_rendezvous(&self, owner: RendezvousOwner) -> Result<()>"
+    signature: "pub async fn repair_rendezvous(&self, owner: RendezvousOwner) -> Result<RepairOutcome>"
     parameters:
       - name: owner
         type: RendezvousOwner
         direction: in
         description: The record's rendezvous owner.
     returns:
-      type: "Result<()>"
+      type: "Result<RepairOutcome>"
       description: >-
-        Ok once the repair is dispatched. A PublicOnly owner re-opens read-only, and a
-        record that cannot be found is an error here rather than a state to wait out — a
-        repair re-establishes a session that was working.
+        Answers once the repair has finished: Complete when every slot read of the
+        re-sweep succeeded, Partial { attempted, failed } when any failed,
+        AlreadyRunning at once when a repair of the same record is in flight. Err when the re-open or re-watch
+        failed. A PublicOnly owner re-opens read-only, and a record that cannot be found
+        is an error here rather than a state to wait out — a repair re-establishes a
+        session that was working.
   - name: VeilidNetHandle::rendezvous_record_key
     module: daemonseed_veilid_net::actor
     description: Derive a rendezvous record's RecordKey from its owner locally (no network) — the owner→key resolution the self-heal needs.
@@ -2122,6 +2201,16 @@ error_types:
 # ─────────────────────────────────────────────────────────────────────
 
 constants:
+  - name: REDACTED_PATH
+    module: daemonseed_veilid_net::dm::unavailable
+    type: "&str"
+    value: '"<path>"'
+    description: What replaces a filesystem path in a DmUnavailable's detail.
+  - name: REDACTED_TOKEN
+    module: daemonseed_veilid_net::dm::unavailable
+    type: "&str"
+    value: '"<redacted>"'
+    description: What replaces a long key-like token in a DmUnavailable's detail.
   - name: DM_REQUEST_CAP
     module: daemonseed_veilid_net::dm::view
     type: usize

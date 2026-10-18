@@ -103,7 +103,7 @@ use daemonseed_core::public_room::{
 };
 use daemonseed_core::route_guard::ImportedRouteGuard;
 use daemonseed_core::session_health::{
-    RepairDecision, SessionHealthTracker, SweepHealthInput, WatchState, Weather,
+    REPAIR_K_THRESHOLD, RepairDecision, SessionHealthTracker, SweepHealthInput, WatchState, Weather,
 };
 use daemonseed_core::share_announce::{
     AnnouncementFields, derive_root_commitment, derive_share_id_v2, derive_share_root_nonce,
@@ -124,18 +124,20 @@ use daemonseed_veilid_net::dm::runner::{
     CommandToken, Refusal, RunnerCommand, RunnerConfig, RunnerEvent, RunnerHandle, RunnerParts,
     ShutdownOutcome, spawn_runner,
 };
+use daemonseed_veilid_net::dm::unavailable::{DmUnavailable, DmUnavailableCause};
 use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download};
 use daemonseed_veilid_net::{
     CLOSE_FLUSH_FLOOR, CLOSE_PREFLUSH_BUDGET, DiscoveryEnvelope, FetchErrorClass, OwnerSeed,
-    PresenceBoundary, RecordKey, RendezvousOwner, RouteBudget, RouteId, SharerKey, TEARDOWN_CAP,
-    VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
+    PresenceBoundary, RecordKey, RendezvousOwner, RepairOutcome, RouteBudget, RouteId, SharerKey,
+    TEARDOWN_CAP, VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
     next_resweep_record, verify_route_advert,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::app::IndexerStatus;
 use crate::net::{
-    DmSessionKeys, NetCommand, NetEvent, RootKind, ShareManifestEntry, resolve_share_folder,
+    DmSessionKeys, NetCommand, NetEvent, RoomRecord, RootKind, ShareManifestEntry,
+    resolve_share_folder,
 };
 
 /// Reported for [`NetEvent::Connected::version`]: the Veilid transport carries
@@ -405,6 +407,9 @@ pub async fn veilid_net_actor(
     // warmup: enqueued here (dedup by the tracker's latch) and drained one-at-a-time at
     // the cadence tick. One repair in flight at a time via `resweep_busy` (§RS-1.2).
     let mut pending_repairs: VecDeque<RecordKey> = VecDeque::new();
+    // Each record's run of ordinary passes that got no answer to any read, which
+    // decides when its room shows unreachable (`reach_after_sweep`).
+    let mut failed_passes: FailedPasses<RecordKey> = FailedPasses::default();
     // (#180 §RS-2, CRSH-ISC-8) Spawned share fetches report their generation-tagged outcome
     // here; the loop folds them on-loop (`fold_fetch_outcome`) so a slow/failing fetch never
     // parks the command loop and starves chat (#180 item 3). The actor holds a sender for
@@ -418,6 +423,10 @@ pub async fn veilid_net_actor(
     // local-disk) is disjoint from the browse fold's staleness dance.
     let (confirm_outcome_tx, mut confirm_outcome_rx) =
         tokio::sync::mpsc::unbounded_channel::<ConfirmOutcome>();
+    // Spawned repairs report how they ended here, so the loop folds each one into
+    // `failed_passes` and the room's reach (`fold_repair`).
+    let (repair_done_tx, mut repair_done_rx) =
+        tokio::sync::mpsc::unbounded_channel::<RepairDone<RecordKey>>();
     // (#180 §RS-3, CRSH-ISC-10) The in-use guard over discovered shares' imported routes
     // lives on `shares.route_guard`; the loop drains `shares.pending_route_releases` below.
 
@@ -430,6 +439,7 @@ pub async fn veilid_net_actor(
                 if matches!(cmd, NetCommand::Connect { .. }) {
                     connected_at = Some(Instant::now());
                     resweep_cursor = None;
+                    failed_passes.reset();
                 }
                 handle_command(
                     cmd, &evt_tx, &mut net, &mut ev_rx, &mut circles,
@@ -440,7 +450,7 @@ pub async fn veilid_net_actor(
             // Forward one runner event to the UI; the actor folds nothing. A `None`
             // means the runner has ended.
             dm_event = recv_dm(&mut dm), if dm.is_some() => {
-                on_dm_event(&mut dm, &evt_tx, dm_event);
+                on_dm_event(&mut dm, &mut dm_start, &evt_tx, dm_event, shares.profile_root.as_deref());
             }
             // A runner replaced off this loop has ended, and its successor, if one
             // was started, takes the slot.
@@ -449,7 +459,7 @@ pub async fn veilid_net_actor(
                 match started {
                     Ok(Some(handle)) => dm = Some(DmSession::new(handle, &evt_tx)),
                     Ok(None) => {}
-                    Err(e) => daemonseed_veilid_net::vtrace!("tui dm: runner start task failed ({e})"),
+                    Err(e) => on_dm_task_failed(&evt_tx, &e),
                 }
             }
             // (#180 §RS-2, CRSH-ISC-8/19) Fold a spawned fetch's generation-tagged outcome
@@ -465,6 +475,13 @@ pub async fn veilid_net_actor(
             // the download itself already ran in the spawned task, never awaited here.
             Some(outcome) = confirm_outcome_rx.recv() => {
                 fold_confirm_outcome(&mut shares, &evt_tx, outcome);
+            }
+            // A finished repair reports its room's reach, and one that reached the
+            // record ends the record's run of failed passes.
+            Some(done) = repair_done_rx.recv() => {
+                if let Some(event) = fold_repair(&mut failed_passes, done) {
+                    let _ = evt_tx.send(event);
+                }
             }
             // Only poll the Veilid event stream once connected.
             Some(ev) = recv_opt(&mut ev_rx), if ev_rx.is_some() => {
@@ -487,6 +504,19 @@ pub async fn veilid_net_actor(
                         watch: WatchState::Unknown,
                         weather,
                     };
+                    // A re-read that got an answer clears the room's reconnecting state,
+                    // and a run of re-reads that got none sets it, whether or not a
+                    // repair is let run.
+                    if let Some(event) = reach_after_sweep(
+                        &mut failed_passes,
+                        &key,
+                        &input,
+                        &record_key_owners,
+                        &shares,
+                        &circles,
+                    ) {
+                        let _ = evt_tx.send(event);
+                    }
                     match session_health.observe(key.clone(), input) {
                         RepairDecision::RepairDue => {
                             // Step 3b: re-establish the record's session (§RS-1.2). The
@@ -510,7 +540,16 @@ pub async fn veilid_net_actor(
                                         // so the next drain cannot double-dispatch this key.
                                         // Defense-in-depth with the drain re-check.
                                         pending_repairs.retain(|k| k != &key);
-                                        spawn_repair(handle, &resweep_busy, owner_seed);
+                                        let room = room_record(owner_seed, &shares, &circles);
+                                        spawn_repair(
+                                            handle,
+                                            &resweep_busy,
+                                            owner_seed,
+                                            key.clone(),
+                                            room,
+                                            failed_passes.generation(),
+                                            &repair_done_tx,
+                                        );
                                         daemonseed_veilid_net::vtrace!(
                                             "tui session-health: repairing dead record \
                                              ({} failed) — re-establishing session",
@@ -524,10 +563,15 @@ pub async fn veilid_net_actor(
                                         );
                                     }
                                 }
-                                None => daemonseed_veilid_net::vtrace!(
-                                    "tui session-health: repair-due for an unmapped record \
-                                     key — cannot resolve owner seed"
-                                ),
+                                None => {
+                                    // Dropped so the record is detected again once its
+                                    // owner is known, not left latched repair-due.
+                                    session_health.clear(&key);
+                                    daemonseed_veilid_net::vtrace!(
+                                        "tui session-health: repair-due for an unmapped record \
+                                         key — cannot resolve owner seed"
+                                    );
+                                }
                             }
                         }
                         RepairDecision::Suppressed => {
@@ -590,7 +634,16 @@ pub async fn veilid_net_actor(
                         if session_health.is_repair_due(&key) {
                             if let Some(&owner_seed) = record_key_owners.get(&key) {
                                 session_health.note_repair_dispatched(&key);
-                                spawn_repair(handle, &resweep_busy, owner_seed);
+                                let room = room_record(owner_seed, &shares, &circles);
+                                spawn_repair(
+                                    handle,
+                                    &resweep_busy,
+                                    owner_seed,
+                                    key.clone(),
+                                    room,
+                                    failed_passes.generation(),
+                                    &repair_done_tx,
+                                );
                                 daemonseed_veilid_net::vtrace!(
                                     "tui steady-resweep: draining a queued repair"
                                 );
@@ -760,20 +813,124 @@ type DmStart = tokio::task::JoinHandle<Option<RunnerHandle>>;
 
 /// Hand one runner event to the UI, or, where the runner has ended, empty the
 /// slot and say so.
+///
+/// An ended runner's task is awaited off the actor loop, on `dm_start`, so a
+/// later connect waits for it before opening the store again. Where it ended
+/// with an error, the error is traced and [`NetEvent::DmUnavailable`] follows.
 fn on_dm_event(
     dm: &mut Option<DmSession>,
+    dm_start: &mut Option<DmStart>,
     evt_tx: &UnboundedSender<NetEvent>,
     event: Option<RunnerEvent>,
+    profile_root: Option<&std::path::Path>,
 ) {
     match event {
         Some(event) => {
             let _ = evt_tx.send(NetEvent::Dm(Arc::new(event)));
         }
         None => {
-            *dm = None;
+            let ended = dm.take();
             let _ = evt_tx.send(NetEvent::DmStopped);
-            daemonseed_veilid_net::vtrace!("tui dm: runner ended");
+            let Some(session) = ended else {
+                return;
+            };
+            let previous = dm_start.take();
+            let reporter = evt_tx.clone();
+            let literals = profile_root_literals(profile_root);
+            *dm_start = Some(tokio::spawn(restart_dm(
+                previous,
+                None,
+                evt_tx.clone(),
+                async move {
+                    report_runner_end(session.handle, &reporter, &literals).await;
+                    None
+                },
+            )));
         }
+    }
+}
+
+/// Trace a runner start or end task that did not return. One that panicked
+/// may have left messaging without a runner, so [`NetEvent::DmUnavailable`]
+/// follows; one cancelled was stopped with the runtime, on request.
+fn on_dm_task_failed(evt_tx: &UnboundedSender<NetEvent>, e: &tokio::task::JoinError) {
+    daemonseed_veilid_net::vtrace!("tui dm: runner start task failed ({e})");
+    if e.is_panic() {
+        let _ = evt_tx.send(NetEvent::DmUnavailable(DmUnavailable::new(
+            DmUnavailableCause::Internal,
+            "the runner's start or end task panicked",
+        )));
+    }
+}
+
+/// The strings a direct-messaging error may name the profile root by: `root` as
+/// given and, where it resolves, its canonical form. Empty without a root.
+fn profile_root_literals(root: Option<&std::path::Path>) -> Vec<String> {
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    let mut literals = vec![root.to_string_lossy().into_owned()];
+    if let Ok(canonical) = std::fs::canonicalize(root) {
+        let canonical = canonical.to_string_lossy().into_owned();
+        if !literals.contains(&canonical) {
+            literals.push(canonical);
+        }
+    }
+    literals
+}
+
+/// [`DmUnavailable`] for `cause`, with `reason` redacted and each of `literals`
+/// in it replaced too.
+fn dm_unavailable(cause: DmUnavailableCause, reason: &str, literals: &[String]) -> DmUnavailable {
+    let literals: Vec<&str> = literals.iter().map(String::as_str).collect();
+    DmUnavailable::with_redactions(cause, reason, &literals)
+}
+
+/// Wait for a runner whose event stream has closed to end, trace how it
+/// ended, and send [`NetEvent::DmUnavailable`] where it ended with an error or
+/// panicked. The detail is redacted of `literals`, the profile root's names.
+async fn report_runner_end(
+    handle: RunnerHandle,
+    evt_tx: &UnboundedSender<NetEvent>,
+    literals: &[String],
+) {
+    let failure = match runner_outcome(handle, evt_tx).await {
+        ShutdownOutcome::Finished(Ok(())) | ShutdownOutcome::TimedOut(_) => None,
+        ShutdownOutcome::Finished(Err(e)) => {
+            Some((DmUnavailableCause::RunnerFailed, e.to_string()))
+        }
+        ShutdownOutcome::Panicked => Some((
+            DmUnavailableCause::Internal,
+            String::from("the runner panicked"),
+        )),
+    };
+    match failure {
+        Some((cause, reason)) => {
+            daemonseed_veilid_net::vtrace!("tui dm: runner ended ({reason})");
+            let _ = evt_tx.send(NetEvent::DmUnavailable(dm_unavailable(
+                cause, &reason, literals,
+            )));
+        }
+        None => daemonseed_veilid_net::vtrace!("tui dm: runner ended"),
+    }
+}
+
+/// Stop a runner and wait for its task to end, forwarding every event it had
+/// not delivered, and return how it ended. Never [`ShutdownOutcome::TimedOut`]:
+/// a task still in a flow call at the end of the grace period is awaited.
+async fn runner_outcome(
+    handle: RunnerHandle,
+    evt_tx: &UnboundedSender<NetEvent>,
+) -> ShutdownOutcome {
+    let stop = handle.shutdown().await;
+    forward_dm_events(evt_tx, stop.undelivered);
+    match stop.outcome {
+        ShutdownOutcome::TimedOut(end) => {
+            let rest = end.finish().await;
+            forward_dm_events(evt_tx, rest.undelivered);
+            rest.outcome
+        }
+        outcome => outcome,
     }
 }
 
@@ -783,17 +940,7 @@ fn on_dm_event(
 /// Where the shutdown's grace period runs out with a flow call in progress, the
 /// task is awaited to its end: until it ends it holds the profile's store open.
 async fn stop_runner(handle: RunnerHandle, evt_tx: &UnboundedSender<NetEvent>) {
-    let stop = handle.shutdown().await;
-    forward_dm_events(evt_tx, stop.undelivered);
-    let outcome = match stop.outcome {
-        ShutdownOutcome::TimedOut(end) => {
-            let rest = end.finish().await;
-            forward_dm_events(evt_tx, rest.undelivered);
-            rest.outcome
-        }
-        outcome => outcome,
-    };
-    match outcome {
+    match runner_outcome(handle, evt_tx).await {
         ShutdownOutcome::Finished(Err(e)) => {
             daemonseed_veilid_net::vtrace!("tui dm: runner ended with an error ({e})");
         }
@@ -821,7 +968,7 @@ async fn restart_dm(
         match previous.await {
             Ok(Some(started)) => stop_runner(started, &evt_tx).await,
             Ok(None) => {}
-            Err(e) => daemonseed_veilid_net::vtrace!("tui dm: runner start task failed ({e})"),
+            Err(e) => on_dm_task_failed(&evt_tx, &e),
         }
     }
     if let Some(old) = old {
@@ -907,7 +1054,7 @@ fn dm_after_connect(
         dm,
         dm_start,
         evt_tx,
-        dm_runner_over_veilid(net.clone(), keys, profile_root, own_handle),
+        dm_runner_over_veilid(net.clone(), keys, profile_root, own_handle, evt_tx.clone()),
     );
 }
 
@@ -915,22 +1062,50 @@ fn dm_after_connect(
 /// one: a started node, the profile's direct-messaging keys and its profile
 /// root.
 ///
-/// `None` without any of the three. A record store that will not build is
-/// traced, and messaging stays off for the connection.
+/// `None` without any of the three, or where the record store will not build,
+/// and messaging stays off for the connection. Each `None` is traced with its
+/// reason. Each is also answered with [`NetEvent::DmUnavailable`] except the one
+/// without keys: no profile is unlocked, or a derivation that failed already
+/// said so.
 async fn dm_runner_over_veilid(
     net: Option<VeilidNetHandle>,
     keys: Option<Box<DmSessionKeys>>,
     profile_root: Option<PathBuf>,
     own_handle: Option<String>,
+    evt_tx: UnboundedSender<NetEvent>,
 ) -> Option<RunnerHandle> {
-    let (Some(net), Some(keys), Some(profile_root)) = (net, keys, profile_root) else {
+    // The detail is redacted of `literals`, the profile root's names, once the root
+    // is known.
+    let not_started = |cause: DmUnavailableCause, reason: String, literals: &[String]| {
+        daemonseed_veilid_net::vtrace!("tui dm: runner not started ({reason})");
+        let _ = evt_tx.send(NetEvent::DmUnavailable(dm_unavailable(
+            cause, &reason, literals,
+        )));
+        None
+    };
+    let Some(keys) = keys else {
+        daemonseed_veilid_net::vtrace!("tui dm: runner not started (no direct-message keys)");
         return None;
+    };
+    let Some(profile_root) = profile_root else {
+        return not_started(
+            DmUnavailableCause::StoreUnopened,
+            String::from("no profile root"),
+            &[],
+        );
+    };
+    let literals = profile_root_literals(Some(&profile_root));
+    let Some(net) = net else {
+        return not_started(
+            DmUnavailableCause::NotConnected,
+            String::from("no Veilid node"),
+            &literals,
+        );
     };
     let parts = match net.dm_records_parts().await {
         Ok(parts) => parts,
         Err(e) => {
-            daemonseed_veilid_net::vtrace!("tui dm: runner not started ({e})");
-            return None;
+            return not_started(DmUnavailableCause::StoreUnopened, e.to_string(), &literals);
         }
     };
     let DmSessionKeys {
@@ -962,10 +1137,7 @@ async fn dm_runner_over_veilid(
             }
             Some(runner)
         }
-        Err(e) => {
-            daemonseed_veilid_net::vtrace!("tui dm: runner not started ({e})");
-            None
-        }
+        Err(e) => not_started(DmUnavailableCause::StoreUnopened, e.to_string(), &literals),
     }
 }
 
@@ -1397,12 +1569,70 @@ fn fail(evt_tx: &UnboundedSender<NetEvent>, message: String) {
     let _ = evt_tx.send(NetEvent::ConnectFailed { message });
 }
 
+/// The keys a lobby join needs: the room key and the owner seeds of the lobby's chat,
+/// share and presence records.
+struct LobbyKeys {
+    room_key: PublicRoomKey,
+    owner_seed: [u8; 32],
+    share_owner_seed: [u8; 32],
+    presence_owner_seed: [u8; 32],
+}
+
+/// The lobby's keys from their derivations, or the reason the lobby is refused.
+///
+/// Each of the three records is written by whoever holds its seed, so a failed
+/// derivation has no safe substitute: a fixed seed would put every affected client on
+/// one record that anyone can write. The first failure, in field order, is the reason.
+fn lobby_keys<E: std::fmt::Display>(
+    room_key: Result<PublicRoomKey, E>,
+    owner_seed: Result<[u8; 32], E>,
+    share_owner_seed: Result<[u8; 32], E>,
+    presence: Result<[u8; 32], E>,
+) -> Result<LobbyKeys, String> {
+    Ok(LobbyKeys {
+        room_key: room_key.map_err(|e| format!("room-key derivation failed: {e}"))?,
+        owner_seed: owner_seed.map_err(|e| format!("owner-seed derivation failed: {e}"))?,
+        share_owner_seed: share_owner_seed
+            .map_err(|e| format!("share owner-seed derivation failed: {e}"))?,
+        presence_owner_seed: presence_owner_seed(presence)?,
+    })
+}
+
+/// Refuse the lobby join: trace `reason` and show it to the user.
+fn refuse_lobby(evt_tx: &UnboundedSender<NetEvent>, reason: String) {
+    daemonseed_veilid_net::vtrace!("tui lobby: {reason}");
+    let _ = evt_tx.send(NetEvent::PublicRoomJoinFailed { message: reason });
+}
+
 /// Subscribe the world-derivable lobby / public-room rendezvous (Phase 3/4):
 /// derive the `PublicRoomKey` + the rendezvous-owner seed from the public room
 /// name + suite, subscribe the rendezvous record, and remember it so discovery
-/// items fold into the catalog. Best-effort: a derivation/subscribe failure is
-/// traced and leaves the lobby unset (publish/fetch then surface a clean error).
+/// items fold into the catalog. A key derivation failure is refused through
+/// [`refuse_lobby`]. A subscribe failure is traced and leaves the lobby unset
+/// (publish/fetch then surface a clean error).
 async fn subscribe_lobby(
+    shares: &mut ShareState,
+    net: &Option<VeilidNetHandle>,
+    evt_tx: &UnboundedSender<NetEvent>,
+    my_handle: &str,
+) {
+    subscribe_lobby_with(derive_lobby_keys, shares, net, evt_tx, my_handle).await;
+}
+
+/// Derive every key the default lobby needs.
+fn derive_lobby_keys() -> Result<LobbyKeys, String> {
+    lobby_keys(
+        derive_room_key(DEFAULT_ROOM, &CNSA_2_0),
+        derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).map(|s| *s.as_bytes()),
+        derive_room_share_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).map(|s| *s.as_bytes()),
+        derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).map(|s| *s.as_bytes()),
+    )
+}
+
+/// [`subscribe_lobby`] with the key derivation supplied by the caller. A failed
+/// derivation refuses the lobby before anything is subscribed or recorded.
+async fn subscribe_lobby_with(
+    derive: impl FnOnce() -> Result<LobbyKeys, String>,
     shares: &mut ShareState,
     net: &Option<VeilidNetHandle>,
     evt_tx: &UnboundedSender<NetEvent>,
@@ -1414,39 +1644,17 @@ async fn subscribe_lobby(
     let Some(handle) = net.as_ref() else {
         return;
     };
-    let room_key = match derive_room_key(DEFAULT_ROOM, &CNSA_2_0) {
-        Ok(k) => k,
-        Err(e) => {
-            daemonseed_veilid_net::vtrace!("tui lobby: room-key derivation failed: {e}");
-            return;
-        }
+    // Every key the lobby needs is derived before anything is subscribed, and a
+    // failure refuses the lobby where the user sees it.
+    let LobbyKeys {
+        room_key,
+        owner_seed,
+        share_owner_seed,
+        presence_owner_seed,
+    } = match derive() {
+        Ok(keys) => keys,
+        Err(reason) => return refuse_lobby(evt_tx, reason),
     };
-    let owner_seed = match derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0) {
-        Ok(s) => *s.as_bytes(),
-        Err(e) => {
-            daemonseed_veilid_net::vtrace!("tui lobby: owner-seed derivation failed: {e}");
-            return;
-        }
-    };
-    // The SHARE-discovery sibling record (#153) — a distinct, world-derivable
-    // rendezvous so share adverts never share the chat append-ring's record (the two
-    // subkey schemes overlapped and silently overwrote each other). Unlike presence
-    // (read-only), this is a WRITE record — publish_share advertises on it — so a
-    // [0u8;32] fallback would advertise on a predictable, world-writable record. Same
-    // KDF primitive as the chat owner seed, so a failure means the lobby is broken:
-    // bail rather than write to a zeros record.
-    let share_owner_seed = match derive_room_share_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0) {
-        Ok(s) => *s.as_bytes(),
-        Err(e) => {
-            daemonseed_veilid_net::vtrace!("tui lobby: share owner-seed derivation failed: {e}");
-            return;
-        }
-    };
-    // The PRESENCE sibling record (P1) — a distinct, world-derivable rendezvous so
-    // beacons never share the chat append-ring. Non-fatal on failure.
-    let presence_owner_seed = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
-        .map(|s| *s.as_bytes())
-        .unwrap_or([0u8; 32]);
     if let Err(e) = handle
         .subscribe_room(RendezvousOwner::held(owner_seed))
         .await
@@ -1509,6 +1717,27 @@ async fn join_circle(
     circles: &mut Vec<VeilidCircle>,
     next_circle_id: &mut u64,
 ) {
+    join_circle_with(
+        derive_joined_circle,
+        phrase,
+        evt_tx,
+        net,
+        circles,
+        next_circle_id,
+    )
+    .await;
+}
+
+/// [`join_circle`] with the circle derivation supplied by the caller. A failed
+/// derivation refuses the join before anything is subscribed or recorded.
+async fn join_circle_with(
+    derive: impl FnOnce(u64, &str) -> Result<VeilidCircle, String>,
+    phrase: &str,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+    circles: &mut Vec<VeilidCircle>,
+    next_circle_id: &mut u64,
+) {
     let err = |message: String| {
         let _ = evt_tx.send(NetEvent::CircleJoinFailed { message });
     };
@@ -1519,7 +1748,7 @@ async fn join_circle(
     // so nothing downstream can hold a circle assembled on different terms than a join
     // produces. The id is the one the join WOULD take; it is consumed only if the
     // subscribe below succeeds.
-    let candidate = match derive_joined_circle(*next_circle_id, phrase) {
+    let candidate = match derive(*next_circle_id, phrase) {
         Ok(c) => c,
         Err(message) => return err(message),
     };
@@ -1561,14 +1790,25 @@ async fn join_circle(
 /// never from other members and never transmitted. Pure, so the derivations a join runs
 /// are the derivations everything else runs. `Err` carries the message the join surfaces.
 fn derive_joined_circle(circle_id: u64, phrase: &str) -> Result<VeilidCircle, String> {
-    let cot_key = derive_cot_key(phrase, &CNSA_2_0)
-        .map_err(|e| format!("circle-key derivation failed: {e}"))?;
-    let owner_seed = *derive_circle_veilid_owner_seed(phrase, &CNSA_2_0)
-        .map_err(|e| format!("rendezvous-owner derivation failed: {e}"))?
-        .as_bytes();
-    let presence_owner_seed = *derive_circle_presence_veilid_owner_seed(phrase, &CNSA_2_0)
-        .map_err(|e| format!("presence-owner derivation failed: {e}"))?
-        .as_bytes();
+    joined_circle(
+        circle_id,
+        derive_cot_key(phrase, &CNSA_2_0),
+        derive_circle_veilid_owner_seed(phrase, &CNSA_2_0).map(|s| *s.as_bytes()),
+        derive_circle_presence_veilid_owner_seed(phrase, &CNSA_2_0).map(|s| *s.as_bytes()),
+    )
+}
+
+/// The circle a join assembles from its derivations, or the reason the join is
+/// refused. The first failure, in argument order, is the reason.
+fn joined_circle<E: std::fmt::Display>(
+    circle_id: u64,
+    cot_key: Result<CircleKey, E>,
+    owner_seed: Result<[u8; 32], E>,
+    presence: Result<[u8; 32], E>,
+) -> Result<VeilidCircle, String> {
+    let cot_key = cot_key.map_err(|e| format!("circle-key derivation failed: {e}"))?;
+    let owner_seed = owner_seed.map_err(|e| format!("rendezvous-owner derivation failed: {e}"))?;
+    let presence_owner_seed = presence_owner_seed(presence)?;
     let label = default_circle_label(&circle_fingerprint(&cot_key));
     Ok(VeilidCircle {
         circle_id,
@@ -1577,6 +1817,18 @@ fn derive_joined_circle(circle_id: u64, phrase: &str) -> Result<VeilidCircle, St
         presence_owner_seed,
         label,
     })
+}
+
+/// The owner seed of a presence record, or the reason a join is refused.
+///
+/// A presence record's address is the public key of the pair this seed derives, and
+/// writes to it are signed by the private half, so a failed derivation has no safe
+/// substitute: a fixed seed would put every affected client on one record that anyone
+/// can write. The caller refuses the join with the returned reason.
+fn presence_owner_seed<E: std::fmt::Display>(
+    derived: Result<[u8; 32], E>,
+) -> Result<[u8; 32], String> {
+    derived.map_err(|e| format!("presence-owner derivation failed: {e}"))
 }
 
 /// A stable per-circle fingerprint, used only to seed the deterministic
@@ -3262,36 +3514,228 @@ fn veilid_keepalive_interval() -> Duration {
     next_keepalive_interval()
 }
 
-/// Emit one sealed lobby presence beacon (#74) to the presence record, then reap
-/// the lobby tracker (the timer is the reap clock). A missing identity/lobby, a
-/// seal failure, or a closed transport is non-fatal — presence self-heals on the
-/// next tick. Lobby-only; circle presence is #77. The TUI does not push a roster
-/// event (it has none — it applies/reaps like the relay TUI); emitting is what
-/// makes this node visible on other clients' rosters.
-///
-/// The DHT publish is **spawned off the actor loop** (like `send_chat`, the #128
-/// D-0b pattern): awaiting the write's ack inline in the select arm would stall the
-/// loop for seconds every ~15–20 s. The reap is a fast in-memory op and stays inline.
 /// Spawn a one-shot **repair** of a dead rendezvous record session (§RS-1.2 step 3b),
 /// serialized with the steady resweep via `resweep_busy` (one repair/resweep in flight at
-/// a time). Fire-and-forget: the re-established backlog arrives as inbound events, and a
-/// transport error self-heals on the next detection cycle. The caller resets the
-/// session-health tracker (`note_repair_dispatched`) before this so the record re-detects
-/// on a fresh streak if the repair does not restore service.
-fn spawn_repair(
+/// a time). The re-established backlog arrives as inbound events. The repair's result is
+/// traced when it is not a full success and sent to `done_tx` as a [`RepairDone`] for
+/// `key`'s record and `room`, stamped with `generation`, the
+/// [`FailedPasses::generation`] when it was dispatched, which the event loop folds
+/// ([`fold_repair`]).
+/// The caller resets the session-health tracker (`note_repair_dispatched`) before this
+/// so the record re-detects on a fresh streak if the repair does not restore service.
+fn spawn_repair<K: Send + 'static>(
     handle: &VeilidNetHandle,
     resweep_busy: &Arc<std::sync::atomic::AtomicBool>,
     owner_seed: [u8; 32],
+    key: K,
+    room: Option<RoomRecord>,
+    generation: u64,
+    done_tx: &UnboundedSender<RepairDone<K>>,
 ) {
     resweep_busy.store(true, std::sync::atomic::Ordering::Release);
     let handle = handle.clone();
     let busy = resweep_busy.clone();
+    let done_tx = done_tx.clone();
     tokio::spawn(async move {
-        let _ = handle
+        let result = handle
             .repair_rendezvous(RendezvousOwner::held(owner_seed))
             .await;
+        match &result {
+            Ok(RepairOutcome::Partial { attempted, failed }) => daemonseed_veilid_net::vtrace!(
+                "tui session-health: repair of {room:?} left {failed} of {attempted} slot read(s) failing"
+            ),
+            Err(e) => {
+                daemonseed_veilid_net::vtrace!("tui session-health: repair of {room:?} failed: {e}")
+            }
+            Ok(RepairOutcome::Complete | RepairOutcome::AlreadyRunning) => {}
+        }
+        let _ = done_tx.send(RepairDone {
+            key,
+            room,
+            generation,
+            result,
+        });
         busy.store(false, std::sync::atomic::Ordering::Release);
     });
+}
+
+/// How a repair of `key`'s record ended, for the room the record belongs to, if
+/// one is known, and the [`FailedPasses::generation`] it was dispatched at.
+#[derive(Debug)]
+struct RepairDone<K> {
+    key: K,
+    room: Option<RoomRecord>,
+    generation: u64,
+    result: daemonseed_veilid_net::Result<RepairOutcome>,
+}
+
+/// Fold a finished repair: the [`NetEvent::RoomReach`] it reports ([`repair_reach`]),
+/// and, when it reached the record, the end of the record's run of failed passes, so
+/// the room shows unreachable again only after a full run. Nothing for a record no
+/// room is known by, and nothing for a repair older than the record's latest pass
+/// that attempted a read, or the latest reset ([`FailedPasses::is_current`]): what
+/// that pass showed, or the fresh start, stands.
+fn fold_repair<K: std::hash::Hash + Eq>(
+    passes: &mut FailedPasses<K>,
+    done: RepairDone<K>,
+) -> Option<NetEvent> {
+    if !passes.is_current(&done.key, done.generation) {
+        return None;
+    }
+    let event = repair_reach(done.room?, &done.result)?;
+    if matches!(
+        event,
+        NetEvent::RoomReach {
+            reachable: true,
+            ..
+        }
+    ) {
+        passes.runs.remove(&done.key);
+    }
+    Some(event)
+}
+
+/// The [`NetEvent::RoomReach`] a repair of `room`'s record reports, by the rule
+/// [`reads_reached`] states: unreachable when the repair failed, reachable when it
+/// completed, every read of its re-read answered, and for a partial repair whatever
+/// its re-read's reads show. A partial repair that attempted no read reports
+/// nothing, and neither does a request that found a repair of the record already
+/// running.
+fn repair_reach(
+    room: RoomRecord,
+    result: &daemonseed_veilid_net::Result<RepairOutcome>,
+) -> Option<NetEvent> {
+    let reachable = match result {
+        Ok(RepairOutcome::Complete) => true,
+        Ok(RepairOutcome::Partial { attempted, failed }) => reads_reached(*attempted, *failed)?,
+        Err(_) => false,
+        Ok(RepairOutcome::AlreadyRunning) => return None,
+    };
+    Some(NetEvent::RoomReach { room, reachable })
+}
+
+/// Consecutive ordinary passes of a room's record that get no answer to any read
+/// before the room shows unreachable.
+///
+/// Equal to the session-health tracker's repair threshold, so a room whose every
+/// read fails says it cannot be reached on the pass that makes its repair due,
+/// whether or not elevated weather lets the repair run. One pass is not enough: a
+/// single pass can lose every read to a routing fault that the next pass does not
+/// meet.
+const UNREACHABLE_AFTER_FAILED_PASSES: u32 = REPAIR_K_THRESHOLD;
+
+/// Whether `attempted` reads of a record, `failed` of them unanswered, reached it:
+/// `Some(true)` when at least one read was answered, `Some(false)` when every one
+/// failed, and `None` when none was attempted, which says nothing either way.
+/// The one reachability rule, for ordinary passes and repairs alike.
+fn reads_reached(attempted: u32, failed: u32) -> Option<bool> {
+    (attempted > 0).then_some(failed < attempted)
+}
+
+/// Each record's run of consecutive ordinary passes that got no answer to any read,
+/// and the generation of each record's latest pass that attempted a read.
+///
+/// The generation counts every pass folded that attempted a read and every reset,
+/// and no reset clears it, so a repair stamped with it when dispatched can be told
+/// apart from the passes and resets that followed it. A pass that attempted no
+/// read says nothing about the record, so it leaves a repair current.
+#[derive(Debug)]
+struct FailedPasses<K> {
+    runs: HashMap<K, u32>,
+    generation: u64,
+    latest: HashMap<K, u64>,
+    reset_at: u64,
+}
+
+impl<K> Default for FailedPasses<K> {
+    fn default() -> Self {
+        FailedPasses {
+            runs: HashMap::new(),
+            generation: 0,
+            latest: HashMap::new(),
+            reset_at: 0,
+        }
+    }
+}
+
+impl<K: std::hash::Hash + Eq> FailedPasses<K> {
+    /// The generation now: the one a repair dispatched now is stamped with.
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Start every run again, as a new connection does. A repair dispatched before
+    /// this is no longer current.
+    fn reset(&mut self) {
+        self.runs.clear();
+        self.latest.clear();
+        self.generation = self.generation.saturating_add(1);
+        self.reset_at = self.generation;
+    }
+
+    /// Whether a repair of `key`'s record stamped with `generation` is still
+    /// current: no reset, and no pass of that record that attempted a read, has
+    /// been folded since.
+    fn is_current(&self, key: &K, generation: u64) -> bool {
+        generation >= self.reset_at && self.latest.get(key).is_none_or(|&at| at <= generation)
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone> FailedPasses<K> {
+    /// Fold one ordinary pass of `key`'s record into its run, and return the reach the
+    /// pass shows: reachable when a read was answered, which ends the run;
+    /// unreachable once the run reaches [`UNREACHABLE_AFTER_FAILED_PASSES`]; nothing
+    /// for a pass that attempted no read or a run still short of that.
+    fn observe(&mut self, key: &K, input: &SweepHealthInput) -> Option<bool> {
+        let reached = reads_reached(input.attempted, input.failed)?;
+        self.generation = self.generation.saturating_add(1);
+        self.latest.insert(key.clone(), self.generation);
+        if reached {
+            self.runs.remove(key);
+            return Some(true);
+        }
+        let run = self.runs.entry(key.clone()).or_default();
+        *run = run.saturating_add(1);
+        (*run >= UNREACHABLE_AFTER_FAILED_PASSES).then_some(false)
+    }
+}
+
+/// The [`NetEvent::RoomReach`] an ordinary re-read of `key`'s record reports: the
+/// reach [`FailedPasses::observe`] gives the pass, for the room `owners` and the
+/// room state name the record by. Nothing for a record no room is known by.
+fn reach_after_sweep<K: std::hash::Hash + Eq + Clone>(
+    passes: &mut FailedPasses<K>,
+    key: &K,
+    input: &SweepHealthInput,
+    owners: &HashMap<K, [u8; 32]>,
+    shares: &ShareState,
+    circles: &[VeilidCircle],
+) -> Option<NetEvent> {
+    let reachable = passes.observe(key, input)?;
+    let room = room_record(*owners.get(key)?, shares, circles)?;
+    Some(NetEvent::RoomReach { room, reachable })
+}
+
+/// The room a subscribed record belongs to: the lobby, its share list, or a circle.
+/// `None` for a record that is none of these, such as a circle left since the record
+/// was subscribed.
+fn room_record(
+    owner_seed: [u8; 32],
+    shares: &ShareState,
+    circles: &[VeilidCircle],
+) -> Option<RoomRecord> {
+    if let Some(lobby) = shares.lobby.as_ref() {
+        if lobby.owner_seed == owner_seed {
+            return Some(RoomRecord::Lobby);
+        }
+        if lobby.share_owner_seed == owner_seed {
+            return Some(RoomRecord::LobbyShares);
+        }
+    }
+    circles
+        .iter()
+        .find(|c| c.owner_seed == owner_seed)
+        .map(|c| RoomRecord::Circle(c.circle_id))
 }
 
 /// Seal and publish ONE lobby presence beacon (WB-1 join / keepalive), spawning the
@@ -3454,6 +3898,16 @@ async fn publish_circle_leave(
     }
 }
 
+/// Emit one sealed lobby presence beacon (#74) to the presence record, then reap
+/// the lobby tracker (the timer is the reap clock). A missing identity/lobby, a
+/// seal failure, or a closed transport is non-fatal — presence self-heals on the
+/// next tick. Lobby-only; circle presence is #77. The TUI does not push a roster
+/// event (it has none — it applies/reaps like the relay TUI); emitting is what
+/// makes this node visible on other clients' rosters.
+///
+/// The DHT publish is **spawned off the actor loop** (like `send_chat`, the #128
+/// D-0b pattern): awaiting the write's ack inline in the select arm would stall the
+/// loop for seconds every ~15–20 s. The reap is a fast in-memory op and stays inline.
 fn emit_and_reap_lobby_presence(
     evt_tx: &UnboundedSender<NetEvent>,
     net: &Option<VeilidNetHandle>,
@@ -5178,10 +5632,12 @@ mod tests {
     /// slots can outlast a shutdown's grace period. `reading` turns true at the
     /// first read, which is how a test knows a flow call is in progress. `alive`
     /// is dropped with the store, and the store is dropped when the runner's task
-    /// ends, so its count is how a test sees that end.
+    /// ends, so its count is how a test sees that end. While `panicking` is true
+    /// a read panics.
     struct EmptyRecords {
         pause: Duration,
         reading: Arc<AtomicBool>,
+        panicking: Arc<AtomicBool>,
         alive: Arc<()>,
     }
 
@@ -5190,12 +5646,14 @@ mod tests {
             Self {
                 pause,
                 reading: Arc::new(AtomicBool::new(false)),
+                panicking: Arc::new(AtomicBool::new(false)),
                 alive: Arc::new(()),
             }
         }
 
         fn read(&self) {
             self.reading.store(true, Ordering::SeqCst);
+            assert!(!self.panicking.load(Ordering::SeqCst), "a planned panic");
             off_worker(|| std::thread::sleep(self.pause));
         }
 
@@ -5645,19 +6103,253 @@ mod tests {
             &evt_tx,
         ));
 
-        on_dm_event(&mut dm, &evt_tx, Some(RunnerEvent::Roster(Vec::new())));
+        let mut dm_start: Option<DmStart> = None;
+        on_dm_event(
+            &mut dm,
+            &mut dm_start,
+            &evt_tx,
+            Some(RunnerEvent::Roster(Vec::new())),
+            None,
+        );
         assert!(dm.is_some(), "forwarding an event emptied the slot");
         assert!(matches!(
             drain(&mut evt_rx).as_slice(),
             [NetEvent::Dm(event)] if matches!(**event, RunnerEvent::Roster(_))
         ));
 
-        on_dm_event(&mut dm, &evt_tx, None);
+        on_dm_event(&mut dm, &mut dm_start, &evt_tx, None, None);
         assert!(dm.is_none(), "an ended runner stayed in the slot");
-        assert!(matches!(
-            drain(&mut evt_rx).as_slice(),
-            [NetEvent::DmStopped]
+        assert!(dm_start.is_some(), "the ended runner's task is not awaited");
+        let started = wait_dm_start(&mut dm_start).await.expect("the end task");
+        assert!(started.is_none(), "ending a runner started another");
+        // Events the runner emitted before it ended follow the stop; a runner
+        // that ended without an error reports nothing unavailable.
+        let events = drain(&mut evt_rx);
+        assert!(
+            matches!(events.first(), Some(NetEvent::DmStopped)),
+            "the stop was not reported first: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, NetEvent::DmUnavailable(_))),
+            "a clean end reported messaging unavailable: {events:?}"
+        );
+    }
+
+    /// A runner whose task panics ends: the slot empties, the stop is
+    /// reported, and the panic follows as the reason messaging is unavailable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_that_panics_reports_it() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let records = EmptyRecords::new(Duration::ZERO);
+        records.panicking.store(true, Ordering::SeqCst);
+        let mut dm = Some(DmSession::new(
+            empty_runner(profile.path(), records, RunnerConfig::default()),
+            &evt_tx,
         ));
+        let mut dm_start: Option<DmStart> = None;
+
+        let ended = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if let Some(event) = recv_dm(&mut dm).await {
+                    drop(event);
+                    continue;
+                }
+                break;
+            }
+        })
+        .await;
+        assert!(ended.is_ok(), "the panicking runner's events did not end");
+        on_dm_event(&mut dm, &mut dm_start, &evt_tx, None, None);
+        let started = wait_dm_start(&mut dm_start).await.expect("the end task");
+        assert!(started.is_none(), "ending a runner started another");
+
+        let events = drain(&mut evt_rx);
+        let reasons: Vec<(DmUnavailableCause, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                NetEvent::DmUnavailable(why) => Some((why.cause(), why.detail())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [(DmUnavailableCause::Internal, "the runner panicked")],
+            "events: {events:?}"
+        );
+    }
+
+    /// A replacement chained onto a start or end task that panicked says
+    /// messaging is unavailable, once, and still runs what it was given.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_restart_after_a_panicked_task_reports_it() {
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let previous: DmStart = tokio::spawn(async { panic!("a planned panic") });
+        let started = restart_dm(Some(previous), None, evt_tx, async { None }).await;
+        assert!(started.is_none());
+        let reasons: Vec<(DmUnavailableCause, String)> = drain(&mut evt_rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                NetEvent::DmUnavailable(why) => Some((why.cause(), why.detail().to_owned())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [(
+                DmUnavailableCause::Internal,
+                "the runner's start or end task panicked".to_owned()
+            )]
+        );
+    }
+
+    /// A start or end task that panicked says messaging is unavailable; one
+    /// cancelled with the runtime says nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dm_task_that_panicked_reports_it() {
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let panicked: DmStart = tokio::spawn(async { panic!("a planned panic") });
+        let e = panicked.await.expect_err("the task panicked");
+        on_dm_task_failed(&evt_tx, &e);
+        let cancelled: DmStart = tokio::spawn(std::future::pending());
+        cancelled.abort();
+        let e = cancelled.await.expect_err("the task was cancelled");
+        on_dm_task_failed(&evt_tx, &e);
+        let reasons: Vec<(DmUnavailableCause, String)> = drain(&mut evt_rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                NetEvent::DmUnavailable(why) => Some((why.cause(), why.detail().to_owned())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [(
+                DmUnavailableCause::Internal,
+                "the runner's start or end task panicked".to_owned()
+            )]
+        );
+    }
+
+    /// A runner whose store will not open ends at startup: the slot empties,
+    /// the stop is reported, and the store's error follows as the reason
+    /// messaging is unavailable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_that_fails_to_start_reports_why() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        // A file where the profile directory should be, so the store's
+        // directory cannot be created beneath it.
+        let root = profile.path().join("not-a-directory");
+        std::fs::write(&root, b"").expect("the blocking file");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let mut dm = Some(DmSession::new(
+            empty_runner(
+                &root,
+                EmptyRecords::new(Duration::ZERO),
+                RunnerConfig::default(),
+            ),
+            &evt_tx,
+        ));
+        let mut dm_start: Option<DmStart> = None;
+
+        let ended = tokio::time::timeout(Duration::from_secs(30), recv_dm(&mut dm))
+            .await
+            .expect("the runner did not end");
+        assert!(ended.is_none(), "a runner with no store reported an event");
+        on_dm_event(&mut dm, &mut dm_start, &evt_tx, ended, None);
+        assert!(dm.is_none(), "an ended runner stayed in the slot");
+        let started = wait_dm_start(&mut dm_start).await.expect("the end task");
+        assert!(started.is_none(), "ending a runner started another");
+
+        let events = drain(&mut evt_rx);
+        assert!(
+            matches!(events.first(), Some(NetEvent::DmStopped)),
+            "the stop was not reported first: {events:?}"
+        );
+        let reasons: Vec<(DmUnavailableCause, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                NetEvent::DmUnavailable(why) => Some((why.cause(), why.detail())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons.len(), 1, "one unavailable report: {events:?}");
+        let (cause, detail) = reasons[0];
+        assert_eq!(cause, DmUnavailableCause::RunnerFailed);
+        assert!(
+            detail.starts_with("direct-message store:"),
+            "the reason does not name the store: {detail:?}"
+        );
+        let root_text = root.to_string_lossy();
+        assert!(
+            !detail.contains(&*root_text),
+            "the reason names the profile's path: {detail:?}"
+        );
+    }
+
+    /// A store error naming a profile root given as a relative path shows `<path>`
+    /// where the root was, which no path rule of the redaction finds on its own.
+    #[test]
+    fn a_relative_profile_root_is_redacted_from_the_detail() {
+        let error = "direct-message store: alice-profile/dm/lock is a symlink";
+        assert!(
+            DmUnavailable::new(DmUnavailableCause::RunnerFailed, error)
+                .detail()
+                .contains("alice-profile"),
+            "control: the redaction alone keeps a relative root"
+        );
+        let literals = profile_root_literals(Some(std::path::Path::new("alice-profile")));
+        let why = dm_unavailable(DmUnavailableCause::RunnerFailed, error, &literals);
+        assert!(why.detail().contains("<path>"), "{:?}", why.detail());
+        assert!(
+            !why.detail().contains("alice-profile"),
+            "{:?}",
+            why.detail()
+        );
+        assert!(profile_root_literals(None).is_empty());
+    }
+
+    /// A connect that cannot start a runner says which input it lacked, except
+    /// where no keys were given, as when no profile is unlocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_not_started_reports_why() {
+        let profile = tempfile::tempdir().expect("tempdir");
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let keys = || {
+            let identity =
+                derive_identity_keys(&Mnemonic::generate().expect("mnemonic"), Identity::Primary)
+                    .expect("identity derives");
+            Some(Box::new(DmSessionKeys {
+                signing: Arc::new(identity.signing),
+                dm_channel_root: identity.dm_channel_root,
+                at_rest_key: zeroize::Zeroizing::new([0x5a; 32]),
+            }))
+        };
+        let root = || Some(profile.path().to_path_buf());
+        for (keys, root) in [(None, root()), (keys(), None), (keys(), root())] {
+            let started = dm_runner_over_veilid(None, keys, root, None, evt_tx.clone()).await;
+            assert!(started.is_none(), "a runner started without a node");
+        }
+        let reasons: Vec<(DmUnavailableCause, String)> = drain(&mut evt_rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                NetEvent::DmUnavailable(why) => Some((why.cause(), why.detail().to_owned())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                (
+                    DmUnavailableCause::StoreUnopened,
+                    "no profile root".to_owned()
+                ),
+                (DmUnavailableCause::NotConnected, String::new()),
+            ]
+        );
     }
 
     /// `StopDm` stops the runner off the loop, and its task ends.
@@ -6148,6 +6840,605 @@ mod tests {
             Arc::strong_count(&alive),
             1,
             "the runner's task did not end"
+        );
+    }
+}
+
+#[cfg(test)]
+mod presence_seed_tests {
+    use super::presence_owner_seed;
+
+    /// A derived seed passes through unchanged.
+    #[test]
+    fn a_derived_presence_seed_is_used_as_derived() {
+        let seed = [7u8; 32];
+        assert_eq!(presence_owner_seed(Ok::<_, String>(seed)), Ok(seed));
+    }
+
+    /// A failed derivation refuses the join with the derivation error, and never
+    /// yields a seed to subscribe or publish under.
+    #[test]
+    fn a_failed_presence_derivation_refuses_the_join() {
+        let refused = presence_owner_seed::<String>(Err("hkdf expand failed".to_owned()));
+        assert_eq!(
+            refused,
+            Err("presence-owner derivation failed: hkdf expand failed".to_owned())
+        );
+    }
+}
+
+#[cfg(test)]
+mod repair_notice_tests {
+    use super::*;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn lobby_seeds() -> ([u8; 32], [u8; 32]) {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        (
+            *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+            *derive_room_share_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+        )
+    }
+
+    /// A share state subscribed to the default lobby.
+    fn shares_with_lobby() -> ShareState {
+        let (owner_seed, share_owner_seed) = lobby_seeds();
+        let mut shares = ShareState::new();
+        shares.lobby = Some(LobbyRendezvous {
+            room_key: derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap(),
+            owner_seed,
+            share_owner_seed,
+            presence_owner_seed: *derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+                .unwrap()
+                .as_bytes(),
+            presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
+        });
+        shares
+    }
+
+    /// A failed repair reports its room as unreachable and releases the repair slot.
+    /// The scripted handle answers no repair, so `repair_rendezvous` fails.
+    #[tokio::test]
+    async fn a_failed_repair_reports_its_room_unreachable() {
+        let (owner_seed, _) = lobby_seeds();
+        let handle = VeilidNetHandle::with_scripted_subscribes(|_| Ok(true));
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (done_tx, mut done_rx) = unbounded_channel();
+
+        spawn_repair(
+            &handle,
+            &busy,
+            owner_seed,
+            1u8,
+            Some(RoomRecord::Lobby),
+            0,
+            &done_tx,
+        );
+
+        let done = tokio::time::timeout(std::time::Duration::from_secs(5), done_rx.recv())
+            .await
+            .expect("a failed repair reports within the timeout")
+            .expect("the repair channel is open");
+        match fold_repair(&mut FailedPasses::default(), done) {
+            Some(NetEvent::RoomReach { room, reachable }) => {
+                assert_eq!(room, RoomRecord::Lobby);
+                assert!(!reachable, "a failed repair leaves the room unreachable");
+            }
+            other => panic!("expected RoomReach, got {other:?}"),
+        }
+        assert!(
+            !busy.load(std::sync::atomic::Ordering::Acquire),
+            "the repair slot is released after a failure"
+        );
+    }
+
+    /// Each repair result maps to the room's state: a complete repair reaches the room
+    /// and a failed one does not. A partial repair reaches it when any read of its
+    /// re-read was answered and not when every one failed. A partial repair that
+    /// attempted no read, and a repair already running, report nothing.
+    #[test]
+    fn a_repair_result_maps_to_the_rooms_reach() {
+        let reach = |result| match repair_reach(RoomRecord::Circle(3), &result) {
+            Some(NetEvent::RoomReach { room, reachable }) => {
+                assert_eq!(room, RoomRecord::Circle(3));
+                Some(reachable)
+            }
+            Some(other) => panic!("expected RoomReach, got {other:?}"),
+            None => None,
+        };
+        assert_eq!(reach(Ok(RepairOutcome::Complete)), Some(true));
+        let partial = |attempted, failed| Ok(RepairOutcome::Partial { attempted, failed });
+        assert_eq!(reach(partial(64, 2)), Some(true));
+        assert_eq!(reach(partial(64, 63)), Some(true), "one answer of 64");
+        assert_eq!(reach(partial(64, 64)), Some(false));
+        assert_eq!(reach(partial(0, 0)), None);
+        assert_eq!(
+            reach(Err(VeilidNetError::Routing("absent".to_owned()))),
+            Some(false)
+        );
+        assert_eq!(reach(Ok(RepairOutcome::AlreadyRunning)), None);
+    }
+
+    /// An ordinary pass of `attempted` reads, `failed` of them unanswered, in
+    /// `weather`.
+    fn pass_of(attempted: u32, failed: u32, weather: Weather) -> SweepHealthInput {
+        SweepHealthInput {
+            attempted,
+            failed,
+            found: 0,
+            watch: WatchState::Unknown,
+            weather,
+        }
+    }
+
+    /// The reachability rule: any answered read reaches the record, a pass whose every
+    /// read failed does not, and a pass that attempted none says nothing.
+    #[test]
+    fn a_record_is_reached_when_any_read_is_answered() {
+        assert_eq!(reads_reached(64, 0), Some(true));
+        assert_eq!(reads_reached(64, 63), Some(true), "one answer of 64");
+        assert_eq!(reads_reached(64, 64), Some(false));
+        assert_eq!(reads_reached(1, 1), Some(false));
+        assert_eq!(reads_reached(0, 0), None);
+    }
+
+    /// The reach an ordinary pass of record `key` reports for the lobby, through the
+    /// call the event loop makes, with `owners` mapping keys to owner seeds as the
+    /// steady re-sweep maps them. A `u8` stands in for the record key.
+    fn lobby_reach(
+        passes: &mut FailedPasses<u8>,
+        owners: &HashMap<u8, [u8; 32]>,
+        key: u8,
+        input: SweepHealthInput,
+    ) -> Option<bool> {
+        let shares = shares_with_lobby();
+        match reach_after_sweep(passes, &key, &input, owners, &shares, &[]) {
+            Some(NetEvent::RoomReach { room, reachable }) => {
+                assert_eq!(room, RoomRecord::Lobby);
+                Some(reachable)
+            }
+            Some(other) => panic!("expected RoomReach, got {other:?}"),
+            None => None,
+        }
+    }
+
+    /// A room shows unreachable after the K-th consecutive pass with no answered read,
+    /// in elevated weather as in calm, and not before. A pass with one answered read
+    /// in 64 shows it reachable and starts the run again; a pass that attempted no
+    /// read changes nothing.
+    #[test]
+    fn passes_with_no_answer_make_a_room_unreachable_and_one_answer_clears_it() {
+        assert_eq!(
+            UNREACHABLE_AFTER_FAILED_PASSES, 2,
+            "the rule below assumes K = 2"
+        );
+        let (owner_seed, _) = lobby_seeds();
+        let owners = HashMap::from([(1u8, owner_seed)]);
+        for weather in [Weather::Calm, Weather::Elevated] {
+            let mut passes = FailedPasses::default();
+            let reach = |passes: &mut FailedPasses<u8>, attempted, failed| {
+                lobby_reach(passes, &owners, 1, pass_of(attempted, failed, weather))
+            };
+            assert_eq!(
+                reach(&mut passes, 64, 64),
+                None,
+                "one failed pass ({weather:?})"
+            );
+            assert_eq!(reach(&mut passes, 0, 0), None, "a pass with no reads");
+            assert_eq!(reach(&mut passes, 64, 64), Some(false), "{weather:?}");
+            assert_eq!(reach(&mut passes, 64, 64), Some(false), "the run continues");
+            assert_eq!(reach(&mut passes, 0, 0), None, "a pass with no reads");
+            assert_eq!(
+                reach(&mut passes, 64, 63),
+                Some(true),
+                "one answer clears it"
+            );
+            assert_eq!(reach(&mut passes, 64, 64), None, "the run started again");
+        }
+    }
+
+    /// A repair dispatched before its record's latest pass, or before the latest
+    /// reset, changes nothing when it ends: what that pass showed, or the fresh
+    /// start, stands. A pass of another record leaves it current.
+    #[test]
+    fn a_repair_older_than_its_records_latest_pass_is_ignored() {
+        assert_eq!(
+            UNREACHABLE_AFTER_FAILED_PASSES, 2,
+            "the rule below assumes K = 2"
+        );
+        let (owner_seed, _) = lobby_seeds();
+        let owners = HashMap::from([(1u8, owner_seed)]);
+        let mut passes = FailedPasses::default();
+        let fail = |passes: &mut FailedPasses<u8>| {
+            lobby_reach(passes, &owners, 1, pass_of(64, 64, Weather::Calm))
+        };
+        let done = |generation, result| RepairDone {
+            key: 1u8,
+            room: Some(RoomRecord::Lobby),
+            generation,
+            result,
+        };
+        let reached = |event: Option<NetEvent>| match event {
+            Some(NetEvent::RoomReach { reachable, .. }) => Some(reachable),
+            None => None,
+            Some(other) => panic!("expected RoomReach, got {other:?}"),
+        };
+        assert_eq!(fail(&mut passes), None);
+        assert_eq!(fail(&mut passes), Some(false));
+        let dispatched = passes.generation();
+        lobby_reach(&mut passes, &owners, 2, pass_of(64, 64, Weather::Calm));
+        assert!(
+            passes.is_current(&1, dispatched),
+            "another record's pass left the repair current"
+        );
+        assert_eq!(fail(&mut passes), Some(false), "a later pass of the record");
+        let complete = done(dispatched, Ok(RepairOutcome::Complete));
+        assert_eq!(reached(fold_repair(&mut passes, complete)), None);
+        assert_eq!(fail(&mut passes), Some(false), "the run kept counting");
+
+        let current = passes.generation();
+        let complete = done(current, Ok(RepairOutcome::Complete));
+        assert_eq!(
+            reached(fold_repair(&mut passes, complete)),
+            Some(true),
+            "control: a current repair is folded"
+        );
+
+        let before_reset = passes.generation();
+        passes.reset();
+        let failed = |generation| {
+            done(
+                generation,
+                Err(VeilidNetError::Routing("absent".to_owned())),
+            )
+        };
+        assert_eq!(
+            reached(fold_repair(&mut passes, failed(before_reset))),
+            None
+        );
+        let current = passes.generation();
+        assert_eq!(
+            reached(fold_repair(&mut passes, failed(current))),
+            Some(false),
+            "control: a repair dispatched after the reset is folded"
+        );
+    }
+
+    /// A pass of the record that attempted no read, folded while its repair runs,
+    /// leaves the repair current, so what the repair finds is reported. A pass
+    /// that attempted reads makes it stale.
+    #[test]
+    fn a_pass_with_no_reads_leaves_a_running_repair_current() {
+        assert_eq!(
+            UNREACHABLE_AFTER_FAILED_PASSES, 2,
+            "the rule below assumes K = 2"
+        );
+        let (owner_seed, _) = lobby_seeds();
+        let owners = HashMap::from([(1u8, owner_seed)]);
+        let mut passes = FailedPasses::default();
+        let pass = |passes: &mut FailedPasses<u8>, attempted, failed| {
+            lobby_reach(
+                passes,
+                &owners,
+                1,
+                pass_of(attempted, failed, Weather::Calm),
+            )
+        };
+        assert_eq!(pass(&mut passes, 64, 64), None);
+        assert_eq!(pass(&mut passes, 64, 64), Some(false));
+        let dispatched = passes.generation();
+        assert_eq!(pass(&mut passes, 0, 0), None, "a pass with no reads");
+        assert!(
+            passes.is_current(&1, dispatched),
+            "a pass with no reads made the repair stale"
+        );
+        let complete = RepairDone {
+            key: 1u8,
+            room: Some(RoomRecord::Lobby),
+            generation: dispatched,
+            result: Ok(RepairOutcome::Complete),
+        };
+        assert!(
+            matches!(
+                fold_repair(&mut passes, complete),
+                Some(NetEvent::RoomReach {
+                    reachable: true,
+                    ..
+                })
+            ),
+            "the repair's reach was dropped"
+        );
+
+        let dispatched = passes.generation();
+        assert_eq!(pass(&mut passes, 64, 64), None);
+        assert!(
+            !passes.is_current(&1, dispatched),
+            "control: a pass with reads makes the repair stale"
+        );
+    }
+
+    /// A repair that reaches the record ends its run of failed passes, so the room
+    /// shows unreachable again only after a full run; a failed repair leaves the run
+    /// counting.
+    #[test]
+    fn a_repair_that_reaches_the_record_ends_its_run() {
+        assert_eq!(
+            UNREACHABLE_AFTER_FAILED_PASSES, 2,
+            "the rule below assumes K = 2"
+        );
+        let (owner_seed, _) = lobby_seeds();
+        let owners = HashMap::from([(1u8, owner_seed)]);
+        let mut passes = FailedPasses::default();
+        let fail = |passes: &mut FailedPasses<u8>| {
+            lobby_reach(passes, &owners, 1, pass_of(64, 64, Weather::Calm))
+        };
+        let repair = |passes: &mut FailedPasses<u8>, result| {
+            let done = RepairDone {
+                key: 1u8,
+                room: Some(RoomRecord::Lobby),
+                generation: passes.generation(),
+                result,
+            };
+            match fold_repair(passes, done) {
+                Some(NetEvent::RoomReach { room, reachable }) => {
+                    assert_eq!(room, RoomRecord::Lobby);
+                    reachable
+                }
+                other => panic!("expected RoomReach, got {other:?}"),
+            }
+        };
+        assert_eq!(fail(&mut passes), None);
+        assert_eq!(fail(&mut passes), Some(false), "control: K failed passes");
+
+        assert!(repair(&mut passes, Ok(RepairOutcome::Complete)));
+        assert_eq!(fail(&mut passes), None, "one failed pass after a repair");
+        assert_eq!(fail(&mut passes), Some(false));
+
+        let answered = Ok(RepairOutcome::Partial {
+            attempted: 64,
+            failed: 63,
+        });
+        assert!(repair(&mut passes, answered));
+        assert_eq!(fail(&mut passes), None, "one failed pass after a repair");
+        assert_eq!(fail(&mut passes), Some(false));
+
+        let failed = Err(VeilidNetError::Routing("absent".to_owned()));
+        assert!(!repair(&mut passes, failed));
+        assert_eq!(fail(&mut passes), Some(false), "the run kept counting");
+    }
+
+    /// A pass of a record the owners map does not hold, or one no room is known by,
+    /// reports nothing, and still counts toward its run.
+    #[test]
+    fn a_pass_of_an_unknown_record_reports_nothing() {
+        let shares = shares_with_lobby();
+        let mut passes = FailedPasses::default();
+        let stranger = HashMap::from([(1u8, [9u8; 32])]);
+        let good = pass_of(64, 0, Weather::Calm);
+        assert!(reach_after_sweep(&mut passes, &1, &good, &stranger, &shares, &[]).is_none());
+        assert!(reach_after_sweep(&mut passes, &2, &good, &stranger, &shares, &[]).is_none());
+        let bad = pass_of(64, 64, Weather::Calm);
+        let _ = reach_after_sweep(&mut passes, &2, &bad, &stranger, &shares, &[]);
+        let (owner_seed, _) = lobby_seeds();
+        let owners = HashMap::from([(2u8, owner_seed)]);
+        assert_eq!(lobby_reach(&mut passes, &owners, 2, bad), Some(false));
+    }
+
+    /// Each subscribed record maps to the room it belongs to.
+    #[test]
+    fn every_repairable_record_maps_to_its_room() {
+        let (owner_seed, share_owner_seed) = lobby_seeds();
+        let shares = shares_with_lobby();
+        let circle = derive_joined_circle(1, "repair notice phrase").expect("circle derives");
+        let circle_seed = circle.owner_seed;
+        let circles = vec![circle];
+
+        let room = |seed: [u8; 32]| room_record(seed, &shares, &circles);
+        assert_eq!(room(owner_seed), Some(RoomRecord::Lobby));
+        assert_eq!(room(share_owner_seed), Some(RoomRecord::LobbyShares));
+        assert_eq!(room(circle_seed), Some(RoomRecord::Circle(1)));
+        assert_eq!(room([9u8; 32]), None);
+    }
+}
+
+#[cfg(test)]
+mod lobby_refusal_tests {
+    use super::*;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn room_key() -> PublicRoomKey {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        derive_room_key(DEFAULT_ROOM, &CNSA_2_0).expect("room key derives")
+    }
+
+    fn reason(keys: Result<LobbyKeys, String>) -> String {
+        match keys {
+            Err(reason) => reason,
+            Ok(_) => panic!("a failed derivation must refuse the lobby"),
+        }
+    }
+
+    /// Each of the four derivations refuses the lobby with its own reason.
+    #[test]
+    fn every_lobby_derivation_failure_refuses_the_lobby() {
+        let fail = || Err::<[u8; 32], String>("hkdf".to_owned());
+        assert_eq!(
+            reason(lobby_keys(
+                Err("hkdf".to_owned()),
+                Ok([1; 32]),
+                Ok([2; 32]),
+                Ok([3; 32])
+            )),
+            "room-key derivation failed: hkdf"
+        );
+        assert_eq!(
+            reason(lobby_keys(Ok(room_key()), fail(), Ok([2; 32]), Ok([3; 32]))),
+            "owner-seed derivation failed: hkdf"
+        );
+        assert_eq!(
+            reason(lobby_keys(Ok(room_key()), Ok([1; 32]), fail(), Ok([3; 32]))),
+            "share owner-seed derivation failed: hkdf"
+        );
+        assert_eq!(
+            reason(lobby_keys(Ok(room_key()), Ok([1; 32]), Ok([2; 32]), fail())),
+            "presence-owner derivation failed: hkdf"
+        );
+    }
+
+    /// With every derivation good, each seed lands in its own field.
+    #[test]
+    fn lobby_keys_keep_each_seed_in_its_field() {
+        let keys = lobby_keys::<String>(Ok(room_key()), Ok([1; 32]), Ok([2; 32]), Ok([3; 32]))
+            .unwrap_or_else(|reason| panic!("refused: {reason}"));
+        assert_eq!(keys.owner_seed, [1; 32]);
+        assert_eq!(keys.share_owner_seed, [2; 32]);
+        assert_eq!(keys.presence_owner_seed, [3; 32]);
+    }
+
+    /// A refusal reaches the user through the front end's lobby-failure event.
+    #[test]
+    fn a_refused_lobby_is_reported_to_the_user() {
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        refuse_lobby(&evt_tx, "owner-seed derivation failed: hkdf".to_owned());
+        match evt_rx.try_recv().expect("the refusal is reported") {
+            NetEvent::PublicRoomJoinFailed { message } => {
+                assert_eq!(message, "owner-seed derivation failed: hkdf")
+            }
+            other => panic!("expected PublicRoomJoinFailed, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod derivation_refusal_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    /// A handle that accepts every subscribe and counts them.
+    fn recording() -> (VeilidNetHandle, Arc<Mutex<usize>>) {
+        let count = Arc::new(Mutex::new(0usize));
+        let seen = count.clone();
+        let handle = VeilidNetHandle::with_scripted_subscribes(move |_| {
+            *seen.lock().unwrap() += 1;
+            Ok(true)
+        });
+        (handle, count)
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<NetEvent>) -> Vec<NetEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// A failed lobby derivation subscribes nothing, stores no lobby, and tells the
+    /// user. The same call with the real derivation subscribes, so the count can move.
+    #[tokio::test]
+    async fn a_failed_lobby_derivation_subscribes_and_stores_nothing() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let (handle, subscribes) = recording();
+        let net = Some(handle);
+        let mut shares = ShareState::new();
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        subscribe_lobby_with(
+            || Err("presence-owner derivation failed: hkdf".to_owned()),
+            &mut shares,
+            &net,
+            &evt_tx,
+            "me",
+        )
+        .await;
+        assert_eq!(*subscribes.lock().unwrap(), 0, "nothing is subscribed");
+        assert!(shares.lobby.is_none(), "no lobby is stored");
+        let events = drain(&mut evt_rx);
+        assert_eq!(events.len(), 1, "{events:?}");
+        match &events[0] {
+            NetEvent::PublicRoomJoinFailed { message } => {
+                assert_eq!(message, "presence-owner derivation failed: hkdf")
+            }
+            other => panic!("expected PublicRoomJoinFailed, got {other:?}"),
+        }
+
+        subscribe_lobby_with(derive_lobby_keys, &mut shares, &net, &evt_tx, "me").await;
+        assert!(*subscribes.lock().unwrap() > 0, "the control subscribes");
+        assert!(shares.lobby.is_some(), "the control stores the lobby");
+    }
+
+    /// A failed circle derivation subscribes nothing, records no circle, consumes no
+    /// id, and reports the reason. The same call with the real derivation joins.
+    #[tokio::test]
+    async fn a_failed_circle_derivation_subscribes_and_stores_nothing() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let (handle, subscribes) = recording();
+        let net = Some(handle);
+        let mut circles = Vec::new();
+        let mut next_circle_id = 4;
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+
+        join_circle_with(
+            |_, _| Err("presence-owner derivation failed: hkdf".to_owned()),
+            "refusal phrase",
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut next_circle_id,
+        )
+        .await;
+        assert_eq!(*subscribes.lock().unwrap(), 0, "nothing is subscribed");
+        assert!(circles.is_empty(), "no circle is recorded");
+        assert_eq!(next_circle_id, 4, "no id is consumed");
+        let events = drain(&mut evt_rx);
+        assert_eq!(events.len(), 1, "{events:?}");
+        match &events[0] {
+            NetEvent::CircleJoinFailed { message } => {
+                assert_eq!(message, "presence-owner derivation failed: hkdf")
+            }
+            other => panic!("expected CircleJoinFailed, got {other:?}"),
+        }
+
+        join_circle_with(
+            derive_joined_circle,
+            "refusal phrase",
+            &evt_tx,
+            &net,
+            &mut circles,
+            &mut next_circle_id,
+        )
+        .await;
+        assert_eq!(circles.len(), 1, "the control joins");
+        assert!(*subscribes.lock().unwrap() > 0, "the control subscribes");
+    }
+
+    /// Each circle derivation refuses the join with its own reason.
+    #[test]
+    fn every_circle_derivation_failure_refuses_the_join() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let key = || derive_cot_key("refusal phrase", &CNSA_2_0).expect("key derives");
+        let fail = || Err::<[u8; 32], String>("hkdf".to_owned());
+        let reason = |circle: Result<VeilidCircle, String>| match circle {
+            Err(reason) => reason,
+            Ok(_) => panic!("a failed derivation must refuse the join"),
+        };
+        assert_eq!(
+            reason(joined_circle(
+                1,
+                Err("hkdf".to_owned()),
+                Ok([1; 32]),
+                Ok([2; 32])
+            )),
+            "circle-key derivation failed: hkdf"
+        );
+        assert_eq!(
+            reason(joined_circle(1, Ok(key()), fail(), Ok([2; 32]))),
+            "rendezvous-owner derivation failed: hkdf"
+        );
+        assert_eq!(
+            reason(joined_circle(1, Ok(key()), Ok([1; 32]), fail())),
+            "presence-owner derivation failed: hkdf"
         );
     }
 }

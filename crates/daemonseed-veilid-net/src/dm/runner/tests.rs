@@ -336,12 +336,23 @@ struct Faults {
     board: Option<Arc<Mutex<Board>>>,
     /// Send commits the live lane refuses as conflicting before it attempts one.
     forced_conflicts: Arc<std::sync::atomic::AtomicUsize>,
+    /// Fail every rotation of the advert keys.
+    fail_advert_rotation: bool,
+    /// Fail every advert poll's decision.
+    fail_advert_poll: bool,
+    /// Fail every write of the advert's published mark.
+    fail_advert_mark: bool,
+    /// Fail every read of the advert keys back after their update.
+    fail_advert_keys_reload: bool,
     /// The subkeys of every ring read of the channel `gate_ring_read` names,
     /// in order.
     gated_ring_reads: Vec<u16>,
     /// Where set, the lookup key and subkey of every channel write, in order,
     /// logged as the write is made.
     channel_writes: Option<Vec<([u8; HELLO_LOOKUP_KEY_LEN], u16)>>,
+    /// Where set, the system clock a runner started over this node reads, in
+    /// Unix milliseconds.
+    wall_clock: Option<Arc<AtomicU64>>,
 }
 
 /// One record call, as [`Faults::trail`] logs it.
@@ -887,6 +898,10 @@ impl RunnerRecords for Fake {
         self.watching().reads_unwatched = !on;
     }
 
+    fn take_registered_watches(&mut self) -> Vec<[u8; HELLO_LOOKUP_KEY_LEN]> {
+        self.watches.take_registered()
+    }
+
     fn take_watch_failures(&mut self) -> u64 {
         std::mem::take(&mut self.faults().registration_failures)
     }
@@ -914,6 +929,26 @@ impl RunnerRecords for Fake {
 
     fn forced_conflicts(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         Arc::clone(&self.faults().forced_conflicts)
+    }
+
+    fn fails_advert_rotation(&self) -> bool {
+        self.faults().fail_advert_rotation
+    }
+
+    fn fails_advert_poll(&self) -> bool {
+        self.faults().fail_advert_poll
+    }
+
+    fn fails_advert_mark(&self) -> bool {
+        self.faults().fail_advert_mark
+    }
+
+    fn fails_advert_keys_reload(&self) -> bool {
+        self.faults().fail_advert_keys_reload
+    }
+
+    fn wall_clock(&self) -> Option<Arc<AtomicU64>> {
+        self.faults().wall_clock.clone()
     }
 
     fn inspect_channel(
@@ -1980,6 +2015,9 @@ async fn a_message_is_reported_before_the_ring_read_ends_and_once_across_a_resta
         b_peer,
         ..
     } = establish(config).await;
+    // The follow-up collections the establishment's watches scheduled run on
+    // the real clock; a stop inside one can outlast the short grace.
+    settled(&a_fake).await;
     assert!(finished(&aw.stop().await));
     bw.send(RunnerCommand::Send {
         token: CommandToken(60),
@@ -4400,10 +4438,223 @@ async fn a_refused_rewrite_of_an_old_advert_records_nothing() {
     );
 }
 
+/// An advert write the network refuses at startup is reported as the advert
+/// not published, and the poll whose rewrite is taken reports it published.
+/// A startup whose write is taken reports it published, and a poll that reads
+/// the current advert back reports it published without a rewrite.
+#[tokio::test(start_paused = true)]
+async fn the_advert_is_reported_unpublished_until_a_write_is_taken() {
+    let advert = |published: bool| move |event: &RunnerEvent| matches!(event, RunnerEvent::Advert { published: p } if *p == published);
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    a_fake
+        .faults()
+        .plan
+        .push((ADVERT, Op::Write, Fault::Refused));
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    let refused = aw
+        .wait_for("the refused write's report", advert(false))
+        .await;
+    let health_at = aw.wait_for("A's startup", is_health).await;
+    assert!(
+        refused < health_at,
+        "the advert was reported after startup ended"
+    );
+    assert_eq!(
+        published_advert(&dht, &a),
+        None,
+        "control: the write was refused"
+    );
+    let taken = aw
+        .wait_from(refused, "the poll's rewrite", advert(true))
+        .await;
+    assert!(taken > refused);
+    assert!(
+        published_advert(&dht, &a).is_some(),
+        "the rewrite is on the network"
+    );
+    assert!(finished(&aw.stop().await));
+
+    let b = Profile::new();
+    let b_fake = Fake::on(&dht);
+    let mut bw = b.spawn(&b_fake, RunnerConfig::default());
+    bw.wait_for("B's startup", is_health).await;
+    assert!(
+        bw.seen.iter().any(advert(true)),
+        "a startup whose write was taken did not report it: {:?}",
+        bw.seen
+    );
+    assert!(!bw.seen.iter().any(advert(false)));
+    assert!(finished(&bw.stop().await));
+
+    // A write that lands but reports a failure is reported unpublished, and
+    // the poll that reads the current advert back reports it published without
+    // writing it again.
+    let c = Profile::new();
+    let c_fake = Fake::on(&dht);
+    c_fake.faults().refuse_after_advert_write = true;
+    let mut cw = c.spawn(&c_fake, RunnerConfig::default());
+    let refused = cw.wait_for("C's refused write", advert(false)).await;
+    cw.wait_from(refused, "C's intact poll", advert(true)).await;
+    assert_eq!(
+        c_fake.calls().advert_publishes,
+        1,
+        "the intact poll wrote the advert again"
+    );
+    assert!(finished(&cw.stop().await));
+}
+
+/// The profile directory `tests/fixtures/profile-v0.36.3/` holds, and the
+/// passphrase it is sealed under. Neither is a secret.
+///
+/// The fixture is a profile as release v0.36.3, which had no direct messages,
+/// writes it: `daemonseed.toml`, `seeds.blob` and `identity.dseed`, enrolled by
+/// recovery from the BIP-39 phrase of all-zero entropy ("abandon" twenty-three
+/// times, then "art") under the desktop Argon2id parameters, with the display
+/// name "fixture", one circle, one muted handle and one published share
+/// written through to the blob. To regenerate it, check out tag v0.36.3, add
+/// an ignored test to `daemonseed-core`'s `profile::persist` tests that calls
+/// `FirstStart::new().recover(..)`, `finalize(..)` and `write_first_start(..)`
+/// with these values, then `Seeds::add_circle`, `add_mute` and `add_published`
+/// followed by `write_seeds_blob` under the session's sealing key, and run it
+/// with `FIXTURE_OUT` naming the output directory.
+const V0_36_3_PROFILE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/profile-v0.36.3"
+);
+const V0_36_3_PASSPHRASE: &str = "fixture passphrase, not a secret: violet harbor quartz lantern";
+const V0_36_3_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+    abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+    abandon abandon abandon abandon art";
+
+/// A profile written by a release from before direct messages unlocks through
+/// the clients' unlock path, derives the direct-messaging keys of the identity
+/// it holds, and runs direct messaging on its own root: the runner starts,
+/// publishes its advert, takes a fresh correspondent's first contact and
+/// accepts it.
+#[tokio::test(start_paused = true)]
+async fn a_profile_from_before_direct_messages_runs_direct_messaging() {
+    use daemonseed_core::profile::persist::{load_for_unlock, session_materials_from_unlock};
+    use daemonseed_core::storage::seeds;
+
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let root = tempfile::tempdir().expect("a profile directory");
+    let mut copied = 0;
+    for entry in std::fs::read_dir(V0_36_3_PROFILE).expect("the fixture directory") {
+        let entry = entry.expect("a fixture entry");
+        std::fs::copy(entry.path(), root.path().join(entry.file_name()))
+            .expect("copy a fixture file");
+        copied += 1;
+    }
+    assert_eq!(copied, 3, "the fixture holds its three files");
+
+    let (config, blob) = load_for_unlock(root.path()).expect("the profile loads");
+    let opened = seeds::open(&blob, V0_36_3_PASSPHRASE, config.profile_id, config.argon2)
+        .expect("the blob opens under its passphrase");
+    let materials = session_materials_from_unlock(
+        opened.seeds,
+        opened.key,
+        opened.index_key,
+        config,
+        blob,
+        Vec::new(),
+    )
+    .expect("the session restores");
+    assert_eq!(materials.display_name.as_deref(), Some("fixture"));
+    assert_eq!(materials.seeds.circles().len(), 1, "the circle survived");
+
+    let keys = derive_identity_keys(&materials.seeds.mnemonic, Identity::Primary)
+        .expect("the direct-messaging keys derive");
+    let expected = derive_identity_keys(
+        &Mnemonic::from_phrase(V0_36_3_PHRASE).expect("the fixture phrase"),
+        Identity::Primary,
+    )
+    .expect("the fixture identity");
+    assert_eq!(
+        keys.signing.public_key(),
+        expected.signing.public_key(),
+        "the unlocked identity is the one the fixture was enrolled with"
+    );
+    let old = Profile {
+        pk: Box::new(*keys.signing.public_key()),
+        mnemonic: materials.seeds.mnemonic.clone(),
+        root,
+    };
+
+    let dht = network();
+    let mut ow = Watch {
+        handle: spawn_runner(RunnerParts {
+            records: Fake::on(&dht),
+            signer: Arc::new(keys.signing),
+            channel_root: keys.dm_channel_root,
+            at_rest_key: materials.seal_key.to_bytes(),
+            profile_root: old.root.path().to_path_buf(),
+            config: RunnerConfig::default(),
+        }),
+        seen: Vec::new(),
+        budget: PAUSED_BUDGET,
+    };
+    ow.wait_for("the old profile's roster", is_roster).await;
+    ow.wait_for("the old profile's advert", |event| {
+        matches!(event, RunnerEvent::Advert { published: true })
+    })
+    .await;
+    ow.wait_for("the old profile's startup", is_health).await;
+    assert!(
+        published_advert(&dht, &old).is_some(),
+        "the old profile's advert is on the network"
+    );
+
+    let peer = Profile::new();
+    let mut pw = peer.spawn(&Fake::on(&dht), RunnerConfig::default());
+    pw.wait_for("the peer's startup", is_health).await;
+    pw.send(RunnerCommand::FirstContact {
+        token: CommandToken(1),
+        peer_identity_pk: old.pk.clone(),
+        body: b"hello to an old profile".to_vec(),
+    })
+    .await;
+    let at = pw.wait_for("the peer's first contact", sent(1)).await;
+    let peer_label = sent_peer(&pw.seen[at]);
+
+    let at = ow
+        .wait_for(
+            "the contact request at the old profile",
+            request_from(&peer.pk),
+        )
+        .await;
+    let request = request_id(&ow.seen[at]);
+    ow.send(RunnerCommand::Accept {
+        token: CommandToken(2),
+        request,
+        reply: b"the old profile's reply".to_vec(),
+    })
+    .await;
+    let at = ow.wait_for("the old profile's acceptance", sent(2)).await;
+    let old_label = sent_peer(&ow.seen[at]);
+    pw.wait_for("the acceptance at the peer", accepted(peer_label))
+        .await;
+    pw.wait_for(
+        "the old profile's reply at the peer",
+        message(peer_label, 0, b"the old profile's reply"),
+    )
+    .await;
+    ow.wait_for(
+        "the first body at the old profile",
+        message(old_label, 0, b"hello to an old profile"),
+    )
+    .await;
+
+    assert!(finished(&pw.stop().await));
+    assert!(finished(&ow.stop().await));
+}
+
 /// An advert poll whose read of the advert fails counts that failure once and
 /// decides from the numbers alone: where they match it neither rewrites nor
-/// records anything as published, and where the network holds no number it
-/// rewrites the advert as the numbers say.
+/// records anything as published, and reports the advert unpublished, since
+/// nothing confirmed it; where the network holds no number it rewrites the
+/// advert as the numbers say.
 #[tokio::test(start_paused = true)]
 async fn a_failed_advert_read_leaves_the_decision_to_the_numbers() {
     let dht = network();
@@ -4428,6 +4679,18 @@ async fn a_failed_advert_read_leaves_the_decision_to_the_numbers() {
         health(&aw.seen[at]).advert_read_failures,
         1,
         "the failed read is counted once"
+    );
+    let reported: Vec<bool> = aw.seen[..=at]
+        .iter()
+        .filter_map(|event| match event {
+            RunnerEvent::Advert { published } => Some(*published),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reported,
+        [false],
+        "a pass whose read failed reported the advert unpublished, once"
     );
     assert!(finished(&aw.stop().await));
     assert_eq!(
@@ -4454,6 +4717,11 @@ async fn a_failed_advert_read_leaves_the_decision_to_the_numbers() {
         1,
         "the failed read is counted once"
     );
+    assert_eq!(
+        advert_reports(&aw.seen[..=at]),
+        [true],
+        "a rewrite the network took after a failed read reported the advert published"
+    );
     assert!(finished(&aw.stop().await));
     assert_eq!(
         lost.calls().advert_publishes,
@@ -4475,6 +4743,111 @@ async fn a_failed_advert_read_leaves_the_decision_to_the_numbers() {
         minted.serial() + 1,
         "the rewrite the network took was recorded as published"
     );
+}
+
+/// Every [`RunnerEvent::Advert`] report among `events`, in order.
+fn advert_reports(events: &[RunnerEvent]) -> Vec<bool> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            RunnerEvent::Advert { published } => Some(*published),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An advert the network took or holds is reported published though its
+/// published mark will not be written: the mark is local, and its failure is
+/// counted as a store failure. So it is for the first publish of a new
+/// profile, which is then not recorded as published, and for a relaunch's
+/// poll that finds the advert intact.
+#[tokio::test(start_paused = true)]
+async fn an_advert_whose_published_mark_will_not_write_is_reported_published() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    a_fake.faults().fail_advert_mark = true;
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    let at = aw.wait_for("A's startup", is_health).await;
+    assert_eq!(
+        advert_reports(&aw.seen[..=at]),
+        [true],
+        "the first publish is reported published"
+    );
+    assert!(
+        health(&aw.seen[at]).store_failures >= 1,
+        "the mark's failure is counted"
+    );
+    assert!(finished(&aw.stop().await));
+    assert_eq!(
+        a_fake.calls().advert_publishes,
+        1,
+        "the advert was published"
+    );
+    let minted = stored_advert_keys(&a);
+    reset_between_runs(&a);
+    assert_eq!(
+        stored_advert_keys(&a).serial(),
+        minted.serial(),
+        "the publish was not recorded, so a reset does not rotate past it"
+    );
+
+    let intact = a_fake.restart();
+    intact.faults().fail_advert_mark = true;
+    let mut aw = a.spawn(&intact, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    assert_eq!(
+        advert_reports(&aw.seen[..=at]),
+        [true],
+        "an intact advert is reported published"
+    );
+    assert!(
+        health(&aw.seen[at]).store_failures >= 1,
+        "the mark's failure is counted"
+    );
+    assert!(finished(&aw.stop().await));
+    assert_eq!(
+        intact.calls().advert_publishes,
+        0,
+        "an intact advert is not rewritten"
+    );
+}
+
+/// Advert keys that will not be read back after their update report the
+/// advert unpublished, whether the network holds it intact or the pass
+/// rewrites it: the advert this pass holds may not be of the key the store
+/// holds.
+#[tokio::test(start_paused = true)]
+async fn advert_keys_that_will_not_read_back_report_the_advert_unpublished() {
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's startup", is_health).await;
+    assert!(finished(&aw.stop().await));
+
+    let intact = a_fake.restart();
+    intact.faults().fail_advert_keys_reload = true;
+    let mut aw = a.spawn(&intact, RunnerConfig::default());
+    let at = aw.wait_for("the relaunch", is_health).await;
+    assert_eq!(advert_reports(&aw.seen[..=at]), [false]);
+    assert!(
+        health(&aw.seen[at]).store_failures >= 1,
+        "the failed read is counted"
+    );
+    assert!(finished(&aw.stop().await));
+    assert_eq!(intact.calls().advert_publishes, 0, "the advert is intact");
+
+    a_fake.net().evict(a.advert_key());
+    let lost = a_fake.restart();
+    lost.faults().fail_advert_keys_reload = true;
+    let mut aw = a.spawn(&lost, RunnerConfig::default());
+    let at = aw
+        .wait_for("the relaunch with the advert lost", is_health)
+        .await;
+    assert_eq!(advert_reports(&aw.seen[..=at]), [false]);
+    assert!(finished(&aw.stop().await));
+    assert_eq!(lost.calls().advert_publishes, 1, "the advert was rewritten");
 }
 
 /// An advert poll that finds the network holding the current key's advert, bytes
@@ -8434,6 +8807,14 @@ async fn a_message_whose_push_fails_is_delivered_through_the_record_store() {
     let at = bw.wait_for("B's acceptance", sent(2)).await;
     let b_peer = sent_peer(&bw.seen[at]);
     aw.wait_for("A's acceptance", accepted(a_peer)).await;
+    // The third ring read on each side is its watch's follow-up, which the counts include.
+    let (a_fake_ends, b_fake_ends) = (a_fake.clone(), b_fake.clone());
+    wait_until(
+        "both follow-up collections",
+        Duration::from_secs(30),
+        || a_fake_ends.calls().ring_ends >= 3 && b_fake_ends.calls().ring_ends >= 3,
+    )
+    .await;
     let (a_reads, b_reads) = (settled(&a_fake).await, settled(&b_fake).await);
     aw.send(RunnerCommand::Send {
         token: CommandToken(3),
@@ -10055,6 +10436,7 @@ async fn two_concurrent_senders_never_share_a_sequence() {
                             share
                                 .commit_send(&a_peer, format!("{who}{i}").as_bytes())
                                 .expect("the commit")
+                                .0
                         })
                         .collect::<Vec<_>>()
                 })
@@ -11630,6 +12012,277 @@ async fn a_relaunch_catches_up_on_a_cursor_written_while_away() {
     assert!(finished(&bw.stop().await));
 }
 
+/// A message B writes after a relaunched A's first read of B's channel, and
+/// before the watch that read registered is live, raises no change; it is
+/// collected by the follow-up collection the first watch of the channel
+/// schedules, well before the next scheduled collection.
+#[tokio::test(start_paused = true)]
+async fn a_message_written_before_a_first_watch_is_live_is_collected_soon() {
+    let s = establish(RunnerConfig::default()).await;
+    let Scene {
+        board,
+        a,
+        b,
+        a_fake,
+        aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = s;
+    assert!(finished(&aw.stop().await));
+    board.lock().unwrap().down = true;
+    let relaunched = a_fake.restart();
+    relaunched.faults().hand_fed_watches = true;
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    let incoming = b.outgoing_lookup_key(&a);
+    let watched = relaunched.clone();
+    wait_until(
+        "A watches B's channel",
+        Duration::from_secs(10 * 60),
+        || watched.watching().registered.contains(&incoming),
+    )
+    .await;
+    // Past the first collection, at most a jittered tick after the launch.
+    tokio::time::sleep(DEFAULT_TICK + DEFAULT_TICK / 3).await;
+    let reads = relaunched.calls().channel_reads;
+
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(7),
+        peer: b_peer,
+        body: b"before the watch was live".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's send", sent(7)).await;
+    within(
+        Duration::from_secs(10 * 60),
+        "the message at A",
+        aw.wait_for("the message at A", |event| {
+            matches!(event, RunnerEvent::Message { from, body, .. }
+                if *from == a_peer && body.as_slice() == b"before the watch was live")
+        }),
+    )
+    .await;
+    assert!(
+        relaunched.calls().channel_reads > reads,
+        "a collection read B's channel"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+}
+
+/// A watch registered on B's channel while A's stored state of the
+/// conversation will not load still has its follow-up collection: the lookup
+/// is tried again at a later wake. Nothing else reads B's channel meanwhile.
+#[tokio::test(start_paused = true)]
+async fn a_registered_watch_whose_conversation_will_not_load_is_still_followed_up() {
+    let s = establish(RunnerConfig::default()).await;
+    // Past every follow-up the establishment scheduled.
+    tokio::time::sleep(DEFAULT_TICK * 5).await;
+    let incoming = s.b.outgoing_lookup_key(&s.a);
+    let reads = s.a_fake.calls().channel_reads;
+    live_lane::fail_next_reader_load(incoming);
+    s.a_fake.watches.registered(incoming, incoming);
+    // The runner's next wake, at most a jittered drop-scan interval away,
+    // finds the state will not load; the lookup a jittered tick later finds
+    // it, and the follow-up comes two jittered ticks after that. All of it
+    // comes long before the next scheduled collection.
+    let fake = s.a_fake.clone();
+    wait_until(
+        "the follow-up collection read B's channel",
+        DEFAULT_TICK * (DROP_SCAN_TICKS + 8),
+        || fake.calls().channel_reads > reads,
+    )
+    .await;
+    assert!(finished(&s.aw.stop().await));
+    assert!(finished(&s.bw.stop().await));
+}
+
+/// A follow-up already scheduled for a conversation whose channel's watch is
+/// registered again keeps the later of the two moments, so it comes after
+/// the latest registration has had time to go live.
+#[test]
+fn a_follow_up_scheduled_again_keeps_the_later_moment() {
+    let peer = CorrespondenceLabel::mint().expect("a label");
+    let now = Instant::now();
+    let mut follow_ups = HashMap::new();
+    schedule_follow_up(&mut follow_ups, peer, now + Duration::from_secs(60));
+    schedule_follow_up(&mut follow_ups, peer, now + Duration::from_secs(120));
+    assert_eq!(
+        follow_ups.get(&peer),
+        Some(&(now + Duration::from_secs(120))),
+        "a later registration moves the follow-up later"
+    );
+    schedule_follow_up(&mut follow_ups, peer, now + Duration::from_secs(90));
+    assert_eq!(
+        follow_ups.get(&peer),
+        Some(&(now + Duration::from_secs(120))),
+        "an earlier moment does not move it back"
+    );
+    assert_eq!(follow_ups.len(), 1);
+}
+
+/// A change on B's channel reporting A's watch dead.
+fn watch_died(lookup_key: [u8; HELLO_LOOKUP_KEY_LEN]) -> PushInbound {
+    PushInbound::Changed {
+        lookup_key,
+        first_subkey: 0,
+        single: false,
+        dead: true,
+        value: None,
+    }
+}
+
+/// A message B writes after A registers its dead watch on B's channel again,
+/// and before that watch is live, raises no change; it is collected by the
+/// follow-up collection the registration schedules, as a first registration
+/// does, well before the next scheduled collection.
+#[tokio::test(start_paused = true)]
+async fn a_message_written_before_a_watch_registered_again_is_live_is_collected_soon() {
+    let Scene {
+        board,
+        a,
+        b,
+        a_fake,
+        mut aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    // Past every follow-up the establishment scheduled.
+    tokio::time::sleep(DEFAULT_TICK * 5).await;
+    a_fake.faults().hand_fed_watches = true;
+    board.lock().unwrap().down = true;
+    let incoming = b.outgoing_lookup_key(&a);
+    let inbox = a_fake.faults().watch_inbox.clone().expect("a push lane");
+    let reads = a_fake.calls().channel_reads;
+    assert!(inbox.offer(watch_died(incoming)));
+    let watched = a_fake.clone();
+    wait_until(
+        "A registers the watch again and collects B's channel",
+        Duration::from_secs(60),
+        || {
+            watched.watching().rewatched.contains(&incoming)
+                && watched.calls().channel_reads > reads
+        },
+    )
+    .await;
+    // Past the collection the dead watch asked for.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let reads = a_fake.calls().channel_reads;
+
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(7),
+        peer: b_peer,
+        body: b"before the watch was live again".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's send", sent(7)).await;
+    within(
+        Duration::from_secs(10 * 60),
+        "the message at A",
+        aw.wait_for("the message at A", |event| {
+            matches!(event, RunnerEvent::Message { from, body, .. }
+                if *from == a_peer && body.as_slice() == b"before the watch was live again")
+        }),
+    )
+    .await;
+    assert!(
+        a_fake.calls().channel_reads > reads,
+        "a collection read B's channel"
+    );
+    assert!(finished(&aw.stop().await));
+    assert!(finished(&bw.stop().await));
+}
+
+/// A follow-up already scheduled when the channel's watch registers again
+/// moves to the later registration's moment, through the runner's own
+/// scheduling: two dead watches a tick apart bring no collection before the
+/// second registration's follow-up can fall due, and one after it.
+#[tokio::test(start_paused = true)]
+async fn a_watch_registered_again_moves_its_follow_up_later() {
+    let s = establish(RunnerConfig::default()).await;
+    // Past every follow-up the establishment scheduled.
+    tokio::time::sleep(DEFAULT_TICK * 5).await;
+    s.a_fake.faults().hand_fed_watches = true;
+    let incoming = s.b.outgoing_lookup_key(&s.a);
+    let inbox = s.a_fake.faults().watch_inbox.clone().expect("a push lane");
+    let first = tokio::time::Instant::now();
+    assert!(inbox.offer(watch_died(incoming)));
+    tokio::time::sleep(DEFAULT_TICK).await;
+    assert_eq!(
+        s.a_fake.watching().rewatched.len(),
+        1,
+        "registered again once"
+    );
+    assert!(inbox.offer(watch_died(incoming)));
+    // Past the collection the second dead watch asked for.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        s.a_fake.watching().rewatched.len(),
+        2,
+        "registered again twice"
+    );
+    let reads = s.a_fake.calls().channel_reads;
+    // A follow-up falls due between 0.8 and 1.2 times FOLLOW_UP_TICKS ticks
+    // after its registration: the first's by 2.4 ticks after `first`, the
+    // second's from 2.6 ticks after it.
+    tokio::time::sleep_until(first + DEFAULT_TICK * 5 / 2).await;
+    assert_eq!(
+        s.a_fake.calls().channel_reads,
+        reads,
+        "no collection at the first registration's moment"
+    );
+    tokio::time::sleep_until(first + DEFAULT_TICK * 4).await;
+    assert!(
+        s.a_fake.calls().channel_reads > reads,
+        "the follow-up came at the second registration's moment"
+    );
+    assert!(finished(&s.aw.stop().await));
+    assert!(finished(&s.bw.stop().await));
+}
+
+/// A registered watch whose conversation never loads is looked up
+/// [`FOLLOW_UP_LOOKUP_TRIES`] times, then dropped: no further lookup and no
+/// follow-up collection.
+#[tokio::test(start_paused = true)]
+async fn a_registered_watch_whose_conversation_never_loads_is_dropped_after_its_tries() {
+    let s = establish(RunnerConfig::default()).await;
+    // Past every follow-up the establishment scheduled.
+    tokio::time::sleep(DEFAULT_TICK * 5).await;
+    let incoming = s.b.outgoing_lookup_key(&s.a);
+    let reads = s.a_fake.calls().channel_reads;
+    let spare = 2;
+    for _ in 0..FOLLOW_UP_LOOKUP_TRIES as usize + spare {
+        live_lane::fail_next_reader_load(incoming);
+    }
+    s.a_fake.watches.registered(incoming, incoming);
+    // The first lookup comes at the runner's next wake, at most a jittered
+    // drop-scan interval away, and each later one a jittered tick after the
+    // one before.
+    wait_until(
+        "every lookup made",
+        DEFAULT_TICK * (DROP_SCAN_TICKS + 2 * FOLLOW_UP_LOOKUP_TRIES),
+        || live_lane::reader_loads_left_to_fail(&incoming) <= spare,
+    )
+    .await;
+    // Past the moment another lookup would come, and a follow-up after it.
+    tokio::time::sleep(DEFAULT_TICK * 5).await;
+    assert_eq!(
+        live_lane::reader_loads_left_to_fail(&incoming),
+        spare,
+        "the conversation was looked up exactly FOLLOW_UP_LOOKUP_TRIES times"
+    );
+    assert_eq!(
+        s.a_fake.calls().channel_reads,
+        reads,
+        "no follow-up collection read B's channel"
+    );
+    assert!(finished(&s.aw.stop().await));
+    assert!(finished(&s.bw.stop().await));
+}
+
 /// A cursor B published while A's watch on B's channel was dead is taken by
 /// the collection that follows the watch's registration again.
 #[tokio::test(start_paused = true)]
@@ -13192,6 +13845,923 @@ async fn a_failed_push_is_followed_by_a_control_read_that_replaces_the_route() {
     );
 }
 
+/// A's route on the board, and the inbound queue its calls reach, taken before
+/// [`move_b`] adds a route that sorts after it.
+fn a_endpoint(k: &Knocked) -> (Vec<u8>, PushOutbox) {
+    (route_blob(k, 1), a_inbound(k))
+}
+
+/// Move B from its route to `renewed` on the board, as a correspondent that
+/// restarted would: calls to the old route fail at once, and calls to
+/// `renewed` reach B.
+fn move_b(k: &Knocked, renewed: &[u8]) {
+    let old = route_blob(k, 0);
+    let mut board = k.board.lock().unwrap();
+    let b_inbox = board.routes.get(&old).expect("B's route").1.clone();
+    board
+        .routes
+        .insert(renewed.to_vec(), (String::from("route-renewed"), b_inbox));
+    board.routes.remove(&old);
+}
+
+/// A, with B's route gone and every watched change offered by hand on both
+/// sides, sends each of `bodies`, and waits until each send is answered and
+/// the route its push failed on is forgotten. Returns B's channel-read count
+/// before the sends.
+async fn a_sends_while_b_moved(k: &mut Knocked, bodies: &[&[u8]]) -> usize {
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    let b_reads = k.b_fake.calls().channel_reads;
+    for (token, body) in (3..).zip(bodies) {
+        k.aw.send(RunnerCommand::Send {
+            token: CommandToken(token),
+            peer: k.a_peer,
+            body: body.to_vec(),
+        })
+        .await;
+        k.aw.wait_for("A's send", sent(token)).await;
+    }
+    let (a, a_peer) = (&k.a, k.a_peer);
+    wait_until("A dropped B's old route", Duration::from_secs(30), || {
+        kept_route(a, &a_peer).is_none()
+    })
+    .await;
+    assert!(
+        !k.aw.seen.iter().any(delivered(k.a_peer, 1)),
+        "nothing was delivered on the old route"
+    );
+    b_reads
+}
+
+/// A message whose push failed on a route its correspondent no longer serves
+/// is pushed again, once, on the route a reach notice then gives, and is
+/// delivered through it with no new send and no record-store read at the
+/// correspondent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_whose_push_failed_is_pushed_again_on_the_route_a_reach_notice_gives() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (a_route, a_inbox) = a_endpoint(&k);
+    let renewed = b"route-of-b-renewed".to_vec();
+    move_b(&k, &renewed);
+    let b_reads = a_sends_while_b_moved(&mut k, &[b"while B moved"]).await;
+
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (notice, _) = reach_notice(&incoming, &control, &key, &key, &renewed);
+    let caller = FakePush {
+        board: Arc::clone(&k.board),
+        inbound: a_inbox,
+    };
+    caller
+        .call(a_route.clone(), notice.clone())
+        .await
+        .expect("A answers the notice");
+
+    k.bw.wait_for("the message at B", message(b_peer, 1, b"while B moved"))
+        .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 1)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        1,
+        "the message was pushed once on the new route"
+    );
+    assert_eq!(k.b_fake.calls().channel_reads, b_reads, "B read no channel");
+
+    // The same notice again gives the route already held, which is no route
+    // learned.
+    caller
+        .call(a_route.clone(), notice)
+        .await
+        .expect("A answers the notice again");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        1,
+        "the route held again pushed nothing"
+    );
+
+    // Control: a route learned now is pushed on within the same wait, so a
+    // push the held route made would have been seen above.
+    let third = b"route-of-b-third".to_vec();
+    {
+        let mut board = k.board.lock().unwrap();
+        let b_inbox = board.routes.get(&renewed).expect("B's route").1.clone();
+        board
+            .routes
+            .insert(third.clone(), (String::from("route-third"), b_inbox));
+    }
+    let (newer, _) = reach_notice_at(&incoming, &control, &key, &key, &third, NOTICE_SERIAL + 1);
+    caller
+        .call(a_route, newer)
+        .await
+        .expect("A answers the newer notice");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        calls_to(&k.board, &third),
+        1,
+        "the route learned was pushed on within the wait"
+    );
+}
+
+/// Messages whose pushes failed on a route their correspondent no longer
+/// serves are pushed again, each once and in order, on the route a read of
+/// the correspondent's control then gives, and are delivered through it with
+/// no new send and no record-store read at the correspondent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_messages_are_pushed_again_in_order_on_the_route_a_control_read_gives() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (_, a_inbox) = a_endpoint(&k);
+    let renewed = b"route-of-b-renewed".to_vec();
+    move_b(&k, &renewed);
+    let b_reads = a_sends_while_b_moved(&mut k, &[b"first queued", b"second queued"]).await;
+
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (_, sealed) = reach_notice(&incoming, &control, &key, &key, &renewed);
+    k.dht
+        .lock()
+        .unwrap()
+        .put((CHANNEL, incoming, channel::CONTROL_SUBKEY), sealed);
+    assert!(a_inbox.offer(PushInbound::Changed {
+        lookup_key: incoming,
+        first_subkey: 0,
+        single: false,
+        dead: true,
+        value: None,
+    }));
+
+    // B takes only the sequence it expects next, so the second message
+    // arriving with no channel read at B pins the order.
+    k.bw.wait_for(
+        "the first message at B",
+        message(b_peer, 1, b"first queued"),
+    )
+    .await;
+    k.bw.wait_for(
+        "the second message at B",
+        message(b_peer, 2, b"second queued"),
+    )
+    .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 2)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        2,
+        "each message was pushed once on the new route"
+    );
+    assert_eq!(k.b_fake.calls().channel_reads, b_reads, "B read no channel");
+}
+
+/// A sender relaunched with a message its correspondent has not collected,
+/// whose push failed before the relaunch, pushes it on the route its launch
+/// read of the correspondent's control takes, with no new send and no
+/// record-store read at the correspondent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relaunched_sender_pushes_its_uncollected_message_on_the_route_its_launch_read_takes() {
+    let (mut k, b_peer) = establish_pushed().await;
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    let b_route = route_blob(&k, 0);
+    k.board.lock().unwrap().down = true;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"sent before the relaunch".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(3)).await;
+    let (a, a_peer) = (&k.a, k.a_peer);
+    wait_until("A dropped B's route", Duration::from_secs(30), || {
+        kept_route(a, &a_peer).is_none()
+    })
+    .await;
+    assert!(finished(&k.aw.stop().await));
+    k.board.lock().unwrap().down = false;
+    let b_reads = k.b_fake.calls().channel_reads;
+
+    let relaunched = k.a_fake.restart();
+    relaunched.faults().hand_fed_watches = true;
+    let mut aw = k.a.spawn(&relaunched, no_collection());
+    aw.budget = REAL_BUDGET;
+    k.bw.wait_for(
+        "the message at B",
+        message(b_peer, 1, b"sent before the relaunch"),
+    )
+    .await;
+    aw.wait_for("delivery at A", delivered(k.a_peer, 1)).await;
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(b_route));
+    assert_eq!(k.b_fake.calls().channel_reads, b_reads, "B read no channel");
+    assert!(finished(&aw.stop().await));
+}
+
+/// A route learned while the sender's outbox still holds messages its
+/// correspondent has collected, and one it has not, has only the one it has
+/// not pushed on it: the run starts at the cursor the reach notice carries,
+/// not at the older one the sender had seen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_push_on_a_new_route_starts_at_the_cursor_its_reach_notice_carries() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (a_route, a_inbox) = a_endpoint(&k);
+    // B takes each of A's slots from its watched change; A sees nothing of
+    // B's channel.
+    k.a_fake.faults().hand_fed_watches = true;
+    k.board.lock().unwrap().down = true;
+    for (token, body) in [(3, &b"collected first"[..]), (4, &b"collected second"[..])] {
+        k.aw.send(RunnerCommand::Send {
+            token: CommandToken(token),
+            peer: k.a_peer,
+            body: body.to_vec(),
+        })
+        .await;
+        k.aw.wait_for("A's send", sent(token)).await;
+    }
+    k.bw.wait_for("the first at B", message(b_peer, 1, b"collected first"))
+        .await;
+    k.bw.wait_for("the second at B", message(b_peer, 2, b"collected second"))
+        .await;
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let dht = Arc::clone(&k.dht);
+    wait_until("B published cursor 3", Duration::from_secs(30), || {
+        let bytes = channel_bytes(&dht, &incoming, channel::CONTROL_SUBKEY);
+        channel::open_control_with_key(&key, &bytes)
+            .expect("opens")
+            .collected_cursor
+            == 3
+    })
+    .await;
+    assert!(
+        conv_of(&k.a, &k.a_peer).peer_collected < 3,
+        "A has not seen B's cursor"
+    );
+
+    k.b_fake.faults().hand_fed_watches = true;
+    let renewed = b"route-of-b-renewed".to_vec();
+    move_b(&k, &renewed);
+    k.board.lock().unwrap().down = false;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(5),
+        peer: k.a_peer,
+        body: b"not collected".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(5)).await;
+    let (a, a_peer) = (&k.a, k.a_peer);
+    wait_until("A holds no route for B", Duration::from_secs(30), || {
+        kept_route(a, &a_peer).is_none()
+    })
+    .await;
+    let b_reads = k.b_fake.calls().channel_reads;
+
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (notice, _) = reach_notice(&incoming, &control, &key, &key, &renewed);
+    let caller = FakePush {
+        board: Arc::clone(&k.board),
+        inbound: a_inbox,
+    };
+    caller
+        .call(a_route, notice)
+        .await
+        .expect("A answers the notice");
+
+    k.bw.wait_for("the message at B", message(b_peer, 3, b"not collected"))
+        .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 3)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        1,
+        "only the message B had not collected was pushed"
+    );
+    assert_eq!(k.b_fake.calls().channel_reads, b_reads, "B read no channel");
+}
+
+/// A send made while messages are being pushed again on a new route is pushed
+/// after them, in order, and the route stays held: a later send is pushed on
+/// it and delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_made_while_messages_are_pushed_again_follows_them_and_keeps_the_route() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (_, a_inbox) = a_endpoint(&k);
+    let renewed = b"route-of-b-renewed".to_vec();
+    move_b(&k, &renewed);
+    a_sends_while_b_moved(&mut k, &[b"pushed again"]).await;
+    let held = Arc::new(Gate::default());
+    k.board.lock().unwrap().hold_calls = Some(Arc::clone(&held));
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (_, sealed) = reach_notice(&incoming, &control, &key, &key, &renewed);
+    k.dht
+        .lock()
+        .unwrap()
+        .put((CHANNEL, incoming, channel::CONTROL_SUBKEY), sealed);
+    assert!(a_inbox.offer(PushInbound::Changed {
+        lookup_key: incoming,
+        first_subkey: 0,
+        single: false,
+        dead: true,
+        value: None,
+    }));
+    held.reached().await;
+    k.board.lock().unwrap().hold_calls = None;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"sent during the push".to_vec(),
+    })
+    .await;
+    k.aw.wait_for("A's send", sent(4)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    held.release();
+
+    k.bw.wait_for("the first at B", message(b_peer, 1, b"pushed again"))
+        .await;
+    k.bw.wait_for(
+        "the second at B",
+        message(b_peer, 2, b"sent during the push"),
+    )
+    .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 2)).await;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(5),
+        peer: k.a_peer,
+        body: b"after the push".to_vec(),
+    })
+    .await;
+    k.bw.wait_for("the third at B", message(b_peer, 3, b"after the push"))
+        .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 3)).await;
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(renewed.clone()));
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        3,
+        "each message was pushed once on the new route"
+    );
+}
+
+/// Move B to `renewed`, have A send one message whose push fails, then give
+/// A `renewed` through a read of B's control, and return once the push of
+/// that message on `renewed` waits at the returned gate. Calls made after it
+/// pass the board without waiting.
+async fn a_run_held_at_its_first_push(k: &mut Knocked, renewed: &[u8]) -> Arc<Gate> {
+    a_run_of_held_at_its_first_push(k, renewed, &[b"pushed again"]).await
+}
+
+/// [`a_run_held_at_its_first_push`], with A sending each of `bodies`.
+async fn a_run_of_held_at_its_first_push(
+    k: &mut Knocked,
+    renewed: &[u8],
+    bodies: &[&[u8]],
+) -> Arc<Gate> {
+    let (_, a_inbox) = a_endpoint(k);
+    move_b(k, renewed);
+    a_sends_while_b_moved(k, bodies).await;
+    let held = Arc::new(Gate::default());
+    k.board.lock().unwrap().hold_calls = Some(Arc::clone(&held));
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (_, sealed) = reach_notice(&incoming, &control, &key, &key, renewed);
+    k.dht
+        .lock()
+        .unwrap()
+        .put((CHANNEL, incoming, channel::CONTROL_SUBKEY), sealed);
+    assert!(a_inbox.offer(PushInbound::Changed {
+        lookup_key: incoming,
+        first_subkey: 0,
+        single: false,
+        dead: true,
+        value: None,
+    }));
+    held.reached().await;
+    k.board.lock().unwrap().hold_calls = None;
+    held
+}
+
+/// A send that joined a run of pushes whose earlier push then went
+/// unanswered is pushed on its own once the run stops, and the route is
+/// judged on it as on any send: unanswered, with its message not collected,
+/// the route is forgotten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_queued_behind_a_run_that_stops_is_pushed_on_its_own() {
+    let (mut k, _) = establish_pushed().await;
+    let renewed = b"route-of-b-renewed".to_vec();
+    let held = a_run_held_at_its_first_push(&mut k, &renewed).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"queued behind the run".to_vec(),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        0,
+        "the send joined the run and was not pushed on its own"
+    );
+    k.board.lock().unwrap().down = true;
+    held.release();
+
+    let (board, route) = (Arc::clone(&k.board), renewed.clone());
+    wait_until("the queued send pushed", Duration::from_secs(30), || {
+        calls_to(&board, &route) == 2
+    })
+    .await;
+    let (a, a_peer) = (&k.a, k.a_peer);
+    wait_until("the route forgotten", Duration::from_secs(30), || {
+        kept_route(a, &a_peer).is_none()
+    })
+    .await;
+}
+
+/// A route replaced while a run of pushes is in flight on the one before it
+/// stops that run: no sequence is pushed by both runs, and a send that had
+/// joined the first run is delivered on the new route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_route_replaced_mid_run_stops_the_run_on_the_route_before_it() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (a_route, a_inbox) = a_endpoint(&k);
+    let renewed = b"route-of-b-renewed".to_vec();
+    let held = a_run_held_at_its_first_push(&mut k, &renewed).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"queued on the first run".to_vec(),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let third = b"route-of-b-third".to_vec();
+    {
+        let mut board = k.board.lock().unwrap();
+        let b_inbox = board.routes.get(&renewed).expect("B's route").1.clone();
+        board
+            .routes
+            .insert(third.clone(), (String::from("route-third"), b_inbox));
+    }
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (notice, _) = reach_notice_at(&incoming, &control, &key, &key, &third, NOTICE_SERIAL + 1);
+    let caller = FakePush {
+        board: Arc::clone(&k.board),
+        inbound: a_inbox,
+    };
+    caller
+        .call(a_route, notice)
+        .await
+        .expect("A answers the notice");
+    held.release();
+
+    k.bw.wait_for("the first at B", message(b_peer, 1, b"pushed again"))
+        .await;
+    k.bw.wait_for(
+        "the second at B",
+        message(b_peer, 2, b"queued on the first run"),
+    )
+    .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 2)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        1,
+        "the first run made only the push it had started"
+    );
+    assert_eq!(
+        calls_to(&k.board, &third),
+        1,
+        "the new run pushed only what the first had not"
+    );
+}
+
+/// A send made after a take has made a new route visible, and before the
+/// run of pushes it starts has begun, joins that run rather than being
+/// pushed on its own ahead of the run's earlier sequences, so the route is
+/// kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_made_as_a_run_starts_joins_it_and_keeps_the_route() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (_, a_inbox) = a_endpoint(&k);
+    let renewed = b"route-of-b-renewed".to_vec();
+    move_b(&k, &renewed);
+    a_sends_while_b_moved(&mut k, &[b"pushed again"]).await;
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    let at_start = Arc::clone(&held);
+    // The hook runs on a runtime worker; the hold hands that worker's tasks
+    // to the others while it waits.
+    push_hooks::before_run(
+        k.a_peer,
+        Box::new(move || tokio::task::block_in_place(|| at_start.hold())),
+    );
+
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (_, sealed) = reach_notice(&incoming, &control, &key, &key, &renewed);
+    k.dht
+        .lock()
+        .unwrap()
+        .put((CHANNEL, incoming, channel::CONTROL_SUBKEY), sealed);
+    assert!(a_inbox.offer(PushInbound::Changed {
+        lookup_key: incoming,
+        first_subkey: 0,
+        single: false,
+        dead: true,
+        value: None,
+    }));
+    held.reached().await;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"sent as the run starts".to_vec(),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    held.release();
+
+    k.bw.wait_for("the first at B", message(b_peer, 1, b"pushed again"))
+        .await;
+    k.bw.wait_for(
+        "the second at B",
+        message(b_peer, 2, b"sent as the run starts"),
+    )
+    .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 2)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        2,
+        "each message was pushed once, by the run"
+    );
+    // Past the time an unanswered push takes to be reported.
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(renewed));
+}
+
+/// A send's push joins the run of pushes in flight to its correspondent only
+/// where the run is made on the route the send pushes on: a push on another
+/// route is made on its own, on that route. The run, once started, makes the
+/// push that joined it; that push unanswered, the run leaves, and a later push
+/// on its route is made on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_joins_a_run_only_on_the_runs_route() {
+    let (k, _) = establish_pushed().await;
+    let state = conv_of(&k.a, &k.a_peer);
+    let key = state
+        .own_control_key
+        .as_ref()
+        .expect("A holds its control key");
+    let (on_run, elsewhere) = (b"route-of-the-run".to_vec(), b"route-of-the-send".to_vec());
+    let runs = crate::dm::push::Runs::default();
+    let slot = crate::dm::push::enter_run(&runs, k.a_peer, on_run.clone());
+    let (outbox, _inbox) = push_queue();
+    let (events, _events) = mpsc::channel(8);
+    let (unanswered, _unanswered) = mpsc::unbounded_channel();
+    let pusher = |route: &[u8]| crate::dm::push::Pusher {
+        transport: Arc::new(FakePush {
+            board: Arc::clone(&k.board),
+            inbound: outbox.clone(),
+        }),
+        route: route.to_vec(),
+        events: events.clone(),
+        unanswered: unanswered.clone(),
+        answer_key: Some(Arc::new(daemonseed_core::dm::push::AnswerKey::new(key))),
+        own_route: None,
+        kept: crate::dm::push::KeptUnanswered::default(),
+        runs: Arc::clone(&runs),
+    };
+    let seq = 7;
+    let bytes = channel::MessageHeader::continuing(0, 0, 0, seq, 0).encode();
+    let subkey = channel::slot_for(seq);
+    pusher(&on_run).push_slot(k.a_peer, &state.outgoing_lookup_key, subkey, &bytes);
+    pusher(&elsewhere).push_slot(k.a_peer, &state.outgoing_lookup_key, subkey, &bytes);
+    let (board, route) = (Arc::clone(&k.board), elsewhere.clone());
+    wait_until(
+        "the push on another route made on its own",
+        Duration::from_secs(30),
+        || calls_to(&board, &route) == 1,
+    )
+    .await;
+    assert_eq!(
+        calls_to(&k.board, &on_run),
+        0,
+        "the push on the run's route joined the run, which has not started"
+    );
+
+    pusher(&on_run).push_slots(slot, &state.outgoing_lookup_key, || Some(Vec::new()));
+    let (board, route) = (Arc::clone(&k.board), on_run.clone());
+    wait_until(
+        "the joined push made by the run",
+        Duration::from_secs(30),
+        || calls_to(&board, &route) == 1,
+    )
+    .await;
+    // No node serves the run's route, so the push goes unanswered.
+    let (entered, peer) = (Arc::clone(&runs), k.a_peer);
+    wait_until("the run left", Duration::from_secs(30), || {
+        !entered.lock().unwrap().contains_key(&peer)
+    })
+    .await;
+    pusher(&on_run).push_slot(k.a_peer, &state.outgoing_lookup_key, subkey, &bytes);
+    wait_until(
+        "the later push made on its own",
+        Duration::from_secs(30),
+        || calls_to(&board, &route) == 2,
+    )
+    .await;
+}
+
+/// A message whose push is still in flight on the route held when a reach
+/// notice replaces that route is pushed again, once, on the new route, and
+/// delivered; the late failure of the first push does not drop the new route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_in_flight_when_its_route_is_replaced_is_pushed_on_the_new_one() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (a_route, a_inbox) = a_endpoint(&k);
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    let old = route_blob(&k, 0);
+    let held = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.board.lock().unwrap().hold_calls = Some(Arc::clone(&held));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(3),
+        peer: k.a_peer,
+        body: b"in flight".to_vec(),
+    })
+    .await;
+    held.reached().await;
+    k.board.lock().unwrap().hold_calls = None;
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(old.clone()), "still held");
+    let renewed = b"route-of-b-renewed".to_vec();
+    move_b(&k, &renewed);
+    let b_reads = k.b_fake.calls().channel_reads;
+
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (notice, _) = reach_notice(&incoming, &control, &key, &key, &renewed);
+    let caller = FakePush {
+        board: Arc::clone(&k.board),
+        inbound: a_inbox,
+    };
+    caller
+        .call(a_route, notice)
+        .await
+        .expect("A answers the notice");
+    k.bw.wait_for("the message at B", message(b_peer, 1, b"in flight"))
+        .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 1)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        1,
+        "pushed once on the new route"
+    );
+    assert_eq!(k.b_fake.calls().channel_reads, b_reads, "B read no channel");
+
+    held.release();
+    let (board, first) = (Arc::clone(&k.board), old.clone());
+    wait_until("the first push made", Duration::from_secs(30), || {
+        calls_to(&board, &first) >= 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(renewed));
+}
+
+/// A run of pushes that stops on a push it made that went unanswered keeps
+/// the route, the run repeating messages already sent, and leaves the slots
+/// after that push to the record store: no further call is made for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_stopped_by_an_unanswered_push_keeps_the_route() {
+    let (mut k, _) = establish_pushed().await;
+    let renewed = b"route-of-b-renewed".to_vec();
+    let held = a_run_of_held_at_its_first_push(
+        &mut k,
+        &renewed,
+        &[b"pushed again", b"after it", b"and after that"],
+    )
+    .await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    k.board.lock().unwrap().down = true;
+    held.release();
+    let (board, route) = (Arc::clone(&k.board), renewed.clone());
+    wait_until("the run's push made", Duration::from_secs(30), || {
+        calls_to(&board, &route) >= 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        1,
+        "the slots after the unanswered push were left to the record store"
+    );
+    assert_eq!(kept_route(&k.a, &k.a_peer), Some(renewed));
+}
+
+/// A run of pushes on a new route whose read of the outbox fails does not
+/// take over the run before it: that run goes on, and a send that had joined
+/// it is still pushed and delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_whose_outbox_read_fails_leaves_the_run_before_it_to_push() {
+    let (mut k, b_peer) = establish_pushed().await;
+    let (a_route, a_inbox) = a_endpoint(&k);
+    let renewed = b"route-of-b-renewed".to_vec();
+    let held = a_run_held_at_its_first_push(&mut k, &renewed).await;
+    let _release = ReleaseOnDrop(Arc::clone(&held));
+    // Only a push can bring the message to B, and only an answer to it the
+    // delivery to A.
+    k.a_fake.faults().hand_fed_watches = true;
+    k.b_fake.faults().hand_fed_watches = true;
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"queued on the first run".to_vec(),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let third = b"route-of-b-third".to_vec();
+    {
+        let mut board = k.board.lock().unwrap();
+        let b_inbox = board.routes.get(&renewed).expect("B's route").1.clone();
+        board
+            .routes
+            .insert(third.clone(), (String::from("route-third"), b_inbox));
+    }
+    push_hooks::fail_next_run_read(k.a_peer);
+    let incoming = k.b.outgoing_lookup_key(&k.a);
+    let key = conv_of(&k.a, &k.a_peer)
+        .peer_control_key
+        .expect("A holds B's control key");
+    let control = channel_bytes(&k.dht, &incoming, channel::CONTROL_SUBKEY);
+    let (notice, _) = reach_notice_at(&incoming, &control, &key, &key, &third, NOTICE_SERIAL + 1);
+    let caller = FakePush {
+        board: Arc::clone(&k.board),
+        inbound: a_inbox,
+    };
+    caller
+        .call(a_route, notice)
+        .await
+        .expect("A answers the notice");
+    held.release();
+
+    k.bw.wait_for("the first at B", message(b_peer, 1, b"pushed again"))
+        .await;
+    k.bw.wait_for(
+        "the second at B",
+        message(b_peer, 2, b"queued on the first run"),
+    )
+    .await;
+    k.aw.wait_for("delivery at A", delivered(k.a_peer, 2)).await;
+    assert!(
+        !push_hooks::run_read_left_to_fail(&k.a_peer),
+        "the third route's run read the outbox, and the read failed"
+    );
+    assert_eq!(
+        calls_to(&k.board, &renewed),
+        2,
+        "the run on the renewed route pushed both messages"
+    );
+    assert_eq!(
+        calls_to(&k.board, &third),
+        0,
+        "the run on the third route pushed nothing"
+    );
+}
+
+/// A send that joined a run whose own slots were all answered, and whose
+/// push then goes unanswered, is judged as any send is: with its message not
+/// collected, the route is forgotten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_that_joined_a_run_is_judged_as_a_send_when_it_goes_unanswered() {
+    let (mut k, _) = establish_pushed().await;
+    let renewed = b"route-of-b-renewed".to_vec();
+    let first = a_run_held_at_its_first_push(&mut k, &renewed).await;
+    let _release_first = ReleaseOnDrop(Arc::clone(&first));
+    let second = Arc::new(Gate::default());
+    let _release_second = ReleaseOnDrop(Arc::clone(&second));
+    k.board.lock().unwrap().hold_calls = Some(Arc::clone(&second));
+    k.aw.send(RunnerCommand::Send {
+        token: CommandToken(4),
+        peer: k.a_peer,
+        body: b"joined the run".to_vec(),
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    first.release();
+    k.aw.wait_for("the run's own slot delivered", delivered(k.a_peer, 1))
+        .await;
+    second.reached().await;
+    k.board.lock().unwrap().down = true;
+    second.release();
+    let (a, a_peer) = (&k.a, k.a_peer);
+    wait_until("the route forgotten", Duration::from_secs(30), || {
+        kept_route(a, &a_peer).is_none()
+    })
+    .await;
+}
+
+/// A relaunch whose due rotation of the advert keys fails reports the advert
+/// unpublished, though the network still holds the advert of the key past
+/// its rotation. The same failure set before the rotation is due leaves the
+/// advert reported published.
+#[tokio::test(start_paused = true)]
+async fn a_failed_advert_rotation_reports_the_advert_unpublished() {
+    let advert = |published: bool| move |event: &RunnerEvent| matches!(event, RunnerEvent::Advert { published: p } if *p == published);
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's published advert", advert(true)).await;
+    assert!(finished(&aw.stop().await));
+
+    let early = a_fake.restart();
+    early.faults().fail_advert_rotation = true;
+    let mut aw = a.spawn(&early, RunnerConfig::default());
+    aw.wait_for("the advert reported published", advert(true))
+        .await;
+    assert!(
+        !aw.seen.iter().any(advert(false)),
+        "no rotation was due, so none failed"
+    );
+    assert!(finished(&aw.stop().await));
+
+    // Move the current key's start back past a rotation period, so the
+    // relaunch's rotation is due.
+    let store =
+        Store::open(a.root.path().join(STORE_DIR), &[0x42; AEAD_KEY_LEN]).expect("the store opens");
+    store
+        .update_advert_keys(|keys| {
+            let mut snapshot = keys.snapshot();
+            snapshot.not_before = snapshot
+                .not_before
+                .saturating_sub(advert::ROTATION_PERIOD_SECS + 60 * 60);
+            *keys = AdvertKeys::restore(snapshot);
+        })
+        .expect("the advert keys update");
+    drop(store);
+    let relaunched = a_fake.restart();
+    relaunched.faults().fail_advert_rotation = true;
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    aw.wait_for("the advert reported unpublished", advert(false))
+        .await;
+    assert!(
+        !aw.seen.iter().any(advert(true)),
+        "the advert was never reported published"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A relaunch whose advert poll cannot decide reports the advert
+/// unpublished, as a pass that could not build an advert does.
+#[tokio::test(start_paused = true)]
+async fn an_advert_poll_that_cannot_decide_reports_the_advert_unpublished() {
+    let advert = |published: bool| move |event: &RunnerEvent| matches!(event, RunnerEvent::Advert { published: p } if *p == published);
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let mut aw = a.spawn(&a_fake, RunnerConfig::default());
+    aw.wait_for("A's published advert", advert(true)).await;
+    assert!(finished(&aw.stop().await));
+
+    let relaunched = a_fake.restart();
+    relaunched.faults().fail_advert_poll = true;
+    let mut aw = a.spawn(&relaunched, RunnerConfig::default());
+    let at = aw
+        .wait_for("the advert reported unpublished", advert(false))
+        .await;
+    let counted = aw
+        .wait_from(
+            at,
+            "the failure counted",
+            |event| matches!(event, RunnerEvent::Health(h) if h.advert_failures >= 1),
+        )
+        .await;
+    assert!(counted > at);
+    assert!(finished(&aw.stop().await));
+}
+
 /// A message push carrying the route its sender held before a newer reach
 /// notice was taken is recorded, and the route the notice gave stays held and
 /// kept: the route a message push carries has no reach serial, so a push made
@@ -14552,4 +16122,389 @@ async fn a_failed_cursor_publish_is_tried_again_soon() {
         k.b_fake.faults().plan.is_empty(),
         "the failed write was the one planned"
     );
+}
+
+/// The runner's clock reads the system clock afresh each time: a jump forward,
+/// as after a suspend, shows at the next reading, and a step back of up to five
+/// minutes reads as the latest time already read, in every clone, until the
+/// system clock passes it again. A larger step back is followed at once, and the
+/// system reading is never held.
+#[test]
+fn the_runner_clock_follows_the_system_clock_and_holds_small_steps_back() {
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+    const MINUTE_MS: u64 = 60 * 1000;
+    let start = 1_700_000_000_000;
+    let system = Arc::new(AtomicU64::new(start));
+    let clock = Clock::over(WallSource::Fixed(Arc::clone(&system)));
+    let lane = clock.clone();
+    assert_eq!(clock.now_ms(), start);
+
+    // Suspended for an hour.
+    system.store(start + HOUR_MS, Ordering::Relaxed);
+    assert_eq!(clock.now_ms(), start + HOUR_MS);
+    assert_eq!(lane.now_secs(), (start + HOUR_MS) / 1000);
+
+    // Stepped back five minutes: held at the latest reading, in both clones.
+    system.store(start + HOUR_MS - 5 * MINUTE_MS, Ordering::Relaxed);
+    assert_eq!(clock.now_ms(), start + HOUR_MS);
+    assert_eq!(lane.now_ms(), start + HOUR_MS);
+    assert_eq!(
+        clock.system_secs(),
+        (start + HOUR_MS - 5 * MINUTE_MS) / 1000,
+        "the system reading is not held"
+    );
+
+    // Past the held time again: followed.
+    system.store(start + 2 * HOUR_MS, Ordering::Relaxed);
+    assert_eq!(lane.now_ms(), start + 2 * HOUR_MS);
+    assert_eq!(clock.now_ms(), start + 2 * HOUR_MS);
+
+    // Stepped back by more than five minutes: followed, in both clones.
+    system.store(start + 2 * HOUR_MS - 5 * MINUTE_MS - 1, Ordering::Relaxed);
+    assert_eq!(clock.now_ms(), start + 2 * HOUR_MS - 5 * MINUTE_MS - 1);
+    assert_eq!(lane.now_ms(), start + 2 * HOUR_MS - 5 * MINUTE_MS - 1);
+}
+
+/// The source a runner reads outside unit tests is the system clock itself.
+#[test]
+fn the_system_source_reads_the_system_clock() {
+    assert!(matches!(production_source(), WallSource::System));
+    let clock = Clock::over(production_source());
+    let before = system_ms();
+    let read = clock.now_ms();
+    let after = system_ms();
+    assert!(
+        (before..=after).contains(&read),
+        "{read} outside {before}..={after}"
+    );
+}
+
+/// Every event the runner has emitted and nobody has read yet.
+fn drain_events(events: &mut mpsc::Receiver<RunnerEvent>) -> Vec<RunnerEvent> {
+    std::iter::from_fn(|| events.try_recv().ok()).collect()
+}
+
+/// The commit time the [`RunnerEvent::Sent`] answering `token` carries.
+fn sent_at_for(events: &[RunnerEvent], token: u64) -> u64 {
+    match events.iter().find(|event| sent(token)(event)) {
+        Some(RunnerEvent::Sent { sent_at, .. }) => *sent_at,
+        _ => panic!("no answer to send {token}; saw {events:?}"),
+    }
+}
+
+/// The receipt time of the message `seq` from `from` among `events`.
+fn received_at_of(events: &[RunnerEvent], from: CorrespondenceLabel, seq: u64) -> u64 {
+    match events.iter().find(|event| {
+        matches!(event, RunnerEvent::Message { from: f, seq: s, .. } if *f == from && *s == seq)
+    }) {
+        Some(RunnerEvent::Message { received_at, .. }) => *received_at,
+        _ => panic!("no message {seq}; saw {events:?}"),
+    }
+}
+
+/// A system clock stepped a day ahead and then corrected leaves no time ahead
+/// behind it. While it is ahead, a send through the live lane, a receipt and a
+/// due advert rotation all take the time it reads. Once it is right again, the
+/// next send and receipt take the right time, the advert key made while it was
+/// ahead is replaced by one current from the right time, with the key before it
+/// still retained, the advert poll is brought forward to publish it, and a
+/// delivery back-off started while it was ahead starts again from the right
+/// time.
+#[tokio::test(start_paused = true)]
+async fn a_clock_stepped_ahead_and_corrected_leaves_nothing_ahead() {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let Scene {
+        board,
+        a,
+        b: _b,
+        a_fake,
+        aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&aw.stop().await));
+    // Every message reaches A through the collection pass this test runs.
+    board.lock().unwrap().down = true;
+    // Six days after A's advert key was made, so its rotation is a day off. A fixed
+    // part of a second keeps the millisecond checks below meaningful.
+    let right = system_ms() / 1000 * 1000 + 6 * DAY_MS + 637;
+    let system = Arc::new(AtomicU64::new(right));
+    let restarted = a_fake.restart().with_watches_off();
+    restarted.faults().wall_clock = Some(Arc::clone(&system));
+    let keys = a.keys();
+    let (_command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+    let commands: CommandQueue = Arc::new(tokio::sync::Mutex::new(command_rx));
+    let (event_tx, mut events) = mpsc::channel(EVENT_QUEUE);
+    let started = Runner::start(
+        RunnerParts {
+            records: restarted,
+            signer: Arc::new(keys.signing),
+            channel_root: keys.dm_channel_root,
+            at_rest_key: Zeroizing::new([0x42; AEAD_KEY_LEN]),
+            profile_root: a.root.path().to_path_buf(),
+            config: RunnerConfig::default(),
+        },
+        commands,
+        event_tx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    let Ok(mut runner) = started else {
+        panic!("A's runner did not start");
+    };
+    let first = runner.advert_keys.serial();
+    drain_events(&mut events);
+
+    // A day ahead.
+    let ahead = right + DAY_MS;
+    system.store(ahead, Ordering::Relaxed);
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(71),
+        peer: b_peer,
+        body: b"b1".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's first message", sent(71)).await;
+    assert!(runner.collect_tick().await.is_ok(), "the pass ran");
+    let seen = drain_events(&mut events);
+    assert_eq!(received_at_of(&seen, a_peer, 1), ahead, "the receipt ahead");
+    assert_eq!(runner.refresh_advert(false), Some(true));
+    assert_eq!(runner.advert_keys.serial(), first + 1, "the due rotation");
+    assert_eq!(runner.advert_keys.not_before(), ahead / 1000);
+
+    runner.repairs.remove(&a_peer);
+    assert!(
+        runner.send(CommandToken(73), a_peer, b"a1").await.is_ok(),
+        "the send ran"
+    );
+    let seen = drain_events(&mut events);
+    assert_eq!(sent_at_for(&seen, 73), ahead, "the send ahead");
+    assert_eq!(
+        runner.repairs[&a_peer].since_secs,
+        ahead / 1000,
+        "control: the back-off started ahead"
+    );
+
+    // Corrected, a minute after the right time it started at.
+    let corrected = right + 60_000;
+    system.store(corrected, Ordering::Relaxed);
+    assert_eq!(
+        runner.clock.now_ms(),
+        corrected,
+        "the stamp follows the corrected clock"
+    );
+    runner.next_advert_poll = Instant::now() + Duration::from_secs(60 * 60);
+    runner.check_advert_clock();
+    assert!(
+        runner.next_advert_poll <= Instant::now(),
+        "the advert poll was not brought forward"
+    );
+    assert_eq!(runner.refresh_advert(false), Some(true));
+    assert_eq!(runner.advert_keys.serial(), first + 2);
+    assert_eq!(runner.advert_keys.not_before(), corrected / 1000);
+    assert_eq!(
+        runner.advert_keys.previous_serial(),
+        Some(first),
+        "the key before the mistaken one is still retained"
+    );
+    assert!(runner
+        .advert_keys
+        .previous_retired_at()
+        .is_some_and(|at| at <= corrected / 1000));
+    let reloaded = reopen_store(&a)
+        .load_advert_keys()
+        .expect("the advert keys load")
+        .expect("advert keys are stored");
+    assert_eq!(reloaded.not_before, corrected / 1000, "the stored key");
+
+    let conv = runner
+        .load_one(&a_peer)
+        .expect("the store loads")
+        .expect("the conversation");
+    runner.reschedule(&conv);
+    assert_eq!(runner.repairs[&a_peer].since_secs, corrected / 1000);
+
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(72),
+        peer: b_peer,
+        body: b"b2".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's second message", sent(72)).await;
+    assert!(runner.collect_tick().await.is_ok(), "the pass ran");
+    let seen = drain_events(&mut events);
+    assert_eq!(received_at_of(&seen, a_peer, 2), corrected, "the receipt");
+    assert!(
+        runner.send(CommandToken(74), a_peer, b"a2").await.is_ok(),
+        "the send ran"
+    );
+    let seen = drain_events(&mut events);
+    assert_eq!(sent_at_for(&seen, 74), corrected, "the send");
+    drop(runner);
+    assert!(finished(&bw.stop().await));
+}
+
+/// An advert key made while the system clock was ahead by less than the skew
+/// correspondents allow is kept once the clock is right, since a correspondent
+/// whose clock is right may already have encapsulated to it. One made further
+/// ahead is replaced by a key current from the right time.
+#[test]
+fn an_advert_key_ahead_within_the_skew_allowance_is_kept() {
+    const MINUTE: u64 = 60;
+    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let right = 1_700_000_000;
+    let mut keys = AdvertKeys::new(right + 30 * MINUTE, os_fill).expect("the keys are made");
+    assert!(!current_key_beyond_skew(&keys, right));
+    assert_eq!(
+        rotate_advert(&mut keys, right, os_fill).expect("the rotation runs"),
+        advert::Rotation::Unchanged,
+        "a key 30 minutes ahead was replaced"
+    );
+    assert_eq!(keys.serial(), 0);
+    assert_eq!(keys.not_before(), right + 30 * MINUTE);
+
+    // Correspondents accept a key exactly the allowance ahead, so it is kept too.
+    let at_limit =
+        AdvertKeys::new(right + advert::CLOCK_SKEW_SECS, os_fill).expect("the keys are made");
+    assert!(
+        !current_key_beyond_skew(&at_limit, right),
+        "a key exactly the allowance ahead counted as beyond it"
+    );
+
+    let mut keys =
+        AdvertKeys::new(right + advert::CLOCK_SKEW_SECS + 1, os_fill).expect("the keys are made");
+    assert!(current_key_beyond_skew(&keys, right));
+    assert_eq!(
+        rotate_advert(&mut keys, right, os_fill).expect("the rotation runs"),
+        advert::Rotation::Rotated,
+        "control: a key ahead by more than the allowance is replaced"
+    );
+    assert_eq!(keys.serial(), 1);
+    assert_eq!(keys.not_before(), right);
+}
+
+/// A running runner whose advert key was made while the system clock was more
+/// than the skew allowance ahead publishes its replacement at the clock check
+/// after the clock is corrected, well before its next ordinary advert poll.
+#[tokio::test(start_paused = true)]
+async fn the_run_loop_republishes_the_advert_at_the_clock_check_after_a_correction() {
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    let dht = network();
+    let a = Profile::new();
+    let a_fake = Fake::on(&dht);
+    let right = system_ms();
+    let system = Arc::new(AtomicU64::new(right + DAY_MS));
+    a_fake.faults().wall_clock = Some(Arc::clone(&system));
+    // A day-long tick, so nothing else on the schedule wakes the loop within the
+    // first advert poll's interval.
+    let config = RunnerConfig {
+        tick: MAX_TICK,
+        ..RunnerConfig::default()
+    };
+    let mut aw = a.spawn(&a_fake, config);
+    aw.wait_for("A's startup", is_health).await;
+    assert_eq!(
+        stored_advert_keys(&a).not_before(),
+        (right + DAY_MS) / 1000,
+        "control: the key is made a day ahead"
+    );
+    let publishes_before = a_fake.calls().advert_publishes;
+
+    system.store(right, Ordering::Relaxed);
+    tokio::time::sleep(CLOCK_CHECK_INTERVAL - Duration::from_secs(60)).await;
+    assert_eq!(
+        a_fake.calls().advert_publishes,
+        publishes_before,
+        "control: nothing is published before the clock check"
+    );
+    tokio::time::sleep(Duration::from_secs(2 * 60)).await;
+    assert!(
+        CLOCK_CHECK_INTERVAL + Duration::from_secs(60) < advert::POLL_INTERVAL_MIN,
+        "the wait ends before any ordinary advert poll"
+    );
+    assert_eq!(
+        a_fake.calls().advert_publishes,
+        publishes_before + 1,
+        "the clock check did not republish the advert"
+    );
+    assert_eq!(
+        stored_advert_keys(&a).not_before(),
+        right / 1000,
+        "the stored key is current from the right time"
+    );
+    assert!(finished(&aw.stop().await));
+}
+
+/// A reply committed later in the same second as a message received before it
+/// reports its commit time to the millisecond, so it is placed after that
+/// message.
+#[tokio::test(start_paused = true)]
+async fn a_reply_in_the_same_second_as_a_receipt_reports_a_later_time() {
+    let Scene {
+        board,
+        a,
+        b: _b,
+        a_fake,
+        aw,
+        mut bw,
+        a_peer,
+        b_peer,
+        ..
+    } = establish(RunnerConfig::default()).await;
+    assert!(finished(&aw.stop().await));
+    // Every message reaches A through the collection pass this test runs.
+    board.lock().unwrap().down = true;
+    let second = (system_ms() / 1000 + 2) * 1000;
+    let system = Arc::new(AtomicU64::new(second + 100));
+    let restarted = a_fake.restart().with_watches_off();
+    restarted.faults().wall_clock = Some(Arc::clone(&system));
+    let keys = a.keys();
+    let (_command_tx, command_rx) = mpsc::channel(COMMAND_QUEUE);
+    let commands: CommandQueue = Arc::new(tokio::sync::Mutex::new(command_rx));
+    let (event_tx, mut events) = mpsc::channel(EVENT_QUEUE);
+    let started = Runner::start(
+        RunnerParts {
+            records: restarted,
+            signer: Arc::new(keys.signing),
+            channel_root: keys.dm_channel_root,
+            at_rest_key: Zeroizing::new([0x42; AEAD_KEY_LEN]),
+            profile_root: a.root.path().to_path_buf(),
+            config: RunnerConfig::default(),
+        },
+        commands,
+        event_tx,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    let Ok(mut runner) = started else {
+        panic!("A's runner did not start");
+    };
+    drain_events(&mut events);
+
+    bw.send(RunnerCommand::Send {
+        token: CommandToken(81),
+        peer: b_peer,
+        body: b"b1".to_vec(),
+    })
+    .await;
+    bw.wait_for("B's message", sent(81)).await;
+    assert!(runner.collect_tick().await.is_ok(), "the pass ran");
+    let seen = drain_events(&mut events);
+    assert_eq!(received_at_of(&seen, a_peer, 1), second + 100);
+
+    system.store(second + 800, Ordering::Relaxed);
+    assert!(
+        runner.send(CommandToken(83), a_peer, b"a1").await.is_ok(),
+        "the send ran"
+    );
+    let seen = drain_events(&mut events);
+    assert_eq!(
+        sent_at_for(&seen, 83),
+        second + 800,
+        "the reply's time lost its milliseconds"
+    );
+    drop(runner);
+    assert!(finished(&bw.stop().await));
 }

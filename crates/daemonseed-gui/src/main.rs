@@ -129,6 +129,13 @@ impl Platform for GuiPlatform {
 const W: u32 = 1100;
 const H: u32 = 680;
 
+/// The window's logical size while the setup wizard or the unlock screen shows.
+/// It fits a 1366x768 screen at 125% scaling with a taskbar.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+const PRE_UNLOCK_W: u32 = 720;
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+const PRE_UNLOCK_H: u32 = 520;
+
 /// Added to the window close's backstop. The backstop runs from the send, and the
 /// actor starts the close only after the commands queued ahead of it, so a close that
 /// spends its whole cap and budget still acks inside the backstop.
@@ -403,12 +410,30 @@ fn rebuild_rail(ui: &AppWindow, st: &GuiState) {
             initial: SharedString::from(c.initial.as_str()),
             pinned: c.pinned,
             unread: st.room_row_unread(idx),
+            unreachable: st.room_reach_notice(idx).is_some(),
+            joining: st.is_joining(idx),
+            join_failed: st.join_failure(idx).is_some(),
         })
         .collect();
     ui.set_circles(ModelRc::from(Rc::new(VecModel::from(circles))));
     ui.set_only_lobby(st.only_lobby());
+    apply_reach(ui, st);
     // A room's unread dot is also the Chats header's.
     dm_ui::apply_rail_sections(ui, st);
+}
+
+/// Push the reconnecting lines for the active room's chat, the public share list and
+/// the announcements into the props the tabs show them in. Empty while reachable.
+/// Also push whether the active circle is still joining or could not join, either of
+/// which closes the composer.
+fn apply_reach(ui: &AppWindow, st: &GuiState) {
+    let line = |notice: Option<String>| SharedString::from(notice.unwrap_or_default());
+    ui.set_joining_room(line(st.joining_notice(st.active())));
+    ui.set_joining_failed(st.join_failure(st.active()).is_some());
+    ui.set_can_send(st.can_send());
+    ui.set_reach_room(line(st.room_reach_notice(st.active())));
+    ui.set_reach_shares(line(st.reach_notice(net::RoomRecord::LobbyShares)));
+    ui.set_reach_announce(line(st.reach_notice(net::RoomRecord::Announcements)));
 }
 
 /// Show the active room after it was chosen: the rail, the room's view and
@@ -446,15 +471,28 @@ fn refresh_active_room(ui: &AppWindow, st: &GuiState) -> bool {
 }
 
 /// Materialize a circle from `phrase`, rebuild the rail, switch to it, and
-/// autofocus the composer. Returns `false` if derivation failed (rare — a crypto
-/// backend error). Shared by the submit-join / submit-new callbacks and the
-/// `--materialize` offscreen flag.
+/// autofocus the composer. A phrase whose circle is already in the rail switches to
+/// that circle instead, as a rail click does, and adds nothing; if that circle's
+/// join had ended for good, its join is sent again first. Returns `false` if
+/// derivation failed (rare — a crypto backend error). Shared by the submit-join /
+/// submit-new callbacks and the `--materialize` offscreen flag.
 fn materialize_and_select(
     ui: &AppWindow,
     state: &Rc<RefCell<GuiState>>,
     net: &Rc<RefCell<NetHandle>>,
     phrase: &str,
 ) -> bool {
+    let existing = state.borrow().index_of_phrase(phrase);
+    if let Some(idx) = existing {
+        let retry = state.borrow_mut().retry_failed_join(idx);
+        if let Some((circle_id, phrase)) = retry {
+            let _ = net
+                .borrow()
+                .send(NetCommand::JoinCircle { circle_id, phrase });
+        }
+        ui.invoke_switch_circle(idx as i32);
+        return true;
+    }
     let join = {
         let mut st = state.borrow_mut();
         match st.materialize_from_phrase(phrase) {
@@ -497,9 +535,9 @@ fn materialize_and_select(
                     ui.invoke_focus_composer();
                 }
             });
-            // Subscribe the actor to this circle. Fire-and-forget; if the
-            // session isn't Connected yet the actor emits a (drained, non-fatal)
-            // CircleError — the create-before-connect edge, flagged in the ISA.
+            // Subscribe the actor to this circle. Fire-and-forget; with no
+            // connection the actor reports that the join failed, and the circle
+            // shows that it could not join.
             let _ = net
                 .borrow()
                 .send(NetCommand::JoinCircle { circle_id, phrase });
@@ -906,6 +944,11 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
         move |text| {
             let text = text.to_string();
             if text.is_empty() {
+                return;
+            }
+            // A circle that has not joined cannot take a message: its composer stays
+            // closed until the join goes through.
+            if !state.borrow().can_send() {
                 return;
             }
             let ui = weak.unwrap();
@@ -1398,6 +1441,22 @@ fn refocus_auth(ui: &AppWindow) {
     });
 }
 
+/// Whether a dialog, sheet or overlay that takes the keys covers the main
+/// screen, so nothing beneath it should take the keyboard focus.
+fn overlay_open(ui: &AppWindow) -> bool {
+    ui.get_startup_overlay_open()
+        || ui.get_join_open()
+        || ui.get_new_open()
+        || ui.get_rename_open()
+        || ui.get_phrase_prompt_open()
+        || ui.get_leave_confirm_open()
+        || ui.get_palette_open()
+        || ui.get_about_open()
+        || ui.get_publish_open()
+        || ui.get_sheet_open()
+        || ui.get_desktop_prompt_open()
+}
+
 /// #39: dispatch keyboard focus to the field appropriate for the CURRENT screen, used
 /// when the window regains activation (app-switch) so typing/Enter survive without a
 /// click. Always invoked from inside a `defer()` (off the winit event handler), so the
@@ -1419,35 +1478,222 @@ fn refocus_active_field(ui: &AppWindow) {
     }
 }
 
-/// Where the last window size is remembered — `<profile-root>/window-size`, a
-/// one-line `WIDTHxHEIGHT` (physical px). It lives in the resolved profile root
+/// Where the last window size is remembered — `<profile-root>/window-logical-size`,
+/// a one-line `WIDTHxHEIGHT` in logical px. It lives in the resolved profile root
 /// (so a `--portable` / `--config` instance keeps its own size in its own
 /// directory, not the shared XDG one), but it is a plain file outside the
 /// profile/redb store: a non-secret UI convenience, independent of identity.
+///
+/// The size is logical because it is restored before the window exists, when the
+/// display scale is not yet known. A physical size restored then is scaled a
+/// second time once the window lands on a scaled display, and a window saved
+/// maximized at 200% would reopen at twice the size of the screen.
 #[cfg(feature = "desktop")]
 fn window_size_path(profile_root: &std::path::Path) -> std::path::PathBuf {
+    profile_root.join("window-logical-size")
+}
+
+/// The file earlier versions wrote, in physical px. It is never read, because a
+/// physical size cannot be restored correctly, and it is removed on the next save.
+#[cfg(feature = "desktop")]
+fn legacy_window_size_path(profile_root: &std::path::Path) -> std::path::PathBuf {
     profile_root.join("window-size")
 }
 
-/// Last saved window size, or None if absent/unparseable/out-of-sane-range. The clamp
-/// (≥ the 720x480 min, ≤ 8K) drops an absurd value saved on another monitor so we fall
-/// back to the default rather than restore something unusable.
-#[cfg(feature = "desktop")]
-fn load_window_size(profile_root: &std::path::Path) -> Option<(u32, u32)> {
-    let s = std::fs::read_to_string(window_size_path(profile_root)).ok()?;
-    let (w, h) = s.trim().split_once('x')?;
-    let (w, h) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
-    ((720..=7680).contains(&w) && (480..=4320).contains(&h)).then_some((w, h))
+/// The window's last unmaximized size in logical px, and whether it was closed
+/// maximized.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SavedWindow {
+    width: u32,
+    height: u32,
+    maximized: bool,
 }
 
-/// Persist the window size (best-effort; a missing profile dir is created).
+/// Last saved window state, or None if absent/unparseable/out-of-sane-range. The
+/// clamp (≥ the 720x480 min, ≤ 8K) drops an absurd value so we fall back to the
+/// default rather than restore something unusable. The file is `WIDTHxHEIGHT`,
+/// followed by ` maximized` when the window was closed maximized.
 #[cfg(feature = "desktop")]
-fn save_window_size(profile_root: &std::path::Path, w: u32, h: u32) {
+fn load_window_size(profile_root: &std::path::Path) -> Option<SavedWindow> {
+    let s = std::fs::read_to_string(window_size_path(profile_root)).ok()?;
+    let mut parts = s.split_whitespace();
+    let (w, h) = parts.next()?.split_once('x')?;
+    let (width, height) = (w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
+    let maximized = match parts.next() {
+        None => false,
+        Some("maximized") => true,
+        Some(_) => return None,
+    };
+    ((720..=7680).contains(&width) && (480..=4320).contains(&height)).then_some(SavedWindow {
+        width,
+        height,
+        maximized,
+    })
+}
+
+/// Persist the window state (best-effort; a missing profile dir is created).
+#[cfg(feature = "desktop")]
+fn save_window_size(profile_root: &std::path::Path, saved: SavedWindow) {
     let p = window_size_path(profile_root);
     if let Some(parent) = p.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(p, format!("{w}x{h}"));
+    let SavedWindow {
+        width,
+        height,
+        maximized,
+    } = saved;
+    let suffix = if maximized { " maximized" } else { "" };
+    let _ = std::fs::write(p, format!("{width}x{height}{suffix}"));
+    let _ = std::fs::remove_file(legacy_window_size_path(profile_root));
+}
+
+/// Size a window that is not yet shown to `width` x `height` logical px. The size
+/// is set both as the window size and as the root's preferred size, because on
+/// show the winit backend resets the window's width to the preferred width.
+#[cfg(feature = "desktop")]
+fn set_initial_window_size(ui: &AppWindow, width: u32, height: u32) {
+    let (w, h) = (width as f32, height as f32);
+    ui.set_preferred_window_width(w);
+    ui.set_preferred_window_height(h);
+    ui.window().set_size(slint::LogicalSize::new(w, h));
+}
+
+/// Convert a physical size from winit's `Resized` event to logical px at `scale`.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn physical_to_logical_size(w: u32, h: u32, scale: f32) -> (u32, u32) {
+    let scale = if scale > 0.0 { scale } else { 1.0 };
+    (
+        (w as f32 / scale).round() as u32,
+        (h as f32 / scale).round() as u32,
+    )
+}
+
+/// How the window is sized when the main screen first shows.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainWindowSize {
+    /// Resize the window to this logical size.
+    Restore(u32, u32),
+    /// Maximize the window. `unmaximized` is a size that fits the monitor, set
+    /// first so that un-maximizing returns to it.
+    Maximize { unmaximized: Option<(u32, u32)> },
+}
+
+/// The main screen's window size: the saved size, or the design default when none
+/// is saved, if it fits within `monitor` (the monitor's logical size). A size that
+/// does not fit, or a window closed maximized, is maximized instead, which leaves
+/// the work area to the window manager. With no monitor known the size is used
+/// as it is.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn main_window_size(saved: Option<SavedWindow>, monitor: Option<(u32, u32)>) -> MainWindowSize {
+    let (width, height) = saved.map_or((W, H), |s| (s.width, s.height));
+    let fits = monitor.is_none_or(|(mw, mh)| width <= mw && height <= mh);
+    let maximized = saved.is_some_and(|s| s.maximized);
+    match (fits, maximized) {
+        (true, false) => MainWindowSize::Restore(width, height),
+        (true, true) => MainWindowSize::Maximize {
+            unmaximized: Some((width, height)),
+        },
+        (false, _) => MainWindowSize::Maximize { unmaximized: None },
+    }
+}
+
+/// Whether the window's sizes are recorded yet. A one-shot latch: it leaves
+/// [`SizeRecording::Waiting`] once the main screen's size has been applied, so a
+/// `Resized` the switch from the unlock screen delivers is never taken for the
+/// user's size.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeRecording {
+    /// The main screen's size has not been applied yet.
+    Waiting,
+    /// A maximize was requested while the window was `from`, in logical px.
+    /// Nothing is recorded until a resize finds the window maximized or at any
+    /// other size, so the size it had before the request is not kept, and a
+    /// window manager that ignores the request still lets through the next
+    /// resize to another size.
+    UntilMaximized { from: (u32, u32) },
+    /// Sizes are recorded.
+    Recording,
+}
+
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+impl SizeRecording {
+    /// The latch once the main screen has been given `sizing`, from a window that
+    /// was `from` logical px before it.
+    fn after_sizing(sizing: MainWindowSize, from: (u32, u32)) -> Self {
+        match sizing {
+            MainWindowSize::Restore(..) => SizeRecording::Recording,
+            MainWindowSize::Maximize { .. } => SizeRecording::UntilMaximized { from },
+        }
+    }
+
+    /// The latch after a `Resized` to `size` logical px from a window whose
+    /// maximized state is `maximized`.
+    fn on_resize(self, maximized: Option<bool>, size: (u32, u32)) -> Self {
+        match self {
+            SizeRecording::UntilMaximized { from } if maximized == Some(true) || size != from => {
+                SizeRecording::Recording
+            }
+            latch => latch,
+        }
+    }
+}
+
+/// The logical size to remember from a `Resized` event of `width` x `height`
+/// physical px, or None when it is not a size to restore: sizes are not recorded
+/// yet (`recording`), the main screen is not up (the setup and unlock screens have
+/// a size of their own), the window is maximized, or the window is minimized,
+/// which reports a zero size.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn size_to_record(
+    recording: SizeRecording,
+    screen: &str,
+    width: u32,
+    height: u32,
+    maximized: Option<bool>,
+    scale: f32,
+) -> Option<(u32, u32)> {
+    (recording == SizeRecording::Recording
+        && screen == "main"
+        && width > 0
+        && height > 0
+        && maximized != Some(true))
+    .then(|| physical_to_logical_size(width, height, scale))
+}
+
+/// Give the window its main-screen size (see [`main_window_size`]), and return
+/// the size it was given. The window is already mapped, so a maximize request
+/// takes effect directly.
+#[cfg(feature = "desktop")]
+fn size_main_window(ui: &AppWindow, saved: Option<SavedWindow>) -> MainWindowSize {
+    use i_slint_backend_winit::WinitWindowAccessor;
+    let window = ui.window();
+    let monitor = window
+        .with_winit_window(|ww| {
+            let m = ww.current_monitor()?;
+            let size = m.size();
+            Some(physical_to_logical_size(
+                size.width,
+                size.height,
+                m.scale_factor() as f32,
+            ))
+        })
+        .flatten();
+    let set = |(w, h): (u32, u32)| window.set_size(slint::LogicalSize::new(w as f32, h as f32));
+    let sizing = main_window_size(saved, monitor);
+    match sizing {
+        MainWindowSize::Restore(w, h) => set((w, h)),
+        MainWindowSize::Maximize { unmaximized } => {
+            if let Some(size) = unmaximized {
+                set(size);
+            }
+            window.set_maximized(true);
+        }
+    }
+    sizing
 }
 
 /// Everything the running app must keep alive for its whole lifetime. **If this
@@ -1610,7 +1856,7 @@ fn connect_now(
                 profile_root,
                 project_announce_seed,
             ) = {
-                let st = state.borrow();
+                let mut st = state.borrow_mut();
                 (
                     st.display_handle(),
                     st.persisted_rejoins(),
@@ -1657,6 +1903,8 @@ fn connect_now(
             // reconnect gets a fresh mask (counting up + a fresh settle window).
             ui.set_mask_settling(false);
             ui.set_mask_peer_count(SharedString::default());
+            // Keys that failed to derive left messaging shown unavailable.
+            dm_ui::apply_dm(ui, &state.borrow());
         }
         Err(reason) => {
             set_status_unless_closing(ui, SharedString::from(format!("offline · {reason}")));
@@ -1728,6 +1976,12 @@ fn apply_net_event(
             st.on_dm_stopped();
             dm_ui::apply_dm(ui, &st);
         }
+        // Direct messaging cannot run; the reason was traced where it was found.
+        NetEvent::DmUnavailable(why) => {
+            let mut st = state.borrow_mut();
+            st.on_dm_unavailable(why);
+            dm_ui::apply_dm(ui, &st);
+        }
         // A close still waiting on the runner says so where "connecting…" is shown.
         NetEvent::DmCloseSlow => {
             ui.set_connection_status(SharedString::from(net::DM_CLOSE_MESSAGE));
@@ -1738,6 +1992,10 @@ fn apply_net_event(
             // and misleading when viewing a circle; "veilid" is always accurate.
             set_status_unless_closing(ui, SharedString::from("connected · veilid"));
             ui.set_connected(true);
+            // A new connection reads every record afresh.
+            let mut st = state.borrow_mut();
+            st.clear_room_reach();
+            rebuild_rail(ui, &st);
         }
         // #144: the attach peer count climbing during the cold-start warmup — shown
         // on the startup mask so the wait has live motion instead of a static status.
@@ -1771,6 +2029,14 @@ fn apply_net_event(
         NetEvent::Error { reason } => {
             if reason != "not yet on Veilid" {
                 ui.set_connect_notice(SharedString::from(reason));
+            }
+        }
+        // A room's record became unreadable or readable again: its rail row and its
+        // tab show the state until it clears.
+        NetEvent::RoomReach { room, reachable } => {
+            let mut st = state.borrow_mut();
+            if st.set_room_reach(room, reachable) {
+                rebuild_rail(ui, &st);
             }
         }
         NetEvent::Message {
@@ -1825,9 +2091,36 @@ fn apply_net_event(
             // and fill the net contract's rendezvous slot (ISC-C62), then refresh the
             // rail (and the header if it is the active circle).
             let mut st = state.borrow_mut();
+            // An earlier error for this circle is stale once it has joined. It names
+            // the label shown before the join, so check before the label changes.
+            if st.is_circle_error_status(circle_id, ui.get_connection_status().as_str()) {
+                set_status_unless_closing(ui, SharedString::from("connected · veilid"));
+            }
+            // Whether this join is the circle's first, not a re-report of a circle
+            // already joined: only the first opens the composer.
+            let first_join = st
+                .index_of_circle_id(circle_id)
+                .is_some_and(|idx| !st.has_joined(idx));
             if let Some(idx) = st.set_circle_rendezvous(circle_id, asset_addr) {
+                // The circle has joined: its row and chat stop showing it joining,
+                // and the composer opens if it is the active circle.
                 rebuild_rail(ui, &st);
                 if st.active() == idx {
+                    // The composer opens now, so give it the keys the circle's
+                    // autofocus could not, while its chat is on screen. Deferred, as
+                    // every refocus is, off the call path that drew the change.
+                    if first_join
+                        && ui.get_main_pane() == 0
+                        && ui.get_active_tab() == 0
+                        && !overlay_open(ui)
+                    {
+                        let w = ui.as_weak();
+                        defer(move || {
+                            if let Some(ui) = w.upgrade() {
+                                ui.invoke_focus_composer();
+                            }
+                        });
+                    }
                     // Preserve the live composer text: a rendezvous upgrade must not
                     // wipe what the user is typing (same clobber class as an inbound
                     // message). The header label IS still refreshed.
@@ -1878,10 +2171,20 @@ fn apply_net_event(
             }
         }
         NetEvent::CircleError { circle_id, reason } => {
-            // Non-fatal (the connection may still be up). Surface on the status
-            // line for manual test diagnostics; no per-circle status surface yet.
-            let _ = circle_id;
-            set_status_unless_closing(ui, SharedString::from(format!("circle: {reason}")));
+            // Non-fatal (the connection may still be up). Shown on the status line,
+            // naming the circle the way its rail row does. A join refused for a reason
+            // that may pass keeps the circle joining while the network layer retries
+            // it; a join that cannot succeed arrives as `CircleJoinFailed` instead.
+            let status = state.borrow().circle_error_status(circle_id, &reason);
+            set_status_unless_closing(ui, SharedString::from(status));
+        }
+        NetEvent::CircleJoinFailed { circle_id, reason } => {
+            // The circle stops showing that it is joining: its row and chat say it
+            // could not join and why, and its composer stays closed.
+            let mut st = state.borrow_mut();
+            if st.set_circle_join_failed(circle_id, &reason).is_some() {
+                rebuild_rail(ui, &st);
+            }
         }
         // ── Shares: browse tree (commit 1) ──
         // SharesSnapshot + FetchManifest drive the Shares-tab tree. Publish events and
@@ -2168,22 +2471,28 @@ fn apply_net_event(
 
 /// Render the shell offscreen to a PNG (headless-verifiable).
 fn render_png(window: &Rc<MinimalSoftwareWindow>, path: &str) {
-    let mut buf = vec![Rgb565Pixel(0); (W * H) as usize];
+    render_png_sized(window, path, W, H);
+}
+
+/// Render the window offscreen to a PNG of `w` x `h` px, the size the window was
+/// given.
+fn render_png_sized(window: &Rc<MinimalSoftwareWindow>, path: &str, w: u32, h: u32) {
+    let mut buf = vec![Rgb565Pixel(0); (w * h) as usize];
     let mut drawn = false;
     for _ in 0..3 {
         CLOCK.with(|c| c.set(c.get() + Duration::from_millis(16)));
         slint::platform::update_timers_and_animations();
         window.draw_if_needed(|r| {
-            r.render(&mut buf, W as usize);
+            r.render(&mut buf, w as usize);
             drawn = true;
         });
     }
     assert!(drawn, "renderer never drew a frame");
 
-    let mut img = image::RgbImage::new(W, H);
+    let mut img = image::RgbImage::new(w, h);
     for (i, px) in buf.iter().enumerate() {
-        let x = i as u32 % W;
-        let y = i as u32 / W;
+        let x = i as u32 % w;
+        let y = i as u32 / w;
         let v = px.0;
         let r = (((v >> 11) & 0x1f) as u32 * 255 + 15) / 31;
         let g = (((v >> 5) & 0x3f) as u32 * 255 + 31) / 63;
@@ -2192,7 +2501,7 @@ fn render_png(window: &Rc<MinimalSoftwareWindow>, path: &str) {
     }
     img.save(path)
         .unwrap_or_else(|e| panic!("save {path}: {e}"));
-    println!("daemonseed-gui: wrote {path} ({W}x{H}, software renderer)");
+    println!("daemonseed-gui: wrote {path} ({w}x{h}, software renderer)");
 }
 
 /// Live materialize + draft-retention round-trip through the REAL callbacks
@@ -2860,33 +3169,48 @@ fn main() {
         {
             use i_slint_backend_winit::winit::event::WindowEvent;
             use i_slint_backend_winit::{EventResult, WinitWindowAccessor};
-            // Restore the last window size (size only — the WM constrains an oversized
-            // value, and omitting position avoids landing off-screen on a different
-            // monitor; load_window_size() sanity-clamps absurd values).
-            if let Some((w, h)) = load_window_size(&profile_root.borrow()) {
-                ui.window().set_size(slint::PhysicalSize::new(w, h));
-            } else {
-                // No saved size yet (fresh identity): winit does not reliably honour
-                // the .slint preferred-width/height on first map, so the window comes
-                // up square. Apply the design default explicitly. LOGICAL px keeps it
-                // DPI-independent (the restore branch above uses physical because
-                // winit's Resized event reports physical px).
-                ui.window()
-                    .set_size(slint::LogicalSize::new(W as f32, H as f32));
-            }
+            // The setup and unlock screens open at their own small size, set
+            // explicitly because winit does not reliably honour the .slint
+            // preferred-width/height on first map. The saved size (size only:
+            // omitting position avoids landing off-screen on a different monitor;
+            // load_window_size() sanity-clamps absurd values) is applied once the main
+            // screen shows. Both are LOGICAL px, which the backend scales once the
+            // window exists on its display.
+            set_initial_window_size(&ui, PRE_UNLOCK_W, PRE_UNLOCK_H);
             let weak = ui.as_weak();
-            // Latest size, persisted once on close (one write per session, no disk churn
-            // during a drag-resize). The size follows the resolved profile root, so a
-            // --portable / --config instance saves into its own directory, not XDG.
+            // Latest unmaximized size on the main screen, persisted once on close (one
+            // write per session, no disk churn during a drag-resize). It stays None
+            // until the main screen's size has been applied (`recording`), so a quit
+            // before unlocking leaves the saved size as it was. The size follows the
+            // resolved profile root, so a --portable / --config instance saves into
+            // its own directory, not XDG.
             let last_size = std::rc::Rc::new(std::cell::Cell::new(None::<(u32, u32)>));
+            let recording = Rc::new(Cell::new(SizeRecording::Waiting));
             let ws_root = profile_root.clone();
+            {
+                let weak = ui.as_weak();
+                let root = profile_root.clone();
+                let recording = recording.clone();
+                ui.on_main_screen_shown(move || {
+                    if let Some(ui) = weak.upgrade() {
+                        let window = ui.window();
+                        let from = physical_to_logical_size(
+                            window.size().width,
+                            window.size().height,
+                            window.scale_factor(),
+                        );
+                        let sizing = size_main_window(&ui, load_window_size(&root.borrow()));
+                        recording.set(SizeRecording::after_sizing(sizing, from));
+                    }
+                });
+            }
             // Set once a close is under way, so a second close request while the actor
             // finishes is ignored rather than sent again.
             let closing = Rc::new(Cell::new(false));
             // Polls the close's ack while the window stays open, so the event loop keeps
             // drawing and can show the closing message.
             let close_watch = Rc::new(Timer::default());
-            ui.window().on_winit_window_event(move |_w, event| {
+            ui.window().on_winit_window_event(move |w, event| {
                 match event {
                     // #39: re-grab keyboard focus on activation so input survives an
                     // app-switch. defer() off the handler to avoid re-entering the focus
@@ -2899,7 +3223,23 @@ fn main() {
                             }
                         });
                     }
-                    WindowEvent::Resized(sz) => last_size.set(Some((sz.width, sz.height))),
+                    WindowEvent::Resized(sz) => {
+                        let screen = weak.upgrade().map(|ui| ui.get_screen()).unwrap_or_default();
+                        let maximized = w.with_winit_window(|ww| ww.is_maximized());
+                        let logical =
+                            physical_to_logical_size(sz.width, sz.height, w.scale_factor());
+                        recording.set(recording.get().on_resize(maximized, logical));
+                        if let Some(size) = size_to_record(
+                            recording.get(),
+                            &screen,
+                            sz.width,
+                            sz.height,
+                            maximized,
+                            w.scale_factor(),
+                        ) {
+                            last_size.set(Some(size));
+                        }
+                    }
                     WindowEvent::CloseRequested => {
                         // A second request while closing shows the closing message at
                         // once and changes nothing else.
@@ -2910,8 +3250,17 @@ fn main() {
                         if already_closing {
                             return EventResult::PreventDefault;
                         }
-                        if let Some((w, h)) = last_size.get() {
-                            save_window_size(&ws_root.borrow(), w, h);
+                        if let Some((width, height)) = last_size.get() {
+                            let maximized =
+                                w.with_winit_window(|ww| ww.is_maximized()) == Some(true);
+                            save_window_size(
+                                &ws_root.borrow(),
+                                SavedWindow {
+                                    width,
+                                    height,
+                                    maximized,
+                                },
+                            );
                         }
                         // #107: persist each circle's read high-water on graceful close
                         // (the common restart path) so a relaunch seeds the marks and
@@ -3262,6 +3611,47 @@ mod tests {
         TypeBackChallenge::new(PHRASE, &mut OsRng)
     }
 
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn window_size_is_saved_in_logical_px() {
+        // A maximized window on a 200% 4K display reports 3840x2088 physical.
+        assert_eq!(physical_to_logical_size(3840, 2088, 2.0), (1920, 1044));
+        assert_eq!(physical_to_logical_size(1650, 1020, 1.5), (1100, 680));
+        assert_eq!(physical_to_logical_size(1100, 680, 1.0), (1100, 680));
+        // A non-positive scale is treated as 1 rather than dividing by it.
+        assert_eq!(physical_to_logical_size(1100, 680, 0.0), (1100, 680));
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn window_size_round_trips_and_ignores_the_physical_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A size written by an earlier version is physical and must not be restored.
+        std::fs::write(root.join("window-size"), "3840x2088").unwrap();
+        assert_eq!(load_window_size(root), None);
+        let normal = SavedWindow {
+            width: 1920,
+            height: 1044,
+            maximized: false,
+        };
+        save_window_size(root, normal);
+        assert_eq!(load_window_size(root), Some(normal));
+        let maximized = SavedWindow {
+            maximized: true,
+            ..normal
+        };
+        save_window_size(root, maximized);
+        assert_eq!(load_window_size(root), Some(maximized));
+        // An unknown trailing word is rejected, not read as unmaximized.
+        std::fs::write(root.join("window-logical-size"), "1920x1044 full").unwrap();
+        assert_eq!(load_window_size(root), None);
+        assert!(
+            !root.join("window-size").exists(),
+            "the physical file is removed on save"
+        );
+    }
+
     #[test]
     fn format_unix_ms_renders_utc_caption() {
         // 1_000_000_000_000 ms = 2001-09-09 01:46:40 UTC.
@@ -3364,6 +3754,266 @@ mod tests {
                 let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
                 let _ = slint::platform::set_platform(Box::new(GuiPlatform { window }));
                 f(AppWindow::new().expect("create AppWindow"));
+            })
+            .expect("spawn the window thread")
+            .join();
+        if let Err(panic) = joined {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The window's preferred size defaults to the setup and unlock screens' size,
+    /// and follows the size set before the window is shown.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn preferred_size_defaults_to_the_pre_unlock_size_and_follows_the_set_size() {
+        with_offscreen_window(|ui| {
+            assert_eq!(ui.get_preferred_window_width(), PRE_UNLOCK_W as f32);
+            assert_eq!(ui.get_preferred_window_height(), PRE_UNLOCK_H as f32);
+
+            set_initial_window_size(&ui, 1000, 600);
+            assert_eq!(ui.get_preferred_window_width(), 1000.0);
+            assert_eq!(ui.get_preferred_window_height(), 600.0);
+        });
+    }
+
+    fn saved(width: u32, height: u32, maximized: bool) -> Option<SavedWindow> {
+        Some(SavedWindow {
+            width,
+            height,
+            maximized,
+        })
+    }
+
+    /// The main screen takes the saved size when it fits the monitor, exactly
+    /// fitting included, and is maximized when it is one pixel over in either
+    /// dimension.
+    #[test]
+    fn main_window_takes_the_saved_size_only_when_it_fits_the_monitor() {
+        let monitor = Some((1093, 614));
+        assert_eq!(
+            main_window_size(saved(1000, 600, false), monitor),
+            MainWindowSize::Restore(1000, 600)
+        );
+        assert_eq!(
+            main_window_size(saved(1093, 614, false), monitor),
+            MainWindowSize::Restore(1093, 614),
+            "a size exactly the monitor's fits"
+        );
+        assert_eq!(
+            main_window_size(saved(1094, 614, false), monitor),
+            MainWindowSize::Maximize { unmaximized: None },
+            "one pixel too wide"
+        );
+        assert_eq!(
+            main_window_size(saved(1093, 615, false), monitor),
+            MainWindowSize::Maximize { unmaximized: None },
+            "one pixel too tall"
+        );
+    }
+
+    /// With no saved size the design default is used under the same rule.
+    #[test]
+    fn main_window_with_no_saved_size_uses_the_default_when_it_fits() {
+        assert_eq!(
+            main_window_size(None, Some((W, H))),
+            MainWindowSize::Restore(W, H)
+        );
+        assert_eq!(
+            main_window_size(None, Some((1093, 614))),
+            MainWindowSize::Maximize { unmaximized: None }
+        );
+    }
+
+    /// With no monitor known, the saved or default size is used as it is.
+    #[test]
+    fn main_window_with_no_monitor_uses_the_saved_or_default_size() {
+        assert_eq!(
+            main_window_size(saved(3000, 2000, false), None),
+            MainWindowSize::Restore(3000, 2000)
+        );
+        assert_eq!(main_window_size(None, None), MainWindowSize::Restore(W, H));
+    }
+
+    /// A window closed maximized is maximized again over its saved size when that
+    /// size fits, and over no size of its own when it does not.
+    #[test]
+    fn main_window_closed_maximized_is_maximized() {
+        assert_eq!(
+            main_window_size(saved(1000, 600, true), Some((1093, 614))),
+            MainWindowSize::Maximize {
+                unmaximized: Some((1000, 600))
+            }
+        );
+        assert_eq!(
+            main_window_size(saved(1200, 600, true), Some((1093, 614))),
+            MainWindowSize::Maximize { unmaximized: None }
+        );
+        assert_eq!(
+            main_window_size(saved(1000, 600, true), None),
+            MainWindowSize::Maximize {
+                unmaximized: Some((1000, 600))
+            }
+        );
+    }
+
+    /// A resize is remembered only while the main screen is up, and never while
+    /// the window is maximized or minimized.
+    #[test]
+    fn a_resize_before_unlocking_is_not_recorded() {
+        let on = SizeRecording::Recording;
+        assert_eq!(
+            size_to_record(on, "main", 1650, 1020, Some(false), 1.5),
+            Some((1100, 680)),
+            "control: a main-screen resize is recorded"
+        );
+        assert_eq!(
+            size_to_record(on, "unlock", 1650, 1020, Some(false), 1.5),
+            None
+        );
+        assert_eq!(
+            size_to_record(on, "first-start", 1650, 1020, None, 1.5),
+            None
+        );
+        assert_eq!(
+            size_to_record(on, "main", 1650, 1020, Some(true), 1.5),
+            None
+        );
+        assert_eq!(size_to_record(on, "main", 0, 0, Some(false), 1.5), None);
+    }
+
+    /// No size is recorded until the main screen's size has been applied. After a
+    /// restore every size is recorded; after a maximize none is until a resize
+    /// finds the window maximized or at a size other than the one before the
+    /// request, so that earlier size is never kept, and an un-maximize after that
+    /// is.
+    #[test]
+    fn sizes_are_recorded_only_once_the_main_screen_size_is_applied() {
+        let before = (720, 520);
+        let record = |latch, maximized| size_to_record(latch, "main", 720, 520, maximized, 1.0);
+        assert_eq!(
+            record(SizeRecording::Waiting, Some(false)),
+            None,
+            "a resize before the main-screen size was recorded"
+        );
+
+        let restored = SizeRecording::after_sizing(MainWindowSize::Restore(1000, 600), before);
+        assert_eq!(restored, SizeRecording::Recording);
+        assert_eq!(record(restored, Some(false)), Some((720, 520)));
+
+        for unmaximized in [None, Some((1000, 600))] {
+            let mut latch =
+                SizeRecording::after_sizing(MainWindowSize::Maximize { unmaximized }, before);
+            latch = latch.on_resize(Some(false), before);
+            assert_eq!(
+                record(latch, Some(false)),
+                None,
+                "the size before the maximize was recorded ({unmaximized:?})"
+            );
+            latch = latch.on_resize(None, before);
+            assert_eq!(record(latch, None), None, "an unknown state ended the wait");
+            latch = latch.on_resize(Some(true), (1920, 1080));
+            assert_eq!(latch, SizeRecording::Recording);
+            assert_eq!(
+                record(latch.on_resize(Some(false), before), Some(false)),
+                Some((720, 520)),
+                "an un-maximize after the maximize was not recorded"
+            );
+        }
+        assert_eq!(
+            SizeRecording::Waiting.on_resize(Some(true), (1920, 1080)),
+            SizeRecording::Waiting,
+            "a resize opened the latch before the main-screen sizing"
+        );
+    }
+
+    /// A window manager that never maximizes the window, or whose maximized state
+    /// cannot be read, still lets sizes be recorded: the first resize to any size
+    /// other than the one before the request ends the wait and is recorded.
+    #[test]
+    fn the_wait_for_a_maximize_ends_on_any_new_size() {
+        let before = (720, 520);
+        for maximized in [Some(false), None] {
+            let latch =
+                SizeRecording::after_sizing(MainWindowSize::Maximize { unmaximized: None }, before);
+            let latch = latch.on_resize(maximized, before);
+            assert_ne!(
+                latch,
+                SizeRecording::Recording,
+                "control: the old size waits"
+            );
+            let latch = latch.on_resize(maximized, (1000, 600));
+            assert_eq!(latch, SizeRecording::Recording, "{maximized:?}");
+            assert_eq!(
+                size_to_record(latch, "main", 1000, 600, maximized, 1.0),
+                Some((1000, 600))
+            );
+        }
+    }
+
+    /// Writes every setup wizard step and the unlock screen, at the size the window
+    /// has before unlocking, to `prelock-shots` under the temporary directory.
+    /// Run with `--ignored`.
+    #[test]
+    #[ignore = "writes PNG files; run on demand with --ignored"]
+    fn pre_unlock_screenshots() {
+        // 24 eight-letter words, the longest the English wordlist has.
+        const LONG_PHRASE: &str = "abstract accident acoustic activity addition aircraft \
+            alphabet although aluminum ambition anything argument attitude audience bachelor \
+            birthday boundary broccoli business calendar campaign category champion cinnamon";
+        let joined = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+                let _ = slint::platform::set_platform(Box::new(GuiPlatform {
+                    window: window.clone(),
+                }));
+                let (ui, _state, _net, _browser) = build_ui(None);
+                ui.show().expect("show");
+                window.set_size(slint::PhysicalSize::new(PRE_UNLOCK_W, PRE_UNLOCK_H));
+                let dir = std::env::temp_dir().join("prelock-shots");
+                std::fs::create_dir_all(&dir).expect("create the shot directory");
+                let shot = |name: &str| {
+                    let path = dir.join(name);
+                    let path = path.to_str().expect("a UTF-8 path");
+                    render_png_sized(&window, path, PRE_UNLOCK_W, PRE_UNLOCK_H);
+                };
+                let error = |text: &str| ui.set_auth_error(SharedString::from(text));
+
+                ui.set_screen(SharedString::from("first-start"));
+                ui.set_fs_step(0);
+                shot("prelock-0-passphrase-empty.png");
+                ui.set_fs_passphrase(SharedString::from("correct horse battery staple"));
+                ui.set_fs_passphrase_confirm(SharedString::from("correct horse battery stapler"));
+                error("Those don't match — type the same passphrase in both boxes.");
+                shot("prelock-0-passphrase-mismatch.png");
+
+                error("");
+                ui.set_fs_mnemonic(SharedString::from(SAMPLE_MNEMONIC));
+                ui.set_fs_step(1);
+                shot("prelock-1-phrase.png");
+                ui.set_fs_mnemonic(SharedString::from(LONG_PHRASE));
+                shot("prelock-1-phrase-longest-words.png");
+
+                ui.set_fs_step(2);
+                ui.set_fs_typeback_prompt(SharedString::from(
+                    "Type words #4, #12 and #22 of your recovery phrase.",
+                ));
+                ui.set_fs_confirm_1(SharedString::from("about"));
+                ui.set_fs_confirm_2(SharedString::from("accident"));
+                ui.set_fs_confirm_3(SharedString::from("actor"));
+                error("Those words don't match — here's a new set to try.");
+                shot("prelock-2-confirm.png");
+
+                ui.set_fs_step(3);
+                ui.set_fs_name(SharedString::from("quiet-harbor"));
+                error("Pick a name others will see.");
+                shot("prelock-3-name.png");
+
+                ui.set_screen(SharedString::from("unlock"));
+                ui.set_unlock_passphrase(SharedString::from("correct horse battery"));
+                error("Wrong passphrase.");
+                shot("prelock-4-unlock.png");
             })
             .expect("spawn the window thread")
             .join();

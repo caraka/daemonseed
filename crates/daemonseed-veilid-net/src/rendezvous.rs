@@ -498,7 +498,8 @@ pub async fn open_or_create(
 /// nobody for can plausibly surface as `KeyNotFound` too. That path is **untested**;
 /// what is established is the genuinely-absent case, not the unfetchable one.
 ///
-/// **The obligation this puts on the collector (#236, unwritten):** an `Ok(None)` must
+/// **The obligation this puts on the collector (#236, met by
+/// `SessionHealthTracker::observe`, which ignores a pass with no reads):** an `Ok(None)` must
 /// not be treated as authoritative absence. It is safe as a reason to read no slots
 /// and to leave the page alone; it is NOT evidence the correspondent has written
 /// nothing, and it must not clear a health or repair latch on its own. The sweep
@@ -1151,6 +1152,36 @@ pub struct SweepOutcome {
     pub found: u32,
 }
 
+/// How a repair of a rendezvous record session ended, when it re-opened and re-watched
+/// the record. A repair that could not re-open or re-watch is an `Err` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepairOutcome {
+    /// The record was re-opened and re-watched, and every slot read of the full
+    /// re-read succeeded.
+    Complete,
+    /// The record was re-opened and re-watched, but `failed` of the `attempted` slot
+    /// reads of the full re-read got no answer. The session is not known to be
+    /// serving reads.
+    Partial { attempted: u32, failed: u32 },
+    /// A repair of the same record was already running, so this request did nothing.
+    AlreadyRunning,
+}
+
+impl RepairOutcome {
+    /// The outcome of a repair whose re-read reported `sweep`: complete only when no
+    /// slot read failed.
+    pub fn of_sweep(sweep: &SweepOutcome) -> Self {
+        if sweep.failed == 0 {
+            RepairOutcome::Complete
+        } else {
+            RepairOutcome::Partial {
+                attempted: sweep.attempted,
+                failed: sweep.failed,
+            }
+        }
+    }
+}
+
 /// Sweep every subkey once for the login backlog, emitting an [`VeilidNetEvent::Inbound`]
 /// per populated slot. Each `get_dht_value` `force_refresh`es from the network (DHT
 /// reads are eventually consistent) under a **per-GET** read permit from the shared
@@ -1376,7 +1407,9 @@ pub const REPAIR_CLOSE_FIRST: bool = true;
 /// Generic over the veilid ops (`close`/`open`/`watch`/`sweep` are caller-supplied
 /// futures) so the ordering + lock span are unit-testable with an instrumented gate/lock
 /// stand-in and no live veilid attach — exactly as [`sweep_gated`] makes the per-GET
-/// permit discipline testable. Returns the re-sweep's [`SweepOutcome`].
+/// permit discipline testable. Returns the [`RepairOutcome`] of the re-sweep: a re-sweep
+/// with any failed slot read is [`RepairOutcome::Partial`], never a success. `sweep`
+/// receives the fresh key and returns its [`SweepOutcome`].
 #[allow(clippy::too_many_arguments)]
 pub async fn repair_gated<I, K, CloseFut, OpenFut, WatchFut, SweepFut>(
     record_lock: &Arc<tokio::sync::Mutex<()>>,
@@ -1387,7 +1420,7 @@ pub async fn repair_gated<I, K, CloseFut, OpenFut, WatchFut, SweepFut>(
     open: impl FnOnce() -> OpenFut,
     watch: impl FnOnce(K) -> WatchFut,
     sweep: impl FnOnce(K) -> SweepFut,
-) -> Result<SweepOutcome>
+) -> Result<RepairOutcome>
 where
     I: Eq + std::hash::Hash + Clone,
     K: Clone,
@@ -1425,7 +1458,7 @@ where
     watch(key.clone()).await?;
 
     // 5. Full re-sweep (per-GET read permits inside `sweep`) to drain the missed backlog.
-    Ok(sweep(key).await)
+    Ok(RepairOutcome::of_sweep(&sweep(key).await))
 }
 
 #[cfg(test)]
@@ -2870,7 +2903,7 @@ mod tests {
         .expect("repair completes");
 
         competitor.await.unwrap();
-        assert_eq!(outcome.found, 4);
+        assert_eq!(outcome, RepairOutcome::Complete);
         assert_eq!(gets.load(Ordering::SeqCst), 4);
         // The fresh key is re-cached; the old dead handle is gone.
         assert_eq!(*cache.lock().unwrap().get(&SEED).unwrap(), 999);
@@ -2974,7 +3007,7 @@ mod tests {
         .unwrap();
 
         chat.await.unwrap();
-        assert_eq!(outcome.found, 1);
+        assert_eq!(outcome, RepairOutcome::Complete);
         // Repair fully completed BEFORE the chat write ran — no interleave in the lock span.
         assert_eq!(
             *order.lock().unwrap(),
@@ -2987,5 +3020,53 @@ mod tests {
             !chat_opened_its_own.load(Ordering::SeqCst),
             "the chat write reused repair's fresh session, not a torn-down/re-opened one"
         );
+    }
+
+    /// Run [`repair_gated`] with an open and a watch that succeed and a re-sweep that
+    /// reports `sweep`, returning the repair's outcome.
+    async fn repair_with_sweep(sweep: SweepOutcome) -> RepairOutcome {
+        let record_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        let cache: Mutex<HashMap<[u8; 32], u32>> = Mutex::new(HashMap::new());
+        repair_gated(
+            &record_lock,
+            &cache,
+            &[4u8; 32],
+            true,
+            |_old| async {},
+            || async { Ok(7u32) },
+            |_k| async { Ok(()) },
+            move |_k| async move { sweep },
+        )
+        .await
+        .expect("open and watch succeed")
+    }
+
+    /// A repair whose re-read had any failed slot read is a partial repair carrying the
+    /// failure count; one whose every slot read succeeded is complete.
+    #[tokio::test]
+    async fn repair_with_a_failed_slot_read_is_partial_and_a_clean_one_is_complete() {
+        let partial = repair_with_sweep(SweepOutcome {
+            attempted: 64,
+            failed: 3,
+            timed_out: 1,
+            found: 20,
+        })
+        .await;
+        assert_eq!(
+            partial,
+            RepairOutcome::Partial {
+                attempted: 64,
+                failed: 3
+            }
+        );
+
+        let complete = repair_with_sweep(SweepOutcome {
+            attempted: 64,
+            failed: 0,
+            timed_out: 0,
+            found: 20,
+        })
+        .await;
+        assert_eq!(complete, RepairOutcome::Complete);
     }
 }

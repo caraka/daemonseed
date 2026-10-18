@@ -22,8 +22,9 @@ use daemonseed_core::crypto::suite::CNSA_2_0;
 use daemonseed_core::identity::keys::{IDENTITY_PK_LEN, ShareRootIkm, SignKeypair};
 use daemonseed_core::trust_events::{TrustEventKey, TrustEventLog, TrustEventScope};
 use daemonseed_veilid_net::dm::runner::IdentityPk;
+use daemonseed_veilid_net::dm::unavailable::{DmUnavailable, DmUnavailableCause};
 
-use crate::net::{DmSessionKeys, RosterEntry};
+use crate::net::{DmSessionKeys, RoomRecord, RosterEntry};
 use daemonseed_core::passphrase::strength::{self, DicewareError};
 
 use crate::profile::Profile;
@@ -373,6 +374,10 @@ pub struct CircleNet {
     /// The net path fills it (`daemonseed_core::cot::asset_address(cot_key, server_id)`)
     /// once a relay/server-id is in hand.
     pub rendezvous: Option<AssetAddr>,
+    /// Why the circle's join ended for good, from a
+    /// [`crate::net::NetEvent::CircleJoinFailed`]. `None` while the join may still go
+    /// through, and cleared by a later join that does.
+    pub join_failed: Option<String>,
 }
 
 impl core::fmt::Debug for CircleNet {
@@ -381,6 +386,7 @@ impl core::fmt::Debug for CircleNet {
             .field("phrase", &"<redacted>")
             .field("cot_key", &self.cot_key)
             .field("rendezvous", &self.rendezvous.is_some())
+            .field("join_failed", &self.join_failed)
             .finish()
     }
 }
@@ -433,6 +439,27 @@ pub struct CircleState {
 /// First circle id handed out (0 is reserved/unused so a missing id is obvious).
 const FIRST_CIRCLE_ID: u64 = 1;
 
+/// The start of the status line for an error reported for the circle labelled
+/// `name`. The colon ends the label, so one label is never a prefix of another's.
+fn circle_error_prefix(name: &str) -> String {
+    format!("circle {name}: ")
+}
+
+/// The most of a join failure's reason a chat line shows, in characters.
+const JOIN_FAILED_REASON_MAX: usize = 80;
+
+/// `reason` cut to fit a single chat line: its first line, ending in `…` past
+/// [`JOIN_FAILED_REASON_MAX`] characters.
+fn short_reason(reason: &str) -> String {
+    let line = reason.lines().next().unwrap_or_default().trim();
+    if line.chars().count() <= JOIN_FAILED_REASON_MAX {
+        return line.to_owned();
+    }
+    let mut out: String = line.chars().take(JOIN_FAILED_REASON_MAX - 1).collect();
+    out.push('…');
+    out
+}
+
 /// The whole GUI state: the circles, which one is active, and the
 /// unlocked [`Profile`] (when present) that persists circle membership + the
 /// display handle across relaunches. The circles/draft/scroll layer stays RAM-only
@@ -477,6 +504,10 @@ pub struct GuiState {
     /// Direct messaging: what the runner has reported, the commands queued for
     /// it, and the rail's sections and selection. See [`dm`].
     dm: dm::GuiDm,
+    /// Rooms whose record the app cannot read right now: a repair of the record's
+    /// session failed, or consecutive re-reads got no answer to any read, and no
+    /// repair or re-read has got an answer since. Cleared on every new connection.
+    unreachable: BTreeSet<RoomRecord>,
 }
 
 impl GuiState {
@@ -511,6 +542,7 @@ impl GuiState {
             trust_log: TrustEventLog::default(),
             project_announce_seed: None,
             dm: dm::GuiDm::default(),
+            unreachable: BTreeSet::new(),
         }
     }
 
@@ -522,6 +554,11 @@ impl GuiState {
     /// Call once, right after auth succeeds, before [`GuiState::persisted_rejoins`].
     pub fn set_profile(&mut self, profile: Profile) {
         for (phrase, _label) in profile.circles() {
+            // A stored phrase whose circle is already in the rail, such as the same
+            // phrase stored twice with different spacing, adds no second row.
+            if self.index_of_phrase(&phrase).is_some() {
+                continue;
+            }
             if let Ok(idx) = self.materialize_from_phrase(&phrase) {
                 // #107: seed the circle's read high-water from the blob so a relaunch's
                 // backlog re-delivery does NOT re-trip the unread dot for already-seen
@@ -615,9 +652,21 @@ impl GuiState {
 
     /// Derive the secret halves for the direct-messaging runner this connect
     /// starts. `None` on the ephemeral / no-profile path, or if derivation fails,
-    /// and then no runner is started.
-    pub fn dm_session_keys(&self) -> Option<Box<DmSessionKeys>> {
-        self.profile.as_ref().and_then(|p| p.dm_session_keys().ok())
+    /// and then no runner is started. A derivation that fails is traced and
+    /// leaves direct messaging shown unavailable.
+    pub fn dm_session_keys(&mut self) -> Option<Box<DmSessionKeys>> {
+        let profile = self.profile.as_ref()?;
+        match profile.dm_session_keys() {
+            Ok(keys) => Some(keys),
+            Err(e) => {
+                daemonseed_veilid_net::vtrace!("gui dm: direct-message keys not derived ({e})");
+                self.on_dm_unavailable(DmUnavailable::new(
+                    DmUnavailableCause::Internal,
+                    &format!("direct-message keys not derived: {e}"),
+                ));
+                None
+            }
+        }
     }
 
     /// The ISC-C28 trust-event audit log. Read-only; the writes are
@@ -847,16 +896,26 @@ impl GuiState {
     /// always removed from the rail this session; a profile re-seal failure is
     /// surfaced (the circle would otherwise re-join next launch) but does not block
     /// the in-session removal. `active` is shifted so it stays on the same circle.
+    ///
+    /// Every stored phrase that derives the circle's key is dropped, not only the
+    /// one the rail shows: the same phrase stored twice with different spacing
+    /// restores as one circle, and a form left in the blob would re-join it.
     pub fn forget_circle(&mut self, idx: usize) -> Result<(), String> {
-        let Some(phrase) = self
-            .circles
-            .get(idx)
-            .and_then(|c| c.net.as_ref().map(|n| n.phrase.clone()))
-        else {
+        let Some(net) = self.circles.get(idx).and_then(|c| c.net.as_ref()) else {
             return Ok(()); // Lobby or unknown index — nothing to forget.
         };
         let result = match self.profile.as_mut() {
-            Some(p) => p.forget_circle(&phrase).map(|_| ()),
+            Some(p) => {
+                let mut result = Ok(());
+                for (stored, _label) in p.circles() {
+                    let same = derive_cot_key(&stored, &CNSA_2_0)
+                        .is_ok_and(|key| key.as_bytes() == net.cot_key.as_bytes());
+                    if same && let Err(e) = p.forget_circle(&stored) {
+                        result = Err(e);
+                    }
+                }
+                result
+            }
             None => Ok(()),
         };
         self.circles.remove(idx);
@@ -918,6 +977,7 @@ impl GuiState {
                 phrase: phrase.to_owned(),
                 cot_key,
                 rendezvous: None,
+                join_failed: None,
             }),
             unread: false,
             high_water_ms: 0,
@@ -948,6 +1008,7 @@ impl GuiState {
         let circle = &mut self.circles[idx];
         if let Some(net) = circle.net.as_mut() {
             net.rendezvous = Some(asset_addr);
+            net.join_failed = None;
         }
         circle.name = label;
         circle.initial = initial;
@@ -1006,6 +1067,163 @@ impl GuiState {
         self.circles
             .iter()
             .position(|c| c.net.as_ref().is_some_and(|n| n.circle_id == circle_id))
+    }
+
+    /// Rail index of the circle `phrase` names, or `None`. Two phrases name one circle
+    /// when they derive the same key, so a phrase that differs only in the way the
+    /// derivation ignores finds the circle too. `None` when the key cannot be derived.
+    pub fn index_of_phrase(&self, phrase: &str) -> Option<usize> {
+        let key = derive_cot_key(phrase, &CNSA_2_0).ok()?;
+        self.circles.iter().position(|c| {
+            c.net
+                .as_ref()
+                .is_some_and(|n| n.cot_key.as_bytes() == key.as_bytes())
+        })
+    }
+
+    /// Record that the join of `circle_id` ended for good, for `reason`, from a
+    /// [`crate::net::NetEvent::CircleJoinFailed`]. A circle that has already joined
+    /// keeps its joined state. Returns the rail index changed.
+    pub fn set_circle_join_failed(&mut self, circle_id: u64, reason: &str) -> Option<usize> {
+        let idx = self.index_of_circle_id(circle_id)?;
+        let net = self.circles[idx].net.as_mut()?;
+        if net.rendezvous.is_some() {
+            return None;
+        }
+        net.join_failed = Some(reason.to_owned());
+        Some(idx)
+    }
+
+    /// Start the join of the circle at rail index `idx` again after it ended for
+    /// good: the circle shows that it is joining once more. Returns the circle's
+    /// `circle_id` and phrase to send the join with, or `None` for a circle whose
+    /// join has not ended for good.
+    pub fn retry_failed_join(&mut self, idx: usize) -> Option<(u64, String)> {
+        let net = self.circles.get_mut(idx)?.net.as_mut()?;
+        if net.rendezvous.is_some() {
+            return None;
+        }
+        net.join_failed.take()?;
+        Some((net.circle_id, net.phrase.clone()))
+    }
+
+    /// Record whether `room`'s record can be read, from a [`crate::net::NetEvent::RoomReach`].
+    /// Returns whether the room's state changed.
+    pub fn set_room_reach(&mut self, room: RoomRecord, reachable: bool) -> bool {
+        if reachable {
+            self.unreachable.remove(&room)
+        } else {
+            self.unreachable.insert(room)
+        }
+    }
+
+    /// Forget every room's reach state: a new connection reads every record afresh.
+    pub fn clear_room_reach(&mut self) {
+        self.unreachable.clear();
+    }
+
+    /// The line `room` shows while its record cannot be read, naming the room the way
+    /// the rail and header show it. `None` while the room is reachable, and for a circle
+    /// no longer in the rail.
+    pub fn reach_notice(&self, room: RoomRecord) -> Option<String> {
+        if !self.unreachable.contains(&room) {
+            return None;
+        }
+        let name = match room {
+            RoomRecord::Lobby => "the Lobby".to_owned(),
+            RoomRecord::LobbyShares => "the Lobby share list".to_owned(),
+            RoomRecord::Announcements => "the announcements".to_owned(),
+            RoomRecord::Circle(id) => {
+                let idx = self.index_of_circle_id(id)?;
+                // A circle that has never joined cannot be unreachable: it shows
+                // that it is joining, or that it could not join, instead.
+                if !self.has_joined(idx) {
+                    return None;
+                }
+                self.circles[idx].name.clone()
+            }
+        };
+        Some(format!("Can't reach {name} right now. Retrying."))
+    }
+
+    /// Whether the circle at rail index `idx` is still joining: a circle whose join
+    /// has not yet been confirmed by a [`crate::net::NetEvent::CircleJoined`] and has
+    /// not ended for good. The join is sent when the circle is added and again on
+    /// every connect, and a join refused for a reason that may pass is retried, so
+    /// the circle stays joining until a join goes through or one fails for good.
+    /// `false` for the Lobby and for an index past the rail.
+    pub fn is_joining(&self, idx: usize) -> bool {
+        self.circles
+            .get(idx)
+            .and_then(|c| c.net.as_ref())
+            .is_some_and(|n| n.rendezvous.is_none() && n.join_failed.is_none())
+    }
+
+    /// Whether the room at rail index `idx` has joined: the Lobby always, a circle
+    /// once a [`crate::net::NetEvent::CircleJoined`] has confirmed it. `false` for an
+    /// index past the rail.
+    pub fn has_joined(&self, idx: usize) -> bool {
+        self.circles
+            .get(idx)
+            .is_some_and(|c| c.net.as_ref().is_none_or(|n| n.rendezvous.is_some()))
+    }
+
+    /// Why the join of the circle at rail index `idx` ended for good, while it has
+    /// not joined since. `None` otherwise, and for the Lobby.
+    pub fn join_failure(&self, idx: usize) -> Option<&str> {
+        self.circles
+            .get(idx)
+            .and_then(|c| c.net.as_ref())
+            .filter(|n| n.rendezvous.is_none())
+            .and_then(|n| n.join_failed.as_deref())
+    }
+
+    /// The line the chat view shows while the circle at rail index `idx` is
+    /// joining, or after its join ended for good, naming it by the label its rail
+    /// row shows: `Joining <name>…` or `Couldn't join <name>: <reason>`, the reason
+    /// cut to its first line and `JOIN_FAILED_REASON_MAX` characters. `None` once
+    /// the circle has joined, and for the Lobby.
+    pub fn joining_notice(&self, idx: usize) -> Option<String> {
+        let name = &self.circles.get(idx)?.name;
+        if let Some(reason) = self.join_failure(idx) {
+            return Some(format!("Couldn't join {name}: {}", short_reason(reason)));
+        }
+        self.is_joining(idx).then(|| format!("Joining {name}…"))
+    }
+
+    /// Whether the composer can send to the active room: the Lobby always, a circle
+    /// once it has joined.
+    pub fn can_send(&self) -> bool {
+        self.has_joined(self.active)
+    }
+
+    /// The status line for an error the network reported for `circle_id`, naming
+    /// the circle by the label its rail row shows. A circle no longer in the rail
+    /// gets the reason under a generic prefix.
+    pub fn circle_error_status(&self, circle_id: u64, reason: &str) -> String {
+        match self.index_of_circle_id(circle_id) {
+            Some(idx) => format!("{}{reason}", circle_error_prefix(&self.circles[idx].name)),
+            None => format!("circle: {reason}"),
+        }
+    }
+
+    /// Whether `status` is an error that [`Self::circle_error_status`] wrote for
+    /// `circle_id` under the circle's current label.
+    pub fn is_circle_error_status(&self, circle_id: u64, status: &str) -> bool {
+        self.index_of_circle_id(circle_id)
+            .is_some_and(|idx| status.starts_with(&circle_error_prefix(&self.circles[idx].name)))
+    }
+
+    /// The reach line of the room at rail index `idx` (its chat record): the Lobby at
+    /// index 0, otherwise the circle there. `None` while that room is reachable.
+    pub fn room_reach_notice(&self, idx: usize) -> Option<String> {
+        let circle = self.circles.get(idx)?;
+        let room = match circle.net.as_ref() {
+            Some(net) => RoomRecord::Circle(net.circle_id),
+            None if idx == 0 => RoomRecord::Lobby,
+            None => return None,
+        };
+        self.reach_notice(room)
     }
 
     /// Option A (#77 follow-up): cache the roster the net layer surfaced for
@@ -1306,6 +1524,7 @@ impl GuiState {
             trust_log: TrustEventLog::default(),
             project_announce_seed: None,
             dm: dm::GuiDm::default(),
+            unreachable: BTreeSet::new(),
         }
     }
 }
@@ -2490,6 +2709,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A profile that stores one circle's phrase twice, in forms that derive the
+    /// same key, restores one row for it, and leaving that row drops both forms.
+    #[test]
+    fn a_circle_stored_twice_is_restored_once() {
+        use daemonseed_core::bootstrap::BootstrapAnchor;
+        use daemonseed_core::first_start::FirstStart;
+        use daemonseed_core::profile::config::ArgonParams;
+        use daemonseed_core::profile::persist::{
+            load_for_unlock, session_materials_from_unlock, write_first_start,
+        };
+        use daemonseed_core::storage::seeds;
+
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "ds-gui-profile-dup-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let fast = ArgonParams {
+            memory_kib: 8,
+            iterations: 1,
+            parallelism: 1,
+        };
+        let pass = "correct horse battery staple table mountain";
+        let sealed = FirstStart::new().initialize(pass, fast).unwrap();
+        let phrase = sealed.display_phrase();
+        let verified = sealed.verify_round_trip(&phrase).unwrap();
+        let materials = verified
+            .finalize(
+                Some("alice".to_string()),
+                BootstrapAnchor {
+                    server_id: "relay#aabbccddeeff".to_string(),
+                    address: "127.0.0.1:443".to_string(),
+                },
+            )
+            .unwrap()
+            .into_session_materials();
+        write_first_start(&root, &materials, None, false).unwrap();
+
+        let mut st1 = GuiState::lobby_only();
+        st1.set_profile(Profile::from_materials(materials, root.clone()));
+        for stored in [STRONG.to_owned(), format!("  {STRONG} ")] {
+            let idx = st1.materialize_from_phrase(&stored).unwrap();
+            st1.persist_circle(idx).expect("the circle persists");
+        }
+        drop(st1);
+
+        let (config, blob) = load_for_unlock(&root).unwrap();
+        let opened = seeds::open(&blob, pass, config.profile_id, config.argon2).unwrap();
+        assert_eq!(
+            opened.seeds.circles().len(),
+            2,
+            "control: the profile stores the phrase twice"
+        );
+        let materials2 = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob.clone(),
+            vec![],
+        )
+        .unwrap();
+        let mut st2 = GuiState::lobby_only();
+        st2.set_profile(Profile::from_materials(materials2, root.clone()));
+        assert_eq!(st2.len(), 2, "the Lobby and one row for the circle");
+        assert_eq!(st2.persisted_rejoins().len(), 1);
+
+        // Leaving the one row drops both stored forms.
+        st2.forget_circle(1).expect("the circle is forgotten");
+        drop(st2);
+        let (config, blob) = load_for_unlock(&root).unwrap();
+        let opened = seeds::open(&blob, pass, config.profile_id, config.argon2).unwrap();
+        assert!(
+            opened.seeds.circles().is_empty(),
+            "a stored form of the circle was left to re-join it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #115: leaving a circle drops it from the rail AND the blob (so it does not
     /// silently re-join next launch), and revealing a circle's phrase is gated on the
     /// unlock passphrase (an evil-maid guard) — the correct passphrase verifies, a
@@ -3266,5 +3569,236 @@ mod tests {
             before,
             "a direct-messaging event changed visible state"
         );
+    }
+
+    // ── Reaching a room's record ─────────────────────────────────────────────
+
+    /// A joined circle at rail index 1, named by the label the rail shows for it.
+    fn state_with_joined_circle() -> (GuiState, u64, String) {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let mut st = GuiState::lobby_only();
+        let idx = st
+            .materialize_from_phrase("reach notice circle phrase")
+            .expect("the circle derives");
+        let circle_id = st.metas()[idx].net.as_ref().expect("a circle").circle_id;
+        let addr = AssetAddr::from_bytes([7u8; daemonseed_core::cot::ASSET_ADDR_LEN]);
+        st.set_circle_rendezvous(circle_id, addr)
+            .expect("known circle");
+        let label = st.metas()[idx].name.clone();
+        (st, circle_id, label)
+    }
+
+    /// A room whose repair failed shows it cannot be reached, by the name the user
+    /// knows it by: the Lobby by name, a circle by the label its rail row shows.
+    #[test]
+    fn a_failed_repair_names_the_room_it_cannot_reach() {
+        let (mut st, circle_id, label) = state_with_joined_circle();
+        assert_eq!(
+            st.room_reach_notice(0),
+            None,
+            "control: the Lobby starts reachable"
+        );
+
+        assert!(st.set_room_reach(RoomRecord::Lobby, false));
+        assert_eq!(
+            st.room_reach_notice(0).as_deref(),
+            Some("Can't reach the Lobby right now. Retrying.")
+        );
+
+        assert!(st.set_room_reach(RoomRecord::Circle(circle_id), false));
+        let notice = st.room_reach_notice(1).expect("the circle shows its state");
+        assert_eq!(notice, format!("Can't reach {label} right now. Retrying."));
+        assert!(
+            !label.starts_with('#'),
+            "the shown label, not the fingerprint"
+        );
+        assert_eq!(
+            st.reach_notice(RoomRecord::Circle(circle_id)),
+            Some(notice),
+            "the rail row and the chat view read the same line"
+        );
+    }
+
+    /// A repair that fully succeeded, and an ordinary re-read that went through, both
+    /// arrive as a reachable room and clear its line; a second clear changes nothing.
+    #[test]
+    fn a_reachable_room_clears_its_line() {
+        let (mut st, circle_id, _) = state_with_joined_circle();
+        st.set_room_reach(RoomRecord::Lobby, false);
+        st.set_room_reach(RoomRecord::Circle(circle_id), false);
+
+        assert!(st.set_room_reach(RoomRecord::Lobby, true));
+        assert_eq!(st.room_reach_notice(0), None);
+        assert!(!st.set_room_reach(RoomRecord::Lobby, true), "already clear");
+
+        assert!(st.set_room_reach(RoomRecord::Circle(circle_id), true));
+        assert_eq!(st.room_reach_notice(1), None);
+    }
+
+    /// A circle no longer in the rail shows nothing, and a new connection clears
+    /// every room's state.
+    #[test]
+    fn an_unknown_room_shows_nothing_and_a_new_connection_clears_all() {
+        let (mut st, circle_id, _) = state_with_joined_circle();
+        st.set_room_reach(RoomRecord::Circle(circle_id + 100), false);
+        assert_eq!(st.reach_notice(RoomRecord::Circle(circle_id + 100)), None);
+        assert_eq!(
+            st.room_reach_notice(1),
+            None,
+            "the joined circle is untouched"
+        );
+
+        st.set_room_reach(RoomRecord::Announcements, false);
+        assert_eq!(
+            st.reach_notice(RoomRecord::Announcements).as_deref(),
+            Some("Can't reach the announcements right now. Retrying.")
+        );
+        st.clear_room_reach();
+        assert_eq!(st.reach_notice(RoomRecord::Announcements), None);
+    }
+
+    // ── Joining a circle ─────────────────────────────────────────────────────
+
+    /// A circle at rail index 1 whose join has not gone through, made active.
+    fn state_with_joining_circle() -> (GuiState, u64) {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let mut st = GuiState::lobby_only();
+        let idx = st
+            .materialize_from_phrase("joining notice circle phrase")
+            .expect("the circle derives");
+        st.switch_to(idx, String::new(), 0.0);
+        let circle_id = st.metas()[idx].net.as_ref().expect("a circle").circle_id;
+        (st, circle_id)
+    }
+
+    /// A new circle is joining and cannot take a message until its join goes
+    /// through; then it can. The Lobby never joins.
+    #[test]
+    fn a_new_circle_is_joining_until_it_joins() {
+        let (mut st, circle_id) = state_with_joining_circle();
+        assert!(!st.is_joining(0), "control: the Lobby");
+        assert!(st.is_joining(1));
+        assert!(!st.can_send());
+        let pending = st.metas()[1].name.clone();
+        assert_eq!(
+            st.joining_notice(1).as_deref(),
+            Some(format!("Joining {pending}…").as_str())
+        );
+
+        let addr = AssetAddr::from_bytes([7u8; daemonseed_core::cot::ASSET_ADDR_LEN]);
+        st.set_circle_rendezvous(circle_id, addr)
+            .expect("known circle");
+        assert!(!st.is_joining(1));
+        assert!(st.can_send());
+        assert_eq!(st.joining_notice(1), None);
+    }
+
+    /// A circle whose join ended for good stops joining, keeps the composer closed,
+    /// and names the circle and a reason cut to one short line. A later join clears
+    /// it, and a failure reported after the circle joined changes nothing.
+    #[test]
+    fn a_join_that_ends_for_good_shows_why_until_a_join_goes_through() {
+        let (mut st, circle_id) = state_with_joining_circle();
+        let name = st.metas()[1].name.clone();
+        let reason = format!("subscribe failed: {}\nsecond line", "x".repeat(200));
+        assert_eq!(st.set_circle_join_failed(circle_id, &reason), Some(1));
+        assert!(!st.is_joining(1), "a failed join still reads as joining");
+        assert!(!st.can_send(), "a failed circle takes messages");
+        let notice = st.joining_notice(1).expect("the failure line");
+        let shown = notice
+            .strip_prefix(&format!("Couldn't join {name}: "))
+            .unwrap_or_else(|| panic!("the line does not name the circle: {notice}"));
+        assert!(shown.starts_with("subscribe failed: xxx"), "{notice}");
+        assert!(shown.ends_with('…'), "{notice}");
+        assert_eq!(shown.chars().count(), JOIN_FAILED_REASON_MAX, "{notice}");
+        assert_eq!(
+            st.set_circle_join_failed(circle_id, "refused"),
+            Some(1),
+            "control: a short reason"
+        );
+        assert_eq!(
+            st.joining_notice(1),
+            Some(format!("Couldn't join {name}: refused"))
+        );
+        assert!(st.set_room_reach(RoomRecord::Circle(circle_id), false));
+        assert_eq!(
+            st.room_reach_notice(1),
+            None,
+            "a failed circle shows unreachable"
+        );
+
+        let addr = AssetAddr::from_bytes([7u8; daemonseed_core::cot::ASSET_ADDR_LEN]);
+        st.set_circle_rendezvous(circle_id, addr)
+            .expect("known circle");
+        assert_eq!(st.join_failure(1), None, "the failure outlived the join");
+        assert!(st.can_send());
+        assert_eq!(st.joining_notice(1), None);
+        assert_eq!(st.set_circle_join_failed(circle_id, "late"), None);
+        assert!(st.can_send(), "a late failure undid the join");
+        assert_eq!(
+            st.set_circle_join_failed(circle_id + 100, "no such circle"),
+            None
+        );
+    }
+
+    /// A phrase finds the circle it names, also when it differs only in the
+    /// whitespace the derivation ignores, and no other.
+    #[test]
+    fn a_phrase_finds_the_circle_it_names() {
+        let (mut st, _) = state_with_joining_circle();
+        st.materialize_from_phrase("a second joining circle phrase")
+            .expect("the circle derives");
+        assert_eq!(st.index_of_phrase("joining notice circle phrase"), Some(1));
+        assert_eq!(
+            st.index_of_phrase("  joining notice circle phrase "),
+            Some(1)
+        );
+        assert_eq!(
+            st.index_of_phrase("a second joining circle phrase"),
+            Some(2)
+        );
+        assert_eq!(st.index_of_phrase("a phrase no circle has"), None);
+    }
+
+    /// A circle that has never joined shows that it is joining, not that it cannot
+    /// be reached; once it joins, the unreachable state it was given shows.
+    #[test]
+    fn joining_wins_over_unreachable() {
+        let (mut st, circle_id) = state_with_joining_circle();
+        assert!(st.set_room_reach(RoomRecord::Circle(circle_id), false));
+        assert_eq!(st.room_reach_notice(1), None);
+        assert_eq!(st.reach_notice(RoomRecord::Circle(circle_id)), None);
+        assert!(st.joining_notice(1).is_some());
+
+        let addr = AssetAddr::from_bytes([7u8; daemonseed_core::cot::ASSET_ADDR_LEN]);
+        st.set_circle_rendezvous(circle_id, addr)
+            .expect("known circle");
+        assert!(st.room_reach_notice(1).is_some());
+        assert_eq!(st.joining_notice(1), None);
+    }
+
+    /// An error for a circle names it by its rail label, and is recognised as that
+    /// circle's and no other's. An id no circle has gets the generic line.
+    #[test]
+    fn a_circle_error_names_its_circle() {
+        let (mut st, circle_id) = state_with_joining_circle();
+        let other_idx = st
+            .materialize_from_phrase("a second joining circle phrase")
+            .expect("the circle derives");
+        let other_id = st.metas()[other_idx]
+            .net
+            .as_ref()
+            .expect("a circle")
+            .circle_id;
+        let name = st.metas()[1].name.clone();
+
+        let status = st.circle_error_status(circle_id, "refused");
+        assert_eq!(status, format!("circle {name}: refused"));
+        assert!(st.is_circle_error_status(circle_id, &status));
+        assert!(!st.is_circle_error_status(other_id, &status));
+        assert!(!st.is_circle_error_status(circle_id, "connected · veilid"));
+
+        assert_eq!(st.circle_error_status(999, "refused"), "circle: refused");
+        assert!(!st.is_circle_error_status(999, "circle: refused"));
     }
 }

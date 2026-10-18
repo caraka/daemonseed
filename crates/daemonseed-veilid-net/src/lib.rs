@@ -163,7 +163,7 @@ pub use event::VeilidNetEvent;
 pub use identity::{
     OperatorCredential, OperatorCredentialError, OwnerPublic, OwnerSeed, RendezvousOwner,
 };
-pub use rendezvous::SweepOutcome;
+pub use rendezvous::{RepairOutcome, SweepOutcome};
 pub use resweep::next_resweep_record;
 pub use route_budget::{
     BudgetPermit, FragmentOutcome, RouteBudget, RouteLease, SharerKey, F_FILES, G_GLOBAL, W_CEIL,

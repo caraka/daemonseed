@@ -23,6 +23,13 @@ struct CircleData {
     initial: string,
     pinned: bool,
     unread: bool,
+    // The room's record cannot be read right now; the row says so in place of `sub`.
+    unreachable: bool,
+    // The circle's join has not gone through yet; the row says so in place of `sub`,
+    // ahead of `unreachable`.
+    joining: bool,
+    // The circle's join ended for good; the row says so in place of `sub`.
+    join-failed: bool,
 }
 
 struct MsgData {
@@ -119,6 +126,9 @@ component RailRow inherits Rectangle {
     in property <bool> selected: false;
     in property <bool> pinned: false;
     in property <bool> unread: false;   // #64: new-message dot for an unfocused room
+    in property <bool> unreachable: false; // the room's record cannot be read right now
+    in property <bool> joining: false;     // the circle's join has not gone through yet
+    in property <bool> join-failed: false; // the circle's join ended for good
     callback clicked;
     height: 54px;
     border-radius: 8px;
@@ -140,7 +150,11 @@ component RailRow inherits Rectangle {
                 Text { text: root.name; color: #d6dae1; font-size: 14px; vertical-alignment: center; overflow: elide; }
                 if root.pinned : Text { text: "PINNED"; color: #555d6a; font-size: 9px; vertical-alignment: center; }
             }
-            Text { text: root.sub; color: #5b6472; font-size: 12px; overflow: elide; }
+            Text {
+                text: root.join-failed ? "Couldn't join" : root.joining ? "Joining…" : root.unreachable ? "Can't reach. Retrying." : root.sub;
+                color: root.join-failed ? #c2785b : root.joining ? #6fb3a4 : root.unreachable ? #c9a24b : #5b6472;
+                font-size: 12px; overflow: elide;
+            }
         }
         Rectangle { }
         // #64: unread dot — unseen activity in a room whose chat is not on
@@ -340,6 +354,9 @@ component DmRailRowView inherits Rectangle {
 // it did not go).
 component DmBubble inherits Rectangle {
     in property <DmMessageData> msg;
+    // Off-layout clipboard vehicle for the message body, as in MsgBubble: zero-sized
+    // and outside the layout, so it never changes the bubble's size or hit area.
+    copy-src := TextInput { read-only: true; text: root.msg.body; width: 0px; height: 0px; }
     HorizontalLayout {
         alignment: root.msg.outgoing ? end : start;
         Rectangle {
@@ -350,7 +367,15 @@ component DmBubble inherits Rectangle {
             border-color: root.msg.outgoing ? #ffffff10 : #1f4d45;
             VerticalLayout {
                 padding: 8px; spacing: 3px;
-                Text { text: root.msg.body; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
+                // Right-click the message to Copy its body. The Text binds its width
+                // to the menu area's, which does not size its child, so word-wrap
+                // keeps the line inside the bubble.
+                dm_menu := ContextMenuArea {
+                    Menu {
+                        MenuItem { title: "Copy"; enabled: !root.msg.body.is-empty; activated => { copy-src.select-all(); copy-src.copy(); } }
+                    }
+                    Text { width: dm_menu.width; text: root.msg.body; color: #d6dae1; font-size: 13px; wrap: word-wrap; }
+                }
                 if root.msg.caption != "" : Text {
                     text: root.msg.caption;
                     color: root.msg.refused ? #c2785b : #5b6472;
@@ -581,12 +606,20 @@ component MenuTextInput inherits Rectangle {
 }
 
 export component AppWindow inherits Window {
-    // Resizable: prefer the 1100x680 default but let the window adopt the real
+    // Resizable: prefer the preferred-window size but let the window adopt the real
     // surface (down to a small floor) so the shell + auth overlays reflow instead
     // of being clipped. A fixed width/height made the surface non-reflowing, which
     // on small/software-rendered surfaces pushed the passphrase field off-screen.
-    preferred-width: 1100px; preferred-height: 680px;
+    preferred-width: root.preferred-window-width;
+    preferred-height: root.preferred-window-height;
     min-width: 720px; min-height: 480px;
+    // The window's preferred size in logical px: the size of the setup and unlock
+    // screens, which Rust also sets before the window is shown. The backend sizes a
+    // newly shown window's width from the preferred width even after an explicit
+    // `set_size`, so the initial size must be the preferred size too. The main
+    // screen's size is applied from Rust when `main-screen-shown` fires.
+    in property <length> preferred-window-width: 720px;
+    in property <length> preferred-window-height: 520px;
     background: #07080a;
     // Bundle the UI font so the software renderer draws a complete glyph set
     // (password mask ●, carets ▶/▾) regardless of the host's fonts. Pairs with
@@ -637,6 +670,9 @@ export component AppWindow inherits Window {
     // messages that did not go when messaging stopped, a refused block, or why a
     // first message opened another item. Empty = hidden.
     in property <string> dm-notice;
+    // The error text behind an unavailable-messaging notice, already redacted,
+    // shown selectable beneath it with a Copy button. Empty = hidden.
+    in property <string> dm-notice-detail;
     in-out property <string> dm-draft;
     callback toggle-section(int);
     callback open-section(int);
@@ -717,6 +753,20 @@ export component AppWindow inherits Window {
     in-out property <bool> leave-confirm-open: false;
     in-out property <bool> palette-open: false;
     in-out property <bool> announce-unread: false; // #142: unseen announcements/MOTD dot
+    // A record the active tab reads cannot be read right now: the active room's chat,
+    // the public share list, or the announcements. Empty while reachable.
+    in property <string> reach-room;
+    in property <string> reach-shares;
+    in property <string> reach-announce;
+    property <string> reach-line: root.active-tab == 1 ? root.reach-shares
+        : root.active-tab == 3 ? root.reach-announce : root.reach-room;
+    // The active circle's join has not gone through yet, or ended for good: the line
+    // its chat shows, whether that line is a failure, and whether its composer and
+    // Send are open. Empty and open for the Lobby and for a joined circle.
+    in property <string> joining-room;
+    in property <bool> joining-failed: false;
+    in property <bool> can-send: true;
+    property <string> joining-line: root.active-tab == 1 || root.active-tab == 3 ? "" : root.joining-room;
     in-out property <bool> startup-overlay-open: false; // #144: cold-start "assembling network" mask
     in-out property <string> mask-peer-count;           // #144: "N peers" counting up during warmup
     in-out property <bool> mask-settling: false;         // #144: a settle-timer is holding the mask past first content
@@ -828,6 +878,22 @@ export component AppWindow inherits Window {
     // Rust set) refocuses the composer. composer is always-instantiated (visible-
     // gated, not `if`-gated), so focusing here is timing-safe.
     changed active-tab => { if (root.active-tab == 0) { root.focus-composer(); } }
+    // The startup mask closing, by its settle timer or "Enter anyway", hands the keys
+    // to the field of the screen it uncovers, as nothing beneath it took them. A
+    // dialog open when the mask closes keeps them.
+    changed startup-overlay-open => {
+        if (!root.startup-overlay-open && !root.new-open && !root.rename-open
+            && !root.phrase-prompt-open && !root.leave-confirm-open && !root.palette-open
+            && !root.about-open && !root.publish-open && !root.sheet-open
+            && !root.desktop-prompt-open) {
+            if (root.join-open) {
+                root.focus-join-input();
+            } else {
+                root.focus-composer();
+                root.focus-dm-composer();
+            }
+        }
+    }
     // Focus the Join phrase field when the overlay opens, so typing / Ctrl-V lands
     // without needing a click (a software-render path can drop pointer clicks).
     callback focus-join-input();
@@ -845,6 +911,9 @@ export component AppWindow inherits Window {
     // name); Rust owns the FirstStart state machine and advances the step only when a
     // core step actually succeeds, so the UI can't get ahead of the crypto.
     in-out property <string> screen: "main";
+    // Fired when `screen` changes to "main", so the window takes its main-screen size.
+    callback main-screen-shown();
+    changed screen => { if (root.screen == "main") { root.main-screen-shown(); } }
     in-out property <int> fs-step: 0;
     in-out property <string> fs-passphrase;            // two-way; the chosen unlock passphrase
     in-out property <string> fs-passphrase-confirm;    // two-way; the re-entry that must match fs-passphrase (no recovery yet ⇒ a typo locks the id out)
@@ -976,7 +1045,8 @@ export component AppWindow inherits Window {
                         spacing: 4px; alignment: start;
                         for c[i] in root.circles : RailRow {
                             name: c.name; sub: c.sub; initial: c.initial; pinned: c.pinned;
-                            unread: c.unread;
+                            unread: c.unread; unreachable: c.unreachable; joining: c.joining;
+                            join-failed: c.join-failed;
                             selected: i == root.active;
                             clicked => { root.switch-circle(i); }
                         }
@@ -1017,6 +1087,43 @@ export component AppWindow inherits Window {
                 if root.dm-notice != "" : HorizontalLayout {
                     padding-left: 12px; padding-right: 12px;
                     Text { text: root.dm-notice; color: #c2785b; font-size: 12px; wrap: word-wrap; }
+                }
+                // The error behind the notice, read-only but selectable, so a
+                // tester can copy it whole with the button or select part of it.
+                if root.dm-notice-detail != "" : VerticalLayout {
+                    padding-left: 12px; padding-right: 12px; spacing: 4px;
+                    Text {
+                        text: "Copy this and send it to the developer if it keeps happening.";
+                        color: #8b93a1; font-size: 11px; wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 6px; alignment: stretch;
+                        // At most five lines tall; a longer error scrolls inside
+                        // the box, so it never pushes the conversations off the rail.
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            min-width: 1px;
+                            height: min(dm-notice-detail-input.preferred-height, 70px) + 8px;
+                            background: #0e0f11; border-radius: 6px;
+                            border-width: 1px; border-color: #ffffff14;
+                            dm-notice-detail-scroll := Flickable {
+                                x: 6px; y: 4px;
+                                width: parent.width - 12px; height: parent.height - 8px;
+                                viewport-width: self.width;
+                                viewport-height: dm-notice-detail-input.preferred-height;
+                                dm-notice-detail-input := TextInput {
+                                    width: dm-notice-detail-scroll.width;
+                                    text: root.dm-notice-detail;
+                                    read-only: true; single-line: false; wrap: word-wrap;
+                                    color: #cfd5dd; font-size: 11px;
+                                }
+                            }
+                        }
+                        PillButton {
+                            label: "Copy"; w: 56px;
+                            clicked => { dm-notice-detail-input.select-all(); dm-notice-detail-input.copy(); }
+                        }
+                    }
                 }
                 // Requests first, then conversations newest first, as Rust orders them.
                 // Capped at its own height like the rooms list.
@@ -1139,6 +1246,26 @@ export component AppWindow inherits Window {
                     }
                 }
                 Rectangle { height: 1px; background: #ffffff10; }
+
+                // The record the active tab reads cannot be read right now. Shown on
+                // that tab only, and cleared by Rust once the record reads again.
+                // The active circle is still joining, or its join ended for good. Shown
+                // on its own tabs, and cleared by Rust once a join goes through.
+                if root.main-pane == 0 && root.joining-line != "" : Rectangle {
+                    height: 28px; background: #0b0c0e;
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px;
+                        Text { text: root.joining-line; color: root.joining-failed ? #c2785b : #6fb3a4; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                    }
+                }
+
+                if root.main-pane == 0 && root.reach-line != "" : Rectangle {
+                    height: 28px; background: #0b0c0e;
+                    HorizontalLayout {
+                        padding-left: 16px; padding-right: 12px;
+                        Text { text: root.reach-line; color: #c9a24b; font-size: 12px; vertical-alignment: center; overflow: elide; }
+                    }
+                }
 
                 // Restore notice — tab-INDEPENDENT so it is seen from the Chat landing
                 // view (manual test 2026-06-21: was Shares-tab-only via share-status →
@@ -1461,7 +1588,9 @@ export component AppWindow inherits Window {
                                     // partial_renderer "RefCell already borrowed" crash.
                                     Text {
                                         x: 12px; width: parent.width - 24px; height: 100%;
-                                        text: "Message the circle…";
+                                        text: root.can-send ? "Message the circle…"
+                                            : root.joining-failed ? "You can't write here: the circle couldn't join."
+                                            : "You can write here once the circle has joined.";
                                         visible: root.draft == "";
                                         color: #4d5560;
                                         font-size: 13px; vertical-alignment: center;
@@ -1469,15 +1598,17 @@ export component AppWindow inherits Window {
                                     composer := MenuTextInput {
                                         x: 12px; width: parent.width - 24px; height: 100%;
                                         // Takes keys only while the chat is on screen, so a
-                                        // keystroke meant for a direct message never posts here.
-                                        enabled: root.main-pane == 0 && root.active-tab == 0;
+                                        // keystroke meant for a direct message never posts here,
+                                        // and only once the active circle has joined.
+                                        enabled: root.can-send && root.main-pane == 0 && root.active-tab == 0;
                                         text <=> root.draft;
                                         accepted => { root.send-message(root.draft); }
                                     }
                                 }
-                                Rectangle { width: 84px; height: 38px; border-radius: 9px; background: #4a9d8e;
-                                    TouchArea { clicked => { root.send-message(root.draft); } }
-                                    Text { text: "Send"; color: #06120f; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
+                                Rectangle { width: 84px; height: 38px; border-radius: 9px;
+                                    background: root.can-send ? #4a9d8e : #141517;
+                                    TouchArea { enabled: root.can-send; clicked => { root.send-message(root.draft); } }
+                                    Text { text: "Send"; color: root.can-send ? #06120f : #4d5560; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; } }
                             }
                         }
                     }
@@ -2135,8 +2266,9 @@ export component AppWindow inherits Window {
         width: 100%; height: 100%;
         background: #07080a;
         Rectangle {
-            x: (parent.width - self.width) / 2; y: 70px;
-            width: 560px; height: 470px;
+            // Centred in the space above the build-version line.
+            x: (parent.width - self.width) / 2; y: max(16px, (parent.height - self.height - 28px) / 2);
+            width: 560px; height: 420px;
             background: #0e0f11; border-radius: 14px; border-width: 1px; border-color: #ffffff18;
             VerticalLayout {
                 padding: 26px; spacing: 14px; alignment: start;
@@ -2183,8 +2315,9 @@ export component AppWindow inherits Window {
         width: 100%; height: 100%;
         background: #07080a;
         Rectangle {
-            x: (parent.width - self.width) / 2; y: 70px;
-            width: 560px; height: 470px;
+            // Centred in the space above the build-version line.
+            x: (parent.width - self.width) / 2; y: max(16px, (parent.height - self.height - 28px) / 2);
+            width: 560px; height: 420px;
             background: #0e0f11; border-radius: 14px; border-width: 1px; border-color: #ffffff18;
             VerticalLayout {
                 padding: 26px; spacing: 14px; alignment: start;

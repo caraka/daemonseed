@@ -1709,6 +1709,10 @@ impl RunnerRecords for VeilidRecords {
     fn take_watch_failures(&mut self) -> u64 {
         take_failures(&self.watch_failures)
     }
+
+    fn take_registered_watches(&mut self) -> Vec<[u8; HELLO_LOOKUP_KEY_LEN]> {
+        self.watches.take_registered()
+    }
 }
 
 impl RunnerParts<VeilidRecords> {
@@ -3927,6 +3931,7 @@ mod tests {
                 "take_push".to_owned(),
                 "watch_reads".to_owned(),
                 "take_watch_failures".to_owned(),
+                "take_registered_watches".to_owned(),
             ],
             "only the methods that make no network call are untraced"
         );

@@ -87,17 +87,6 @@ pub enum HandleParseError {
     DisplayNameHasUnsafeChar,
 }
 
-/// Whether `c` may not appear in a parsed display name: a control character,
-/// or a bidirectional formatting character (U+061C, U+200E, U+200F,
-/// U+202A..=U+202E, U+2066..=U+2069).
-fn unsafe_in_display_name(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-        )
-}
-
 impl fmt::Display for HandleParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -301,7 +290,10 @@ impl FromStr for Handle {
         if name_segment.contains('#') {
             return Err(HandleParseError::DisplayNameHasHash);
         }
-        if name_segment.chars().any(unsafe_in_display_name) {
+        if name_segment
+            .chars()
+            .any(display_name::is_unsafe_display_name_char)
+        {
             return Err(HandleParseError::DisplayNameHasUnsafeChar);
         }
 

@@ -20,6 +20,7 @@ use daemonseed_core::mention::find_self_mentions;
 use daemonseed_core::passphrase::strength::SESSION_PASSPHRASE_MIN_BITS;
 use daemonseed_core::trust_events::{TrustEventKey, event_key_string};
 use daemonseed_veilid_net::dm::runner::{ConversationState, HealthCounters};
+use daemonseed_veilid_net::dm::unavailable::DmUnavailableCause;
 use daemonseed_veilid_net::dm::view::{DmThreadRow, dm_fingerprint, dm_name};
 
 use crate::app::{
@@ -27,6 +28,7 @@ use crate::app::{
     DM_BLOCK_LIST_UNREADABLE, DM_DECLINE_KEY, DM_PANE_KEY, DirSelection, FetchStatus, FetchUi,
     IndexerStatus, MainFocus, PreviewKind, Screen, Surface, TrustItem, dm_refusal_phrase,
 };
+use crate::net::RoomRecord;
 use crate::screens::first_start::{FirstStartUi, FsStep};
 
 /// Draw the current screen.
@@ -1014,10 +1016,18 @@ fn render_public_shares_pane(app: &App, frame: &mut Frame, area: Rect) {
     // no-wrap `LineTruncator` is what keeps one row on one line, and restoring
     // `Wrap` re-opens #352 — with `fit_row` deciding which of the name, rating
     // and sharer survives the clip.
-    let pane_rows = inner.height as usize;
+    // The reach line, when shown, takes the pane's first row and the window the rest.
+    let notice = app.reach_notice(RoomRecord::LobbyShares);
+    let pane_rows = (inner.height as usize).saturating_sub(usize::from(notice.is_some()));
     let start = scroll_window_start(app.share_sel(), lines.len(), pane_rows);
-    let windowed: Vec<Line> = lines.into_iter().skip(start).take(pane_rows).collect();
+    let mut windowed: Vec<Line> = notice.map(reach_line).into_iter().collect();
+    windowed.extend(lines.into_iter().skip(start).take(pane_rows));
     frame.render_widget(Paragraph::new(windowed).block(block), area);
+}
+
+/// The line a pane leads with while its room's record cannot be read.
+fn reach_line(notice: String) -> Line<'static> {
+    Line::from(notice).style(Style::default().fg(Color::Yellow))
 }
 
 /// The Public Space view (ISC-25 / ISC-S7 / ISC-A-S3): the connected relay's
@@ -1225,6 +1235,27 @@ fn render_deprecation(app: &App, frame: &mut Frame, area: Rect) {
 /// What the direct-message pane says while no runner is reporting.
 const DM_NOT_RUNNING: &str = "messaging needs the node running";
 
+/// What the direct-message pane says where no runner could start, or the last
+/// one ended with an error or panicked, for each cause.
+fn dm_unavailable_text(cause: DmUnavailableCause) -> &'static str {
+    match cause {
+        DmUnavailableCause::NotConnected => "Direct messages will start once you're connected.",
+        DmUnavailableCause::StoreUnopened => {
+            "Direct messages couldn't start because your saved conversations couldn't be opened."
+        }
+        DmUnavailableCause::RunnerFailed => {
+            "Direct messages stopped because of an error. Restart the app to try again."
+        }
+        DmUnavailableCause::Internal => {
+            "Direct messages stopped because of an internal error. Restart the app to try again."
+        }
+    }
+}
+
+/// What the direct-message pane says while this side's advert is not on the
+/// network.
+const DM_NOT_REACHABLE: &str = "others can't reach you for direct messages yet";
+
 /// The direct-message pane: pending contact requests, then conversations newest
 /// first.
 ///
@@ -1250,10 +1281,26 @@ fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
             .title_alignment(Alignment::Left)
     };
     if !app.dm_state().running {
-        let body =
-            Paragraph::new(Line::from(DM_NOT_RUNNING).style(Style::default().fg(Color::DarkGray)))
-                .wrap(Wrap { trim: false })
-                .block(bordered(" direct messages ".to_owned()));
+        // Where messaging could not run, the line says why, and the error text
+        // beneath it can be selected in the terminal and passed on.
+        let lines = match &app.dm_state().unavailable {
+            Some(why) => {
+                let mut lines = vec![
+                    Line::from(dm_unavailable_text(why.cause()))
+                        .style(Style::default().fg(Color::Red)),
+                ];
+                if let Some(detail) = why.shown_detail() {
+                    lines.push(
+                        Line::from(detail.to_owned()).style(Style::default().fg(Color::Gray)),
+                    );
+                }
+                lines
+            }
+            None => vec![Line::from(DM_NOT_RUNNING).style(Style::default().fg(Color::DarkGray))],
+        };
+        let body = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(bordered(" direct messages ".to_owned()));
         frame.render_widget(body, area);
         return;
     }
@@ -1270,6 +1317,9 @@ fn render_dm(app: &App, frame: &mut Frame, area: Rect) {
         lines.push(
             Line::from(DM_BLOCK_LIST_UNREADABLE).style(Style::default().fg(Color::Red).bold()),
         );
+    }
+    if app.dm_state().advert_unpublished {
+        lines.push(Line::from(DM_NOT_REACHABLE).style(Style::default().fg(Color::Yellow)));
     }
     if let Some(health) = app.dm_state().health.as_ref().and_then(dm_health_line) {
         lines.push(Line::from(health).style(Style::default().fg(Color::Yellow)));
@@ -1739,6 +1789,11 @@ fn render_lobby_pane(app: &App, frame: &mut Frame, area: Rect) {
         .messages_on(Surface::Lobby)
         .filter(|m| !app.is_muted(&m.sender)) // ISC-13
         .collect();
+    let pinned: Vec<Line> = app
+        .reach_notice(RoomRecord::Lobby)
+        .map(reach_line)
+        .into_iter()
+        .collect();
     let lines: Vec<Line> = if visible.is_empty() {
         let msg = if app.public_room().is_some() {
             "no lobby messages yet — type to chat"
@@ -1753,13 +1808,59 @@ fn render_lobby_pane(app: &App, frame: &mut Frame, area: Rect) {
         Some(room) => format!(" lobby (# {room}) "),
         None => " lobby ".to_owned(),
     };
-    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_alignment(Alignment::Left),
+    render_chat_pane(frame, area, title, pinned, lines);
+}
+
+/// Draw one chat pane: `pinned` at the top, always shown, and the transcript
+/// `lines` beneath it, oldest first, filled from the bottom so the newest line
+/// sits on the last row and the oldest scroll off the top.
+///
+/// Rows are counted after wrapping, with the wrapper the widget draws with, so a
+/// long message that takes several rows is counted as several rows.
+fn render_chat_pane(
+    frame: &mut Frame,
+    area: Rect,
+    title: String,
+    pinned: Vec<Line<'static>>,
+    mut lines: Vec<Line<'static>>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .title_alignment(Alignment::Left);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let pinned = Paragraph::new(pinned).wrap(Wrap { trim: false });
+    let pinned_rows = u16::try_from(pinned.line_count(inner.width))
+        .unwrap_or(u16::MAX)
+        .min(inner.height);
+    let [top, rest] =
+        Layout::vertical([Constraint::Length(pinned_rows), Constraint::Min(0)]).areas(inner);
+    frame.render_widget(pinned, top);
+
+    // Walk back from the newest line until the rows taken fill the area. Each
+    // line wraps on its own, so the rows of the kept lines add up to the rows
+    // the widget draws for them.
+    let height = usize::from(rest.height);
+    let mut first = lines.len();
+    let mut rows = 0usize;
+    while first > 0 && rows < height {
+        first -= 1;
+        rows += Paragraph::new(lines[first].clone())
+            .wrap(Wrap { trim: false })
+            .line_count(rest.width);
+    }
+    let shown = lines.split_off(first);
+    // The oldest kept line may start above the area; skip the rows that do not
+    // fit so the newest row lands on the bottom one.
+    let skip = u16::try_from(rows.saturating_sub(height)).unwrap_or(u16::MAX);
+    frame.render_widget(
+        Paragraph::new(shown)
+            .wrap(Wrap { trim: false })
+            .scroll((skip, 0)),
+        rest,
     );
-    frame.render_widget(body, area);
 }
 
 /// The active-circle pane (ISC-C61, bottom carousel slot): renders only the
@@ -1771,13 +1872,18 @@ fn render_circle_pane(app: &App, frame: &mut Frame, area: Rect) {
     let own = app.own_chat_handle();
     let total = app.circles().len();
 
-    let (title, lines): (String, Vec<Line>) =
+    let (title, pinned, lines): (String, Vec<Line>, Vec<Line>) =
         match (app.active_circle_label(), app.active_circle_index()) {
             (Some((id, label)), Some(idx)) => {
                 let title = format!(" circle {}/{}: {label}  [←/→] cycle ", idx + 1, total);
                 let visible: Vec<&ChatLine> = app
                     .messages_on(Surface::Circle(id))
                     .filter(|m| !app.is_muted(&m.sender)) // ISC-13
+                    .collect();
+                let pinned: Vec<Line> = app
+                    .reach_notice(RoomRecord::Circle(id))
+                    .map(reach_line)
+                    .into_iter()
                     .collect();
                 let lines: Vec<Line> = if visible.is_empty() {
                     vec![
@@ -1787,7 +1893,7 @@ fn render_circle_pane(app: &App, frame: &mut Frame, area: Rect) {
                 } else {
                     visible.iter().map(|m| chat_line(m, own.as_ref())).collect()
                 };
-                (title, lines)
+                (title, pinned, lines)
             }
             // Lobby is the active surface (carousel position 0) but circles ARE
             // joined: the bottom slot is parked on the lobby. Show that — and how
@@ -1796,6 +1902,7 @@ fn render_circle_pane(app: &App, frame: &mut Frame, area: Rect) {
             // here (ISC-C56); the lobby pane above carries its messages.
             _ if total > 0 => (
                 format!(" lobby active · {total} circle(s) joined  [←/→] cycle "),
+                Vec::new(),
                 vec![
                     Line::from(
                         "the lobby is active — compose posts to the lobby; [←/→] to enter a circle"
@@ -1808,6 +1915,7 @@ fn render_circle_pane(app: &App, frame: &mut Frame, area: Rect) {
             // pane above stays live.
             _ => (
                 " circle (none joined) ".to_owned(),
+                Vec::new(),
                 vec![
                     Line::from(
                         "join a circle to chat — Tab to the circle-join box, enter a phrase"
@@ -1818,13 +1926,7 @@ fn render_circle_pane(app: &App, frame: &mut Frame, area: Rect) {
             ),
         };
 
-    let body = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_alignment(Alignment::Left),
-    );
-    frame.render_widget(body, area);
+    render_chat_pane(frame, area, title, pinned, lines);
 }
 
 /// Build one transcript line: a friendly `sender:` prefix plus the body, with
@@ -2099,11 +2201,17 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
             String::new(),
         ),
     };
-    // A status/error line (e.g. a failed send) is appended briefly when present.
-    let shown = match app.status() {
-        Some(s) => format!("{text}    ! {s}"),
-        None => text,
-    };
+    // The bodies the user types into, which keep a visible stretch beside a status.
+    let typed = matches!(
+        app.main_focus(),
+        MainFocus::Chat | MainFocus::JoinCircle | MainFocus::DefineShare
+    );
+    let shown = with_status(
+        &text,
+        app.status(),
+        usize::from(area.width.saturating_sub(2)),
+        typed,
+    );
     // The join box gets a strength-driven border (ISC-C9): red below 60 bits,
     // yellow approaching the floor, green at/above the ≥128-bit floor — the
     // red→green indicator the spec calls for, within the single-line input. An
@@ -2130,6 +2238,61 @@ fn render_main_input(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(body, area);
 
     render_mention_popup(app, frame, area);
+}
+
+/// The fewest columns of typed input the bottom bar keeps beside a status message,
+/// or the whole input when it is shorter.
+const INPUT_FLOOR: usize = 20;
+
+/// `s` cut to its last `max` characters, behind a `…`, so the end the cursor sits
+/// at stays in view.
+fn keep_tail(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_owned();
+    }
+    match max {
+        0 => String::new(),
+        _ => std::iter::once('…')
+            .chain(chars[chars.len() - (max - 1)..].iter().copied())
+            .collect(),
+    }
+}
+
+/// The bottom bar's body: `text`, then the status message when one is present.
+///
+/// The message wins the width: it keeps up to the whole bar, middle-ellipsized past
+/// that, so its end (an identifier, a key hint) always shows. `text` gets what is
+/// left, middle-ellipsized, and is dropped when fewer than [`NAME_FLOOR`] columns
+/// remain. Text the user is `typed`-ing is the exception: it keeps
+/// [`INPUT_FLOOR`] columns, or all of itself when shorter, cut from the front so its
+/// end shows, and the message shortens first. The result is at most `inner`
+/// characters, measured in `char`s as [`fit_row`] is.
+fn with_status(text: &str, status: Option<&str>, inner: usize, typed: bool) -> String {
+    const STATUS_MARK: &str = "! ";
+    const STATUS_SEP: &str = "    ! ";
+    let Some(status) = status else {
+        return text.to_owned();
+    };
+    if typed {
+        let keep = text.chars().count().min(INPUT_FLOOR);
+        let room = inner.saturating_sub(keep + STATUS_SEP.chars().count());
+        if room == 0 {
+            return keep_tail(text, inner);
+        }
+        let msg = ellipsize(status, room);
+        let left = inner - STATUS_SEP.chars().count() - msg.chars().count();
+        return format!("{}{STATUS_SEP}{msg}", keep_tail(text, left));
+    }
+    let msg = ellipsize(status, inner.saturating_sub(STATUS_MARK.chars().count()));
+    let used = STATUS_SEP.chars().count() + msg.chars().count();
+    match inner.checked_sub(used) {
+        Some(room) if text.chars().count() <= room => format!("{text}{STATUS_SEP}{msg}"),
+        Some(room) if room >= NAME_FLOOR => {
+            format!("{}{STATUS_SEP}{msg}", ellipsize(text, room))
+        }
+        _ => format!("{STATUS_MARK}{msg}").chars().take(inner).collect(),
+    }
 }
 
 /// A mention-autocomplete popup floating just above the compose box (ISC-12).
@@ -2567,5 +2730,83 @@ mod tests {
             event_key_string(TrustEventKey::DmChannelTornDownOnRestart),
             "dm-channel-torn-down-on-restart"
         );
+    }
+}
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::{keep_tail, with_status};
+
+    /// With a message present, the line fits every width and ends with the
+    /// message's end; with none, the text is untouched.
+    #[test]
+    fn a_status_line_fits_the_bar_and_keeps_the_message_end() {
+        let text = format!("defined: {} · [[/]] select · [p] publish", "L".repeat(70));
+        let msg = format!(
+            "sharing {:?} as ABCDEF123456 — [u] in Shares to stop",
+            "L".repeat(70)
+        );
+        for inner in 0..=200 {
+            let line = with_status(&text, Some(&msg), inner, false);
+            assert!(line.chars().count() <= inner, "{inner}: {line:?}");
+            // Past 45 columns the ellipsized message keeps at least its last 21.
+            if inner >= 45 {
+                assert!(line.ends_with("[u] in Shares to stop"), "{inner}: {line:?}");
+            }
+        }
+        for inner in 0..=200 {
+            let line = with_status("", Some(&msg), inner, false);
+            assert!(line.chars().count() <= inner, "no text, {inner}: {line:?}");
+        }
+        assert_eq!(with_status(&text, None, 10, false), text);
+        assert_eq!(with_status("abc", Some("ok"), 78, false), "abc    ! ok");
+    }
+
+    /// Typed input keeps at least 20 visible columns, or all of itself when shorter,
+    /// with its end in view, and the message shortens to make the room. With room
+    /// to spare both show whole.
+    #[test]
+    fn typed_input_keeps_its_room_beside_a_status() {
+        let msg = format!("public room: {} could not be read", "L".repeat(70));
+        let typed = "hello there, this is a long message being typed";
+        let line = with_status(typed, Some(&msg), 78, true);
+        assert!(line.chars().count() <= 78, "{line:?}");
+        let (input, status) = line.split_once("    ! ").expect("both parts show");
+        assert_eq!(input.chars().count(), 20, "{line:?}");
+        assert!(input.ends_with("message being typed"), "{line:?}");
+        assert!(status.ends_with("could not be read"), "{line:?}");
+
+        let line = with_status("short", Some(&msg), 78, true);
+        assert!(line.starts_with("short    ! "), "{line:?}");
+        assert!(line.chars().count() <= 78, "{line:?}");
+
+        assert_eq!(with_status("abc", Some("ok"), 78, true), "abc    ! ok");
+        for inner in 0..=120 {
+            let line = with_status(typed, Some(&msg), inner, true);
+            assert!(line.chars().count() <= inner, "{inner}: {line:?}");
+            match line.split_once("    ! ") {
+                Some((input, status)) => {
+                    let (head, tail) = status.split_once('…').unwrap_or((status, ""));
+                    assert!(
+                        status == msg
+                            || (status.contains('…')
+                                && msg.starts_with(head)
+                                && msg.ends_with(tail)),
+                        "{inner}: the status part is not the message: {line:?}"
+                    );
+                    let room = inner - input.chars().count() - "    ! ".len();
+                    assert!(
+                        room < 2 || !head.is_empty() || !tail.is_empty(),
+                        "{inner}: the status shows none of the message: {line:?}"
+                    );
+                }
+                None => assert_eq!(line, keep_tail(typed, inner), "{inner}"),
+            }
+            let shown = line.split("    ! ").next().unwrap_or_default();
+            assert!(
+                shown.chars().count() >= 20.min(inner),
+                "{inner}: the input lost its room: {line:?}"
+            );
+        }
     }
 }

@@ -69,7 +69,11 @@ modules:
       The direct-message pane is a view over DmState
       (daemonseed_veilid_net::dm::view) opened with [c], outside
       the Tab cycle and not a MainFocus station. While no runner is reporting it
-      lists nothing and says messaging needs the node running. Enter on a
+      lists nothing and says messaging needs the node running, or, while
+      DmState::unavailable holds, a line worded from its DmUnavailableCause with
+      the redacted error text beneath it for every cause but NotConnected. While DmState::advert_unpublished holds, the roster
+      opens with a line saying others can't reach you for direct messages yet.
+      Enter on a
       conversation row opens that conversation's thread in the same area, which
       draws its received messages with their received time, a delivery word
       (composed, sent, delivered) beside each sent one, and its latest refusal. While the
@@ -198,7 +202,10 @@ modules:
       folded into App's DmState; Arc because RunnerEvent is not Clone), DmStopped
       (the runner stopped; nothing reports until a later Connect starts another;
       App marks every unanswered send not sent and says how many on the status
-      line), DmCloseSlow (a close is still waiting for the runner to stop after
+      line), DmUnavailable (DmUnavailable — a DmUnavailableCause and the redacted
+      error text: no runner could start for a reason other than having no keys,
+      or the last one ended with an error or panicked, or a start or end task
+      panicked; traced, after any DmStopped, and App marks DmState unavailable), DmCloseSlow (a close is still waiting for the runner to stop after
       DM_CLOSE_NOTICE_AFTER; App ignores it, and the binary's close wait, which
       runs after the terminal is restored, prints DM_CLOSE_MESSAGE once),
       Connected/ConnectFailed, CircleJoined ({ circle_id: u64, label:
@@ -208,6 +215,14 @@ modules:
       (ISC-C51 / C59 / C62) / CircleJoinFailed,
       ChatMessage ({ circle_id: u64, sender, body, sent_unix_ms } — attributed to
       the single circle whose key opened the frame, ISC-A-C30), ChatError,
+      RoomReach ({ room: RoomRecord, reachable: bool } — whether a room's record
+      can be read: false after a failed repair of its lost session, a repair with
+      no read answered, or two consecutive ordinary re-reads with no read
+      answered; true after a complete repair, or a repair or re-read with at
+      least one read answered; a repair dispatched before its record's latest
+      re-read, or before the latest Connect, reports nothing; App
+      keeps the set of unreachable rooms, cleared on Connected, and the room's
+      pane leads with App::reach_notice),
       TrustEvent (a C28 trust-event key + scope, routed
       by the UI per its affordance class), ConnectionClosed ({ cause:
       CloseCause } — the layer at which the connection closed; it sets
@@ -313,6 +328,7 @@ public_types:
       - "fn circles(&self) -> &[JoinedCircle]  # session-scoped circle membership set in join order (ISC-C59)"
       - "fn active_circle_index(&self) -> Option<usize>  # active-circle index into circles(), or None when the lobby is active (ISC-C60)"
       - "fn active_circle_label(&self) -> Option<(u64, &str)>  # active circle's id + client-local label (ISC-C60 / ISC-C62)"
+      - "fn reach_notice(&self, room: RoomRecord) -> Option<String>  # \"Can't reach <name> right now. Retrying.\" while room's record cannot be read, the lobby by name and a circle by its label; None while reachable or for a circle no longer joined"
       - "fn cycle_active_circle(&mut self, forward: bool)  # ←/→ carousel cycle, wraps; no-op on empty set; a step onto the lobby clears the compose buffer, a step onto a circle leaves it (ISC-C60)"
       - "fn active_chat_surface(&self) -> Option<ChatSurface>  # surface an Enter posts to; active circle > lobby > None (single source of truth for the indicator + handler + seal id, ISC-14 / S22 / C56 / C60 / A-C30)"
       - "fn status(&self) -> Option<&str>"
@@ -368,7 +384,7 @@ public_types:
       - "fn take_pending_introducer_refresh(&mut self) -> bool  # drained into NetCommand::RefreshIntroducer"
       - "fn on_net_event(&mut self, event: NetEvent)"
       - "fn dm_state(&self) -> &DmState  # what the runner has told this session; folded by on_net_event from NetEvent::Dm and NetEvent::DmStopped. RunnerEvent::StartedOver also folds TrustEventKey::DmCorrespondentStateLost through fold_trust_event; a RunnerEvent::Refused with no token clears DmState::blocking and sets the status line; a Refused for an outstanding Accept sets the status to \"not accepted — \" plus dm_refusal_phrase and reopens the reply on its request row"
-      - "fn dm_session_keys(&self) -> Option<Box<DmSessionKeys>>  # one derive_identity_keys call yielding the signing keypair and the channel root, with the profile at-rest key; None with no unlocked profile"
+      - "fn dm_session_keys(&mut self) -> Option<Box<DmSessionKeys>>  # one derive_identity_keys call yielding the signing keypair and the channel root, with the profile at-rest key; None with no unlocked profile, and None where the derivation fails, which is traced and marks DmState unavailable"
       - "fn dm_pane_open(&self) -> bool  # whether the direct-message pane is open. Opened and closed with DM_PANE_KEY ('c') from any focus where MainFocus::consumes_text is false, and closed with Esc; while open it owns the keystream, ahead of the global Esc and Tab"
       - "fn dm_sel(&self) -> usize  # the selected direct-message row, indexing dm_requests first and dm_correspondences after them. Up/Down move it, clamped to the drawn rows; it decrements when a request arriving at DM_REQUEST_CAP evicts row zero"
       - "fn dm_requests(&self) -> &[DmContactRequest]  # contact requests awaiting an answer, one row per identity, oldest first, each drawn with its DmContactRequest::preview messages beneath it. DM_ACCEPT_KEY ('a'/'A') opens a reply pre-filled with DM_ACCEPT_REPLY, whose Enter queues one RunnerCommand::Accept carrying a fresh CommandToken and the reply; nothing opens while that request's acceptance is outstanding. DM_DECLINE_KEY ('d'/'D') hides the sender's requests for the run and queues nothing. DM_BLOCK_KEY ('b'/'B') queues one RunnerCommand::Block with the sender's identity pk, adds it to DmState::blocking and holds its requests back until a token-less refusal clears it. A key on a conversation row does nothing"
@@ -422,6 +438,10 @@ public_types:
   - name: daemonseed_tui::net::DmSessionKeys
     kind: struct
     description: "The secret halves NetCommand::Connect carries to the direct-messaging runner: signing (Arc<SignKeypair>), dm_channel_root (DmChannelRootSecret), at_rest_key (Zeroizing<[u8; AEAD_KEY_LEN]> — the key the runner's store opens under). Debug prints no field. Not Clone, which is why NetCommand is Debug-only."
+  - name: daemonseed_tui::net::RoomRecord
+    kind: enum
+    description: "A room whose record the app keeps a session with, as NetEvent::RoomReach names it."
+    variants: [Lobby, LobbyShares, "Circle(u64)"]
   - name: daemonseed_tui::net::ShareManifestEntry
     kind: struct
     description: "One file in an A1 fetch-preview (NetEvent::FetchManifest, M16 — ISC-C66): rel_path (the sharer-advertised relative path) + size (bytes) + chunk_count (u32 — how many 1 MiB CHUNK_SIZE chunks the file spans, manifest chunks.len(), 0 for an empty file; the app sums it over the selected files to seed the chunk-granular gauge before the net actor's first FetchProgress). Carries no chunk addresses — those stay in the net actor; the overlay shows names + sizes only and confirms by manifest-row index (the A2 selective-fetch hook)."

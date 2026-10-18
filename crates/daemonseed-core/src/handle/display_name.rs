@@ -87,28 +87,53 @@ pub fn generate_display_name<R: DisplayNameRng>(rng: &mut R) -> String {
     format!("{adj}-{noun}")
 }
 
+/// Whether `c` may not appear in a display name: a control character, or a
+/// bidirectional formatting character (U+061C, U+200E, U+200F,
+/// U+202A..=U+202E, U+2066..=U+2069), any of which can make a rendered name
+/// read as something other than its characters.
+///
+/// [`is_valid_display_name`] and the [`Handle`](super::Handle) parser both
+/// refuse a name holding such a character, so a name the validator accepts
+/// always parses as a handle.
+pub(crate) fn is_unsafe_display_name_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
 /// Validate a user-supplied display name.
 ///
 /// Rejects names that:
 /// - Are empty (use the floor-handle presentation instead).
 /// - Contain `#` — would alias the handle hash separator (ISC-C4).
 /// - Exceed [`MAX_DISPLAY_NAME_BYTES`] bytes.
-/// - Contain ASCII control characters (newline, tab, NUL, …) — these break
-///   rendering and lead to handle-confusion in chat UIs.
+/// - Contain a control character (newline, tab, NUL, …) or a Unicode
+///   bidirectional formatting character (U+061C, U+200E, U+200F,
+///   U+202A..=U+202E, U+2066..=U+2069). These break rendering or make one
+///   name display as another.
+///
+/// The character rule is the one the handle parser applies, so every name
+/// this accepts parses as a handle once its hash suffix is appended.
 ///
 /// This is a permissive validator: it accepts any Unicode that survives the
 /// above constraints, including emoji and non-Latin scripts. Stricter
 /// per-server rules can apply on top via operator config.
+///
+/// It gates choosing a name, not loading one. A name stored before these
+/// rules still loads and unlocks; it is refused at the next rename.
 pub fn is_valid_display_name(s: &str) -> bool {
     !s.is_empty()
         && !s.contains('#')
         && s.len() <= MAX_DISPLAY_NAME_BYTES
-        && !s.chars().any(|c| c.is_control())
+        && !s.chars().any(is_unsafe_display_name_char)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handle::{Handle, HandleParseError};
 
     /// Deterministic RNG for tests — returns indices from a pre-seeded
     /// sequence so each test sees the same `(adjective, noun)` pair.
@@ -256,6 +281,91 @@ mod tests {
         assert!(!is_valid_display_name("alice\n"));
         assert!(!is_valid_display_name("alice\tbob"));
         assert!(!is_valid_display_name("alice\0"));
+    }
+
+    /// The Unicode bidirectional formatting characters: the Arabic letter mark,
+    /// the left-to-right and right-to-left marks, the embeddings and overrides,
+    /// and the isolates.
+    const BIDI_FORMATTING: [char; 12] = [
+        '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+        '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ];
+
+    /// Hash suffix appended to a display name to form a parseable handle.
+    const SUFFIX: &str = "#aabbccddeeff";
+
+    #[test]
+    fn rejects_bidirectional_formatting_characters_in_both_validator_and_handle_parser() {
+        assert_eq!(BIDI_FORMATTING.len(), 12);
+        for c in BIDI_FORMATTING {
+            let name = format!("al{c}ice");
+            assert!(
+                !is_valid_display_name(&name),
+                "validator accepted U+{:04X}",
+                c as u32
+            );
+            assert_eq!(
+                format!("{name}{SUFFIX}").parse::<Handle>(),
+                Err(HandleParseError::DisplayNameHasUnsafeChar),
+                "handle parser accepted U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    /// Assert that `name`, accepted by the validator, parses as a handle once
+    /// the hash suffix is appended, and keeps its display name.
+    fn assert_parses_as_handle(name: &str) {
+        let handle: Handle = format!("{name}{SUFFIX}")
+            .parse()
+            .unwrap_or_else(|e| panic!("accepted name {name:?} does not parse as a handle: {e}"));
+        assert_eq!(handle.display_name(), Some(name));
+    }
+
+    #[test]
+    fn every_accepted_single_character_insertion_parses_as_handle() {
+        let mut accepted = 0usize;
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            let name = format!("a{c}b");
+            if is_valid_display_name(&name) {
+                accepted += 1;
+                assert_parses_as_handle(&name);
+            }
+        }
+        // Every scalar value but `#` and the refused characters is accepted, so
+        // the sweep covers well over a million names.
+        assert!(accepted > 1_000_000, "only {accepted} names accepted");
+    }
+
+    #[test]
+    fn accepted_names_from_a_table_parse_as_handles() {
+        let at_limit = "a".repeat(MAX_DISPLAY_NAME_BYTES);
+        let mut rng = OsRng;
+        let generated: Vec<String> = (0..64).map(|_| generate_display_name(&mut rng)).collect();
+        let table = [
+            "alice",
+            "Alice Bob",
+            "able-aardvark",
+            "Æthelred",
+            "Ωmega",
+            "\u{0627}\u{0644}\u{0639}\u{0631}\u{0628}\u{064A}\u{0629}",
+            "\u{05E9}\u{05DC}\u{05D5}\u{05DD}",
+            "\u{1F99D} raccoon",
+            "a\u{200D}b",
+            " padded ",
+            at_limit.as_str(),
+        ];
+        let names = table
+            .iter()
+            .copied()
+            .chain(generated.iter().map(String::as_str));
+        let mut checked = 0usize;
+        for name in names {
+            assert!(is_valid_display_name(name), "table entry {name:?} refused");
+            assert_parses_as_handle(name);
+            checked += 1;
+        }
+        assert_eq!(checked, table.len() + generated.len());
     }
 
     #[test]

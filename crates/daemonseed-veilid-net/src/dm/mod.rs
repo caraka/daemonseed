@@ -5,11 +5,13 @@
 //! what it writes over, [`runner`] is the task a front end spawns to drive one
 //! identity's conversations over that record store, and [`view`] folds what the
 //! runner reports into the state a front end draws. [`watch`] holds the
-//! watches on the channel records this node reads.
+//! watches on the channel records this node reads. [`unavailable`] says why
+//! messaging cannot run, with the error text redacted for showing.
 
 pub mod push;
 pub mod records;
 pub mod runner;
+pub mod unavailable;
 pub mod view;
 pub mod watch;
 

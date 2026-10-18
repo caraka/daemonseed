@@ -2072,9 +2072,8 @@ types:
     kind: struct
     description: >-
       ML-DSA-87 keypair. Drop zeroizes private key. Exposes detached `sign`.
-      Built from a mnemonic (via derive_identity_keys), directly from a raw
-      seed (from_ml_dsa_seed, server path), or from two stored halves
-      (from_halves).
+      Built from a mnemonic (via derive_identity_keys) or directly from a raw
+      seed (from_ml_dsa_seed, server path).
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -4579,27 +4578,6 @@ functions:
       type: "T"
       description: Whatever the closure returns. T cannot borrow from the argument.
 
-  - name: SignKeypair::from_halves
-    module: daemonseed_core::identity::keys
-    description: >-
-      Assemble a SignKeypair from a verifying key and a signing key already
-      known to belong together. The pairing is not re-checked; the halves come
-      from one record that stored both, because ML-DSA-87 has no
-      public-from-private derivation.
-    signature: "pub fn from_halves(public_key: &[u8; ml_dsa::PK_LEN], secret_key: &[u8; ml_dsa::SK_LEN]) -> Self"
-    parameters:
-      - name: public_key
-        type: "&[u8; ml_dsa::PK_LEN]"
-        direction: in
-        description: The verifying half.
-      - name: secret_key
-        type: "&[u8; ml_dsa::SK_LEN]"
-        direction: in
-        description: The signing half, copied straight into its heap allocation.
-    returns:
-      type: "SignKeypair"
-      description: The keypair those two halves form.
-
   - name: SignKeypair::from_ml_dsa_seed
     module: daemonseed_core::identity::keys
     description: >-
@@ -4885,8 +4863,11 @@ functions:
   - name: is_valid_display_name
     module: daemonseed_core::handle::display_name
     description: >-
-      Empty allowed (floor handle). Otherwise: 1-32 chars, no whitespace, no `#`,
-      NFKC-normalizable.
+      True for a non-empty name of at most MAX_DISPLAY_NAME_BYTES bytes with no
+      `#`, no control character and no Unicode bidirectional formatting
+      character (U+061C, U+200E, U+200F, U+202A..=U+202E, U+2066..=U+2069).
+      Shares its character rule with Handle::from_str, so an accepted name
+      parses as a handle. Gates choosing a name, not loading a stored one.
     signature: "pub fn is_valid_display_name(s: &str) -> bool"
     parameters:
       - name: s
@@ -4895,7 +4876,7 @@ functions:
         description: The candidate display name.
     returns:
       type: bool
-      description: True if the name is empty or a valid 1-32 char display name.
+      description: True if the name may be chosen as a display name.
 
   # ── kdf::info ───────────────────────────────────────────────────────
   - name: "info::primary"

@@ -423,6 +423,41 @@ mod tests {
         );
     }
 
+    /// A profile whose stored display name holds a character that
+    /// `is_valid_display_name` refuses still unlocks, to the same identity and
+    /// the same stored name. The validator gates a rename, never a load.
+    #[test]
+    fn unlock_keeps_a_stored_name_the_validator_now_refuses() {
+        let stored = "al\u{202E}ice";
+        assert!(!crate::handle::display_name::is_valid_display_name(stored));
+
+        let tmp = Tmp::new();
+        let m = enroll();
+        let enrolled_prefix = *m.handle.hash_prefix();
+        write_first_start(&tmp.path, &m, None, false).unwrap();
+        let (config, blob) = load_for_unlock(&tmp.path).unwrap();
+        let mut opened = seeds::open(&blob, STRONG, config.profile_id, config.argon2).unwrap();
+        assert!(opened.seeds.set_display_name(Some(stored.to_owned())));
+        let resealed = opened.key.seal(&opened.seeds).unwrap();
+        write_seeds_blob(&tmp.path, &resealed).unwrap();
+
+        let (config, blob) = load_for_unlock(&tmp.path).unwrap();
+        let opened = seeds::open(&blob, STRONG, config.profile_id, config.argon2)
+            .expect("a stored name the validator refuses still opens");
+        let recovered = session_materials_from_unlock(
+            opened.seeds,
+            opened.key,
+            opened.index_key,
+            config,
+            blob,
+            vec![],
+        )
+        .expect("a stored name the validator refuses still unlocks");
+        assert_eq!(recovered.handle.hash_prefix(), &enrolled_prefix);
+        assert_eq!(recovered.display_name.as_deref(), Some(stored));
+        assert_eq!(recovered.handle.display_name(), Some(stored));
+    }
+
     /// A profile with no persisted bootstrap (legacy) yields `NoBootstrap` so
     /// the caller routes to manual server selection instead of auto-connect.
     #[test]

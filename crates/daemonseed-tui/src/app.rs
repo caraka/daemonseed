@@ -18,13 +18,14 @@ use daemonseed_core::trust_events::{
     DismissalScope, TrustEventClass, TrustEventKey, TrustEventLog, TrustEventScope, class_of,
 };
 use daemonseed_veilid_net::dm::runner::{IdentityPk, Refusal, RunnerCommand, RunnerEvent};
+use daemonseed_veilid_net::dm::unavailable::{DmUnavailable, DmUnavailableCause};
 use daemonseed_veilid_net::dm::view::{
     DmAcceptDraft, DmContactRequest, DmCorrespondence, DmOutstanding, DmState,
 };
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
 
-use crate::net::{NetEvent, ShareManifestEntry};
+use crate::net::{NetEvent, RoomRecord, ShareManifestEntry};
 use crate::screens::first_start::{FirstStartOutcome, FirstStartUi};
 
 /// Live connection state shown in the main view.
@@ -238,6 +239,9 @@ pub const DM_ACCEPT_REPLY: &str = "message accepted";
 /// no conversation is collected until the list reads again.
 pub const DM_BLOCK_LIST_UNREADABLE: &str =
     "messaging: block list unreadable — requests and conversations paused";
+
+/// How the status line opens when messaging stopped with messages not sent.
+const DM_NOT_SENT_PREFIX: &str = "messaging stopped; ";
 
 /// [`DM_PANE_KEY`] with Shift held. Derived rather than written out, so the two
 /// cases of one key cannot drift apart.
@@ -920,6 +924,10 @@ pub struct App {
     /// The default chat surface is this room — no circle required. `None` until
     /// the net actor reports a successful join after connect.
     public_room: Option<String>,
+    /// Rooms whose record the app cannot read right now: a repair of the record's
+    /// session failed, or consecutive re-reads got no answer to any read, and no
+    /// repair or re-read has got an answer since. Cleared on every new connection.
+    unreachable: std::collections::BTreeSet<RoomRecord>,
     /// A transient status/error line (e.g. a failed send).
     status: Option<String>,
     /// The mute-box input buffer (ISC-13).
@@ -1256,6 +1264,7 @@ impl App {
             circles: Vec::new(),
             active_circle: None,
             public_room: None,
+            unreachable: std::collections::BTreeSet::new(),
             status: None,
             mute_input: String::new(),
             muted: std::collections::BTreeSet::new(),
@@ -1800,6 +1809,18 @@ impl App {
                             _ => "the block list could not be written; nothing changed".to_owned(),
                         });
                     }
+                    // A roster from a runner that was not reporting, or after
+                    // messaging was marked unavailable, opens a new session: the
+                    // last runner's count of messages not sent no longer applies.
+                    RunnerEvent::Roster(_)
+                        if (!self.dm.running || self.dm.unavailable.is_some())
+                            && self
+                                .status
+                                .as_deref()
+                                .is_some_and(|s| s.starts_with(DM_NOT_SENT_PREFIX)) =>
+                    {
+                        self.status = None;
+                    }
                     _ => {}
                 }
                 // An eviction removes row zero, so every row below the cursor
@@ -1829,11 +1850,13 @@ impl App {
             // A close waits for the runner after this state is no longer drawn, so
             // the binary tells the user itself.
             NetEvent::DmCloseSlow => {}
+            // The reason was traced where it was found.
+            NetEvent::DmUnavailable(why) => self.dm.mark_unavailable(why),
             NetEvent::DmStopped => {
                 let unsent = self.dm.stop();
                 if unsent > 0 {
                     self.status = Some(format!(
-                        "messaging stopped; {unsent} {} not sent",
+                        "{DM_NOT_SENT_PREFIX}{unsent} {} not sent",
                         if unsent == 1 {
                             "message was"
                         } else {
@@ -1856,6 +1879,8 @@ impl App {
                     version,
                     rotation_notice,
                 };
+                // A new connection reads every record afresh.
+                self.unreachable.clear();
             }
             NetEvent::ConnectFailed { message } => {
                 self.connection = ConnectionStatus::Failed(message);
@@ -1950,6 +1975,15 @@ impl App {
             }
             NetEvent::PublicRoomJoinFailed { message } => {
                 self.status = Some(format!("public room: {message}"));
+            }
+            // A room's record became unreadable or readable again: its pane shows the
+            // state until it clears.
+            NetEvent::RoomReach { room, reachable } => {
+                if reachable {
+                    self.unreachable.remove(&room);
+                } else {
+                    self.unreachable.insert(room);
+                }
             }
             NetEvent::PublicRoomMessage {
                 room: _,
@@ -2512,15 +2546,25 @@ impl App {
     /// One `derive_identity_keys` call, because the channel root is `!Clone`
     /// and has to be moved out whole. `None` without a profile, before Unlock
     /// has produced a seal key, or if derivation fails, and then no runner is
-    /// started.
-    pub fn dm_session_keys(&self) -> Option<Box<crate::net::DmSessionKeys>> {
+    /// started. A derivation that fails is traced and leaves direct messaging
+    /// shown unavailable.
+    pub fn dm_session_keys(&mut self) -> Option<Box<crate::net::DmSessionKeys>> {
         let seeds = self.seeds.as_ref()?;
         let seal_key = self.seal_key.as_ref()?;
-        let keys = daemonseed_core::identity::keys::derive_identity_keys(
+        let keys = match daemonseed_core::identity::keys::derive_identity_keys(
             &seeds.mnemonic,
             daemonseed_core::identity::keys::Identity::Primary,
-        )
-        .ok()?;
+        ) {
+            Ok(keys) => keys,
+            Err(e) => {
+                daemonseed_veilid_net::vtrace!("tui dm: direct-message keys not derived ({e})");
+                self.dm.mark_unavailable(DmUnavailable::new(
+                    DmUnavailableCause::Internal,
+                    &format!("direct-message keys not derived: {e}"),
+                ));
+                return None;
+            }
+        };
         Some(Box::new(crate::net::DmSessionKeys {
             signing: std::sync::Arc::new(keys.signing),
             dm_channel_root: keys.dm_channel_root,
@@ -3726,6 +3770,21 @@ impl App {
         self.active_circle
     }
 
+    /// The line `room`'s pane shows while its record cannot be read, naming the room the
+    /// way the panes show it. `None` while the room is reachable, and for a circle no
+    /// longer joined.
+    pub fn reach_notice(&self, room: RoomRecord) -> Option<String> {
+        if !self.unreachable.contains(&room) {
+            return None;
+        }
+        let name = match room {
+            RoomRecord::Lobby => "the Lobby".to_owned(),
+            RoomRecord::LobbyShares => "the Lobby share list".to_owned(),
+            RoomRecord::Circle(id) => self.circles.iter().find(|c| c.id == id)?.label.clone(),
+        };
+        Some(format!("Can't reach {name} right now. Retrying."))
+    }
+
     /// The active circle's id + label (ISC-C60 / ISC-C62), for the circle-pane
     /// header and the compose indicator. `None` when the lobby is active.
     pub fn active_circle_label(&self) -> Option<(u64, &str)> {
@@ -4622,6 +4681,238 @@ mod tests {
             app.circle_status(),
             &CircleStatus::Failed("subscribe refused".to_owned())
         );
+    }
+
+    /// The rows of the 80x24 frame that show `line`.
+    fn rows_with(app: &App, line: &str) -> usize {
+        buffer_rows(app, 80, 24)
+            .iter()
+            .filter(|r| r.contains(line))
+            .count()
+    }
+
+    /// A room whose repair failed says so in its own pane, naming it the way the
+    /// panes do: the lobby by name, a circle by its label. Never on the status line.
+    #[test]
+    fn a_failed_repair_shows_in_the_rooms_pane() {
+        let mut app = drive_to_main();
+        app.on_net_event(NetEvent::CircleJoined {
+            circle_id: 7,
+            label: "book-club".to_owned(),
+            entropy: "entropy-7".to_owned(),
+        });
+        let lobby = "Can't reach the Lobby right now. Retrying.";
+        let circle = "Can't reach book-club right now. Retrying.";
+        assert_eq!(rows_with(&app, lobby), 0, "control: reachable at first");
+
+        app.on_net_event(NetEvent::RoomReach {
+            room: RoomRecord::Lobby,
+            reachable: false,
+        });
+        app.on_net_event(NetEvent::RoomReach {
+            room: RoomRecord::Circle(7),
+            reachable: false,
+        });
+        assert_eq!(
+            rows_with(&app, lobby),
+            1,
+            "{:#?}",
+            buffer_rows(&app, 80, 24)
+        );
+        assert_eq!(
+            rows_with(&app, circle),
+            1,
+            "{:#?}",
+            buffer_rows(&app, 80, 24)
+        );
+        assert!(
+            buffer_rows(&app, 80, 24)
+                .iter()
+                .all(|r| !r.contains("! Can't reach")),
+            "not on the status line"
+        );
+    }
+
+    /// A reachable room, from a repair that fully succeeded or an ordinary re-read
+    /// that went through, clears its line; a new connection clears every line.
+    #[test]
+    fn a_reachable_room_clears_its_line() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 3);
+        let lobby = "Can't reach the Lobby right now. Retrying.";
+        let circle = "Can't reach circle-3 right now. Retrying.";
+        for room in [RoomRecord::Lobby, RoomRecord::Circle(3)] {
+            app.on_net_event(NetEvent::RoomReach {
+                room,
+                reachable: false,
+            });
+        }
+        assert_eq!(rows_with(&app, circle), 1, "control: the circle shows it");
+
+        app.on_net_event(NetEvent::RoomReach {
+            room: RoomRecord::Circle(3),
+            reachable: true,
+        });
+        assert_eq!(rows_with(&app, circle), 0);
+        assert_eq!(rows_with(&app, lobby), 1, "the lobby is untouched");
+
+        app.on_net_event(NetEvent::Connected {
+            server: "veilid".to_owned(),
+            version: "1.0".to_owned(),
+            rotation_notice: None,
+        });
+        assert_eq!(rows_with(&app, lobby), 0);
+    }
+
+    /// A circle no longer joined shows nothing.
+    #[test]
+    fn an_unknown_room_shows_nothing() {
+        let mut app = drive_to_main();
+        join_circle(&mut app, 3);
+        app.on_net_event(NetEvent::RoomReach {
+            room: RoomRecord::Circle(99),
+            reachable: false,
+        });
+        assert_eq!(app.reach_notice(RoomRecord::Circle(99)), None);
+        assert_eq!(rows_with(&app, "Can't reach"), 0);
+    }
+
+    /// A body long enough to wrap to several rows of an 80-column pane, tagged
+    /// with `tag` so each one is a distinct needle.
+    fn wrapping_body(tag: &str) -> String {
+        format!("{tag} {}", "wraps across rows ".repeat(10))
+    }
+
+    /// Thirty lobby lines, the oldest `lb00x`, the newest `lbnewestx`, with three
+    /// wrapping lines just before the newest. A pane that counts messages rather
+    /// than screen rows scrolls too little and clips the newest.
+    fn overflow_lobby(app: &mut App) {
+        let now = crate::net::now_unix_ms();
+        app.on_net_event(NetEvent::PublicRoomJoined {
+            room: "lobby".to_owned(),
+        });
+        let mut bodies: Vec<String> = (0..26).map(|i| format!("lb{i:02}x")).collect();
+        bodies.extend(["lbwrapax", "lbwrapbx", "lbwrapcx"].map(wrapping_body));
+        bodies.push("lbnewestx".to_owned());
+        let count = i64::try_from(bodies.len()).unwrap();
+        for (i, body) in (0i64..).zip(bodies) {
+            app.on_net_event(NetEvent::PublicRoomMessage {
+                room: "lobby".to_owned(),
+                sender: "a#aabbccddeeff".to_owned(),
+                body,
+                sent_unix_ms: now - (count - i) * 1000,
+            });
+        }
+    }
+
+    /// The circle-pane counterpart of [`overflow_lobby`]: `cl00x` to `clnewestx`
+    /// on circle 1, which is joined and active.
+    fn overflow_circle(app: &mut App) {
+        let now = crate::net::now_unix_ms();
+        join_circle(app, 1);
+        let mut bodies: Vec<String> = (0..26).map(|i| format!("cl{i:02}x")).collect();
+        bodies.extend(["clwrapax", "clwrapbx", "clwrapcx"].map(wrapping_body));
+        bodies.push("clnewestx".to_owned());
+        let count = i64::try_from(bodies.len()).unwrap();
+        for (i, body) in (0i64..).zip(bodies) {
+            app.on_net_event(NetEvent::ChatMessage {
+                circle_id: 1,
+                sender: "b#ccddeeff0011".to_owned(),
+                body,
+                sent_unix_ms: now - (count - i) * 1000,
+            });
+        }
+    }
+
+    /// A lobby holding more lines than its pane shows draws the newest, with the
+    /// oldest scrolled off the top.
+    #[test]
+    fn an_overflowing_lobby_pane_shows_its_newest_line() {
+        let mut app = drive_to_main();
+        overflow_lobby(&mut app);
+        assert_eq!(
+            app.messages_on(Surface::Lobby).count(),
+            30,
+            "control: every line is in the transcript"
+        );
+        let rows = buffer_rows(&app, 80, 24);
+        assert_eq!(rows_with(&app, "lbnewestx"), 1, "{rows:#?}");
+        assert_eq!(rows_with(&app, "lbwrapcx"), 1, "{rows:#?}");
+        assert_eq!(rows_with(&app, "lb00x"), 0, "{rows:#?}");
+    }
+
+    /// The active circle's pane draws its newest line once it overflows.
+    #[test]
+    fn an_overflowing_circle_pane_shows_its_newest_line() {
+        let mut app = drive_to_main();
+        overflow_circle(&mut app);
+        assert_eq!(
+            app.messages_on(Surface::Circle(1)).count(),
+            30,
+            "control: every line is in the transcript"
+        );
+        let rows = buffer_rows(&app, 80, 24);
+        assert_eq!(rows_with(&app, "clnewestx"), 1, "{rows:#?}");
+        assert_eq!(rows_with(&app, "clwrapcx"), 1, "{rows:#?}");
+        assert_eq!(rows_with(&app, "cl00x"), 0, "{rows:#?}");
+    }
+
+    /// An unreachable room's line stays at the top of its pane while the
+    /// transcript beneath it overflows and scrolls.
+    #[test]
+    fn the_reach_line_stays_on_an_overflowing_pane() {
+        let mut app = drive_to_main();
+        overflow_lobby(&mut app);
+        overflow_circle(&mut app);
+        for room in [RoomRecord::Lobby, RoomRecord::Circle(1)] {
+            app.on_net_event(NetEvent::RoomReach {
+                room,
+                reachable: false,
+            });
+        }
+        let rows = buffer_rows(&app, 80, 24);
+        for needle in [
+            "Can't reach the Lobby right now. Retrying.",
+            "Can't reach circle-1 right now. Retrying.",
+            "lbnewestx",
+            "clnewestx",
+        ] {
+            assert_eq!(rows_with(&app, needle), 1, "{needle}: {rows:#?}");
+        }
+        for needle in ["lb00x", "cl00x"] {
+            assert_eq!(rows_with(&app, needle), 0, "{needle}: {rows:#?}");
+        }
+        // Each line is the first row inside its own pane's top border, from the
+        // pane's first column.
+        let top_of = |title: &str| {
+            rows.iter()
+                .position(|r| r.starts_with('┌') && r.contains(title))
+                .unwrap_or_else(|| panic!("no pane titled {title:?}: {rows:#?}"))
+        };
+        for (title, line, newest) in [
+            (
+                " lobby (# lobby) ",
+                "│Can't reach the Lobby right now. Retrying.",
+                "lbnewestx",
+            ),
+            (
+                " circle 1/1: circle-1 ",
+                "│Can't reach circle-1 right now. Retrying.",
+                "clnewestx",
+            ),
+        ] {
+            let top = top_of(title);
+            assert!(rows[top + 1].starts_with(line), "{title}: {rows:#?}");
+            let bottom = top
+                + rows[top..]
+                    .iter()
+                    .position(|r| r.starts_with('└'))
+                    .expect("the pane's bottom border");
+            assert!(
+                rows[bottom - 1].contains(newest),
+                "{title}: the newest line is not the pane's last: {rows:#?}"
+            );
+        }
     }
 
     #[test]
@@ -8645,6 +8936,106 @@ mod tests {
             .collect()
     }
 
+    /// The row of the 80x24 frame that carries the status line (`! ` prefix).
+    fn status_row(app: &App) -> String {
+        let rows = buffer_rows(app, 80, 24);
+        let hits: Vec<&String> = rows.iter().filter(|r| r.contains("! ")).collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one row carries the status: {rows:#?}"
+        );
+        hits[0].clone()
+    }
+
+    /// A status message too wide for the bar is cut with a visible ellipsis and
+    /// its end (identifier and key hint) still reaches the screen.
+    #[test]
+    fn a_too_wide_status_message_is_ellipsized_and_keeps_its_end() {
+        let mut app = drive_to_main();
+        let name = "L".repeat(70);
+        let msg = format!("sharing {name:?} as ABCDEF123456 (3 file(s)) — [u] in Shares to stop");
+        app.set_status(msg.clone());
+        let row = status_row(&app);
+        assert!(row.contains('…'), "the cut is marked: {row:?}");
+        assert!(
+            row.trim_end_matches('│')
+                .trim_end()
+                .ends_with("[u] in Shares to stop"),
+            "the end of the message shows: {row:?}"
+        );
+        assert!(row.contains("! sharing \"L"), "the head shows: {row:?}");
+    }
+
+    /// While the user types, a status message too wide for the bar shortens, and the
+    /// end of what is typed stays in view beside it.
+    #[test]
+    fn typed_input_stays_in_view_beside_a_wide_status() {
+        let mut app = drive_to_main();
+        assert_eq!(app.main_focus(), MainFocus::Chat);
+        for ch in "a message long enough to need cutting ENDMARK".chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.set_status(format!(
+            "sharing {:?} as ABCDEF123456 — [u] in Shares to stop",
+            "L".repeat(70)
+        ));
+        let row = status_row(&app);
+        assert!(row.contains("…"), "the cut is marked: {row:?}");
+        assert!(
+            row.contains("cutting ENDMARK    ! "),
+            "the typed end left the bar: {row:?}"
+        );
+        assert!(
+            row.trim_end_matches('│')
+                .trim_end()
+                .ends_with("[u] in Shares to stop"),
+            "the end of the message shows: {row:?}"
+        );
+    }
+
+    /// In Shares focus, where the body already carries a long defined-share line, a
+    /// status message still ends whole and the row still fits an 80-column bar.
+    #[test]
+    fn a_status_message_in_shares_focus_keeps_its_end_and_fits() {
+        let mut app = drive_to_main();
+        let name = "L".repeat(70);
+        let dir = std::env::temp_dir().join("ds-399-long-defined");
+        std::fs::create_dir_all(&dir).expect("mk defined-share dir");
+        for _ in 0..4 {
+            app.on_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.main_focus(), MainFocus::DefineShare);
+        for ch in format!("{}|{name}", dir.display()).chars() {
+            app.on_key(press(KeyCode::Char(ch)));
+        }
+        app.on_key(press(KeyCode::Enter));
+        let _ = app.take_pending_share_define();
+        assert_eq!(app.main_focus(), MainFocus::Shares);
+        app.set_status(format!(
+            "sharing {name:?} as ABCDEF123456 (3 file(s)) — [u] in Shares to stop"
+        ));
+        let row = status_row(&app);
+        assert_eq!(row.chars().count(), 80, "one terminal row: {row:?}");
+        let inner = row
+            .strip_prefix('│')
+            .and_then(|r| r.strip_suffix('│'))
+            .expect("the row sits between the bar's borders");
+        assert!(
+            inner.trim_end().ends_with("[u] in Shares to stop"),
+            "the end of the message shows: {row:?}"
+        );
+    }
+
+    /// A status message that fits the bar is drawn whole.
+    #[test]
+    fn a_short_status_message_is_drawn_unchanged() {
+        let mut app = drive_to_main();
+        app.set_status("share added — indexing…");
+        let row = status_row(&app);
+        assert!(row.contains("! share added — indexing…"), "{row:?}");
+    }
+
     /// Define `n` share roots named `mine00`..; leaves focus on Shares.
     fn define_n_shares(app: &mut App, n: usize) {
         let base = std::env::temp_dir();
@@ -9425,6 +9816,12 @@ mod tests {
         app.on_net_event(NetEvent::Dm(std::sync::Arc::new(event)));
     }
 
+    /// This moment in Unix milliseconds, as a runner reports a send committed
+    /// at.
+    fn dm_now_ms() -> u64 {
+        u64::try_from(now_unix_ms()).expect("a clock past the epoch")
+    }
+
     /// One roster row.
     fn dm_row(
         tag: u8,
@@ -9485,14 +9882,29 @@ mod tests {
         buffer_rows(app, 80, 24).join("\n")
     }
 
-    /// Every bordered row's interior, trailing blanks removed — so a row can be
-    /// asserted whole rather than by a word that another widget may also draw.
+    /// The interior of every row of the direct-message pane, or of the thread open
+    /// in its place, from below its top border (the one that names the pane) to
+    /// above its bottom border, trailing
+    /// blanks removed — so a row can be asserted whole, and only a row the pane
+    /// itself draws, rather than one of the status bar or input box around it.
     fn dm_pane_rows(app: &App) -> Vec<String> {
-        buffer_rows(app, 80, 24)
-            .into_iter()
-            .filter_map(|row| {
-                let inner = row.strip_prefix('│')?.strip_suffix('│')?;
-                Some(inner.trim_end().to_owned())
+        let rows = buffer_rows(app, 80, 24);
+        let top = rows
+            .iter()
+            .position(|row| {
+                row.starts_with('┌')
+                    && (row.contains(" direct messages") || row.contains(" dm thread · "))
+            })
+            .unwrap_or_else(|| panic!("no direct-message pane; drew:\n{}", rows.join("\n")));
+        rows[top + 1..]
+            .iter()
+            .take_while(|row| !row.starts_with('└'))
+            .map(|row| {
+                let inner = row
+                    .strip_prefix('│')
+                    .and_then(|r| r.strip_suffix('│'))
+                    .unwrap_or_else(|| panic!("a pane row without its borders: {row:?}"));
+                inner.trim_end().to_owned()
             })
             .collect()
     }
@@ -9538,6 +9950,165 @@ mod tests {
     }
 
     const NOT_RUNNING: &str = "messaging needs the node running";
+
+    /// Messaging that could not run says so in place of the not-running line,
+    /// until a runner reports; a clean stop alone does not say it.
+    #[test]
+    fn the_pane_says_when_messaging_is_unavailable() {
+        const UNAVAILABLE: &str = "Direct messages will start once you're connected.";
+        let mut app = dm_pane_app();
+        app.on_net_event(NetEvent::DmStopped);
+        let rows = dm_pane_rows(&app);
+        assert!(
+            !rows.iter().any(|row| row.contains(UNAVAILABLE)),
+            "a clean stop drew the unavailable line; drew:\n{}",
+            rows.join("\n")
+        );
+        app.on_net_event(NetEvent::DmUnavailable(DmUnavailable::new(
+            DmUnavailableCause::NotConnected,
+            "no Veilid node",
+        )));
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.iter().any(|row| row.contains(UNAVAILABLE)),
+            "no unavailable line; drew:\n{}",
+            rows.join("\n")
+        );
+        app.on_net_event(NetEvent::DmStopped);
+        assert!(
+            dm_pane_rows(&app)
+                .iter()
+                .any(|row| row.contains(UNAVAILABLE))
+        );
+        // A runner reports, and once it stops cleanly the pane reads as not
+        // running again rather than unavailable.
+        dm_roster(&mut app, &[1]);
+        app.on_net_event(NetEvent::DmStopped);
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.iter().any(|row| row.contains(NOT_RUNNING)),
+            "no not-running line after a clean stop; drew:\n{}",
+            rows.join("\n")
+        );
+        assert!(!rows.iter().any(|row| row.contains(UNAVAILABLE)));
+    }
+
+    /// The drawn pane as one line of words, so a line the pane wrapped is
+    /// still found whole.
+    fn dm_pane_text(app: &App) -> String {
+        dm_pane_rows(app)
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Each cause of messaging being unavailable draws its own line, and the
+    /// redacted error text beneath it for every cause but not being connected.
+    #[test]
+    fn the_pane_says_why_messaging_is_unavailable() {
+        let cases = [
+            (
+                DmUnavailableCause::NotConnected,
+                "no Veilid node",
+                "Direct messages will start once you're connected.",
+                None,
+            ),
+            (
+                DmUnavailableCause::StoreUnopened,
+                "refused locally: C:\\Users\\alice\\AppData\\dm",
+                "Direct messages couldn't start because your saved conversations couldn't be opened.",
+                Some("refused locally: <path>"),
+            ),
+            (
+                DmUnavailableCause::RunnerFailed,
+                "direct-message store: /home/alice/dm/lock is a symlink",
+                "Direct messages stopped because of an error. Restart the app to try again.",
+                Some("direct-message store: <path> is a symlink"),
+            ),
+            (
+                DmUnavailableCause::Internal,
+                "the runner panicked",
+                "Direct messages stopped because of an internal error. Restart the app to try again.",
+                Some("the runner panicked"),
+            ),
+        ];
+        for (cause, detail, line, shown) in cases {
+            let mut app = dm_pane_app();
+            app.on_net_event(NetEvent::DmStopped);
+            app.on_net_event(NetEvent::DmUnavailable(DmUnavailable::new(cause, detail)));
+            let text = dm_pane_text(&app);
+            assert!(text.contains(line), "no line for {cause:?}; drew:\n{text}");
+            assert!(
+                !text.contains("alice"),
+                "a path was drawn for {cause:?}: {text}"
+            );
+            match shown {
+                Some(shown) => assert!(
+                    text.contains(shown),
+                    "no detail for {cause:?}; drew:\n{text}"
+                ),
+                None => assert!(
+                    !text.contains(detail),
+                    "a detail was drawn while not connected: {text}"
+                ),
+            }
+        }
+    }
+
+    /// A runner that reports after a stop, or after messaging was marked
+    /// unavailable while the state still reads running, clears the last
+    /// runner's count of messages not sent; a roster from the same runner
+    /// leaves the status alone.
+    #[test]
+    fn a_new_runner_clears_the_last_runners_not_sent_status() {
+        let mut app = dm_pane_app();
+        app.status = Some(format!("{DM_NOT_SENT_PREFIX}1 message was not sent"));
+        dm_roster(&mut app, &[1]);
+        assert_eq!(app.status(), None, "a new runner kept the not-sent status");
+
+        app.status = Some(format!("{DM_NOT_SENT_PREFIX}1 message was not sent"));
+        dm_roster(&mut app, &[1]);
+        assert!(
+            app.status().is_some(),
+            "the same runner's roster cleared it"
+        );
+
+        app.on_net_event(NetEvent::DmUnavailable(DmUnavailable::new(
+            DmUnavailableCause::Internal,
+            "the runner panicked",
+        )));
+        assert!(app.dm_state().running);
+        dm_roster(&mut app, &[1]);
+        assert_eq!(app.status(), None, "a roster after unavailable kept it");
+    }
+
+    /// An advert the runner could not publish is a line in the pane until a
+    /// write is taken.
+    #[test]
+    fn the_pane_says_while_the_advert_is_unpublished() {
+        const NOT_REACHABLE: &str = "others can't reach you";
+        let mut app = dm_pane_app();
+        dm_roster(&mut app, &[1]);
+        assert!(
+            !dm_pane_rows(&app)
+                .iter()
+                .any(|row| row.contains(NOT_REACHABLE))
+        );
+        dm_event(&mut app, RunnerEvent::Advert { published: false });
+        let rows = dm_pane_rows(&app);
+        assert!(
+            rows.iter().any(|row| row.contains(NOT_REACHABLE)),
+            "no not-reachable line; drew:\n{}",
+            rows.join("\n")
+        );
+        dm_event(&mut app, RunnerEvent::Advert { published: true });
+        assert!(
+            !dm_pane_rows(&app)
+                .iter()
+                .any(|row| row.contains(NOT_REACHABLE))
+        );
+    }
 
     /// Until a runner reports, the pane lists nothing and says messaging needs
     /// the node running; once its roster arrives, the pane lists; once it stops,
@@ -9710,6 +10281,7 @@ mod tests {
                 token: first,
                 peer: label,
                 seq: 0,
+                sent_at: dm_now_ms(),
             },
         );
         dm_event(
@@ -9718,6 +10290,7 @@ mod tests {
                 token: second,
                 peer: label,
                 seq: 1,
+                sent_at: dm_now_ms(),
             },
         );
         let rows = dm_pane_rows(&app);
@@ -9769,6 +10342,7 @@ mod tests {
                     token,
                     peer: label,
                     seq: seq as u64,
+                    sent_at: dm_now_ms(),
                 },
             );
         }
@@ -9839,6 +10413,7 @@ mod tests {
                 token: kept,
                 peer: label,
                 seq: 0,
+                sent_at: dm_now_ms(),
             },
         );
         assert!(
@@ -10202,7 +10777,7 @@ mod tests {
     /// channel root, and the session's own at-rest key.
     #[test]
     fn dm_session_keys_bind_the_identity_the_channel_root_and_the_profile_key() {
-        let (app, phrase) = drive_to_main_with_phrase();
+        let (mut app, phrase) = drive_to_main_with_phrase();
         let keys = app
             .dm_session_keys()
             .expect("an unlocked profile has DM keys");
@@ -10434,6 +11009,7 @@ mod tests {
                     token,
                     peer: label,
                     seq,
+                    sent_at: dm_now_ms(),
                 },
             );
         }
@@ -10814,6 +11390,7 @@ mod tests {
                 token,
                 peer: label,
                 seq: 0,
+                sent_at: dm_now_ms(),
             },
         );
         dm_event(
@@ -11454,6 +12031,7 @@ mod tests {
                 token: CommandToken(u64::MAX),
                 peer: label,
                 seq: 4,
+                sent_at: dm_now_ms(),
             },
         );
         let rows = dm_pane_rows(&app);
@@ -11475,6 +12053,7 @@ mod tests {
                 token: second,
                 peer: label,
                 seq: 5,
+                sent_at: dm_now_ms(),
             },
         );
         let rows = dm_pane_rows(&app);
@@ -11504,6 +12083,7 @@ mod tests {
                     token,
                     peer: label,
                     seq,
+                    sent_at: dm_now_ms(),
                 },
             );
         }
@@ -11536,6 +12116,7 @@ mod tests {
                     token,
                     peer: label,
                     seq,
+                    sent_at: dm_now_ms(),
                 },
             );
         }
