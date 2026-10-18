@@ -24,6 +24,8 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+## [v0.37.1] — 2026-10-18
+
 ### Added
 
 - GUI: added Copy to the right-click menu of a direct message.

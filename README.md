@@ -58,7 +58,7 @@ The `tui` (ratatui) and `gui` (Slint) crates are the product surfaces; their int
 
 ## Status
 
-Current release: **v0.37.0** — beta (post-MVP). daemonseed runs fully serverless and peer-to-peer over the Veilid DHT: the public Lobby and circle chat, member presence, in-band share discovery/transfer, operator announcements/MOTD and direct messages. Circle chat and direct messages are end-to-end encrypted; the public Lobby is open by design. See `CHANGELOG.md` for per-release detail.
+Current release: **v0.37.1** — beta (post-MVP). daemonseed runs fully serverless and peer-to-peer over the Veilid DHT: the public Lobby and circle chat, member presence, in-band share discovery/transfer, operator announcements/MOTD and direct messages. Circle chat and direct messages are end-to-end encrypted; the public Lobby is open by design. See `CHANGELOG.md` for per-release detail.
 
 The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track.
 
