@@ -28,7 +28,6 @@ library:
   license: "AGPL-3.0-or-later (code); Apache-2.0 OR MIT (schema)"
   minimum_toolchain: "rust 1.95"
   edition: "2024"
-  phase: private
 
 # ─────────────────────────────────────────────────────────────────────
 # This file is a LAMA discovery manifest, not a project status board. Per the
@@ -88,16 +87,9 @@ crates:
 
   - name: daemonseed-gui
     purpose: >-
-      Slint GUI client (scaffold). The design brief's three-zone shell
-      ported from the perf spike into structured components + the alpha tab nav
-      (Chat / Shares / a "coming soon" circle-shares placeholder), with a
-      command-palette overlay seeded from a Rust-side action registry. Stub
-      in-memory data, no daemonseed-core wiring yet. Base build is
-      software-renderer-only (offscreen `--screenshot` PNG, headless-verifiable);
-      the `desktop` feature forwards slint/backend-winit for a real window.
-      Binary, no library API surface.
+      Slint desktop client: Lobby and circle chat, presence, direct messages, public share publish, browse and download, announcements and MOTD, first-start enrollment and passphrase unlock, driven over daemonseed-veilid-net. Software renderer by default; the desktop feature opens a window. Binary, no library API surface.
     license: AGPL-3.0-or-later
-    status: scaffold
+    status: active
     manifest: "docs/llm-api-manifest/daemonseed-gui-api.yaml"
 
   - name: daemonseed-veilid-net

@@ -1,132 +1,74 @@
 # daemonseed
 
-Peer-to-peer end-to-end-encrypted communication and file-sharing protocol. Pure Rust.
+daemonseed is a desktop app for private group chat, direct messages and file sharing with no server behind it. It is for people who want to talk and share files with a group they trust, without any company or operator in the middle who could read, store or shut off the conversation. Pure Rust.
 
-Private phase. See [`AGENTS.md`](AGENTS.md) for the working context, conventions, and per-commit discipline. AI agents discovering the project surface should start at [`lama.yaml`](lama.yaml) at the repository root.
+## What it does
 
-## Project map
+- **Lobby chat.** A public room every user lands in. Anyone can read and post, with no account to create and nothing to coordinate.
+- **Circles.** A private group formed from a shared phrase. Create a circle and the app generates a strong phrase; hand it to the people you want in, by any channel you trust. Anyone holding the phrase can read and post; nobody else can. You can be in several circles at once.
+- **Direct messages.** One-to-one private conversations. A first message arrives as a contact request the other person can accept, decline or block. Each identity shows a fingerprint you can compare out of band.
+- **Public shares.** Publish a folder from your computer while the app is running. Others browse what is on offer and download it; every downloaded file is checked against its content hash.
+- **Presence.** Each room shows who is in it right now.
+- **Announcements and a message of the day**, signed by the project and verified by your client before display.
 
-Each kind of fact has one home — to avoid the drift that comes from duplicating state. Where to look:
-
-- **What shipped, when** → [`CHANGELOG.md`](CHANGELOG.md) (one entry per SSH-signed git tag).
-- **The design contract** (problem, principles, boundaries, every ISC) → [`ISA.md`](ISA.md).
-- **Live ISC coverage** → `cargo xtask isc-coverage`.
-- **The full canonical-homes map** (authoritative; what lives where and why) → the *Canonical homes* table in [`AGENTS.md`](AGENTS.md#canonical-homes).
-- **Per-crate API surface** (for client implementers) → [`docs/llm-api-manifest/`](docs/llm-api-manifest/), indexed from [`lama.yaml`](lama.yaml).
-
-## Workspace layout
-
-```
-daemonseed/
-├── Cargo.toml                              workspace root (resolver = "2", edition = 2024, MSRV 1.95)
-├── lama.yaml                               LAMA discovery entry point — AI agent quick triage
-├── AGENTS.md                               canonical working rules (referenced by CLAUDE.md)
-│
-├── crates/
-│   ├── daemonseed-core/                    protocol library — identity, 3-layer storage (seeds /
-│   │                                       redb share index / chunk CAS), crypto-agility, first-start,
-│   │                                       bootstrap, flat circle-of-trust keys, shared-record (rendezvous) addressing, indexer,
-│   │                                       mute/hide lists, @-mention logic,
-│   │                                       release trust anchor + multi-sig verify + update-lifecycle FSM,
-│   │                                       at-rest persistence of display-name / mute / hide / circle membership
-│   │                                       via a cached SealingKey re-encrypt; fetched-download CAS + manifest
-│   │                                       store (storage::fetched, M15)
-│   ├── daemonseed-proto/                   wire schema (Protocol Buffers, prost + tonic)
-│   ├── daemonseed-veilid-net/              Veilid transport: identity-bound node, encrypted 1:1 + circle/lobby/public-room shared records, signed share-discovery route advertisements, owner-on-demand share content transfer
-│   ├── daemonseed-cli/                     library-only client: Veilid route-advertisement signer (`route_signer`) + announcements/MOTD authoring & render helpers (`public_space`)
-│   ├── daemonseed-tui/                     interactive ratatui client — the MVP product surface; Servers-pane introducer discovery; multi-circle carousel (v0.16); session write-through + silent circle rejoin from the at-rest blob; define-share + indexer; publish/serve/unpublish + fetched-download browse/extract
-│   ├── daemonseed-gui/                     Slint GUI client (scaffold) — software-renderer shell; `--features desktop` opens a real window
-│   ├── daemonseed-isc/                      ISC registry leaf crate (zero deps): the single source of
-│   │                                       TOTAL / COVERED, read by both the integration tests and xtask
-│   └── daemonseed-integration-tests/       cross-crate integration tests (re-exports daemonseed-isc)
-│
-├── docs/
-│   └── llm-api-manifest/                   per-crate LAMA API manifests referenced by lama.yaml
-│       ├── daemonseed-core-api.yaml
-│       ├── daemonseed-proto-protocol.yaml
-│       ├── daemonseed-veilid-net-api.yaml
-│       ├── daemonseed-cli-api.yaml
-│       ├── daemonseed-tui-api.yaml
-│       └── daemonseed-gui-api.yaml
-│
-└── xtask/                                  workspace task runner: gen-proto, check-proto,
-                                            check-manifests, check-ui-strings,
-                                            isc-coverage, install-hooks, gate, release-gate
-```
-
-The `tui` (ratatui) and `gui` (Slint) crates are the product surfaces; their interactive logic is a terminal-free / RAM-only, unit-testable screen state machine over the shared authoring library (`cli`) and the Veilid DHT transport (`daemonseed-veilid-net`). There is no relay — every client is a Veilid node.
+Two clients ship from the same code: a graphical desktop app and a terminal app.
 
 ## Status
 
-Current release: **v0.37.1** — beta (post-MVP). daemonseed runs fully serverless and peer-to-peer over the Veilid DHT: the public Lobby and circle chat, member presence, in-band share discovery/transfer, operator announcements/MOTD and direct messages. Circle chat and direct messages are end-to-end encrypted; the public Lobby is open by design. See `CHANGELOG.md` for per-release detail.
+Current release: **v0.37.1** — beta (post-MVP). The features above work end to end. Message formats and on-disk formats may change between releases; `CHANGELOG.md` marks any such change. Only the current release receives fixes; `SECURITY.md` says how to report a vulnerability.
 
-The per-release history lives in **[`CHANGELOG.md`](CHANGELOG.md)** (one entry per SSH-signed tag) — this section is intentionally kept to the current release so it can't silently drift. The release-signing *infrastructure* (real keys, Sigstore co-signature, reproducible builds, store / package-manager channels) and the platform features (biometric login, OS-native autostart) remain on a follow-up track.
+## Get it
+
+Downloads are at <https://daemonseed.org>, with the release files at <https://github.com/caraka/daemonseed-releases>. Each release carries the desktop app for x86_64 Linux (a single-file AppImage) and for x86_64 Windows 10 or later (a single `.exe`), plus a `SHA256SUMS` file to check a download against. The terminal app is not published as a binary; build it from source (see Building from source).
+
+## First launch
+
+1. **Choose a passphrase.** It encrypts your identity keys, recovery phrase, display name, circle memberships, mute and hide lists, shared folder list and direct-message conversations on this computer. Files you download from a share are saved as ordinary files, and the settings file is plain text. There is no reset, so make it strong and memorable.
+2. **Write down your recovery phrase.** The app shows 24 words. On this computer they are kept only encrypted under your passphrase. Writing them down is what lets you recover your identity on another computer or after forgetting the passphrase. You confirm the backup by typing three of the words back.
+3. **Pick a display name.** This is what others see in chat; you can change it later.
+
+The app then connects to the peer network. The first connection takes a little while to find other nodes, and the screen says so. You arrive in the Lobby. From the left rail, create a circle or join one with a phrase you were given, open a direct message from a person's name, and publish or browse shares from the Shares tab. On later launches you enter your passphrase once to unlock.
+
+**Wayland.** On some Wayland desktops the window stops responding to the mouse. Start the app on XWayland instead with `--x11`, or set `DAEMONSEED_X11=1`. The AppImage does this by default; `DAEMONSEED_X11=0` restores native Wayland.
+
+## How it works
+
+There is no daemonseed server. Every running client is a node of [Veilid](https://veilid.com), an open-source peer-to-peer network whose distributed hash table stores small records across the participating nodes and whose private routes hide where a node is. Rooms, shares and direct messages are records on that network. Other nodes carry circle messages and direct messages without being able to read them; public rooms, public shares and announcements are readable by anyone.
+
+What is private and what is not:
+
+- **Circle chat and direct messages are end-to-end encrypted.** A circle's key is derived from its phrase, which is never on the network. A direct message is encrypted with keys only the two parties hold. Nodes carrying the traffic see encrypted bytes and the fact that someone is present at an address, never content or membership.
+- **The Lobby, public shares, announcements and the message of the day are open by design.** They are encrypted in transit, but with a key anyone can derive, so anyone can read them. They carry no confidentiality.
+- **Your identity is a key pair derived from the 24-word recovery phrase.** The phrase is the root of recovery; the only copy on disk is encrypted under your passphrase, alongside your keys and private state.
+
+Cryptography follows the CNSA 2.0 suite (ML-DSA-87 signatures, ML-KEM-1024 key encapsulation, AES-256-GCM, SHA-384) through the [oxicrypt](https://github.com/oxiforge/oxicrypt) crates. The crypto module checks its own binary image against a signature slot before it does any work, and refuses to run if the check fails.
+
+Not yet in place: the release-signing keys that would let a client verify an update against a published trust anchor (the trust anchor ships with an empty key set), reproducible builds, package-manager or app-store distribution, biometric unlock and start-on-login. Encrypted sharing inside a circle is shown in the app as coming soon. Presence beacons are a constant length, but chat messages are not padded in length or timing. Because public room addresses can be derived by anyone, an observer can tell that a client is subscribed to a known public room and can read what is posted there; circle addresses, circle messages and direct messages stay opaque. The full set of guarantees, each with the test that would show it broken, is the design contract in `ISA.md`.
+
+## Building from source
+
+```sh
+packaging/appimage/build-appimage.sh   # Linux desktop app → dist/daemonseed-gui-x86_64.AppImage
+packaging/windows/build-windows.sh     # Windows desktop app → dist/daemonseed-gui.exe
+packaging/tui/build-tui.sh             # Linux terminal app → dist/daemonseed-tui-x86_64
+```
+
+A plain `cargo build` binary refuses to start: the crypto module's self-check fails on an unsigned image and the process exits with `Module image integrity`. The packaging scripts sign the binary as their last step, so what they produce runs. `BUILD.md` lists the toolchain (Rust pinned by `rust-toolchain.toml`, `cargo-zigbuild` and `zig`, `protoc`, Wayland headers), how to sign a hand-built binary, and how to run two clients on one machine. `packaging/appimage/README.md` covers the AppImage recipe.
+
+## Contributing
+
+Work is tracked in GitHub Issues; pick one, or open one before anything larger than a one-line fix. `CONTRIBUTING.md` is the short version of the rules and `AGENTS.md` the full contract: signed commits, documentation updated in the same commit as the code, and a pull request for every change. Before pushing, run the gate:
+
+```sh
+cargo xtask gate
+```
+
+`cargo xtask install-hooks` installs a pre-push hook that runs the quick part of it.
 
 ## License
 
-- Code crates: **AGPL-3.0-or-later** (`LICENSE-AGPL`).
-- `daemonseed-proto` (wire schema): **Apache-2.0 OR MIT** (`LICENSE-APACHE`, `LICENSE-MIT`). Schema is dual-licensed so cross-language client implementations are free of copyleft drag.
+Code crates: **AGPL-3.0-or-later** (`LICENSE-AGPL`). The `daemonseed-proto` wire schema: **Apache-2.0 OR MIT** (`LICENSE-APACHE`, `LICENSE-MIT`), so clients in other languages can implement the protocol without a copyleft obligation.
 
-## Quickstart for contributors
+## For AI agents
 
-```bash
-cargo build --workspace                                          # build everything
-cargo test --workspace                                           # run all tests
-cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
-cargo xtask check-proto                                          # verify committed proto snapshot matches .proto sources
-cargo xtask isc-coverage                                         # report ISC coverage against the spec
-```
-
-See `AGENTS.md` for the full definition-of-done and the doc-sync ritual at every commit boundary.
-
-## Running the GUI
-
-```bash
-cargo run -p daemonseed-gui --features desktop          # opens a real window
-```
-
-**Wayland input note.** Under some Wayland compositors — most reliably reproduced when running **more than one client in the same session** — winit 0.30's Wayland pointer path can stop delivering input, leaving the window non-responsive (the process stays healthy; it is a dead surface, not a hang). Force XWayland with `--x11` or `DAEMONSEED_X11=1` to work around it:
-
-```bash
-DAEMONSEED_X11=1 cargo run -p daemonseed-gui --features desktop
-./daemonseed-gui --x11                                  # equivalent, for a built binary
-```
-
-## Packaging
-
-A reproducible AppImage recipe for the desktop GUI lives in
-[`packaging/appimage/`](packaging/appimage/):
-
-```bash
-packaging/appimage/build-appimage.sh        # → dist/daemonseed-gui-x86_64.AppImage
-```
-
-It builds `daemonseed-gui --release --features desktop` against a glibc 2.35 floor
-via `cargo-zigbuild` and bundles it with `appimagetool`. See
-[`packaging/appimage/README.md`](packaging/appimage/README.md) for requirements and knobs.
-
-A self-contained Windows build (no MSVC, no Windows host needed) lives in
-[`packaging/windows/`](packaging/windows/):
-
-```bash
-packaging/windows/build-windows.sh          # → dist/daemonseed-gui.exe
-```
-
-It cross-compiles `daemonseed-gui --release --features desktop` for
-`x86_64-pc-windows-gnu` via `cargo-zigbuild`; zig static-links the mingw runtime, so the
-`.exe` depends only on stock Windows 10+ system DLLs (nothing to ship alongside it).
-Requires the target: `rustup target add x86_64-pc-windows-gnu`.
-
-A portable Linux TUI build lives in [`packaging/tui/`](packaging/tui/):
-
-```bash
-packaging/tui/build-tui.sh                  # → dist/daemonseed-tui-x86_64
-```
-
-**Every packaging script signs the artifact's integrity slot as its final step.**
-The crypto module verifies its own image before doing any work, so an unsigned
-binary — including anything from a plain `cargo build` — exits at startup with
-`Module image integrity`. The signer is fetched from crates.io at the version this
-workspace pins, so no sibling checkout is needed. See
-[`BUILD.md`](BUILD.md#signing-a-build-you-intend-to-run-must-carry-an-integrity-slot)
-for signing a hand-built binary.
+Start at `lama.yaml` at the repository root; it indexes the per-crate API manifests under `docs/llm-api-manifest/`.

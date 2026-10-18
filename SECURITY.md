@@ -12,4 +12,4 @@ This repository holds the daemonseed protocol, its clients, and its DHT transpor
 
 ## Supported versions
 
-daemonseed is alpha software. Only the current release, named in `README.md` under **Status**, receives fixes.
+daemonseed is beta software. Only the current release, named in `README.md` under **Status**, receives fixes.

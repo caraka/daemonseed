@@ -38,7 +38,7 @@ work lives in the maintainer's own planning notes, not here.
 - GUI and TUI: stated why direct messages stopped, with the error text minus recognised personal paths and key-like text, and the GUI added a Copy button for it.
 - GUI and TUI: stated when others cannot yet reach you for direct messages.
 - GUI: opened setup and unlock in a small window and reopened the main window at its saved size or the default size, maximized if it was closed maximized or the size exceeds the screen.
-- Docs: marked the project status as beta.
+- Docs: rewrote the README for new readers and marked the project status and SECURITY.md as beta.
 
 ### Fixed
 
