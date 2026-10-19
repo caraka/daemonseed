@@ -1198,8 +1198,9 @@ UI-string checks), `dev-suite` (the windowed-GUI lint and the dev-profile test s
 `release-suite` (the release-profile test suite). The pre-push hook runs `preflight`. CI runs
 `preflight` and `dev-suite` on every pull request and `release-suite` on `release/` pull requests
 and on `main`. On `main` it does not re-run a group when the newest pull-request run of the same
-commit ID passed it on the same tree, and any doubt runs the gate. `cargo xtask release-gate` runs all three before a tag is
-created, so a tag is never cut on a red tree. Alongside it sits the judgment gate that the commit's
+commit ID passed it on the same tree, and any doubt runs the gate. `cargo xtask release-gate` runs all three
+locally and exits non-zero naming any red step; it is the fallback, run before `git tag` when CI
+cannot run. Alongside it sits the judgment gate that the commit's
 documentation is already true.
 
 **Known partial and vacuous coverage, recorded rather than hidden.**

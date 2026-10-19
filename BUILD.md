@@ -157,7 +157,9 @@ Wayland setups).
 Building is not the gate. Before committing, run the
 [Definition of done](AGENTS.md#definition-of-done) checks. On `main`, CI does not re-run
 a group of that gate when the newest pull-request run of the same commit ID passed it on the
-same tree. Any doubt runs the gate. Before cutting a release tag, run `cargo xtask release-gate`,
-which runs every group of that gate and refuses to let a tag be created on a red tree.
+same tree. Any doubt runs the gate. Before cutting a release tag, the tagged commit needs green CI in
+all three groups, which a pull request from a `release/` branch runs. When CI cannot run,
+`cargo xtask release-gate` runs every group locally and exits non-zero naming any red
+step; run it before `git tag`.
 `cargo xtask gate --list` prints the step table; `cargo xtask gate --group preflight` runs
 the group the pre-push hook runs.

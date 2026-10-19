@@ -27,8 +27,9 @@
 //!   every group. A test step reporting zero passing tests is red whatever its
 //!   exit code. Every run, whole or single-group, ends by deleting the binaries
 //!   its steps linked into `target/` (see `remove_linked_bins`).
-//! - `release-gate` — run every group of the gate and exit non-zero if any step
-//!   is red, so a release tag is never cut on a red tree. Run before `git tag`.
+//! - `release-gate` — run every group of the gate and exit non-zero naming any
+//!   red step. It is the fallback for a release: run it before `git tag` when CI
+//!   cannot run.
 
 mod manifests;
 mod ui_strings;
@@ -90,9 +91,8 @@ enum Cmd {
         #[arg(long)]
         list: bool,
     },
-    /// Run every group of the Definition-of-Done gate and refuse (non-zero
-    /// exit) if any step is red — so a release tag is never cut on a red tree
-    /// (#62). Run before `git tag`.
+    /// Run every group of the Definition-of-Done gate and exit non-zero naming
+    /// any red step (#62). Run before `git tag` when CI cannot run.
     ReleaseGate,
 }
 
@@ -524,8 +524,8 @@ struct GateStep {
 /// The Definition-of-Done gate: one table, read by every caller. The pre-push hook
 /// runs the `preflight` group; CI runs each group in its own job, and on `main` does
 /// not run a group again when the newest pull-request run of the pushed commit
-/// already passed it on the same tree; a release tag-cut runs the whole
-/// table through `release-gate` (#62).
+/// already passed it on the same tree; `release-gate` runs the whole table
+/// locally, before `git tag` when CI cannot run (#62).
 const RELEASE_GATE_STEPS: &[GateStep] = &[
     GateStep {
         name: "fmt --all --check",
@@ -739,8 +739,8 @@ fn list_gate_steps(group: Option<GateGroup>) {
 }
 
 /// Run the gate — every group, or only `group` — and exit non-zero naming any red
-/// step. With no group this is the full Definition-of-Done gate a release tag-cut
-/// must pass, so a tag is never created on a red tree (#62).
+/// step. With no group this is the full Definition-of-Done gate, which
+/// `release-gate` runs (#62).
 fn run_gate(group: Option<GateGroup>) -> Result<()> {
     let repo = workspace_root_from_xtask()?;
     let cargo = cargo_bin();

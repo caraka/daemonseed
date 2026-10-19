@@ -71,7 +71,7 @@ A test states what it needs and how to run it, in terms true for anyone: the net
 
 ## Definition of done
 
-The gate is defined once — one table of steps in three groups, `RELEASE_GATE_STEPS` in `xtask/src/main.rs` — and read by every caller. The pre-push hook runs the `preflight` group. CI runs `preflight` and `dev-suite`, one job per group, on every pull request and on `main`, and `release-suite` on every push to `main` and on manual dispatch — the release profile is exercised once per merge, always before a tag, and not on every pull request. `cargo xtask release-gate` runs all three before a release tag.
+The gate is defined once — one table of steps in three groups, `RELEASE_GATE_STEPS` in `xtask/src/main.rs` — and read by every caller. The pre-push hook runs the `preflight` group. CI runs one job per group. `preflight` and `dev-suite` run on every pull request and on `main`; `release-suite` runs on every push to `main`, on manual dispatch, and on pull requests from a `release/` branch, but not on other pull requests. On a push to `main`, CI does not re-run a group when the newest pull-request run of the same commit ID passed it on the same tree. Any doubt runs the gate. `scripts/ci/already-passed.sh` states the full rule. `cargo xtask release-gate` runs all three groups locally, for when CI cannot run.
 
 | Group | Steps |
 |-------|-------|
@@ -90,7 +90,7 @@ Every task is incomplete until both of these pass:
 
 Run the gate as the last step before handing control back to the user, and re-run after any post-review fix-up; doc-sync is applied per-commit as you go, not deferred to handback. If `cargo fmt --all --check` reports diffs, run `cargo fmt --all` to fix them before re-running — clippy output is easier to read on formatted code.
 
-**Cutting a release tag:** run `cargo xtask release-gate` before `git tag`. It runs every group of the gate above and exits non-zero naming any red step, so a tag is never created on a red tree. The pre-push hook is the backstop on push and CI is the backstop on the pull request; the release-gate stops the tag being created in the first place.
+**Cutting a release tag:** before `git tag`, the commit being tagged must have green CI in all three groups. Open the release as a pull request from a `release/` branch, which runs all three, and tag the commit it lands. When CI cannot run, run `cargo xtask release-gate` instead: it runs every group of the gate above and exits non-zero naming any red step. The pre-push hook is the backstop on push and CI is the backstop on the pull request.
 
 ## Documentation sync at every commit point
 
