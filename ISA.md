@@ -1195,8 +1195,10 @@ fail today.
 **The gate.** One table of steps in `xtask`, in three groups: `preflight` (format, lint, a
 release-profile type-check, rustdoc with warnings denied, and the proto, coverage, manifest and
 UI-string checks), `dev-suite` (the windowed-GUI lint and the dev-profile test suite) and
-`release-suite` (the release-profile test suite). The pre-push hook runs `preflight`; CI runs all
-three on every pull request and on `main`; `cargo xtask release-gate` runs all three before a tag is
+`release-suite` (the release-profile test suite). The pre-push hook runs `preflight`. CI runs
+`preflight` and `dev-suite` on every pull request and `release-suite` on `release/` pull requests
+and on `main`. On `main` it does not re-run a group when the newest pull-request run of the same
+commit ID passed it on the same tree, and any doubt runs the gate. `cargo xtask release-gate` runs all three before a tag is
 created, so a tag is never cut on a red tree. Alongside it sits the judgment gate that the commit's
 documentation is already true.
 

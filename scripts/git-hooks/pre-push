@@ -4,11 +4,14 @@
 #
 # Installed by `cargo xtask install-hooks`. The two suite groups are
 # `dev-suite`, which lints the windowed GUI and runs the dev-profile test
-# suite, and `release-suite`, which runs the release-profile suite; CI runs all
-# three groups on every pull request and on `main`. `git push --no-verify`
-# skips this hook, and a skip is justified in the commit body. The full gate is
-# `cargo xtask gate`. Every gate run ends by deleting the binaries its steps
-# linked into `target/`, so the next build of one relinks it.
+# suite, and `release-suite`, which runs the release-profile suite. On `main`,
+# CI does not re-run a group when the newest pull-request run of the same
+# commit ID passed it on the same tree, and any doubt runs the gate (see
+# `.github/workflows/ci.yml`).
+# `git push --no-verify` skips this hook, and a skip is justified in the
+# commit body. The full gate is `cargo xtask gate`. Every gate run ends by
+# deleting the binaries its steps linked into `target/`, so the next build of
+# one relinks it.
 
 set -euo pipefail
 

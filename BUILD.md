@@ -33,6 +33,7 @@ says nothing about the pinned version.
   `daemonseed-gui` → `rfd` → `ashpd`), and **pkg-config**, which that probe
   uses. dbus is vendored and sqlite is bundled by their crates, so neither needs
   a package. On Debian/Ubuntu: `protobuf-compiler libwayland-dev pkg-config`.
+- The `xtask` tests of `scripts/ci/already-passed.sh` also need **`jq`** on `PATH`.
 
 ## Dev builds (fast, local run)
 
@@ -154,7 +155,9 @@ Wayland setups).
 ## Gate before you commit / tag
 
 Building is not the gate. Before committing, run the
-[Definition of done](AGENTS.md#definition-of-done) checks; before cutting a release
-tag, run `cargo xtask release-gate`, which runs every group of that gate and refuses
-to let a tag be created on a red tree. `cargo xtask gate --list` prints the step
-table; `cargo xtask gate --group preflight` runs the group the pre-push hook runs.
+[Definition of done](AGENTS.md#definition-of-done) checks. On `main`, CI does not re-run
+a group of that gate when the newest pull-request run of the same commit ID passed it on the
+same tree. Any doubt runs the gate. Before cutting a release tag, run `cargo xtask release-gate`,
+which runs every group of that gate and refuses to let a tag be created on a red tree.
+`cargo xtask gate --list` prints the step table; `cargo xtask gate --group preflight` runs
+the group the pre-push hook runs.

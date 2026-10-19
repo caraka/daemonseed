@@ -3,11 +3,30 @@
 # `preflight` and `dev-suite` run on every pull request and on `main`.
 # `release-suite` runs the whole test suite in the release profile, which
 # differs in behaviour (overflow checks, `debug_assertions`) and not only in
-# optimisation; it runs on every push to `main` and on manual dispatch, not on
-# pull requests — a profile-only regression is caught within one merge of
-# landing and always before a tag, at half the billed minutes per pull request.
+# optimisation; it runs on every push to `main`, on manual dispatch, and on pull
+# requests from a `release/` branch, but not on other pull requests. A
+# profile-only regression is caught within one merge of landing, and a release
+# pull request carries all three groups before its commit is tagged.
+#
+# On `main`, CI can skip a group. It does not re-run one when the newest
+# pull-request run of the same commit ID passed it on the same tree. Any doubt
+# runs the gate. On a pull request, once a
+# job's gate passes, it uploads an artifact named for the job and the tree of the
+# merge commit it tested. On a push that is not a force-push, a job first runs
+# `scripts/ci/already-passed.sh`, which asks the GitHub API whether the newest
+# pull-request run of this commit that ran the same job passed it and recorded
+# the pushed commit's tree. A newer run that has not reported this job's result
+# answers run. If the check passes, the job skips its setup and gate steps and
+# reports success; otherwise, or if the API cannot answer, it runs the gate.
+# Comparing trees is what makes the skip sound: a pull-request run tests its head
+# merged into whatever base it had, and only a matching tree shows that the
+# result applies to what was pushed. This covers a merge that lands the pull
+# request's head with its commit ID unchanged; a squash or rebase merge lands a
+# new commit ID and always runs the gate. Pull requests and manual dispatch
+# always run the gate.
+#
 # The pre-push hook runs the `preflight` group, and `cargo xtask release-gate`
-# runs all three before a release tag.
+# runs all three groups locally.
 #
 # The live-network tests are excluded by their `#[ignore]` attribute and are NOT
 # covered by this workflow. No job opts back into ignored tests; a unit test in
@@ -52,33 +71,109 @@ jobs:
   #
   # Each job takes its own cache key: they run concurrently, and one shared key
   # would have them racing to save over each other.
+  #
+  # The job ids carry no `name:`, so `github.job` is the name the API reports
+  # for the job, which is what `scripts/ci/already-passed.sh` matches on.
+  #
+  # The last two steps of each job record, on a pull request, the tree the gate
+  # just passed. They follow the gate without `always()`, so they run only when
+  # it succeeded. `overwrite` lets a re-run attempt record the same tree again.
   preflight:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - id: prior
+        if: github.event_name == 'push' && github.event.forced != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/already-passed.sh "${{ github.job }}"
+      - if: steps.prior.outputs.passed != 'true'
+        uses: ./.github/actions/setup
         with:
           cache-key: ci-preflight
-      - run: cargo xtask gate --group preflight
+      - if: steps.prior.outputs.passed != 'true'
+        run: cargo xtask gate --group preflight
+      - id: tree
+        if: github.event_name == 'pull_request'
+        run: |
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/tested-tree"
+          echo "sha=$(cat "$RUNNER_TEMP/tested-tree")" >> "$GITHUB_OUTPUT"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-${{ github.job }}-${{ steps.tree.outputs.sha }}
+          path: ${{ runner.temp }}/tested-tree
+          retention-days: 30
+          overwrite: true
+          if-no-files-found: error
 
   dev-suite:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - id: prior
+        if: github.event_name == 'push' && github.event.forced != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/already-passed.sh "${{ github.job }}"
+      - if: steps.prior.outputs.passed != 'true'
+        uses: ./.github/actions/setup
         with:
           cache-key: ci-dev-suite
-      - run: cargo xtask gate --group dev-suite
+      - if: steps.prior.outputs.passed != 'true'
+        run: cargo xtask gate --group dev-suite
+      - id: tree
+        if: github.event_name == 'pull_request'
+        run: |
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/tested-tree"
+          echo "sha=$(cat "$RUNNER_TEMP/tested-tree")" >> "$GITHUB_OUTPUT"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-${{ github.job }}-${{ steps.tree.outputs.sha }}
+          path: ${{ runner.temp }}/tested-tree
+          retention-days: 30
+          overwrite: true
+          if-no-files-found: error
 
   release-suite:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release/')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - id: prior
+        if: github.event_name == 'push' && github.event.forced != true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/already-passed.sh "${{ github.job }}"
+      - if: steps.prior.outputs.passed != 'true'
+        uses: ./.github/actions/setup
         with:
           cache-key: ci-release-suite
-      - run: cargo xtask gate --group release-suite
+      - if: steps.prior.outputs.passed != 'true'
+        run: cargo xtask gate --group release-suite
+      - id: tree
+        if: github.event_name == 'pull_request'
+        run: |
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/tested-tree"
+          echo "sha=$(cat "$RUNNER_TEMP/tested-tree")" >> "$GITHUB_OUTPUT"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-${{ github.job }}-${{ steps.tree.outputs.sha }}
+          path: ${{ runner.temp }}/tested-tree
+          retention-days: 30
+          overwrite: true
+          if-no-files-found: error

@@ -522,7 +522,9 @@ struct GateStep {
 }
 
 /// The Definition-of-Done gate: one table, read by every caller. The pre-push hook
-/// runs the `preflight` group; CI runs all three; a release tag-cut runs the whole
+/// runs the `preflight` group; CI runs each group in its own job, and on `main` does
+/// not run a group again when the newest pull-request run of the pushed commit
+/// already passed it on the same tree; a release tag-cut runs the whole
 /// table through `release-gate` (#62).
 const RELEASE_GATE_STEPS: &[GateStep] = &[
     GateStep {
@@ -1021,19 +1023,91 @@ mod tests {
     }
 
     /// The workflow and the gate table are one definition with two callers, so
-    /// every group has exactly one job invoking it. `preflight` and `dev-suite` run
-    /// unconditionally; `release-suite` runs on every event except a pull request,
-    /// and that exact condition is pinned so a broader one — which would silently
-    /// stop the release profile being tested on `main` — fails here. The live-network
-    /// tests stay behind their `#[ignore]` attribute, so nothing in the workflow or
-    /// in the action it calls opts back into ignored tests.
+    /// every group has exactly one job invoking it, and no other job exists.
     ///
-    /// Parsed rather than grepped: a commented-out job, or one held behind an `if:`
-    /// at the step, is not a job that runs its group, and raw text cannot tell the
+    /// Each gate job runs `scripts/ci/already-passed.sh` on a push that is not a
+    /// force-push, and its setup and gate steps run unless that check reported that
+    /// the pushed tree already passed the same job in a pull-request run. On a pull
+    /// request, after the gate passes, the job uploads the artifact that records the
+    /// tree it tested, which is the evidence the check looks for. Every condition is
+    /// pinned exactly: any other expression could skip the gate on a pull request,
+    /// or on a tree no run has tested. The check is pinned to its exact command and
+    /// environment, because a command that only mentions the script, or asks about
+    /// another job, would answer for the wrong thing. No job has a `name:`, because
+    /// the script matches the API's job name against `github.job`, and no job or
+    /// step has `continue-on-error`, which would report a red gate as green. The
+    /// triggers are pinned too: the conditions assume pull requests run the gate
+    /// and pushes run only on `main`.
+    ///
+    /// `preflight` and `dev-suite` carry no job-level `if:`, so they always report
+    /// a result. `release-suite` runs on every event except a pull
+    /// request, and on a pull request from a `release/` branch; that exact condition
+    /// is pinned so a broader one, which would run the release profile on every pull
+    /// request, or a narrower one, which would stop it being tested on `main`, fails
+    /// here. The live-network tests stay behind their `#[ignore]` attribute, so
+    /// nothing in the workflow or in the action it calls opts back into ignored
+    /// tests.
+    ///
+    /// Parsed rather than grepped: a commented-out job, or a step held behind some
+    /// other `if:`, is not a job that runs its group, and raw text cannot tell the
     /// difference.
     #[test]
     fn the_workflow_runs_every_gate_group_once() {
+        const CHECK_ID: &str = "prior";
+        const CHECK_SCRIPT: &str = "scripts/ci/already-passed.sh";
+        const CHECK_RUN: &str = r#"scripts/ci/already-passed.sh "${{ github.job }}""#;
+        const CHECK_TOKEN: &str = "${{ github.token }}";
+        const CHECK_ONLY_ON_PUSH: &str =
+            "github.event_name == 'push' && github.event.forced != true";
+        const UNLESS_ALREADY_PASSED: &str = "steps.prior.outputs.passed != 'true'";
+        const ONLY_ON_PULL_REQUESTS: &str = "github.event_name == 'pull_request'";
+        const TREE_ID: &str = "tree";
+        const TREE_RUN: &str = concat!(
+            "git rev-parse 'HEAD^{tree}' > \"$RUNNER_TEMP/tested-tree\"\n",
+            "echo \"sha=$(cat \"$RUNNER_TEMP/tested-tree\")\" >> \"$GITHUB_OUTPUT\"\n",
+        );
+        const UPLOAD_ACTION: &str = "actions/upload-artifact@v4";
+        const ARTIFACT_NAME: &str = "tested-${{ github.job }}-${{ steps.tree.outputs.sha }}";
+        const RELEASE_SUITE_CONDITION: &str =
+            "github.event_name != 'pull_request' || startsWith(github.head_ref, 'release/')";
+
         let workflow = parse_yaml(".github/workflows/ci.yml");
+        let triggers = &workflow["on"];
+        let pull_request = &triggers["pull_request"];
+        assert!(
+            !pull_request.is_badvalue(),
+            "every pull request must run the gate"
+        );
+        for filter in [
+            "branches",
+            "branches-ignore",
+            "paths",
+            "paths-ignore",
+            "types",
+        ] {
+            assert!(
+                pull_request[filter].is_badvalue(),
+                "the `pull_request` trigger takes no `{filter}` filter: every pull request runs the gate"
+            );
+        }
+        let push = triggers["push"].as_hash();
+        assert_eq!(
+            push.map(|keys| keys.len()),
+            Some(1),
+            "the `push` trigger carries its branch filter and nothing else"
+        );
+        let push_branches: Option<Vec<Option<&str>>> = triggers["push"]["branches"]
+            .as_vec()
+            .map(|branches| branches.iter().map(|b| b.as_str()).collect());
+        assert_eq!(
+            push_branches,
+            Some(vec![Some("main")]),
+            "pushes run the workflow on `main` and on no other branch"
+        );
+        assert!(
+            !triggers["workflow_dispatch"].is_badvalue(),
+            "the workflow can be run by hand"
+        );
         let jobs = workflow["jobs"]
             .as_hash()
             .expect("the workflow defines jobs");
@@ -1050,52 +1124,166 @@ mod tests {
             "the workflow has one job per gate group and no other"
         );
 
-        // One entry per job: the job-level `if:` (absent, a string, or something
-        // else — a YAML `false` is not a string and must not read as absent) and the
-        // `run` strings of its unconditional steps. A step carrying an `if:` is
-        // conditional.
-        let per_job: Vec<(Option<&str>, Vec<&str>)> = jobs
-            .iter()
-            .map(|(name, job)| {
-                let condition = &job["if"];
-                assert!(
-                    condition.is_badvalue() || condition.as_str().is_some(),
-                    "job {name:?}: an `if:` must be a string expression, never a bare value"
-                );
-                let runs = job["steps"]
-                    .as_vec()
-                    .map(|steps| {
-                        steps
-                            .iter()
-                            .filter(|step| step["if"].is_badvalue())
-                            .filter_map(|step| step["run"].as_str())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                (condition.as_str(), runs)
-            })
-            .collect();
-
-        const NOT_ON_PULL_REQUESTS: &str = "github.event_name != 'pull_request'";
         for group in GateGroup::value_variants() {
             let invocation = format!("cargo xtask gate --group {}", group.as_str());
-            let conditions: Vec<Option<&str>> = per_job
+            let is_gate = |step: &yaml_rust2::Yaml| {
+                step["run"].as_str().map(str::trim) == Some(invocation.as_str())
+            };
+            let running: Vec<(&yaml_rust2::Yaml, &yaml_rust2::Yaml, &[yaml_rust2::Yaml])> = jobs
                 .iter()
-                .filter(|(_, runs)| runs.iter().any(|run| run.trim() == invocation))
-                .map(|(condition, _)| *condition)
+                .filter_map(|(name, job)| {
+                    job["steps"]
+                        .as_vec()
+                        .map(|steps| (name, job, steps.as_slice()))
+                })
+                .filter(|(_, _, steps)| steps.iter().any(is_gate))
                 .collect();
-            assert_eq!(
-                conditions.len(),
-                1,
-                "exactly one job must run `{invocation}`"
+            assert_eq!(running.len(), 1, "exactly one job must run `{invocation}`");
+            let (name, job, steps) = running[0];
+
+            // The job-level `if:` is absent or a string: a YAML `false` is not a
+            // string and must not read as absent.
+            let condition = &job["if"];
+            assert!(
+                condition.is_badvalue() || condition.as_str().is_some(),
+                "job {name:?}: an `if:` must be a string expression, never a bare value"
             );
             let expected = match group {
                 GateGroup::Preflight | GateGroup::DevSuite => None,
-                GateGroup::ReleaseSuite => Some(NOT_ON_PULL_REQUESTS),
+                GateGroup::ReleaseSuite => Some(RELEASE_SUITE_CONDITION),
             };
             assert_eq!(
-                conditions[0], expected,
+                condition.as_str(),
+                expected,
                 "the job running `{invocation}` carries the wrong condition"
+            );
+            assert_eq!(
+                job["permissions"]["actions"].as_str(),
+                Some("read"),
+                "job {name:?} must be able to read earlier runs of the workflow"
+            );
+            assert!(
+                job["name"].is_badvalue(),
+                "job {name:?}: the API must report the job by its id, which the check matches"
+            );
+            assert!(
+                job["continue-on-error"].is_badvalue(),
+                "job {name:?}: a failing gate must fail the job"
+            );
+            for (at, step) in steps.iter().enumerate() {
+                assert!(
+                    step["continue-on-error"].is_badvalue(),
+                    "job {name:?}: step {at} must fail the job when it fails"
+                );
+            }
+
+            let checks: Vec<usize> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, step)| {
+                    step["run"]
+                        .as_str()
+                        .is_some_and(|run| run.contains(CHECK_SCRIPT))
+                })
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(
+                checks.len(),
+                1,
+                "job {name:?} must run `{CHECK_SCRIPT}` exactly once"
+            );
+            let check_at = checks[0];
+            assert_eq!(
+                steps[check_at]["id"].as_str(),
+                Some(CHECK_ID),
+                "job {name:?}: the gate conditions read the check's output by this id"
+            );
+            assert_eq!(
+                steps[check_at]["if"].as_str(),
+                Some(CHECK_ONLY_ON_PUSH),
+                "job {name:?}: the check is consulted on a push that is not a force-push, and on nothing else"
+            );
+            assert_eq!(
+                steps[check_at]["run"].as_str().map(str::trim),
+                Some(CHECK_RUN),
+                "job {name:?}: the check must run the script, asking about this job"
+            );
+            let check_env = steps[check_at]["env"].as_hash();
+            assert_eq!(
+                check_env.map(|env| env.len()),
+                Some(1),
+                "job {name:?}: the check's environment holds the token and nothing else"
+            );
+            assert_eq!(
+                steps[check_at]["env"]["GH_TOKEN"].as_str(),
+                Some(CHECK_TOKEN),
+                "job {name:?}: the check authenticates with the job's token"
+            );
+            assert_eq!(
+                steps.iter().filter(|step| is_gate(step)).count(),
+                1,
+                "job {name:?} must run `{invocation}` exactly once"
+            );
+            let gate_at = steps
+                .iter()
+                .position(is_gate)
+                .expect("the job runs its gate");
+            assert!(
+                gate_at > check_at,
+                "job {name:?}: the gate must come after the check that can skip it"
+            );
+
+            // Before the check, nothing is conditional. From the check to the gate,
+            // every step is skipped exactly when the check reported the tree already
+            // passed. After the gate come exactly the two steps that record the tested
+            // tree, on a pull request only, and only once the gate has passed.
+            assert_eq!(
+                steps.len(),
+                gate_at + 3,
+                "job {name:?}: the gate is followed by the tree record and its upload, and nothing else"
+            );
+            for (at, step) in steps.iter().enumerate() {
+                if at < check_at {
+                    assert!(
+                        step["if"].is_badvalue(),
+                        "job {name:?}: step {at} runs before the check and must be unconditional"
+                    );
+                } else if at > check_at && at <= gate_at {
+                    assert_eq!(
+                        step["if"].as_str(),
+                        Some(UNLESS_ALREADY_PASSED),
+                        "job {name:?}: step {at} must run unless the tree already passed"
+                    );
+                } else if at > gate_at {
+                    assert_eq!(
+                        step["if"].as_str(),
+                        Some(ONLY_ON_PULL_REQUESTS),
+                        "job {name:?}: step {at} records the tested tree on a pull request, after the gate passed"
+                    );
+                }
+            }
+            let tree = &steps[gate_at + 1];
+            assert_eq!(
+                tree["id"].as_str(),
+                Some(TREE_ID),
+                "job {name:?}: the artifact name reads the tree by this id"
+            );
+            assert_eq!(
+                tree["run"].as_str(),
+                Some(TREE_RUN),
+                "job {name:?}: the record names the tree of the checked-out commit"
+            );
+            let upload = &steps[gate_at + 2];
+            assert_eq!(upload["uses"].as_str(), Some(UPLOAD_ACTION));
+            assert_eq!(
+                upload["with"]["name"].as_str(),
+                Some(ARTIFACT_NAME),
+                "job {name:?}: the artifact name is what the check looks for"
+            );
+            assert_eq!(
+                upload["with"]["retention-days"].as_i64(),
+                Some(30),
+                "job {name:?}: the record is kept for 30 days"
             );
         }
 
@@ -1116,6 +1304,594 @@ mod tests {
             !strings.iter().any(|s| s.contains("--include-ignored")),
             "the live-network tests are excluded by their attribute"
         );
+    }
+
+    /// A canned GitHub API for `scripts/ci/already-passed.sh`. A stub `gh`, first on
+    /// `PATH`, serves each request from a JSON file and applies the script's `--jq`
+    /// filter with `jq`, as `gh` would. The commit is real, in a scratch repository,
+    /// so the script computes its tree with `git` exactly as it does in CI.
+    struct ApiFixture {
+        dir: PathBuf,
+        sha: String,
+        tree: String,
+    }
+
+    const STUB_GH: &str = r#"#!/usr/bin/env bash
+# Serves `gh api` requests from canned files in $STUB_GH_DIR.
+set -euo pipefail
+if [[ -n "${STUB_GH_FAIL:-}" ]]; then
+    echo "gh: HTTP 500" >&2
+    exit 1
+fi
+filter="." url=""
+while (($#)); do
+    case "$1" in
+        --jq) filter="$2"; shift 2 ;;
+        repos/*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+echo "$url" >> "$STUB_GH_DIR/requests.log"
+path="${url%%\?*}"
+case "$path" in
+    */actions/workflows/*/runs) file="runs.json" ;;
+    */actions/runs/*/jobs) id="${path%/jobs}"; file="jobs-${id##*/}.json" ;;
+    */actions/runs/*/artifacts) id="${path%/artifacts}"; file="artifacts-${id##*/}.json" ;;
+    *) echo "gh: unexpected request $url" >&2; exit 1 ;;
+esac
+if [[ ! -f "$STUB_GH_DIR/$file" ]]; then
+    echo "gh: Not Found (HTTP 404)" >&2
+    exit 1
+fi
+jq -r "$filter" "$STUB_GH_DIR/$file"
+"#;
+
+    impl ApiFixture {
+        fn new(label: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let jq = Command::new("jq").arg("--version").output();
+            assert!(
+                jq.is_ok_and(|out| out.status.success()),
+                "these tests need `jq` on PATH to stand in for the filter `gh` applies"
+            );
+            let dir =
+                std::env::temp_dir().join(format!("already-passed-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            for sub in ["bin", "api", "repo"] {
+                fs::create_dir_all(dir.join(sub)).unwrap();
+            }
+            let repo = dir.join("repo");
+            let git = |args: &[&str]| {
+                let out = Command::new("git")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .args([
+                        "-c",
+                        "user.name=fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                    ])
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+                String::from_utf8(out.stdout).unwrap().trim().to_owned()
+            };
+            git(&["init", "-q"]);
+            fs::write(repo.join("file"), "fixture\n").unwrap();
+            git(&["add", "file"]);
+            git(&["commit", "-q", "-m", "fixture"]);
+            let sha = git(&["rev-parse", "HEAD"]);
+            let tree = git(&["rev-parse", "HEAD^{tree}"]);
+            assert_ne!(sha, tree, "positive control: a commit and its tree differ");
+
+            let gh = dir.join("bin/gh");
+            fs::write(&gh, STUB_GH).unwrap();
+            fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir, sha, tree }
+        }
+
+        fn serve(&self, file: &str, json: &str) {
+            fs::write(self.dir.join("api").join(file), json).unwrap();
+        }
+
+        /// Completed runs of the workflow for this commit, as `(id, created_at,
+        /// event)`, with no `run_started_at`, so the script falls back to
+        /// `created_at`.
+        fn serve_runs(&self, runs: &[(u64, &str, &str)]) {
+            let full: Vec<(u64, &str, Option<&str>, &str, &str)> = runs
+                .iter()
+                .map(|(id, created, event)| (*id, *created, None, *event, "completed"))
+                .collect();
+            self.serve_runs_full(&full);
+        }
+
+        /// Runs as `(id, created_at, run_started_at, event, status)`.
+        fn serve_runs_full(&self, runs: &[(u64, &str, Option<&str>, &str, &str)]) {
+            let entries: Vec<String> = runs
+                .iter()
+                .map(|(id, created, started, event, status)| {
+                    let started = started
+                        .map(|at| format!(r#","run_started_at":"{at}""#))
+                        .unwrap_or_default();
+                    format!(
+                        r#"{{"id":{id},"head_sha":"{}","event":"{event}","status":"{status}","created_at":"{created}"{started}}}"#,
+                        self.sha
+                    )
+                })
+                .collect();
+            self.serve(
+                "runs.json",
+                &format!(r#"{{"workflow_runs":[{}]}}"#, entries.join(",")),
+            );
+        }
+
+        fn serve_job(&self, run: u64, job: &str, conclusion: &str) {
+            self.serve(
+                &format!("jobs-{run}.json"),
+                &format!(r#"{{"jobs":[{{"name":"{job}","status":"completed","conclusion":"{conclusion}"}}]}}"#),
+            );
+        }
+
+        /// A job that has started and not finished: the API reports no conclusion.
+        fn serve_job_in_progress(&self, run: u64, job: &str) {
+            self.serve(
+                &format!("jobs-{run}.json"),
+                &format!(
+                    r#"{{"jobs":[{{"name":"{job}","status":"in_progress","conclusion":null}}]}}"#
+                ),
+            );
+        }
+
+        /// A run whose jobs list is empty, as it is before its jobs are created.
+        fn serve_no_jobs(&self, run: u64) {
+            self.serve(&format!("jobs-{run}.json"), r#"{"jobs":[]}"#);
+        }
+
+        fn serve_artifacts(&self, run: u64, names: &[String]) {
+            let entries: Vec<(String, bool)> =
+                names.iter().map(|name| (name.clone(), false)).collect();
+            self.serve_artifacts_full(run, &entries);
+        }
+
+        /// Artifacts as `(name, expired)`.
+        fn serve_artifacts_full(&self, run: u64, artifacts: &[(String, bool)]) {
+            let entries: Vec<String> = artifacts
+                .iter()
+                .map(|(name, expired)| format!(r#"{{"name":"{name}","expired":{expired}}}"#))
+                .collect();
+            self.serve(
+                &format!("artifacts-{run}.json"),
+                &format!(r#"{{"artifacts":[{}]}}"#, entries.join(",")),
+            );
+        }
+
+        fn tested(&self, job: &str) -> String {
+            format!("tested-{job}-{}", self.tree)
+        }
+
+        /// Run the script for `dev-suite`, with `overrides` replacing the default
+        /// environment, and return its stdout and what it wrote to `GITHUB_OUTPUT`.
+        /// The script answers every case with exit 0.
+        fn ask(&self, overrides: &[(&str, &str)]) -> (String, String) {
+            let output = self.dir.join("github-output");
+            let _ = fs::remove_file(&output);
+            let path = format!(
+                "{}:{}",
+                self.dir.join("bin").display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let script = workspace_root_from_xtask()
+                .unwrap()
+                .join("scripts/ci/already-passed.sh");
+            let mut command = Command::new(script);
+            command
+                .arg("dev-suite")
+                .current_dir(self.dir.join("repo"))
+                .env("PATH", path)
+                .env("STUB_GH_DIR", self.dir.join("api"))
+                .env("GITHUB_OUTPUT", &output)
+                .env("GITHUB_REPOSITORY", "owner/repo")
+                .env("GITHUB_SHA", &self.sha)
+                .env(
+                    "GITHUB_WORKFLOW_REF",
+                    "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+                )
+                .env_remove("STUB_GH_FAIL");
+            for (key, value) in overrides {
+                command.env(key, value);
+            }
+            let out = command.output().unwrap();
+            assert!(
+                out.status.success(),
+                "the script must always exit 0: {out:?}"
+            );
+            (
+                String::from_utf8(out.stdout).unwrap(),
+                fs::read_to_string(&output).unwrap_or_default(),
+            )
+        }
+
+        fn requests(&self) -> String {
+            fs::read_to_string(self.dir.join("api/requests.log")).unwrap_or_default()
+        }
+    }
+
+    impl Drop for ApiFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn assert_runs_gate((stdout, output): (String, String)) {
+        assert!(
+            stdout.starts_with("run: "),
+            "expected `run:`, got {stdout:?}"
+        );
+        assert_eq!(output, "passed=false\n");
+    }
+
+    /// The one case that skips the gate: the newest pull-request run that ran the
+    /// job passed it, and recorded the pushed commit's tree. It is also the positive
+    /// control for every `run:` case below, each of which changes one thing.
+    #[test]
+    fn a_newest_passing_run_that_recorded_this_tree_skips_the_gate() {
+        let api = ApiFixture::new("pass");
+        api.serve_runs(&[(11, "2026-10-01T10:00:00Z", "pull_request")]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        let (stdout, output) = api.ask(&[]);
+        assert!(
+            stdout.starts_with("already-passed: "),
+            "expected `already-passed:`, got {stdout:?}"
+        );
+        assert_eq!(output, "passed=true\n");
+        assert!(
+            api.requests()
+                .contains("repos/owner/repo/actions/workflows/ci.yml/runs?"),
+            "the workflow file comes from GITHUB_WORKFLOW_REF: {}",
+            api.requests()
+        );
+    }
+
+    #[test]
+    fn an_older_pass_behind_a_newer_failure_runs_the_gate() {
+        let api = ApiFixture::new("newer-failure");
+        // Listed oldest first, so only ordering by start time finds the failure.
+        api.serve_runs(&[
+            (11, "2026-10-01T10:00:00Z", "pull_request"),
+            (12, "2026-10-01T11:00:00Z", "pull_request"),
+        ]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        api.serve_job(12, "dev-suite", "failure");
+        api.serve_artifacts(12, &[]);
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    /// A job whose `if:` was false is listed as `skipped`: that run did not test the
+    /// job, so the decision falls to the newest run that did.
+    #[test]
+    fn a_newer_run_that_skipped_the_job_defers_to_the_one_that_ran_it() {
+        let api = ApiFixture::new("newer-skipped");
+        api.serve_runs(&[
+            (11, "2026-10-01T10:00:00Z", "pull_request"),
+            (12, "2026-10-01T11:00:00Z", "pull_request"),
+        ]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        api.serve_job(12, "dev-suite", "skipped");
+        let (stdout, output) = api.ask(&[]);
+        assert!(stdout.starts_with("already-passed: "), "{stdout:?}");
+        assert_eq!(output, "passed=true\n");
+    }
+
+    /// A newer run that has not reported this job yet may still fail it, so it
+    /// decides, and the gate runs. Queued, its jobs list is empty.
+    #[test]
+    fn a_newer_queued_run_runs_the_gate() {
+        let api = ApiFixture::new("newer-queued");
+        api.serve_runs_full(&[
+            (
+                11,
+                "2026-10-01T10:00:00Z",
+                None,
+                "pull_request",
+                "completed",
+            ),
+            (12, "2026-10-01T11:00:00Z", None, "pull_request", "queued"),
+        ]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        api.serve_no_jobs(12);
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    /// In progress, with this job not yet listed.
+    #[test]
+    fn a_newer_run_in_progress_without_the_job_runs_the_gate() {
+        let api = ApiFixture::new("newer-in-progress");
+        api.serve_runs_full(&[
+            (
+                11,
+                "2026-10-01T10:00:00Z",
+                None,
+                "pull_request",
+                "completed",
+            ),
+            (
+                12,
+                "2026-10-01T11:00:00Z",
+                None,
+                "pull_request",
+                "in_progress",
+            ),
+        ]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        api.serve_job(12, "preflight", "success");
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    /// A completed newer run that has no entry for the job did not test it, so the
+    /// decision falls to the older run.
+    #[test]
+    fn a_completed_newer_run_without_the_job_defers_to_the_one_that_ran_it() {
+        let api = ApiFixture::new("newer-absent");
+        api.serve_runs(&[
+            (11, "2026-10-01T10:00:00Z", "pull_request"),
+            (12, "2026-10-01T11:00:00Z", "pull_request"),
+        ]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        api.serve_no_jobs(12);
+        let (stdout, output) = api.ask(&[]);
+        assert!(stdout.starts_with("already-passed: "), "{stdout:?}");
+        assert_eq!(output, "passed=true\n");
+    }
+
+    /// A re-run keeps its run's `created_at` and moves its `run_started_at`, so an
+    /// older run re-run after a newer pass is the newest evidence.
+    #[test]
+    fn an_older_run_re_run_later_and_failed_runs_the_gate() {
+        let api = ApiFixture::new("re-run-failed");
+        api.serve_runs_full(&[
+            (
+                11,
+                "2026-10-01T10:00:00Z",
+                Some("2026-10-01T12:00:00Z"),
+                "pull_request",
+                "completed",
+            ),
+            (
+                12,
+                "2026-10-01T11:00:00Z",
+                Some("2026-10-01T11:00:05Z"),
+                "pull_request",
+                "completed",
+            ),
+        ]);
+        api.serve_job(11, "dev-suite", "failure");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        api.serve_job(12, "dev-suite", "success");
+        api.serve_artifacts(12, &[api.tested("dev-suite")]);
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    /// Two runs that started at the same second cannot be ordered, so neither may
+    /// stand in for the other. The passing run has the larger id, so breaking the
+    /// tie by id would pick it and skip the gate.
+    #[test]
+    fn runs_tied_on_start_time_run_the_gate() {
+        let api = ApiFixture::new("tied");
+        api.serve_runs_full(&[
+            (
+                11,
+                "2026-10-01T10:00:00Z",
+                Some("2026-10-01T11:00:00Z"),
+                "pull_request",
+                "completed",
+            ),
+            (
+                12,
+                "2026-10-01T10:30:00Z",
+                Some("2026-10-01T11:00:00Z"),
+                "pull_request",
+                "completed",
+            ),
+        ]);
+        api.serve_job(11, "dev-suite", "failure");
+        api.serve_artifacts(11, &[]);
+        api.serve_job(12, "dev-suite", "success");
+        api.serve_artifacts(12, &[api.tested("dev-suite")]);
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    /// A run whose start time is not a fixed-width UTC timestamp cannot be ordered
+    /// against the others. Here the malformed one is the pass, and as text it sorts
+    /// above the failure in any locale, so ordering it at all would skip the gate.
+    #[test]
+    fn a_run_with_a_malformed_start_time_runs_the_gate() {
+        let api = ApiFixture::new("bad-time");
+        api.serve_runs_full(&[
+            (
+                11,
+                "2026-10-01T10:00:00Z",
+                Some("2026-10-01T11:00:00Z"),
+                "pull_request",
+                "completed",
+            ),
+            (
+                12,
+                "2026-10-01T09:00:00Z",
+                Some("soon"),
+                "pull_request",
+                "completed",
+            ),
+        ]);
+        api.serve_job(11, "dev-suite", "failure");
+        api.serve_artifacts(11, &[]);
+        api.serve_job(12, "dev-suite", "success");
+        api.serve_artifacts(12, &[api.tested("dev-suite")]);
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    /// Only the fixed-width form GitHub returns is accepted, so that byte order is
+    /// time order. A fractional second sorts after the whole second it follows, and
+    /// an offset is a different clock, so either answers run.
+    #[test]
+    fn a_start_time_with_fractional_seconds_runs_the_gate() {
+        assert_runs_gate(odd_start_time("frac", "2026-10-01T10:00:00.1Z"));
+    }
+
+    #[test]
+    fn a_start_time_with_an_offset_runs_the_gate() {
+        assert_runs_gate(odd_start_time("offset", "2026-10-01T10:00:00+00:00"));
+    }
+
+    /// One passing run, with the tree recorded, whose start time is `started`.
+    fn odd_start_time(label: &str, started: &str) -> (String, String) {
+        let api = ApiFixture::new(label);
+        api.serve_runs_full(&[(
+            11,
+            "2026-10-01T09:00:00Z",
+            Some(started),
+            "pull_request",
+            "completed",
+        )]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        api.ask(&[])
+    }
+
+    /// A run still in progress whose job has already concluded is judged on that
+    /// job: its result is final for the attempt, and a re-run of the job would
+    /// replace it in the latest-attempt listing.
+    #[test]
+    fn a_running_newest_run_that_already_passed_the_job_skips_the_gate() {
+        let api = ApiFixture::new("running-passed");
+        api.serve_runs_full(&[
+            (
+                11,
+                "2026-10-01T10:00:00Z",
+                None,
+                "pull_request",
+                "completed",
+            ),
+            (
+                12,
+                "2026-10-01T11:00:00Z",
+                None,
+                "pull_request",
+                "in_progress",
+            ),
+        ]);
+        api.serve_job(11, "dev-suite", "failure");
+        api.serve_artifacts(11, &[]);
+        api.serve_job(12, "dev-suite", "success");
+        api.serve_artifacts(12, &[api.tested("dev-suite")]);
+        let (stdout, output) = api.ask(&[]);
+        assert!(stdout.starts_with("already-passed: "), "{stdout:?}");
+        assert_eq!(output, "passed=true\n");
+    }
+
+    /// The newest run's job has started and has no conclusion yet.
+    #[test]
+    fn a_job_still_running_in_the_newest_run_runs_the_gate() {
+        let api = ApiFixture::new("job-in-progress");
+        api.serve_runs_full(&[
+            (
+                11,
+                "2026-10-01T10:00:00Z",
+                None,
+                "pull_request",
+                "completed",
+            ),
+            (
+                12,
+                "2026-10-01T11:00:00Z",
+                None,
+                "pull_request",
+                "in_progress",
+            ),
+        ]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        api.serve_job_in_progress(12, "dev-suite");
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    #[test]
+    fn an_expired_record_of_the_tree_runs_the_gate() {
+        let api = ApiFixture::new("expired");
+        api.serve_runs(&[(11, "2026-10-01T10:00:00Z", "pull_request")]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts_full(11, &[(api.tested("dev-suite"), true)]);
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    #[test]
+    fn a_pass_that_recorded_no_tree_runs_the_gate() {
+        let api = ApiFixture::new("no-artifact");
+        api.serve_runs(&[(11, "2026-10-01T10:00:00Z", "pull_request")]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[]);
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    /// A pull request whose base was not the branch the commit landed on tested the
+    /// merge with that base, which is a different tree.
+    #[test]
+    fn a_pass_that_recorded_a_different_tree_runs_the_gate() {
+        let api = ApiFixture::new("other-tree");
+        api.serve_runs(&[(11, "2026-10-01T10:00:00Z", "pull_request")]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(
+            11,
+            &[
+                format!("tested-dev-suite-{}", "0".repeat(40)),
+                format!("tested-preflight-{}", api.tree),
+            ],
+        );
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    #[test]
+    fn a_run_that_was_not_a_pull_request_runs_the_gate() {
+        let api = ApiFixture::new("not-pr");
+        api.serve_runs(&[(11, "2026-10-01T10:00:00Z", "push")]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        assert_runs_gate(api.ask(&[]));
+    }
+
+    #[test]
+    fn an_api_error_runs_the_gate() {
+        let api = ApiFixture::new("gh-error");
+        api.serve_runs(&[(11, "2026-10-01T10:00:00Z", "pull_request")]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        assert_runs_gate(api.ask(&[("STUB_GH_FAIL", "1")]));
+    }
+
+    #[test]
+    fn a_malformed_commit_id_runs_the_gate() {
+        let api = ApiFixture::new("bad-sha");
+        api.serve_runs(&[(11, "2026-10-01T10:00:00Z", "pull_request")]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        let short = api.sha[..7].to_owned();
+        assert_runs_gate(api.ask(&[("GITHUB_SHA", &short)]));
+    }
+
+    #[test]
+    fn an_unparseable_workflow_ref_runs_the_gate() {
+        let api = ApiFixture::new("bad-ref");
+        api.serve_runs(&[(11, "2026-10-01T10:00:00Z", "pull_request")]);
+        api.serve_job(11, "dev-suite", "success");
+        api.serve_artifacts(11, &[api.tested("dev-suite")]);
+        assert_runs_gate(api.ask(&[("GITHUB_WORKFLOW_REF", "ci.yml")]));
     }
 
     /// The workflow's jobs share their setup through a local composite action, which

@@ -24,6 +24,10 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+### Changed
+
+- CI: a push to `main` does not re-run a gate group when the newest pull-request run of the same commit ID passed it on the same tree. Any doubt runs the gate. `release-suite` also runs on pull requests from a `release/` branch.
+
 ## [v0.37.1] — 2026-10-18
 
 ### Added
