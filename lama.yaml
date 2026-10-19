@@ -45,18 +45,25 @@ library:
 # ─────────────────────────────────────────────────────────────────────
 
 crates:
+  - name: daemonseed-sys
+    purpose: "OS calls that std does not wrap. It provides one function, replace_durably, which renames a file onto another, replacing it, with the durability each platform gives. daemonseed-core calls it from its storage paths."
+    license: AGPL-3.0-or-later
+    status: active
+    manifest: null
+
   - name: daemonseed-core
     purpose: >-
-      Protocol library — identity, storage, bootstrap, first-start
-      orchestration, crypto-agility primitives, circle-of-trust key derivation,
-      the M9 client surfaces (mute / hide-shares lists,
-      @-mention recognition/resolution), the M10 release surface
-      (daemonseed_core::release: release trust anchor + N-of-M multi-sig verify +
-      update-lifecycle FSM), and the M13 at-rest persistence keystone — the
-      storage::seeds blob now carries display_name + circle membership alongside
-      the mute/hide lists, re-sealed on each mutation via a cached SealingKey
-      (no second Argon2id). Pure library (no_std-compatible where the underlying
-      primitives allow; currently uses std for I/O).
+      Protocol library shared by the clients. Identity (handle format, BIP-39
+      mnemonic, HKDF-derived ML-DSA-87 and ML-KEM-1024 keypairs), first-start
+      orchestration and crypto-agility suites; the passphrase-sealed at-rest
+      store (the seeds blob holding display name, circle memberships and the
+      mute and hide lists, re-sealed on each change), the content-addressed
+      chunk store and the encrypted share index; circle-of-trust key derivation
+      and rendezvous addressing; public-room and share sealing, share
+      announcement, indexing and serving; direct messaging; presence; @-mention
+      recognition; the signed public-space artifact model; and the release
+      trust anchor with N-of-M multi-signature verification and the update
+      lifecycle. Uses std.
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-core-api.yaml"
@@ -64,23 +71,22 @@ crates:
   - name: daemonseed-proto
     purpose: >-
       Wire schema — `.proto` definitions for the daemonseed protocol,
-      compiled via tonic-build. Carries the first gRPC service (PublicSpace)
-      alongside the message schema; took a `tonic` runtime dep at v0.8.0
-      because the generated service stubs reference it. Schema crate is
-      dual-licensed to remove copyleft drag from cross-language client
-      implementations.
+      compiled via tonic-build. Carries the PublicSpace, CircleOfTrust and
+      FederationIntroducer service definitions alongside the message schema.
+      Depends on the `tonic` runtime for the generated service stubs.
+      Dual-licensed Apache-2.0 OR MIT.
     license: "Apache-2.0 OR MIT"
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-proto-protocol.yaml"
 
   - name: daemonseed-cli
-    purpose: "Non-interactive scriptable client binary + library. `connect <server-id>` does APP_HELLO + client-side identity-proof over the Veilid transport, returning only after Authenticated. Adds the user-publish share subcommands `publish` / `unpublish` / `list-shares` over the PublicSpace RPCs (gate step 5); `publish` holds the connection open until Ctrl-C (you-must-be-online-to-share), and the share is RAM-only — reaped on disconnect (ISC-A-S1). The library side also carries the M6 public-space client plumbing and the introducer refresh."
+    purpose: "Library the GUI and TUI share; no binary. route_signer is the least-authority RouteAdvertSigner adapter that signs a Veilid share-route advert with the node's identity key without handing the key to the transport crate. public_space holds the announcement and MOTD helpers: signing a MOTD or post, rendering a signed MOTD as inert plaintext, re-verifying served artifacts, gating the composer on the signer whitelist, and filtering share listings by hide list and rating. All of it is transport-independent."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-cli-api.yaml"
 
   - name: daemonseed-tui
-    purpose: "Interactive ratatui client — the MVP product surface. A terminal-free screen state machine (daemonseed_tui::app) rendered by pure functions (daemonseed_tui::ui), driven by a thin binary (terminal lifecycle + event loop) that reuses daemonseed-cli's connect / identity-proof / C22-trust client stack. M11 grows it through first-start (incl. clean-device recovery), chat, circle, share/fetch, the C22 trust slider, the C28 trust-event taxonomy, the server-management screen, the public-space (MOTD + announcements) view, and the suite-deprecation policy view (fetch + ML-DSA verify + anti-rollback, ISC-C25 / A-S11). Adds the Servers-pane introducer refresh: a read-only Discovered (introducer) sub-section listing introducer-discovered candidates (server-id + address, no keys, never auto-trusted — ISC-S6 / C22 / A-C19; gate step 6). v0.16 adds the multi-circle carousel: simultaneous membership in several circles (joining ADDS, never evicts — ISC-C59), a split chat view (lobby pane + active-circle carousel pane) where each line carries a Surface tag and each pane filters strictly on it (no cross-surface bleed — ISC-A-C29), arrow-key cycling of the active circle (ISC-C60), per-circle client-local labels (ISC-C62), and per-circle seal/attribution (a post seals under exactly the active circle's key; an inbound frame is attributed to the single circle whose key opened it — ISC-A-C30) — all client-internal, no wire change. M13 (the persistence keystone) wires the session write-through: the running client holds the at-rest SealingKey and re-seals the seeds blob on each persist-worthy mutation, so display name + mute/hide + circle membership survive a daily-login Unlock; on Unlock the persisted circles silently rejoin without re-typing the phrase (CircleJoined echoes the entropy in-process for ordering-free rejoin pairing — ISC-C51 / C59). M14 adds the share-management surface (MainFocus::DefineShare): define a local share root, which the net actor opens + cold-scans on a background thread (redb MVCC, ISC-A-C7) with the share-index key derived as a sibling of the at-rest key from one Argon2id run (ISC-C3 / A-C6); defined roots persist in the at-rest blob (a `share` directive) and re-index on Unlock (ISC-C21). Still client-internal, no wire change."
+    purpose: "Interactive ratatui terminal client for Veilid, with no relay. It drives first-start (mnemonic, passphrase, recovery) and passphrase unlock, then the live session: the public Lobby, circles of trust, member presence, and in-band share discovery and fetch, all over the daemonseed-veilid-net actor behind its NetCommand / NetEvent contract. Operator announcements and MOTD are not yet carried over Veilid in this client. Several circles can be joined at once, and each chat line is shown only on the surface it arrived on. Display name, mute and hide lists and circle memberships persist in the passphrase-sealed at-rest blob. The screen state machine (daemonseed_tui::app) and its render functions (daemonseed_tui::ui) are terminal-free, and a thin binary owns the terminal and the event loop."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-tui-api.yaml"
@@ -93,7 +99,7 @@ crates:
     manifest: "docs/llm-api-manifest/daemonseed-gui-api.yaml"
 
   - name: daemonseed-veilid-net
-    purpose: "Veilid transport layer — the AppSession replacement the GUI/TUI drive behind their `veilid` feature. An identity-bound Veilid node (VeilidNet::start) driven through a command-channel handle (VeilidNetHandle): sealed 1:1 messaging over a private route; circles + lobby / public rooms over a shared-owner DFLT DHT rendezvous (append-ring fan-out + backlog sweep + re-sweep recovery); public-share discovery via an anti-swap SIGNED route advert on the lobby rendezvous (DiscoveryEnvelope + verify_route_advert); and public-share content transfer owner-on-demand over app_call, fragment-reassembled and SHA-384-verified per chunk. Direct messaging (daemonseed_veilid_net::dm) is VeilidRecords, the record store the core flows run over real DHT records, and the runner task a front end spawns over it, exchanging RunnerCommand / RunnerEvent with it. Moves only opaque cot-sealed bytes (ISC-A-S2). Presence / announcements are Phase 4."
+    purpose: "Veilid transport layer the GUI and TUI run on. An identity-bound Veilid node (VeilidNet::start) driven through a command-channel handle (VeilidNetHandle): sealed 1:1 messages over a private route; circles and lobby / public rooms over a shared-owner DFLT DHT rendezvous record (per-participant append-rings, backlog sweep, watch); member presence heartbeats on a sibling rendezvous record; announcements and MOTD read from the operator-owned announce record; public-share discovery through a signed route advert on the lobby rendezvous (DiscoveryEnvelope, verify_route_advert); and owner-on-demand share content transfer over app_call, reassembled from fragments and SHA-384-verified per chunk. Direct messaging (daemonseed_veilid_net::dm) is VeilidRecords, the record store the core flows run over real DHT records, and the runner task a front end spawns over it, exchanging RunnerCommand / RunnerEvent with it. Every DHT write goes through one prioritized, rate-limited scheduler. 1:1 private-route messages, circle items and presence heartbeats reach this crate already sealed, under keys it never holds. Public-room items, share announcements and served share content are sealed under a PublicRoomKey that anyone derives from the room name, and the share server holds that key to seal its responses, so anyone can read them. Announcements and MOTD are signed, unencrypted payloads on the operator-owned announce record. The dm runner holds the identity signing keypair, the channel root secret and the profile's at-rest key (RunnerParts), takes message plaintext in RunnerCommand::FirstContact, Send and Accept, and returns opened plaintext in RunnerEvent::Message."
     license: AGPL-3.0-or-later
     status: active
     manifest: "docs/llm-api-manifest/daemonseed-veilid-net-api.yaml"
@@ -105,7 +111,7 @@ crates:
     manifest: null
 
   - name: daemonseed-integration-tests
-    purpose: "Cross-crate integration tests; re-exports the daemonseed-isc registry as isc_coverage. Per-milestone ISC-coverage exercise files under tests/m{N}_isc_coverage.rs, plus per-feature ones for alpha2 client identity, portability and share download, circle detail, presence, identity rename and share-name persistence, and tests/spike_type_state.rs."
+    purpose: "Cross-crate integration tests; re-exports the daemonseed-isc registry as isc_coverage. ISC-coverage exercise files under tests/*_isc_coverage.rs (client identity, identity portability, share download, circle detail, presence, identity rename, share-name persistence and the earlier protocol layers), an indexer benchmark, and tests/spike_type_state.rs."
     license: AGPL-3.0-or-later
     status: active
     manifest: null
@@ -155,12 +161,13 @@ capabilities:
   - category: "At-rest storage"
     summary: >-
       Three-layer storage. The at-rest seeds blob (ISC-C3) holds the
-      user's mnemonic + future profile state; the recovery file `.dseed`
-      (ISC-C32) is the air-gap-paper replacement for recovery on a clean
-      device — both v2 as of M3 with a 2-byte suite_id slot after the
-      magic prefix (v1 reads accepted under implicit suite_id=0x0001 for
-      M1/M2 compatibility; v2 binds suite_id into the AEAD AAD; touch_reseal
-      migrates v1 → v2 on next save per ISC-C24). The chunk CAS is a
+      user's mnemonic and profile state; the recovery file `.dseed`
+      (ISC-C32) restores an identity on a clean device. Both are written
+      in the v2 format, with a 2-byte suite_id slot after the magic prefix
+      that is bound into the AEAD AAD. A v1 seeds blob is still read, under
+      an implicit suite_id of 0x0001, and the desktop app writes it back as
+      v2 on the next profile change (ISC-C24). A v1 recovery file is still
+      read the same way and is never rewritten. The chunk CAS is a
       third layer: opaque encrypted chunks named by SHA-384, reference-
       counted, with an ephemeral in-memory relay backing (constant-time
       presence per A-S2/A-S12) and a persistent client-cache on disk (ISC-6).
@@ -239,9 +246,9 @@ capabilities:
   - category: "Crypto-agility (suite registry)"
     summary: >-
       Registry of (AEAD, KEM, signature, hash, KDF, memory-hard) bundles
-      identified by a u16 SuiteId. Single entry at M3: CNSA 2.0 (0x0001).
-      Family discriminator = (KDF, hash) equivalence; cross-family
-      migration is post-MVP (treated as a new-circle event per ISC-A-C8).
+      identified by a u16 SuiteId. It holds one suite, CNSA 2.0 (0x0001).
+      Family discriminator = (KDF, hash) equivalence; there is no
+      cross-family migration.
       Compose-time write-policy gate (WritePolicy enum) refuses
       Read-only-deprecated and Removed states by default.
     crate: daemonseed-core
@@ -331,16 +338,16 @@ capabilities:
 
   - category: "Wire schema (proto)"
     summary: >-
-      Protocol Buffers schema for the `daemonseed.v1` package. Messages
-      so far: Version (for HELLO once it lands), SuiteId (wire
-      tag for cryptographic artifacts). Schema is version-stable per
-      ISC-S14: MINOR bumps are additive-only; MAJOR bumps create a new
-      `vN` module. (CircleMin, added M3, was retired at M8 per —
-      flat metadata-free circles — before it was ever sent on the wire.)
-      M8 adds the CircleOfTrust service (CotFrame) — the protocol's first
-      streaming RPC, a bidirectional Subscribe carrying opaque CoT frames.
-      M11 adds CircleMessage — the plaintext chat envelope (additive MINOR),
-      never sent in the clear; it is sealed under cot_key and only the
+      Protocol Buffers schema for the `daemonseed.v1` package: SuiteId and
+      ProtocolVersion; the AppHello handshake; IdentityProof; the
+      direct-message records and frames (Dm*, FirstContact*); the
+      public-space artifacts (SignedArtifact, Post, MOTD, deprecation
+      policy, signer whitelist, rating taxonomy); and the room surface
+      (CotFrame, RoomMessage, ShareAnnouncement, ShareRollCall,
+      MemberHeartbeat). Services: PublicSpace, FederationIntroducer, and
+      CircleOfTrust, whose Subscribe is a bidirectional stream of opaque
+      CotFrames. RoomMessage is the plaintext chat payload for public rooms
+      and circles alike; it is sealed under the surface's key and only the
       ciphertext rides in CotFrame.payload.
     crate: daemonseed-proto
     modules:
@@ -353,13 +360,14 @@ capabilities:
       apply_jitter, the one definition of jitter in the workspace (±frac at a
       unit in [-1, 1]), and CloseCause, the close-cause vocabulary by observable
       layer whose user_message() never speculates which limit was hit.
-      storage::seeds gains mute +
+      storage::seeds holds the mute and
       hide-shares handle lists, persisted as additive directive lines in the
       sealed at-rest blob and never sent on the wire (C15/C16/A-C3). mention:
       find_self_mentions (read-only scan keyed on the full wire handle) and
       resolve_mention (autocomplete → full handle / candidates), adding no
-      new server-visible distinction over plain chat (C17/C18/A-C4). TUI
-      rendering of all three lands at M11.
+      new server-visible distinction over plain chat (C17/C18/A-C4). The
+      TUI shows close causes, applies the mute and hide lists, and marks
+      self-mentions.
     crate: daemonseed-core
     modules:
       - daemonseed_core::backoff
@@ -369,19 +377,18 @@ capabilities:
 
   - category: "Release-signing verify + update lifecycle (verifiable-core)"
     summary: >-
-      The pure-Rust half of M10's release/update story. daemonseed_core::release
-      holds the binary-bound release trust anchor (an N-of-M ML-DSA-87 key set,
-      shipping its 1-of-1 shape with the key array empty until the signing-key
-      ceremony) and verify_multisig, which accepts iff >= threshold DISTINCT
-      anchor keys each signed validly — no verify-bypass, each key counted once,
-      a non-anchor signature is a hard refusal, a wrong-length blob is rejected
-      without panic (S18/A-C11).
+      Release verification and the client update lifecycle, in pure Rust.
+      daemonseed_core::release holds the binary-bound release trust anchor (an
+      N-of-M ML-DSA-87 key set, currently a threshold of 1 with no keys, so no
+      release verifies) and verify_multisig, which requires >= threshold DISTINCT
+      anchor keys each signed validly and fails on any signature it does not
+      recognise — no verify-bypass, each key counted once, a wrong-length blob
+      is rejected without panic (S18/A-C11).
       daemonseed_core::release::update is the client update-lifecycle FSM that
       verifies before applying, never auto-installs (even emergencies), refuses
-      silent downgrades, and wipes+logs on failure — emitting the existing M7
-      update trust-event keys (no new wire surface). Real signing keys, Sigstore,
-      reproducible build, the update-relay role, live fetch, and C7/C20 platform
-      features are deferred to M10-infra.
+      silent downgrades, and drops the artifact and logs on failure, emitting
+      the update trust-event keys (no new wire surface). It does not fetch
+      updates.
     crate: daemonseed-core
     modules:
       - daemonseed_core::release
@@ -389,18 +396,16 @@ capabilities:
 
   - category: "Platform-feature scaffolds — biometric unlock + autostart"
     summary: >-
-      Abstraction-only scaffolds for the two platform-gated M10 ISCs; opt-in,
-      off by default, platform halves reserved. daemonseed_core::biometric: the
-      BiometricStore trait over a zeroizing SessionPassphrase newtype (never the
-      mnemonic — a type-level guarantee), the RECOVERY_RISK_WARNING constant, and
+      Abstraction-only scaffolds for biometric unlock and autostart; opt-in,
+      off by default, with no platform implementation. daemonseed_core::biometric: the
+      BiometricStore trait over SessionPassphrase, a zeroizing String newtype
+      that accepts any string, the RECOVERY_RISK_WARNING constant, and
       the opt-in ProfileConfig::biometric_unlock flag; no platform secure-enclave
       backend ships (ISC-C7). daemonseed_core::autostart: the pure unit_descriptor
       generator emitting systemd-user-unit / launchd-plist / Windows-Startup text
       for a profile (headless by default, never installs/enables/runs), the
       AutostartManager trait, the PRESENCE_SIDE_CHANNEL_WARNING constant, and the
-      opt-in ProfileConfig::autostart flag; no OS install ships (ISC-C20). The
-      platform backends + OS install + the session-holding GUI/mobile client that
-      gives them meaning are reserved (see the C7/C20 Reservations).
+      opt-in ProfileConfig::autostart flag; no OS install ships (ISC-C20).
     crate: daemonseed-core
     modules:
       - daemonseed_core::biometric
@@ -413,33 +418,28 @@ capabilities:
 #
 # System-wide invariants — no-client-history, server-payload-opacity,
 # type-state protocol gating, censorship-survivability baseline — are part of
-# the design contract. Canonical home: ../ISA.md (## Principles + ## Constraints),
+# the design contract. Canonical home: ISA.md (## Principles + ## Constraints),
 # each tied to its ISC IDs there. Not duplicated here (a LAMA discovery file
 # describes the API surface, not the design invariants).
 #
 # Dependency inventory + pinned versions: the Cargo manifests (Cargo.toml /
 # Cargo.lock) are the canonical, build-enforced source — a copy here only drifts.
-# The one architecturally notable dependency is the sibling crypto/TLS crate
-# `oxicrypt` (CNSA 2.0 primitives + TLS 1.3 glue; path-dep in the private phase,
-# registry-dep once it opens) — see ../ISA.md ## Constraints and ../AGENTS.md.
+# The one architecturally notable dependency is the `oxicrypt` crypto crate
+# family (CNSA 2.0 primitives), consumed from the registry at a pinned
+# version; see ISA.md ## Constraints and AGENTS.md.
 
 # ─────────────────────────────────────────────────────────────────────
 # Design-document references
 # ─────────────────────────────────────────────────────────────────────
 #
-# The Ideal State Criteria (ISC) document and the suite-registry doc
-# are the authoritative spec sources during the private phase. They
-# live OUTSIDE this repository during the private phase and are
-# referenced by ISC number throughout the LAMA manifests.
-# The ISC document has been promoted into this repo as the authoritative
-# `ISA.md` (2026-05-29); the suite-registry doc is not yet in this repo.
-# ISC numbers are the spec breadcrumbs throughout these manifests.
+# The authoritative spec is the Ideal State Criteria (ISC) contract in the
+# repo-root `ISA.md`. ISC numbers are the spec breadcrumbs throughout these
+# manifests.
 
 # ISC inventory and live coverage are NOT tracked here — the canonical source is
 # the integration-tests registry (`isc_coverage::ISCS` / `TOTAL`), surfaced by
 # `cargo xtask isc-coverage`. The full ISC contract (every ID + its end-state)
-# lives in ../ISA.md `## Criteria`. This kept drifting when duplicated; don't
-# re-add a count here.
+# lives in ISA.md `## Criteria`. Do not add a count here.
 
 # ─────────────────────────────────────────────────────────────────────
 # Where the rich detail lives
@@ -447,6 +447,6 @@ capabilities:
 #
 # Canonical LAMA root carries a single `manifest:` pointer to the primary full
 # manifest (daemonseed-core, the protocol library). The per-crate manifests for
-# the proto / server / cli crates are enumerated above under `crates[].manifest`.
+# the other crates that have one are enumerated above under `crates[].manifest`.
 
 manifest: "docs/llm-api-manifest/daemonseed-core-api.yaml"

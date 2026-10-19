@@ -6,11 +6,15 @@
 //! of `daemonseed-gui`'s `veilid_net` module, adapted to the TUI's command
 //! surface (the GUI and TUI `NetCommand`/`NetEvent` enums diverge — see below).
 //!
-//! **Circles, public shares + lobby chat today.** `Connect` (attach + lobby
-//! subscribe), `JoinCircle`, `SendChat`, the inbound circle path, the public-share
-//! publish / discover / fetch path (Phase 3 Slice 2b), and public-room (Lobby) chat
-//! (`SendPublicRoom`) are live; presence, MOTD and announcements return the
-//! matching per-surface error event carrying `"not yet on Veilid"` until Phase 4.
+//! **Circles, public shares, lobby chat and presence today.** `Connect` (attach,
+//! then subscribe the lobby, its share record and its presence record),
+//! `JoinCircle`, `SendChat`, the inbound circle path, the public-share
+//! publish / discover / fetch path, public-room (Lobby) chat
+//! (`SendPublicRoom`) and member presence (a join beacon, keepalives, and inbound
+//! beacons folded into the roster) are live. MOTD and announcements
+//! (`RefreshPublicSpace`, `SetMotd`, `UploadAnnouncement`), `DefineShare` and the
+//! deprecation and introducer refreshes return the matching per-surface error
+//! event carrying `"not yet on Veilid"`.
 //! This is a degraded-but-honest dev/test mode, NOT a dual transport — it honors the
 //! no-relay↔Veilid-interop clean cut (one transport at a time).
 //!

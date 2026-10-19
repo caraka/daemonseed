@@ -626,7 +626,7 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
         env: &[],
     },
     // The version stated in the hand-edited manifests and README drifts silently from
-    // the workspace version otherwise. A read of the same small files as the step above.
+    // the workspace version otherwise. A read of the same small files as `xtask check-manifests`.
     GateStep {
         name: "xtask check-versions",
         group: GateGroup::Preflight,

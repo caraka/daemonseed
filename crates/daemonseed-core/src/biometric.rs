@@ -21,10 +21,9 @@ use zeroize::ZeroizeOnDrop;
 
 /// The session passphrase — the **only** secret a [`BiometricStore`] may hold.
 ///
-/// Wrapping it in a zeroizing newtype (rather than a bare `String`) is what
-/// makes ISC-C7's "never the mnemonic" guarantee a type-level property: the
-/// trait surface mentions `SessionPassphrase` and nothing else, so a backend
-/// physically cannot be handed the recovery seed.
+/// A zeroizing newtype over `String`. The trait surface mentions
+/// `SessionPassphrase` and nothing else, but [`SessionPassphrase::new`] accepts
+/// any string, so the type names the intended content without checking it.
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct SessionPassphrase(String);
 

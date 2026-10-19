@@ -4,8 +4,9 @@
 //! handshake — all transport rides the Veilid DHT via the crate's `veilid_net`
 //! actor (behind the [`net`] `NetCommand`/`NetEvent` contract). It drives
 //! first-start (mnemonic, passphrase, recovery) and then the live session — the
-//! public **Lobby** room, **circles** of trust, member **presence**, in-band
-//! **share** discovery/fetch, and operator **announcements / MOTD**.
+//! public **Lobby** room, **circles** of trust, member **presence**, and in-band
+//! **share** discovery/fetch. Operator announcements and MOTD are not yet carried
+//! over Veilid in this client.
 //!
 //! ## Multi-circle carousel (ISC-C59..C62 / A-C29 / A-C30)
 //!

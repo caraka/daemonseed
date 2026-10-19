@@ -23,7 +23,7 @@ Downloads are at <https://daemonseed.org>, with the release files at <https://gi
 
 ## First launch
 
-1. **Choose a passphrase.** It encrypts your identity keys, recovery phrase, display name, circle memberships, mute and hide lists, shared folder list and direct-message conversations on this computer. Files you download from a share are saved as ordinary files, and the settings file is plain text. There is no reset, so make it strong and memorable.
+1. **Choose a passphrase.** It encrypts your identity keys, recovery phrase, display name, circle memberships, mute and hide lists, shared folder list and direct-message contacts and unsent messages on this computer. Files you download from a share are saved as ordinary files, and the settings file is plain text. There is no reset, so make it strong and memorable.
 2. **Write down your recovery phrase.** The app shows 24 words. On this computer they are kept only encrypted under your passphrase. Writing them down is what lets you recover your identity on another computer or after forgetting the passphrase. You confirm the backup by typing three of the words back.
 3. **Pick a display name.** This is what others see in chat; you can change it later.
 
