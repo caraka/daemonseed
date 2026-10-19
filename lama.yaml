@@ -12,7 +12,7 @@ lama: "0.1"
 
 library:
   name: daemonseed
-  version: "0.37.1"
+  version: "0.37.2"
   description: >-
     Peer-to-peer end-to-end-encrypted communication and file-sharing
     over the Veilid DHT. Pure Rust, CNSA 2.0 baseline crypto via the
@@ -111,7 +111,7 @@ crates:
     manifest: null
 
   - name: xtask
-    purpose: "Workspace task runner. Subcommands: check-manifests, gen-proto, check-proto, check-ui-strings (refuses placeholder text in any string a user can read), isc-coverage, install-hooks, gate (runs the Definition-of-Done gate — one step table in the groups preflight, dev-suite and release-suite; --group runs one group, --list prints the table — and exits non-zero naming any red step), release-gate (runs every group of that gate)."
+    purpose: "Workspace task runner. Subcommands: check-manifests, check-versions (fails when a workspace package does not inherit the workspace version, or lama.yaml or a manifest under docs/llm-api-manifest/ disagrees with it, or the README current-release line is newer than it: the README may lag but never lead; --release also requires the README line and any v* tag on HEAD to equal it, and a clean working tree), gen-proto, check-proto, check-ui-strings (refuses placeholder text in any string a user can read), isc-coverage, install-hooks, gate (runs the Definition-of-Done gate — one step table in the groups preflight, dev-suite and release-suite; --group runs one group, --list prints the table — and exits non-zero naming any red step), release-gate (runs check-versions --release, then every group of that gate)."
     license: AGPL-3.0-or-later
     status: active
     manifest: null

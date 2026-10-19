@@ -23,7 +23,7 @@ lama: "0.1"
 
 library:
   name: daemonseed-veilid-net
-  version: "0.1.0"
+  version: "0.37.2"
   description: >-
     Veilid transport layer for daemonseed. Brings up an identity-bound Veilid
     node (VeilidNet::start), driven through a cloneable command-channel handle

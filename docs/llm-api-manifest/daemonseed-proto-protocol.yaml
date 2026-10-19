@@ -19,7 +19,7 @@ lama: "0.1"
 
 library:
   name: daemonseed-proto
-  version: "0.1.0"
+  version: "0.37.2"
   description: >-
     Wire-protocol schema for daemonseed. All public Rust types are
     generated from proto/*.proto via build.rs (tonic-build) on every

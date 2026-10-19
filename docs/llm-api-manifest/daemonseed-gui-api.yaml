@@ -19,7 +19,7 @@ lama: "0.1"
 
 library:
   name: daemonseed-gui
-  version: "0.1.0"
+  version: "0.37.2"
   description: >-
     Slint GUI client for daemonseed (scaffold). The design brief's
     three-zone shell (circle rail / conversation pane / on-demand context sheet)

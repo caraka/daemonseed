@@ -142,10 +142,10 @@ const PRE_UNLOCK_H: u32 = 520;
 #[cfg(feature = "desktop")]
 const CLOSE_BACKSTOP_MARGIN: Duration = Duration::from_secs(1);
 
-/// Released build version shown in-app (auth-screen readout, issue #59 surface).
-/// Stamped at release from the git tag — like `lama.yaml` `version` and the README
-/// Status line — NOT Cargo's tag-driven `0.1.0`.
-const APP_VERSION: &str = "v0.37.1";
+/// Build version shown in-app (auth-screen readout, issue #59 surface), read from the
+/// workspace version in `Cargo.toml` so it cannot drift from the crate. A pre-release
+/// version such as `0.37.2-rc.1` labels itself without any other edit.
+const APP_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 
 /// Run `f` on the next event-loop tick instead of synchronously. Used to move
 /// `.focus()` calls OUT of key-event handlers: focusing an element while Slint is
@@ -3624,6 +3624,27 @@ mod tests {
 
     fn sample_challenge() -> TypeBackChallenge {
         TypeBackChallenge::new(PHRASE, &mut OsRng)
+    }
+
+    /// The in-app label is the workspace version from the root `Cargo.toml`. A GUI
+    /// crate version that differs from it fails here; `cargo xtask check-versions`
+    /// also refuses a literal version that matches.
+    #[test]
+    fn the_app_version_label_is_the_workspace_version() {
+        let manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
+                .unwrap();
+        let section = manifest
+            .split("[workspace.package]")
+            .nth(1)
+            .expect("the root manifest has a [workspace.package] table");
+        let version = section
+            .lines()
+            .take_while(|line| !line.starts_with('['))
+            .find_map(|line| line.strip_prefix("version = \""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("[workspace.package] sets a version");
+        assert_eq!(APP_VERSION, format!("v{version}"));
     }
 
     #[cfg(feature = "desktop")]

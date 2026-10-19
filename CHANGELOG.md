@@ -3,8 +3,8 @@
 All notable changes to daemonseed are recorded here, one entry per release.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html) on
-the wire protocol (the `0.x` crate versions are tag-driven; `Cargo.toml` stays
-`0.1.0`).
+the wire protocol. The workspace version in `Cargo.toml` is the release version,
+and each release is named by an SSH-signed tag `vX.Y.Z` carrying that version.
 
 **This file plus the SSH-signed git tags are the canonical record of milestone
 history** — what shipped, when, under which tag. Each entry corresponds to one
@@ -24,9 +24,15 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+### Added
+
+- Added `cargo xtask check-versions`, which fails when a package does not inherit the workspace version, when `lama.yaml` or an API manifest disagrees with it, or the README release line is newer than it. It runs in the `preflight` gate group.
+- Added `cargo xtask check-versions --release`, run first by `cargo xtask release-gate`. It also requires a final workspace version, a README release line equal to it, any `v*` tag on `HEAD` to be `v` plus that version, and a clean working tree.
+
 ### Changed
 
 - CI: a push to `main` does not re-run a gate group when the newest pull-request run of the same commit ID passed it on the same tree. Any doubt runs the gate. `release-suite` also runs on pull requests from a `release/` branch.
+- GUI: read the version label from Cargo, showing a pre-release suffix.
 
 ### Fixed
 

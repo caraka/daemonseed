@@ -24,7 +24,7 @@ lama: "0.1"
 
 library:
   name: daemonseed-core
-  version: "0.1.0"
+  version: "0.37.2"
   description: >-
     Protocol library. Identity primitives, profile substrate, at-rest
     storage, first-start orchestration, bootstrap-anchor selection,

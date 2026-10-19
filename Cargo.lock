@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "daemonseed-cli"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "daemonseed-core",
  "daemonseed-proto",
@@ -1662,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "daemonseed-core"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "argon2 0.5.3",
  "bip39",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "daemonseed-gui"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "arboard",
  "daemonseed-cli",
@@ -1726,7 +1726,7 @@ dependencies = [
 
 [[package]]
 name = "daemonseed-integration-tests"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "daemonseed-core",
  "daemonseed-isc",
@@ -1742,11 +1742,11 @@ dependencies = [
 
 [[package]]
 name = "daemonseed-isc"
-version = "0.1.0"
+version = "0.37.2"
 
 [[package]]
 name = "daemonseed-proto"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "prost",
  "prost-types",
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "daemonseed-sys"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "daemonseed-tui"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "anyhow",
  "daemonseed-cli",
@@ -1785,7 +1785,7 @@ dependencies = [
 
 [[package]]
 name = "daemonseed-veilid-net"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "base64",
  "daemonseed-core",
@@ -9366,11 +9366,14 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.37.2"
 dependencies = [
  "anyhow",
  "clap",
  "daemonseed-isc",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
  "tonic-build",
  "walkdir",
  "yaml-rust2",

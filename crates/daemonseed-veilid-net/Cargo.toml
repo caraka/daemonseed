@@ -5,7 +5,7 @@
 # transport the GUI/TUI drive now that the relay (daemonseed-server) is gone.
 [package]
 name = "daemonseed-veilid-net"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "AGPL-3.0-or-later"
 publish = false

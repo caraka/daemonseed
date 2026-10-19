@@ -17,7 +17,7 @@ lama: "0.1"
 
 library:
   name: daemonseed-cli
-  version: "0.1.0"
+  version: "0.37.2"
   description: "The Veilid clients' shared authoring library: least-authority route-advert signing (`route_signer`) plus announcement/MOTD authoring, render, and re-verification helpers (`public_space`). No binary; no transport."
   license: "AGPL-3.0-or-later"
   manifest_for: "crates/daemonseed-cli"

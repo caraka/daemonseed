@@ -18,6 +18,12 @@
 //!   duplicate-key detection at the event level and fail on any repeat. YAML
 //!   discards a repeated mapping key silently, so nothing else in the repo
 //!   would notice (#326).
+//! - `check-versions` — fail when a workspace package does not inherit the
+//!   workspace version in `Cargo.toml`, or `lama.yaml` or a manifest under
+//!   `docs/llm-api-manifest/` disagrees with it, or the `README.md` `## Status`
+//!   release line is newer than it: the README may lag but never lead (see
+//!   `versions`). `--release` also requires the README line and any `v*` tag on
+//!   `HEAD` to equal it, and a clean working tree.
 //! - `gate` — run the Definition-of-Done gate, defined once as one table of
 //!   steps in three groups: `preflight` (fmt, clippy, a release-profile
 //!   type-check, rustdoc with warnings denied, and the xtask checks),
@@ -27,12 +33,15 @@
 //!   every group. A test step reporting zero passing tests is red whatever its
 //!   exit code. Every run, whole or single-group, ends by deleting the binaries
 //!   its steps linked into `target/` (see `remove_linked_bins`).
-//! - `release-gate` — run every group of the gate and exit non-zero naming any
-//!   red step. It is the fallback for a release: run it before `git tag` when CI
-//!   cannot run.
+//! - `release-gate` — run `check-versions --release`, then every group of the
+//!   gate, and exit non-zero naming any red step. It is the fallback for a
+//!   release: run it before `git tag` when CI cannot run.
 
 mod manifests;
 mod ui_strings;
+#[cfg(test)]
+mod version_fixture;
+mod versions;
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -55,6 +64,20 @@ enum Cmd {
     /// Parse every `docs/llm-api-manifest/*.yaml` and fail on a duplicate
     /// mapping key, which YAML would otherwise discard silently (#326).
     CheckManifests,
+    /// Fail when a workspace package does not inherit the workspace version, or
+    /// `lama.yaml` or a manifest under `docs/llm-api-manifest/` disagrees with it, or
+    /// the README's current-release line is newer than it. The README may lag but
+    /// never lead.
+    CheckVersions {
+        /// Release rules: the README line must equal the workspace version, which
+        /// must be final, any `v*` tag on `HEAD` must be `v` plus that version, and the
+        /// working tree must be clean.
+        #[arg(long)]
+        release: bool,
+        /// Check this tree instead of the workspace xtask was built from.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
     /// Regenerate `crates/daemonseed-proto/src/generated/` from .proto files.
     GenProto,
     /// Verify that the committed snapshot matches what tonic-build emits.
@@ -91,14 +114,27 @@ enum Cmd {
         #[arg(long)]
         list: bool,
     },
-    /// Run every group of the Definition-of-Done gate and exit non-zero naming
-    /// any red step (#62). Run before `git tag` when CI cannot run.
+    /// Run `check-versions --release`, then every group of the Definition-of-Done
+    /// gate, and exit non-zero naming any red step (#62). Run before `git tag`
+    /// when CI cannot run.
     ReleaseGate,
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::CheckManifests => manifests::check_manifests(&workspace_root_from_xtask()?),
+        Cmd::CheckVersions { release, root } => {
+            let root = match root {
+                Some(root) => root,
+                None => workspace_root_from_xtask()?,
+            };
+            let mode = if release {
+                versions::Mode::Release
+            } else {
+                versions::Mode::Preflight
+            };
+            versions::check_versions(&root, mode)
+        }
         Cmd::GenProto => gen_proto(),
         Cmd::CheckProto => check_proto(),
         Cmd::CheckUiStrings => ui_strings::check_ui_strings(&workspace_root_from_xtask()?),
@@ -112,7 +148,10 @@ fn main() -> Result<()> {
                 run_gate(group)
             }
         }
-        Cmd::ReleaseGate => run_gate(None),
+        Cmd::ReleaseGate => {
+            versions::check_versions(&workspace_root_from_xtask()?, versions::Mode::Release)?;
+            run_gate(None)
+        }
     }
 }
 
@@ -586,6 +625,14 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
         args: &["xtask", "check-manifests"],
         env: &[],
     },
+    // The version stated in the hand-edited manifests and README drifts silently from
+    // the workspace version otherwise. A read of the same small files as the step above.
+    GateStep {
+        name: "xtask check-versions",
+        group: GateGroup::Preflight,
+        args: &["xtask", "check-versions"],
+        env: &[],
+    },
     // No other step reads a user-visible string. Cheap: a scan of the .slint
     // files and the two front-end src trees.
     GateStep {
@@ -931,6 +978,16 @@ mod tests {
         assert_eq!(step.args, ["doc", "--workspace", "--no-deps"]);
         assert_eq!(step.group, GateGroup::Preflight);
         assert!(step.env.contains(&("RUSTDOCFLAGS", "-D warnings")));
+    }
+
+    /// The version-agreement check runs in `preflight`, the group the pre-push hook runs.
+    #[test]
+    fn the_gate_checks_versions_in_preflight() {
+        let step = RELEASE_GATE_STEPS
+            .iter()
+            .find(|s| s.args == ["xtask", "check-versions"])
+            .expect("the version check must be in the gate");
+        assert_eq!(step.group, GateGroup::Preflight);
     }
 
     /// The `release-suite` group is exactly the release-profile test suite: it is the
