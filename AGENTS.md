@@ -36,7 +36,7 @@ Every kind of project fact has exactly **one** canonical home. Do not duplicate 
 | **Public API surface** (per crate) | **`docs/llm-api-manifest/*-api.yaml`** | the full LAMA manifests |
 | **API-discovery summary** | **`lama.yaml`** (root) — concise capabilities + manifest pointer | no milestone / coverage / status state in this file |
 | **Crypto suites** (current + deprecated) | **`daemonseed_core::crypto::suite::Registry`** — supported set, enforced at runtime (`Registry::lookup`); wire tags are `SuiteId` in `daemonseed_proto::v1` | ISC-S15/S16/A-S10/A-S11/C24/C25 (`ISA.md`) govern the rules; never hand-copy the suite list elsewhere |
-| **Release version** | **git tags** (Cargo is tag-driven, stays `0.1.0`) | `lama.yaml` `version` + `README.md` `## Status` + `daemonseed-gui`'s `APP_VERSION` (`crates/daemonseed-gui/src/main.rs`) — all three stamped at release from the tag |
+| **Release version** | **`[workspace.package] version` in the root `Cargo.toml`**, which every package inherits; the signed git tag `vX.Y.Z` names the same version | `daemonseed-gui`'s in-app label reads it at compile time. `lama.yaml` and every `docs/llm-api-manifest/*.yaml` carry it in `library.version`. The `README.md` `## Status` line names the newest published release: a final release, never a pre-release, which may lag the workspace on a release branch but never lead it. `cargo xtask check-versions` (in `preflight`) fails when a package or manifest differs or the README leads. `cargo xtask release-gate` first runs `check-versions --release`, which also requires a final workspace version, a README line equal to it, any `v*` tag on `HEAD` to be `v` plus it, and a clean working tree. |
 
 ## Issue tracking, roadmap & design docs
 
@@ -63,7 +63,7 @@ Every change lands on `main` through a **pull request** — never a direct push 
 1. Branch from `main`; push the branch and open a PR (`gh pr create`).
 2. Review before merge. A trust-surface change — crypto, the signer whitelist / announce write-gate, provenance, identity/key derivation — warrants a thorough review pass called out in the PR.
 3. Merge by a **signature-preserving** path (this repo signs commits): a local fast-forward of the PR branch, or `gh pr merge --merge`. Never `--rebase` / `--squash` — they re-create the commits server-side and drop the SSH signature, landing an unsigned commit on `main`.
-4. The **release-chore** — version stamps (`lama.yaml`, `README.md` `## Status`, `daemonseed-gui`'s `APP_VERSION`) and the `CHANGELOG.md` `[Unreleased]` → `[vX.Y.Z]` rename — plus the signed tag are a **separate post-merge** step, never bundled into a feature PR (see *Cutting a release tag* below).
+4. The **release changes** — the workspace version in `Cargo.toml` with `Cargo.lock` (`cargo update --workspace`), the manifests' `library.version`, the `README.md` `## Status` release line, and the `CHANGELOG.md` `[Unreleased]` → `[vX.Y.Z]` rename — land on the release's own `release/vX.Y.Z` branch and its pull request, never bundled into a feature PR. Only the signed tag is a **separate post-merge** step, cut on the merged commit (see *Cutting a release tag* below).
 
 ## What a test file says about its environment
 
@@ -75,7 +75,7 @@ The gate is defined once — one table of steps in three groups, `RELEASE_GATE_S
 
 | Group | Steps |
 |-------|-------|
-| `preflight` | `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo check --workspace --release` · `cargo doc --workspace --no-deps` under `RUSTDOCFLAGS=-D warnings` · `cargo xtask check-proto` · `cargo xtask isc-coverage` · `cargo xtask check-manifests` · `cargo xtask check-ui-strings` |
+| `preflight` | `cargo fmt --all --check` · `cargo clippy --workspace --all-targets -- -D warnings` · `cargo check --workspace --release` · `cargo doc --workspace --no-deps` under `RUSTDOCFLAGS=-D warnings` · `cargo xtask check-proto` · `cargo xtask isc-coverage` · `cargo xtask check-manifests` · `cargo xtask check-versions` · `cargo xtask check-ui-strings` |
 | `dev-suite` | `cargo clippy -p daemonseed-gui --features desktop --all-targets -- -D warnings` · `cargo test --workspace` |
 | `release-suite` | `cargo test --workspace --release` |
 
@@ -90,7 +90,7 @@ Every task is incomplete until both of these pass:
 
 Run the gate as the last step before handing control back to the user, and re-run after any post-review fix-up; doc-sync is applied per-commit as you go, not deferred to handback. If `cargo fmt --all --check` reports diffs, run `cargo fmt --all` to fix them before re-running — clippy output is easier to read on formatted code.
 
-**Cutting a release tag:** before `git tag`, the commit being tagged must have green CI in all three groups. Open the release as a pull request from a `release/` branch, which runs all three, and tag the commit it lands. When CI cannot run, run `cargo xtask release-gate` instead: it runs every group of the gate above and exits non-zero naming any red step. The pre-push hook is the backstop on push and CI is the backstop on the pull request.
+**Cutting a release tag:** before `git tag`, the commit being tagged must have green CI in all three groups. Open the release as a pull request from a `release/` branch, which runs all three, and tag the commit it lands. When CI cannot run, run `cargo xtask release-gate` instead: it runs `cargo xtask check-versions --release`, then every group of the gate above, and exits non-zero naming any red step. The pre-push hook is the backstop on push and CI is the backstop on the pull request.
 
 ## Documentation sync at every commit point
 
@@ -118,7 +118,7 @@ At every commit, reconcile every one of the following that the change affects �
 1. **`CHANGELOG.md`** (canonical change history) — a changelog entry is part of **every** change-bearing PR / commit, NOT deferred to a release tag. Add the change under `## [Unreleased]` in Keep-a-Changelog form (`### Added` / `### Changed` / `### Fixed` / `### Removed`) at the moment it lands; entries pile up there until a release. **At release**, rename the `## [Unreleased]` block to `## [vX.Y.Z] — <date>` matching the SSH-signed tag (`git tag --verify vX.Y.Z`) and open a fresh empty `## [Unreleased]`. The tag is the durable anchor; the changelog is its human/agent-readable rendering. This is the ONLY place change/milestone history is recorded — do not re-list it elsewhere. (Planning for *unstarted* work stays in the maintainer's own planning notes, never here — `[Unreleased]` is for changes that have *landed*.)
 2. **`ISA.md`** — frozen contract only: add `## Decisions` entries for boundary-level design calls, `## Verification` evidence, and any new/changed `## Criteria`. Principles, Constraints, Criteria wording, and Out of Scope change only here, deliberately, in the PR. **Do NOT add milestone rows or release narrative** — history is git tags + `CHANGELOG.md` (see **Canonical homes**).
 3. **`README.md` `## Status`** — the current-release line only (the version + a one-line "what it is now"), with a pointer to `CHANGELOG.md` for the per-release detail. Do not grow a multi-release narrative here; that duplicates the changelog and is the surface most prone to silent drift.
-4. **`lama.yaml` (root) + `docs/llm-api-manifest/*-api.yaml`** — bump the `version` field to the release; conform both to the LAMA spec, `SPEC.md` at <https://github.com/lamaspec/lama> (root stays a concise capabilities + manifest pointer, **no** milestone/coverage/status); update the per-crate manifests for any crate whose surface the batch changed. **Also stamp `daemonseed-gui`'s `APP_VERSION` (`crates/daemonseed-gui/src/main.rs`) to the release version** — it is the in-app version label and drifts silently if forgotten (it read `v0.32.0` through the v0.33.0 release). All three version surfaces — `lama.yaml`, `README.md` `## Status`, and `APP_VERSION` — move together at the tag.
+4. **`lama.yaml` (root) + `docs/llm-api-manifest/*.yaml`** — conform both to the LAMA spec, `SPEC.md` at <https://github.com/lamaspec/lama> (root stays a concise capabilities + manifest pointer, **no** milestone/coverage/status), and update the per-crate manifests for any crate whose surface the batch changed. When the workspace version in `Cargo.toml` changes, set every manifest's `library.version` to the same value. `cargo xtask check-versions`, part of the `preflight` gate, fails until they agree. The desktop app's in-app version label is read from `Cargo.toml` at compile time and needs no edit.
 
 **Every item above is a contributor requirement** — a PR is incomplete without them, and a reviewer should block on stale repo docs exactly as on a failing test.
 
