@@ -21,6 +21,8 @@
 /// Per ISC-S14, MINOR bumps are additive-only; never reuse field numbers,
 /// never repurpose enum values, never tighten validation after the field
 /// has shipped. MAJOR bumps create a new `vN` module here.
+// The code tonic-build 0.12.3 generates triggers these two lints.
+#[allow(clippy::result_large_err, clippy::double_must_use)]
 pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/daemonseed.v1.rs"));
 }

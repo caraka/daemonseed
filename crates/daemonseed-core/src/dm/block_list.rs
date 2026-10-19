@@ -226,8 +226,8 @@ impl BlockList {
         }
 
         let mut blocked = BTreeSet::new();
-        let mut previous: Option<&[u8]> = None;
-        for chunk in bytes.chunks_exact(ml_dsa::PK_LEN) {
+        let mut previous: Option<&[u8; ml_dsa::PK_LEN]> = None;
+        for chunk in bytes.as_chunks::<{ ml_dsa::PK_LEN }>().0 {
             if previous.is_some_and(|prev| chunk <= prev) {
                 return Err(BlockListError::NotAscending);
             }

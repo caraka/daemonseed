@@ -276,7 +276,7 @@ impl LaneShare {
             #[cfg(test)]
             let forced = self
                 .forced_conflicts
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok();
             #[cfg(not(test))]
             let forced = false;

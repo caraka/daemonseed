@@ -1649,7 +1649,7 @@ impl Clock {
         let read = self.source.read_ms();
         let taken = self
             .held_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 (read > held || held - read > CLOCK_REANCHOR_MS).then_some(read)
             });
         match taken {

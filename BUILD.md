@@ -20,7 +20,7 @@ says nothing about the pinned version.
 
 ## Toolchain
 
-- Rust is pinned by `rust-toolchain.toml` (channel `1.96`, with `rustfmt` +
+- Rust is pinned by `rust-toolchain.toml` (channel `1.99.1`, with `rustfmt` +
   `clippy`) — rustup selects it automatically. Workspace MSRV is `1.95`.
 - Distributable / portable builds also need **`cargo-zigbuild` + `zig`** (the
   cross-linker that pins the glibc floor): `cargo install cargo-zigbuild` and a

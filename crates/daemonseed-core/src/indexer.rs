@@ -437,8 +437,10 @@ fn parse_addr_blob(blob: &[u8], size: u64) -> Option<Vec<ChunkAddr>> {
         return None;
     }
     Some(
-        blob.chunks_exact(CHUNK_ADDR_LEN)
-            .map(|c| ChunkAddr::from_bytes(c.try_into().expect("exact 48-byte chunk")))
+        blob.as_chunks::<CHUNK_ADDR_LEN>()
+            .0
+            .iter()
+            .map(|c| ChunkAddr::from_bytes(*c))
             .collect(),
     )
 }
