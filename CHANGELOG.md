@@ -35,6 +35,7 @@ work lives in the maintainer's own planning notes, not here.
 - GUI: read the version label from Cargo, showing a pre-release suffix.
 - Moved the toolchain to Rust 1.99.1. The minimum supported version remains 1.95.
 - GUI: listed on the setup screen what the passphrase encrypts and stated that downloads and settings are not encrypted.
+- Updated dependencies to their latest compatible versions.
 
 ### Fixed
 
