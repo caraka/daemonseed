@@ -15,7 +15,7 @@ Two clients ship from the same code: a graphical desktop app and a terminal app.
 
 ## Status
 
-Current release: **v0.37.1** — beta (post-MVP). The features above work end to end. Message formats and on-disk formats may change between releases; `CHANGELOG.md` marks any such change. Only the current release receives fixes; `SECURITY.md` says how to report a vulnerability.
+Current release: **v0.37.2** — beta (post-MVP). The features above work end to end. Message formats and on-disk formats may change between releases; `CHANGELOG.md` marks any such change. Only the current release receives fixes; `SECURITY.md` says how to report a vulnerability.
 
 ## Get it
 

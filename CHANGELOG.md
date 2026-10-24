@@ -24,6 +24,8 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+## [v0.37.2] — 2026-10-24
+
 ### Added
 
 - Added `cargo xtask check-versions`, which fails when a package does not inherit the workspace version, when `lama.yaml` or an API manifest disagrees with it, or the README release line is newer than it. It runs in the `preflight` gate group.
@@ -41,7 +43,7 @@ work lives in the maintainer's own planning notes, not here.
 
 - GUI: the startup mask closes once the Lobby backlog has been read, including on a network with no one else online (#495).
 - GUI and TUI: a connection completes on its own once its Veilid node is ready, and quit and disconnect do not wait for it (#496).
-- GUI: Corrected the Windows repaint after a minimized window is restored, where most of the window stayed blank until something changed (#498)
+- GUI: corrected the Windows repaint after a minimized window is restored, where most of the window stayed blank until something changed (#498).
 
 ## [v0.37.1] — 2026-10-18
 
