@@ -1896,7 +1896,8 @@ fn connect_now(
             });
             // #144: raise the "assembling network" startup mask for the cold-start
             // warmup; it is dismissed on the first real content (a Lobby/circle message
-            // or a non-empty roster) or by the user, framing the unavoidable
+            // or a non-empty roster), once the Lobby backlog has been read, or by the
+            // user, framing the unavoidable
             // DHT-convergence wait as the serverless feature rather than a hang.
             ui.set_startup_overlay_open(true);
             // #144: re-arm the settle-timer guard + clear the stale peer count so a
@@ -1912,6 +1913,10 @@ fn connect_now(
         }
     }
 }
+
+/// The connection status while the Veilid attach waits on its node, the same text
+/// the window starts with.
+const STILL_CONNECTING_STATUS: &str = "connecting…";
 
 /// Set the connection status, unless the closing message is already shown: once a
 /// close has said it is finishing up, nothing replaces that until the process exits.
@@ -1937,7 +1942,8 @@ fn close_request_while_closing(ui: &AppWindow, closing: &Cell<bool>) -> bool {
 }
 
 /// #144: dismiss the startup "assembling network" mask a short SETTLE window after
-/// the first real content, instead of snapping it shut on the very first message —
+/// the first real content, or after the Lobby backlog has been read on a network
+/// with nothing to show, instead of snapping it shut on the very first message —
 /// so the Lobby opens with more of the cold-start DHT backlog already in, and the
 /// peer count keeps climbing during the hold. Guarded by `mask-settling` so only the
 /// first content arms the one timer (a message burst can't restart it); a no-op once
@@ -2015,6 +2021,15 @@ fn apply_net_event(
             // joined room name, which read as "connected · lobby" even inside a circle.
             set_status_unless_closing(ui, SharedString::from("connected · veilid"));
             ui.set_connected(true);
+        }
+        // A quiet network sends no message or roster to close the mask, so the
+        // read Lobby backlog closes it too, whatever the reads found.
+        NetEvent::LobbyBacklogRead => settle_dismiss_mask(ui),
+        // The attach is still waiting on its node, so the status says connecting,
+        // not offline. The startup mask is left as it is.
+        NetEvent::StillConnecting => {
+            set_status_unless_closing(ui, SharedString::from(STILL_CONNECTING_STATUS));
+            ui.set_connected(false);
         }
         NetEvent::ConnectFailed { reason } => {
             set_status_unless_closing(ui, SharedString::from(format!("offline · {reason}")));
@@ -4042,6 +4057,79 @@ mod tests {
             closing.set(true);
             assert!(close_request_while_closing(&ui, &closing));
             assert_eq!(ui.get_connection_status(), net::DM_CLOSE_MESSAGE);
+        });
+    }
+
+    /// A finished Lobby backlog read closes the startup mask once the settle hold
+    /// has elapsed, so a quiet network, where no message or roster arrives, does not
+    /// hold the mask open.
+    #[test]
+    fn a_read_lobby_backlog_closes_the_mask_after_the_hold() {
+        with_offscreen_window(|ui| {
+            let advance_to = |at: Duration| {
+                CLOCK.with(|c| c.set(at));
+                slint::platform::update_timers_and_animations();
+            };
+            let state = Rc::new(RefCell::new(GuiState::lobby_only()));
+            let browser = Rc::new(RefCell::new(ShareBrowser::new()));
+            ui.set_startup_overlay_open(true);
+
+            apply_net_event(&ui, &state, &browser, NetEvent::Connected);
+            assert!(
+                !ui.get_mask_settling(),
+                "control: connecting alone started closing the mask"
+            );
+
+            apply_net_event(&ui, &state, &browser, NetEvent::LobbyBacklogRead);
+            assert!(
+                ui.get_mask_settling(),
+                "the read did not start closing the mask"
+            );
+            assert!(
+                ui.get_startup_overlay_open(),
+                "the mask closed without the settle hold"
+            );
+
+            advance_to(Duration::from_millis(2_900));
+            assert!(
+                ui.get_startup_overlay_open(),
+                "the mask closed before the settle hold elapsed"
+            );
+
+            advance_to(Duration::from_millis(3_100));
+            assert!(
+                !ui.get_startup_overlay_open(),
+                "the mask was still open after the settle hold"
+            );
+        });
+    }
+
+    /// An attach still waiting on its node says connecting rather than offline, and
+    /// leaves the startup mask open.
+    #[test]
+    fn a_parked_attach_says_connecting_and_keeps_the_mask() {
+        with_offscreen_window(|ui| {
+            let state = Rc::new(RefCell::new(GuiState::lobby_only()));
+            let browser = Rc::new(RefCell::new(ShareBrowser::new()));
+            ui.set_startup_overlay_open(true);
+            apply_net_event(
+                &ui,
+                &state,
+                &browser,
+                NetEvent::ConnectFailed {
+                    reason: "control".to_owned(),
+                },
+            );
+            assert!(
+                ui.get_connection_status().starts_with("offline"),
+                "control: a failed connect did not say offline"
+            );
+
+            apply_net_event(&ui, &state, &browser, NetEvent::StillConnecting);
+            assert_eq!(ui.get_connection_status(), STILL_CONNECTING_STATUS);
+            assert!(!ui.get_connected());
+            assert!(ui.get_startup_overlay_open(), "the mask closed");
+            assert!(!ui.get_mask_settling(), "the mask started closing");
         });
     }
 

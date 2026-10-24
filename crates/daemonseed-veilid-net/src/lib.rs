@@ -142,9 +142,11 @@ pub mod route_budget;
 pub mod schedule;
 pub mod share;
 
+#[cfg(feature = "test-support")]
+pub use actor::{scripted_record_key, ScriptedNode, ScriptedShutdown};
 pub use actor::{
-    PresenceBoundary, VeilidNet, VeilidNetHandle, CLOSE_FLUSH_FLOOR, CLOSE_LEAVE_RESERVE,
-    CLOSE_PREFLUSH_BUDGET, GRACEFUL_CLOSE_BUDGET, TEARDOWN_CAP,
+    PresenceBoundary, Readiness, VeilidNet, VeilidNetHandle, CLOSE_FLUSH_FLOOR,
+    CLOSE_LEAVE_RESERVE, CLOSE_PREFLUSH_BUDGET, GRACEFUL_CLOSE_BUDGET, TEARDOWN_CAP,
 };
 pub use aimd::AimdWindow;
 pub use config::VeilidNetConfig;

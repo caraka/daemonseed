@@ -57,7 +57,7 @@ library:
 # `NetCommand::Connect{ dm_session_keys: Option<Box<DmSessionKeys>> }` moves the
 # signing keypair, the channel root and the profile at-rest key into a
 # `dm::runner` the actor starts over `VeilidNetHandle::dm_records_parts` once the
-# node has started. `NetCommand::Dm(RunnerCommand)`, sent by `NetHandle::dm`, goes
+# node is ready. `NetCommand::Dm(RunnerCommand)`, sent by `NetHandle::dm`, goes
 # to that runner's queue, and with no runner is answered by
 # `RunnerEvent::Refused { reason: Refusal::ShuttingDown }`. Connect,
 # `NetCommand::StopDm` and `GracefulClose` replace the runner off the actor loop,
@@ -112,6 +112,23 @@ library:
 # circle no longer in the rail. The line shows under the tab strip on the tab that
 # reads that record, and an unreachable circle's rail row says so in place of its
 # subtitle.
+# `NetEvent::StillConnecting`: a Connect's Veilid node is attaching and not yet
+# ready. Status "connecting…"; the startup mask is unchanged.
+# `NetEvent::PeerCount { reliable, live }` is also sent from the waiting node's
+# readiness reads, when the counts change.
+# `Connected` follows once the node is ready; `ConnectFailed` when it cannot start,
+# attach or be read. Commands sent while the node waits run once it connects, or
+# with no node when `StopDm` or `GracefulClose` ends the wait. A `NetCommand::Dm`
+# among them that finds no runner running is refused with `Refusal::ShuttingDown`.
+# A Connect among them replays once the node connects; when `StopDm` ends the wait
+# it is refused with `ConnectFailed` asking to try again, and when `GracefulClose`
+# ends it, it is dropped. A Connect sent while the previous node is still shutting
+# down is refused with `ConnectFailed` asking to try again.
+# `NetEvent::LobbyBacklogRead`: sent at most once per lobby subscription, when the
+# lobby chat record has had a read that got an answer and the presence record any
+# finished read. A record whose subscribe failed or whose key did not resolve is
+# not waited for; with neither waited for, the event is not sent. It closes the
+# startup mask after the 3 s settle hold.
 # A circle is joining until `NetEvent::CircleJoined` or
 # `NetEvent::CircleJoinFailed { circle_id, reason }` arrives for it
 # (`GuiState::is_joining`): its rail row reads "Joining…" in place of its subtitle,

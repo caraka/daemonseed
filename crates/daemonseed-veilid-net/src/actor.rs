@@ -123,10 +123,15 @@ pub const CLOSE_FLUSH_FLOOR: Duration = Duration::from_secs(2);
 /// enqueue completes on that poll. That is correctness by luck; this makes it structural.
 pub const CLOSE_LEAVE_RESERVE: Duration = Duration::from_secs(2);
 
-/// Cap on veilid's own teardown. `flush_budget` bounds the scheduler flush only;
+/// Cap on veilid's own teardown in [`VeilidNetHandle::shutdown`], the shutdown for a
+/// process that is exiting. `flush_budget` bounds the scheduler flush only;
 /// `api.shutdown()` is a separate unbounded await on the same path, so without this the
-/// close has no bound at all past the flush. An overrun is abandoned — the process is
+/// close has no bound at all past the flush. An overrun is abandoned: the process is
 /// exiting and the OS reclaims the node either way.
+///
+/// It does not apply to [`VeilidNetHandle::shutdown_to_completion`], which a caller
+/// uses when another node may start after this one. An abandoned teardown leaves the
+/// node's namespace marked initialized, and a later start on that namespace fails.
 ///
 /// Public because it is half of the caller's bound, not an actor-private detail:
 /// `flush_budget` starts counting when the actor *dequeues* `Command::Shutdown`, and
@@ -161,6 +166,13 @@ enum Command {
     Attach {
         timeout_secs: u64,
         reply: oneshot::Sender<Result<()>>,
+    },
+    /// Start attaching and reply once `api.attach()` returns, without waiting for
+    /// readiness.
+    AttachOnly { reply: oneshot::Sender<Result<()>> },
+    /// One read of the attachment state: readiness and peer counts. Never attaches.
+    ReadReadiness {
+        reply: oneshot::Sender<Result<Readiness>>,
     },
     NewInboundRoute {
         reply: oneshot::Sender<Result<RouteBlob>>,
@@ -315,6 +327,8 @@ enum Command {
     Shutdown {
         /// Budget for the WB-3.I7 scheduler flush before the node is torn down.
         flush_budget: Duration,
+        /// Whether veilid's teardown is cut off at [`TEARDOWN_CAP`].
+        cap_teardown: bool,
         reply: oneshot::Sender<()>,
     },
 }
@@ -330,6 +344,173 @@ pub struct VeilidNetHandle {
     /// reaping while the local write funnel is backed up. `0` until the first
     /// non-chat write completes.
     write_latency: Arc<AtomicU64>,
+}
+
+/// A scripted node for a front end's tests: a [`VeilidNetHandle`] over no node, whose
+/// answers each test chooses. [`Self::spawn`] starts its actor, so it must be called
+/// inside a Tokio runtime.
+///
+/// By default every subscribe succeeds, every rendezvous key resolves to
+/// [`scripted_record_key`], every attach succeeds, every readiness read reports a node
+/// that is not ready with no peers, and every shutdown is answered at once. The
+/// scripted actor ends after a shutdown, so every later command fails. Every other command is dropped unanswered, so its call returns
+/// [`VeilidNetError::Actor`].
+///
+/// Only with the `test-support` feature, which is off by default.
+#[cfg(feature = "test-support")]
+pub struct ScriptedNode {
+    subscribe: SubscribeScript,
+    attach: Box<dyn FnMut() -> Result<()> + Send>,
+    readiness: Box<dyn FnMut(ReadinessReply) + Send>,
+    shutdown: Box<dyn FnMut(ScriptedShutdown) + Send>,
+}
+
+/// How a [`ScriptedNode`] answers a subscribe request for an owner.
+#[cfg(feature = "test-support")]
+type SubscribeScript = Box<dyn FnMut(&RendezvousOwner) -> Result<bool> + Send>;
+
+/// The reply a [`ScriptedNode`] hands its readiness script.
+#[cfg(feature = "test-support")]
+type ReadinessReply = oneshot::Sender<Result<Readiness>>;
+
+/// A shutdown request a [`ScriptedNode`] received. Dropping `reply` unanswered ends
+/// the caller's wait; holding it keeps the caller waiting.
+#[cfg(feature = "test-support")]
+pub struct ScriptedShutdown {
+    /// Whether the caller asked for veilid's teardown to be cut off at [`TEARDOWN_CAP`].
+    pub cap_teardown: bool,
+    /// Answers the caller's shutdown.
+    pub reply: oneshot::Sender<()>,
+}
+
+#[cfg(feature = "test-support")]
+impl Default for ScriptedNode {
+    fn default() -> Self {
+        Self {
+            subscribe: Box::new(|_| Ok(true)),
+            attach: Box::new(|| Ok(())),
+            readiness: Box::new(|reply| {
+                let _ = reply.send(Ok(Readiness::default()));
+            }),
+            shutdown: Box::new(|request| {
+                let _ = request.reply.send(());
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl ScriptedNode {
+    /// Answer each subscribe request with what `f` returns for its owner.
+    pub fn on_subscribe(
+        mut self,
+        f: impl FnMut(&RendezvousOwner) -> Result<bool> + Send + 'static,
+    ) -> Self {
+        self.subscribe = Box::new(f);
+        self
+    }
+
+    /// Answer each [`VeilidNetHandle::attach`] with what `f` returns.
+    pub fn on_attach(mut self, f: impl FnMut() -> Result<()> + Send + 'static) -> Self {
+        self.attach = Box::new(f);
+        self
+    }
+
+    /// Hand each [`VeilidNetHandle::readiness`] reply to `f`, which may answer it at
+    /// once, keep it to answer later, or drop it.
+    pub fn on_readiness(mut self, f: impl FnMut(ReadinessReply) + Send + 'static) -> Self {
+        self.readiness = Box::new(f);
+        self
+    }
+
+    /// Hand each shutdown request to `f`, which may answer it at once, keep it to
+    /// answer later, or drop it.
+    pub fn on_shutdown(mut self, f: impl FnMut(ScriptedShutdown) + Send + 'static) -> Self {
+        self.shutdown = Box::new(f);
+        self
+    }
+
+    /// Start the scripted actor and return a handle to it.
+    pub fn spawn(mut self) -> VeilidNetHandle {
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(64);
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    Command::SubscribeRendezvous { owner, reply } => {
+                        let _ = reply.send((self.subscribe)(&owner));
+                    }
+                    Command::RendezvousKey { owner, reply } => {
+                        let _ = reply.send(Ok(scripted_record_key(&owner)));
+                    }
+                    Command::AttachOnly { reply } => {
+                        let _ = reply.send((self.attach)());
+                    }
+                    Command::ReadReadiness { reply } => (self.readiness)(reply),
+                    Command::Shutdown {
+                        cap_teardown,
+                        reply,
+                        ..
+                    } => {
+                        (self.shutdown)(ScriptedShutdown {
+                            cap_teardown,
+                            reply,
+                        });
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        VeilidNetHandle {
+            cmd_tx,
+            write_latency: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// The record key a [`ScriptedNode`] resolves `owner` to: distinct per owner, and the
+/// same for both forms of one owner.
+///
+/// Only with the `test-support` feature, which is off by default.
+#[cfg(feature = "test-support")]
+pub fn scripted_record_key(owner: &RendezvousOwner) -> RecordKey {
+    RecordKey::new(
+        veilid_core::CRYPTO_KIND_VLD0,
+        veilid_core::BareRecordKey::new(
+            veilid_core::BareOpaqueRecordKey::new(&owner.public_bytes()),
+            None,
+        ),
+    )
+}
+
+/// The error for a node Veilid would not start. A start refused because a node is
+/// still running in the namespace has its own error.
+fn startup_error(error: veilid_core::VeilidAPIError) -> VeilidNetError {
+    match error {
+        veilid_core::VeilidAPIError::AlreadyInitialized => VeilidNetError::NamespaceInUse,
+        error => VeilidNetError::Startup(error.to_string()),
+    }
+}
+
+/// The [`Readiness`] a node's attachment state reports.
+fn readiness_of(attachment: &veilid_core::VeilidStateAttachment) -> Readiness {
+    Readiness {
+        public_internet_ready: attachment.public_internet_ready,
+        // NodeCount is a u64 newtype; peer counts are small, so the cast is safe.
+        reliable_peers: attachment.reliable_peer_count.as_u64() as u32,
+        live_peers: attachment.live_peer_count.as_u64() as u32,
+    }
+}
+
+/// One read of a node's attachment state, from [`VeilidNetHandle::readiness`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Readiness {
+    /// Whether the node is public-internet-ready, which gates every operation.
+    pub public_internet_ready: bool,
+    /// Peers the node holds reliable connections to.
+    pub reliable_peers: u32,
+    /// Peers the node holds any live connection to.
+    pub live_peers: u32,
 }
 
 impl VeilidNetHandle {
@@ -352,6 +533,24 @@ impl VeilidNetHandle {
             reply,
         })
         .await?
+    }
+
+    /// Start attaching the node to the network and return once Veilid has accepted
+    /// the attach, without waiting for public-internet readiness. Poll
+    /// [`Self::readiness`] to learn when the node is ready. Call it once per node:
+    /// Veilid refuses a second attach.
+    pub async fn attach(&self) -> Result<()> {
+        self.send(|reply| Command::AttachOnly { reply }).await?
+    }
+
+    /// Whether the node is public-internet-ready now, with its peer counts, from
+    /// one read of its attachment state.
+    ///
+    /// This never attaches. A caller that attached with [`Self::attach`], or whose
+    /// [`Self::attach_and_wait`] returned [`VeilidNetError::NotReady`], polls it to
+    /// learn when the same node becomes ready and how many peers it has meanwhile.
+    pub async fn readiness(&self) -> Result<Readiness> {
+        self.send(|reply| Command::ReadReadiness { reply }).await?
     }
 
     /// Allocate a private inbound route. The returned blob is what a peer
@@ -393,13 +592,35 @@ impl VeilidNetHandle {
     /// has already spent part of its close on withdraws and leaves passes what is left,
     /// so the whole close stays inside one bound. Terminal: the actor task returns, so
     /// every later command on this handle fails.
+    ///
+    /// Veilid's own teardown is cut off at [`TEARDOWN_CAP`], so use this only when the
+    /// process is exiting. See [`Self::shutdown_to_completion`] otherwise.
     pub async fn shutdown(&self, flush_budget: Duration) {
         let _ = self
             .send(|reply| Command::Shutdown {
                 flush_budget,
+                cap_teardown: true,
                 reply,
             })
             .await;
+    }
+
+    /// Shut the node down as [`Self::shutdown`] does, but wait for veilid's teardown
+    /// to finish however long it takes. Unbounded: a caller that must not wait
+    /// forever bounds it with its own timeout.
+    ///
+    /// Returns whether the node's actor ran the shutdown: when `true`, veilid's
+    /// teardown has completed and the namespace is free for another node. `false`
+    /// when the actor was already gone or dropped the request, and nothing is known
+    /// about the namespace.
+    pub async fn shutdown_to_completion(&self, flush_budget: Duration) -> bool {
+        self.send(|reply| Command::Shutdown {
+            flush_budget,
+            cap_teardown: false,
+            reply,
+        })
+        .await
+        .is_ok()
     }
 
     /// The scheduler's most-recent non-chat enqueue-to-ack latency in millis (WB-1.10
@@ -832,7 +1053,8 @@ pub struct VeilidNet;
 impl VeilidNet {
     /// Bring up the node with a daemonseed-derived identity (D3), spawn the
     /// actor task, and return a [`VeilidNetHandle`] plus a stream of typed
-    /// events. Does NOT attach — call [`VeilidNetHandle::attach_and_wait`].
+    /// events. Does NOT attach: call [`VeilidNetHandle::attach`] and poll
+    /// [`VeilidNetHandle::readiness`], or call [`VeilidNetHandle::attach_and_wait`].
     pub async fn start(
         cfg: VeilidNetConfig,
     ) -> Result<(VeilidNetHandle, mpsc::UnboundedReceiver<VeilidNetEvent>)> {
@@ -971,7 +1193,7 @@ impl VeilidNet {
         );
         let api = crate::device_key::startup_protected(update_callback, vcfg)
             .await
-            .map_err(|e| VeilidNetError::Startup(e.to_string()))?;
+            .map_err(startup_error)?;
         crate::vtrace!("start: api_startup ok; node identity assigned");
         // Phase 1 uses Veilid's DEFAULT routing context, which already carries a
         // 1-hop safety route. Sends ride the receiver's private route
@@ -1135,6 +1357,21 @@ async fn actor_loop(
                 reply,
             } => {
                 let _ = reply.send(attach_and_wait(&api, timeout_secs).await);
+            }
+            Command::AttachOnly { reply } => {
+                let res = api
+                    .attach()
+                    .await
+                    .map_err(|e| VeilidNetError::Attach(e.to_string()));
+                let _ = reply.send(res);
+            }
+            Command::ReadReadiness { reply } => {
+                let res = api
+                    .get_state()
+                    .await
+                    .map(|state| readiness_of(&state.attachment))
+                    .map_err(|e| VeilidNetError::Attach(e.to_string()));
+                let _ = reply.send(res);
             }
             Command::NewInboundRoute { reply } => {
                 let res = api
@@ -1540,6 +1777,7 @@ async fn actor_loop(
             }
             Command::Shutdown {
                 flush_budget,
+                cap_teardown,
                 reply,
             } => {
                 // Traced at the dequeue, not at the send: `flush_budget` starts counting
@@ -1556,17 +1794,27 @@ async fn actor_loop(
                     "close: sched.shutdown returned after {:?}",
                     dequeued.elapsed()
                 );
-                // Capped: the caller is blocking a UI thread on the reply below, and
-                // veilid's teardown is otherwise an unbounded await past every budget.
                 let teardown_started = std::time::Instant::now();
-                match tokio::time::timeout(TEARDOWN_CAP, api.shutdown()).await {
-                    Ok(()) => crate::vtrace!(
-                        "close: teardown returned after {:?}",
-                        teardown_started.elapsed()
-                    ),
-                    Err(_) => {
-                        crate::vtrace!("close: teardown hit TEARDOWN_CAP {TEARDOWN_CAP:?}")
+                if cap_teardown {
+                    // Capped: the caller is blocking a UI thread on the reply below, and
+                    // veilid's teardown is otherwise an unbounded await past every budget.
+                    match tokio::time::timeout(TEARDOWN_CAP, api.shutdown()).await {
+                        Ok(()) => crate::vtrace!(
+                            "close: teardown returned after {:?}",
+                            teardown_started.elapsed()
+                        ),
+                        Err(_) => {
+                            crate::vtrace!("close: teardown hit TEARDOWN_CAP {TEARDOWN_CAP:?}")
+                        }
                     }
+                } else {
+                    // Uncapped: the caller may start another node on this namespace next,
+                    // which needs veilid's teardown to have finished.
+                    api.shutdown().await;
+                    crate::vtrace!(
+                        "close: teardown completed after {:?}",
+                        teardown_started.elapsed()
+                    );
                 }
                 let _ = reply.send(());
                 return;
@@ -2722,7 +2970,7 @@ async fn attach_and_wait(api: &VeilidAPI, timeout_secs: u64) -> Result<()> {
     crate::vtrace!("attach: calling api.attach()");
     api.attach()
         .await
-        .map_err(|e| VeilidNetError::Startup(e.to_string()))?;
+        .map_err(|e| VeilidNetError::Attach(e.to_string()))?;
     crate::vtrace!(
         "attach: api.attach() ok; waiting up to {timeout_secs}s for public_internet_ready"
     );
@@ -2735,7 +2983,7 @@ async fn attach_and_wait(api: &VeilidAPI, timeout_secs: u64) -> Result<()> {
         let attachment = api
             .get_state()
             .await
-            .map_err(|e| VeilidNetError::Startup(e.to_string()))?
+            .map_err(|e| VeilidNetError::Attach(e.to_string()))?
             .attachment;
         let snap = format!(
             "state={:?} public={} local={} peers(reliable={:?} live={:?})",
@@ -2899,6 +3147,55 @@ fn veilid_config(cfg: &VeilidNetConfig) -> Result<VeilidConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A start refused because a node is still running in the namespace has its own
+    /// error; any other refusal is a startup failure carrying Veilid's text.
+    #[test]
+    fn startup_error_names_a_namespace_in_use() {
+        assert!(matches!(
+            startup_error(veilid_core::VeilidAPIError::AlreadyInitialized),
+            VeilidNetError::NamespaceInUse
+        ));
+        assert!(matches!(
+            startup_error(veilid_core::VeilidAPIError::generic("boom")),
+            VeilidNetError::Startup(text) if text.contains("boom")
+        ));
+    }
+
+    /// Readiness reports the attachment state's ready flag and its reliable and live
+    /// peer counts, each from its own field.
+    #[test]
+    fn readiness_maps_each_attachment_field() {
+        let attachment =
+            |ready: bool, reliable: u64, live: u64| veilid_core::VeilidStateAttachment {
+                state: veilid_core::AttachmentState::AttachedWeak,
+                public_internet_ready: ready,
+                local_network_ready: !ready,
+                uptime: veilid_core::TimestampDuration::new(0),
+                attached_uptime: None,
+                reliable_peer_count: veilid_core::NodeCount::new(reliable),
+                live_peer_count: veilid_core::NodeCount::new(live),
+                estimated_network_size: veilid_core::NodeCount::new(99),
+                median_latency: None,
+                over_attached_nodes: veilid_core::NodeCount::new(98),
+            };
+        assert_eq!(
+            readiness_of(&attachment(true, 2, 7)),
+            Readiness {
+                public_internet_ready: true,
+                reliable_peers: 2,
+                live_peers: 7,
+            }
+        );
+        assert_eq!(
+            readiness_of(&attachment(false, 5, 3)),
+            Readiness {
+                public_internet_ready: false,
+                reliable_peers: 5,
+                live_peers: 3,
+            }
+        );
+    }
 
     fn node_seed() -> daemonseed_core::identity::keys::VeilidNodeSeed {
         let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();

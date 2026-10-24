@@ -6,6 +6,14 @@ pub enum VeilidNetError {
     #[error("veilid startup failed: {0}")]
     Startup(String),
 
+    /// Veilid refused to start because a node is still running in this namespace.
+    #[error("a Veilid node is still running in this namespace")]
+    NamespaceInUse,
+
+    /// Attaching a started node, or reading its attachment state, failed.
+    #[error("attachment error: {0}")]
+    Attach(String),
+
     #[error("node did not become public-internet-ready in time")]
     NotReady,
 
@@ -178,6 +186,8 @@ impl VeilidNetError {
             | VeilidNetError::Actor(_)
             | VeilidNetError::NotReady
             | VeilidNetError::Startup(_)
+            | VeilidNetError::NamespaceInUse
+            | VeilidNetError::Attach(_)
             | VeilidNetError::Identity(_)
             | VeilidNetError::Unimplemented(_) => FetchErrorClass::Transient,
         }
@@ -209,6 +219,8 @@ mod tests {
             VeilidNetError::Actor("actor gone".into()),
             VeilidNetError::NotReady,
             VeilidNetError::Startup("boot".into()),
+            VeilidNetError::NamespaceInUse,
+            VeilidNetError::Attach("attach".into()),
             VeilidNetError::Identity("bad identity".into()),
             VeilidNetError::Unimplemented("phase-2"),
         ] {

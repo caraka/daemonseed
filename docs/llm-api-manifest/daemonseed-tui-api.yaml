@@ -179,11 +179,18 @@ modules:
       parks the actor; with no runner it is answered with RunnerEvent::Refused
       carrying its token and Refusal::ShuttingDown, and a Shutdown is answered
       with nothing. NetHandle::dm(cmd) is the UI-side wrapper), StopDm (stop the
-      runner, sent on disconnect). Connect
+      runner, sent on disconnect; it also abandons a connect whose node is not
+      ready yet). Commands sent while a connect's node is not ready wait and run
+      once it is, or run with no node when StopDm or GracefulClose ends the wait.
+      A Connect among them replays once the node is ready; when StopDm ends the
+      wait it is refused with ConnectFailed asking to try again, and when
+      GracefulClose ends it, it is dropped. A Connect sent while the previous
+      node is still shutting down is refused with ConnectFailed asking to try
+      again. Connect
       additionally carries dm_session_keys (Option<Box<DmSessionKeys>>): the
       signing keypair, the channel root and the profile at-rest key, moved into
       RunnerParts::over_veilid. After Connect the actor starts a runner with
-      spawn_runner over VeilidNetHandle::dm_records_parts when the node started
+      spawn_runner over VeilidNetHandle::dm_records_parts once the node is ready
       and keys and a profile root are present. Connect, StopDm and GracefulClose
       each replace the runner in a spawned task, chained onto any replacement
       still running: it stops the previous runner, awaits TaskEnd::finish when
@@ -208,7 +215,9 @@ modules:
       panicked; traced, after any DmStopped, and App marks DmState unavailable), DmCloseSlow (a close is still waiting for the runner to stop after
       DM_CLOSE_NOTICE_AFTER; App ignores it, and the binary's close wait, which
       runs after the terminal is restored, prints DM_CLOSE_MESSAGE once),
-      Connected/ConnectFailed, CircleJoined ({ circle_id: u64, label:
+      Connected/ConnectFailed, StillConnecting (a Connect's Veilid node is
+      attaching and not yet ready; App shows ConnectionStatus::Connecting),
+      CircleJoined ({ circle_id: u64, label:
       String, entropy: String } — the added circle's stable id + client-local
       label, plus the canonicalized entropy echoed back in-process so the app can
       pair a rejoin to its persisted PersistedCircle without ordering assumptions

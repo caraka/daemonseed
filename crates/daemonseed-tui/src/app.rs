@@ -1882,6 +1882,10 @@ impl App {
                 // A new connection reads every record afresh.
                 self.unreachable.clear();
             }
+            // The attach is still waiting on its node: connecting, not failed.
+            NetEvent::StillConnecting => {
+                self.connection = ConnectionStatus::Connecting;
+            }
             NetEvent::ConnectFailed { message } => {
                 self.connection = ConnectionStatus::Failed(message);
             }
@@ -4554,6 +4558,19 @@ mod tests {
             app.connection(),
             &ConnectionStatus::Failed("tcp connect refused".to_owned())
         );
+    }
+
+    /// An attach still waiting on its node shows the client as connecting, not
+    /// failed.
+    #[test]
+    fn net_event_still_connecting_sets_connecting_status() {
+        let mut app = App::new();
+        app.on_net_event(NetEvent::ConnectFailed {
+            message: "control".to_owned(),
+        });
+        assert!(matches!(app.connection(), ConnectionStatus::Failed(_)));
+        app.on_net_event(NetEvent::StillConnecting);
+        assert_eq!(app.connection(), &ConnectionStatus::Connecting);
     }
 
     #[test]

@@ -28,6 +28,11 @@ work lives in the maintainer's own planning notes, not here.
 
 - CI: a push to `main` does not re-run a gate group when the newest pull-request run of the same commit ID passed it on the same tree. Any doubt runs the gate. `release-suite` also runs on pull requests from a `release/` branch.
 
+### Fixed
+
+- GUI: the startup mask closes once the Lobby backlog has been read, including on a network with no one else online (#495).
+- GUI and TUI: a connection completes on its own once its Veilid node is ready, and quit and disconnect do not wait for it (#496).
+
 ## [v0.37.1] — 2026-10-18
 
 ### Added

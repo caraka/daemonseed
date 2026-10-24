@@ -111,10 +111,10 @@ use daemonseed_veilid_net::download::{DownloadOutcome, PlannedFile, run_download
 use daemonseed_veilid_net::identity::PROJECT_ANNOUNCE_OWNER_PUBKEY;
 use daemonseed_veilid_net::{
     CLOSE_FLUSH_FLOOR, CLOSE_LEAVE_RESERVE, CLOSE_PREFLUSH_BUDGET, DiscoveryEnvelope,
-    FetchErrorClass, OperatorCredential, OwnerPublic, OwnerSeed, PresenceBoundary, RecordKey,
-    RendezvousOwner, RepairOutcome, RouteBudget, RouteId, SharerKey, TEARDOWN_CAP, VeilidNet,
-    VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle, next_resweep_record,
-    verify_route_advert,
+    FetchErrorClass, OperatorCredential, OwnerPublic, OwnerSeed, PresenceBoundary, Readiness,
+    RecordKey, RendezvousOwner, RepairOutcome, RouteBudget, RouteId, SharerKey, TEARDOWN_CAP,
+    VeilidNet, VeilidNetConfig, VeilidNetError, VeilidNetEvent, VeilidNetHandle,
+    next_resweep_record, verify_route_advert,
 };
 use prost::Message as _;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -149,6 +149,22 @@ const JOIN_RETRY_MAX_DELAY: Duration = Duration::from_secs(120);
 /// How often the actor loop looks for a failed circle join that is due again. The
 /// clock is only polled while a join is pending.
 const JOIN_RETRY_TICK: Duration = Duration::from_secs(1);
+
+/// How often the actor loop reads whether a parked node (see [`ParkedConnect`]) has
+/// become public-internet-ready. The clock is only polled while a node is parked.
+const PARKED_READY_POLL: Duration = Duration::from_secs(5);
+
+/// The wait from parking a node to its first readiness read, shorter than
+/// [`PARKED_READY_POLL`] so a node that is ready quickly connects promptly.
+const PARKED_FIRST_POLL: Duration = Duration::from_secs(1);
+
+/// How long one readiness read of a parked node may take. A read that takes longer
+/// counts as not ready.
+const PARKED_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The reason a Connect is refused while the previous node is still shutting down.
+const PREVIOUS_NODE_STOPPING: &str =
+    "veilid start: the previous Veilid node is still stopping; try again in a moment";
 
 /// The longest a retried circle join may take. The retry runs on the actor loop,
 /// so this bounds how long a join nobody is waiting for can hold it. Running out
@@ -367,6 +383,10 @@ struct LobbyRendezvous {
     /// fresh, non-own member beacons fold in via [`PresenceTracker::apply`]; the
     /// heartbeat timer `reap`s it. Live-only — a fresh actor starts empty.
     presence: PresenceTracker,
+    /// The lobby records whose backlog read is still awaited, each with the read
+    /// that counts for it. A record is awaited only if its subscribe succeeded and
+    /// its key resolved. The lobby backlog counts as read when the last one leaves.
+    backlog_pending: Vec<(RecordKey, BacklogRead)>,
 }
 
 /// A discovered share's anti-swap-verified route: the sharer's opaque Veilid
@@ -612,16 +632,55 @@ pub async fn veilid_net_actor(
 }
 
 /// The actor loop behind [`veilid_net_actor`], starting from the transport
-/// handle `net`: `None` until a Connect starts a node, or a handle a test
+/// handle `net`: `None` until a Connect's node is ready, or a handle a test
 /// supplies.
 async fn run_actor(
+    cmd_rx: UnboundedReceiver<NetCommand>,
+    cmd_tx: UnboundedSender<NetCommand>,
+    evt_tx: UnboundedSender<NetEvent>,
+    net: Option<VeilidNetHandle>,
+) {
+    run_actor_from(cmd_rx, cmd_tx, evt_tx, net, None).await;
+}
+
+/// [`run_actor`] starting with `parked` as the parked node, so a test can drive a
+/// Connect waiting on readiness without starting a real node.
+async fn run_actor_from(
     mut cmd_rx: UnboundedReceiver<NetCommand>,
     cmd_tx: UnboundedSender<NetCommand>,
     evt_tx: UnboundedSender<NetEvent>,
     mut net: Option<VeilidNetHandle>,
+    initial_parked: Option<ParkedConnect>,
 ) {
     let mut ev_rx: Option<UnboundedReceiver<VeilidNetEvent>> = None;
-    // The direct-messaging runner started at each connect with a started node.
+    // Reads whether the parked node is ready yet, polled only while one is parked.
+    let mut parked_poll = tokio::time::interval(PARKED_READY_POLL);
+    parked_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    parked_poll.reset_at(tokio::time::Instant::now() + PARKED_FIRST_POLL);
+    // Readiness reads of the parked node run off this loop and report here, tagged
+    // with the generation of the node they read.
+    let (parked_read_tx, mut parked_read_rx) = tokio::sync::mpsc::unbounded_channel::<ParkedRead>();
+    // The node a Connect started that is not ready yet. At most one.
+    let mut parked: Option<ParkedConnect> = None;
+    // The generation of the latest parked node. A read tagged with another is for a
+    // node already discarded and is ignored.
+    let mut park_generation: u64 = 0;
+    // The shutdown of a discarded node, running off this loop. No node starts until
+    // it has completed.
+    let mut teardown: Option<Teardown> = None;
+    if let Some(node) = initial_parked {
+        park(
+            &mut parked,
+            &mut park_generation,
+            &mut parked_poll,
+            &teardown,
+            node,
+        );
+    }
+    // Commands to handle before the command channel is read again: those a parked
+    // node held, and those read early to see whether a ready node is still wanted.
+    let mut queued: VecDeque<NetCommand> = VecDeque::new();
+    // The direct-messaging runner started at each connect whose node is ready.
     // `None` before the first such connect, without a profile, and after the
     // runner ends.
     let mut dm: Option<DmSession> = None;
@@ -666,8 +725,8 @@ async fn run_actor(
     // #157 (generalized): steady-state resweep clock. Round-robins ONE subscribed
     // chat/discovery record per tick once the warmup window closes (see
     // STEADY_RESWEEP_TICK / STEADY_RESWEEP_WARMUP_HANDOFF). `connected_at` is the
-    // warmup hand-off reference (set on Connect); `resweep_cursor` is the key-based
-    // round-robin position.
+    // warmup hand-off reference (set on Connect, and again when a parked node becomes
+    // ready); `resweep_cursor` is the key-based round-robin position.
     let mut steady_resweep = tokio::time::interval(STEADY_RESWEEP_TICK);
     steady_resweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut connected_at: Option<Instant> = None;
@@ -723,35 +782,188 @@ async fn run_actor(
 
     loop {
         tokio::select! {
-            cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break }; // UI side dropped — shut down
-                // #157: anchor the steady-resweep warmup hand-off to each Connect, and
-                // reset the round-robin cursor so a reconnect re-sweeps from the top.
-                if matches!(cmd, NetCommand::Connect { .. }) {
-                    connected_at = Some(Instant::now());
-                    resweep_cursor = None;
-                    failed_passes.reset();
-                }
-                // (#180 §RS-4, CRSH-ISC-13) The manual Refresh button drives loop-local
-                // state (resweep_busy, the record-key maps, refresh_armed) that the stateless
-                // command dispatcher cannot reach, so its §RS-4 contract runs here — the only
-                // path into the Refresh contract (CRSH-ISC-20).
-                if matches!(cmd, NetCommand::ResweepShares) {
-                    handle_refresh_shares(
-                        &evt_tx, &net, &shares, &circles, &resweep_busy,
-                        &mut record_key_owners, &mut resolved_records, &mut refresh_armed,
-                    ).await;
+            cmd = next_command(&mut queued, &mut cmd_rx) => {
+                // Every sender is gone. Not reached in production: the actor holds
+                // its own sender, so the channel stays open and a session ends with
+                // a `GracefulClose`.
+                let Some(cmd) = cmd else { break };
+                if let Some(p) = parked.as_mut()
+                    && !discards_parked(&cmd)
+                {
+                    // A parked node holds every command that does not end its session,
+                    // and they run in order once it connects.
+                    daemonseed_veilid_net::vtrace!("gui connect: command held for the parked node");
+                    p.held.push(cmd);
+                } else if let Some(old) = parked.take() {
+                    // A stop or a close ends the session the parked node was started
+                    // for. The node is shut down and never completed. The commands it
+                    // held run first, with no node, then this command. A held Connect
+                    // is the exception: a close drops it, and after a stop it is
+                    // refused while the node shuts down.
+                    let closing = matches!(cmd, NetCommand::GracefulClose { .. });
+                    if closing {
+                        shut_down_node(old.handle).await;
+                    } else {
+                        start_teardown(&mut teardown, old.handle);
+                    }
+                    queued.push_front(cmd);
+                    for held in old.held.into_iter().rev() {
+                        if closing && matches!(held, NetCommand::Connect { .. }) {
+                            daemonseed_veilid_net::vtrace!(
+                                "gui close: a Connect held for the parked node is dropped"
+                            );
+                            continue;
+                        }
+                        queued.push_front(held);
+                    }
+                } else if matches!(cmd, NetCommand::Connect { .. }) && teardown.is_some() {
+                    // No node starts until the previous one has shut down, and a Connect
+                    // is not queued behind it: it is refused, to be tried again.
+                    daemonseed_veilid_net::vtrace!(
+                        "gui connect: Connect refused, the previous node is still shutting down"
+                    );
+                    fail(&evt_tx, PREVIOUS_NODE_STOPPING.to_owned());
                 } else {
-                    // (#274) The ambient boundary for the command path: the write role is
-                    // read from the actor state HERE, once, and every operator handler
-                    // below takes it as a value.
-                    let operator_write = shares.is_operator();
-                    handle_command(
-                        cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles,
-                        &mut pending_joins, &mut my_handle,
-                        &mut shares, &fetch_outcome_tx, &confirm_outcome_tx,
-                        operator_write, &mut dm, &mut dm_start,
-                    ).await;
+                    if matches!(cmd, NetCommand::GracefulClose { .. }) && teardown.is_some() {
+                        daemonseed_veilid_net::vtrace!(
+                            "gui close: the previous node is still shutting down; its teardown is cut off at exit"
+                        );
+                    }
+                    // #157: anchor the steady-resweep warmup hand-off to each Connect, and
+                    // reset the round-robin cursor so a reconnect re-sweeps from the top.
+                    if matches!(cmd, NetCommand::Connect { .. }) {
+                        connected_at = Some(Instant::now());
+                        resweep_cursor = None;
+                        failed_passes.reset();
+                    }
+                    // (#180 §RS-4, CRSH-ISC-13) The manual Refresh button drives loop-local
+                    // state (resweep_busy, the record-key maps, refresh_armed) that the stateless
+                    // command dispatcher cannot reach, so its §RS-4 contract runs here — the only
+                    // path into the Refresh contract (CRSH-ISC-20).
+                    if matches!(cmd, NetCommand::ResweepShares) {
+                        handle_refresh_shares(
+                            &evt_tx, &net, &shares, &circles, &resweep_busy,
+                            &mut record_key_owners, &mut resolved_records, &mut refresh_armed,
+                        ).await;
+                    } else {
+                        // (#274) The ambient boundary for the command path: the write role is
+                        // read from the actor state HERE, once, and every operator handler
+                        // below takes it as a value.
+                        let operator_write = shares.is_operator();
+                        match handle_command(
+                            cmd, &evt_tx, &cmd_tx, &mut net, &mut ev_rx, &mut circles,
+                            &mut pending_joins, &mut my_handle,
+                            &mut shares, &fetch_outcome_tx, &confirm_outcome_tx,
+                            operator_write, &mut dm, &mut dm_start,
+                        ).await {
+                            Some(ConnectOutcome::Parked(node)) => park(
+                                &mut parked, &mut park_generation, &mut parked_poll, &teardown, node,
+                            ),
+                            Some(ConnectOutcome::AttachRefused(handle)) => {
+                                start_teardown(&mut teardown, handle);
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+            // A Connect parks its node as soon as the attach starts. Each tick starts one
+            // readiness read off this loop, never more than one at a time.
+            _ = parked_poll.tick(), if parked.as_ref().is_some_and(|p| !p.reading) => {
+                if let Some(p) = parked.as_mut() {
+                    p.reading = true;
+                    spawn_readiness_read(p.handle.clone(), p.generation, &parked_read_tx);
+                }
+            }
+            // A finished readiness read. Each step owns the parked node and ends with it
+            // parked again, connected, or shut down.
+            Some(read) = parked_read_rx.recv() => {
+                match parked.take() {
+                    Some(mut p) if p.generation == read.generation => {
+                        p.reading = false;
+                        match read.result {
+                            None => {
+                                daemonseed_veilid_net::vtrace!(
+                                    "gui connect: readiness read timed out after {PARKED_READ_TIMEOUT:?}, still waiting"
+                                );
+                                parked = Some(p);
+                            }
+                            Some(Err(e)) => {
+                                daemonseed_veilid_net::vtrace!("gui connect: readiness read failed: {e}");
+                                start_teardown(&mut teardown, p.handle);
+                                fail(&evt_tx, format!("veilid attach: {e}"));
+                                after_connect(
+                                    p.tail, &evt_tx, &net, &mut circles, &mut pending_joins,
+                                    &my_handle, &mut shares, &mut dm, &mut dm_start,
+                                ).await;
+                                for held in p.held.into_iter().rev() {
+                                    queued.push_front(held);
+                                }
+                            }
+                            Some(Ok(readiness)) => {
+                                daemonseed_veilid_net::vtrace!(
+                                    "gui connect: readiness read: ready={} reliable={} live={} parked for {:?}",
+                                    readiness.public_internet_ready,
+                                    readiness.reliable_peers,
+                                    readiness.live_peers,
+                                    p.since.elapsed()
+                                );
+                                if let Some(event) = peer_count_change(&mut p.peers, &readiness) {
+                                    let _ = evt_tx.send(event);
+                                }
+                                if !readiness.public_internet_ready {
+                                    parked = Some(p);
+                                } else {
+                                    // A command already sent may end this node's session,
+                                    // and then the node must not connect.
+                                    if session_ending_queued(&mut queued, &mut cmd_rx) {
+                                        daemonseed_veilid_net::vtrace!(
+                                            "gui connect: parked node ready, but a queued command ends its session"
+                                        );
+                                        parked = Some(p);
+                                    } else {
+                                        daemonseed_veilid_net::vtrace!("gui connect: parked node is ready");
+                                        install_node(&evt_tx, &mut net, &mut ev_rx, p.handle, p.events);
+                                        connected_at = Some(Instant::now());
+                                        resweep_cursor = None;
+                                        failed_passes.reset();
+                                        after_connect(
+                                            p.tail, &evt_tx, &net, &mut circles, &mut pending_joins,
+                                            &my_handle, &mut shares, &mut dm, &mut dm_start,
+                                        ).await;
+                                        for held in p.held.into_iter().rev() {
+                                            queued.push_front(held);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        daemonseed_veilid_net::vtrace!(
+                            "gui connect: readiness read for a discarded node ignored"
+                        );
+                        parked = other;
+                    }
+                }
+            }
+            // The discarded node's shutdown has ended, so another node may start.
+            ended = teardown_done(&mut teardown), if teardown.is_some() => {
+                if let Some(done) = teardown.take() {
+                    let took = done.started.elapsed();
+                    match ended {
+                        Some(Ok(true)) => daemonseed_veilid_net::vtrace!(
+                            "gui connect: previous node shut down after {took:?}"
+                        ),
+                        Some(Ok(false)) => daemonseed_veilid_net::vtrace!(
+                            "gui connect: previous node's actor was gone after {took:?}; \
+                             its shutdown did not run"
+                        ),
+                        Some(Err(e)) => daemonseed_veilid_net::vtrace!(
+                            "gui connect: previous node's teardown task failed after {took:?}: {e}"
+                        ),
+                        None => {}
+                    }
                 }
             }
             // Forward one runner event to the UI; the actor folds nothing. A `None`
@@ -827,6 +1039,20 @@ async fn run_actor(
                             watch: WatchState::Unknown,
                             weather,
                         };
+                        let answered = input.attempted > input.failed;
+                        let lobby_read = shares.lobby.as_mut().is_some_and(|lobby| {
+                            if !answered
+                                && lobby.backlog_pending.contains(&(key.clone(), BacklogRead::Answered))
+                            {
+                                daemonseed_veilid_net::vtrace!(
+                                    "gui lobby: chat backlog read got no answer, not counted; waiting for a re-read"
+                                );
+                            }
+                            take_backlog_read(&mut lobby.backlog_pending, &key, answered)
+                        });
+                        if lobby_read {
+                            let _ = evt_tx.send(NetEvent::LobbyBacklogRead);
+                        }
                         let decision = session_health.observe(key.clone(), input);
                         // A re-read that got an answer clears the room's reconnecting
                         // state, and a run of re-reads that got none sets it, whether
@@ -1146,11 +1372,240 @@ async fn run_actor(
         // iteration (superseded advert + no in-flight fetch), off the loop.
         drain_route_releases(&mut shares, &net);
     }
-    // The UI side dropped the command channel, so the session is over. Dropping
+    // Every sender of the command channel is gone, so the session is over. In
+    // production this is not reached: the actor holds its own sender, so the
+    // channel never closes, and a `GracefulClose` is how a session ends. Dropping
     // the handle stops the runner after the flow call in progress, and a runner
     // still being replaced ends with the runtime.
     drop(dm);
     drop(dm_start);
+    if let Some(old) = parked.take() {
+        shut_down_node(old.handle).await;
+    }
+}
+
+/// The inputs of a Connect that the work after attach consumes. A parked Connect
+/// holds them until its node is ready.
+struct ConnectTail {
+    rejoin_circles: Vec<(u64, String)>,
+    republish_roots: Vec<(PathBuf, Option<String>)>,
+    dm_session_keys: Option<Box<DmSessionKeys>>,
+}
+
+/// A node started and attached for a Connect but not yet public-internet-ready.
+/// The actor loop reads its readiness [`PARKED_FIRST_POLL`] after parking and then
+/// every [`PARKED_READY_POLL`], until it is ready, a read fails, or the Connect's
+/// session ends.
+struct ParkedConnect {
+    handle: VeilidNetHandle,
+    events: UnboundedReceiver<VeilidNetEvent>,
+    tail: ConnectTail,
+    /// Distinguishes this node's readiness reads from a discarded node's.
+    generation: u64,
+    /// Whether a readiness read of this node is running.
+    reading: bool,
+    /// When the node was parked.
+    since: tokio::time::Instant,
+    /// The `(reliable, live)` peer counts last sent to the UI from a readiness
+    /// read. `None` before the first read.
+    peers: Option<(u32, u32)>,
+    /// Commands that arrived while the node was parked, in arrival order.
+    held: Vec<NetCommand>,
+}
+
+impl ParkedConnect {
+    fn new(
+        handle: VeilidNetHandle,
+        events: UnboundedReceiver<VeilidNetEvent>,
+        tail: ConnectTail,
+    ) -> Self {
+        Self {
+            handle,
+            events,
+            tail,
+            generation: 0,
+            reading: false,
+            since: tokio::time::Instant::now(),
+            peers: None,
+            held: Vec::new(),
+        }
+    }
+}
+
+/// The outcome of one readiness read of the parked node of `generation`. `None` when
+/// the read took longer than [`PARKED_READ_TIMEOUT`].
+struct ParkedRead {
+    generation: u64,
+    result: Option<daemonseed_veilid_net::Result<Readiness>>,
+}
+
+/// Read a parked node's readiness off the actor loop and report it on `reads`.
+fn spawn_readiness_read(
+    handle: VeilidNetHandle,
+    generation: u64,
+    reads: &UnboundedSender<ParkedRead>,
+) {
+    let reads = reads.clone();
+    tokio::spawn(async move {
+        let result = tokio::time::timeout(PARKED_READ_TIMEOUT, handle.readiness())
+            .await
+            .ok();
+        let _ = reads.send(ParkedRead { generation, result });
+    });
+}
+
+/// The next command to handle: the first queued one, else the next from the channel.
+async fn next_command(
+    queued: &mut VecDeque<NetCommand>,
+    cmd_rx: &mut UnboundedReceiver<NetCommand>,
+) -> Option<NetCommand> {
+    match queued.pop_front() {
+        Some(cmd) => Some(cmd),
+        None => cmd_rx.recv().await,
+    }
+}
+
+/// The [`NetEvent::PeerCount`] to send for a readiness read of a parked node, when
+/// its peer counts differ from the last ones sent, which `last` then records. The
+/// node's own event stream is not read until it connects, so these reads are what
+/// keep the startup mask's peer count moving while it warms up.
+fn peer_count_change(last: &mut Option<(u32, u32)>, read: &Readiness) -> Option<NetEvent> {
+    let counts = (read.reliable_peers, read.live_peers);
+    if *last == Some(counts) {
+        return None;
+    }
+    *last = Some(counts);
+    Some(NetEvent::PeerCount {
+        reliable: counts.0,
+        live: counts.1,
+    })
+}
+
+/// Whether a command ends the session a parked node was started for. A Connect
+/// does not: it is held and replays once the node connects, as a Connect does on a
+/// connected session. When a stop ends the wait instead, the held Connect is
+/// refused, to be tried again, and when a close ends it, the held Connect is dropped.
+fn discards_parked(cmd: &NetCommand) -> bool {
+    match cmd {
+        NetCommand::StopDm | NetCommand::GracefulClose { .. } => true,
+        NetCommand::Connect { .. }
+        | NetCommand::SetMyHandle { .. }
+        | NetCommand::SendRoom { .. }
+        | NetCommand::JoinCircle { .. }
+        | NetCommand::LeaveCircle { .. }
+        | NetCommand::SendCircle { .. }
+        | NetCommand::PublishShare { .. }
+        | NetCommand::UnpublishShare { .. }
+        | NetCommand::RefreshShares
+        | NetCommand::ResweepShares
+        | NetCommand::RefreshPublicSpace
+        | NetCommand::UploadAnnouncement { .. }
+        | NetCommand::SetMotd { .. }
+        | NetCommand::FetchShare { .. }
+        | NetCommand::ConfirmFetch { .. }
+        | NetCommand::Dm(_) => false,
+    }
+}
+
+/// Shut down a parked node as the session closes, bounded by [`TEARDOWN_CAP`]. It
+/// has written nothing, so there is nothing to flush.
+async fn shut_down_node(handle: VeilidNetHandle) {
+    daemonseed_veilid_net::vtrace!("gui close: shutting down the parked node");
+    if tokio::time::timeout(TEARDOWN_CAP, handle.shutdown(Duration::ZERO))
+        .await
+        .is_err()
+    {
+        daemonseed_veilid_net::vtrace!("gui close: parked node shutdown hit {TEARDOWN_CAP:?}");
+    }
+}
+
+/// Shut down a node that another may replace, and wait for its teardown to complete
+/// so the namespace is free. Unbounded: no node may start on the namespace before
+/// this returns.
+///
+/// Returns whether the node's actor ran the shutdown.
+async fn shut_down_for_replacement(handle: VeilidNetHandle) -> bool {
+    daemonseed_veilid_net::vtrace!("gui connect: shutting down the unconnected node");
+    handle.shutdown_to_completion(Duration::ZERO).await
+}
+
+/// A discarded node's shutdown, running off the actor loop.
+struct Teardown {
+    task: tokio::task::JoinHandle<bool>,
+    started: tokio::time::Instant,
+}
+
+/// What a Connect left for the actor loop: a node to park, or a node whose attach
+/// Veilid refused, to shut down.
+enum ConnectOutcome {
+    Parked(ParkedConnect),
+    AttachRefused(VeilidNetHandle),
+}
+
+/// Start shutting `handle` down off the loop, as the actor's one teardown.
+fn start_teardown(teardown: &mut Option<Teardown>, handle: VeilidNetHandle) {
+    debug_assert!(teardown.is_none(), "one node is shut down at a time");
+    *teardown = Some(Teardown {
+        task: tokio::spawn(shut_down_for_replacement(handle)),
+        started: tokio::time::Instant::now(),
+    });
+}
+
+/// Wait for the running teardown to end, and say how: whether the node's actor ran
+/// the shutdown, or how the teardown task failed. Polled only while there is one.
+async fn teardown_done(
+    teardown: &mut Option<Teardown>,
+) -> Option<Result<bool, tokio::task::JoinError>> {
+    match teardown.as_mut() {
+        Some(running) => Some((&mut running.task).await),
+        None => None,
+    }
+}
+
+/// Park `node` as the actor's one parked node, under a new generation, and schedule
+/// its first readiness read.
+fn park(
+    parked: &mut Option<ParkedConnect>,
+    generation: &mut u64,
+    poll: &mut tokio::time::Interval,
+    teardown: &Option<Teardown>,
+    mut node: ParkedConnect,
+) {
+    debug_assert!(parked.is_none(), "a node parks only when none is parked");
+    debug_assert!(
+        teardown.is_none(),
+        "a node parks only after the previous one shut down"
+    );
+    *generation += 1;
+    node.generation = *generation;
+    *parked = Some(node);
+    poll.reset_at(tokio::time::Instant::now() + PARKED_FIRST_POLL);
+}
+
+/// Whether a command already sent ends the session of the node that just became
+/// ready. Every command waiting in `cmd_rx` moves to the back of `queued` first, so
+/// none is reordered.
+fn session_ending_queued(
+    queued: &mut VecDeque<NetCommand>,
+    cmd_rx: &mut UnboundedReceiver<NetCommand>,
+) -> bool {
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        queued.push_back(cmd);
+    }
+    queued.iter().any(discards_parked)
+}
+
+/// Hold an attached node as this session's transport and report the connection.
+fn install_node(
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &mut Option<VeilidNetHandle>,
+    ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>,
+    handle: VeilidNetHandle,
+    events: UnboundedReceiver<VeilidNetEvent>,
+) {
+    *net = Some(handle);
+    *ev_rx = Some(events);
+    let _ = evt_tx.send(NetEvent::Connected);
 }
 
 /// (#180 §RS-3, CRSH-ISC-10) Release, off the loop, every imported route the in-use guard
@@ -1495,6 +1950,40 @@ fn reach_after_sweep<K: std::hash::Hash + Eq + Clone>(
     let reachable = passes.observe(key, input)?;
     let room = room_record(owners.get(key)?, shares, circles)?;
     Some(NetEvent::RoomReach { room, reachable })
+}
+
+/// Which finished read of a lobby record counts as its backlog read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BacklogRead {
+    /// A read in which at least one read got an answer. The chat record is re-read by
+    /// the warmup and steady re-sweeps, so a read with no answer is followed by
+    /// another.
+    Answered,
+    /// Any finished read. The presence record is read only once, when it is
+    /// subscribed, so waiting for an answer could wait for the whole session.
+    Any,
+}
+
+/// Fold one finished read of `key` into the awaited backlog reads `pending`. A read
+/// that counts for `key` (see [`BacklogRead`]; `answered` says whether any of its reads
+/// got an answer) removes it, so later reads of that record do not count again.
+/// Returns true exactly once: when the read removes the last awaited key.
+fn take_backlog_read<K: PartialEq>(
+    pending: &mut Vec<(K, BacklogRead)>,
+    key: &K,
+    answered: bool,
+) -> bool {
+    let counts = |rule: BacklogRead| answered || rule == BacklogRead::Any;
+    match pending
+        .iter()
+        .position(|(k, rule)| k == key && counts(*rule))
+    {
+        Some(i) => {
+            pending.swap_remove(i);
+            pending.is_empty()
+        }
+        None => false,
+    }
 }
 
 /// The room a subscribed record belongs to: the Lobby, its share list, a circle, or the
@@ -2137,7 +2626,7 @@ fn dm_after_connect(
 }
 
 /// A runner over this connection's Veilid node, where the connection can have
-/// one: a started node, the profile's direct-messaging keys and its profile
+/// one: a node that is ready, the profile's direct-messaging keys and its profile
 /// root.
 ///
 /// `None` without any of the three, or where the record store will not build,
@@ -2247,7 +2736,7 @@ async fn handle_command(
     // A runner being replaced off the loop. Every Connect, StopDm and
     // GracefulClose chains onto it, so no two runners open one store.
     dm_start: &mut Option<DmStart>,
-) {
+) -> Option<ConnectOutcome> {
     match cmd {
         NetCommand::Connect {
             display_handle,
@@ -2287,133 +2776,47 @@ async fn handle_command(
                 hex::encode(&pk[..pk.len().min(8)])
             });
             let profile_secret = dm_session_keys.as_ref().map(|keys| &*keys.at_rest_key);
-            connect(
+            let started = connect(
                 evt_tx,
                 net,
-                ev_rx,
                 ns_key,
                 profile_secret.map(|key| key.as_slice()),
             )
             .await;
-            fail_rejoins_without_connection(net, &rejoin_circles, evt_tx);
-            if net.is_some() {
-                // Subscribe the world-derivable lobby so share announcements fold
-                // into the catalog as they arrive (Phase 3 discovery).
-                subscribe_lobby(shares, net, evt_tx, my_handle).await;
-                // Subscribe the operator announce/MOTD record (Phase 4 A-c) so MOTD +
-                // announcement items fold in as they arrive.
-                subscribe_operator_space(shares, net).await;
-                // Operator content (MOTD/announcements) folds in ASYNC via the
-                // post-connect sweep + watch; each verified fold emits a
-                // `PublicSpaceSnapshot` that drives the #142 unread dot, and the warmup
-                // re-sweep below force-refreshes the operator record early. (The #93
-                // connect-time auto-landing was removed in #142 in favour of the dot, so
-                // there is no self-sent settle-refresh here any more.)
-                // #102: relay-parity — silently re-subscribe persisted circles after
-                // attach, so a circle restored into the UI is actually joined on the
-                // transport (else SendCircle finds known=[] → "join before sending").
-                for (circle_id, phrase) in rejoin_circles {
-                    join_or_schedule_retry(
-                        circle_id,
-                        phrase,
+            let tail = ConnectTail {
+                rejoin_circles,
+                republish_roots,
+                dm_session_keys,
+            };
+            match started {
+                Some(StartedNode::Attaching(handle, events)) => {
+                    return Some(ConnectOutcome::Parked(ParkedConnect::new(
+                        handle, events, tail,
+                    )));
+                }
+                refused_or_none => {
+                    after_connect(
+                        tail,
                         evt_tx,
                         net,
                         circles,
                         pending_joins,
                         my_handle,
-                        shares.signing.clone(),
+                        shares,
+                        dm,
+                        dm_start,
                     )
                     .await;
-                }
-                // #108: relay-parity — re-publish persisted shares on connect, exactly
-                // like the circle re-join above (the relay path does this; the Veilid
-                // path was dropping `republish_roots`). The node identity is ephemeral
-                // per launch, so each re-serves under a fresh private route and
-                // discovery re-announces it. A per-share failure surfaces as a publish
-                // error and never aborts the others.
-                let sharer = my_handle.clone();
-                // #122: lead the restore with a single reassurance banner before any
-                // share is re-served, instead of a per-share toast coincident with the
-                // share going live.
-                if !republish_roots.is_empty() {
-                    let _ = evt_tx.send(NetEvent::RestoreStarted {
-                        count: republish_roots.len(),
-                    });
-                }
-                for (root, persisted_name) in republish_roots {
-                    let name = crate::net::republish_name(&root, persisted_name.as_deref());
-                    publish_share(shares, evt_tx, net, root, name, sharer.clone(), true).await;
-                }
-                // #132 / #140: the passive watch's first fold lands tens of seconds in,
-                // so a message/announcement published during the post-connect warmup
-                // window is missed by the join-time one-shot sweep and only surfaces
-                // late. Replace the single delayed re-sweep with a STEPPED, priority-
-                // ordered schedule ([`WARMUP_RESWEEP_SCHEDULE`]): force-refresh the
-                // operator record first (its MOTD/announce feeds the #142 unread dot),
-                // then the lobby, then circles, at widening delays. Re-swept already-seen
-                // items are deduped downstream (`apply_discovery` self-filter,
-                // `push_message` exact-match). Presence records self-heal via the
-                // heartbeat cycle and are excluded.
-                if let Some(handle) = net.as_ref() {
-                    let handle = handle.clone();
-                    let priority = warmup_priority_records(shares);
-                    let circle_owners: Vec<RendezvousOwner> = circles
-                        .iter()
-                        .map(|c| RendezvousOwner::held(c.owner_seed))
-                        .collect();
-                    daemonseed_veilid_net::vtrace!(
-                        "gui connect: scheduling {}-round stepped warmup re-sweep ({} priority + {} circles)",
-                        WARMUP_RESWEEP_SCHEDULE.len(),
-                        priority.len(),
-                        circle_owners.len()
-                    );
-                    tokio::spawn(async move {
-                        // Absolute deadlines from connect: `sleep_until` means a round's own
-                        // re-sweep await time never pushes later rounds later (#140 review —
-                        // no accumulated drift between rounds).
-                        let start = tokio::time::Instant::now();
-                        for (round, &at) in WARMUP_RESWEEP_SCHEDULE.iter().enumerate() {
-                            tokio::time::sleep_until(start + at).await;
-                            // Operator + lobby every round (top priority + #93 landing feed).
-                            // Circles only in the early rounds — bounds the fan-out for a
-                            // heavily-joined user (#140 review). A round's sweeps run
-                            // together, and the round ends when the last one does.
-                            let circles_this_round: &[RendezvousOwner] =
-                                if round < WARMUP_CIRCLE_RESWEEP_ROUNDS {
-                                    &circle_owners
-                                } else {
-                                    &[]
-                                };
-                            futures_util::future::join_all(
-                                priority
-                                    .iter()
-                                    .chain(circles_this_round)
-                                    .map(|owner| handle.resweep_rendezvous(owner.clone())),
-                            )
-                            .await;
-                        }
-                    });
+                    if let Some(StartedNode::AttachRefused(handle)) = refused_or_none {
+                        return Some(ConnectOutcome::AttachRefused(handle));
+                    }
                 }
             }
-            // Start the direct-messaging runner for this connection, off this
-            // loop. A prior runner (this is a reconnect) is stopped, and its task
-            // awaited, before the new one opens the same profile's store. Outside
-            // the connected branch on purpose: a reconnect whose node never started
-            // must still stop the previous connection's runner.
-            dm_after_connect(
-                net,
-                dm_session_keys,
-                shares.profile_root.clone(),
-                Some(my_handle.clone()),
-                dm,
-                dm_start,
-                evt_tx,
-            );
         }
-        // Forward one command to the runner. With no runner, the command is
-        // answered as the runner answers one it stopped before serving: outside
-        // a connection it has nowhere to go, and queueing it would act on a
-        // session the user has already left.
+        // Forward one command to the runner. With no runner (none has started for
+        // this connection yet, or it has stopped), the command is answered as the
+        // runner answers one it stopped before serving rather than queued for a
+        // runner that may never start.
         NetCommand::Dm(command) => match dm.as_ref() {
             Some(session) => {
                 if let Err(unsent) = session.commands.send(command) {
@@ -2712,9 +3115,143 @@ async fn handle_command(
             upload_announcement(shares, evt_tx, net, operator_write, &topic, &body).await;
         }
     }
+    None
 }
 
-/// Start a Veilid node bound to a fresh daemonseed-derived identity (D3) and
+/// The work that ends a Connect, shared by a Connect that does not park (the
+/// session is already connected, or the node could not start or attach) and one
+/// whose parked node became ready, so the two cannot drift apart: the
+/// lobby and operator subscribes, circle re-joins, share re-publishes, the stepped
+/// warmup re-sweep and the direct-messaging runner. With no node (`net` is `None`)
+/// each re-join fails and the previous connection's runner is stopped.
+#[allow(clippy::too_many_arguments)]
+async fn after_connect(
+    tail: ConnectTail,
+    evt_tx: &UnboundedSender<NetEvent>,
+    net: &Option<VeilidNetHandle>,
+    circles: &mut Vec<VeilidCircle>,
+    pending_joins: &mut Vec<PendingJoin>,
+    my_handle: &str,
+    shares: &mut ShareState,
+    dm: &mut Option<DmSession>,
+    dm_start: &mut Option<DmStart>,
+) {
+    fail_rejoins_without_connection(net, &tail.rejoin_circles, evt_tx);
+    if net.is_some() {
+        // Subscribe the world-derivable lobby so share announcements fold
+        // into the catalog as they arrive (Phase 3 discovery).
+        subscribe_lobby(shares, net, evt_tx, my_handle).await;
+        // Subscribe the operator announce/MOTD record (Phase 4 A-c) so MOTD +
+        // announcement items fold in as they arrive.
+        subscribe_operator_space(shares, net).await;
+        // Operator content (MOTD/announcements) folds in ASYNC via the
+        // post-connect sweep + watch; each verified fold emits a
+        // `PublicSpaceSnapshot` that drives the #142 unread dot, and the warmup
+        // re-sweep below force-refreshes the operator record early. (The #93
+        // connect-time auto-landing was removed in #142 in favour of the dot, so
+        // there is no self-sent settle-refresh here any more.)
+        // #102: relay-parity — silently re-subscribe persisted circles after
+        // attach, so a circle restored into the UI is actually joined on the
+        // transport (else SendCircle finds known=[] → "join before sending").
+        for (circle_id, phrase) in tail.rejoin_circles {
+            join_or_schedule_retry(
+                circle_id,
+                phrase,
+                evt_tx,
+                net,
+                circles,
+                pending_joins,
+                my_handle,
+                shares.signing.clone(),
+            )
+            .await;
+        }
+        // #108: relay-parity — re-publish persisted shares on connect, exactly
+        // like the circle re-join above (the relay path does this; the Veilid
+        // path was dropping `republish_roots`). The node identity is ephemeral
+        // per launch, so each re-serves under a fresh private route and
+        // discovery re-announces it. A per-share failure surfaces as a publish
+        // error and never aborts the others.
+        let sharer = my_handle.to_owned();
+        // #122: lead the restore with a single reassurance banner before any
+        // share is re-served, instead of a per-share toast coincident with the
+        // share going live.
+        if !tail.republish_roots.is_empty() {
+            let _ = evt_tx.send(NetEvent::RestoreStarted {
+                count: tail.republish_roots.len(),
+            });
+        }
+        for (root, persisted_name) in tail.republish_roots {
+            let name = crate::net::republish_name(&root, persisted_name.as_deref());
+            publish_share(shares, evt_tx, net, root, name, sharer.clone(), true).await;
+        }
+        // #132 / #140: the passive watch's first fold lands tens of seconds in,
+        // so a message/announcement published during the post-connect warmup
+        // window is missed by the join-time one-shot sweep and only surfaces
+        // late. Replace the single delayed re-sweep with a STEPPED, priority-
+        // ordered schedule ([`WARMUP_RESWEEP_SCHEDULE`]): force-refresh the
+        // operator record first (its MOTD/announce feeds the #142 unread dot),
+        // then the lobby, then circles, at widening delays. Re-swept already-seen
+        // items are deduped downstream (`apply_discovery` self-filter,
+        // `push_message` exact-match). Presence records self-heal via the
+        // heartbeat cycle and are excluded.
+        if let Some(handle) = net.as_ref() {
+            let handle = handle.clone();
+            let priority = warmup_priority_records(shares);
+            let circle_owners: Vec<RendezvousOwner> = circles
+                .iter()
+                .map(|c| RendezvousOwner::held(c.owner_seed))
+                .collect();
+            daemonseed_veilid_net::vtrace!(
+                "gui connect: scheduling {}-round stepped warmup re-sweep ({} priority + {} circles)",
+                WARMUP_RESWEEP_SCHEDULE.len(),
+                priority.len(),
+                circle_owners.len()
+            );
+            tokio::spawn(async move {
+                // Absolute deadlines from connect: `sleep_until` means a round's own
+                // re-sweep await time never pushes later rounds later (#140 review —
+                // no accumulated drift between rounds).
+                let start = tokio::time::Instant::now();
+                for (round, &at) in WARMUP_RESWEEP_SCHEDULE.iter().enumerate() {
+                    tokio::time::sleep_until(start + at).await;
+                    // Operator + lobby every round (top priority + #93 landing feed).
+                    // Circles only in the early rounds — bounds the fan-out for a
+                    // heavily-joined user (#140 review). A round's sweeps run
+                    // together, and the round ends when the last one does.
+                    let circles_this_round: &[RendezvousOwner] =
+                        if round < WARMUP_CIRCLE_RESWEEP_ROUNDS {
+                            &circle_owners
+                        } else {
+                            &[]
+                        };
+                    futures_util::future::join_all(
+                        priority
+                            .iter()
+                            .chain(circles_this_round)
+                            .map(|owner| handle.resweep_rendezvous(owner.clone())),
+                    )
+                    .await;
+                }
+            });
+        }
+    }
+    // Start the direct-messaging runner for this connection, off this
+    // loop. A prior runner (this is a reconnect) is stopped, and its task
+    // awaited, before the new one opens the same profile's store. Outside
+    // the connected branch on purpose: a reconnect whose node never started
+    // must still stop the previous connection's runner.
+    dm_after_connect(
+        net,
+        tail.dm_session_keys,
+        shares.profile_root.clone(),
+        Some(my_handle.to_owned()),
+        dm,
+        dm_start,
+        evt_tx,
+    );
+}
+
 /// #188: reserve an OS-assigned free port, then release it, so the Veilid node can
 /// bind udp/tcp/ws there without clashing with a co-resident instance. Binding
 /// `0.0.0.0:0` lets the kernel pick a free port; we read it back and drop the probe
@@ -2729,22 +3266,26 @@ fn pick_free_port() -> Option<u16> {
         .map(|a| a.port())
 }
 
-/// attach to the public network. No relay address / handshake (D1/D4): the
-/// bootstrap is baked into the node config.
+/// Start a Veilid node bound to a fresh daemonseed-derived identity (D3) and begin
+/// its attach to the public network, without waiting for it to become ready. No
+/// relay address / handshake (D1/D4): the bootstrap is baked into the node config.
+///
+/// Returns the attaching node for the caller to park, or a node whose attach Veilid
+/// refused for the caller to shut down. `None` when the session is already
+/// connected, or when the node could not start; every failure has been reported.
 async fn connect(
     evt_tx: &UnboundedSender<NetEvent>,
-    net: &mut Option<VeilidNetHandle>,
-    ev_rx: &mut Option<UnboundedReceiver<VeilidNetEvent>>,
+    net: &Option<VeilidNetHandle>,
     // #188: stable per-profile veilid namespace discriminator (hex of the unlocked
     // identity pubkey prefix); `None` on the ephemeral no-profile path.
     ns_key: Option<String>,
     // The unlocked profile's at-rest key, which Veilid's device-key password
     // derives from; `None` without a profile, which draws a fresh password.
     profile_secret: Option<&[u8]>,
-) {
+) -> Option<StartedNode> {
     if net.is_some() {
         let _ = evt_tx.send(NetEvent::Connected);
-        return;
+        return None;
     }
     // The node identity is per-launch; circle membership derives from the phrase,
     // not the node key, so a fresh identity is fine (proven by #99's two
@@ -2752,12 +3293,18 @@ async fn connect(
     let id = match derive_identity_keys(
         &match Mnemonic::generate() {
             Ok(m) => m,
-            Err(e) => return fail(evt_tx, format!("identity seed: {e}")),
+            Err(e) => {
+                fail(evt_tx, format!("identity seed: {e}"));
+                return None;
+            }
         },
         Identity::Primary,
     ) {
         Ok(k) => k,
-        Err(e) => return fail(evt_tx, format!("identity keys: {e}")),
+        Err(e) => {
+            fail(evt_tx, format!("identity keys: {e}"));
+            return None;
+        }
     };
     // Per-instance overrides so several clients can run on ONE host (the
     // single-machine manual test): `DAEMONSEED_VEILID_DIR` gives each instance its
@@ -2800,7 +3347,8 @@ async fn connect(
     if let Some(secret) = profile_secret
         && let Err(e) = cfg.protect_with_profile(secret)
     {
-        return fail(evt_tx, format!("veilid device key: {e}"));
+        fail(evt_tx, format!("veilid device key: {e}"));
+        return None;
     }
     daemonseed_veilid_net::vtrace!(
         "gui connect: namespace={} listen={:?} dir-env={:?}",
@@ -2809,28 +3357,82 @@ async fn connect(
         std::env::var("DAEMONSEED_VEILID_DIR").ok()
     );
     let listen = cfg.listen_address.clone();
-    match VeilidNet::start(cfg).await {
-        Ok((handle, rx)) => match handle.attach_and_wait(180).await {
-            Ok(()) => {
-                *net = Some(handle);
-                *ev_rx = Some(rx);
-                let _ = evt_tx.send(NetEvent::Connected);
-            }
-            Err(e) => fail(evt_tx, format!("veilid attach: {e}")),
-        },
-        // #188 guardrail: a listen-bind clash aborts veilid startup and surfaces as
-        // the misleading keyring error. When a listen address was in play, name the
-        // likely cause + the escape hatch instead of the raw internal string.
-        Err(e) => fail(
-            evt_tx,
-            match &listen {
-                Some(a) => format!(
-                    "veilid start: {e} — listen {a} may already be in use by another \
-                     instance; set DAEMONSEED_VEILID_PORT to a free port"
-                ),
-                None => format!("veilid start: {e}"),
-            },
+    match start_node(cfg).await {
+        Ok((handle, rx)) => return Some(attach_and_park(evt_tx, handle, rx).await),
+        Err(e) => fail(evt_tx, start_failure(&e, listen.as_deref())),
+    }
+    None
+}
+
+/// The reason shown for a node that would not start. #188 guardrail: a listen-bind
+/// clash aborts veilid startup and surfaces as the misleading keyring error, so
+/// when a listen address was in play the reason names the likely cause and the
+/// escape hatch. A node still running in the namespace is reported as itself, with
+/// the one remedy: restarting daemonseed.
+fn start_failure(error: &VeilidNetError, listen: Option<&str>) -> String {
+    match (error, listen) {
+        (VeilidNetError::NamespaceInUse, _) => format!("veilid start: {error}; restart daemonseed"),
+        (_, None) => format!("veilid start: {error}"),
+        (_, Some(address)) => format!(
+            "veilid start: {error} — listen {address} may already be in use by another \
+             instance; set DAEMONSEED_VEILID_PORT to a free port"
         ),
+    }
+}
+
+/// A node [`connect`] started.
+enum StartedNode {
+    /// Attaching, to be parked until it is ready.
+    Attaching(VeilidNetHandle, UnboundedReceiver<VeilidNetEvent>),
+    /// Its attach was refused, so it is to be shut down.
+    AttachRefused(VeilidNetHandle),
+}
+
+/// Start attaching a freshly started node without waiting for readiness, so the
+/// actor loop stays free while the node warms up. A refused attach fails the
+/// Connect at once and hands the node back to be shut down off the loop.
+async fn attach_and_park(
+    evt_tx: &UnboundedSender<NetEvent>,
+    handle: VeilidNetHandle,
+    events: UnboundedReceiver<VeilidNetEvent>,
+) -> StartedNode {
+    match handle.attach().await {
+        Ok(()) => {
+            daemonseed_veilid_net::vtrace!("gui connect: attach started, parking the node");
+            let _ = evt_tx.send(NetEvent::StillConnecting);
+            StartedNode::Attaching(handle, events)
+        }
+        Err(e) => {
+            fail(evt_tx, format!("veilid attach: {e}"));
+            StartedNode::AttachRefused(handle)
+        }
+    }
+}
+
+/// A started node and its event stream.
+type NodeParts = (VeilidNetHandle, UnboundedReceiver<VeilidNetEvent>);
+
+/// Start a Veilid node. A test replaces the start for its actor task through
+/// `seams::START_NODE`.
+async fn start_node(cfg: VeilidNetConfig) -> daemonseed_veilid_net::Result<NodeParts> {
+    #[cfg(test)]
+    if let Ok(start) = seams::START_NODE.try_with(Arc::clone) {
+        return start();
+    }
+    VeilidNet::start(cfg).await
+}
+
+/// Test-only replacements, each set for one actor task with `scope`.
+#[cfg(test)]
+pub(crate) mod seams {
+    use super::*;
+
+    /// What starts a node in place of [`VeilidNet::start`].
+    pub(crate) type StartNode =
+        Arc<dyn Fn() -> daemonseed_veilid_net::Result<NodeParts> + Send + Sync>;
+
+    tokio::task_local! {
+        pub(crate) static START_NODE: StartNode;
     }
 }
 
@@ -2926,13 +3528,16 @@ async fn subscribe_lobby_with(
         Ok(keys) => keys,
         Err(reason) => return refuse_lobby(evt_tx, reason),
     };
-    if let Err(e) = handle
+    let chat_watched = match handle
         .subscribe_room(RendezvousOwner::held(owner_seed))
         .await
     {
-        daemonseed_veilid_net::vtrace!("gui lobby: subscribe failed: {e}");
-        return;
-    }
+        Ok(watched) => watched,
+        Err(e) => {
+            daemonseed_veilid_net::vtrace!("gui lobby: subscribe failed: {e}");
+            return;
+        }
+    };
     // Subscribe the share record too so inbound share adverts fold into the catalog
     // (#153). Non-fatal on failure — discovery stays empty but chat is unaffected.
     if let Err(e) = handle
@@ -2943,13 +3548,52 @@ async fn subscribe_lobby_with(
     }
     // Subscribe the presence record too so inbound beacons fold into the roster.
     // Non-fatal on failure — the roster stays empty but chat is unaffected.
-    if let Err(e) = handle
+    let presence_watched = match handle
         .subscribe_room(RendezvousOwner::held(presence_owner_seed))
         .await
     {
-        daemonseed_veilid_net::vtrace!("gui lobby: presence subscribe failed: {e}");
-    }
+        Ok(watched) => watched,
+        Err(e) => {
+            daemonseed_veilid_net::vtrace!("gui lobby: presence subscribe failed: {e}");
+            false
+        }
+    };
     daemonseed_veilid_net::vtrace!("gui lobby: subscribed (chat + shares + presence)");
+    // A successful chat or presence subscribe started that record's backlog read.
+    // Each read's completion arrives as a `SweepHealth` for its record key, handled on
+    // the actor loop after this function returns. A record whose subscribe did not
+    // start a read is not awaited, since no read of it would arrive.
+    let mut backlog_pending = Vec::new();
+    for (record, seed, watched, rule) in [
+        ("chat", owner_seed, chat_watched, BacklogRead::Answered),
+        (
+            "presence",
+            presence_owner_seed,
+            presence_watched,
+            BacklogRead::Any,
+        ),
+    ] {
+        if !watched {
+            daemonseed_veilid_net::vtrace!(
+                "gui lobby: {record} record not subscribed, its backlog read not awaited"
+            );
+            continue;
+        }
+        match handle
+            .rendezvous_record_key(RendezvousOwner::held(seed))
+            .await
+        {
+            Ok(key) => backlog_pending.push((key, rule)),
+            Err(e) => daemonseed_veilid_net::vtrace!(
+                "gui lobby: {record} record key unresolved, its backlog read not awaited: {e}"
+            ),
+        }
+    }
+    if backlog_pending.is_empty() {
+        daemonseed_veilid_net::vtrace!(
+            "gui lobby: no backlog read awaited, LobbyBacklogRead will not be sent"
+        );
+    }
     shares.lobby = Some(LobbyRendezvous {
         room_key,
         owner_seed,
@@ -2958,6 +3602,7 @@ async fn subscribe_lobby_with(
         // WB-1.9: TTL 600s + read-side fold; the crash/network-loss backstop only —
         // a graceful close disappears immediately via the leave tombstone.
         presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
+        backlog_pending,
     });
     // WB-1.1: publish one JOIN beacon (a session-boundary current-state write) so
     // the roster shows this member within the connect window, not a keepalive
@@ -6018,7 +6663,59 @@ mod tests {
                 .unwrap()
                 .as_bytes(),
             presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
+            backlog_pending: Vec::new(),
         }
+    }
+
+    /// The backlog counts as read once every awaited record has had a read that got
+    /// an answer, exactly once, and an unanswered read or another record does not count.
+    #[test]
+    fn take_backlog_read_matches_the_awaited_record_once() {
+        let mut pending = vec![(7u32, BacklogRead::Answered), (9, BacklogRead::Answered)];
+        assert!(
+            !take_backlog_read(&mut pending, &8, true),
+            "another record counted"
+        );
+        assert!(
+            !take_backlog_read(&mut pending, &7, false),
+            "an unanswered read counted"
+        );
+        assert_eq!(
+            pending,
+            vec![(7, BacklogRead::Answered), (9, BacklogRead::Answered)],
+            "an unanswered or foreign read cleared a wait"
+        );
+        assert!(
+            !take_backlog_read(&mut pending, &7, true),
+            "read before every awaited record had answered"
+        );
+        assert!(
+            !take_backlog_read(&mut pending, &7, true),
+            "the same record counted twice"
+        );
+        assert!(take_backlog_read(&mut pending, &9, true));
+        assert!(pending.is_empty());
+        assert!(
+            !take_backlog_read(&mut pending, &9, true),
+            "reported read a second time"
+        );
+
+        let mut none: Vec<(u32, BacklogRead)> = Vec::new();
+        assert!(
+            !take_backlog_read(&mut none, &7, true),
+            "with no awaited records, a read was reported"
+        );
+    }
+
+    /// A record awaited for any read counts on a read with no answer; one awaited for
+    /// an answered read does not.
+    #[test]
+    fn take_backlog_read_counts_an_unanswered_read_only_where_any_read_counts() {
+        let mut pending = vec![(7u32, BacklogRead::Answered), (9, BacklogRead::Any)];
+        assert!(!take_backlog_read(&mut pending, &7, false));
+        assert!(!take_backlog_read(&mut pending, &9, false));
+        assert_eq!(pending, vec![(7, BacklogRead::Answered)]);
+        assert!(take_backlog_read(&mut pending, &7, true));
     }
 
     /// Build a lobby `DiscoveryEnvelope`: a sealed self-signed announcement plus a
@@ -10953,6 +11650,7 @@ mod repair_notice_tests {
                 .unwrap()
                 .as_bytes(),
             presence: PresenceTracker::for_room(DEFAULT_ROOM, PRESENCE_TTL),
+            backlog_pending: Vec::new(),
         });
         shares
     }
@@ -11550,5 +12248,1410 @@ mod derivation_refusal_tests {
             reason(circle_keys(Ok(key()), Ok([1; 32]), fail())),
             "presence-owner derivation failed: hkdf"
         );
+    }
+}
+
+#[cfg(test)]
+mod parked_connect_tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+
+    use daemonseed_veilid_net::{
+        ScriptedNode, ScriptedShutdown, SweepOutcome, scripted_record_key,
+    };
+    use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    /// What a scripted parked node reports and records: whether it is ready, its live
+    /// peer count, how often its readiness was read, and its shutdowns.
+    #[derive(Clone, Default)]
+    struct Script {
+        ready: Arc<AtomicBool>,
+        live: Arc<AtomicU32>,
+        reads: Arc<AtomicUsize>,
+        shutdowns: Arc<AtomicUsize>,
+        /// Whether each shutdown asked for veilid's teardown to be capped.
+        capped: Arc<Mutex<Vec<bool>>>,
+        /// Readiness replies held back, when `hold_reads` is set.
+        held_reads: Arc<Mutex<Vec<oneshot::Sender<daemonseed_veilid_net::Result<Readiness>>>>>,
+        hold_reads: Arc<AtomicBool>,
+        /// Shutdown replies held back, when `hold_shutdowns` is set.
+        held_shutdowns: Arc<Mutex<Vec<oneshot::Sender<()>>>>,
+        hold_shutdowns: Arc<AtomicBool>,
+        /// When set, each shutdown is answered after this long.
+        shutdown_delay: Arc<Mutex<Option<Duration>>>,
+        /// Whether this node refuses its attach.
+        refuse_attach: Arc<AtomicBool>,
+        /// Whether this node's readiness reads fail.
+        fail_reads: Arc<AtomicBool>,
+        /// The order in which nodes started and their shutdowns completed, shared by
+        /// every node one test starts.
+        log: Arc<Mutex<Vec<(&'static str, usize)>>>,
+        /// This node's number in `log`.
+        index: usize,
+        /// Keeps the node's event stream open, as a running node does.
+        events: Arc<Mutex<Option<UnboundedSender<VeilidNetEvent>>>>,
+        /// Subscribe requests this node answered.
+        subscribes: Arc<AtomicUsize>,
+        /// The public key of an owner whose subscribe this node refuses.
+        refuse: Arc<Mutex<Option<[u8; 32]>>>,
+    }
+
+    impl Script {
+        fn readiness(&self) -> Readiness {
+            Readiness {
+                public_internet_ready: self.ready.load(Ordering::SeqCst),
+                reliable_peers: 0,
+                live_peers: self.live.load(Ordering::SeqCst),
+            }
+        }
+
+        /// Answer every held readiness read with the current readiness.
+        fn release_reads(&self) {
+            for reply in self.held_reads.lock().unwrap().drain(..) {
+                let _ = reply.send(Ok(self.readiness()));
+            }
+        }
+
+        fn node(&self) -> ScriptedNode {
+            let (on_read, on_shutdown, on_subscribe) = (self.clone(), self.clone(), self.clone());
+            let on_attach = self.clone();
+            ScriptedNode::default()
+                .on_attach(move || {
+                    if on_attach.refuse_attach.load(Ordering::SeqCst) {
+                        Err(VeilidNetError::Attach("attach refused".into()))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .on_subscribe(move |owner| {
+                    on_subscribe.subscribes.fetch_add(1, Ordering::SeqCst);
+                    if *on_subscribe.refuse.lock().unwrap() == Some(owner.public_bytes()) {
+                        return Err(VeilidNetError::Routing("refused".into()));
+                    }
+                    Ok(true)
+                })
+                .on_readiness(move |reply| {
+                    on_read.reads.fetch_add(1, Ordering::SeqCst);
+                    if on_read.fail_reads.load(Ordering::SeqCst) {
+                        let _ = reply.send(Err(VeilidNetError::Attach("state unavailable".into())));
+                    } else if on_read.hold_reads.load(Ordering::SeqCst) {
+                        on_read.held_reads.lock().unwrap().push(reply);
+                    } else {
+                        let _ = reply.send(Ok(on_read.readiness()));
+                    }
+                })
+                .on_shutdown(
+                    move |ScriptedShutdown {
+                              cap_teardown,
+                              reply,
+                          }| {
+                        on_shutdown.shutdowns.fetch_add(1, Ordering::SeqCst);
+                        on_shutdown.capped.lock().unwrap().push(cap_teardown);
+                        if on_shutdown.hold_shutdowns.load(Ordering::SeqCst) {
+                            on_shutdown.held_shutdowns.lock().unwrap().push(reply);
+                        } else {
+                            let delay = *on_shutdown.shutdown_delay.lock().unwrap();
+                            let done = on_shutdown.clone();
+                            tokio::spawn(async move {
+                                if let Some(delay) = delay {
+                                    tokio::time::sleep(delay).await;
+                                }
+                                done.log.lock().unwrap().push(("shut down", done.index));
+                                let _ = reply.send(());
+                            });
+                        }
+                    },
+                )
+        }
+    }
+
+    /// A parked Connect over a scripted node, and the sender of its event stream,
+    /// which the caller keeps open as a node does.
+    fn parked_with(
+        script: &Script,
+        tail: ConnectTail,
+    ) -> (ParkedConnect, UnboundedSender<VeilidNetEvent>) {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let (ev_tx, events) = unbounded_channel();
+        (
+            ParkedConnect::new(script.node().spawn(), events, tail),
+            ev_tx,
+        )
+    }
+
+    fn parked(tail: ConnectTail) -> (ParkedConnect, Script, UnboundedSender<VeilidNetEvent>) {
+        let script = Script::default();
+        let (node, ev_tx) = parked_with(&script, tail);
+        (node, script, ev_tx)
+    }
+
+    fn no_tail() -> ConnectTail {
+        ConnectTail {
+            rejoin_circles: Vec::new(),
+            republish_roots: Vec::new(),
+            dm_session_keys: None,
+        }
+    }
+
+    fn drain(evt_rx: &mut UnboundedReceiver<NetEvent>) -> Vec<NetEvent> {
+        std::iter::from_fn(|| evt_rx.try_recv().ok()).collect()
+    }
+
+    /// How many Connects were refused because the previous node was still stopping.
+    fn previous_node_refusals(events: &[NetEvent]) -> usize {
+        count(
+            events,
+            |e| matches!(e, NetEvent::ConnectFailed { reason } if reason == PREVIOUS_NODE_STOPPING),
+        )
+    }
+
+    fn connected_count(events: &[NetEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, NetEvent::Connected))
+            .count()
+    }
+
+    fn count(events: &[NetEvent], matches: impl Fn(&NetEvent) -> bool) -> usize {
+        events.iter().filter(|e| matches(e)).count()
+    }
+
+    fn connect_command() -> NetCommand {
+        NetCommand::Connect {
+            display_handle: None,
+            rejoin_circles: Vec::new(),
+            republish_roots: Vec::new(),
+            stable_signing_key: None,
+            stable_share_root_ikm: None,
+            dm_session_keys: None,
+            profile_root: None,
+            project_announce_seed: None,
+        }
+    }
+
+    /// Run the actor from a parked node. As in production, the actor holds a sender
+    /// of its own command channel, so dropping the returned sender does not end it.
+    fn spawn_actor(
+        net: Option<VeilidNetHandle>,
+        node: ParkedConnect,
+    ) -> (
+        UnboundedSender<NetCommand>,
+        UnboundedReceiver<NetEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        // As in production, the actor holds a sender of its own command channel.
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let (evt_tx, evt_rx) = unbounded_channel();
+        let actor = tokio::spawn(run_actor_from(
+            cmd_rx,
+            cmd_tx.clone(),
+            evt_tx,
+            net,
+            Some(node),
+        ));
+        (cmd_tx, evt_rx, actor)
+    }
+
+    /// A stop and a close end the parked node's session, and other commands, a new
+    /// Connect among them, do not.
+    #[test]
+    fn a_stop_and_a_close_discard_a_parked_node_and_a_connect_does_not() {
+        let (ack, _) = oneshot::channel();
+        assert!(
+            !discards_parked(&connect_command()),
+            "a Connect discards the parked node"
+        );
+        assert!(discards_parked(&NetCommand::StopDm));
+        assert!(discards_parked(&NetCommand::GracefulClose { ack }));
+        assert!(!discards_parked(&NetCommand::SetMyHandle {
+            handle: "x".to_owned()
+        }));
+        assert!(!discards_parked(&NetCommand::JoinCircle {
+            circle_id: 1,
+            phrase: "p".to_owned(),
+        }));
+        assert!(!discards_parked(&NetCommand::LeaveCircle { circle_id: 1 }));
+    }
+
+    /// An attach that starts parks the node at once and says the client is still
+    /// connecting, with no readiness wait and no shutdown.
+    #[tokio::test]
+    async fn an_attach_that_starts_parks_the_node_at_once() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let started = attach_and_park(&evt_tx, node.handle, node.events).await;
+        assert!(
+            matches!(started, StartedNode::Attaching(..)),
+            "the node was not handed back to park"
+        );
+        let events = drain(&mut evt_rx);
+        assert!(
+            matches!(events.as_slice(), [NetEvent::StillConnecting]),
+            "{events:?}"
+        );
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            0,
+            "readiness was awaited"
+        );
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 0);
+    }
+
+    /// An attach that Veilid refuses fails the Connect at once and hands the node
+    /// back to be shut down off the actor loop; nothing is shut down here.
+    #[tokio::test]
+    async fn a_refused_attach_fails_at_once_and_hands_the_node_back() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        script.refuse_attach.store(true, Ordering::SeqCst);
+        let (evt_tx, mut evt_rx) = unbounded_channel();
+        let started = attach_and_park(&evt_tx, node.handle, node.events).await;
+        assert!(matches!(started, StartedNode::AttachRefused(_)));
+        let events = drain(&mut evt_rx);
+        assert!(
+            matches!(events.as_slice(), [NetEvent::ConnectFailed { .. }]),
+            "{events:?}"
+        );
+        assert_eq!(
+            script.shutdowns.load(Ordering::SeqCst),
+            0,
+            "shut down inline"
+        );
+    }
+
+    /// The first readiness read comes [`PARKED_FIRST_POLL`] after parking, sooner
+    /// than the steady [`PARKED_READY_POLL`], and the next one a poll period later.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_readiness_read_comes_soon_after_parking() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        let (_cmd_tx, _evt_rx, actor) = spawn_actor(None, node);
+
+        tokio::time::sleep(PARKED_FIRST_POLL - Duration::from_millis(100)).await;
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            0,
+            "read before the first poll"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            1,
+            "no read at the first poll"
+        );
+        tokio::time::sleep(PARKED_READY_POLL - Duration::from_millis(200)).await;
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            1,
+            "read again too soon"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            2,
+            "no read a period later"
+        );
+        actor.abort();
+    }
+
+    /// The peer counts of a parked node's readiness reads reach the UI as
+    /// `PeerCount`, once per change.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_node_forwards_its_peer_count_while_warming_up() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        let (_cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+        let counts = |events: Vec<NetEvent>| -> Vec<(u32, u32)> {
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    NetEvent::PeerCount { reliable, live } => Some((reliable, live)),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        script.live.store(3, Ordering::SeqCst);
+        tokio::time::sleep(PARKED_FIRST_POLL + Duration::from_millis(100)).await;
+        assert_eq!(counts(drain(&mut evt_rx)), [(0, 3)]);
+
+        tokio::time::sleep(PARKED_READY_POLL).await;
+        assert!(
+            counts(drain(&mut evt_rx)).is_empty(),
+            "an unchanged count was sent again"
+        );
+
+        script.live.store(4, Ordering::SeqCst);
+        tokio::time::sleep(PARKED_READY_POLL).await;
+        assert_eq!(counts(drain(&mut evt_rx)), [(0, 4)]);
+        assert_eq!(connected_count(&drain(&mut evt_rx)), 0);
+        actor.abort();
+    }
+
+    /// A parked node that becomes ready finishes the Connect once: one
+    /// `Connected`, then the work after attach (the lobby subscribe and the
+    /// Connect's circle re-joins), and no further readiness reads.
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_parked_node_finishes_the_connect_once() {
+        let (node, script, _ev_tx) = parked(ConnectTail {
+            rejoin_circles: vec![(7, "parked phrase".to_owned())],
+            republish_roots: Vec::new(),
+            dm_session_keys: None,
+        });
+        let (_cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+
+        tokio::time::sleep(PARKED_READY_POLL * 3).await;
+        assert_eq!(
+            connected_count(&drain(&mut evt_rx)),
+            0,
+            "connected before ready"
+        );
+        assert!(
+            script.reads.load(Ordering::SeqCst) >= 2,
+            "control: the parked node's readiness was not polled"
+        );
+
+        script.ready.store(true, Ordering::SeqCst);
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+        let events = drain(&mut evt_rx);
+        assert_eq!(connected_count(&events), 1, "{events:?}");
+        assert_eq!(
+            count(&events, |e| matches!(e, NetEvent::RoomJoined)),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(
+            count(&events, |e| matches!(
+                e,
+                NetEvent::CircleJoined { circle_id: 7, .. }
+            )),
+            1,
+            "{events:?}"
+        );
+
+        let reads = script.reads.load(Ordering::SeqCst);
+        tokio::time::sleep(PARKED_READY_POLL * 4).await;
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            reads,
+            "readiness was still read after the Connect finished"
+        );
+        assert_eq!(connected_count(&drain(&mut evt_rx)), 0, "connected twice");
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 0);
+        actor.abort();
+    }
+
+    /// A parked node that stays not ready stays parked: no connection, no failure,
+    /// no shutdown, and its readiness read on each tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_not_ready_parked_node_stays_parked() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        let (_cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+
+        tokio::time::sleep(PARKED_READY_POLL * 10).await;
+        let events = drain(&mut evt_rx);
+        assert_eq!(connected_count(&events), 0, "{events:?}");
+        assert_eq!(
+            count(&events, |e| matches!(e, NetEvent::ConnectFailed { .. })),
+            0
+        );
+        assert!(script.reads.load(Ordering::SeqCst) >= 8);
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 0);
+        actor.abort();
+    }
+
+    /// A parked node whose readiness read fails is shut down and the Connect fails,
+    /// as one whose attach failed does.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_readiness_read_fails_the_connect() {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let script = Script::default();
+        let handle = script
+            .node()
+            .on_readiness(|reply| {
+                let _ = reply.send(Err(VeilidNetError::Attach("state unavailable".into())));
+            })
+            .spawn();
+        let (_ev_tx, events) = unbounded_channel();
+        let node = ParkedConnect::new(
+            handle,
+            events,
+            ConnectTail {
+                rejoin_circles: vec![(7, "p".to_owned())],
+                republish_roots: Vec::new(),
+                dm_session_keys: None,
+            },
+        );
+        let (_cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+
+        tokio::time::sleep(PARKED_READY_POLL * 3).await;
+        let events = drain(&mut evt_rx);
+        assert_eq!(
+            count(&events, |e| matches!(e, NetEvent::ConnectFailed { .. })),
+            1
+        );
+        assert_eq!(
+            count(&events, |e| matches!(
+                e,
+                NetEvent::CircleJoinFailed { circle_id: 7, .. }
+            )),
+            1,
+            "the re-join was not ended with the Connect: {events:?}"
+        );
+        assert_eq!(connected_count(&events), 0);
+        assert_eq!(*script.capped.lock().unwrap(), [false]);
+        actor.abort();
+    }
+
+    /// A readiness read that never answers counts as not ready once it times out:
+    /// the next read starts, and a close is handled while the read is outstanding.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_readiness_read_blocks_nothing() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        script.hold_reads.store(true, Ordering::SeqCst);
+        let (cmd_tx, _evt_rx, actor) = spawn_actor(None, node);
+
+        tokio::time::sleep(PARKED_FIRST_POLL + PARKED_READY_POLL).await;
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            1,
+            "a second read overlapped the first"
+        );
+        tokio::time::sleep(PARKED_READ_TIMEOUT + PARKED_READY_POLL).await;
+        assert!(
+            script.reads.load(Ordering::SeqCst) >= 2,
+            "no read started after the first timed out"
+        );
+
+        let (ack, acked) = oneshot::channel();
+        cmd_tx
+            .send(NetCommand::GracefulClose { ack })
+            .expect("actor is running");
+        tokio::time::timeout(TEARDOWN_CAP + Duration::from_secs(1), acked)
+            .await
+            .expect("the close waited on the readiness read")
+            .expect("the close was acknowledged");
+        actor.abort();
+    }
+
+    /// Run a parked node that never becomes ready, send `discard`, then let the
+    /// node report ready: it must have been shut down once and never connected.
+    async fn discarded_by(discard: NetCommand) -> (Vec<NetEvent>, Script) {
+        let (node, script, _ev_tx) = parked(no_tail());
+        let (cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+        assert!(
+            script.reads.load(Ordering::SeqCst) >= 1,
+            "control: the parked node's readiness was not polled"
+        );
+        cmd_tx.send(discard).expect("actor is running");
+        tokio::time::sleep(PARKED_READY_POLL).await;
+        assert_eq!(
+            script.shutdowns.load(Ordering::SeqCst),
+            1,
+            "not shut down once"
+        );
+
+        let reads = script.reads.load(Ordering::SeqCst);
+        script.ready.store(true, Ordering::SeqCst);
+        tokio::time::sleep(PARKED_READY_POLL * 4).await;
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            reads,
+            "a discarded node's readiness was still read"
+        );
+        assert_eq!(
+            script.shutdowns.load(Ordering::SeqCst),
+            1,
+            "shut down twice"
+        );
+        actor.abort();
+        (drain(&mut evt_rx), script)
+    }
+
+    /// A Connect sent while a node is parked is held: the node is not shut down, and
+    /// once it is ready it connects, with no failure. The held Connect then runs on
+    /// the connected session, reporting connected again and starting nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_while_parked_is_held_until_the_node_connects() {
+        let starts = Starts::default();
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(|_| {}));
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(PARKED_FIRST_POLL + Duration::from_millis(100)).await;
+        let node = starts.node(0);
+        assert!(
+            node.reads.load(Ordering::SeqCst) >= 1,
+            "control: the node did not park"
+        );
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+        let waiting = drain(&mut evt_rx);
+        assert_eq!(
+            node.shutdowns.load(Ordering::SeqCst),
+            0,
+            "the Connect tore the parked node down"
+        );
+        assert_eq!(
+            count(&waiting, |e| matches!(e, NetEvent::ConnectFailed { .. })),
+            0,
+            "the Connect was refused: {waiting:?}"
+        );
+        assert_eq!(
+            connected_count(&waiting),
+            0,
+            "connected before the node was ready: {waiting:?}"
+        );
+
+        node.ready.store(true, Ordering::SeqCst);
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+        let events = drain(&mut evt_rx);
+        assert_eq!(
+            count(&events, |e| matches!(e, NetEvent::ConnectFailed { .. })),
+            0,
+            "{events:?}"
+        );
+        assert_eq!(
+            connected_count(&events),
+            2,
+            "not the node connecting and then the held Connect: {events:?}"
+        );
+        assert_eq!(starts.started(), 1, "the held Connect started a node");
+        assert!(
+            node.subscribes.load(Ordering::SeqCst) >= 1,
+            "the ready node was not used"
+        );
+        assert_eq!(
+            node.shutdowns.load(Ordering::SeqCst),
+            0,
+            "the node shut down"
+        );
+        actor.abort();
+    }
+
+    /// A stop discards the parked node, waiting for its teardown to complete.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_discards_the_parked_node() {
+        let (events, script) = discarded_by(NetCommand::StopDm).await;
+        assert_eq!(connected_count(&events), 0, "{events:?}");
+        assert_eq!(
+            *script.capped.lock().unwrap(),
+            [false],
+            "teardown was capped"
+        );
+    }
+
+    /// A graceful close discards the parked node with a capped teardown and is
+    /// acknowledged.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_discards_the_parked_node() {
+        let (ack, acked) = oneshot::channel();
+        let (events, script) = discarded_by(NetCommand::GracefulClose { ack }).await;
+        assert_eq!(connected_count(&events), 0, "{events:?}");
+        assert_eq!(
+            *script.capped.lock().unwrap(),
+            [true],
+            "teardown was not capped"
+        );
+        acked.await.expect("the close was acknowledged");
+    }
+
+    /// The actor holds a sender of its own command channel, as in production, so the
+    /// UI dropping its sender does not end it or discard the parked node; a close does.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_node_outlives_the_ui_sender_until_a_close() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        let (cmd_tx, _evt_rx, actor) = spawn_actor(None, node);
+        let close_tx = cmd_tx.clone();
+
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+        drop(cmd_tx);
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+        assert!(!actor.is_finished(), "the actor ended without a close");
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 0);
+
+        let (ack, acked) = oneshot::channel();
+        close_tx
+            .send(NetCommand::GracefulClose { ack })
+            .expect("actor is running");
+        tokio::time::timeout(TEARDOWN_CAP + Duration::from_secs(1), acked)
+            .await
+            .expect("the close was not acknowledged in time")
+            .expect("the close was acknowledged");
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 1);
+        actor.abort();
+    }
+
+    /// A close while the parked node's shutdown never answers is still acknowledged
+    /// within [`TEARDOWN_CAP`].
+    #[tokio::test(start_paused = true)]
+    async fn a_close_does_not_wait_past_the_teardown_cap() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        script.hold_shutdowns.store(true, Ordering::SeqCst);
+        let (cmd_tx, _evt_rx, actor) = spawn_actor(None, node);
+        tokio::time::sleep(PARKED_FIRST_POLL).await;
+
+        let (ack, acked) = oneshot::channel();
+        cmd_tx
+            .send(NetCommand::GracefulClose { ack })
+            .expect("actor is running");
+        tokio::time::timeout(TEARDOWN_CAP + Duration::from_secs(1), acked)
+            .await
+            .expect("the close waited past the teardown cap")
+            .expect("the close was acknowledged");
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 1);
+        actor.abort();
+    }
+
+    /// Commands sent while parked run in order once the node is ready: a join made
+    /// while parked ends joined, and a circle left while parked stays left after the
+    /// Connect's re-joins.
+    #[tokio::test(start_paused = true)]
+    async fn commands_sent_while_parked_run_once_the_node_is_ready() {
+        let (node, script, _ev_tx) = parked(ConnectTail {
+            rejoin_circles: vec![(7, "restored phrase".to_owned())],
+            republish_roots: Vec::new(),
+            dm_session_keys: None,
+        });
+        let (cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+
+        for cmd in [
+            NetCommand::JoinCircle {
+                circle_id: 8,
+                phrase: "joined while parked".to_owned(),
+            },
+            NetCommand::LeaveCircle { circle_id: 7 },
+        ] {
+            cmd_tx.send(cmd).expect("actor is running");
+        }
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+        let waiting = drain(&mut evt_rx);
+        assert_eq!(
+            count(&waiting, |e| matches!(
+                e,
+                NetEvent::CircleJoined { .. }
+                    | NetEvent::CircleJoinFailed { .. }
+                    | NetEvent::CircleError { .. }
+            )),
+            0,
+            "a held command ran before the node was ready: {waiting:?}"
+        );
+
+        script.ready.store(true, Ordering::SeqCst);
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+        for circle_id in [7, 8] {
+            cmd_tx
+                .send(NetCommand::SendCircle {
+                    circle_id,
+                    text: "hello".to_owned(),
+                })
+                .expect("actor is running");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let events = drain(&mut evt_rx);
+        assert_eq!(
+            count(&events, |e| matches!(
+                e,
+                NetEvent::CircleJoined { circle_id: 8, .. }
+            )),
+            1,
+            "the join made while parked did not join: {events:?}"
+        );
+        let not_joined = |id: u64| {
+            count(&events, |e| {
+                matches!(e, NetEvent::CircleError { circle_id, reason }
+                    if *circle_id == id && reason == "join the circle before sending")
+            })
+        };
+        assert_eq!(
+            not_joined(7),
+            1,
+            "the circle left while parked is joined: {events:?}"
+        );
+        assert_eq!(
+            not_joined(8),
+            0,
+            "the circle joined while parked is not joined: {events:?}"
+        );
+        actor.abort();
+    }
+
+    /// Commands held by a parked node that is then discarded run with no node, and
+    /// fail where the user sees it.
+    #[tokio::test(start_paused = true)]
+    async fn commands_held_by_a_discarded_node_fail_visibly() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        let (cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+
+        cmd_tx
+            .send(NetCommand::JoinCircle {
+                circle_id: 8,
+                phrase: "joined while parked".to_owned(),
+            })
+            .expect("actor is running");
+        cmd_tx.send(NetCommand::StopDm).expect("actor is running");
+        tokio::time::sleep(PARKED_READY_POLL).await;
+        let events = drain(&mut evt_rx);
+        assert_eq!(
+            count(&events, |e| matches!(
+                e,
+                NetEvent::CircleJoinFailed { circle_id: 8, .. }
+            )),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 1);
+        actor.abort();
+    }
+
+    /// A ready result for a node that a queued stop has since discarded installs
+    /// nothing: the old node never connects, is used for nothing, and shuts down once.
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_read_racing_a_stop_never_installs_the_old_node() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        script.hold_reads.store(true, Ordering::SeqCst);
+        let (cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+
+        tokio::time::sleep(PARKED_FIRST_POLL + Duration::from_millis(100)).await;
+        assert_eq!(
+            script.reads.load(Ordering::SeqCst),
+            1,
+            "control: no read in flight"
+        );
+        cmd_tx.send(NetCommand::StopDm).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        script.ready.store(true, Ordering::SeqCst);
+        script.release_reads();
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+
+        let events = drain(&mut evt_rx);
+        assert_eq!(
+            connected_count(&events),
+            0,
+            "the old node connected: {events:?}"
+        );
+        assert_eq!(
+            script.subscribes.load(Ordering::SeqCst),
+            0,
+            "the old node was used"
+        );
+        assert_eq!(script.shutdowns.load(Ordering::SeqCst), 1);
+        actor.abort();
+    }
+
+    /// A ready result that arrives together with a queued stop installs nothing,
+    /// whichever the actor sees first.
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_read_arriving_with_a_stop_never_installs_the_old_node() {
+        for _ in 0..8 {
+            let (node, script, _ev_tx) = parked(no_tail());
+            script.hold_reads.store(true, Ordering::SeqCst);
+            let (cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+
+            tokio::time::sleep(PARKED_FIRST_POLL + Duration::from_millis(100)).await;
+            script.ready.store(true, Ordering::SeqCst);
+            script.release_reads();
+            cmd_tx.send(NetCommand::StopDm).expect("actor is running");
+            tokio::time::sleep(PARKED_READY_POLL).await;
+
+            let events = drain(&mut evt_rx);
+            assert_eq!(connected_count(&events), 0, "{events:?}");
+            assert_eq!(
+                script.subscribes.load(Ordering::SeqCst),
+                0,
+                "the old node was used"
+            );
+            assert_eq!(script.shutdowns.load(Ordering::SeqCst), 1);
+            actor.abort();
+        }
+    }
+
+    /// Push one finished backlog read of `owner_seed`'s record.
+    fn sweep(ev_tx: &UnboundedSender<VeilidNetEvent>, owner_seed: [u8; 32], answered: bool) {
+        let _ = ev_tx.send(VeilidNetEvent::SweepHealth {
+            key: scripted_record_key(&RendezvousOwner::held(owner_seed)),
+            outcome: SweepOutcome {
+                attempted: 4,
+                failed: if answered { 0 } else { 4 },
+                timed_out: 0,
+                found: 0,
+            },
+        });
+    }
+
+    fn lobby_seeds() -> ([u8; 32], [u8; 32]) {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let chat = *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+            .expect("chat seed")
+            .as_bytes();
+        let presence = *derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
+            .expect("presence seed")
+            .as_bytes();
+        (chat, presence)
+    }
+
+    /// Run a parked node to ready, so its lobby is subscribed and its backlog reads
+    /// are awaited, and return the stream to push reads on.
+    async fn connected_lobby(
+        refuse: Option<[u8; 32]>,
+    ) -> (
+        UnboundedSender<VeilidNetEvent>,
+        UnboundedReceiver<NetEvent>,
+        UnboundedSender<NetCommand>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (node, script, ev_tx) = parked(no_tail());
+        *script.refuse.lock().unwrap() =
+            refuse.map(|seed| RendezvousOwner::held(seed).public_bytes());
+        script.ready.store(true, Ordering::SeqCst);
+        let (cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+        tokio::time::sleep(PARKED_FIRST_POLL * 2).await;
+        let events = drain(&mut evt_rx);
+        assert_eq!(
+            count(&events, |e| matches!(e, NetEvent::RoomJoined)),
+            1,
+            "{events:?}"
+        );
+        (ev_tx, evt_rx, cmd_tx, actor)
+    }
+
+    fn backlog_reads(evt_rx: &mut UnboundedReceiver<NetEvent>) -> usize {
+        count(&drain(evt_rx), |e| matches!(e, NetEvent::LobbyBacklogRead))
+    }
+
+    /// The lobby backlog counts as read only once the chat record has had an answered
+    /// read and the presence record any read, and then exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn the_lobby_backlog_is_read_after_chat_answers_and_presence_finishes() {
+        let (chat, presence) = lobby_seeds();
+        let (ev_tx, mut evt_rx, _cmd_tx, actor) = connected_lobby(None).await;
+        let settle = || tokio::time::sleep(Duration::from_millis(100));
+
+        sweep(&ev_tx, chat, true);
+        settle().await;
+        assert_eq!(
+            backlog_reads(&mut evt_rx),
+            0,
+            "read after the chat record alone"
+        );
+        sweep(&ev_tx, presence, false);
+        settle().await;
+        assert_eq!(
+            backlog_reads(&mut evt_rx),
+            1,
+            "an unanswered presence read did not count"
+        );
+        sweep(&ev_tx, chat, true);
+        sweep(&ev_tx, presence, true);
+        settle().await;
+        assert_eq!(backlog_reads(&mut evt_rx), 0, "a re-read counted again");
+        actor.abort();
+    }
+
+    /// An unanswered chat read does not count, so the backlog is read only once the
+    /// chat record answers.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_chat_read_does_not_count() {
+        let (chat, presence) = lobby_seeds();
+        let (ev_tx, mut evt_rx, _cmd_tx, actor) = connected_lobby(None).await;
+        let settle = || tokio::time::sleep(Duration::from_millis(100));
+
+        sweep(&ev_tx, chat, false);
+        sweep(&ev_tx, presence, false);
+        settle().await;
+        assert_eq!(
+            backlog_reads(&mut evt_rx),
+            0,
+            "an unanswered chat read counted"
+        );
+        sweep(&ev_tx, chat, true);
+        settle().await;
+        assert_eq!(backlog_reads(&mut evt_rx), 1);
+        actor.abort();
+    }
+
+    /// A presence record whose subscribe failed is not waited for: the chat
+    /// record's answered read alone reads the backlog.
+    #[tokio::test(start_paused = true)]
+    async fn a_presence_record_not_subscribed_is_not_waited_for() {
+        let (chat, presence) = lobby_seeds();
+        let (ev_tx, mut evt_rx, _cmd_tx, actor) = connected_lobby(Some(presence)).await;
+
+        sweep(&ev_tx, chat, true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(backlog_reads(&mut evt_rx), 1);
+        actor.abort();
+    }
+
+    /// Commands held by a parked node whose readiness read fails run with no node,
+    /// after the failure, and fail where the user sees it.
+    #[tokio::test(start_paused = true)]
+    async fn commands_held_when_a_readiness_read_fails_fail_visibly() {
+        let (node, script, _ev_tx) = parked(no_tail());
+        script.hold_reads.store(true, Ordering::SeqCst);
+        let (cmd_tx, mut evt_rx, actor) = spawn_actor(None, node);
+        tokio::time::sleep(PARKED_FIRST_POLL + Duration::from_millis(100)).await;
+        cmd_tx
+            .send(NetCommand::JoinCircle {
+                circle_id: 8,
+                phrase: "joined while parked".to_owned(),
+            })
+            .expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for reply in script.held_reads.lock().unwrap().drain(..) {
+            let _ = reply.send(Err(VeilidNetError::Attach("state unavailable".into())));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let events = drain(&mut evt_rx);
+        let failed_at = events
+            .iter()
+            .position(|e| matches!(e, NetEvent::ConnectFailed { .. }))
+            .expect("the connect did not fail");
+        let join_failed_at = events
+            .iter()
+            .position(|e| matches!(e, NetEvent::CircleJoinFailed { circle_id: 8, .. }))
+            .expect("the held join did not fail");
+        assert!(failed_at < join_failed_at, "{events:?}");
+        actor.abort();
+    }
+
+    /// A ready node is not connected when a command already sent ends its session:
+    /// every waiting command moves to the back of the queue, in order.
+    #[test]
+    fn a_queued_session_end_is_found_before_a_ready_node_connects() {
+        let (cmd_tx, mut cmd_rx) = unbounded_channel();
+        let mut queued = VecDeque::from([NetCommand::RefreshShares]);
+        cmd_tx.send(NetCommand::RefreshShares).expect("open");
+        assert!(!session_ending_queued(&mut queued, &mut cmd_rx));
+        assert_eq!(queued.len(), 2, "a waiting command was not moved");
+
+        cmd_tx.send(NetCommand::StopDm).expect("open");
+        cmd_tx.send(NetCommand::RefreshShares).expect("open");
+        assert!(session_ending_queued(&mut queued, &mut cmd_rx));
+        assert_eq!(queued.len(), 4);
+        assert!(matches!(queued[2], NetCommand::StopDm), "reordered");
+    }
+
+    /// Nodes the start seam starts, one script each, sharing one log.
+    #[derive(Clone, Default)]
+    struct Starts {
+        nodes: Arc<Mutex<Vec<Script>>>,
+        log: Arc<Mutex<Vec<(&'static str, usize)>>>,
+    }
+
+    impl Starts {
+        /// A start seam whose nodes are scripted by `configure`.
+        fn seam(&self, configure: impl Fn(&Script) + Send + Sync + 'static) -> seams::StartNode {
+            let starts = self.clone();
+            Arc::new(move || {
+                let mut nodes = starts.nodes.lock().unwrap();
+                let script = Script {
+                    index: nodes.len(),
+                    log: starts.log.clone(),
+                    ..Script::default()
+                };
+                configure(&script);
+                let (ev_tx, events) = unbounded_channel();
+                *script.events.lock().unwrap() = Some(ev_tx);
+                starts.log.lock().unwrap().push(("start", script.index));
+                let handle = script.node().spawn();
+                nodes.push(script);
+                Ok((handle, events))
+            })
+        }
+
+        fn node(&self, index: usize) -> Script {
+            self.nodes.lock().unwrap()[index].clone()
+        }
+
+        fn started(&self) -> usize {
+            self.nodes.lock().unwrap().len()
+        }
+    }
+
+    /// Run the actor from no node, starting nodes through `seam`.
+    fn spawn_with_seam(
+        seam: seams::StartNode,
+    ) -> (
+        UnboundedSender<NetCommand>,
+        UnboundedReceiver<NetEvent>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let (cmd_tx, cmd_rx) = unbounded_channel();
+        let (evt_tx, evt_rx) = unbounded_channel();
+        let own = cmd_tx.clone();
+        let actor = tokio::spawn(seams::START_NODE.scope(seam, async move {
+            let _own = own.clone();
+            run_actor_from(cmd_rx, own, evt_tx, None, None).await;
+        }));
+        (cmd_tx, evt_rx, actor)
+    }
+
+    /// A Connect sent while the previous node is still shutting down is refused at
+    /// once with a try-again reason and starts nothing; one sent after that shutdown
+    /// has completed starts the next node.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_while_the_previous_node_stops_is_refused() {
+        let starts = Starts::default();
+        let slow = Duration::from_secs(90);
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(move |script| {
+            *script.shutdown_delay.lock().unwrap() = Some(slow);
+        }));
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cmd_tx.send(NetCommand::StopDm).expect("actor is running");
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(previous_node_refusals(&drain(&mut evt_rx)), 1);
+        tokio::time::sleep(slow).await;
+        assert_eq!(starts.started(), 1, "the refused Connect started a node");
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            starts.started(),
+            2,
+            "a Connect after the shutdown did not start"
+        );
+        assert_eq!(
+            *starts.log.lock().unwrap(),
+            [("start", 0), ("shut down", 0), ("start", 1)]
+        );
+        assert_eq!(*starts.node(0).capped.lock().unwrap(), [false]);
+        actor.abort();
+    }
+
+    /// A close while the previous node is still shutting down is acknowledged within
+    /// [`TEARDOWN_CAP`].
+    #[tokio::test(start_paused = true)]
+    async fn a_close_during_a_teardown_is_acknowledged() {
+        let starts = Starts::default();
+        let (cmd_tx, _evt_rx, actor) = spawn_with_seam(starts.seam(|script| {
+            *script.shutdown_delay.lock().unwrap() = Some(Duration::from_secs(120));
+        }));
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cmd_tx.send(NetCommand::StopDm).expect("actor is running");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let (ack, acked) = oneshot::channel();
+        cmd_tx
+            .send(NetCommand::GracefulClose { ack })
+            .expect("actor is running");
+        tokio::time::timeout(TEARDOWN_CAP + Duration::from_secs(1), acked)
+            .await
+            .expect("the close was not acknowledged in time")
+            .expect("the close was acknowledged");
+        actor.abort();
+    }
+
+    /// A close while a node is parked drops a Connect the node held: the close is
+    /// acknowledged, no other node starts, and nothing reports connected or failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_close_while_parked_drops_a_held_connect() {
+        let starts = Starts::default();
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(|_| {}));
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(PARKED_FIRST_POLL + Duration::from_millis(100)).await;
+        assert!(
+            starts.node(0).reads.load(Ordering::SeqCst) >= 1,
+            "control: the node did not park"
+        );
+        drain(&mut evt_rx);
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        let (ack, acked) = oneshot::channel();
+        cmd_tx
+            .send(NetCommand::GracefulClose { ack })
+            .expect("actor is running");
+        tokio::time::timeout(TEARDOWN_CAP + Duration::from_secs(1), acked)
+            .await
+            .expect("the close was not acknowledged in time")
+            .expect("the close was acknowledged");
+        tokio::time::sleep(PARKED_READY_POLL * 2).await;
+
+        assert_eq!(starts.started(), 1, "the held Connect started a node");
+        let events = drain(&mut evt_rx);
+        assert_eq!(
+            count(&events, |e| matches!(
+                e,
+                NetEvent::Connected | NetEvent::ConnectFailed { .. }
+            )),
+            0,
+            "{events:?}"
+        );
+        actor.abort();
+    }
+
+    /// A refused attach fails the Connect at once and shuts the node down off the
+    /// actor loop, so a close is acknowledged while that shutdown runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_attach_does_not_hold_the_actor() {
+        let starts = Starts::default();
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(|script| {
+            script.refuse_attach.store(true, Ordering::SeqCst);
+            *script.shutdown_delay.lock().unwrap() = Some(Duration::from_secs(120));
+        }));
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            count(&drain(&mut evt_rx), |e| matches!(
+                e,
+                NetEvent::ConnectFailed { .. }
+            )),
+            1,
+            "the refused attach was not reported at once"
+        );
+        let (ack, acked) = oneshot::channel();
+        cmd_tx
+            .send(NetCommand::GracefulClose { ack })
+            .expect("actor is running");
+        tokio::time::timeout(TEARDOWN_CAP + Duration::from_secs(1), acked)
+            .await
+            .expect("the close was not acknowledged in time")
+            .expect("the close was acknowledged");
+        assert_eq!(*starts.node(0).capped.lock().unwrap(), [false]);
+        actor.abort();
+    }
+
+    /// A readiness read of the first node that arrives after the second node has
+    /// parked is ignored: it neither connects the second node nor the first.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_read_of_a_replaced_node_is_ignored() {
+        let starts = Starts::default();
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(|script| {
+            script.hold_reads.store(true, Ordering::SeqCst);
+        }));
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(PARKED_FIRST_POLL + Duration::from_millis(100)).await;
+        assert_eq!(
+            starts.node(0).reads.load(Ordering::SeqCst),
+            1,
+            "control: no read in flight"
+        );
+        cmd_tx.send(NetCommand::StopDm).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(starts.started(), 2, "control: the second node did not park");
+
+        let first = starts.node(0);
+        first.ready.store(true, Ordering::SeqCst);
+        first.release_reads();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            connected_count(&drain(&mut evt_rx)),
+            0,
+            "a stale read connected a node"
+        );
+
+        let second = starts.node(1);
+        second.ready.store(true, Ordering::SeqCst);
+        tokio::time::sleep(PARKED_READY_POLL).await;
+        second.release_reads();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            connected_count(&drain(&mut evt_rx)),
+            1,
+            "the second node did not connect"
+        );
+        assert_eq!(
+            first.subscribes.load(Ordering::SeqCst),
+            0,
+            "the first node was used"
+        );
+        actor.abort();
+    }
+
+    /// A retry after a refused attach is refused while that node is still shutting down,
+    /// and starts the next node once the shutdown has completed.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_a_refused_attach_waits_for_its_shutdown() {
+        let starts = Starts::default();
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(|script| {
+            if script.index == 0 {
+                script.refuse_attach.store(true, Ordering::SeqCst);
+                *script.shutdown_delay.lock().unwrap() = Some(Duration::from_secs(30));
+            }
+        }));
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            previous_node_refusals(&drain(&mut evt_rx)),
+            1,
+            "the retry was not refused"
+        );
+        assert_eq!(
+            starts.started(),
+            1,
+            "the retry started before the node shut down"
+        );
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *starts.log.lock().unwrap(),
+            [("start", 0), ("shut down", 0), ("start", 1)]
+        );
+        actor.abort();
+    }
+
+    /// A retry after a failed readiness read is refused while that node is still shutting down,
+    /// and starts the next node once the shutdown has completed.
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_a_failed_read_waits_for_its_shutdown() {
+        let starts = Starts::default();
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(|script| {
+            if script.index == 0 {
+                script.fail_reads.store(true, Ordering::SeqCst);
+                *script.shutdown_delay.lock().unwrap() = Some(Duration::from_secs(30));
+            }
+        }));
+
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(PARKED_FIRST_POLL + Duration::from_millis(100)).await;
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            previous_node_refusals(&drain(&mut evt_rx)),
+            1,
+            "the retry was not refused"
+        );
+        assert_eq!(
+            starts.started(),
+            1,
+            "the retry started before the node shut down"
+        );
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *starts.log.lock().unwrap(),
+            [("start", 0), ("shut down", 0), ("start", 1)]
+        );
+        actor.abort();
+    }
+
+    /// A start Veilid refuses because a node is still running in the namespace fails
+    /// the Connect with its own reason and the remedy.
+    #[tokio::test(start_paused = true)]
+    async fn a_namespace_in_use_fails_the_connect_with_its_remedy() {
+        let seam: seams::StartNode = Arc::new(|| Err(VeilidNetError::NamespaceInUse));
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(seam);
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let reasons: Vec<String> = drain(&mut evt_rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                NetEvent::ConnectFailed { reason } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].contains("restart daemonseed"), "{reasons:?}");
+        assert!(
+            !reasons[0].contains("DAEMONSEED_VEILID_PORT"),
+            "{reasons:?}"
+        );
+        actor.abort();
+    }
+
+    /// A node still running in the namespace is reported as itself, with the remedy
+    /// and without the port-clash hint; another start failure on a listen address
+    /// keeps the hint.
+    #[test]
+    fn a_namespace_in_use_is_reported_without_the_port_hint() {
+        let in_use = start_failure(&VeilidNetError::NamespaceInUse, Some(":5150"));
+        assert!(in_use.contains("restart daemonseed"), "{in_use}");
+        assert!(!in_use.contains("DAEMONSEED_VEILID_PORT"), "{in_use}");
+        let other = start_failure(&VeilidNetError::Startup("boot".into()), Some(":5150"));
+        assert!(other.contains("DAEMONSEED_VEILID_PORT"), "{other}");
+    }
+
+    /// A stop that discards a parked node runs the commands that node held first:
+    /// they fail before a Connect sent after the stop is answered.
+    #[tokio::test(start_paused = true)]
+    async fn commands_held_by_a_discarded_node_run_before_the_next_connect() {
+        let starts = Starts::default();
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(|_| {}));
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drain(&mut evt_rx);
+        cmd_tx
+            .send(NetCommand::JoinCircle {
+                circle_id: 8,
+                phrase: "sent while waiting".to_owned(),
+            })
+            .expect("actor is running");
+        cmd_tx.send(NetCommand::StopDm).expect("actor is running");
+        cmd_tx.send(connect_command()).expect("actor is running");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let events = drain(&mut evt_rx);
+        let failed = events
+            .iter()
+            .position(|e| matches!(e, NetEvent::CircleJoinFailed { circle_id: 8, .. }))
+            .expect("the held join did not fail");
+        let answered = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    NetEvent::ConnectFailed { .. } | NetEvent::StillConnecting
+                )
+            })
+            .expect("the next Connect was not answered");
+        assert!(failed < answered, "{events:?}");
+        actor.abort();
+    }
+
+    /// A Connect's direct-messaging keys reach the runner start on the parked path:
+    /// with no profile root, the ready node reports messaging unavailable because
+    /// the store cannot open, which only a start that received the keys reports.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_connect_hands_its_dm_keys_to_the_runner_start() {
+        let starts = Starts::default();
+        let (cmd_tx, mut evt_rx, actor) = spawn_with_seam(starts.seam(|script| {
+            script.ready.store(true, Ordering::SeqCst);
+        }));
+        let identity =
+            derive_identity_keys(&Mnemonic::generate().expect("mnemonic"), Identity::Primary)
+                .expect("identity derives");
+        let keys = Some(Box::new(DmSessionKeys {
+            signing: Arc::new(identity.signing),
+            dm_channel_root: identity.dm_channel_root,
+            at_rest_key: zeroize::Zeroizing::new([0x5a; 32]),
+        }));
+        cmd_tx
+            .send(NetCommand::Connect {
+                display_handle: None,
+                rejoin_circles: Vec::new(),
+                republish_roots: Vec::new(),
+                stable_signing_key: None,
+                stable_share_root_ikm: None,
+                dm_session_keys: keys,
+                profile_root: None,
+                project_announce_seed: None,
+            })
+            .expect("actor is running");
+        tokio::time::sleep(PARKED_FIRST_POLL * 3).await;
+        let events = drain(&mut evt_rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                NetEvent::DmUnavailable(why) if why.cause() == DmUnavailableCause::StoreUnopened
+            )),
+            "{events:?}"
+        );
+        actor.abort();
     }
 }

@@ -102,6 +102,12 @@ pub enum NetCommand {
     /// Open a connection to `server_id` at `address`, in the given trust mode
     /// (C22), running TLS + APP_HELLO + identity-proof to Authenticated and
     /// keeping the live application session.
+    ///
+    /// Sent while an earlier Connect's node is still attaching, it is held and
+    /// replays once that node is ready, as a Connect on a connected session does. A
+    /// disconnect that ends that wait gets it refused with `ConnectFailed` asking to
+    /// try again, and a close drops it. Sent while a previous node is still shutting
+    /// down, it is refused the same way.
     Connect {
         server_id: String,
         address: String,
@@ -382,12 +388,15 @@ pub enum NetCommand {
     ///
     /// The actor forwards it to the runner's queue and folds nothing. A command
     /// arriving while no runner is running is answered with
-    /// `Refusal::ShuttingDown` rather than queued: a runner exists only between
-    /// a connect with a started node and the disconnect that stops it, and a
-    /// command held across that gap would act on a session the user has left.
+    /// `Refusal::ShuttingDown` rather than queued: a runner runs only from a
+    /// connect whose node is ready until the disconnect that stops it. A command
+    /// sent while a connect's node is not ready yet runs once the node is ready,
+    /// before its runner has started, so it is refused too.
     Dm(RunnerCommand),
     /// Stop the direct-messaging runner, as a disconnect does. It is stopped off
-    /// the actor loop, and a later connect starts another only after it ends.
+    /// the actor loop, and a later connect starts another only after it ends. A
+    /// connect still waiting for its node to become ready is abandoned and its
+    /// node shut down.
     StopDm,
 }
 
@@ -463,6 +472,13 @@ pub enum NetEvent {
         /// presented a new (undismissed) key.
         rotation_notice: Option<String>,
     },
+    /// The Veilid node is started and attaching, and the client waits for it to
+    /// become ready: still connecting, not failed. `Connected` follows once the node
+    /// is ready, or `ConnectFailed` if it cannot become ready. Neither follows when a
+    /// stop or a close abandons the connect. A Connect sent meanwhile replays once
+    /// the node is ready, is refused if a stop abandons the connect, and is dropped
+    /// if a close does.
+    StillConnecting,
     /// The connection attempt failed; `message` is a human-readable cause.
     ConnectFailed { message: String },
     /// (WB-5.1 / I5″.7, WB-ISC-20) The aggregate "presence may be stale" signal
@@ -716,7 +732,7 @@ pub enum NetEvent {
     /// fields it keeps.
     Dm(Arc<RunnerEvent>),
     /// The direct-messaging runner stopped. Nothing reports until a later
-    /// connect with a started node starts another.
+    /// connect whose node is ready starts another.
     DmStopped,
     /// Direct messaging cannot run on this connection: no runner started, or
     /// the last one ended with an error or panicked. Carries the cause the

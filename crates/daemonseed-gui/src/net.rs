@@ -112,6 +112,12 @@ pub enum NetCommand {
     /// live session; failures surface per-circle (`CircleError`, or
     /// `CircleJoinFailed` for a join that cannot succeed) and never abort the
     /// connect. Empty for the ephemeral / no-profile path.
+    ///
+    /// Sent while an earlier Connect's node is still attaching, it is held and
+    /// replays once that node is ready, as a Connect on a connected session does. A
+    /// stop that ends that wait gets it refused with `ConnectFailed` asking to try
+    /// again, and a close drops it. Sent while a previous node is still shutting
+    /// down, it is refused the same way.
     Connect {
         display_handle: Option<String>,
         rejoin_circles: Vec<(u64, String)>,
@@ -285,13 +291,15 @@ pub enum NetCommand {
     ///
     /// The actor forwards it to the runner's queue and folds nothing. A command
     /// arriving while no runner is running is answered with
-    /// `Refusal::ShuttingDown` rather than queued: a runner exists only between
-    /// a connect with a started node and the stop that ends it, and a command
-    /// held across that gap would act on a session the user has left.
+    /// `Refusal::ShuttingDown` rather than queued: a runner runs only from a
+    /// connect whose node is ready until the stop that ends it. A command sent
+    /// while a connect's node is not ready yet runs once the node is ready, before
+    /// its runner has started, so it is refused too.
     #[cfg_attr(not(test), allow(dead_code))]
     Dm(RunnerCommand),
     /// Stop the direct-messaging runner. It is stopped off the actor loop, and a
-    /// later connect starts another only after it ends.
+    /// later connect starts another only after it ends. A connect still waiting
+    /// for its node to become ready is abandoned and its node shut down.
     // No GUI action sends this yet; the actor handles it and the tests send it.
     #[cfg_attr(not(test), allow(dead_code))]
     StopDm,
@@ -342,10 +350,24 @@ pub enum NetEvent {
     /// past-TTL member visible on some roster. The UI surfaces a "presence may be
     /// stale" indicator while `stale` is true. Emitted only on a change.
     PresenceStale { stale: bool },
+    /// The Veilid node is started and attaching, and the client waits for it to
+    /// become ready: still connecting, not offline. `Connected` follows once the node
+    /// is ready, or `ConnectFailed` if it cannot become ready. Neither follows when a
+    /// stop or a close abandons the connect. A Connect sent meanwhile replays once
+    /// the node is ready, is refused if a stop abandons the connect, and is dropped
+    /// if a close does.
+    StillConnecting,
     /// The connection attempt failed; `reason` is human-readable.
     ConnectFailed { reason: String },
     /// A public room is subscribed and chat can flow.
     RoomJoined,
+    /// The Lobby's backlog has been read, whatever it found: the chat record by a
+    /// read that got an answer, and the presence record by any finished read. A
+    /// record whose subscribe failed or whose key did not resolve is not waited
+    /// for, and with neither waited for this is not sent. Sent at most once per
+    /// lobby subscription. On a quiet network no message or roster arrives, so this
+    /// is what closes the startup mask there.
+    LobbyBacklogRead,
     /// A message to render: a verified inbound frame, or a local echo of the
     /// user's own just-sent message. `mine` is true when `who == my_handle`.
     Message {
@@ -494,7 +516,7 @@ pub enum NetEvent {
     /// [`NetEvent`] is. The state layer reads through the `Arc`.
     Dm(std::sync::Arc<RunnerEvent>),
     /// The direct-messaging runner stopped. Nothing reports until a later
-    /// connect with a started node starts another.
+    /// connect whose node is ready starts another.
     DmStopped,
     /// Direct messaging cannot run on this connection: no runner started, or
     /// the last one ended with an error or panicked. Carries the cause the

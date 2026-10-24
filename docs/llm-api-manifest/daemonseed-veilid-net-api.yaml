@@ -57,7 +57,9 @@ constraints:
 
   - description: >-
       The node MUST be attached and public-internet-ready before any transport
-      operation — call `VeilidNetHandle::attach_and_wait` after `VeilidNet::start`.
+      operation: after `VeilidNet::start`, call `VeilidNetHandle::attach_and_wait`,
+      or call `VeilidNetHandle::attach` and poll `VeilidNetHandle::readiness` until
+      `public_internet_ready`.
     enforcement: runtime
     severity: error
 
@@ -337,6 +339,20 @@ types:
     module: daemonseed_veilid_net::actor
     kind: struct
     description: Entry point; `start` brings up the node and spawns the actor.
+  - name: Readiness
+    module: daemonseed_veilid_net::actor
+    kind: struct
+    description: One read of a node's attachment state, returned by VeilidNetHandle::readiness.
+    fields:
+      - name: public_internet_ready
+        type: bool
+        description: Whether the node is public-internet-ready, which gates every operation.
+      - name: reliable_peers
+        type: u32
+        description: Peers the node holds reliable connections to.
+      - name: live_peers
+        type: u32
+        description: Peers the node holds any live connection to.
   - name: VeilidNetHandle
     module: daemonseed_veilid_net::actor
     kind: struct
@@ -348,6 +364,28 @@ types:
       VeilidNetHandle::with_scripted_subscribes(script) builds a handle over no
       node whose circle and room subscribes answer from `script` per owner; every
       other command is dropped unanswered.
+  - name: ScriptedNode
+    module: daemonseed_veilid_net::actor
+    kind: struct
+    description: >-
+      Test-support only (`test-support` feature). A VeilidNetHandle over no node
+      whose answers a test scripts: on_subscribe, on_attach, on_readiness (gets the
+      reply sender) and on_shutdown (gets a ScriptedShutdown), then spawn() returns
+      the handle. Defaults: subscribes succeed, rendezvous keys resolve to
+      scripted_record_key, attach succeeds, readiness reports not ready with no
+      peers, shutdowns are answered at once. Its actor ends after a shutdown;
+      every other command is dropped unanswered.
+  - name: ScriptedShutdown
+    module: daemonseed_veilid_net::actor
+    kind: struct
+    description: Test-support only. A shutdown request a ScriptedNode received.
+    fields:
+      - name: cap_teardown
+        type: bool
+        description: Whether the caller asked for veilid's teardown to be cut off at TEARDOWN_CAP.
+      - name: reply
+        type: "oneshot::Sender<()>"
+        description: Answers the caller's shutdown; holding it keeps the caller waiting.
   - name: VeilidNetConfig
     module: daemonseed_veilid_net::config
     kind: struct
@@ -1187,7 +1225,27 @@ functions:
         description: Deadline for reaching public-internet-ready.
     returns:
       type: "Result<()>"
-      description: Ok when ready; NotReady on timeout.
+      description: Ok when ready; NotReady on timeout. After NotReady the node stays attached, and a second attach fails.
+  - name: VeilidNetHandle::attach
+    module: daemonseed_veilid_net::actor
+    description: >-
+      Start attaching the node and return once Veilid accepts the attach, without
+      waiting for readiness. Once per node; a second attach fails.
+    signature: "pub async fn attach(&self) -> Result<()>"
+    parameters: []
+    returns:
+      type: "Result<()>"
+      description: Ok once the attach has started; Attach if Veilid refuses it, Actor if the actor is gone.
+  - name: VeilidNetHandle::readiness
+    module: daemonseed_veilid_net::actor
+    description: >-
+      One read of the node's attachment state: whether it is public-internet-ready
+      now, and its reliable and live peer counts. Never attaches.
+    signature: "pub async fn readiness(&self) -> Result<Readiness>"
+    parameters: []
+    returns:
+      type: "Result<Readiness>"
+      description: The node's readiness and peer counts; Attach if the state cannot be read, Actor if the actor is gone.
   - name: VeilidNetHandle::new_inbound_route
     module: daemonseed_veilid_net::actor
     description: Allocate a private inbound route; the returned blob never exposes this node's id or IP.
@@ -1648,7 +1706,31 @@ functions:
         description: Bound on the flush. The caller's remaining GRACEFUL_CLOSE_BUDGET; pending chat and tombstones dispatch inside it, class-3/4/5 current-state writes are shed, and an overrun abandons to the TTL backstop.
     returns:
       type: "()"
-      description: Returns once the flush has completed or expired and the node has shut down.
+      description: Returns once the flush has completed or expired and the node has shut down, with veilid's teardown cut off at TEARDOWN_CAP.
+  - name: VeilidNetHandle::shutdown_to_completion
+    module: daemonseed_veilid_net::actor
+    description: Shuts the node down as shutdown does, but waits for veilid's teardown to finish with no cap. Unbounded; the caller bounds it.
+    signature: "pub async fn shutdown_to_completion(&self, flush_budget: Duration) -> bool"
+    parameters:
+      - name: flush_budget
+        type: Duration
+        direction: in
+        description: Bound on the write-scheduler flush, as for shutdown.
+    returns:
+      type: bool
+      description: true once the node's actor ran the shutdown and veilid's teardown completed, so the namespace is free; false when the actor was already gone or dropped the request.
+  - name: scripted_record_key
+    module: daemonseed_veilid_net::actor
+    description: Test-support only. The record key a ScriptedNode resolves an owner to, distinct per owner.
+    signature: "pub fn scripted_record_key(owner: &RendezvousOwner) -> RecordKey"
+    parameters:
+      - name: owner
+        type: "&RendezvousOwner"
+        direction: in
+        description: The record's owner.
+    returns:
+      type: RecordKey
+      description: A key built from the owner's public key.
 
   # ── config ───────────────────────────────────────────────────────────
   - name: VeilidNetConfig::protect_with_profile
@@ -2162,6 +2244,10 @@ error_types:
     variants:
       - name: Startup
         condition: veilid startup failed.
+      - name: NamespaceInUse
+        condition: Veilid refused to start because a node is still running in this namespace.
+      - name: Attach
+        condition: Attaching a started node, or reading its attachment state, failed.
       - name: NotReady
         condition: The node did not become public-internet-ready in time.
       - name: Routing
@@ -2255,7 +2341,7 @@ constants:
     module: daemonseed_veilid_net::actor
     type: Duration
     value: "Duration::from_secs(3)"
-    description: Cap on veilid's own teardown, and half a caller's bound on shutdown. flush_budget counts from the moment the actor dequeues Command::Shutdown, so a caller caps its await at flush_budget + TEARDOWN_CAP.
+    description: Cap on veilid's teardown in VeilidNetHandle::shutdown; VeilidNetHandle::shutdown_to_completion does not apply it.
   - name: APP_MESSAGE_CAP
     module: daemonseed_veilid_net::actor
     type: usize
@@ -2353,8 +2439,9 @@ constants:
 
 gotchas:
   - description: >-
-      Attach first. Every operation requires the node public-internet-ready —
-      call attach_and_wait after start; operations before then fail.
+      Attach first. Every operation requires the node public-internet-ready: after
+      start, call attach_and_wait, or attach and poll readiness until
+      public_internet_ready. Operations before then fail.
   - description: >-
       Node identity is EPHEMERAL (fresh per launch); content identity (the ML-DSA
       signing key) is stable. Share adverts are placed at a stable-share_id
