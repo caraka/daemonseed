@@ -1664,6 +1664,28 @@ fn size_to_record(
     .then(|| physical_to_logical_size(width, height, scale))
 }
 
+/// Whether a `Resized` event of `width` x `height` physical px brings the window
+/// back from minimized. On Windows a minimized window reports a zero size.
+/// `minimized` holds whether the previous `Resized` did, and is updated.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn restored_from_minimized(minimized: &Cell<bool>, width: u32, height: u32) -> bool {
+    let zero = width == 0 || height == 0;
+    minimized.replace(zero) && !zero
+}
+
+/// Make the next frame repaint the whole window.
+///
+/// The software renderer redraws only what changed since the last frame and
+/// presents only that region. Windows discards a minimized window's pixels, and a
+/// restore to the same size changes nothing the renderer tracks, so the restored
+/// window would show only the parts that change afterwards. Flipping
+/// `repaint-flip` changes a transparent element that covers the window, which
+/// marks the whole window as changed and alters no pixel.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
+fn repaint_whole_window(ui: &AppWindow) {
+    ui.set_repaint_flip(!ui.get_repaint_flip());
+}
+
 /// Give the window its main-screen size (see [`main_window_size`]), and return
 /// the size it was given. The window is already mapped, so a maximize request
 /// takes effect directly.
@@ -3222,6 +3244,8 @@ fn main() {
             // Set once a close is under way, so a second close request while the actor
             // finishes is ignored rather than sent again.
             let closing = Rc::new(Cell::new(false));
+            // Whether the last `Resized` was the zero size of a minimized window.
+            let minimized = Cell::new(false);
             // Polls the close's ack while the window stays open, so the event loop keeps
             // drawing and can show the closing message.
             let close_watch = Rc::new(Timer::default());
@@ -3239,6 +3263,11 @@ fn main() {
                         });
                     }
                     WindowEvent::Resized(sz) => {
+                        if restored_from_minimized(&minimized, sz.width, sz.height)
+                            && let Some(ui) = weak.upgrade()
+                        {
+                            repaint_whole_window(&ui);
+                        }
                         let screen = weak.upgrade().map(|ui| ui.get_screen()).unwrap_or_default();
                         let maximized = w.with_winit_window(|ww| ww.is_maximized());
                         let logical =
@@ -3784,12 +3813,23 @@ mod tests {
     /// stack overflows while the window is created. The platform is per thread, so
     /// that thread installs its own. A panic in `f` is raised again here.
     fn with_offscreen_window(f: impl FnOnce(AppWindow) + Send + 'static) {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, _| f(ui));
+    }
+
+    /// [`with_offscreen_window`] on a window of buffer type `buffer`, also handing
+    /// `f` the window so it can render frames.
+    fn with_offscreen_window_of(
+        buffer: RepaintBufferType,
+        f: impl FnOnce(AppWindow, Rc<MinimalSoftwareWindow>) + Send + 'static,
+    ) {
         let joined = std::thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
             .spawn(move || {
-                let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
-                let _ = slint::platform::set_platform(Box::new(GuiPlatform { window }));
-                f(AppWindow::new().expect("create AppWindow"));
+                let window = MinimalSoftwareWindow::new(buffer);
+                let _ = slint::platform::set_platform(Box::new(GuiPlatform {
+                    window: window.clone(),
+                }));
+                f(AppWindow::new().expect("create AppWindow"), window);
             })
             .expect("spawn the window thread")
             .join();
@@ -3810,6 +3850,63 @@ mod tests {
             set_initial_window_size(&ui, 1000, 600);
             assert_eq!(ui.get_preferred_window_width(), 1000.0);
             assert_eq!(ui.get_preferred_window_height(), 600.0);
+        });
+    }
+
+    /// A restore is the first non-zero size after a zero one. A zero width or a
+    /// zero height alone counts as minimized.
+    #[test]
+    fn a_restore_is_the_first_nonzero_size_after_a_zero_one() {
+        let minimized = Cell::new(false);
+        assert!(!restored_from_minimized(&minimized, W, H));
+        assert!(!restored_from_minimized(&minimized, 0, 0));
+        assert!(!restored_from_minimized(&minimized, 0, 0));
+        assert!(restored_from_minimized(&minimized, W, H));
+        assert!(!restored_from_minimized(&minimized, W, H));
+        assert!(!restored_from_minimized(&minimized, W, 0));
+        assert!(restored_from_minimized(&minimized, W, H));
+        assert!(!restored_from_minimized(&minimized, 0, H));
+        assert!(restored_from_minimized(&minimized, W, H));
+    }
+
+    /// On a reused buffer the renderer redraws only what changed, and only the
+    /// redrawn region is copied to the window. A frame with nothing changed
+    /// redraws nothing, so a window whose on-screen pixels Windows discarded while
+    /// minimized stays blank. After `repaint_whole_window` the next frame redraws
+    /// the whole window and draws exactly the pixels it had before. Clearing the
+    /// buffer between frames shows which pixels a frame redraws.
+    #[test]
+    fn repaint_whole_window_redraws_every_pixel_and_changes_none() {
+        with_offscreen_window_of(RepaintBufferType::ReusedBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            let mut buf = vec![Rgb565Pixel(0); (W * H) as usize];
+            let frame = |buf: &mut [Rgb565Pixel]| {
+                let mut region = None;
+                window.draw_if_needed(|r| region = Some(r.render(buf, W as usize)));
+                region.map(|r| r.bounding_box_size())
+            };
+            let full = slint::PhysicalSize::new(W, H);
+
+            assert_eq!(frame(&mut buf), Some(full), "the first frame draws it all");
+            let painted = buf.clone();
+            assert!(
+                painted.iter().any(|p| p.0 != 0),
+                "the first frame drew something"
+            );
+
+            // Control: with nothing changed, a frame redraws nothing.
+            buf.fill(Rgb565Pixel(0));
+            let idle = frame(&mut buf);
+            assert!(
+                idle.is_none_or(|s| s.width == 0 || s.height == 0),
+                "an idle frame drew {idle:?}"
+            );
+            assert!(buf != painted, "an idle frame restored the lost pixels");
+
+            repaint_whole_window(&ui);
+            assert_eq!(frame(&mut buf), Some(full), "the repaint covers the window");
+            assert!(buf == painted, "the repaint changed pixels");
         });
     }
 
