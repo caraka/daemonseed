@@ -167,7 +167,7 @@ mod tests {
     use super::*;
 
     fn ensure_module() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     /// Build a real server-id Handle and the matching presented prefix from a

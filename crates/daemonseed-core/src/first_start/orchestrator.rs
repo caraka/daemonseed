@@ -614,7 +614,7 @@ mod tests {
     use crate::storage::seeds;
 
     fn init_oxicrypt() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     fn fast_params() -> ArgonParams {

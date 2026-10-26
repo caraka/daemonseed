@@ -44,17 +44,17 @@
 //! a share announcement ([`crate::share_announce`]), or a sealed content frame
 //! ([`crate::share_seal`]) even under a coincidentally-equal key.
 
+use crate::oxi::Aes256Key;
 use daemonseed_proto::v1 as wire;
-use oxicrypt_aes::{Aes256Key, ModeError};
-use oxicrypt_module::Error as OxicryptError;
+use oxicrypt::Error as OxicryptError;
 use prost::Message;
 use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::key::{AeadKey256, COT_KEY_LEN, CircleKey};
 use crate::identity::keys::{SignKeypair, verify_signature};
+use crate::oxi::ml_dsa;
 use crate::public_room::PublicRoomKey;
-use oxicrypt_ml_dsa as ml_dsa;
 
 /// Domain-separation tag bound as AEAD additional-authenticated-data for the
 /// share-roll-call seal, distinct from [`crate::circle::message::MESSAGE_AAD`],
@@ -209,7 +209,7 @@ pub enum ShareRollCallError {
     /// The OS entropy source failed while drawing a nonce.
     EntropySource(getrandom::Error),
     /// A non-`TagMismatch` AEAD mode error.
-    Aead(ModeError),
+    Aead(oxicrypt::Error),
     /// AEAD authentication failed (wrong key, tampered ciphertext, swapped
     /// nonce, or wrong AAD). Carries no sub-cause.
     Authentication,
@@ -250,7 +250,7 @@ impl From<EnvelopeError> for ShareRollCallError {
             EnvelopeError::EntropySource(e) => Self::EntropySource(e),
             EnvelopeError::Encrypt(m) => Self::Aead(m),
             EnvelopeError::TooShort => Self::Truncated,
-            EnvelopeError::Decrypt(ModeError::TagMismatch) => Self::Authentication,
+            EnvelopeError::Decrypt(oxicrypt::Error::TagMismatch) => Self::Authentication,
             EnvelopeError::Decrypt(other) => Self::Aead(other),
         }
     }
@@ -263,12 +263,12 @@ mod tests {
     use crate::circle::message::{NONCE_LEN, TAG_LEN};
     use crate::crypto::suite::CNSA_2_0;
     use crate::identity::keys::SignKeypair;
+    use crate::oxi::gcm_encrypt;
     use crate::public_room::{DEFAULT_ROOM, derive_room_key};
     use crate::share_announce::{AnnouncementFields, open_announcement, seal_public_announcement};
-    use oxicrypt_aes::gcm_encrypt;
 
     fn requester(seed: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 
@@ -283,7 +283,7 @@ mod tests {
     /// Derive a public room key, initializing the crypto module first so each
     /// test stands alone (no cross-test ordering dependency).
     fn room_key(room: &str) -> PublicRoomKey {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         derive_room_key(room, &CNSA_2_0).unwrap()
     }
 
@@ -304,7 +304,7 @@ mod tests {
     /// tier-agnostic; only the key (and thus who can open) differs.
     #[test]
     fn seal_open_round_trip_under_circle_key() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let key = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let me = requester(8);
         let sealed = seal_circle_rollcall(&key, &me, &fields("a circle")).unwrap();

@@ -41,8 +41,8 @@
 //! [`ShareContent`]: share_serve::ShareContent
 //!
 //! Startup crypto-init shared with the frontends lives here too:
-//! [`kats`] assembles the CNSA 2.0 KATS slice for
-//! `oxicrypt_module::initialize_with_profile`.
+//! [`oxi`] holds the oxicrypt module and [`oxi::initialize_module`] brings it
+//! up.
 
 #![forbid(unsafe_code)]
 
@@ -66,9 +66,9 @@ pub mod identity;
 pub mod identity_proof;
 pub mod indexer;
 pub(crate) mod jitter;
-pub mod kats;
 pub mod kdf;
 pub mod mention;
+pub mod oxi;
 pub mod passphrase;
 pub mod presence;
 pub mod profile;

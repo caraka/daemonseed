@@ -1266,7 +1266,7 @@ async fn run_step(step: Step) {
         .and_then(|name| Boundary::from_name(&name))
         .expect("the boundary in the environment is one this file knows");
 
-    daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
+    daemonseed_core::oxi::initialize_module().expect("oxicrypt init");
 
     let mut result = StepResult::load(&role.result_path(&state));
     let resuming = result.has_done(step);
@@ -1976,7 +1976,7 @@ fn a_roles_advert_keys_survive_between_steps() {
     // The store seals its records, so the module has to be up before it opens.
     // Tolerated rather than asserted: another test in this binary may have
     // initialized it already, and a second call is not a failure of this one.
-    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let _ = daemonseed_core::oxi::initialize_module();
     let root = tempfile::tempdir().expect("a store directory");
     let first = {
         let store = Store::open(root.path().join("dm-flows"), &AT_REST).expect("the store opens");

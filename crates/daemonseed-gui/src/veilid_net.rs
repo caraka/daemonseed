@@ -6535,7 +6535,7 @@ mod tests {
     /// names it; the production fold passes `Whitelist::default()`, which names the
     /// project-announce key alone.
     fn test_signer() -> SignKeypair {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[0x42; 32]).unwrap()
     }
 
@@ -6646,7 +6646,7 @@ mod tests {
     }
 
     fn announcer(seed: u8) -> SignKeypair {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 
@@ -8352,7 +8352,7 @@ mod tests {
     fn a_reader_subscribes_on_the_baked_key_and_a_writer_on_its_own_seed() {
         // The seed derivation runs through the cryptographic module, which the binary
         // brings up on its own path; a test binary powers it on itself.
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let reader = announce_subscribe_owner(None);
         assert!(
             matches!(reader, RendezvousOwner::PublicOnly(_)),
@@ -8387,7 +8387,7 @@ mod tests {
     /// what `OperatorCredential::load` would hold if the build's baked keys were
     /// this seed's.
     fn test_credential() -> (ProjectAnnounceSeed, OperatorCredential) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let seed = ProjectAnnounceSeed::from_bytes([0x11; 32]);
         let signer = *seed.signing_keypair().unwrap().public_key();
         let owner = daemonseed_veilid_net::identity::rendezvous_owner_public_bytes(
@@ -8423,7 +8423,7 @@ mod tests {
     /// a reader, so the write sites and every later snapshot keep saying so.
     #[test]
     fn load_operator_role_reports_absence_silently_and_a_refusal_loudly() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let (evt_tx, mut evt_rx) = unbounded_channel();
 
         let mut shares = ShareState::new();
@@ -8533,7 +8533,7 @@ mod tests {
     /// derive the record's well-known owner seed.
     #[test]
     fn a_subscriber_never_keeps_the_operator_record_alive() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         push_announcement(&mut shares, "release", "v0.33.0 is out", 200);
@@ -8553,7 +8553,7 @@ mod tests {
     /// the write rate on the record is independent of how many announcements stand.
     #[test]
     fn the_keepalive_round_robins_one_slot_per_emission() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         let mut slots = vec![
@@ -8598,7 +8598,7 @@ mod tests {
     /// slot, so the assertion held for the bug it was written to catch.
     #[test]
     fn a_vanished_cursor_slot_resumes_at_the_next_key() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let mut shares = ShareState::new();
         shares.operator = Some(operator_space());
         let mut slots = [
@@ -8626,7 +8626,7 @@ mod tests {
 
     #[test]
     fn the_keepalive_excludes_the_mutable_motd() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         // No operator record → nothing to re-publish.
         assert!(next_operator_keepalive_item(&ShareState::new(), true, None).is_none());
         // Operator subscribed but empty → still None.
@@ -8691,7 +8691,7 @@ mod tests {
     /// its `circle_id` — the per-circle mirror of the lobby presence path.
     #[test]
     fn circle_heartbeat_folds_into_the_owning_circles_roster() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let phrase = "a shared circle passphrase for presence #77";
         let cot_key = derive_cot_key(phrase, &CNSA_2_0).unwrap();
         // A DISTINCT member (not us): shares.signing is None below, so the own-filter
@@ -8762,7 +8762,7 @@ mod tests {
     /// a release build.
     #[test]
     fn apply_operator_item_folds_a_verified_f17_motd() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let kp = test_signer();
         let artifact = sign_motd(&kp, "Welcome to daemonseed", 100).unwrap();
         let bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &artifact.encode_to_vec());
@@ -8809,7 +8809,7 @@ mod tests {
     /// and appears in the projected view's posts.
     #[test]
     fn apply_operator_item_folds_a_verified_f17_announcement() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let kp = test_signer();
         let artifact = sign_post(&kp, "release", "v0.33.0 is out", 200).unwrap();
         let addr = content_address(&artifact.signed_payload).unwrap();
@@ -8869,7 +8869,7 @@ mod tests {
     /// the search lands on the same post on every run.
     #[test]
     fn announcements_render_newest_first_not_in_content_hash_order() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let kp = test_signer();
         let (older_slot, older) = signed_post_in_slot(&kp, "maintenance", "posted first", 1_000);
         let (newer_slot, newer) = (0..64)
@@ -8923,7 +8923,7 @@ mod tests {
     /// the order total explicitly instead of resting on it.
     #[test]
     fn announcements_with_equal_timestamps_order_by_slot_key() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let kp = test_signer();
         let mut op = operator_space();
         let mut by_slot: Vec<(String, String)> = Vec::new();
@@ -8978,7 +8978,7 @@ mod tests {
     /// that authorized everything, would pass every positive test above.
     #[test]
     fn apply_operator_item_does_not_fold_a_signer_off_the_whitelist() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let stranger = SignKeypair::from_ml_dsa_seed(&[0x43; 32]).unwrap();
         let artifact = sign_motd(&stranger, "not the operator", 100).unwrap();
         let bytes = encode_operator_item(OPERATOR_ITEM_MOTD, &artifact.encode_to_vec());
@@ -9615,7 +9615,7 @@ mod tests {
 
     /// A fresh identity's direct-messaging keys.
     fn dm_test_identity() -> daemonseed_core::identity::keys::IdentityKeys {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         derive_identity_keys(&Mnemonic::generate().expect("mnemonic"), Identity::Primary)
             .expect("identity derives")
     }
@@ -10905,7 +10905,7 @@ mod tests {
 
     /// The chat rendezvous-owner seed of the circle `phrase` names.
     fn circle_seed(phrase: &str) -> [u8; 32] {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         *derive_circle_veilid_owner_seed(phrase, &CNSA_2_0)
             .expect("owner seed derives")
             .as_bytes()
@@ -11627,7 +11627,7 @@ mod repair_notice_tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     fn lobby_seeds() -> ([u8; 32], [u8; 32]) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         (
             *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
@@ -12056,7 +12056,7 @@ mod lobby_refusal_tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     fn room_key() -> PublicRoomKey {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         derive_room_key(DEFAULT_ROOM, &CNSA_2_0).expect("room key derives")
     }
 
@@ -12143,7 +12143,7 @@ mod derivation_refusal_tests {
     /// user. The same call with the real derivation subscribes, so the count can move.
     #[tokio::test]
     async fn a_failed_lobby_derivation_subscribes_and_stores_nothing() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let (handle, subscribes) = recording();
         let net = Some(handle);
         let mut shares = ShareState::new();
@@ -12177,7 +12177,7 @@ mod derivation_refusal_tests {
     /// the reason. The same call with the real derivation joins.
     #[tokio::test]
     async fn a_failed_circle_derivation_subscribes_and_stores_nothing() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let (handle, subscribes) = recording();
         let net = Some(handle);
         let mut circles = Vec::new();
@@ -12225,7 +12225,7 @@ mod derivation_refusal_tests {
     /// Each circle derivation refuses the join with its own reason.
     #[test]
     fn every_circle_derivation_failure_refuses_the_join() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let key = || derive_cot_key("refusal phrase", &CNSA_2_0).expect("key derives");
         let fail = || Err::<[u8; 32], String>("hkdf".to_owned());
         let reason = |keys: Result<CircleKeys, String>| match keys {
@@ -12374,7 +12374,7 @@ mod parked_connect_tests {
         script: &Script,
         tail: ConnectTail,
     ) -> (ParkedConnect, UnboundedSender<VeilidNetEvent>) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let (ev_tx, events) = unbounded_channel();
         (
             ParkedConnect::new(script.node().spawn(), events, tail),
@@ -12664,7 +12664,7 @@ mod parked_connect_tests {
     /// as one whose attach failed does.
     #[tokio::test(start_paused = true)]
     async fn a_failed_readiness_read_fails_the_connect() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let script = Script::default();
         let handle = script
             .node()
@@ -13081,7 +13081,7 @@ mod parked_connect_tests {
     }
 
     fn lobby_seeds() -> ([u8; 32], [u8; 32]) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let chat = *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
             .expect("chat seed")
             .as_bytes();
@@ -13279,7 +13279,7 @@ mod parked_connect_tests {
         UnboundedReceiver<NetEvent>,
         tokio::task::JoinHandle<()>,
     ) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (evt_tx, evt_rx) = unbounded_channel();
         let own = cmd_tx.clone();

@@ -1002,7 +1002,7 @@ async fn run_step(step: Step) {
         step.label()
     );
 
-    daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
+    daemonseed_core::oxi::initialize_module().expect("oxicrypt init");
     let started = Instant::now();
 
     let keys = identity_of(role, &state);
@@ -1784,7 +1784,7 @@ fn the_end_state_check_catches_each_way_attribution_can_fail() {
 fn an_opening_claiming_another_writer_does_not_verify() {
     // Tolerated rather than asserted: another test in this binary may have
     // initialized the module already.
-    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let _ = daemonseed_core::oxi::initialize_module();
     let derive = || {
         derive_identity_keys(
             &Mnemonic::generate().expect("the operating system's generator"),

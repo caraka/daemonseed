@@ -664,7 +664,7 @@ export component AppWindow inherits Window {
     in property <int> main-pane: 0;
     in property <[DmRailRowData]> dm-rows;
     // How far the rooms list and the Direct messages list are scrolled: each
-    // list's viewport-y, 0 at the top and negative once scrolled down.
+    // list's content-y, 0 at the top and negative once scrolled down.
     out property <length> chats-list-offset;
     out property <length> dm-list-offset;
     in property <string> dm-header-label;
@@ -733,7 +733,7 @@ export component AppWindow inherits Window {
     in property <string> download-label;
     in property <float> download-progress: 0.0;
     in-out property <string> draft;           // live composer text, read by Rust on switch
-    in-out property <length> scroll-y: 0px;   // Flickable viewport-y (negative when scrolled)
+    in-out property <length> scroll-y: 0px;   // Flickable content-y (negative when scrolled)
     // #84/#86: the chat transcript's real laid-out content height, pushed up from inside
     // the chat Flickable. Bubbles are variable-height since #86, so a fixed per-message
     // stride no longer measures the content; 0px until the chat tab first instantiates.
@@ -1047,9 +1047,9 @@ export component AppWindow inherits Window {
                     min-height: 54px;
                     preferred-height: chats-list.preferred-height;
                     max-height: chats-list.preferred-height;
-                    viewport-width: self.width;
-                    viewport-height: chats-list.preferred-height;
-                    changed viewport-y => { root.chats-list-offset = self.viewport-y; }
+                    content-width: self.width;
+                    content-height: chats-list.preferred-height;
+                    changed content-y => { root.chats-list-offset = self.content-y; }
                     chats-list := VerticalLayout {
                         spacing: 4px; alignment: start;
                         for c[i] in root.circles : RailRow {
@@ -1118,8 +1118,8 @@ export component AppWindow inherits Window {
                             dm-notice-detail-scroll := Flickable {
                                 x: 6px; y: 4px;
                                 width: parent.width - 12px; height: parent.height - 8px;
-                                viewport-width: self.width;
-                                viewport-height: dm-notice-detail-input.preferred-height;
+                                content-width: self.width;
+                                content-height: dm-notice-detail-input.preferred-height;
                                 dm-notice-detail-input := TextInput {
                                     width: dm-notice-detail-scroll.width;
                                     text: root.dm-notice-detail;
@@ -1139,9 +1139,9 @@ export component AppWindow inherits Window {
                 if root.dms-open : Flickable {
                     preferred-height: max(dm-list.preferred-height, 40px);
                     max-height: max(dm-list.preferred-height, 40px);
-                    viewport-width: self.width;
-                    viewport-height: dm-list.preferred-height;
-                    changed viewport-y => { root.dm-list-offset = self.viewport-y; }
+                    content-width: self.width;
+                    content-height: dm-list.preferred-height;
+                    changed content-y => { root.dm-list-offset = self.content-y; }
                     dm-list := VerticalLayout {
                         spacing: 2px; alignment: start;
                         for r in root.dm-rows : DmRailRowView {
@@ -1303,12 +1303,12 @@ export component AppWindow inherits Window {
                         chat-area := Rectangle {
                             // CHAT — message list
                             if root.main-pane == 0 && root.active-tab == 0 : Flickable {
-                                viewport-width: self.width;
+                                content-width: self.width;
                                 // #86: real laid-out content height (variable-height bubbles),
                                 // not a fixed per-message stride. Mirrored into root.chat-content-h
                                 // so the #84 at-bottom test can use it (root can't see into this `if`).
-                                viewport-height: chat-content.preferred-height;
-                                viewport-y <=> root.scroll-y;
+                                content-height: chat-content.preferred-height;
+                                content-y <=> root.scroll-y;
                                 property <length> content-h: chat-content.preferred-height;
                                 init => { root.chat-content-h = self.content-h; }
                                 changed content-h => { root.chat-content-h = self.content-h; }
@@ -1345,8 +1345,8 @@ export component AppWindow inherits Window {
                                     border-radius: 10px; background: #0b0c0e; border-width: 1px; border-color: #ffffff10;
                                     Flickable {
                                         width: 100%; height: 100%;
-                                        viewport-width: self.width;
-                                        viewport-height: root.share-rows.length * 30px + 12px;
+                                        content-width: self.width;
+                                        content-height: root.share-rows.length * 30px + 12px;
                                         VerticalLayout {
                                             padding: 6px; alignment: start;
                                             for r in root.share-rows : ShareTreeRow {
@@ -1410,8 +1410,8 @@ export component AppWindow inherits Window {
                                     border-radius: 10px; background: #0b0c0e; border-width: 1px; border-color: #ffffff10;
                                     Flickable {
                                         width: 100%; height: 100%;
-                                        viewport-width: self.width;
-                                        viewport-height: ann-list.preferred-height;
+                                        content-width: self.width;
+                                        content-height: ann-list.preferred-height;
                                         ann-list := VerticalLayout {
                                             padding: 8px; spacing: 8px; alignment: start;
                                             for a in root.announcements : AnnouncementRowView {
@@ -1497,10 +1497,10 @@ export component AppWindow inherits Window {
                             // The selected direct-message thread, oldest first. It follows
                             // the newest message whenever the thread grows.
                             if root.main-pane == 3 : Flickable {
-                                viewport-width: self.width;
-                                viewport-height: dm-thread.preferred-height;
-                                init => { self.viewport-y = min(0px, self.height - self.viewport-height); }
-                                changed viewport-height => { self.viewport-y = min(0px, self.height - self.viewport-height); }
+                                content-width: self.width;
+                                content-height: dm-thread.preferred-height;
+                                init => { self.content-y = min(0px, self.height - self.content-height); }
+                                changed content-height => { self.content-y = min(0px, self.height - self.content-height); }
                                 dm-thread := VerticalLayout {
                                     padding: 16px; spacing: 8px; alignment: start;
                                     for m in root.dm-messages : DmBubble { msg: m; }
@@ -1649,8 +1649,8 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     Flickable {
                         width: 100%; height: 100%;
-                        viewport-width: self.width;
-                        viewport-height: root.roster.length * 46px + 8px;
+                        content-width: self.width;
+                        content-height: root.roster.length * 46px + 8px;
                         VerticalLayout {
                             padding: 2px; spacing: 2px; alignment: start;
                             for r[i] in root.roster : RosterRowView {
@@ -2218,8 +2218,8 @@ export component AppWindow inherits Window {
                 border-radius: 10px; background: #0b0c0e; border-width: 1px; border-color: #ffffff10;
                 Flickable {
                     width: 100%; height: 100%;
-                    viewport-width: self.width;
-                    viewport-height: root.my-shares.length * 40px + 12px;
+                    content-width: self.width;
+                    content-height: root.my-shares.length * 40px + 12px;
                     VerticalLayout {
                         padding: 6px; alignment: start;
                         for s in root.my-shares : Rectangle {

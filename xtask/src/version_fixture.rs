@@ -97,7 +97,9 @@ impl Tree {
     /// commit.
     pub fn git_tag(&self, tag: &str) {
         let git = |args: &[&str]| {
-            let status = Command::new("git")
+            let mut cmd = Command::new("git");
+            crate::git_env::without_repo_env(&mut cmd);
+            let status = cmd
                 .arg("-C")
                 .arg(self.root())
                 .args([
@@ -111,9 +113,6 @@ impl Tree {
                     "tag.gpgsign=false",
                 ])
                 .args(args)
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_INDEX_FILE")
                 .status()
                 .expect("spawn git");
             assert!(status.success(), "git {args:?} failed");

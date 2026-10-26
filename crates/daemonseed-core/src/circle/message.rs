@@ -108,12 +108,12 @@ mod tests {
     use crate::crypto::suite::CNSA_2_0;
 
     fn key(phrase: &str) -> CircleKey {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         derive_cot_key(phrase, &CNSA_2_0).unwrap()
     }
 
     fn sender(seed: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 

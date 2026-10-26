@@ -10,6 +10,8 @@
 #   - rustup with the x86_64-unknown-linux-gnu target
 #   - cargo-zigbuild + zig   (the cross-linker that pins the glibc floor)
 #   - appimagetool           (on PATH; assembles the AppDir into the .AppImage)
+#   - network access on the first build, to fetch the pinned oxicrypt library
+#     (cached under target/oxicrypt-ffi/ afterwards)
 # No imagemagick is needed: the app icon is a scalable SVG.
 #
 # Usage:
@@ -39,8 +41,13 @@ command -v zig >/dev/null || die "zig not found"
 [ -n "${APPIMAGETOOL}" ] || die "appimagetool not found on PATH (set APPIMAGETOOL=...)"
 rustup target list --installed 2>/dev/null | grep -qx "${TARGET}" || die "rust target ${TARGET} not installed (rustup target add ${TARGET})"
 
+# The signed oxicrypt library the binary links, fetched at the pinned release.
+# shellcheck source=../lib/oxicrypt-ffi.sh
+. "${HERE}/../lib/oxicrypt-ffi.sh"
+oxicrypt_prepare "${REPO_ROOT}" || die "could not prepare the oxicrypt library"
+
 log "building ${BIN} (release, --features \"desktop\") for ${ZIG_TARGET}"
-cargo zigbuild --release --locked \
+RUSTFLAGS="$(oxicrypt_rustflags)" cargo zigbuild --release --locked \
   -p "${BIN}" --features "desktop" \
   --target "${ZIG_TARGET}"
 
@@ -57,31 +64,13 @@ mkdir -p "${APPDIR}/usr/bin" \
 
 install -m 0755 "${BIN_PATH}"                       "${APPDIR}/usr/bin/${BIN}"
 
-# The oxicrypt module verifies its own image before it will do any work, so an
-# unsigned binary never reaches `Operational` and the app dies at init with
-# "crypto module init failed". `oxicrypt-integrity-sign` computes HMAC-SHA-256
-# over the artifact's loader-invariant extent and writes the range table and MAC
-# into a reserved slot inside it.
-#
-# **Signed here, on the AppDir copy, and nowhere earlier.** Anything that
-# rewrites the file after signing invalidates the slot — a strip, a compressor,
-# a platform signing tool. `install` above copies bytes verbatim and
-# appimagetool below embeds this ELF without rewriting it, so this is the last
-# point at which the shipped bytes exist as a file. The binary left in
-# `target/` stays unsigned on purpose: it is the dev-run artifact, and tests
-# initialize the module through the unsigned-test-binary path instead.
-#
-# The signer is a build tool outside the cryptographic boundary, linked into
-# nothing that ships, resolved by `packaging/lib/sign.sh` from the same pin as
-# the runtime it must agree with.
-# The signer is resolved from the registry at the version this workspace pins,
-# so the tool that writes the slot and the runtime that reads it cannot drift.
-# shellcheck source=../lib/sign.sh
-. "${HERE}/../lib/sign.sh"
-SIGNER_BIN="$(resolve_signer "${REPO_ROOT}")" || die "could not resolve the integrity signer"
-
-log "signing the module image"
-sign_artifact "${SIGNER_BIN}" "${APPDIR}/usr/bin/${BIN}" || die "integrity signing failed or the slot did not verify"
+# The library ships unchanged in usr/lib, where the binary's RUNPATH
+# ($ORIGIN/../lib) finds it; it verifies its own signature when initialised.
+log "bundling ${OXICRYPT_SONAME}"
+oxicrypt_bundle "${APPDIR}/usr/lib" || die "could not bundle ${OXICRYPT_SONAME}"
+MAX_GLIBC="$(oxicrypt_check_glibc "${GLIBC_FLOOR}" "${APPDIR}/usr/bin/${BIN}" "${APPDIR}/usr/lib/${OXICRYPT_SONAME}")" \
+  || die "glibc floor check failed"
+log "glibc floor ok (max symbol GLIBC_${MAX_GLIBC} <= ${GLIBC_FLOOR})"
 install -m 0755 "${HERE}/AppRun"                    "${APPDIR}/AppRun"
 install -m 0644 "${HERE}/${BIN}.desktop"            "${APPDIR}/${BIN}.desktop"
 install -m 0644 "${HERE}/${BIN}.desktop"            "${APPDIR}/usr/share/applications/${BIN}.desktop"

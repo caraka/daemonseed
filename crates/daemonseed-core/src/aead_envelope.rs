@@ -40,7 +40,7 @@
 //! surface: the `TagMismatch` → `Authentication` and the too-short →
 //! `Truncated` mappings are preserved exactly.
 
-use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
+use crate::oxi::{Aes256Key, gcm_decrypt, gcm_encrypt};
 
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 
@@ -80,7 +80,7 @@ pub(crate) fn seal_envelope(
 /// Returns the recovered plaintext, which the caller must zeroize after decoding
 /// (this helper allocates it but does not zeroize on the returned/`Ok` path — it
 /// hands ownership back). A wrong key or wrong `aad` fails as
-/// [`EnvelopeError::Decrypt`] carrying [`ModeError::TagMismatch`].
+/// [`EnvelopeError::Decrypt`] carrying [`oxicrypt::Error::TagMismatch`].
 pub(crate) fn open_envelope(
     key: &Aes256Key,
     aad: &[u8],
@@ -111,13 +111,13 @@ pub(crate) enum EnvelopeError {
     /// The OS entropy source failed while drawing a nonce.
     EntropySource(getrandom::Error),
     /// AES-256-GCM encryption failed (a non-authentication mode error).
-    Encrypt(ModeError),
+    Encrypt(oxicrypt::Error),
     /// The sealed buffer is shorter than `nonce ‖ tag`.
     TooShort,
-    /// AES-256-GCM decryption failed. [`ModeError::TagMismatch`] is the
+    /// AES-256-GCM decryption failed. [`oxicrypt::Error::TagMismatch`] is the
     /// authentication failure (wrong key / tampered ciphertext / swapped nonce /
     /// wrong AAD); other variants are non-authentication mode errors.
-    Decrypt(ModeError),
+    Decrypt(oxicrypt::Error),
 }
 
 #[cfg(test)]
@@ -125,7 +125,7 @@ mod tests {
     use super::*;
 
     fn key() -> Aes256Key {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         Aes256Key::new(&[7u8; 32]).unwrap()
     }
 
@@ -189,7 +189,7 @@ mod tests {
         let pt = b"aad separation".to_vec();
         let sealed = seal_envelope(&k, AAD_A, &pt).unwrap();
         match open_envelope(&k, AAD_B, &sealed) {
-            Err(EnvelopeError::Decrypt(ModeError::TagMismatch)) => {}
+            Err(EnvelopeError::Decrypt(oxicrypt::Error::TagMismatch)) => {}
             other => panic!("expected Decrypt(TagMismatch), got {other:?}"),
         }
     }

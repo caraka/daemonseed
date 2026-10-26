@@ -4811,7 +4811,7 @@ mod tests {
     }
 
     fn announcer(seed: u8) -> SignKeypair {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 
@@ -6319,7 +6319,7 @@ mod tests {
         records: EmptyRecords,
         config: RunnerConfig,
     ) -> RunnerHandle {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let identity =
             derive_identity_keys(&Mnemonic::generate().expect("mnemonic"), Identity::Primary)
                 .expect("identity derives");
@@ -6844,7 +6844,7 @@ mod tests {
     async fn a_runner_not_started_reports_why() {
         let profile = tempfile::tempdir().expect("tempdir");
         let (evt_tx, mut evt_rx) = unbounded_channel();
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let keys = || {
             let identity =
                 derive_identity_keys(&Mnemonic::generate().expect("mnemonic"), Identity::Primary)
@@ -7400,7 +7400,7 @@ mod repair_notice_tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     fn lobby_seeds() -> ([u8; 32], [u8; 32]) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         (
             *derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0)
                 .unwrap()
@@ -7778,7 +7778,7 @@ mod lobby_refusal_tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     fn room_key() -> PublicRoomKey {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         derive_room_key(DEFAULT_ROOM, &CNSA_2_0).expect("room key derives")
     }
 
@@ -7865,7 +7865,7 @@ mod derivation_refusal_tests {
     /// user. The same call with the real derivation subscribes, so the count can move.
     #[tokio::test]
     async fn a_failed_lobby_derivation_subscribes_and_stores_nothing() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let (handle, subscribes) = recording();
         let net = Some(handle);
         let mut shares = ShareState::new();
@@ -7899,7 +7899,7 @@ mod derivation_refusal_tests {
     /// id, and reports the reason. The same call with the real derivation joins.
     #[tokio::test]
     async fn a_failed_circle_derivation_subscribes_and_stores_nothing() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let (handle, subscribes) = recording();
         let net = Some(handle);
         let mut circles = Vec::new();
@@ -7943,7 +7943,7 @@ mod derivation_refusal_tests {
     /// Each circle derivation refuses the join with its own reason.
     #[test]
     fn every_circle_derivation_failure_refuses_the_join() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let key = || derive_cot_key("refusal phrase", &CNSA_2_0).expect("key derives");
         let fail = || Err::<[u8; 32], String>("hkdf".to_owned());
         let reason = |circle: Result<VeilidCircle, String>| match circle {
@@ -8089,7 +8089,7 @@ mod parked_connect_tests {
     /// A parked Connect over a scripted node, and the sender of its event stream,
     /// which the caller keeps open as a node does.
     fn parked() -> (ParkedConnect, Script, UnboundedSender<VeilidNetEvent>) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let script = Script::default();
         let (ev_tx, events) = unbounded_channel();
         (
@@ -8310,7 +8310,7 @@ mod parked_connect_tests {
     /// as one whose attach failed does.
     #[tokio::test(start_paused = true)]
     async fn a_failed_readiness_read_fails_the_connect() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let script = Script::default();
         let handle = script
             .node()
@@ -8752,7 +8752,7 @@ mod parked_connect_tests {
         UnboundedReceiver<NetEvent>,
         tokio::task::JoinHandle<()>,
     ) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (evt_tx, evt_rx) = unbounded_channel();
         let own = cmd_tx.clone();

@@ -43,7 +43,7 @@ fn node_config(port: &str, dir: &std::path::Path) -> VeilidNetConfig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "attaches to the public Veilid network; opt-in, run with --ignored"]
 async fn public_share_content_crosses_app_call() {
-    daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
+    daemonseed_core::oxi::initialize_module().expect("oxicrypt init");
 
     let base = std::env::temp_dir().join("daemonseed-veilid-net-share-it");
     let _ = std::fs::remove_dir_all(&base);

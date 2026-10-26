@@ -20,7 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use oxicrypt_ml_dsa as ml_dsa;
+use crate::oxi::ml_dsa;
 
 const RELEASE_ANCHOR_TOML_SRC: &str = include_str!("release_anchor.toml");
 
@@ -177,7 +177,7 @@ mod tests {
     }
 
     fn a_keypair(seed_byte: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed_byte; 32]).unwrap()
     }
 

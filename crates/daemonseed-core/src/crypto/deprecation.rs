@@ -34,8 +34,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use crate::oxi::ml_dsa;
 use daemonseed_proto::v1 as wire;
-use oxicrypt_ml_dsa as ml_dsa;
 use prost::Message;
 
 use crate::crypto::suite::{SuiteId, SuiteIdError};
@@ -379,7 +379,7 @@ mod tests {
     const HOUR_MS: i64 = 3_600_000;
 
     fn keypair() -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[7u8; 32]).unwrap()
     }
 

@@ -41,7 +41,7 @@ What is private and what is not:
 - **The Lobby, public shares, announcements and the message of the day are open by design.** They are encrypted in transit, but with a key anyone can derive, so anyone can read them. They carry no confidentiality.
 - **Your identity is a key pair derived from the 24-word recovery phrase.** The phrase is the root of recovery; the only copy on disk is encrypted under your passphrase, alongside your keys and private state.
 
-Cryptography follows the CNSA 2.0 suite (ML-DSA-87 signatures, ML-KEM-1024 key encapsulation, AES-256-GCM, SHA-384) through the [oxicrypt](https://github.com/oxiforge/oxicrypt) crates. The crypto module checks its own binary image against a signature slot before it does any work, and refuses to run if the check fails.
+Cryptography follows the CNSA 2.0 suite (ML-DSA-87 signatures, ML-KEM-1024 key encapsulation, AES-256-GCM, SHA-384) through [oxicrypt](https://github.com/oxiforge/oxicrypt). Its cryptographic module is oxicrypt's signed shared library, shipped beside the daemonseed binary unchanged; when it starts, the library verifies its own signature against oxicrypt's release key and runs its self-tests, and no cryptographic operation runs if either fails.
 
 Not yet in place: the release-signing keys that would let a client verify an update against a published trust anchor (the trust anchor ships with an empty key set), reproducible builds, package-manager or app-store distribution, biometric unlock and start-on-login. Encrypted sharing inside a circle is shown in the app as coming soon. Presence beacons are a constant length, but chat messages are not padded in length or timing. Because public room addresses can be derived by anyone, an observer can tell that a client is subscribed to a known public room and can read what is posted there; circle addresses, circle messages and direct messages stay opaque. The full set of guarantees, each with the test that would show it broken, is the design contract in `ISA.md`.
 
@@ -49,11 +49,10 @@ Not yet in place: the release-signing keys that would let a client verify an upd
 
 ```sh
 packaging/appimage/build-appimage.sh   # Linux desktop app → dist/daemonseed-gui-x86_64.AppImage
-packaging/windows/build-windows.sh     # Windows desktop app → dist/daemonseed-gui.exe
-packaging/tui/build-tui.sh             # Linux terminal app → dist/daemonseed-tui-x86_64
+packaging/tui/build-tui.sh             # Linux terminal app → dist/daemonseed-tui-x86_64, with liboxicrypt_ffi.so.1 beside it
 ```
 
-A plain `cargo build` binary refuses to start: the crypto module's self-check fails on an unsigned image and the process exits with `Module image integrity`. The packaging scripts sign the binary as their last step, so what they produce runs. `BUILD.md` lists the toolchain (Rust pinned by `rust-toolchain.toml`, `cargo-zigbuild` and `zig`, `protoc`, Wayland headers), how to sign a hand-built binary, and how to run two clients on one machine. `packaging/appimage/README.md` covers the AppImage recipe.
+Both scripts fetch oxicrypt's signed library (`scripts/fetch-oxicrypt-ffi.sh`, which checks a pinned sha256) and ship it with the binary. A `cargo build` needs that library too: `cargo run` and `cargo test` find it on Linux, while a binary started directly from `target/` needs it on the loader path. The Windows desktop app builds on Windows with the MSVC toolchain. `BUILD.md` lists the toolchain (Rust pinned by `rust-toolchain.toml`, `cargo-zigbuild` and `zig`, `protoc`, Wayland headers), the Windows build, how releases are built and staged, and how to run two clients on one machine. `packaging/appimage/README.md` covers the AppImage recipe.
 
 ## Contributing
 

@@ -1,2 +1,21 @@
 [alias]
 xtask = "run --package xtask --"
+
+# The signed oxicrypt shared library the `oxicrypt` crate links. Fetch it with
+# `scripts/fetch-oxicrypt-ffi.sh`, which unpacks into this directory after
+# checking the pinned sha256. The fingerprint is that of oxicrypt's release
+# integrity key; `oxicrypt::Module::init` refuses a library signed with any
+# other. This line is the one definition of the pin: the release workflow
+# reads it with `scripts/oxicrypt-fingerprint.sh`. Set either variable in the
+# environment to override it, as the Windows build does for the library
+# directory.
+[env]
+OXICRYPT_LIB_DIR = { value = "target/oxicrypt-ffi/v0.26.0/linux-x86_64", relative = true }
+OXICRYPT_LIB_FINGERPRINT = "sha256:ef4ff23cd2cdd5c9aa97576f928e874b149017485b3a0e74e45aee1155f248fe"
+
+# Cargo adds to the loader's search path only the library directories under
+# its own build output, which this directory is not, so the programs cargo
+# runs (`cargo test`, `cargo run`) are started with OXICRYPT_LIB_DIR prepended
+# to LD_LIBRARY_PATH. Nothing is written into the binaries.
+[target.'cfg(target_os = "linux")']
+runner = ["sh", "-c", 'LD_LIBRARY_PATH="$OXICRYPT_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" exec "$0" "$@"']

@@ -584,7 +584,7 @@ impl NetHandle {
     /// [`tokio::task::LocalSet`]) and the actor loop.
     ///
     /// Caller contract: the oxicrypt module must be `Operational` before a
-    /// `Connect` is sent (the binary drives `initialize_with_profile` at
+    /// `Connect` is sent (the binary calls `oxi::initialize_module` at
     /// startup; the in-process test drives it too). Building the channels +
     /// thread itself has no such dependency, so `new` is infallible beyond the
     /// OS thread spawn.
@@ -810,7 +810,7 @@ mod tests {
     /// independently-spelled core call (same inputs the actor's `join_room` uses).
     #[test]
     fn lobby_asset_address_is_canonical() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         // The address the actor's join_room computes (DEFAULT_ROOM, server_id bytes).
         let key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         let gui_addr = room_asset_address(&key, SERVER_ID.as_bytes()).unwrap();
@@ -837,7 +837,7 @@ mod tests {
     /// proven by the round-trip below (a wrong derivation lands on a dead asset).
     #[test]
     fn share_asset_address_is_canonical() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let share_id: &[u8] = b"9f3c1a77b2e04d6680aa1c2d3e4f5061";
         let server = SERVER_ID.as_bytes();
         let addr = public_share_asset_address(share_id, server).unwrap();
@@ -864,7 +864,7 @@ mod tests {
     fn non_member_cannot_decrypt() {
         use daemonseed_core::identity::keys::SignKeypair;
         use daemonseed_core::public_room::{open_room_message, seal_room_message};
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let lobby = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         let other = derive_room_key("a-room-no-member-joined", &CNSA_2_0).unwrap();
         let sender = SignKeypair::from_ml_dsa_seed(&[3u8; 32]).unwrap();
@@ -899,7 +899,7 @@ mod tests {
     /// would pass them; this nails the derivation itself.
     #[test]
     fn circle_asset_address_is_canonical() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         // The address handle_join_circle computes (derive_cot_key → asset_address).
         let key = derive_cot_key(CIRCLE_PHRASE, &CNSA_2_0).unwrap();
         let gui_addr = asset_address(&key, SERVER_ID.as_bytes()).unwrap();
@@ -927,7 +927,7 @@ mod tests {
     /// drops silently (the `if let Ok(..)` arm). Uses the core seal/open the actor uses.
     #[test]
     fn non_member_cannot_decrypt_circle() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let member = derive_cot_key(CIRCLE_PHRASE, &CNSA_2_0).unwrap();
         let outsider = derive_cot_key(
             "a completely different circle phrase nobody shared",
@@ -973,7 +973,7 @@ mod tests {
         /// IDENTICAL display names produce two DISTINCT rows.
         #[test]
         fn identical_display_names_are_two_rows() {
-            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary(); // SHA-384 self-test must pass for fingerprints
+            let _ = daemonseed_core::oxi::initialize_module(); // SHA-384 self-test must pass for fingerprints
             let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
             let now = Instant::now();
             t.apply(&heartbeat(b"pubkey-a", "twin#aaaa", 100), now);
@@ -997,7 +997,7 @@ mod tests {
         /// pubkey (ISC-C4), reusing `Handle::from_pubkey` — not a GUI-local hash.
         #[test]
         fn fingerprint_matches_handle_from_pubkey() {
-            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary(); // SHA-384 self-test must pass for fingerprints
+            let _ = daemonseed_core::oxi::initialize_module(); // SHA-384 self-test must pass for fingerprints
             let pubkey = b"some-verified-ml-dsa-pubkey-bytes";
             let fp = member_fingerprint(pubkey);
             let expected = Handle::from_pubkey(None, pubkey).unwrap().to_string();
@@ -1010,7 +1010,7 @@ mod tests {
         /// the rows, so a row picked in the people column resolves to that member.
         #[test]
         fn roster_rows_carry_each_members_identity_key() {
-            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let _ = daemonseed_core::oxi::initialize_module();
             let a = SignKeypair::from_ml_dsa_seed(&[1u8; 32]).unwrap();
             let b = SignKeypair::from_ml_dsa_seed(&[2u8; 32]).unwrap();
             let mut t = PresenceTracker::with_cadence(HEARTBEAT_INTERVAL_MAX, HEARTBEAT_MISS_COUNT);
@@ -1050,7 +1050,7 @@ mod tests {
         /// roster end-to-end (sans relay).
         #[test]
         fn sealed_beacon_appears_then_reaps() {
-            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let _ = daemonseed_core::oxi::initialize_module();
             let lobby = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
             let member = SignKeypair::from_ml_dsa_seed(&[7u8; 32]).unwrap();
             let fields = HeartbeatFields {
@@ -1185,7 +1185,7 @@ mod tests {
         /// roster path end-to-end (sans relay).
         #[test]
         fn circle_beacon_opens_under_its_key_only_then_rosters() {
-            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let _ = daemonseed_core::oxi::initialize_module();
             let circle_a = derive_cot_key("alpha circle phrase one", &CNSA_2_0).unwrap();
             let circle_b = derive_cot_key("beta circle phrase two", &CNSA_2_0).unwrap();
             let member = SignKeypair::from_ml_dsa_seed(&[5u8; 32]).unwrap();
@@ -1234,7 +1234,7 @@ mod tests {
         /// `handle_apply_heartbeat` runs before routing to the lobby or any circle.
         #[test]
         fn self_filter_drops_own_beacon_only() {
-            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let _ = daemonseed_core::oxi::initialize_module();
             let me = SignKeypair::from_ml_dsa_seed(&[1u8; 32]).unwrap();
             let other = SignKeypair::from_ml_dsa_seed(&[2u8; 32]).unwrap();
             assert!(

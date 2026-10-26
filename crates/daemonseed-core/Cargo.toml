@@ -9,20 +9,7 @@ license = "AGPL-3.0-or-later"
 description = "daemonseed protocol library"
 
 [dependencies]
-oxicrypt-module = { workspace = true }
-oxicrypt-sha = { workspace = true }
-oxicrypt-kdf = { workspace = true }
-oxicrypt-aes = { workspace = true }
-oxicrypt-ml-dsa = { workspace = true }
-oxicrypt-ml-kem = { workspace = true }
-# oxicrypt primitives daemonseed does not call directly — declared so `kats`
-# can assemble the complete KATS slice for
-# `oxicrypt_module::initialize_with_profile`. ECDH is reached by no call path
-# at all; see the `kats` module header.
-oxicrypt-hmac = { workspace = true }
-oxicrypt-drbg = { workspace = true }
-oxicrypt-ecdh = { workspace = true }
-oxicrypt-integrity = { workspace = true }
+oxicrypt = { workspace = true }
 bip39 = { workspace = true }
 zeroize = { workspace = true }
 uuid = { workspace = true }

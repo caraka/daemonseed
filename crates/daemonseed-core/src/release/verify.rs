@@ -24,7 +24,7 @@
 
 use std::collections::BTreeSet;
 
-use oxicrypt_ml_dsa as ml_dsa;
+use crate::oxi::ml_dsa;
 
 use crate::identity::keys::{SignatureError, verify_signature};
 use crate::release::anchor::ReleaseAnchor;
@@ -109,7 +109,7 @@ mod tests {
     use crate::release::anchor::{ReleaseAnchor, ReleaseKey};
 
     fn kp(seed_byte: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed_byte; 32]).unwrap()
     }
 

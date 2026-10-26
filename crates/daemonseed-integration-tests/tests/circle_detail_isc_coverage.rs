@@ -21,7 +21,7 @@ use daemonseed_integration_tests::isc_coverage::Coverage;
 /// yields a different label; the fingerprint is unchanged.
 #[test]
 fn circle_detail_label_and_fingerprint_diverge() {
-    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let _ = daemonseed_core::oxi::initialize_module();
     let phrase =
         "abandon ability able about above absent absorb abstract absurd abuse access accident";
 

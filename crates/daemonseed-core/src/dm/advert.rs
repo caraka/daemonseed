@@ -46,9 +46,10 @@
 
 use std::time::Duration;
 
-use oxicrypt_kdf::HkdfSha384;
-use oxicrypt_ml_dsa as ml_dsa;
-use oxicrypt_ml_kem as ml_kem;
+use crate::oxi::HkdfSha384;
+use crate::oxi::ml_dsa;
+use crate::oxi::ml_kem;
+use crate::oxi::{MlKem1024DecapsulationKey, SharedSecret};
 use zeroize::Zeroize;
 
 use crate::dm::{domain, push_lp};
@@ -145,47 +146,34 @@ redacted_secret_newtype! {
 
 redacted_secret_newtype! {
     /// The secret half of one advert KEM keypair.
-    boxed pub struct AdvertDecapKey([u8; ml_kem::DK_LEN]);
-}
-
-impl AdvertDecapKey {
-    /// A key over bytes read back from the profile's at-rest store.
     ///
-    /// The counterpart of [`Self::as_bytes`], for the one caller that writes
-    /// an [`AdvertSnapshot`] down and reads it again
-    /// ([`crate::dm::store`]). Nothing derives a decapsulation key, so a
-    /// restored one has to come from the bytes a snapshot was written from.
-    pub(crate) fn from_bytes(bytes: &[u8; ml_kem::DK_LEN]) -> Self {
-        Self(Box::new(*bytes))
-    }
+    /// Restored with `from_bytes` by the one caller that writes an
+    /// [`AdvertSnapshot`] down and reads it again ([`crate::dm::store`]).
+    /// Nothing derives a decapsulation key, so a restored one has to come from
+    /// the bytes a snapshot was written from.
+    shared pub struct AdvertDecapKey(MlKem1024DecapsulationKey; ml_kem::DK_LEN);
 }
 
 redacted_secret_newtype! {
     /// The secret an encapsulation to an advert key yields on both sides.
-    boxed pub struct AdvertSharedSecret([u8; ml_kem::SHARED_SECRET_LEN]);
-}
-
-impl AdvertSharedSecret {
-    /// A secret over bytes read back from the profile's at-rest store.
     ///
-    /// The counterpart of [`Self::as_bytes`], for the one caller that writes a
-    /// hello secret down and reads it again ([`crate::dm::store`]). A
-    /// conversation outlives the encapsulation that established it, and the
-    /// secret cannot be re-derived from anything the conversation record holds.
-    pub(crate) fn from_bytes(bytes: &[u8; ml_kem::SHARED_SECRET_LEN]) -> Self {
-        Self(Box::new(*bytes))
-    }
+    /// Restored with `from_bytes` by the one caller that writes a hello secret
+    /// down and reads it again ([`crate::dm::store`]). A conversation outlives
+    /// the encapsulation that established it, and the secret cannot be
+    /// re-derived from anything the conversation record holds.
+    shared pub struct AdvertSharedSecret(SharedSecret; ml_kem::SHARED_SECRET_LEN);
 }
 
 /// Why an advert operation failed.
 ///
-/// `PartialEq` is implemented by hand rather than derived because neither
-/// [`SignatureError`] nor `oxicrypt_module::Error` is comparable; those two
-/// variants compare equal on the variant alone, which is all a caller needs.
+/// `PartialEq` is implemented by hand rather than derived because
+/// [`SignatureError`] is not comparable. `Signing` and `Module` compare equal on
+/// the variant alone, which is all a caller needs; `Kdf` compares its
+/// `oxicrypt::Error`.
 #[derive(Debug)]
 pub enum AdvertError {
     /// HKDF failed — an unrecoverable crypto-module condition.
-    Kdf(oxicrypt_kdf::KdfError),
+    Kdf(oxicrypt::Error),
     /// The bytes are not [`ADVERT_LEN`] long, so no field can be read from
     /// them. Carries both figures, so a truncation is diagnosable.
     Length {
@@ -234,7 +222,7 @@ pub enum AdvertError {
     Entropy,
     /// The crypto module refused a key-generation, encapsulation or
     /// decapsulation call.
-    Module(oxicrypt_module::Error),
+    Module(oxicrypt::Error),
 }
 
 impl PartialEq for AdvertError {
@@ -273,8 +261,8 @@ impl PartialEq for AdvertError {
                 },
             ) => na == nb && ba == bb,
             (Self::Entropy, Self::Entropy) => true,
-            // Compared on the variant: the wrapped cause is diagnostic and is
-            // not itself comparable.
+            // Compared on the variant: `SignatureError` is not comparable, and
+            // the module error is diagnostic.
             (Self::Signing(_), Self::Signing(_)) => true,
             (Self::Module(_), Self::Module(_)) => true,
             _ => false,
@@ -523,15 +511,11 @@ fn ek_from_dk(dk: &AdvertDecapKey) -> Box<[u8; ml_kem::EK_LEN]> {
 
 /// Generate a fresh advert KEM keypair at `serial` and `not_before`.
 ///
-/// **What the zeroize here does and does not reach.** `keygen` hands the
-/// secret half back inside a `Result`, and moving a `Copy` array out of one
-/// copies rather than takes — so `let (ek, dk) = generated?` would leave the
-/// `Result`'s own copy of the key on this frame with nothing able to reach
-/// it. Binding by reference keeps it reachable and the zeroize below clears
-/// it. It does NOT clear the argument temporary `Box::new(*dk)` materialises
-/// on the way into the allocation: the crate's API offers no way to construct
-/// the box without that copy, so one copy of the key is left for the frame to
-/// overwrite. The same is true of [`AdvertKeys::decapsulate`]'s `Box::new`.
+/// The seeds `d` and `z` are zeroized here on both paths. The decapsulation
+/// key comes back from `keygen` in oxicrypt's own type, which keeps it in a
+/// heap block and wipes it when dropped, so moving it into the
+/// [`AdvertDecapKey`] moves a pointer and leaves no copy of the key on this
+/// frame.
 fn generate(
     serial: u64,
     not_before: u64,
@@ -545,18 +529,17 @@ fn generate(
         z.zeroize();
         return Err(AdvertError::Entropy);
     }
-    let mut generated = ml_kem::keygen(&d, &z);
+    let generated = ml_kem::keygen(&d, &z);
     d.zeroize();
     z.zeroize();
     match generated {
-        Ok((ref ek, ref mut dk)) => {
+        Ok((ek, dk)) => {
             let key = AdvertKey {
                 serial,
                 not_before,
-                ek: Box::new(*ek),
-                dk: AdvertDecapKey(Box::new(*dk)),
+                ek: Box::new(ek),
+                dk: AdvertDecapKey::new(dk),
             };
-            dk.zeroize();
             Ok(key)
         }
         Err(e) => Err(AdvertError::Module(e)),
@@ -679,11 +662,11 @@ impl AdvertKeys {
         AdvertSnapshot {
             serial: self.current.serial,
             not_before: self.current.not_before,
-            decapsulation_key: AdvertDecapKey(Box::new(*self.current.dk.as_bytes())),
+            decapsulation_key: self.current.dk.clone(),
             previous: self.previous.as_ref().map(|p| RetiredSnapshot {
                 serial: p.key.serial,
                 retired_at: p.retired_at,
-                decapsulation_key: AdvertDecapKey(Box::new(*p.key.dk.as_bytes())),
+                decapsulation_key: p.key.dk.clone(),
             }),
         }
     }
@@ -827,11 +810,8 @@ impl AdvertKeys {
                 _ => return Ok(None),
             }
         };
-        let mut ss =
-            ml_kem::decapsulate(key.dk.as_bytes(), ciphertext).map_err(AdvertError::Module)?;
-        let secret = AdvertSharedSecret(Box::new(ss));
-        ss.zeroize();
-        Ok(Some(secret))
+        let ss = ml_kem::decapsulate(&key.dk.0, ciphertext).map_err(AdvertError::Module)?;
+        Ok(Some(AdvertSharedSecret::new(ss)))
     }
 
     /// The canonical encoding of the current key — the exact bytes subkey 0
@@ -946,9 +926,8 @@ pub fn encapsulate_to(
     }
     let encapsulated = ml_kem::encapsulate(&advert.kem_pk, &m);
     m.zeroize();
-    let (mut ss, ct) = encapsulated.map_err(AdvertError::Module)?;
-    let shared_secret = AdvertSharedSecret(Box::new(ss));
-    ss.zeroize();
+    let (ss, ct) = encapsulated.map_err(AdvertError::Module)?;
+    let shared_secret = AdvertSharedSecret::new(ss);
     Ok(HelloEncapsulation {
         serial: advert.serial,
         shared_secret,
@@ -1003,7 +982,7 @@ mod tests {
     /// suite order-sensitive, and the failure it produces —
     /// `NotOperational` out of a keygen — reads like a broken keygen.
     fn module() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     fn keys(phrase: &str) -> IdentityKeys {
@@ -1218,7 +1197,7 @@ mod tests {
         let preimage = signing_input(a.signing.public_key(), 7, ORIGIN, &pk);
         assert_eq!(preimage.len(), 4235);
         assert_eq!(
-            hex(&oxicrypt_sha::sha384(&preimage).unwrap()),
+            hex(&crate::oxi::sha384(&preimage).unwrap()),
             "8b6a0f413ad2e0121c52567ff69d3d1302a73d4fa43c2985ec99ef531017e5b0\
              78fda5ed817b23b8607460e9b33cc514"
         );

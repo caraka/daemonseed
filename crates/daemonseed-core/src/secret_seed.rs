@@ -1,10 +1,12 @@
 //! Shared hygiene for redacted-zeroizing secret-material newtypes (#135).
 //!
-//! Several distinct secrets in this crate share one hygiene contract: a 32-byte
-//! newtype that (a) zeroizes its bytes on drop, (b) renders `Debug` as
+//! Several distinct secrets in this crate share one hygiene contract: a newtype
+//! that (a) zeroizes its bytes on drop, (b) renders `Debug` as
 //! `"<Name>(<redacted>)"` so raw bytes never reach a log surface (ISC-A-C1), and
-//! (c) exposes exactly one accessor — `as_bytes()`, or `with_bytes()` on the
-//! scoped arm (#271). Three families use it:
+//! (c) exposes exactly one byte accessor — `as_bytes()`, or `with_bytes()` on the
+//! scoped arm (#271). Most hold 32 bytes; the `shared` arm holds an oxicrypt
+//! secret of whatever size its type has, and adds the crate-internal `new` and
+//! `from_bytes` constructors. These families use it:
 //!
 //! - **AEAD content keys** — [`crate::circle::key::CircleKey`] and
 //!   [`crate::public_room::PublicRoomKey`], held in a `Box<[u8; 32]>` (the `boxed`
@@ -34,6 +36,12 @@
 //!   one newtype that adds accessors beyond `as_bytes` — the two derivations it
 //!   roots, `signing_keypair` and `announce_owner_seed` — since a caller that holds
 //!   the seed holds both keys already.
+//! - **ML-KEM secrets of the direct-message layer** — `TurnSecret`,
+//!   `RatchetDecapKey` ([`crate::dm::chain`]), `AdvertDecapKey` and
+//!   `AdvertSharedSecret` ([`crate::dm::advert`]), on the `shared` arm: an
+//!   oxicrypt shared secret or decapsulation key, which wipes itself in its own
+//!   `Drop`, behind an `Arc` that a state snapshot shares. The bytes are wiped
+//!   when the last clone drops.
 //!
 //! Consolidating the newtype boilerplate and the boxed-seed derivation into one
 //! place means the zeroize-on-drop / redacted-`Debug` / both-path stack-zeroize
@@ -44,7 +52,7 @@
 //! shared. The per-context HKDF-**extract** deliberately stays at each call site —
 //! the salt, IKM, and canonicalization differ per secret and must not be unified.
 
-use oxicrypt_kdf::{HkdfSha384, KdfError};
+use crate::oxi::HkdfSha384;
 use zeroize::Zeroize;
 
 /// Define a redacted-zeroizing 32-(or N-)byte secret newtype with the shared
@@ -53,7 +61,7 @@ use zeroize::Zeroize;
 /// `///` docs) written before the `boxed`/`inline`/`inline_scoped` keyword are
 /// applied to the generated struct.
 ///
-/// Three storage shapes:
+/// Four storage shapes:
 ///
 /// - `boxed` — `Box<[u8; N]>`, `ZeroizeOnDrop`. Two families: the AEAD content
 ///   keys, constructed in their own modules, and the rendezvous-owner seeds, built
@@ -68,6 +76,10 @@ use zeroize::Zeroize;
 ///   sweep: the DM siblings are world-derivable by design and the circle seeds
 ///   derive from material their trust set already holds, so a copy of any of them
 ///   opens no boundary.
+/// - `shared` — one of the oxicrypt binding's secret types (an ML-KEM shared
+///   secret or decapsulation key), which zeroes itself in its own `Drop`, behind
+///   an `Arc`. `Clone`, because a state snapshot duplicates these secrets: clones
+///   share the one binding value, which is zeroed when the last clone drops.
 macro_rules! redacted_secret_newtype {
     (
         $(#[$meta:meta])*
@@ -144,6 +156,43 @@ macro_rules! redacted_secret_newtype {
             }
         }
     };
+    (
+        $(#[$meta:meta])*
+        shared $vis:vis struct $name:ident($inner:ty; $len:expr);
+    ) => {
+        $(#[$meta])*
+        #[derive(::core::clone::Clone)]
+        $vis struct $name(::std::sync::Arc<$inner>);
+
+        impl $name {
+            /// Take ownership of the binding's secret value.
+            pub(crate) fn new(secret: $inner) -> Self {
+                Self(::std::sync::Arc::new(secret))
+            }
+
+            /// A secret over bytes read back from the profile's at-rest store,
+            /// copied into the binding's type. The caller zeroes `bytes`.
+            pub(crate) fn from_bytes(bytes: &[u8; $len]) -> Self {
+                Self::new(<$inner>::from_bytes(bytes))
+            }
+
+            /// Borrow the raw secret bytes. Callers must not copy these into a
+            /// non-zeroizing buffer.
+            $vis fn as_bytes(&self) -> &[u8; $len] {
+                self.0.as_bytes()
+            }
+        }
+
+        // The binding type wipes its bytes in its own `Drop`, which runs when
+        // the last clone of this wrapper drops.
+        impl ::zeroize::ZeroizeOnDrop for $name {}
+
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                f.write_str(concat!(stringify!($name), "(<redacted>)"))
+            }
+        }
+    };
 }
 
 pub(crate) use redacted_secret_newtype;
@@ -162,7 +211,7 @@ pub(crate) use redacted_secret_newtype;
 pub(crate) fn derive_boxed_seed<const N: usize>(
     hkdf: &HkdfSha384,
     info: &[u8],
-) -> Result<Box<[u8; N]>, KdfError> {
+) -> Result<Box<[u8; N]>, oxicrypt::Error> {
     let mut seed = [0u8; N];
     if let Err(e) = hkdf.expand(info, &mut seed) {
         seed.zeroize();
@@ -479,7 +528,7 @@ mod tests {
     /// `tests/secret_zeroize_on_drop.rs` covers.
     #[test]
     fn derive_boxed_seed_is_deterministic_per_label() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let hkdf = super::HkdfSha384::extract(Some(b"salt"), b"ikm").unwrap();
 
         let a = super::derive_boxed_seed::<32>(&hkdf, b"label-one").unwrap();

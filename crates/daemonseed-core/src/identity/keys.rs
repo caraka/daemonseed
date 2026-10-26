@@ -17,9 +17,10 @@
 //! That deterministic property is what makes recovery-from-mnemonic work
 //! across devices (ISC-C32 round-trip).
 
-use oxicrypt_kdf::HkdfSha384;
-use oxicrypt_ml_dsa as ml_dsa;
-use oxicrypt_ml_kem as ml_kem;
+use crate::oxi::HkdfSha384;
+use crate::oxi::ml_dsa;
+use crate::oxi::ml_kem;
+use crate::oxi::{MlDsa87SecretKey, MlKem1024DecapsulationKey};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -59,9 +60,9 @@ impl Identity {
 /// Errors surfaced by key derivation.
 #[derive(Debug)]
 pub enum KeyDerivationError {
-    Hkdf(oxicrypt_kdf::KdfError),
-    MlDsa(oxicrypt_module::Error),
-    MlKem(oxicrypt_module::Error),
+    Hkdf(oxicrypt::Error),
+    MlDsa(oxicrypt::Error),
+    MlKem(oxicrypt::Error),
 }
 
 impl core::fmt::Display for KeyDerivationError {
@@ -82,11 +83,25 @@ pub const IDENTITY_PK_LEN: usize = ml_dsa::PK_LEN;
 /// ML-DSA-87 signing keypair derived for an [`Identity`].
 ///
 /// The secret key zeroes on drop. The public key is non-secret.
-#[derive(ZeroizeOnDrop)]
 pub struct SignKeypair {
-    #[zeroize(skip)]
     public_key: Box<[u8; ml_dsa::PK_LEN]>,
-    secret_key: Box<[u8; ml_dsa::SK_LEN]>,
+    secret_key: MlDsa87SecretKey,
+}
+
+// The secret key is the binding's type, which wipes itself in its own `Drop`.
+impl ZeroizeOnDrop for SignKeypair {}
+
+impl Drop for SignKeypair {
+    /// Names every field, so a field added later fails to compile here until it
+    /// is placed on one side or the other: a secret held in a type that wipes
+    /// itself, or a value that is not secret.
+    fn drop(&mut self) {
+        let Self {
+            public_key: _not_secret,
+            secret_key: _wipes_itself,
+        } = self;
+        let _: &MlDsa87SecretKey = _wipes_itself;
+    }
 }
 
 impl SignKeypair {
@@ -97,12 +112,12 @@ impl SignKeypair {
 
     /// 4896-byte ML-DSA-87 secret key. Caller must keep this in RAM only;
     /// it zeroes when this struct drops.
-    pub fn secret_key(&self) -> &[u8; ml_dsa::SK_LEN] {
+    pub fn secret_key(&self) -> &MlDsa87SecretKey {
         &self.secret_key
     }
 
     /// Build a `SignKeypair` directly from a raw 32-byte ML-DSA-87 seed
-    /// (FIPS 204 §5.1) via `oxicrypt_ml_dsa::keygen`.
+    /// (FIPS 204 §5.1) via `crate::oxi::ml_dsa::keygen`.
     ///
     /// Clients derive their keypair from a BIP-39 mnemonic through
     /// [`derive_identity_keys`]; a relay **server**, by contrast, persists a
@@ -114,10 +129,10 @@ impl SignKeypair {
     /// yields the same keypair. Requires the oxicrypt module to be
     /// operational.
     pub fn from_ml_dsa_seed(seed: &[u8; ML_DSA_SEED_LEN]) -> Result<Self, KeyDerivationError> {
-        let (pk_arr, sk_arr) = ml_dsa::keygen(seed).map_err(KeyDerivationError::MlDsa)?;
+        let (pk_arr, secret_key) = ml_dsa::keygen(seed).map_err(KeyDerivationError::MlDsa)?;
         Ok(Self {
             public_key: Box::new(pk_arr),
-            secret_key: Box::new(sk_arr),
+            secret_key,
         })
     }
 
@@ -138,7 +153,7 @@ impl SignKeypair {
 pub enum SignatureError {
     /// The oxicrypt module was not operational, or its active profile
     /// disallows the ML-DSA sign/verify service.
-    Module(oxicrypt_module::Error),
+    Module(oxicrypt::Error),
     /// The signature did not verify under the supplied public key. This is the
     /// uniform failure for a tampered message, a wrong key, or a forged
     /// signature — verifiers MUST NOT distinguish the sub-cause (ISC-A-S12 /
@@ -187,11 +202,26 @@ impl core::fmt::Debug for SignKeypair {
 ///
 /// The decapsulation key zeroes on drop. The encapsulation key is
 /// non-secret.
-#[derive(ZeroizeOnDrop)]
 pub struct KemKeypair {
-    #[zeroize(skip)]
     encapsulation_key: Box<[u8; ml_kem::EK_LEN]>,
-    decapsulation_key: Box<[u8; ml_kem::DK_LEN]>,
+    decapsulation_key: MlKem1024DecapsulationKey,
+}
+
+// The decapsulation key is the binding's type, which wipes itself in its own
+// `Drop`.
+impl ZeroizeOnDrop for KemKeypair {}
+
+impl Drop for KemKeypair {
+    /// Names every field, so a field added later fails to compile here until it
+    /// is placed on one side or the other: a secret held in a type that wipes
+    /// itself, or a value that is not secret.
+    fn drop(&mut self) {
+        let Self {
+            encapsulation_key: _not_secret,
+            decapsulation_key: _wipes_itself,
+        } = self;
+        let _: &MlKem1024DecapsulationKey = _wipes_itself;
+    }
 }
 
 impl KemKeypair {
@@ -201,7 +231,7 @@ impl KemKeypair {
     }
 
     /// 3168-byte ML-KEM-1024 decapsulation (secret) key.
-    pub fn decapsulation_key(&self) -> &[u8; ml_kem::DK_LEN] {
+    pub fn decapsulation_key(&self) -> &MlKem1024DecapsulationKey {
         &self.decapsulation_key
     }
 }
@@ -470,10 +500,10 @@ pub fn derive_identity_keys(
         &mut *ml_dsa_seed,
     )
     .map_err(KeyDerivationError::Hkdf)?;
-    let (pk_arr, sk_arr) = ml_dsa::keygen(&ml_dsa_seed).map_err(KeyDerivationError::MlDsa)?;
+    let (pk_arr, secret_key) = ml_dsa::keygen(&ml_dsa_seed).map_err(KeyDerivationError::MlDsa)?;
     let signing = SignKeypair {
         public_key: Box::new(pk_arr),
-        secret_key: Box::new(sk_arr),
+        secret_key,
     };
 
     // ML-KEM-1024 takes two independent seeds (`d` and `z` per FIPS 203).
@@ -489,10 +519,11 @@ pub fn derive_identity_keys(
         &mut *kem_z,
     )
     .map_err(KeyDerivationError::Hkdf)?;
-    let (ek_arr, dk_arr) = ml_kem::keygen(&kem_d, &kem_z).map_err(KeyDerivationError::MlKem)?;
+    let (ek_arr, decapsulation_key) =
+        ml_kem::keygen(&kem_d, &kem_z).map_err(KeyDerivationError::MlKem)?;
     let kem = KemKeypair {
         encapsulation_key: Box::new(ek_arr),
-        decapsulation_key: Box::new(dk_arr),
+        decapsulation_key,
     };
 
     // Veilid node seed (D3): one more expansion of the SAME PRK under a
@@ -607,7 +638,7 @@ mod tests {
     use super::*;
 
     fn ensure_oxicrypt_initialized() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     const ALL_ZEROS_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
@@ -619,9 +650,15 @@ mod tests {
         let a = derive_identity_keys(&m, Identity::Primary).unwrap();
         let b = derive_identity_keys(&m, Identity::Primary).unwrap();
         assert_eq!(a.signing.public_key(), b.signing.public_key());
-        assert_eq!(a.signing.secret_key(), b.signing.secret_key());
+        assert_eq!(
+            a.signing.secret_key().as_bytes(),
+            b.signing.secret_key().as_bytes()
+        );
         assert_eq!(a.kem.encapsulation_key(), b.kem.encapsulation_key());
-        assert_eq!(a.kem.decapsulation_key(), b.kem.decapsulation_key());
+        assert_eq!(
+            a.kem.decapsulation_key().as_bytes(),
+            b.kem.decapsulation_key().as_bytes()
+        );
     }
 
     #[test]
@@ -666,7 +703,7 @@ mod tests {
         let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
         let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
         assert_eq!(keys.signing.public_key().len(), ml_dsa::PK_LEN);
-        assert_eq!(keys.signing.secret_key().len(), ml_dsa::SK_LEN);
+        assert_eq!(keys.signing.secret_key().as_bytes().len(), ml_dsa::SK_LEN);
     }
 
     #[test]
@@ -675,7 +712,10 @@ mod tests {
         let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
         let keys = derive_identity_keys(&m, Identity::Primary).unwrap();
         assert_eq!(keys.kem.encapsulation_key().len(), ml_kem::EK_LEN);
-        assert_eq!(keys.kem.decapsulation_key().len(), ml_kem::DK_LEN);
+        assert_eq!(
+            keys.kem.decapsulation_key().as_bytes().len(),
+            ml_kem::DK_LEN
+        );
     }
 
     #[test]
@@ -711,7 +751,7 @@ mod tests {
         let a = SignKeypair::from_ml_dsa_seed(&seed).unwrap();
         let b = SignKeypair::from_ml_dsa_seed(&seed).unwrap();
         assert_eq!(a.public_key(), b.public_key());
-        assert_eq!(a.secret_key(), b.secret_key());
+        assert_eq!(a.secret_key().as_bytes(), b.secret_key().as_bytes());
     }
 
     #[test]
@@ -1036,7 +1076,7 @@ mod tests {
     fn identity_chain_kat_pins_every_existing_output() {
         ensure_oxicrypt_initialized();
         let m = Mnemonic::from_phrase(ALL_ZEROS_PHRASE).unwrap();
-        let digest = |bytes: &[u8]| hex::encode(oxicrypt_sha::sha384(bytes).unwrap());
+        let digest = |bytes: &[u8]| hex::encode(crate::oxi::sha384(bytes).unwrap());
         let cases = [
             (
                 Identity::Primary,
@@ -1068,9 +1108,9 @@ mod tests {
             let keys = derive_identity_keys(&m, identity).unwrap();
             let actual = [
                 digest(keys.signing.public_key()),
-                digest(keys.signing.secret_key()),
+                digest(keys.signing.secret_key().as_bytes()),
                 digest(keys.kem.encapsulation_key()),
-                digest(keys.kem.decapsulation_key()),
+                digest(keys.kem.decapsulation_key().as_bytes()),
                 hex::encode(keys.veilid_node_seed.with_bytes(|b| *b)),
                 hex::encode(keys.share_root_ikm.as_bytes()),
                 hex::encode(keys.dm_doorbell_slot_secret.as_bytes()),

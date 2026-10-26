@@ -24,6 +24,27 @@ next release this block is renamed to its version + date and a fresh
 `[Unreleased]` is opened (see `AGENTS.md` doc-sync). Planning for *unstarted*
 work lives in the maintainer's own planning notes, not here.
 
+### Added
+
+- Release workflow (`.github/workflows/release.yml`): a signed annotated `v*` tag builds the Linux AppImage, the Linux TUI and the Windows GUI on GitHub runners in the `release` environment, which a repository setting holds for reviewer approval, load-checks each on the runner that built it, checks each against its target triple and an import allow-list, and stages them on a draft release that is published by hand. Adding the `release-dry-run` label to a pull request, or a `workflow_dispatch` run, dry-runs the release legs without staging anything.
+- Each release leg ships one archive with a `.sha256` beside it, `.tar.gz` for the Linux legs and `.zip` for the Windows GUI, carrying a `BUILD-PROVENANCE.txt` naming its target triple, the oxicrypt library's sha256, the oxicrypt release-key fingerprint and its load check.
+- The Linux TUI is built as a release artifact, with `liboxicrypt_ffi.so.1` beside the binary.
+- `cargo xtask check-crypto-deps`, which fails when `Cargo.lock` holds an `oxicrypt` package other than the binding crate, and `cargo xtask release-scripts`, which runs the release scripts' fixture tests; both run in the `preflight` gate group.
+
+### Changed
+
+- Crypto: the module is oxicrypt 0.26's signed shared library (`liboxicrypt_ffi`), linked through the `oxicrypt` crate and shipped unchanged beside each binary.
+- Windows: the desktop app is built for `x86_64-pc-windows-msvc` and ships `oxicrypt_ffi.dll` and `vcruntime140.dll` beside `daemonseed-gui.exe`.
+- GUI: Slint 1.18. TUI: ratatui 0.30.
+- `daemonseed-core`: `oxi::initialize_module` initialises the oxicrypt library; crypto errors are `oxicrypt::Error` (re-exported as `oxi::Error`); `kdf` functions return `oxicrypt::Error`.
+- `daemonseed-core`: `SignKeypair::secret_key` returns `&MlDsa87SecretKey` and `KemKeypair::decapsulation_key` returns `&MlKem1024DecapsulationKey`, oxicrypt's self-zeroing types.
+- CI: every gate group fetches the oxicrypt library through `scripts/fetch-oxicrypt-ffi.sh`, which checks a pinned sha256.
+
+### Removed
+
+- `daemonseed-core`: the `kats` module (`initialize_module`, `initialize_module_unsigned_test_binary`, `CNSA_2_0_KATS`) and `kdf::KdfError`.
+- The cross-compiled Windows build (`packaging/windows/build-windows.sh`) and the integrity-signing helper (`packaging/lib/sign.sh`).
+
 ## [v0.37.2] — 2026-10-24
 
 ### Added

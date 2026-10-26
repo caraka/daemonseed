@@ -661,7 +661,7 @@ mod tests {
     };
 
     fn signer(seed: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 

@@ -50,9 +50,9 @@ use crate::dm::flows::{
 };
 use crate::dm::store::{Store, StoreError};
 use crate::identity::keys::IDENTITY_PK_LEN;
+use crate::oxi::HkdfSha384;
 use crate::secret_seed::derive_boxed_seed;
 use crate::storage::dm_store::CorrespondenceLabel;
-use oxicrypt_kdf::HkdfSha384;
 
 /// The bytes every push and every answer to one starts with. No other
 /// request on the same transport starts with them.
@@ -632,7 +632,7 @@ pub enum ReachTaken {
 /// answers.
 pub fn reach_seq(control: &[u8]) -> Result<u64, FlowError> {
     let digest =
-        oxicrypt_sha::sha384(control).map_err(|e| FlowError::Channel(ChannelError::Module(e)))?;
+        crate::oxi::sha384(control).map_err(|e| FlowError::Channel(ChannelError::Module(e)))?;
     let mut seq = [0u8; 8];
     seq.copy_from_slice(&digest[..8]);
     Ok(u64::from_be_bytes(seq))
@@ -959,7 +959,7 @@ mod tests {
     use super::*;
 
     fn module() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     /// **Known-answer vectors, computed outside this crate from the preimages

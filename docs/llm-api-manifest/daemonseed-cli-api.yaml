@@ -379,7 +379,7 @@ functions:
       type: "Result<wire::SignedArtifact, SignatureError>"
       description: The signed post artifact, or a signing failure.
       error_variants:
-        - name: "Module(oxicrypt_module::Error)"
+        - name: "Module(oxicrypt::Error)"
           condition: The oxicrypt module was not operational for signing.
     iscs: ["S7"]
 
@@ -435,7 +435,7 @@ functions:
       type: "Result<wire::SignedArtifact, SignatureError>"
       description: The signed delete artifact, or a signing failure.
       error_variants:
-        - name: "Module(oxicrypt_module::Error)"
+        - name: "Module(oxicrypt::Error)"
           condition: The oxicrypt module was not operational for signing.
     iscs: ["S7"]
 
@@ -465,7 +465,7 @@ functions:
           condition: A full-key entry was the wrong length.
         - name: "BadHandle(HandleParseError)"
           condition: A handle entry didn't parse as "<name>#<hash>".
-        - name: "Module(oxicrypt_module::Error)"
+        - name: "Module(oxicrypt::Error)"
           condition: The oxicrypt module was not operational for the hash-prefix authorization check.
     iscs: [S8]
 

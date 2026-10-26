@@ -540,7 +540,7 @@ mod tests {
     /// A fixed test project seed and the owner key it derives — the expectation
     /// a credential is checked against, built the way a rotation builds the real one.
     fn test_project_seed() -> (ProjectAnnounceSeed, [u8; IDENTITY_PK_LEN], [u8; 32]) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let seed = ProjectAnnounceSeed::from_bytes([0x11; 32]);
         let signer = *seed
             .signing_keypair()
@@ -650,7 +650,7 @@ mod tests {
     /// tree held.
     #[test]
     fn former_dev_owner_seed_record_is_orphaned() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let old =
             daemonseed_core::public_space::derive_project_announce_veilid_owner_seed(&[0x5d; 32])
                 .unwrap();
@@ -673,7 +673,7 @@ mod tests {
         use daemonseed_core::public_room::{
             derive_room_presence_veilid_owner_seed, derive_room_veilid_owner_seed,
         };
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let world: [[u8; 32]; 4] = [
             *derive_room_veilid_owner_seed("lobby", &CNSA_2_0)
                 .unwrap()

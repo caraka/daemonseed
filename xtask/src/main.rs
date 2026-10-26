@@ -24,6 +24,10 @@
 //!   release line is newer than it: the README may lag but never lead (see
 //!   `versions`). `--release` also requires the README line and any `v*` tag on
 //!   `HEAD` to equal it, and a clean working tree.
+//! - `check-crypto-deps` — fail unless `Cargo.lock` holds the `oxicrypt`
+//!   binding crate and no other `oxicrypt*` package (see `release_checks`).
+//! - `release-scripts` — run `scripts/test-release-scripts.sh`, the fixture
+//!   tests of the release workflow's scripts.
 //! - `gate` — run the Definition-of-Done gate, defined once as one table of
 //!   steps in three groups: `preflight` (fmt, clippy, a release-profile
 //!   type-check, rustdoc with warnings denied, and the xtask checks),
@@ -37,7 +41,9 @@
 //!   gate, and exit non-zero naming any red step. It is the fallback for a
 //!   release: run it before `git tag` when CI cannot run.
 
+mod git_env;
 mod manifests;
+mod release_checks;
 mod ui_strings;
 #[cfg(test)]
 mod version_fixture;
@@ -78,6 +84,12 @@ enum Cmd {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Fail unless `Cargo.lock` holds the `oxicrypt` binding crate and no other
+    /// `oxicrypt*` package.
+    CheckCryptoDeps,
+    /// Run `scripts/test-release-scripts.sh`, the fixture tests of the release
+    /// workflow's scripts.
+    ReleaseScripts,
     /// Regenerate `crates/daemonseed-proto/src/generated/` from .proto files.
     GenProto,
     /// Verify that the committed snapshot matches what tonic-build emits.
@@ -135,6 +147,8 @@ fn main() -> Result<()> {
             };
             versions::check_versions(&root, mode)
         }
+        Cmd::CheckCryptoDeps => release_checks::check_crypto_deps(&workspace_root_from_xtask()?),
+        Cmd::ReleaseScripts => release_checks::release_scripts(&workspace_root_from_xtask()?),
         Cmd::GenProto => gen_proto(),
         Cmd::CheckProto => check_proto(),
         Cmd::CheckUiStrings => ui_strings::check_ui_strings(&workspace_root_from_xtask()?),
@@ -641,6 +655,22 @@ const RELEASE_GATE_STEPS: &[GateStep] = &[
         args: &["xtask", "check-ui-strings"],
         env: &[],
     },
+    // The binding crate is the only oxicrypt package the graph may hold: a module
+    // crate would compile an unsigned copy of module code beside the signed library.
+    GateStep {
+        name: "xtask check-crypto-deps",
+        group: GateGroup::Preflight,
+        args: &["xtask", "check-crypto-deps"],
+        env: &[],
+    },
+    // The release workflow's scripts run only when a release is staged, so their
+    // fixture tests run here, on every change.
+    GateStep {
+        name: "xtask release-scripts",
+        group: GateGroup::Preflight,
+        args: &["xtask", "release-scripts"],
+        env: &[],
+    },
     // `--all-targets` skips targets whose `required-features` are unsatisfied, so the
     // windowed GUI is linted only by an invocation that opts into `desktop`.
     GateStep {
@@ -729,6 +759,9 @@ fn release_gate_verdict(
 /// a step is red when it reports zero passing tests, whatever its exit code.
 fn run_gate_step(cargo: &std::ffi::OsStr, repo: &Path, step: &GateStep) -> Result<bool> {
     let mut cmd = Command::new(cargo);
+    // The pre-push hook runs the gate with git's repository-local variables set,
+    // and a step's tests build scratch repositories of their own.
+    git_env::without_repo_env(&mut cmd);
     cmd.current_dir(repo).args(step.args);
     for (key, value) in step.env {
         cmd.env(key, value);
@@ -1419,7 +1452,9 @@ jq -r "$filter" "$STUB_GH_DIR/$file"
             }
             let repo = dir.join("repo");
             let git = |args: &[&str]| {
-                let out = Command::new("git")
+                let mut cmd = Command::new("git");
+                git_env::without_repo_env(&mut cmd);
+                let out = cmd
                     .env("GIT_CONFIG_GLOBAL", "/dev/null")
                     .env("GIT_CONFIG_NOSYSTEM", "1")
                     .args([
@@ -1543,6 +1578,7 @@ jq -r "$filter" "$STUB_GH_DIR/$file"
                 .unwrap()
                 .join("scripts/ci/already-passed.sh");
             let mut command = Command::new(script);
+            git_env::without_repo_env(&mut command);
             command
                 .arg("dev-suite")
                 .current_dir(self.dir.join("repo"))

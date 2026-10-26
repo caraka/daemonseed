@@ -274,7 +274,7 @@ mod tests {
     /// A shared secret by the real path: `AdvertSharedSecret` is constructible
     /// only by encapsulating to or decapsulating an advert key.
     fn shared_secret(seed: u8) -> advert::AdvertSharedSecret {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let signer = SignKeypair::from_ml_dsa_seed(&[seed; 32]).expect("derive a signer");
         let keys = advert::AdvertKeys::new(NOW, counting_fill(seed)).expect("advert keys");
         let bytes = keys.advert_bytes(&signer).expect("advert bytes");
@@ -310,7 +310,7 @@ mod tests {
     /// conversation record, an outbox entry for a message still owed, and a
     /// signed opening over the conversation's own first ratchet key.
     fn fixture() -> Fixture {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().expect("a temporary directory");
         let store = Store::open(tmp.path().join("dm"), &[0x2c; AEAD_KEY_LEN]).expect("open");
         let peer = CorrespondenceLabel::from_bytes([0x9e; 32]);

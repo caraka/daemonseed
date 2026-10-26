@@ -749,7 +749,7 @@ mod tests {
     /// Two circles beside the Lobby, and two established conversations, bert
     /// and cora, with the rail built over them.
     fn two_rooms_two_conversations(app: &App) -> (CorrespondenceLabel, CorrespondenceLabel) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let phrase =
             "abandon ability able about above absent absorb abstract absurd abuse access accident";
         {
@@ -1362,7 +1362,7 @@ mod tests {
     /// Add 15 circles, and 25 conversations with members of the Lobby roster,
     /// which lists `others` first: both rail lists run past the window.
     fn fill_long_lists(app: &App, others: &[RosterEntry]) {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         {
             let mut st = app.state.borrow_mut();
             for i in 1..=15 {
@@ -2132,7 +2132,7 @@ mod tests {
     #[test]
     fn joining_a_phrase_already_joined_switches_to_its_circle() {
         with_app(|app| {
-            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let _ = daemonseed_core::oxi::initialize_module();
             let phrase = "abandon ability able about above absent absorb abstract absurd abuse access accident";
             app.ui.invoke_submit_join(phrase.into());
             assert_eq!(
@@ -2383,7 +2383,7 @@ mod tests {
     #[test]
     fn joining_the_phrase_of_a_failed_circle_joins_it_again() {
         with_app(|app| {
-            let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+            let _ = daemonseed_core::oxi::initialize_module();
             let phrase = "abandon ability able about above absent absorb abstract absurd abuse access accident";
             app.ui.invoke_submit_join(phrase.into());
             let circle_id = fold_next_join_failure(app).expect("a join failure arrived");

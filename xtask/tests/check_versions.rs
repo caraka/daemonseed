@@ -1,6 +1,8 @@
 //! The built `xtask check-versions` exits non-zero on a drifted tree and zero on a
 //! clean one, so the gate step that runs it can be red.
 
+#[path = "../src/git_env.rs"]
+mod git_env;
 #[path = "../src/version_fixture.rs"]
 mod version_fixture;
 

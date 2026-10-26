@@ -46,7 +46,7 @@ fn main() -> io::Result<()> {
     // Bring the oxicrypt module Operational before touching the terminal — a
     // failure here should print plainly, not corrupt a raw-mode screen.
     // First-start sealing needs the module Operational.
-    if let Err(e) = daemonseed_core::kats::initialize_module() {
+    if let Err(e) = daemonseed_core::oxi::initialize_module() {
         eprintln!("daemonseed-tui: crypto module init failed: {e}");
         return Err(io::Error::other(e.to_string()));
     }

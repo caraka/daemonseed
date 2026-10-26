@@ -1,5 +1,7 @@
-//! Behavioural proof that both arms of `redacted_secret_newtype!` clear a
-//! secret's bytes before that memory is handed back to the allocator (#242).
+//! Behavioural proof that the arms of `redacted_secret_newtype!` clear a
+//! secret's bytes before that memory is handed back to the allocator (#242), and
+//! that the oxicrypt secret types the identity keypairs and the `shared` arm hold
+//! are wiped the same way.
 //!
 //! The obvious test is unsound. A `boxed`-arm secret lives in the `Box`'s own
 //! allocation, and by the time the wrapper's `Drop` has run that allocation is
@@ -68,6 +70,8 @@ use daemonseed_core::circle::key::{
     derive_circle_presence_veilid_owner_seed, derive_circle_veilid_owner_seed,
 };
 use daemonseed_core::crypto::suite::CNSA_2_0;
+use daemonseed_core::dm::advert::{self, AdvertKeys};
+use daemonseed_core::dm::chain::{self, OwnTurn};
 use daemonseed_core::identity::keys::{Identity, derive_identity_keys};
 use daemonseed_core::identity::mnemonic::Mnemonic;
 use daemonseed_core::public_room::derive_room_veilid_owner_seed;
@@ -76,13 +80,17 @@ use daemonseed_core::storage::seeds::{
 };
 use zeroize::Zeroizing;
 
-/// Large enough for the biggest secret watched here, the decode buffer case's
-/// `DECODE_SECRET_LEN`.
+/// Large enough for the biggest secret watched here: the decode buffer case's
+/// `DECODE_SECRET_LEN`, or an ML-DSA-87 secret key.
 ///
 /// `assert_zeroed_when_freed` refuses a secret longer than this rather than
 /// truncating it — a truncating snapshot would compare only the first bytes and
 /// pass while the tail went unexamined.
-const SNAPSHOT_CAP: usize = DECODE_SECRET_LEN;
+const SNAPSHOT_CAP: usize = if DECODE_SECRET_LEN > ML_DSA_SK_LEN {
+    DECODE_SECRET_LEN
+} else {
+    ML_DSA_SK_LEN
+};
 
 /// The size every 32-byte secret newtype watched here occupies — the block size
 /// each such case expects the allocator to hand back.
@@ -438,7 +446,12 @@ fn assert_zeroed_when_freed<T>(
     WATCH_ADDR.store(addr, Ordering::SeqCst);
 
     drop(secret);
+    assert_freed_block_was_zeroed(name, expect, len);
+}
 
+/// The checks that follow the drop of a watched secret: a block holding it was
+/// freed, it is the block and offset `expect` names, and it held zeros.
+fn assert_freed_block_was_zeroed(name: &str, expect: (usize, usize), len: usize) {
     // Second control. If no block enclosing the watched range were ever freed — a
     // leak, or the accessor pointing into some other allocation — the snapshot
     // would still read as the zeros it was initialised with, and the test would
@@ -486,7 +499,7 @@ fn assert_zeroed_when_freed<T>(
 }
 
 fn init() {
-    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let _ = daemonseed_core::oxi::initialize_module();
 }
 
 /// Length of the circle entropy the #343 cases decode.
@@ -1117,6 +1130,242 @@ fn inline_arm_secrets_are_zeroed_before_their_memory_is_released() {
         || Box::new(keys.dm_channel_root),
         |s| s.with_bytes(|b| at(b)),
     );
+}
+
+/// ML-KEM-1024 decapsulation key length: the block size of the binding type that
+/// holds one.
+const ML_KEM_DK_LEN: usize = 3168;
+
+/// ML-KEM decapsulation keys are held in the oxicrypt binding's own type, which
+/// keeps the key in a heap block of exactly the key's size and wipes it in its own
+/// `Drop`. Two holders reach it: an identity's `KemKeypair` owns the binding
+/// value directly, and the DM key classes (`AdvertDecapKey` here, from the
+/// `shared` arm of the secret newtype macro) hold it behind an `Arc` that a state
+/// snapshot shares. Both are watched through their public accessors.
+///
+/// Two tests rather than two cases in one, so a failure in one holder does not
+/// hide the other.
+#[test]
+fn a_binding_held_identity_decapsulation_key_is_zeroed_before_its_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "KemKeypair::decapsulation_key",
+        (0, ML_KEM_DK_LEN),
+        || {
+            let mnemonic = Mnemonic::generate().unwrap();
+            derive_identity_keys(&mnemonic, Identity::Primary)
+                .unwrap()
+                .kem
+        },
+        |k| at(k.decapsulation_key().as_bytes()),
+    );
+}
+
+/// The `Arc` case drops the `AdvertKeys` inside `make`, so the snapshot holds the
+/// last handle and its drop is the one that releases the key.
+#[test]
+fn a_shared_dm_decapsulation_key_is_zeroed_before_its_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "AdvertDecapKey",
+        (0, ML_KEM_DK_LEN),
+        || {
+            let keys = AdvertKeys::new(0, |b: &mut [u8]| {
+                b.fill(0x5a);
+                Ok(())
+            })
+            .unwrap();
+            keys.snapshot()
+        },
+        |s| at(s.decapsulation_key.as_bytes()),
+    );
+}
+
+/// ML-DSA-87 secret key length: the block size of the binding type that holds one.
+const ML_DSA_SK_LEN: usize = 4896;
+
+/// An ML-KEM shared secret is the binding's 32-byte value, held inline in the
+/// `Arc` the `shared` arm allocates: after the `Arc`'s two counts, so at offset
+/// 16 of a 48-byte block.
+const ARC_SHARED_SECRET_AT: (usize, usize) = (16, 48);
+
+/// The DM-layer fixtures below draw from this instead of the OS, so a failure
+/// reproduces.
+fn fixed_fill(b: &mut [u8]) -> Result<(), ()> {
+    b.fill(0x5a);
+    Ok(())
+}
+
+/// The ML-DSA secret key an identity's `SignKeypair` holds, in the binding's own
+/// type: its own heap block of exactly the key's size.
+#[test]
+fn a_binding_held_identity_signing_key_is_zeroed_before_its_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "SignKeypair::secret_key",
+        (0, ML_DSA_SK_LEN),
+        || {
+            let mnemonic = Mnemonic::generate().unwrap();
+            derive_identity_keys(&mnemonic, Identity::Primary)
+                .unwrap()
+                .signing
+        },
+        |k| at(k.secret_key().as_bytes()),
+    );
+}
+
+/// A hello encapsulation's shared secret, the last holder of its `Arc`.
+#[test]
+fn a_shared_hello_secret_is_zeroed_before_its_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "AdvertSharedSecret",
+        ARC_SHARED_SECRET_AT,
+        || hello_encapsulation().shared_secret,
+        |s| at(s.as_bytes()),
+    );
+}
+
+/// The ratchet decapsulation key of the initiator's turn 0, taken out of a
+/// snapshot after the conversation it was copied from has dropped.
+#[test]
+fn a_shared_ratchet_decapsulation_key_is_zeroed_before_its_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "RatchetDecapKey",
+        (0, ML_KEM_DK_LEN),
+        || {
+            let ss0 = hello_encapsulation().shared_secret;
+            let opening = chain::initiate(&ss0, fixed_fill).unwrap();
+            first_own_turn(opening.conversation.snapshot(), |_| true)
+                .keypair
+                .dk
+        },
+        |k| at(k.as_bytes()),
+    );
+}
+
+/// The turn secret of the acceptor's first turn, which its first seal
+/// encapsulates, taken out of a snapshot after the conversation has dropped.
+#[test]
+fn a_shared_turn_secret_is_zeroed_before_its_memory_is_released() {
+    init();
+
+    assert_zeroed_when_freed(
+        "TurnSecret",
+        ARC_SHARED_SECRET_AT,
+        || {
+            let ss0 = hello_encapsulation().shared_secret;
+            let opening = chain::initiate(&ss0, fixed_fill).unwrap();
+            let mut acceptor = chain::accept(&ss0, &opening.ratchet_pk).unwrap();
+            acceptor.seal(b"the first message", 1, fixed_fill).unwrap();
+            first_own_turn(acceptor.snapshot(), |t| t.ss.is_some())
+                .ss
+                .expect("the turn the predicate chose holds a secret")
+        },
+        |k| at(k.as_bytes()),
+    );
+}
+
+/// The `shared` arm's clones share one key, so the key must survive the
+/// original's drop untouched while a clone lives, and be zeroed when the last
+/// clone drops. The clone here is an `AdvertKeys` snapshot.
+#[test]
+fn a_shared_key_outlives_its_original_and_is_zeroed_after_its_last_clone() {
+    init();
+
+    assert_wiped_only_after_the_last_clone(
+        "AdvertDecapKey snapshot",
+        (0, ML_KEM_DK_LEN),
+        || {
+            let keys = AdvertKeys::new(0, fixed_fill).unwrap();
+            let snapshot = keys.snapshot();
+            (keys, snapshot)
+        },
+        |s| at(s.decapsulation_key.as_bytes()),
+    );
+}
+
+/// A hello encapsulated to a fresh advert key of a fresh identity.
+fn hello_encapsulation() -> advert::HelloEncapsulation {
+    const NOW: u64 = 1_000_000;
+    let mnemonic = Mnemonic::generate().unwrap();
+    let identity = derive_identity_keys(&mnemonic, Identity::Primary).unwrap();
+    let keys = AdvertKeys::new(NOW, fixed_fill).unwrap();
+    let bytes = keys.advert_bytes(&identity.signing).unwrap();
+    let verified = advert::verify(identity.signing.public_key(), &bytes).unwrap();
+    advert::encapsulate_to(&verified, NOW, fixed_fill).unwrap()
+}
+
+/// The first retained or pending own turn of a snapshot that `pick` accepts.
+fn first_own_turn(
+    snapshot: chain::ConversationSnapshot,
+    pick: impl Fn(&OwnTurn) -> bool,
+) -> OwnTurn {
+    let chain::ConversationSnapshot { sending, receiving } = snapshot;
+    sending
+        .pending_turn
+        .into_iter()
+        .chain(receiving.own_turns.into_iter().flatten())
+        .find(|t| pick(t))
+        .expect("the snapshot holds an own turn of the kind asked for")
+}
+
+/// As [`assert_zeroed_when_freed`], for a secret two holders share. `make`
+/// returns the original and a clone; the watch is armed on the clone's bytes.
+/// Dropping the original must release nothing and leave the bytes unchanged;
+/// dropping the clone must then release the block, zeroed.
+fn assert_wiped_only_after_the_last_clone<A, B>(
+    name: &str,
+    expect: (usize, usize),
+    make: impl FnOnce() -> (A, B),
+    locate: impl Fn(&B) -> (usize, Zeroizing<Vec<u8>>),
+) {
+    let _gate = GATE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    WATCH_ADDR.store(0, Ordering::SeqCst);
+    CAPTURED.store(false, Ordering::SeqCst);
+    REALLOCATED.store(false, Ordering::SeqCst);
+    CAPTURED_OFFSET.store(0, Ordering::SeqCst);
+    CAPTURED_BLOCK.store(0, Ordering::SeqCst);
+
+    let (original, clone) = make();
+    let (addr, before) = locate(&clone);
+    let len = before.len();
+    assert!(
+        len <= SNAPSHOT_CAP,
+        "{name}: {len}-byte secret exceeds the {SNAPSHOT_CAP}-byte snapshot buffer"
+    );
+    assert!(
+        before.iter().any(|&b| b != 0),
+        "{name}: the secret is all-zero before the drop, so this test proves nothing"
+    );
+
+    WATCH_LEN.store(len, Ordering::SeqCst);
+    WATCH_ADDR.store(addr, Ordering::SeqCst);
+
+    drop(original);
+    assert!(
+        !CAPTURED.load(Ordering::SeqCst),
+        "{name}: the key's memory was released while a clone still holds it"
+    );
+    let (addr_after, after) = locate(&clone);
+    assert_eq!(
+        addr_after, addr,
+        "{name}: the clone no longer reads the same block"
+    );
+    assert!(
+        *after == *before,
+        "{name}: the bytes changed while a clone still holds them"
+    );
+
+    drop(clone);
+    assert_freed_block_was_zeroed(name, expect, len);
 }
 
 /// Every heap-resident field of the multi-field secret struct is zeroed before its

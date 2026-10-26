@@ -162,7 +162,7 @@ mod tests {
     use daemonseed_proto::v1::PeerTriple;
 
     fn ensure_module() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     /// A server-id Handle from a fake key, plus its canonical string form.

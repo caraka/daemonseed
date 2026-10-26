@@ -135,7 +135,7 @@ pub enum WhitelistConvertError {
     BadHandle(HandleParseError),
     /// Authorizing a key against the rebuilt whitelist failed (the oxicrypt
     /// module was not operational for the hash-prefix check).
-    Module(oxicrypt_module::Error),
+    Module(oxicrypt::Error),
 }
 
 /// Build a [`Whitelist`] from the wire entries a client fetched via
@@ -511,7 +511,7 @@ mod tests {
     use daemonseed_core::identity::keys::SignKeypair;
 
     fn keypair(seed: u8) -> SignKeypair {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 

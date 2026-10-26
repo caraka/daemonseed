@@ -42,10 +42,10 @@
 //! with a distinct AAD ([`ROOM_MESSAGE_AAD`]) so a room-sealed message can never
 //! be confused with a circle-sealed one even under a coincidentally-equal key.
 
+use crate::oxi::HkdfSha384;
+use crate::oxi::sha384;
 use daemonseed_proto::v1 as wire;
-use oxicrypt_kdf::HkdfSha384;
-use oxicrypt_module::Error as OxicryptError;
-use oxicrypt_sha::sha384;
+use oxicrypt::Error as OxicryptError;
 use zeroize::Zeroize;
 
 use crate::circle::key::{AeadKey256, COT_KEY_LEN};
@@ -319,7 +319,7 @@ pub fn open_room_message(
 #[derive(Debug)]
 pub enum RoomKeyError {
     /// The HKDF extract/expand step failed.
-    Hkdf(oxicrypt_kdf::KdfError),
+    Hkdf(oxicrypt::Error),
 }
 
 impl core::fmt::Display for RoomKeyError {
@@ -340,7 +340,7 @@ mod tests {
     const SERVER_ID: &[u8] = b"relay-test#001122334455";
 
     fn keypair(seed: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 
@@ -348,7 +348,7 @@ mod tests {
     /// (and the relay) derives the byte-identical global key for the same room.
     #[test]
     fn room_key_is_deterministic_global() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let a = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         let b = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
@@ -358,7 +358,7 @@ mod tests {
     /// distinguisher).
     #[test]
     fn distinct_rooms_distinct_keys() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let lobby = derive_room_key("lobby", &CNSA_2_0).unwrap();
         let news = derive_room_key("announcements", &CNSA_2_0).unwrap();
         assert_ne!(lobby.as_bytes(), news.as_bytes());
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn room_key_does_not_collide_with_circle_key() {
         use crate::circle::key::derive_cot_key;
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let room = derive_room_key("correct horse battery staple", &CNSA_2_0).unwrap();
         let circle = derive_cot_key("correct horse battery staple", &CNSA_2_0).unwrap();
         assert_ne!(
@@ -384,7 +384,7 @@ mod tests {
     /// relay (so the same room on two relays presents two addresses).
     #[test]
     fn room_address_deterministic_and_namespaced() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         let a = room_asset_address(&key, SERVER_ID).unwrap();
         let b = room_asset_address(&key, SERVER_ID).unwrap();
@@ -433,8 +433,8 @@ mod tests {
     /// provenance verification: the message is never surfaced unverified.
     #[test]
     fn tampered_provenance_rejected() {
+        use crate::oxi::{Aes256Key, gcm_encrypt};
         use crate::room_message::provenance_input;
-        use oxicrypt_aes::{Aes256Key, gcm_encrypt};
         let key = derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         let sender = keypair(9);
         // Forge a message: valid seal under the (public) global key, but the
@@ -499,7 +499,7 @@ mod tests {
     /// participant derives the byte-identical owner (→ same lobby rendezvous).
     #[test]
     fn room_owner_seed_is_deterministic() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let a = derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         let b = derive_room_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
@@ -509,7 +509,7 @@ mod tests {
     /// sole distinguisher, so two rooms never share a rendezvous).
     #[test]
     fn room_owner_seed_distinct_rooms() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let lobby = derive_room_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
         let news = derive_room_veilid_owner_seed("announcements", &CNSA_2_0).unwrap();
         assert_ne!(lobby.as_bytes(), news.as_bytes());
@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn room_owner_seed_disjoint_from_room_key_and_circle_owner() {
         use crate::circle::key::derive_circle_veilid_owner_seed;
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let owner = derive_room_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
         let room_key = derive_room_key("lobby", &CNSA_2_0).unwrap();
         assert_ne!(
@@ -544,7 +544,7 @@ mod tests {
     /// per-room (two rooms never share a presence rendezvous).
     #[test]
     fn room_presence_owner_seed_is_deterministic_and_per_room() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let a = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         let b = derive_room_presence_veilid_owner_seed(DEFAULT_ROOM, &CNSA_2_0).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn room_presence_owner_disjoint_from_all_siblings() {
         use crate::circle::key::derive_circle_presence_veilid_owner_seed;
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let presence = derive_room_presence_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
         let room_key = derive_room_key("lobby", &CNSA_2_0).unwrap();
         let chat_owner = derive_room_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
@@ -585,7 +585,7 @@ mod tests {
     /// overwritten by it). Deterministic from public inputs and per-room.
     #[test]
     fn room_share_owner_seed_is_deterministic_and_disjoint_from_all_siblings() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let a = derive_room_share_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
         let b = derive_room_share_veilid_owner_seed("lobby", &CNSA_2_0).unwrap();
         assert_eq!(
@@ -614,7 +614,7 @@ mod tests {
     /// consolidated extract/expand/zeroize/Box path fails the test.
     #[test]
     fn owner_seed_kat_byte_identity() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         assert_eq!(
             hex::encode(
                 derive_room_veilid_owner_seed("lobby", &CNSA_2_0)
@@ -645,7 +645,7 @@ mod tests {
     /// byte-identically for each room seed newtype (ISC-A-C1 log-surface hygiene).
     #[test]
     fn owner_seed_debug_is_redacted() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         assert_eq!(
             format!(
                 "{:?}",

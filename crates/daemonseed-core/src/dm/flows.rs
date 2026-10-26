@@ -31,8 +31,8 @@
 //! rewritten for the lifetime of the conversation and neither secret can be
 //! re-derived from anything else the record holds.
 
-use oxicrypt_ml_dsa as ml_dsa;
-use oxicrypt_ml_kem as ml_kem;
+use crate::oxi::ml_dsa;
+use crate::oxi::ml_kem;
 use zeroize::Zeroizing;
 
 use crate::dm::advert::{self, AdvertError, AdvertKeys, AdvertOwnerSeed, AdvertSharedSecret};
@@ -748,7 +748,7 @@ fn seal_outstanding(
 ) -> Result<OutstandingHello, FlowError> {
     let encapsulation = advert::HelloEncapsulation {
         serial: seal.advert_serial,
-        shared_secret: AdvertSharedSecret::from_bytes(seal.shared_secret.as_bytes()),
+        shared_secret: seal.shared_secret.clone(),
         ciphertext: Box::new(*seal.kem_ct),
     };
     let sealed = match seal.original {
@@ -1627,13 +1627,13 @@ fn finish_accept<R: Records>(
             .try_into()
             .map(Box::new)
             .expect("an opening encodes to OPENING_LEN bytes");
-        let secret_bytes = Zeroizing::new(*encapsulation.shared_secret.as_bytes());
         let control_bytes =
             Zeroizing::new(*channel::control_key(&encapsulation.shared_secret)?.as_bytes());
+        let hello_secret = encapsulation.shared_secret;
         let kem_ct = encapsulation.ciphertext.clone();
         store.update_conv(&peer, |state| {
             state.own_control_key = Some(ControlKey::from_bytes(&control_bytes));
-            state.own_hello_secret = Some(AdvertSharedSecret::from_bytes(&secret_bytes));
+            state.own_hello_secret = Some(hello_secret);
             state.own_hello_kem_ct = Some(kem_ct.clone());
             state.own_opening = Some(opening_bytes.clone());
         })?;
@@ -2829,7 +2829,7 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
 
-    use oxicrypt_sha::sha384;
+    use crate::oxi::sha384;
 
     use crate::dm::store::encode_conv;
     use crate::identity::keys::ML_DSA_SEED_LEN;
@@ -3240,7 +3240,7 @@ mod tests {
     /// module having run first would fail with `NotOperational` out of a
     /// keygen, which reads like a broken keygen.
     fn module() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     /// One identity with its own profile, advert keys and store.
@@ -4140,12 +4140,11 @@ mod tests {
             .load_conv(&peer_a)
             .expect("load")
             .expect("A's record");
-        let ss0 = AdvertSharedSecret::from_bytes(
+        let ss0 = AdvertSharedSecret::clone(
             before
                 .own_hello_secret
                 .as_ref()
-                .expect("A holds its hello secret while awaiting acceptance")
-                .as_bytes(),
+                .expect("A holds its hello secret while awaiting acceptance"),
         );
         // The control: the same search finds the secret before acceptance.
         assert!(
@@ -9091,7 +9090,7 @@ mod tests {
             first_ratchet_pk: ratchet.first_ratchet_pk.clone(),
             slot: from_c.slot,
             advert_serial: from_c.advert_serial,
-            shared_secret: AdvertSharedSecret::from_bytes(from_c.shared_secret.as_bytes()),
+            shared_secret: from_c.shared_secret.clone(),
             generation: from_c.generation,
             reach: Reach::default(),
             reach_serial: 0,

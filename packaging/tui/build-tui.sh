@@ -1,27 +1,23 @@
 #!/usr/bin/env bash
 #
-# build-tui.sh — portable, signed build of the daemonseed TUI.
+# build-tui.sh — portable build of the daemonseed TUI.
 #
-# Produces a single x86_64 binary linked against an old glibc floor (Ubuntu
-# 22.04 "Jammy", glibc 2.35) via cargo-zigbuild, so it runs on a host older
-# than the build machine — and signs it, because since oxicrypt 0.24.0 the
-# module verifies its own image before doing any work and an unsigned binary
-# dies at startup with "Module image integrity".
-#
-# The TUI is a shipped artifact and had no script: the recipe lived in BUILD.md
-# as instructions to follow by hand. A signing step that only a human performs
-# is the one step nothing can fail on, so it lives here instead.
+# Produces an x86_64 binary linked against an old glibc floor (Ubuntu 22.04
+# "Jammy", glibc 2.35) via cargo-zigbuild, so it runs on a host older than the
+# build machine, and places oxicrypt's signed shared library beside it, where
+# the binary's $ORIGIN RUNPATH finds it. Ship the two files together.
 #
 # Requirements:
 #   - rustup with the x86_64-unknown-linux-gnu target
 #   - cargo-zigbuild + zig   (the cross-linker that pins the glibc floor)
-#   - network access on the first build, to fetch the pinned integrity signer
-#     (cached under target/signer/ afterwards)
+#   - network access on the first build, to fetch the pinned oxicrypt library
+#     (cached under target/oxicrypt-ffi/ afterwards)
 #
 # Usage:
 #   packaging/tui/build-tui.sh [OUTPUT_DIR]
-# OUTPUT_DIR defaults to ./dist. The resulting file is
+# OUTPUT_DIR defaults to ./dist. The resulting files are
 #   <OUTPUT_DIR>/daemonseed-tui-x86_64
+#   <OUTPUT_DIR>/liboxicrypt_ffi.so.1
 #
 # Knobs (env):
 #   GLIBC_FLOOR   glibc version suffix for the target triple (default 2.35)
@@ -43,9 +39,14 @@ command -v cargo-zigbuild >/dev/null || die "cargo-zigbuild not found (cargo ins
 command -v zig >/dev/null || die "zig not found"
 rustup target list --installed 2>/dev/null | grep -qx "${TARGET}" || die "rust target ${TARGET} not installed (rustup target add ${TARGET})"
 
+# The signed oxicrypt library the binary links, fetched at the pinned release.
+# shellcheck source=../lib/oxicrypt-ffi.sh
+. "${HERE}/../lib/oxicrypt-ffi.sh"
+oxicrypt_prepare "${REPO_ROOT}" || die "could not prepare the oxicrypt library"
+
 # No `--features desktop`: that is the GUI's slint flag and means nothing here.
 log "building ${BIN} (release) for ${ZIG_TARGET}"
-cargo zigbuild --release --locked -p "${BIN}" --target "${ZIG_TARGET}"
+RUSTFLAGS="$(oxicrypt_rustflags)" cargo zigbuild --release --locked -p "${BIN}" --target "${ZIG_TARGET}"
 
 # cargo-zigbuild emits under the base triple directory (no glibc suffix), which
 # is also why this never collides with a native `target/release` build.
@@ -54,30 +55,15 @@ BIN_PATH="${REPO_ROOT}/target/${TARGET}/release/${BIN}"
 
 mkdir -p "${OUT_DIR}"
 cp -f "${BIN_PATH}" "${OUT_BIN}"
+oxicrypt_bundle "${OUT_DIR}" || die "could not bundle ${OXICRYPT_SONAME}"
 
 # Assert the floor rather than trusting the flag: a zigbuild that silently fell
 # back to the host linker produces a binary that loads here and nowhere older,
 # and the only symptom is a tester reporting a GLIBC version error.
 log "checking the glibc floor"
-MAX_GLIBC="$(objdump -T "${OUT_BIN}" | grep -oE 'GLIBC_[0-9.]+' | sort -u -V | tail -1 | sed 's/^GLIBC_//')"
-[ -n "${MAX_GLIBC}" ] || die "no GLIBC version symbols found in ${OUT_BIN} — objdump read nothing, so this check proved nothing"
-# Sort -V puts the higher version last; if that is the floor, nothing exceeds it.
-[ "$(printf '%s\n%s\n' "${MAX_GLIBC}" "${GLIBC_FLOOR}" | sort -V | tail -1)" = "${GLIBC_FLOOR}" ] \
-  || die "binary requires GLIBC_${MAX_GLIBC}, above the ${GLIBC_FLOOR} floor"
+MAX_GLIBC="$(oxicrypt_check_glibc "${GLIBC_FLOOR}" "${OUT_BIN}" "${OUT_DIR}/${OXICRYPT_SONAME}")" \
+  || die "glibc floor check failed"
 log "glibc floor ok (max symbol GLIBC_${MAX_GLIBC} <= ${GLIBC_FLOOR})"
 
-# Signed LAST, after the copy and after the floor check, because the MAC covers
-# the artifact's loader-invariant extent and anything that rewrites the file
-# invalidates the slot. The signer is a build tool from oxicrypt's own tree,
-# outside the cryptographic boundary; nothing here links it.
-# The signer is resolved from the registry at the version this workspace pins,
-# so the tool that writes the slot and the runtime that reads it cannot drift.
-# shellcheck source=../lib/sign.sh
-. "${HERE}/../lib/sign.sh"
-SIGNER_BIN="$(resolve_signer "${REPO_ROOT}")" || die "could not resolve the integrity signer"
-
-log "signing the module image"
-sign_artifact "${SIGNER_BIN}" "${OUT_BIN}" || die "integrity signing failed or the slot did not verify"
-
 log "done: ${OUT_BIN}"
-file "${OUT_BIN}"
+file "${OUT_BIN}" "${OUT_DIR}/${OXICRYPT_SONAME}"

@@ -3198,7 +3198,7 @@ mod tests {
     }
 
     fn node_seed() -> daemonseed_core::identity::keys::VeilidNodeSeed {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let mnemonic =
             daemonseed_core::identity::mnemonic::Mnemonic::generate().expect("a recovery phrase");
         daemonseed_core::identity::keys::derive_identity_keys(

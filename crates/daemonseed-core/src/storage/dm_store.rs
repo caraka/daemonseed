@@ -143,8 +143,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use oxicrypt_aes::{Aes256Key, ModeError};
-use oxicrypt_kdf::HkdfSha384;
+use crate::oxi::Aes256Key;
+use crate::oxi::HkdfSha384;
 use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
@@ -2286,7 +2286,7 @@ impl DmStoreError {
     fn from_envelope(kind: RecordKind, e: EnvelopeError) -> Self {
         match e {
             EnvelopeError::EntropySource(e) => DmStoreError::EntropySource(e),
-            EnvelopeError::Decrypt(ModeError::TagMismatch) | EnvelopeError::TooShort => {
+            EnvelopeError::Decrypt(oxicrypt::Error::TagMismatch) | EnvelopeError::TooShort => {
                 DmStoreError::NotAuthentic { kind }
             }
             EnvelopeError::Decrypt(_) | EnvelopeError::Encrypt(_) => DmStoreError::Module,
@@ -2499,7 +2499,7 @@ mod tests {
     }
 
     fn store(dir: &Path) -> DmStore {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         DmStore::open(dir.join("dm"), &AT_REST).unwrap()
     }
 
@@ -4574,7 +4574,7 @@ mod tests {
         let root = tmp.path().join("dm");
         let l = label(14);
 
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let ours = DmStore::open(&root, &AT_REST).unwrap();
         ours.critical_section::<_, DmStoreError>(&l, |g| g.replace(RecordKind::Resume, b"ours"))
             .unwrap();
@@ -5196,7 +5196,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("dm");
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let l = label(18);
         let start = std::sync::Barrier::new(2);
 
@@ -5233,7 +5233,7 @@ mod tests {
     fn different_correspondences_do_not_serialize() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("dm");
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
 
         let (tx_a, rx_a) = mpsc::channel();
         let (tx_b, rx_b) = mpsc::channel();
@@ -5959,7 +5959,7 @@ mod tests {
     fn a_contact_record_round_trips_through_the_store() {
         use crate::dm::contact_cache::ContactRecord;
         use crate::dm::contact_cache::ROOT_LEN;
-        use oxicrypt_ml_dsa as ml_dsa;
+        use crate::oxi::ml_dsa;
 
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path());
@@ -6038,7 +6038,7 @@ mod tests {
     fn a_contact_record_from_another_correspondence_does_not_open() {
         use crate::dm::contact_cache::ContactRecord;
         use crate::dm::contact_cache::ROOT_LEN;
-        use oxicrypt_ml_dsa as ml_dsa;
+        use crate::oxi::ml_dsa;
 
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path());

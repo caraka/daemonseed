@@ -1,0 +1,571 @@
+# Release artifacts: the Linux AppImage (GUI), the Linux TUI and the Windows
+# GUI, built on GitHub runners from a signed tag.
+#
+# TRIGGER POLICY: a pushed tag stages a release; a person publishes it.
+#   A push of a `v*` tag runs `guard`, which takes `scripts/release-guard.sh`,
+#   `scripts/check-release-tag.sh` and `keys/allowed-signers` from `main`, so
+#   the tagged tree cannot change them. The tag must be annotated, signed by a
+#   key that file names, carry its own name in the signed tag object, name the
+#   workspace version as `v` and a SemVer version, and point at a commit
+#   reachable from `main`. The build legs then run in the `release`
+#   environment, which holds them for approval only when the repository
+#   configures that environment with required reviewers, as it must for a
+#   release. They build every artifact, load each one on the runner that
+#   built it, and record its provenance. `verify` checks every archive
+#   against its matrix row and the import allow-list, and `attach` puts the
+#   archives and their checksums on a DRAFT release for the tag, creating the
+#   draft if there is none. The maintainer downloads the draft's files, tests
+#   them, and publishes the draft by hand, so the bytes tested are the bytes
+#   published. The workflow never publishes a release and never changes a
+#   published one. A staging run whose leg failed is re-run from that run; the
+#   draft takes the re-run's files in place of any of the same name.
+#   A tag push runs this file as it stands in the tagged commit, so a tag on a
+#   commit whose copy lacks the guard is held only by the `release`
+#   environment: its rule admitting `v*` tags alone, and the required reviewers
+#   it holds runs for when the repository configures them.
+#
+#   `workflow_dispatch`, on any branch, is a dry run, and so is a pull request
+#   that carries the `release-dry-run` label: add the label to a pull request to
+#   dry-run the release legs on it. Without the label a pull request's runs
+#   build nothing: a new commit, a reopen or an added label still starts a
+#   run, its `guard` job finds no `release-dry-run` label, and every leg,
+#   `verify` and `attach` is skipped. A dry run builds, loads and checks
+#   every leg exactly as for a release, and uploads the archives as workflow
+#   artifacts. A dry run never enters the `release` environment and never
+#   creates or changes a release or a tag; the guard decides publish=false for
+#   every dispatch and pull request, and its tests in
+#   `scripts/test-release-scripts.sh` pin that. `build-release` and `attach`
+#   also require a push event. The label decides whether the legs run, which
+#   is a matter of cost, not what a run may do. What bounds a pull request's
+#   run lies outside it, in the platform and the repository's settings: GitHub
+#   gives a pull request from a fork a read-only token and no secrets, the
+#   `release` environment admits only `v*` tags and holds runs for approval when
+#   the repository configures it with required reviewers, and a first-time
+#   contributor's runs wait for approval.
+#
+# THE LEGS
+#   One matrix row per artifact. A new platform is a new row: its runner, its
+#   target triple, the oxicrypt release platform it links, its kind (how it is
+#   built and loaded) and the files it ships. RELEASE_ARTIFACTS below counts
+#   the rows, and `verify` and `attach` require exactly that many archives.
+#   Each leg ships one archive: a `.zip` for a Windows triple, a `.tar.gz`
+#   for any other.
+#
+#   linux-x86_64-appimage  `packaging/appimage/build-appimage.sh`; the AppImage
+#                          carries oxicrypt's library in `usr/lib`.
+#   linux-x86_64-tui       `packaging/tui/build-tui.sh`; the library ships
+#                          beside the binary.
+#   windows-x86_64-gui     `cargo build` for `x86_64-pc-windows-msvc`, linked
+#                          through oxicrypt's `oxicrypt_ffi.dll.lib`; the exe
+#                          ships in a `.zip` with oxicrypt's DLL and the
+#                          runner's `vcruntime140.dll` beside it.
+#
+# WHAT EACH ARTIFACT RECORDS
+#   `BUILD-PROVENANCE.txt` in every archive names the target triple, the
+#   commit, the toolchain, the run, the oxicrypt library file and its sha256,
+#   the oxicrypt release-key fingerprint the build pinned, and how the artifact
+#   was loaded. The Windows provenance also names the `vcruntime140.dll`
+#   version and sha256. daemonseed's binaries carry no signature of their own:
+#   the oxicrypt library is oxicrypt's release file, byte for byte, and it
+#   verifies its own signature when it is initialised.
+#
+# THE LOAD CHECK (scripts/release-load-check.sh)
+#   The GUI runs `--self-check`, a headless path that initialises the oxicrypt
+#   module, joins a circle from a fixed phrase (deriving the circle's key) and
+#   checks that a draft survives switching circles; joining fails unless the
+#   module is operational. The TUI runs in a pseudo-terminal and must draw its
+#   first-start screen, which it does only after the module initialised. The
+#   control for each is a copy of the binary alone, which must fail to start
+#   because the library is not beside it.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build as a dry run (vX.Y.Z); empty builds the dispatched ref"
+        required: false
+        default: ''
+        type: string
+  # A dry run on a pull request, opt-in: the legs run only while the pull
+  # request carries the `release-dry-run` label (see `guard`). No `opened`: a
+  # pull request opened with the label also fires `labeled`.
+  pull_request:
+    types: [synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The number of matrix rows below. `verify` and `attach` require exactly
+  # this many archives, so a row added or removed changes this number with it.
+  RELEASE_ARTIFACTS: 3
+  ZIG_VERSION: 0.13.0
+  ZIG_SHA256: d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea
+  CARGO_ZIGBUILD_VERSION: 0.23.0
+  APPIMAGETOOL_VERSION: 1.9.0
+  APPIMAGETOOL_SHA256: 46fdd785094c7f6e545b61afcfb0f3d98d8eab243f644b4b17698c01d06083d1
+  PROTOC_VERSION: '21.12'
+  PROTOC_WIN64_SHA256: 71852a30cf62975358edfcbbff93086e8857a079c8e4d6904881aa968d65c7f9
+
+# Push and dispatch run one at a time per ref. A pull request's runs that will
+# build (it carries `release-dry-run`, and a `labeled` event added that label,
+# the same rule as the guard's) share one group per pull request, so the latest
+# head waits for the run before it and replaces only another run that builds.
+# A run that will not build gets a group of its own, keyed by its run ID, so it
+# can neither wait behind a dry run nor displace a pending one.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request'
+    && format('release-pr-{0}-{1}', github.event.pull_request.number,
+    (contains(github.event.pull_request.labels.*.name, 'release-dry-run')
+    && (github.event.action != 'labeled' || github.event.label.name == 'release-dry-run'))
+    && 'dry-run' || github.run_id)
+    || format('release-{0}', github.ref) }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: guard (what to build, whether to stage a release)
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.decide.outputs.sha }}
+      label: ${{ steps.decide.outputs.label }}
+      tag: ${{ steps.decide.outputs.tag }}
+      publish: ${{ steps.decide.outputs.publish }}
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide and validate
+        id: decide
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PR_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_ADDED_LABEL: ${{ github.event.label.name }}
+        run: |
+          set -euo pipefail
+          G="$RUNNER_TEMP/guard"
+          mkdir -p "$G"
+          if [ "$EVENT" = push ]; then
+            [[ "$REF_NAME" =~ ^v[0-9A-Za-z.-]+$ ]] || { echo "::error::the tag is not of the form vX.Y.Z or vX.Y.Z-suffix"; exit 1; }
+            # The tag object itself, which carries the signature; the checkout
+            # may hold the tag as a plain ref to its commit.
+            git fetch --no-tags --force origin "+refs/tags/${REF_NAME}:refs/tags/${REF_NAME}"
+            for f in scripts/release-guard.sh scripts/check-release-tag.sh keys/allowed-signers; do
+              git show "origin/main:$f" > "$G/$(basename "$f")"
+            done
+          else
+            # A dry run stages nothing, so the dispatched or pull-request
+            # tree's copies serve.
+            cp scripts/release-guard.sh scripts/check-release-tag.sh keys/allowed-signers "$G/"
+          fi
+          bash "$G/release-guard.sh" "$EVENT" "$REF_TYPE" "$REF_NAME" "$EVENT_SHA" "$INPUT_TAG" \
+            "$G/check-release-tag.sh" "$G/allowed-signers" | tee -a "$GITHUB_OUTPUT"
+
+  # Two jobs with one definition (the YAML anchors below): `build` for a dry
+  # run, which enters no environment, and `build-release` for a run that
+  # stages a release, which runs in the `release` environment and so waits for
+  # the approval that environment's required reviewers give, when configured.
+  # The guard's `publish` output selects exactly one.
+  build:
+    name: ${{ matrix.name }}
+    needs: guard
+    # A pull request without the `release-dry-run` label runs no leg: the guard
+    # says run=false, and every leg, and `verify`, is skipped.
+    if: needs.guard.outputs.publish != 'true' && needs.guard.outputs.run == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    env: &build-env
+      LABEL: ${{ needs.guard.outputs.label }}
+      PUBLISH: ${{ needs.guard.outputs.publish }}
+    strategy: &build-strategy
+      # One failing leg must not cancel the others; its run is re-run once the
+      # cause is fixed.
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64-appimage
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            ffi: linux-x86_64
+            kind: appimage
+            files: out/daemonseed-gui-x86_64.AppImage
+          - name: linux-x86_64-tui
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            ffi: linux-x86_64
+            kind: tui
+            files: out/daemonseed-tui-x86_64 out/liboxicrypt_ffi.so.1
+          - name: windows-x86_64-gui
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            ffi: windows-x86_64
+            kind: windows-gui
+            files: out/daemonseed-gui.exe out/oxicrypt_ffi.dll out/vcruntime140.dll
+
+    steps: &build-steps
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+
+      # A re-run reuses the guard's verdict, so a staging leg checks again
+      # that the tag still names the commit the guard accepted.
+      - name: The tag still names the accepted commit
+        if: env.PUBLISH == 'true'
+        shell: bash
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+          SHA: ${{ needs.guard.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          now="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+          [ "$now" = "$SHA" ] || { echo "::error::$TAG now names $now, not the accepted $SHA"; exit 1; }
+
+      - name: Install the pinned toolchain and the target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show
+          rustup target add '${{ matrix.target }}'
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-${{ matrix.name }}
+          save-if: false
+
+      - name: Fetch the oxicrypt library
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$(bash scripts/fetch-oxicrypt-ffi.sh '${{ matrix.ffi }}')"
+          if [ "$RUNNER_OS" = Windows ]; then
+            dir="$(cygpath -w "$dir")"
+            echo "OXICRYPT_LIB_FILE=oxicrypt_ffi.dll" >> "$GITHUB_ENV"
+          else
+            echo "OXICRYPT_LIB_FILE=liboxicrypt_ffi.so.1" >> "$GITHUB_ENV"
+          fi
+          echo "OXICRYPT_LIB_DIR=$dir" >> "$GITHUB_ENV"
+          # The pin cargo hands the build, from its one definition in
+          # .cargo/config.toml, for the provenance the stage step writes.
+          fp="$(bash scripts/oxicrypt-fingerprint.sh)"
+          echo "OXICRYPT_LIB_FINGERPRINT=$fp" >> "$GITHUB_ENV"
+
+      # --- Linux -------------------------------------------------------------
+
+      - name: Install native build dependencies, zig and cargo-zigbuild
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # desktop-file-utils: appimagetool refuses to pack without
+          # desktop-file-validate. librsvg2-bin: rsvg-convert renders the PNG icon.
+          sudo apt-get install -y --no-install-recommends protobuf-compiler libwayland-dev pkg-config \
+            desktop-file-utils librsvg2-bin
+          Z="$RUNNER_TEMP/zig.tar.xz"
+          curl --fail --location --silent --show-error --max-time 300 --output "$Z" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  $Z" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$Z" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --version "${CARGO_ZIGBUILD_VERSION}" --locked
+
+      - name: Install appimagetool
+        if: matrix.kind == 'appimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          A="$RUNNER_TEMP/bin/appimagetool"
+          curl --fail --location --silent --show-error --max-time 300 --output "$A" \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage"
+          echo "${APPIMAGETOOL_SHA256}  $A" | sha256sum --check
+          chmod +x "$A"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          # appimagetool and the AppImage it builds run without FUSE.
+          echo "APPIMAGE_EXTRACT_AND_RUN=1" >> "$GITHUB_ENV"
+
+      - name: Build the AppImage, and load it
+        if: matrix.kind == 'appimage'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash packaging/appimage/build-appimage.sh "$PWD/out"
+          line="$(bash scripts/release-load-check.sh gui out/daemonseed-gui-x86_64.AppImage | tail -n 1)"
+          X="$(mktemp -d)"
+          (cd "$X" && "$GITHUB_WORKSPACE/out/daemonseed-gui-x86_64.AppImage" --appimage-extract >/dev/null)
+          bash scripts/release-load-check.sh missing-library "$X/squashfs-root/usr/bin/daemonseed-gui"
+          echo "LOADED=${line#load check: }, on the runner that built it" >> "$GITHUB_ENV"
+
+      - name: Build the TUI, and load it
+        if: matrix.kind == 'tui'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash packaging/tui/build-tui.sh "$PWD/out"
+          line="$(bash scripts/release-load-check.sh tui out/daemonseed-tui-x86_64 | tail -n 1)"
+          bash scripts/release-load-check.sh missing-library out/daemonseed-tui-x86_64
+          echo "LOADED=${line#load check: }, on the runner that built it" >> "$GITHUB_ENV"
+
+      # --- Windows -----------------------------------------------------------
+
+      - name: Install protoc
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip" -OutFile $zip
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($sha -ne $env:PROTOC_WIN64_SHA256) { throw "protoc.zip sha256 $sha is not the pinned $env:PROTOC_WIN64_SHA256" }
+          $dir = Join-Path $env:RUNNER_TEMP 'protoc'
+          Expand-Archive -Path $zip -DestinationPath $dir
+          Join-Path $dir 'bin' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Build the Windows GUI
+        if: matrix.kind == 'windows-gui'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p daemonseed-gui --features desktop --target '${{ matrix.target }}'
+
+      # The exe, oxicrypt's DLL unchanged, and the runner's Visual C++ runtime,
+      # whose version and sha256 go into the provenance.
+      - name: Assemble the Windows files
+        if: matrix.kind == 'windows-gui'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/daemonseed-gui.exe" out/
+          Copy-Item (Join-Path $env:OXICRYPT_LIB_DIR 'oxicrypt_ffi.dll') out/
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $crt = Get-ChildItem (Join-Path $vs 'VC\Redist\MSVC') -Directory |
+            Where-Object { $_.Name -match '^\d+(\.\d+)+$' } |
+            Sort-Object { [version]$_.Name } -Descending |
+            ForEach-Object { Get-ChildItem (Join-Path $_.FullName 'x64') -Directory -Filter 'Microsoft.VC*.CRT' } |
+            Select-Object -First 1
+          if (-not $crt) { throw 'no Microsoft.VC*.CRT directory in the Visual C++ redistributable' }
+          $vc = Join-Path $crt.FullName 'vcruntime140.dll'
+          if (-not (Test-Path $vc)) { throw "no vcruntime140.dll in $($crt.FullName)" }
+          Copy-Item $vc out/
+          $version = (Get-Item $vc).VersionInfo.FileVersion
+          $sha = (Get-FileHash -Algorithm SHA256 out/vcruntime140.dll).Hash.ToLower()
+          "vcruntime140.dll     : $version sha256:$sha, from $vc" |
+            Out-File -FilePath (Join-Path $env:RUNNER_TEMP 'provenance-extra.txt') -Encoding utf8
+          "RELEASE_PROVENANCE_EXTRA=$(Join-Path $env:RUNNER_TEMP 'provenance-extra.txt')" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Load the Windows GUI
+        if: matrix.kind == 'windows-gui'
+        shell: bash
+        run: |
+          set -euo pipefail
+          line="$(bash scripts/release-load-check.sh gui out/daemonseed-gui.exe | tail -n 1)"
+          bash scripts/release-load-check.sh missing-library out/daemonseed-gui.exe
+          echo "LOADED=${line#load check: }, on the runner that built it" >> "$GITHUB_ENV"
+
+      # --- every leg ---------------------------------------------------------
+
+      # The bundled library must be oxicrypt's release file: the same bytes as
+      # the copy inside the pinned tarball.
+      - name: The bundled library is the release file
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="$OXICRYPT_LIB_DIR"
+          if [ "$RUNNER_OS" = Windows ]; then dir="$(cygpath -u "$dir")"; fi
+          tarball="$(find "$dir" -maxdepth 1 -name 'oxicrypt-ffi-v*-${{ matrix.ffi }}.tar.gz')"
+          [ "$(printf '%s\n' "$tarball" | grep -c .)" -eq 1 ] || { echo "::error::expected one oxicrypt tarball in $dir"; exit 1; }
+          want="$(tar -xOzf "$tarball" "$(basename "$tarball" .tar.gz)/$OXICRYPT_LIB_FILE" | sha256sum | cut -d' ' -f1)"
+          found=0
+          for f in ${{ matrix.files }}; do
+            if [ "$(basename "$f")" = "$OXICRYPT_LIB_FILE" ]; then
+              found=1
+              [ "$(sha256sum < "$f" | cut -d' ' -f1)" = "$want" ] || { echo "::error::$f is not the release file"; exit 1; }
+            fi
+          done
+          if [ '${{ matrix.kind }}' = appimage ]; then
+            X="$(mktemp -d)"
+            (cd "$X" && "$GITHUB_WORKSPACE/out/daemonseed-gui-x86_64.AppImage" --appimage-extract >/dev/null)
+            [ "$(sha256sum < "$X/squashfs-root/usr/lib/$OXICRYPT_LIB_FILE" | cut -d' ' -f1)" = "$want" ] \
+              || { echo "::error::the AppImage's library is not the release file"; exit 1; }
+            found=1
+          fi
+          [ "$found" = 1 ] || { echo "::error::the leg ships no $OXICRYPT_LIB_FILE"; exit 1; }
+          echo "bundled $OXICRYPT_LIB_FILE: sha256 $want, the release file"
+
+      - name: Stage the artifact with its provenance
+        shell: bash
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = Windows ]; then
+            OXICRYPT_LIB_DIR="$(cygpath -u "$OXICRYPT_LIB_DIR")"
+            export OXICRYPT_LIB_DIR
+          fi
+          bash scripts/stage-release-artifact.sh "$LABEL" '${{ matrix.name }}' '${{ matrix.target }}' "$LOADED" dist \
+            ${{ matrix.files }} LICENSE-AGPL LICENSE-APACHE LICENSE-MIT | tee stage.txt
+          archive="$(tail -n 1 stage.txt)"
+          # The archive the stage wrote, and the triple of this matrix row,
+          # for `verify`: a `.zip` for a Windows triple, a `.tar.gz` otherwise.
+          echo "$archive ${{ matrix.target }}" > row.txt
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            dist/
+            row.txt
+          retention-days: 7
+          if-no-files-found: error
+
+  build-release:
+    name: ${{ matrix.name }} (release)
+    needs: guard
+    if: github.event_name == 'push' && needs.guard.outputs.publish == 'true'
+    runs-on: ${{ matrix.runner }}
+    environment: release
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    env: *build-env
+    strategy: *build-strategy
+    steps: *build-steps
+
+  # Every archive against the matrix row that built it and against the import
+  # allow-list in the repository, for a dry run and a release alike.
+  verify:
+    name: provenance and imports
+    needs: [guard, build, build-release]
+    # Exactly one of the two build jobs runs; the other is skipped.
+    if: >-
+      always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+      && contains(needs.*.result, 'success') && needs.guard.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/check-release-artifact.py
+            scripts/verify-release-rows.sh
+            packaging/release/import-allow-list.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Install the inspection tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils squashfs-tools
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: records
+
+      - name: Check every archive against its row and the allow-list
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/verify-release-rows.sh records packaging/release/import-allow-list.txt "$RELEASE_ARTIFACTS"
+
+  # The only job that writes to the repository, with the job token's
+  # `contents: write` scope and no other secret. It checks out one file of the
+  # tagged tree, scripts/attach-draft.sh, and runs it to attach what the build
+  # jobs uploaded to a draft release, which the maintainer tests and then
+  # publishes. Unlike the guard's scripts, that file comes from the tagged
+  # commit, which the guard accepted only on `main`. It starts only when every leg and `verify`
+  # passed, and first checks that the tag still names the commit the guard
+  # accepted.
+  attach:
+    name: attach to a draft release
+    needs: [guard, build-release, verify]
+    if: >-
+      always() && needs.guard.result == 'success' && needs.build-release.result == 'success'
+      && needs.verify.result == 'success' && needs.guard.outputs.publish == 'true'
+      && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/attach-draft.sh
+          sparse-checkout-cone-mode: false
+
+      - name: The tag still names the accepted commit
+        shell: bash
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+          SHA: ${{ needs.guard.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          now="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+          [ "$now" = "$SHA" ] || { echo "::error::$TAG now names $now, not the accepted $SHA"; exit 1; }
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: records
+
+      - name: Check the set
+        shell: bash
+        run: |
+          set -euo pipefail
+          listing="$(find records -path '*/dist/*' -type f)"
+          mapfile -t files < <(sort <<<"$listing")
+          mapfile -t sums < <(printf '%s\n' "${files[@]}" | grep -E '\.(tar\.gz|zip)\.sha256$')
+          archives="$(printf '%s\n' "${files[@]}" | grep -cE '/daemonseed-[^/]*\.(tar\.gz|zip)$' || true)"
+          echo "archives: $archives; checksums: ${#sums[@]}; files: ${#files[@]}"
+          if [ "$archives" -ne "$RELEASE_ARTIFACTS" ] || [ "${#sums[@]}" -ne "$RELEASE_ARTIFACTS" ] \
+              || [ "${#files[@]}" -ne $((2 * RELEASE_ARTIFACTS)) ]; then
+            echo "::error::expected $RELEASE_ARTIFACTS archives, each with its checksum, and nothing else"
+            exit 1
+          fi
+          for sum in "${sums[@]}"; do
+            read -r _ named rest < "$sum"
+            if [ "${named#\*}" != "$(basename "${sum%.sha256}")" ] || [ -n "${rest:-}" ] \
+                || [ "$(wc -l < "$sum")" -ne 1 ]; then
+              echo "::error::$sum does not name only $(basename "${sum%.sha256}")"
+              exit 1
+            fi
+            (cd "$(dirname "$sum")" && sha256sum -c "$(basename "$sum")")
+          done
+
+      - name: Attach to the draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          listing="$(find records -path '*/dist/*' -type f)"
+          mapfile -t files < <(sort <<<"$listing")
+          bash scripts/attach-draft.sh "$TAG" "$GITHUB_REPOSITORY" "${files[@]}"

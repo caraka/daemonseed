@@ -21,7 +21,7 @@ dirs = "5"
 # Direct handle on the winit backend for the focus-restoration hook (#39): re-grab
 # keyboard focus on window activation. Optional + desktop-gated; already in the lock
 # transitively via `slint/backend-winit`, so no new download. Version tracks `slint`.
-i-slint-backend-winit = { version = "1.13", optional = true }
+i-slint-backend-winit = { version = "1.18", optional = true }
 
 # Real networking (round-3): the GUI lobby wires to a relay by REUSING the proven
 # client stack rather than duplicating security-critical code. `daemonseed-cli`
@@ -45,9 +45,6 @@ daemonseed-veilid-net = { path = "../daemonseed-veilid-net" }
 # public-share chunk downloads (#113) — same dep + spec the veilid-net fragment
 # pipeline (#109) uses.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-
-# Startup crypto-module init — symmetric with the TUI.
-oxicrypt-module = { workspace = true }
 
 # Async runtime for the network side. The render loop stays on the main (UI)
 # thread; the net actor runs a current-thread runtime on a dedicated thread and
@@ -99,22 +96,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Turns on Slint's fontique `fontconfig-dlopen`, so fontconfig is loaded at run time rather than linked.
+fontique = { version = "0.11", default-features = false, features = ["fontconfig-dlopen"] }
+
 [build-dependencies]
 slint-build = { workspace = true }
 
 [dev-dependencies]
-# The integrity signer, pinned here so the tool that writes the slot and the
-# runtime test that reads it move together. Built and run as a binary against
-# the packaged artifact; nothing in this crate links it.
-oxicrypt-integrity-sign = { workspace = true }
-# Named again here purely to switch daemonseed-core's `testing` feature on while
-# building this crate's test targets, so `kats::initialize_module_unsigned_test_binary`
-# is reachable from test targets. The release command carries no dev-dependency
-# edge (`cargo zigbuild --release --locked -p <crate>`), so the shipped artifact
-# never links a `testing`-enabled core. Note the narrower true statement: under
-# `--all-targets` cargo does enable the feature for this crate's bin target too,
-# so "off in every build" would be false — it is off in the build that ships.
-daemonseed-core = { path = "../daemonseed-core", features = ["testing"] }
 # Named again to switch on `test-support`, whose `ContactRequestId::for_test`
 # lets this crate's tests build the contact-request events a runner sends, and
 # whose `VeilidNetHandle::with_scripted_subscribes` gives them a handle whose

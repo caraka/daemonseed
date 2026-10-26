@@ -70,7 +70,7 @@ impl VeilidNetConfig {
     pub fn protect_with_profile(
         &mut self,
         profile_secret: &[u8],
-    ) -> Result<(), daemonseed_core::kdf::KdfError> {
+    ) -> Result<(), daemonseed_core::oxi::Error> {
         let tag = daemonseed_core::kdf::veilid_namespace_tag(profile_secret)?;
         self.device_key_password = Some(daemonseed_core::kdf::veilid_device_key_password(
             profile_secret,

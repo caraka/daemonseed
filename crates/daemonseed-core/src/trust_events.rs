@@ -40,9 +40,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::oxi::HkdfSha384;
+use crate::oxi::{Aes256Key, gcm_decrypt, gcm_encrypt};
 use argon2::{Algorithm, Argon2, Params, Version};
-use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
-use oxicrypt_kdf::HkdfSha384;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -645,11 +645,11 @@ pub enum AuditLogError {
     /// Argon2id stage failed (bad params).
     Argon2(argon2::Error),
     /// HKDF stage failed.
-    Hkdf(oxicrypt_kdf::KdfError),
+    Hkdf(oxicrypt::Error),
     /// AES-256 key init failed.
-    AesKeyInit(oxicrypt_module::Error),
+    AesKeyInit(oxicrypt::Error),
     /// AES-GCM mode error (non-auth).
-    AesMode(oxicrypt_aes::ModeError),
+    AesMode(oxicrypt::Error),
     /// AEAD authentication failed — wrong passphrase or tampered file.
     AuthenticationFailed,
     /// Entropy source failed while generating the nonce.
@@ -807,7 +807,7 @@ pub fn open_log(bytes: &[u8], passphrase: &str) -> Result<TrustEventLog, AuditLo
 
     let mut plaintext = vec![0u8; ciphertext.len()];
     gcm_decrypt(&aes, &nonce, header, ciphertext, &tag, &mut plaintext).map_err(|e| match e {
-        oxicrypt_aes::ModeError::TagMismatch => AuditLogError::AuthenticationFailed,
+        oxicrypt::Error::TagMismatch => AuditLogError::AuthenticationFailed,
         other => AuditLogError::AesMode(other),
     })?;
 
@@ -1735,7 +1735,7 @@ mod tests {
     /// caller actually uses — `decode_log` is private.
     #[test]
     fn the_unreadable_count_survives_seal_and_open() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let entries = vec![
             TrustEvent::observed(1, TrustEventKey::ServerKeyRotated, None, None),
             TrustEvent::observed(2, TrustEventKey::NoCommonVersion, None, None),
@@ -1884,7 +1884,7 @@ mod tests {
     /// removed, this input aborts the process attempting a 4 TiB allocation.
     #[test]
     fn an_absurd_argon_cost_is_refused_before_deriving() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let log = TrustEventLog::new(DEFAULT_LOG_CAP);
         let bytes =
             seal_log(&log, "pass", Uuid::from_bytes([3u8; 16]), fast_params()).expect("seals");
@@ -1912,7 +1912,7 @@ mod tests {
     /// A log round-trips through seal → open under the right passphrase.
     #[test]
     fn seal_then_open_round_trips() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let profile_id = Uuid::from_bytes([3u8; 16]);
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         log.append(TrustEvent::observed(
@@ -1942,7 +1942,7 @@ mod tests {
     /// The wrong passphrase fails authentication (does not silently return junk).
     #[test]
     fn open_rejects_wrong_passphrase() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let profile_id = Uuid::from_bytes([4u8; 16]);
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         log.append(TrustEvent::observed(
@@ -2136,7 +2136,7 @@ mod tests {
     /// does not stop a v1 file authenticating.
     #[test]
     fn a_v1_file_still_opens_after_the_version_bump() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let profile_id = Uuid::from_bytes([7u8; 16]);
         let params = fast_params();
         let sealed = seal_body_as_v1(&unhex(V1_BODY_KAT), "old-pass", profile_id, params);
@@ -2151,7 +2151,7 @@ mod tests {
     /// decoding short — the magic is AAD, so the version is authenticated.
     #[test]
     fn a_v1_file_relabelled_as_v2_fails_the_tag() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let profile_id = Uuid::from_bytes([8u8; 16]);
         let mut sealed =
             seal_body_as_v1(&unhex(V1_BODY_KAT), "old-pass", profile_id, fast_params());
@@ -2168,7 +2168,7 @@ mod tests {
     /// downgrade.
     #[test]
     fn a_v2_file_relabelled_as_v1_fails_the_tag() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let profile_id = Uuid::from_bytes([10u8; 16]);
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         log.append(
@@ -2222,7 +2222,7 @@ mod tests {
     /// A record kind survives a full seal → open.
     #[test]
     fn a_record_kind_round_trips_through_seal_and_open() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let profile_id = Uuid::from_bytes([9u8; 16]);
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         for kind in RecordKind::ALL {
@@ -2534,7 +2534,7 @@ mod tests {
     /// Tampering with the ciphertext fails authentication (AAD + AEAD).
     #[test]
     fn open_rejects_tampered_bytes() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let profile_id = Uuid::from_bytes([5u8; 16]);
         let mut log = TrustEventLog::new(DEFAULT_LOG_CAP);
         log.append(TrustEvent::observed(

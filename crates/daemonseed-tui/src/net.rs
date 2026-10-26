@@ -764,7 +764,7 @@ impl NetHandle {
     /// via `block_on` + `spawn_local` sidesteps both `Send` bounds.
     ///
     /// Caller contract: the oxicrypt module must already be `Operational`
-    /// (the binary drives `initialize_with_profile` at startup).
+    /// (the binary calls `oxi::initialize_module` at startup).
     pub fn new() -> std::io::Result<Self> {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();

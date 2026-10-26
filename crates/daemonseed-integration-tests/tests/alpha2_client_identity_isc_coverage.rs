@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 fn ensure_module() {
-    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let _ = daemonseed_core::oxi::initialize_module();
 }
 
 fn test_params() -> ArgonParams {

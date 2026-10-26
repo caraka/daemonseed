@@ -16,27 +16,26 @@ The script builds `daemonseed-gui --release --features desktop` with
 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild), targeting
 `x86_64-unknown-linux-gnu.2.35` so the binary links against the **glibc 2.35**
 floor (Ubuntu 22.04 "Jammy"). It then assembles an AppDir from the templates in
-this directory, **signs the binary's integrity slot**, and runs `appimagetool`.
+this directory, bundles oxicrypt's signed shared library, and runs `appimagetool`.
 
-## Signing
+## The oxicrypt library
 
-The oxicrypt module verifies its own image before doing any work, so an unsigned
-binary exits at startup with `Module image integrity`. The script runs
-`oxicrypt-integrity-sign --sign` on the AppDir binary and reads the slot back with
-`--verify`, as its **last** step before packaging — anything that rewrites the
-artifact after signing invalidates the MAC. `appimagetool` stores the ELF verbatim,
-so the slot survives into the AppImage.
-
-The signer is fetched from crates.io at the version this workspace pins, so the tool
-that writes the slot and the runtime that reads it cannot drift. It is a build tool,
-outside the cryptographic boundary, and is linked into nothing that ships.
+The binary links oxicrypt's separately built and signed shared library,
+`liboxicrypt_ffi.so.1`, which verifies its own signature when it is initialised.
+The script fetches the pinned release with `scripts/fetch-oxicrypt-ffi.sh` (which
+checks the tarball's sha256), confirms the unpacked library is byte-identical to the
+tarball's copy, and installs it unchanged as `usr/lib/liboxicrypt_ffi.so.1`. The
+binary is linked with the RUNPATH `$ORIGIN:$ORIGIN/../lib`, so it finds the library
+from `usr/bin` with no absolute path and no `LD_LIBRARY_PATH`. The daemonseed binary
+itself carries no signature. The script fails if the binary or the library needs a
+glibc symbol version above the floor.
 
 ## Requirements (must be present on the build host)
 
 - `rustup` with the `x86_64-unknown-linux-gnu` target
 - `cargo-zigbuild` + `zig` (the cross-linker that pins the glibc floor)
 - `appimagetool` on `PATH`
-- network access on the first build, to fetch the pinned integrity signer (cached after)
+- network access on the first build, to fetch the pinned oxicrypt library (cached after)
 
 No imagemagick is needed — the app icon is a scalable SVG.
 
@@ -61,6 +60,7 @@ with `DAEMONSEED_X11=0` for native Wayland.
 | File | Role |
 |------|------|
 | `build-appimage.sh` | the recipe |
+| `../lib/oxicrypt-ffi.sh` | fetches, checks and bundles the oxicrypt library; shared with the TUI recipe |
 | `AppRun` | AppImage entry point (sets `DAEMONSEED_X11=1`, execs the binary) |
 | `daemonseed-gui.desktop` | desktop entry template |
 | `daemonseed-gui.svg` | scalable placeholder icon (replace with the real brand icon) |

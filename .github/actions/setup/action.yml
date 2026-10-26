@@ -39,3 +39,10 @@ runs:
       with:
         shared-key: ${{ inputs.cache-key }}
         save-if: ${{ github.ref == 'refs/heads/main' }}
+    # The signed oxicrypt library the `oxicrypt` crate links, at the release
+    # `scripts/fetch-oxicrypt-ffi.sh` pins by sha256, unpacked into the
+    # directory `.cargo/config.toml` points OXICRYPT_LIB_DIR at. After the
+    # cache restore, so a restored `target/` cannot replace it.
+    - name: Fetch the oxicrypt library
+      shell: bash
+      run: bash scripts/fetch-oxicrypt-ffi.sh linux-x86_64

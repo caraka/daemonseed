@@ -16,7 +16,8 @@ library:
   description: >-
     Peer-to-peer end-to-end-encrypted communication and file-sharing
     over the Veilid DHT. Pure Rust, CNSA 2.0 baseline crypto via the
-    oxicrypt sibling crate, protobuf (prost) messages, AGPL-3.0 code
+    oxicrypt binding crate and oxicrypt's signed shared library, protobuf
+    (prost) messages, AGPL-3.0 code
     with Apache-2.0/MIT dual-licensed schema.
   repository: "https://github.com/caraka/daemonseed"
   languages:
@@ -424,9 +425,10 @@ capabilities:
 #
 # Dependency inventory + pinned versions: the Cargo manifests (Cargo.toml /
 # Cargo.lock) are the canonical, build-enforced source — a copy here only drifts.
-# The one architecturally notable dependency is the `oxicrypt` crypto crate
-# family (CNSA 2.0 primitives), consumed from the registry at a pinned
-# version; see ISA.md ## Constraints and AGENTS.md.
+# The one architecturally notable dependency is the `oxicrypt` binding crate
+# (CNSA 2.0 primitives), consumed from the registry at a pinned version, which
+# links oxicrypt's separately signed shared library; see ISA.md ## Constraints
+# and AGENTS.md.
 
 # ─────────────────────────────────────────────────────────────────────
 # Design-document references

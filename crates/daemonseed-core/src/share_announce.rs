@@ -45,19 +45,19 @@
 //! ([`crate::cot::public_share_asset_address`]), so the same announcement is
 //! portable across relays — the basis for a future cross-relay sharing path.
 
+use crate::oxi::HkdfSha384;
+use crate::oxi::sha384;
+use crate::oxi::{Aes256Key, gcm_decrypt, gcm_encrypt};
 use daemonseed_proto::v1 as wire;
-use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
-use oxicrypt_kdf::HkdfSha384;
-use oxicrypt_module::Error as OxicryptError;
-use oxicrypt_sha::sha384;
+use oxicrypt::Error as OxicryptError;
 use prost::Message;
 use zeroize::Zeroize;
 
 use crate::circle::key::{AeadKey256, COT_KEY_LEN, CircleKey};
 use crate::circle::message::{NONCE_LEN, TAG_LEN};
 use crate::identity::keys::{SignKeypair, verify_signature};
+use crate::oxi::ml_dsa;
 use crate::public_room::PublicRoomKey;
-use oxicrypt_ml_dsa as ml_dsa;
 
 /// Domain-separation tag bound as AEAD additional-authenticated-data for the
 /// share-announcement seal, distinct from [`crate::circle::message::MESSAGE_AAD`],
@@ -407,7 +407,7 @@ pub fn open_announcement<K: AeadKey256>(
         &mut plaintext,
     )
     .map_err(|e| match e {
-        ModeError::TagMismatch => ShareAnnounceError::Authentication,
+        oxicrypt::Error::TagMismatch => ShareAnnounceError::Authentication,
         other => ShareAnnounceError::Aead(other),
     })?;
 
@@ -450,7 +450,7 @@ pub enum ShareAnnounceError {
     /// The OS entropy source failed while drawing a nonce.
     EntropySource(getrandom::Error),
     /// A non-`TagMismatch` AEAD mode error.
-    Aead(ModeError),
+    Aead(oxicrypt::Error),
     /// AEAD authentication failed (wrong key, tampered ciphertext, swapped
     /// nonce, or wrong AAD). Carries no sub-cause.
     Authentication,
@@ -495,7 +495,7 @@ mod tests {
     const TEST_RC: &[u8] = &[7u8; ROOT_COMMITMENT_LEN];
 
     fn announcer(seed: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 
@@ -515,7 +515,7 @@ mod tests {
     /// Derive a public room key, initializing the crypto module first so each
     /// test stands alone (no cross-test ordering dependency).
     fn room_key(room: &str) -> PublicRoomKey {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         derive_room_key(room, &CNSA_2_0).unwrap()
     }
 
@@ -691,7 +691,7 @@ mod tests {
     /// tier-agnostic; only the key (and thus who can open) differs.
     #[test]
     fn seal_open_round_trip_under_circle_key() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let key = derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap();
         let me = announcer(8);
         let sealed =

@@ -31,8 +31,8 @@
 //! being opened as — or substituted from — a chat message, a public-room message,
 //! or a share *announcement* under a coincidentally-equal key.
 
-use oxicrypt_aes::{Aes256Key, ModeError, gcm_decrypt, gcm_encrypt};
-use oxicrypt_module::Error as OxicryptError;
+use crate::oxi::{Aes256Key, gcm_decrypt, gcm_encrypt};
+use oxicrypt::Error as OxicryptError;
 use zeroize::Zeroize;
 
 use crate::circle::key::{AeadKey256, COT_KEY_LEN, CircleKey};
@@ -131,7 +131,7 @@ pub fn open_share_frame<K: AeadKey256>(
         &mut plaintext,
     )
     .map_err(|e| match e {
-        ModeError::TagMismatch => ShareSealError::Authentication,
+        oxicrypt::Error::TagMismatch => ShareSealError::Authentication,
         other => ShareSealError::Aead(other),
     })?;
 
@@ -148,7 +148,7 @@ pub enum ShareSealError {
     /// The OS entropy source failed while drawing a nonce.
     EntropySource(getrandom::Error),
     /// A non-`TagMismatch` AEAD mode error.
-    Aead(ModeError),
+    Aead(oxicrypt::Error),
     /// AEAD authentication failed (wrong key, tampered ciphertext, swapped
     /// nonce, or wrong AAD). Carries no sub-cause.
     Authentication,
@@ -183,12 +183,12 @@ mod tests {
     use crate::share_envelope::{ManifestEntry, ShareFrame};
 
     fn room_key() -> PublicRoomKey {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         derive_room_key(DEFAULT_ROOM, &CNSA_2_0).unwrap()
     }
 
     fn circle_key() -> CircleKey {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         derive_cot_key("a shared circle phrase for sealing", &CNSA_2_0).unwrap()
     }
 
@@ -245,7 +245,7 @@ mod tests {
     fn wrong_key_fails_authentication() {
         let lobby = derive_room_key("lobby", &CNSA_2_0).unwrap();
         let other = derive_room_key("a-different-room", &CNSA_2_0).unwrap();
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let sealed = seal_public_share_frame(&lobby, &manifest_frame("f.txt")).unwrap();
         match open_share_frame(&other, &sealed) {
             Err(ShareSealError::Authentication) => {}
@@ -294,7 +294,7 @@ mod tests {
     /// frame.
     #[test]
     fn announcement_cannot_open_as_content_frame() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let key = room_key();
         let announcer = crate::identity::keys::SignKeypair::from_ml_dsa_seed(&[5u8; 32]).unwrap();
         let sealed = seal_public_announcement(

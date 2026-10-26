@@ -1099,7 +1099,7 @@ struct Profile {
 
 impl Profile {
     fn new() -> Self {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let mnemonic = Mnemonic::generate().expect("a recovery phrase");
         let keys = derive_identity_keys(&mnemonic, Identity::Primary).expect("the identity");
         Self {
@@ -4538,7 +4538,7 @@ async fn a_profile_from_before_direct_messages_runs_direct_messaging() {
     use daemonseed_core::profile::persist::{load_for_unlock, session_materials_from_unlock};
     use daemonseed_core::storage::seeds;
 
-    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let _ = daemonseed_core::oxi::initialize_module();
     let root = tempfile::tempdir().expect("a profile directory");
     let mut copied = 0;
     for entry in std::fs::read_dir(V0_36_3_PROFILE).expect("the fixture directory") {
@@ -16353,7 +16353,7 @@ async fn a_clock_stepped_ahead_and_corrected_leaves_nothing_ahead() {
 #[test]
 fn an_advert_key_ahead_within_the_skew_allowance_is_kept() {
     const MINUTE: u64 = 60;
-    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let _ = daemonseed_core::oxi::initialize_module();
     let right = 1_700_000_000;
     let mut keys = AdvertKeys::new(right + 30 * MINUTE, os_fill).expect("the keys are made");
     assert!(!current_key_beyond_skew(&keys, right));

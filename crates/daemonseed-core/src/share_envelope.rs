@@ -326,7 +326,7 @@ mod tests {
     use crate::storage::cas::chunk_addr;
 
     fn addr(bytes: &[u8]) -> ChunkAddr {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         chunk_addr(bytes).unwrap()
     }
 
@@ -490,7 +490,7 @@ mod tests {
     /// chunk forwarded byte-identically passes; a tampered chunk fails closed.
     #[test]
     fn chunk_response_verification_matches_against_recomputed_address() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let original = b"the quick brown fox jumps over the lazy dog";
         let advertised = chunk_addr(original).unwrap();
 
@@ -527,7 +527,7 @@ mod tests {
     /// share entry); decode still produces an empty Vec rather than failing.
     #[test]
     fn chunk_response_with_empty_data_roundtrips() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let a = chunk_addr(&[]).unwrap();
         let frame = ShareFrame::ChunkResponse {
             chunk_addr: a,

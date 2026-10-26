@@ -178,7 +178,7 @@ mod tests {
     }
 
     fn signer(seed: u8) -> TestSigner {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         TestSigner(SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap())
     }
 

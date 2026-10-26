@@ -67,11 +67,11 @@
 //!
 //! Serves FC4, FC5.
 
-use oxicrypt_aes::Aes256Key;
-use oxicrypt_kdf::HkdfSha384;
-use oxicrypt_ml_dsa as ml_dsa;
-use oxicrypt_ml_kem as ml_kem;
-use oxicrypt_sha::sha384;
+use crate::oxi::Aes256Key;
+use crate::oxi::HkdfSha384;
+use crate::oxi::ml_dsa;
+use crate::oxi::ml_kem;
+use crate::oxi::sha384;
 use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
@@ -174,14 +174,13 @@ redacted_secret_newtype! {
 
 /// Why a drop operation failed.
 ///
-/// `PartialEq` is implemented by hand rather than derived because
-/// `oxicrypt_module::Error` and `oxicrypt_aes::ModeError` are not comparable;
-/// those variants compare equal on the variant alone, which is all a caller
-/// needs.
+/// `PartialEq` is implemented by hand rather than derived so that `Module`
+/// compares equal on the variant alone, which is all a caller needs; `Kdf`
+/// compares its `oxicrypt::Error`.
 #[derive(Debug)]
 pub enum DropError {
     /// HKDF failed — an unrecoverable crypto-module condition.
-    Kdf(oxicrypt_kdf::KdfError),
+    Kdf(oxicrypt::Error),
     /// The bytes are not [`HELLO_LEN`] long, so no field can be read from
     /// them. Carries both figures, so a truncation is diagnosable.
     Length {
@@ -211,7 +210,7 @@ pub enum DropError {
     /// sealed.
     Entropy,
     /// The crypto module refused an AES or SHA call.
-    Module(oxicrypt_module::Error),
+    Module(oxicrypt::Error),
 }
 
 impl PartialEq for DropError {
@@ -241,8 +240,7 @@ impl PartialEq for DropError {
                 },
             ) => ea == eb && fa == fb,
             (Self::Entropy, Self::Entropy) => true,
-            // Compared on the variant: the wrapped cause is diagnostic and is
-            // not itself comparable.
+            // Compared on the variant: the module error is diagnostic.
             (Self::Module(_), Self::Module(_)) => true,
             _ => false,
         }
@@ -762,7 +760,7 @@ mod tests {
     /// The crypto module has to be operational before any SHA or AES call, so
     /// every test that reaches one starts here.
     fn module() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     fn signer(seed: u8) -> SignKeypair {

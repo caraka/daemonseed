@@ -72,9 +72,10 @@
 //!
 //! Serves FC3.
 
-use oxicrypt_aes::Aes256Key;
-use oxicrypt_kdf::HkdfSha384;
-use oxicrypt_ml_kem as ml_kem;
+use crate::oxi::Aes256Key;
+use crate::oxi::HkdfSha384;
+use crate::oxi::ml_kem;
+use crate::oxi::{MlKem1024DecapsulationKey, SharedSecret};
 use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
@@ -122,12 +123,12 @@ redacted_secret_newtype! {
 
 redacted_secret_newtype! {
     /// The secret one turn's ML-KEM encapsulation yields on both sides.
-    inline pub struct TurnSecret([u8; ml_kem::SHARED_SECRET_LEN]);
+    shared pub struct TurnSecret(SharedSecret; ml_kem::SHARED_SECRET_LEN);
 }
 
 redacted_secret_newtype! {
     /// The secret half of one turn's ratchet keypair.
-    boxed pub struct RatchetDecapKey([u8; ml_kem::DK_LEN]);
+    shared pub struct RatchetDecapKey(MlKem1024DecapsulationKey; ml_kem::DK_LEN);
 }
 
 /// Rebuild a key-schedule secret from bytes read back out of the profile's
@@ -158,8 +159,6 @@ macro_rules! restore_from_bytes {
 
 restore_from_bytes!(Root, ROOT_LEN, inline);
 restore_from_bytes!(ChainKey, CHAIN_KEY_LEN, inline);
-restore_from_bytes!(TurnSecret, ml_kem::SHARED_SECRET_LEN, inline);
-restore_from_bytes!(RatchetDecapKey, ml_kem::DK_LEN, boxed);
 
 /// One turn's ratchet keypair. The decapsulation key is zeroized on drop.
 pub struct RatchetKeypair {
@@ -170,15 +169,15 @@ pub struct RatchetKeypair {
 }
 
 impl RatchetKeypair {
-    /// A byte-for-byte copy of both halves.
+    /// A copy of the public half and a second handle on the secret one.
     ///
-    /// Not `Clone`: copying a decapsulation key is what a state snapshot and a
+    /// Not `Clone`: duplicating a keypair is what a state snapshot and a
     /// device clone both do, and it should be written where it happens rather
     /// than reachable by a derive.
     fn duplicate(&self) -> Self {
         Self {
             pk: self.pk.clone(),
-            dk: RatchetDecapKey(Box::new(*self.dk.as_bytes())),
+            dk: self.dk.clone(),
         }
     }
 }
@@ -195,7 +194,7 @@ impl std::fmt::Debug for RatchetKeypair {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ChainError {
     /// HKDF failed — the crypto module is not operational.
-    Kdf(oxicrypt_kdf::KdfError),
+    Kdf(oxicrypt::Error),
     /// The caller's fill function could not supply entropy for a keypair or
     /// an encapsulation.
     Entropy,
@@ -240,7 +239,7 @@ pub enum ChainError {
     /// associated-data mismatch. Uniform by design.
     Aead,
     /// The crypto module refused an AES, ML-KEM or key-generation call.
-    Module(oxicrypt_module::Error),
+    Module(oxicrypt::Error),
 }
 
 impl std::fmt::Display for ChainError {
@@ -291,7 +290,7 @@ impl From<EnvelopeError> for ChainError {
 /// stays live in the frame until something overwrites it. The wrapping happens
 /// inside this helper so the buffer can be cleared after it.
 fn expand_secret<const N: usize, T>(
-    expand: impl FnOnce(&mut [u8; N]) -> Result<(), oxicrypt_kdf::KdfError>,
+    expand: impl FnOnce(&mut [u8; N]) -> Result<(), oxicrypt::Error>,
     wrap: impl FnOnce([u8; N]) -> T,
 ) -> Result<T, ChainError> {
     let mut buf = [0u8; N];
@@ -371,26 +370,14 @@ fn mint(mut fill: impl FnMut(&mut [u8]) -> Result<(), ()>) -> Result<RatchetKeyp
         z.zeroize();
         return Err(ChainError::Entropy);
     }
-    let mut generated = ml_kem::keygen(&d, &z);
+    let generated = ml_kem::keygen(&d, &z);
     d.zeroize();
     z.zeroize();
-    // Bound by reference, so the secret half stays reachable inside the
-    // `Result` and the zeroize below clears it; moving a `Copy` array out
-    // would leave that copy on this frame with nothing able to reach it. It
-    // does NOT reach the temporary `Box::new(*dk)` materialises on the way
-    // into the allocation — the crate's API offers no way to build the box
-    // without that copy, so one copy is left for the frame to overwrite.
-    match generated {
-        Ok((ref ek, ref mut dk)) => {
-            let pair = RatchetKeypair {
-                pk: Box::new(*ek),
-                dk: RatchetDecapKey(Box::new(*dk)),
-            };
-            dk.zeroize();
-            Ok(pair)
-        }
-        Err(e) => Err(ChainError::Module(e)),
-    }
+    let (ek, dk) = generated.map_err(ChainError::Module)?;
+    Ok(RatchetKeypair {
+        pk: Box::new(ek),
+        dk: RatchetDecapKey::new(dk),
+    })
 }
 
 /// Encapsulate to a peer's ratchet key, yielding the turn's secret and the
@@ -406,10 +393,8 @@ fn encapsulate(
     }
     let encapsulated = ml_kem::encapsulate(peer_pk, &m);
     m.zeroize();
-    let (mut ss, ct) = encapsulated.map_err(ChainError::Module)?;
-    let secret = TurnSecret(ss);
-    ss.zeroize();
-    Ok((secret, Box::new(ct)))
+    let (ss, ct) = encapsulated.map_err(ChainError::Module)?;
+    Ok((TurnSecret::new(ss), Box::new(ct)))
 }
 
 /// Seal a body under a message key, then zeroize the key's working buffer.
@@ -818,10 +803,9 @@ impl Receiving {
                     .flatten()
                     .find(|t| t.m == header.m)
                     .ok_or(ChainError::SecretGone { named: header.m })?;
-                let mut decapsulated = ml_kem::decapsulate(own.keypair.dk.as_bytes(), kem_ct)
-                    .map_err(ChainError::Module)?;
-                let peer_ss = TurnSecret(decapsulated);
-                decapsulated.zeroize();
+                let peer_ss = TurnSecret::new(
+                    ml_kem::decapsulate(&own.keypair.dk.0, kem_ct).map_err(ChainError::Module)?,
+                );
                 let root = advance_root(&self.root, own.ss.as_ref(), &peer_ss)?;
                 let chain = chain_from_root(&root)?;
                 let read = PeerTurn {
@@ -1242,7 +1226,7 @@ mod tests {
     /// A shared secret by the real path: `AdvertSharedSecret` is constructible
     /// only by encapsulating to or decapsulating an advert key.
     fn ss0(seed: u8) -> advert::AdvertSharedSecret {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let signer = SignKeypair::from_ml_dsa_seed(&[seed; 32]).expect("derive a signer");
         let keys = advert::AdvertKeys::new(NOW, counting_fill(seed)).expect("advert keys");
         let bytes = keys.advert_bytes(&signer).expect("advert bytes");
@@ -1941,7 +1925,7 @@ mod tests {
         // The three-input form, which every turn after the first uses: the
         // absent case above cannot pin where the peer secret sits in the IKM or
         // how it is length-prefixed.
-        let peer_ss = TurnSecret([0x5au8; ml_kem::SHARED_SECRET_LEN]);
+        let peer_ss = TurnSecret::from_bytes(&[0x5au8; ml_kem::SHARED_SECRET_LEN]);
         let mixed = advance_root(&root, Some(&peer_ss), &own_ss).unwrap();
 
         assert_eq!(

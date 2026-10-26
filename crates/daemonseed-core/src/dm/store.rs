@@ -60,8 +60,8 @@
 
 use std::path::PathBuf;
 
-use oxicrypt_ml_dsa as ml_dsa;
-use oxicrypt_ml_kem as ml_kem;
+use crate::oxi::ml_dsa;
+use crate::oxi::ml_kem;
 use zeroize::Zeroizing;
 
 use crate::dm::advert::{
@@ -2320,7 +2320,7 @@ mod tests {
     /// A shared secret by the real path: `AdvertSharedSecret` is constructible
     /// only by encapsulating to or decapsulating an advert key.
     fn shared_secret(seed: u8) -> advert::AdvertSharedSecret {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let signer = SignKeypair::from_ml_dsa_seed(&[seed; 32]).expect("derive a signer");
         let keys = advert::AdvertKeys::new(NOW, counting_fill(seed)).expect("advert keys");
         let bytes = keys.advert_bytes(&signer).expect("advert bytes");
@@ -2333,7 +2333,7 @@ mod tests {
     /// An advert state that has rotated once, so the record's retained-key
     /// field is exercised rather than written as zeros.
     fn rotated_advert() -> AdvertSnapshot {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let mut keys = advert::AdvertKeys::new(NOW, counting_fill(0x11)).expect("advert keys");
         let rotation = keys
             .rotate_if_due(NOW + advert::ROTATION_PERIOD_SECS, counting_fill(0x44))
@@ -2351,7 +2351,7 @@ mod tests {
     /// advert, sealed by `dm::drop`, so the stored bytes are the bytes a drop
     /// slot would hold.
     fn outstanding_hello() -> OutstandingHello {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let signer = SignKeypair::from_ml_dsa_seed(&[0x31; 32]).expect("derive a signer");
         let keys = advert::AdvertKeys::new(NOW, counting_fill(0x31)).expect("advert keys");
         let bytes = keys.advert_bytes(&signer).expect("advert bytes");
@@ -2606,7 +2606,7 @@ mod tests {
     /// refused rather than overwriting it.
     #[test]
     fn an_outbox_entry_is_never_overwritten_by_a_sequence_that_shares_its_ring_slot() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(3)).unwrap();
         store.persist_outbox(&label(4), 0, b"first", NOW).unwrap();
@@ -3468,7 +3468,7 @@ mod tests {
     /// than dropping that correspondence out of the answer.
     #[test]
     fn load_refuses_a_conversation_record_it_cannot_decode() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(9)).unwrap();
         let (a, _b) = pair();
@@ -3580,7 +3580,7 @@ mod tests {
     /// delete, outbox included, and offers every other correspondence.
     #[test]
     fn load_finishes_a_conversation_delete_stopped_before_its_unlink() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(0x40)).unwrap();
         let peers = [label(0x41), label(0x42), label(0x43)];
@@ -3623,7 +3623,7 @@ mod tests {
     /// the sentinel and no conversation record beside it. The load removes it.
     #[test]
     fn load_finishes_an_outbox_delete_stopped_before_its_unlink() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(0x44)).unwrap();
         let peers = [label(0x45), label(0x46), label(0x47)];
@@ -3656,7 +3656,7 @@ mod tests {
     /// [`Store::delete_outbox_through`]'s.
     #[test]
     fn a_new_conversation_over_a_stopped_outbox_delete_loads() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(0x4c)).unwrap();
         let peers = [label(0x4d), label(0x4e), label(0x4f)];
@@ -3708,7 +3708,7 @@ mod tests {
     /// authenticate, and it still fails the load and stays on disk.
     #[test]
     fn load_refuses_a_scrubbed_record_whose_sentinel_is_altered() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(0x48)).unwrap();
         let peers = [label(0x49), label(0x4a), label(0x4b)];
@@ -3784,7 +3784,7 @@ mod tests {
     /// rewritten.
     #[test]
     fn an_owed_entry_keeps_its_send_time_across_later_writes() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(0x3c)).unwrap();
         let peer = label(0x3d);
@@ -4155,7 +4155,7 @@ mod tests {
     /// at open.
     #[test]
     fn a_reach_serial_issued_after_a_reopen_with_the_clock_behind_is_higher() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let issued = {
             let store =
@@ -4198,7 +4198,7 @@ mod tests {
     #[test]
     fn a_reach_serial_that_is_not_written_is_not_held() {
         use std::os::unix::fs::PermissionsExt;
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x5f), clock_behind).unwrap();
         assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
@@ -4230,7 +4230,7 @@ mod tests {
     /// and the call says so.
     #[test]
     fn an_undecodable_reach_serial_record_is_overwritten_and_reported() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x60), clock_ahead).unwrap();
         assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
@@ -4277,7 +4277,7 @@ mod tests {
     /// other wrote, whatever each holds in memory.
     #[test]
     fn two_stores_on_one_root_issue_rising_serials() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let a = Store::open_with_clock(tmp.path(), &at_rest_key(0x61), clock_behind).unwrap();
         let b = Store::open_with_clock(tmp.path(), &at_rest_key(0x61), clock_behind).unwrap();
@@ -4296,7 +4296,7 @@ mod tests {
     /// undecodable one is, and the call says so.
     #[test]
     fn an_unreadable_reach_serial_record_is_overwritten_and_reported() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x62), clock_ahead).unwrap();
         assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
@@ -4344,7 +4344,7 @@ mod tests {
     /// reach's handle is not written over them.
     #[test]
     fn a_newer_handle_taken_just_before_a_reachs_section_is_kept() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let (a, _b) = pair();
         let tmp = tempfile::tempdir().unwrap();
         let peer = label(0x64);
@@ -4434,7 +4434,7 @@ mod tests {
     /// failure is reported beside it rather than as the take's.
     #[test]
     fn a_handle_record_that_will_not_read_is_reported_beside_the_take() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let peer = label(0x66);
         let (store, reach) = store_with_reach(&tmp, &peer, 0x67);
@@ -4471,7 +4471,7 @@ mod tests {
     /// against cannot be read.
     #[test]
     fn an_unreadable_route_record_is_refused_and_nothing_is_written() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let peer = label(0x68);
         let (store, reach) = store_with_reach(&tmp, &peer, 0x69);
@@ -4540,7 +4540,7 @@ mod tests {
     #[test]
     fn a_route_record_read_error_is_returned_and_nothing_is_written() {
         use std::os::unix::fs::PermissionsExt;
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         if !modes_enforced(&tmp) {
             return;
@@ -4568,7 +4568,7 @@ mod tests {
     /// unreadable one is, and the call says so.
     #[test]
     fn an_interrupted_erase_of_the_reach_serial_record_is_overwritten_and_reported() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open_with_clock(tmp.path(), &at_rest_key(0x6d), clock_ahead).unwrap();
         assert_eq!(store.set_reach(reach_at(1)).unwrap(), SetReach::Issued);
@@ -4597,7 +4597,7 @@ mod tests {
     #[test]
     fn a_reach_serial_read_error_is_returned_and_nothing_is_written() {
         use std::os::unix::fs::PermissionsExt;
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         if !modes_enforced(&tmp) {
             return;
@@ -4658,7 +4658,7 @@ mod tests {
     /// `generate_dm_store_without_handles_fixture` writes it.
     #[test]
     fn a_store_without_handle_records_loads_every_conversation() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dm-store-without-handles");
         for (side, key) in [("a", 0xa1u8), ("b", 0xb2)] {
@@ -5064,7 +5064,7 @@ mod tests {
     /// than replacing the record with the caller's idea of it.
     #[test]
     fn creating_a_conversation_twice_is_refused() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(0x2c)).unwrap();
         let (a, _b) = pair();
@@ -5083,7 +5083,7 @@ mod tests {
     /// already encapsulated to the previous serial still opens.
     #[test]
     fn a_rotation_through_the_store_persists_the_retired_key() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path(), &at_rest_key(0x2d)).unwrap();
 
@@ -5145,7 +5145,7 @@ mod tests {
     /// current key's, and is absent from a record written whole.
     #[test]
     fn the_published_advert_serial_survives_a_reopen_and_a_rotation() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let tmp = tempfile::tempdir().unwrap();
         let published =
             |store: &Store| store.update_advert_state(|_, published| published).unwrap();

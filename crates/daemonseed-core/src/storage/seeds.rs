@@ -57,9 +57,9 @@
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::oxi::HkdfSha384;
+use crate::oxi::{Aes256Key, gcm_decrypt, gcm_encrypt};
 use argon2::{Algorithm, Argon2, Params, Version};
-use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
-use oxicrypt_kdf::HkdfSha384;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -1352,11 +1352,11 @@ pub enum BlobError {
     /// Argon2 KDF returned an error (bad params, etc.).
     Argon2(argon2::Error),
     /// HKDF expand or the underlying oxicrypt module gate failed.
-    Hkdf(oxicrypt_kdf::KdfError),
-    /// `oxicrypt-module`-gated AES key construction failed.
-    AesKeyInit(oxicrypt_module::Error),
+    Hkdf(oxicrypt::Error),
+    /// oxicrypt AES key construction failed.
+    AesKeyInit(oxicrypt::Error),
     /// AES-GCM encrypt / decrypt failed.
-    AesMode(oxicrypt_aes::ModeError),
+    AesMode(oxicrypt::Error),
     /// Failed to fill nonce from OS CSPRNG.
     EntropySource(getrandom::Error),
     /// Blob is too short / missing magic / truncated layout.
@@ -1673,7 +1673,7 @@ fn open_v2(
     let mut plaintext = Zeroizing::new(vec![0u8; ciphertext.len()]);
     gcm_decrypt(&aes, nonce, &suite_bytes, ciphertext, tag, &mut plaintext).map_err(
         |e| match e {
-            oxicrypt_aes::ModeError::TagMismatch => BlobError::AuthenticationFailed,
+            oxicrypt::Error::TagMismatch => BlobError::AuthenticationFailed,
             other => BlobError::AesMode(other),
         },
     )?;
@@ -1723,7 +1723,7 @@ fn open_v1(
     let mut plaintext = Zeroizing::new(vec![0u8; ciphertext.len()]);
     // v1 used empty AAD — preserve that contract or M2 blobs fail to open.
     gcm_decrypt(&aes, nonce, b"", ciphertext, tag, &mut plaintext).map_err(|e| match e {
-        oxicrypt_aes::ModeError::TagMismatch => BlobError::AuthenticationFailed,
+        oxicrypt::Error::TagMismatch => BlobError::AuthenticationFailed,
         other => BlobError::AesMode(other),
     })?;
 
@@ -1831,7 +1831,7 @@ mod tests {
     use super::*;
 
     fn ensure_oxicrypt_initialized() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     fn test_params() -> ArgonParams {

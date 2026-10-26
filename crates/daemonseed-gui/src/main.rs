@@ -16,7 +16,7 @@
 //! shell to a PNG; the only mode a headless *terminal* can verify.
 //!
 //! Offscreen verification flags: `--switch <n>` drives the real switch callback;
-//! `--scroll <px>` sets the viewport-y sign; `--show-join` / `--show-new` open the
+//! `--scroll <px>` sets the content-y sign; `--show-join` / `--show-new` open the
 //! circle overlays before rendering; `--materialize <phrase>` drives the real
 //! materialize path so the PNG shows a materialized circle selected in the rail;
 //! `--self-check` runs a live materialize + draft-retention round-trip through the
@@ -78,7 +78,7 @@ use std::time::Duration;
 const LOBBY: usize = 0;
 
 /// #84: large-negative `scroll_y` sentinel meaning "pin to the bottom". `apply_view`
-/// writes it into the Flickable's `viewport-y`, which Slint clamps against the current
+/// writes it into the Flickable's `content-y`, which Slint clamps against the current
 /// content height — so it lands exactly at the newest message without the GUI needing
 /// to know the visible height. Any value below the real minimum (≈ -msg_count*52px)
 /// works; this is safely beyond it.
@@ -103,7 +103,7 @@ fn relay_target() -> (String, String) {
 /// the offscreen + self-check paths init it too. Returns `Ok(())` or a
 /// human-readable reason.
 fn init_crypto() -> Result<(), String> {
-    daemonseed_core::kats::initialize_module()
+    daemonseed_core::oxi::initialize_module()
         .map_err(|e| format!("crypto module init failed: {e}"))?;
     Ok(())
 }

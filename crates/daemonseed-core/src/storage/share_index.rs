@@ -56,8 +56,8 @@
 
 use std::path::Path;
 
-use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
-use oxicrypt_sha::sha384;
+use crate::oxi::sha384;
+use crate::oxi::{Aes256Key, gcm_decrypt, gcm_encrypt};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -544,7 +544,7 @@ mod tests {
     // ── store behaviour (ISC-18 / ISC-A-C6 / ISC-A-C7) ─────────────────────
 
     fn open_temp(key: [u8; INDEX_KEY_LEN]) -> (tempfile::TempDir, ShareIndex) {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let dir = tempfile::TempDir::new().unwrap();
         let idx = ShareIndex::open(dir.path().join("index.redb"), key).unwrap();
         (dir, idx)
@@ -598,7 +598,7 @@ mod tests {
     /// reading the same file), so the indexer reuses rather than cold-rescans.
     #[test]
     fn persists_across_reopen() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("index.redb");
         {
@@ -648,7 +648,7 @@ mod tests {
     /// gets garbage back.
     #[test]
     fn wrong_key_cannot_read_entries() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("index.redb");
         {
@@ -690,7 +690,7 @@ mod tests {
     /// key).
     #[test]
     fn opaque_key_is_keyed() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let dir = tempfile::TempDir::new().unwrap();
         let a = ShareIndex::open(dir.path().join("a.redb"), [0x01; INDEX_KEY_LEN]).unwrap();
         let b = ShareIndex::open(dir.path().join("b.redb"), [0x02; INDEX_KEY_LEN]).unwrap();

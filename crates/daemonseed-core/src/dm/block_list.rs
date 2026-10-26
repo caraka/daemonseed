@@ -78,7 +78,7 @@
 
 use std::collections::BTreeSet;
 
-use oxicrypt_ml_dsa as ml_dsa;
+use crate::oxi::ml_dsa;
 
 /// The set of identity keys a client refuses.
 ///

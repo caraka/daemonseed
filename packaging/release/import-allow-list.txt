@@ -1,0 +1,48 @@
+# The libraries a release artifact's binaries may import.
+#
+# Read by scripts/check-release-artifact.py, which fails a release when any ELF
+# NEEDED entry (readelf -d) or PE import (objdump -p) of any shipped binary,
+# including the files inside an AppImage, matches no line here.
+#
+#   <format> <kind> <pattern>
+#
+# format   elf or pe
+# kind     system: the host provides it
+#          bundled: the artifact must ship a file of that name
+# pattern  a shell-style pattern; PE names compare case-insensitively
+#
+# A new import is added here deliberately, in the change that introduces it.
+
+# glibc
+elf system libc.so.6
+elf system libm.so.6
+elf system libpthread.so.0
+elf system libdl.so.2
+elf system ld-linux-x86-64.so.2
+elf bundled liboxicrypt_ffi.so.1
+
+# Windows system libraries and the Universal CRT, which the GUI and the
+# oxicrypt DLL import.
+pe system kernel32.dll
+pe system ntdll.dll
+pe system api-ms-win-*.dll
+pe system advapi32.dll
+pe system bcrypt.dll
+pe system bcryptprimitives.dll
+pe system combase.dll
+pe system comctl32.dll
+pe system dnsapi.dll
+pe system dwmapi.dll
+pe system dwrite.dll
+pe system gdi32.dll
+pe system imm32.dll
+pe system iphlpapi.dll
+pe system ole32.dll
+pe system oleaut32.dll
+pe system shell32.dll
+pe system shlwapi.dll
+pe system user32.dll
+pe system uxtheme.dll
+pe system ws2_32.dll
+pe bundled oxicrypt_ffi.dll
+pe bundled vcruntime140.dll

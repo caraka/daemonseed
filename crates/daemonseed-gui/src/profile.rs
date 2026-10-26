@@ -320,7 +320,7 @@ mod tests {
     /// key a DM to that member is addressed to.
     #[test]
     fn heartbeat_signing_key_and_dm_signing_key_are_one_identity() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let fast = ArgonParams {
             memory_kib: 8,
             iterations: 1,
@@ -360,7 +360,7 @@ mod tests {
     /// the runner's store opens at all.
     #[test]
     fn dm_session_keys_bind_the_identity_the_channel_root_and_the_profile_key() {
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         let fast = ArgonParams {
             memory_kib: 8,
             iterations: 1,

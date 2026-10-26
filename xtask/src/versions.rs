@@ -402,14 +402,14 @@ pub fn package_manifest_paths(metadata_json: &str) -> Result<Vec<(String, PathBu
 
 /// Run `git` at `repo_root` and return its stdout lines.
 fn git_lines(repo_root: &Path, args: &[&str]) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    // Read the repository at `repo_root`, not one an enclosing git process
+    // named in the environment.
+    crate::git_env::without_repo_env(&mut cmd);
+    let output = cmd
         .arg("-C")
         .arg(repo_root)
         .args(args)
-        // The repository is the one at `repo_root`, whatever an enclosing git
-        // process exported.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
         .output()
         .with_context(|| format!("spawn git {}", args.join(" ")))?;
     if !output.status.success() {

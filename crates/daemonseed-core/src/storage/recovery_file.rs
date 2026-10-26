@@ -60,9 +60,9 @@
 //! success the caller persists the embedded profile-id + argon2 params
 //! into a freshly-written `daemonseed.toml` and the identity is back.
 
+use crate::oxi::HkdfSha384;
+use crate::oxi::{Aes256Key, gcm_decrypt, gcm_encrypt};
 use argon2::{Algorithm, Argon2, Params, Version};
-use oxicrypt_aes::{Aes256Key, gcm_decrypt, gcm_encrypt};
-use oxicrypt_kdf::HkdfSha384;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -129,9 +129,9 @@ impl core::fmt::Debug for RecoveryFileContents {
 #[derive(Debug)]
 pub enum RecoveryFileError {
     Argon2(argon2::Error),
-    Hkdf(oxicrypt_kdf::KdfError),
-    AesKeyInit(oxicrypt_module::Error),
-    AesMode(oxicrypt_aes::ModeError),
+    Hkdf(oxicrypt::Error),
+    AesKeyInit(oxicrypt::Error),
+    AesMode(oxicrypt::Error),
     EntropySource(getrandom::Error),
     Malformed(&'static str),
     AuthenticationFailed,
@@ -290,7 +290,7 @@ fn open_v2(bytes: &[u8], passphrase: &str) -> Result<RecoveryFileContents, Recov
     let mut plaintext = vec![0u8; ciphertext.len()];
     gcm_decrypt(&aes, nonce, &suite_bytes, ciphertext, tag, &mut plaintext).map_err(
         |e| match e {
-            oxicrypt_aes::ModeError::TagMismatch => RecoveryFileError::AuthenticationFailed,
+            oxicrypt::Error::TagMismatch => RecoveryFileError::AuthenticationFailed,
             other => RecoveryFileError::AesMode(other),
         },
     )?;
@@ -327,7 +327,7 @@ fn open_v1(bytes: &[u8], passphrase: &str) -> Result<RecoveryFileContents, Recov
     let mut plaintext = vec![0u8; ciphertext.len()];
     // v1 used empty AAD — preserve that contract or M2 .dseed fails to open.
     gcm_decrypt(&aes, nonce, b"", ciphertext, tag, &mut plaintext).map_err(|e| match e {
-        oxicrypt_aes::ModeError::TagMismatch => RecoveryFileError::AuthenticationFailed,
+        oxicrypt::Error::TagMismatch => RecoveryFileError::AuthenticationFailed,
         other => RecoveryFileError::AesMode(other),
     })?;
 
@@ -451,7 +451,7 @@ mod tests {
     use super::*;
 
     fn init_oxicrypt() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     fn fast_params() -> ArgonParams {

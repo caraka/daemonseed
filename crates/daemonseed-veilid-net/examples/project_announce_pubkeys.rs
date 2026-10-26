@@ -56,7 +56,7 @@ fn main() {
     // copy now, so the text is wiped before anything else runs.
     zeroize::Zeroize::zeroize(&mut text);
 
-    if let Err(e) = daemonseed_core::kats::initialize_module_unsigned_test_binary() {
+    if let Err(e) = daemonseed_core::oxi::initialize_module() {
         eprintln!("crypto module init failed: {e}");
         std::process::exit(1);
     }

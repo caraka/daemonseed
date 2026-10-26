@@ -49,7 +49,7 @@ library:
 
 constraints:
   - description: >-
-      `oxicrypt_module::initialize()` MUST have run before any operation that
+      `daemonseed_core::oxi::initialize_module()` MUST have succeeded before any operation that
       seals/opens or signs/verifies (share serve/fetch, route advert sign/verify).
       The consuming binary initializes oxicrypt at startup.
     enforcement: runtime
@@ -1736,7 +1736,7 @@ functions:
   - name: VeilidNetConfig::protect_with_profile
     module: daemonseed_veilid_net::config
     description: Set device_key_password to the one derived from the unlocked profile's at-rest key and append the profile's namespace tag to namespace.
-    signature: "pub fn protect_with_profile(&mut self, profile_secret: &[u8]) -> Result<(), daemonseed_core::kdf::KdfError>"
+    signature: "pub fn protect_with_profile(&mut self, profile_secret: &[u8]) -> Result<(), daemonseed_core::oxi::Error>"
   - name: VeilidNetConfig::new
     module: daemonseed_veilid_net::config
     description: A node config with daemonseed defaults (public network, hop_count = 2, no profile).

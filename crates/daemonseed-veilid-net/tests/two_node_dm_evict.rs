@@ -1292,7 +1292,7 @@ async fn run_step(step: Step) {
         .ok()
         .and_then(|r| r.parse::<u32>().ok());
 
-    daemonseed_core::kats::initialize_module_unsigned_test_binary().expect("oxicrypt init");
+    daemonseed_core::oxi::initialize_module().expect("oxicrypt init");
     let started = Instant::now();
 
     let node_dir = role.dir(&state).join("node");

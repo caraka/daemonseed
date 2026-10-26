@@ -136,10 +136,10 @@ Substrate-independent truths the work must respect. These bind the *thinking*.
 
 Immovable architectural mandates. These bind the *solution space*.
 
-- **Backend: pure Rust, no C dependencies.** Networking, crypto, and runtime stay in the Rust ecosystem.
+- **Backend: pure Rust, no C dependencies.** Networking, crypto, and runtime stay in the Rust ecosystem. Cryptography is oxicrypt's Rust module, loaded as its separately signed shared library.
 - **Crypto: CNSA 2.0** — ML-DSA-87 (signature), ML-KEM-1024 (key encapsulation), AES-256-GCM
   (authenticated encryption), SHA-384 (hash) — via the `oxicrypt` crate, consumed from crates.io at a
-  pinned version. The architecture absorbs CNSA 2.1 through additive MINOR bumps: every artifact
+  pinned version, which links oxicrypt's separately signed shared library. The architecture absorbs CNSA 2.1 through additive MINOR bumps: every artifact
   carries a suite identifier, and every key derives from a BIP-39 mnemonic through HKDF.
 - **Transport: Veilid** (unconditional since the v0.33.0 cutover) — an encrypted distributed hash
   table with private routes supplies channel security and hides network location. daemonseed
@@ -782,23 +782,22 @@ route taken to reach a decision are not recorded here — the git history and `C
   assuming it — the alternative, trusting a byte count, silently produces a corrupt file that passes
   every subsequent check until someone opens it.
 
-- **The crypto dependency is pinned to a published release, and the signing tool moves with it.** A
+- **The crypto dependency is pinned to a published release, and so is the library it links.** A
   path dependency on a sibling working tree tracks whatever that tree happens to be: no version to
   notice, no lockfile to hold the old behaviour, and no diff to review. A registry pin turns the same
-  upstream change into a reviewed version bump with a changelog. The signing tool is resolved at the
-  version read out of this workspace's own metadata, because the integrity slot format is a contract
-  between the runtime a binary links and the signer that wrote its slot — pinning only the runtime
-  would let a newer signer write a slot the pinned runtime cannot verify, whose only symptom is an app
-  that refuses to start.
+  upstream change into a reviewed version bump with a changelog. The shared library the binding links
+  is fetched from oxicrypt's release at a sha256 pinned in `scripts/fetch-oxicrypt-ffi.sh`, and the
+  build pins the fingerprint of oxicrypt's release key, so a library signed with any other key is
+  refused at start-up.
 
-- **A shipped artifact carries an integrity slot, and signing is the last build step.** The crypto
-  module verifies its own image before doing any work; a module initialized without an integrity group
-  latches an unverified state instead of becoming operational. There is deliberately no skip flag,
-  because a skip flag is the thing that eventually ships enabled. The signer computes a MAC over the
-  artifact's loader-invariant extent and writes it into a reserved slot, so anything that rewrites the
-  file afterwards — a strip, a compressor, a platform signing tool — invalidates it. Every packaging
-  script signs the copy that ships as its final step and then reads the slot back, because a signer
-  that wrote nothing exits the same way as one that worked.
+- **The cryptographic module is oxicrypt's signed shared library, shipped unchanged; daemonseed signs
+  nothing.** The module is the library, not daemonseed's binary: it verifies its own signature and
+  runs its self-tests when it is initialised, whatever program loaded it, so no daemonseed binary
+  carries module code or a signature of its own, and `cargo tree -i oxicrypt-module` is empty. Each
+  artifact ships the library's release file byte for byte beside the binary, found through an
+  `$ORIGIN`-relative RUNPATH on Linux and the application directory on Windows. Releases are built and
+  load-checked on GitHub runners and staged as a draft that is tested before it is published by hand,
+  so the bytes tested are the bytes published.
 
 - **Direct messaging is a circle with one other person, over a two-directional post-quantum double
   ratchet on scattered pages.** A per-contact pseudonym, bound in-seal to the long-term identity,

@@ -62,10 +62,10 @@
 //!
 //! Serves FC1, FC5.
 
-use oxicrypt_aes::Aes256Key;
-use oxicrypt_kdf::HkdfSha384;
-use oxicrypt_ml_dsa as ml_dsa;
-use oxicrypt_ml_kem as ml_kem;
+use crate::oxi::Aes256Key;
+use crate::oxi::HkdfSha384;
+use crate::oxi::ml_dsa;
+use crate::oxi::ml_kem;
 use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
@@ -233,13 +233,14 @@ impl ControlKey {
 
 /// Why a channel operation failed.
 ///
-/// `PartialEq` is implemented by hand rather than derived because neither
-/// [`SignatureError`] nor `oxicrypt_module::Error` is comparable; those
-/// variants compare equal on the variant alone, which is all a caller needs.
+/// `PartialEq` is implemented by hand rather than derived because
+/// [`SignatureError`] is not comparable. `Signing` and `Module` compare equal on
+/// the variant alone, which is all a caller needs; `Kdf` compares its
+/// `oxicrypt::Error`.
 #[derive(Debug)]
 pub enum ChannelError {
     /// HKDF failed — an unrecoverable crypto-module condition.
-    Kdf(oxicrypt_kdf::KdfError),
+    Kdf(oxicrypt::Error),
     /// An encoded opening is not [`OPENING_LEN`] long, so no field can be
     /// read from it. Carries both figures, so a truncation is diagnosable.
     Length {
@@ -316,7 +317,7 @@ pub enum ChannelError {
     /// ML-DSA signing. Carries the cause: there is no adversary on this path.
     Signing(SignatureError),
     /// The crypto module refused an AES or key-generation call.
-    Module(oxicrypt_module::Error),
+    Module(oxicrypt::Error),
 }
 
 impl PartialEq for ChannelError {
@@ -380,8 +381,8 @@ impl PartialEq for ChannelError {
             ) => ea == eb && fa == fb,
             (Self::Aead, Self::Aead) => true,
             (Self::MessagePlaintext, Self::MessagePlaintext) => true,
-            // Compared on the variant: the wrapped cause is diagnostic and is
-            // not itself comparable.
+            // Compared on the variant: `SignatureError` is not comparable, and
+            // the module error is diagnostic.
             (Self::Signing(_), Self::Signing(_)) => true,
             (Self::Module(_), Self::Module(_)) => true,
             _ => false,
@@ -1291,7 +1292,7 @@ mod tests {
     }
 
     fn signer(seed: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).expect("derive a signer")
     }
 
@@ -2087,7 +2088,7 @@ mod tests {
         );
         assert_eq!(preimage.len(), KAT_OPENING_PREIMAGE_LEN);
         assert_eq!(
-            hex::encode(oxicrypt_sha::sha384(&preimage).unwrap()),
+            hex::encode(crate::oxi::sha384(&preimage).unwrap()),
             KAT_OPENING_PREIMAGE_SHA384
         );
     }
@@ -2114,6 +2115,6 @@ mod tests {
 
     /// The crypto module has to be operational before any SHA or ML-DSA call.
     fn module() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 }

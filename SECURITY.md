@@ -8,7 +8,7 @@ Include what you can of: the affected crate and version or commit, how to reprod
 
 ## Scope
 
-This repository holds the daemonseed protocol, its clients, and its DHT transport. The cryptographic primitives (ML-KEM, ML-DSA, AES-GCM, SHA-2, HKDF) come from the `oxicrypt` crates, which have their own repository at <https://github.com/oxiforge/oxicrypt>; report a defect in a primitive there.
+This repository holds the daemonseed protocol, its clients, and its DHT transport. The cryptographic primitives (ML-KEM, ML-DSA, AES-GCM, SHA-2, HKDF) come from oxicrypt, a signed shared library reached through the `oxicrypt` crate, which has its own repository at <https://github.com/oxiforge/oxicrypt>; report a defect in a primitive there.
 
 ## Supported versions
 

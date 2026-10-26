@@ -12,7 +12,7 @@ use daemonseed_core::storage::recovery_file;
 use daemonseed_integration_tests::isc_coverage::Coverage;
 
 fn init_oxicrypt() {
-    let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+    let _ = daemonseed_core::oxi::initialize_module();
 }
 
 fn fast_params() -> ArgonParams {

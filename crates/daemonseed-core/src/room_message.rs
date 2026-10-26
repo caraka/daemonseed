@@ -41,16 +41,16 @@
 //! absent/empty/wrong-length pubkey or signature is a hard [`RoomMessageError::Provenance`]
 //! reject — an empty pubkey never equals anyone.
 
+use crate::oxi::Aes256Key;
 use daemonseed_proto::v1 as wire;
-use oxicrypt_aes::{Aes256Key, ModeError};
-use oxicrypt_module::Error as OxicryptError;
+use oxicrypt::Error as OxicryptError;
 use prost::Message;
 use zeroize::Zeroize;
 
 use crate::aead_envelope::{EnvelopeError, open_envelope, seal_envelope};
 use crate::circle::key::AeadKey256;
 use crate::identity::keys::{SignKeypair, verify_signature};
-use oxicrypt_ml_dsa as ml_dsa;
+use crate::oxi::ml_dsa;
 
 /// Build the domain-separated provenance signing input (ISC-S24). Binds the
 /// provenance domain, room_id, sender pubkey, timestamp, and body so a signature
@@ -203,7 +203,7 @@ pub enum RoomMessageError {
     /// The OS entropy source failed while drawing a nonce.
     EntropySource(getrandom::Error),
     /// A non-`TagMismatch` AEAD mode error.
-    Aead(ModeError),
+    Aead(oxicrypt::Error),
     /// AEAD authentication failed (wrong key, tampered ciphertext, swapped
     /// nonce, or wrong AAD — including a payload sealed for the other surface).
     /// Carries no sub-cause.
@@ -247,7 +247,7 @@ impl From<EnvelopeError> for RoomMessageError {
             EnvelopeError::EntropySource(e) => Self::EntropySource(e),
             EnvelopeError::Encrypt(m) => Self::Aead(m),
             EnvelopeError::TooShort => Self::Truncated,
-            EnvelopeError::Decrypt(ModeError::TagMismatch) => Self::Authentication,
+            EnvelopeError::Decrypt(oxicrypt::Error::TagMismatch) => Self::Authentication,
             EnvelopeError::Decrypt(other) => Self::Aead(other),
         }
     }
@@ -259,19 +259,19 @@ mod tests {
     use crate::circle::key::{CircleKey, EXAMPLE_ENTROPY, circle_room_id, derive_cot_key};
     use crate::circle::message::{NONCE_LEN, TAG_LEN};
     use crate::crypto::suite::CNSA_2_0;
+    use crate::oxi::gcm_encrypt;
     use crate::public_room::{ROOM_MESSAGE_AAD, ROOM_PROVENANCE_DOMAIN};
-    use oxicrypt_aes::gcm_encrypt;
 
     const CIRCLE_AAD: &[u8] = crate::circle::message::MESSAGE_AAD;
     const CIRCLE_DOMAIN: &[u8] = crate::circle::message::CIRCLE_PROVENANCE_DOMAIN;
 
     fn cot(phrase: &str) -> CircleKey {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         derive_cot_key(phrase, &CNSA_2_0).unwrap()
     }
 
     fn keypair(seed: u8) -> SignKeypair {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         SignKeypair::from_ml_dsa_seed(&[seed; 32]).unwrap()
     }
 

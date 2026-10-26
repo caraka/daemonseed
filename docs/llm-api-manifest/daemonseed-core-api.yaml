@@ -46,11 +46,12 @@ library:
 
 constraints:
   - description: >-
-      `oxicrypt_module::initialize()` (or `initialize_with_tests`) MUST
-      be called before any cryptographic function in this crate runs.
-      Every cryptographic primitive gates on the underlying oxicrypt
-      power-on self-test. Tests in this crate call a local `init_oxicrypt()`
-      helper at the top of every test function for this reason.
+      `oxi::initialize_module()` MUST succeed before any cryptographic
+      function in this crate runs; until it has, every one returns
+      `oxicrypt::Error::NotOperational`. It initialises oxicrypt's signed
+      shared library, which verifies its own signature and runs its
+      self-tests. Tests in this crate call it at the top of every test
+      function for this reason.
     enforcement: runtime
     severity: error
 
@@ -181,8 +182,8 @@ modules:
       VEILID_STORAGE_SALT is the salt, and VEILID_DEVICE_KEY_PASSWORD and
       VEILID_NAMESPACE_TAG the info strings, of
       kdf::veilid_device_key_password(profile_secret) -> Result<Zeroizing<String>,
-      KdfError> (32 bytes of HKDF-SHA384 as lowercase hex) and
-      kdf::veilid_namespace_tag(profile_secret) -> Result<String, KdfError> (8 bytes).
+      oxicrypt::Error> (32 bytes of HKDF-SHA384 as lowercase hex) and
+      kdf::veilid_namespace_tag(profile_secret) -> Result<String, oxicrypt::Error> (8 bytes).
     no_std: false
     depends_on: []
     iscs:
@@ -647,18 +648,18 @@ modules:
       - C22
       - C37
 
-  - name: daemonseed_core::kats
+  - name: daemonseed_core::oxi
     description: >-
-      Module initialization. initialize_module brings oxicrypt
-      Operational under AlgorithmProfile::Cnsa2, passing the
-      pre-operational integrity group and CNSA_2_0_KATS, the
-      union-covering algorithm inventory for every module-gated
-      primitive daemonseed reaches. The calling artifact must carry an
-      integrity slot written by oxicrypt-integrity-sign; an unsigned
-      one does not reach Operational.
-      initialize_module_unsigned_test_binary, behind the testing
-      feature, is the entry point for test targets, which are never
-      signed.
+      The oxicrypt cryptographic module, reached through the `oxicrypt`
+      binding crate, which links oxicrypt's separately signed shared
+      library (liboxicrypt_ffi). initialize_module initialises it once
+      under the CNSA 2.0 profile; the library verifies its own signature
+      and runs its self-tests. The module then offers free functions and
+      small types: sha384, HkdfSha384, Aes256Key with gcm_encrypt and
+      gcm_decrypt, and the ml_dsa (ML-DSA-87) and ml_kem (ML-KEM-1024)
+      submodules. ML-DSA secret keys, ML-KEM decapsulation keys and
+      shared secrets are oxicrypt's self-zeroing types, re-exported here
+      with Error; public keys, ciphertexts and signatures are arrays.
     no_std: false
     depends_on: []
     iscs: []
@@ -1081,7 +1082,8 @@ modules:
       slice — the advert is one record per identity — which the caller performs through
       AdvertKeys::rotate_now; this module rotates nothing. Root, ChainKey, MessageKey, TurnSecret and
       RatchetDecapKey are zeroize-on-drop redacting newtypes, including inside a
-      snapshot. The module holds no clock,
+      snapshot; TurnSecret and RatchetDecapKey hold oxicrypt's self-zeroing types
+      behind an Arc, which a snapshot shares. The module holds no clock,
       performs no I/O, and takes entropy as a fill function.
       Sub-module dm::store is the layer's on-disk state, over
       storage::dm_store. Store::open(root, at_rest_key) -> Result<Store, StoreError>
@@ -2065,13 +2067,15 @@ types:
   - name: KeyDerivationError
     module: daemonseed_core::identity::keys
     kind: enum
-    description: HKDF / oxicrypt-module / KEM keygen failure modes.
+    description: HKDF / oxicrypt / KEM keygen failure modes.
 
   - name: SignKeypair
     module: daemonseed_core::identity::keys
     kind: struct
     description: >-
-      ML-DSA-87 keypair. Drop zeroizes private key. Exposes detached `sign`.
+      ML-DSA-87 keypair. public_key() -> &[u8; ml_dsa::PK_LEN];
+      secret_key() -> &oxi::MlDsa87SecretKey, oxicrypt's self-zeroing type,
+      wiped on drop. Exposes detached `sign`.
       Built from a mnemonic (via derive_identity_keys) or directly from a raw
       seed (from_ml_dsa_seed, server path).
     security:
@@ -2081,7 +2085,10 @@ types:
   - name: KemKeypair
     module: daemonseed_core::identity::keys
     kind: struct
-    description: ML-KEM-1024 keypair. Drop zeroizes private key.
+    description: >-
+      ML-KEM-1024 keypair. encapsulation_key() -> &[u8; ml_kem::EK_LEN];
+      decapsulation_key() -> &oxi::MlKem1024DecapsulationKey, oxicrypt's
+      self-zeroing type, wiped on drop.
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -2114,7 +2121,7 @@ types:
     module: daemonseed_core::identity::keys
     kind: enum
     description: >-
-      Module(oxicrypt_module::Error) | BadSignature. BadSignature is uniform
+      Module(oxicrypt::Error) | BadSignature. BadSignature is uniform
       across tampered-message / wrong-key / forged-sig (ISC-A-S12 / A-C18 —
       verifier cannot distinguish the sub-cause).
 
@@ -2534,7 +2541,7 @@ types:
     module: daemonseed_core::storage::cas
     kind: enum
     description: >-
-      Hash(oxicrypt_module::Error) | Io(std::io::Error) | CorruptRefcount.
+      Hash(oxicrypt::Error) | Io(std::io::Error) | CorruptRefcount.
       MemoryChunkStore raises only Hash (on put); FileChunkStore adds
       Io/CorruptRefcount.
 
@@ -3402,7 +3409,7 @@ types:
     description: Failure modes for derive_cot_key and derive_circle_veilid_owner_seed.
     variants:
       - name: Hkdf
-        description: "Hkdf(oxicrypt_kdf::KdfError) — HKDF derivation failed."
+        description: "Hkdf(oxicrypt::Error) — HKDF derivation failed."
 
   - name: VeilidNodeSeed
     module: daemonseed_core::identity::keys
@@ -3454,11 +3461,11 @@ types:
       cot_key or tamper) carries no sub-cause — fail closed.
     variants:
       - name: KeyInit
-        description: "KeyInit(oxicrypt_module::Error) — AES-256 key schedule init failed."
+        description: "KeyInit(oxicrypt::Error) — AES-256 key schedule init failed."
       - name: EntropySource
         description: "EntropySource(getrandom::Error) — OS entropy failed drawing the nonce."
       - name: Aead
-        description: "Aead(oxicrypt_aes::ModeError) — non-TagMismatch AEAD error."
+        description: "Aead(oxicrypt::Error) — non-TagMismatch AEAD error."
       - name: Authentication
         description: "Wrong cot_key, tampered ciphertext, swapped nonce, or wrong AAD."
       - name: Truncated
@@ -3520,7 +3527,7 @@ types:
       - name: BadSignature
         description: The ML-DSA-87 signature did not verify.
       - name: Module
-        description: "Module(oxicrypt_module::Error) — underlying crypto-module error."
+        description: "Module(oxicrypt::Error) — underlying crypto-module error."
 
   # ── crypto::deprecation ─────────────────────────────────────────────
   - name: DeprecationEntry
@@ -3687,7 +3694,7 @@ types:
       - name: MalformedSignature
         description: A signature blob was the wrong length / unparseable.
       - name: Module
-        description: Underlying oxicrypt-module error.
+        description: Underlying oxicrypt error.
 
   - name: UpdateChannel
     module: daemonseed_core::release
@@ -4136,14 +4143,20 @@ types:
   - name: AdvertDecapKey
     module: daemonseed_core::dm::advert
     kind: struct
-    description: An ML-KEM-1024 decapsulation key an identity holds for one advert serial, boxed.
+    description: >-
+      An ML-KEM-1024 decapsulation key an identity holds for one advert serial,
+      held in oxicrypt's self-zeroing type behind an Arc. Clone shares the one
+      key, which is wiped when the last clone drops.
     security:
       contains_secret: true
       zeroize_on_drop: true
   - name: AdvertSharedSecret
     module: daemonseed_core::dm::advert
     kind: struct
-    description: The ML-KEM-1024 shared secret ss0 an encapsulation to an advert key yields, boxed.
+    description: >-
+      The ML-KEM-1024 shared secret ss0 an encapsulation to an advert key yields,
+      held in oxicrypt's self-zeroing type behind an Arc. Clone shares the one
+      secret, which is wiped when the last clone drops.
     security:
       contains_secret: true
       zeroize_on_drop: true
@@ -4414,54 +4427,192 @@ types:
 # ─────────────────────────────────────────────────────────────────────
 
 functions:
-  # ── kats ────────────────────────────────────────────────────────────
+  # ── oxi ─────────────────────────────────────────────────────────────
   - name: initialize_module
-    module: daemonseed_core::kats
+    module: daemonseed_core::oxi
     description: >-
-      Bring the oxicrypt module Operational under the CNSA 2.0 profile.
-      Call before any cryptographic call. Safe to call unconditionally
-      and more than once: module init is one-shot per process and the
-      losing caller receives AlreadyInitialized, which this function maps
-      to Ok. The calling artifact must be signed with
-      oxicrypt-integrity-sign.
-    signature: "pub fn initialize_module() -> Result<(), oxicrypt_module::Error>"
-    parameters: []
+      Initialise oxicrypt's signed shared library under the CNSA 2.0 profile; the library verifies its own signature and runs its self-tests. Call before any cryptographic call. Idempotent: a later call returns Ok without initialising again. A failure is terminal for the process.
+    signature: "pub fn initialize_module() -> Result<(), oxicrypt::InitError>"
     returns:
-      type: "Result<(), oxicrypt_module::Error>"
-      description: >-
-        Operational, or the terminal state the module latched into. Never
-        AlreadyInitialized — that case returns Ok.
+      type: "Result<(), oxicrypt::InitError>"
+      description: "Ok once the library is operational; otherwise the refusal, with the library's integrity indicator and detail."
       error_variants:
-        - name: "oxicrypt_module::Error::SelfTestFailed"
-          condition: A power-up known-answer test failed. The module is in the error state.
-        - name: "oxicrypt_module::Error::IntegrityUnverified"
-          condition: >-
-            The artifact carries no valid integrity slot, so its image
-            could not be verified. Sign it with oxicrypt-integrity-sign.
-        - name: "oxicrypt_module::Error::ConditionalTestFailed"
-          condition: A conditional self-test failed. The module is in the error state.
+        - name: "oxicrypt::InitError"
+          condition: "The library refused initialisation: a self-test or its signature check failed, or it embeds another release key than the pinned fingerprint."
 
-  - name: initialize_module_unsigned_test_binary
-    module: daemonseed_core::kats
+  - name: sha384
+    module: daemonseed_core::oxi
     description: >-
-      Bring the module Operational inside a cargo test binary, which
-      carries no integrity slot. Behind the `testing` feature, reached
-      only through a dev-dependency edge, which the release command does
-      not carry — so no shipped artifact links it. Safe to call
-      unconditionally and more than once, on the same terms as
-      initialize_module.
-    signature: "pub fn initialize_module_unsigned_test_binary() -> Result<(), oxicrypt_module::Error>"
-    parameters: []
+      SHA-384 of data.
+    signature: "pub fn sha384(data: &[u8]) -> Result<[u8; SHA384_LEN], Error>"
     returns:
-      type: "Result<(), oxicrypt_module::Error>"
-      description: >-
-        Operational, or the terminal state the module latched into. Never
-        AlreadyInitialized — that case returns Ok.
+      type: "Result<[u8; 48], oxicrypt::Error>"
+      description: "The digest."
       error_variants:
-        - name: "oxicrypt_module::Error::SelfTestFailed"
-          condition: A power-up known-answer test failed. The module is in the error state.
-        - name: "oxicrypt_module::Error::ConditionalTestFailed"
-          condition: A conditional self-test failed. The module is in the error state.
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+
+  - name: HkdfSha384::extract
+    module: daemonseed_core::oxi
+    description: >-
+      HKDF-Extract with HMAC-SHA-384. A None salt means 48 zero bytes.
+    signature: "pub fn extract(salt: Option<&[u8]>, ikm: &[u8]) -> Result<Self, Error>"
+    returns:
+      type: "Result<HkdfSha384, oxicrypt::Error>"
+      description: "An instance holding the pseudorandom key in oxicrypt's self-zeroing type."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+
+  - name: HkdfSha384::from_prk
+    module: daemonseed_core::oxi
+    description: >-
+      An instance over a 48-byte pseudorandom key derived elsewhere.
+    signature: "pub fn from_prk(prk: &[u8]) -> Result<Self, Error>"
+    returns:
+      type: "Result<HkdfSha384, oxicrypt::Error>"
+      description: "The instance."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+        - name: "oxicrypt::Error::InvalidInput"
+          condition: "prk is not 48 bytes."
+
+  - name: HkdfSha384::expand
+    module: daemonseed_core::oxi
+    description: >-
+      HKDF-Expand into okm, filling all of it; an empty okm is left as it is.
+    signature: "pub fn expand(&self, info: &[u8], okm: &mut [u8]) -> Result<(), Error>"
+    returns:
+      type: "Result<(), oxicrypt::Error>"
+      description: "Ok when okm is filled."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+        - name: "oxicrypt::Error::OutputTooLong"
+          condition: "okm is longer than 255 x 48 bytes."
+
+  - name: Aes256Key::new
+    module: daemonseed_core::oxi
+    description: >-
+      An AES-256 key schedule held by the library. Clone shares it; the library frees and zeroes it when the last clone drops.
+    signature: "pub fn new(key: &[u8; AES256_KEY_LEN]) -> Result<Self, Error>"
+    returns:
+      type: "Result<Aes256Key, oxicrypt::Error>"
+      description: "The key."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+
+  - name: gcm_encrypt
+    module: daemonseed_core::oxi
+    description: >-
+      AES-256-GCM encryption of plaintext into ciphertext_out (same length), writing the tag to tag_out. iv must be 12 bytes.
+    signature: "pub fn gcm_encrypt(key: &Aes256Key, iv: &[u8], aad: &[u8], plaintext: &[u8], ciphertext_out: &mut [u8], tag_out: &mut [u8; AES256_GCM_TAG_LEN]) -> Result<(), Error>"
+    returns:
+      type: "Result<(), oxicrypt::Error>"
+      description: "Ok when encrypted."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+        - name: "oxicrypt::Error::InvalidIvLength"
+          condition: "iv is not 12 bytes."
+        - name: "oxicrypt::Error::LengthMismatch"
+          condition: "ciphertext_out is not plaintext's length."
+
+  - name: gcm_decrypt
+    module: daemonseed_core::oxi
+    description: >-
+      AES-256-GCM decryption of ciphertext into plaintext_out (same length). Every error the library returns, and a length mismatch, zeroes plaintext_out; an iv that is not 12 bytes, or a call before initialize_module succeeded, returns before plaintext_out is written and leaves it as it was.
+    signature: "pub fn gcm_decrypt(key: &Aes256Key, iv: &[u8], aad: &[u8], ciphertext: &[u8], tag: &[u8; AES256_GCM_TAG_LEN], plaintext_out: &mut [u8]) -> Result<(), Error>"
+    returns:
+      type: "Result<(), oxicrypt::Error>"
+      description: "Ok when the tag verified."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+        - name: "oxicrypt::Error::TagMismatch"
+          condition: "The tag did not verify."
+        - name: "oxicrypt::Error::InvalidIvLength"
+          condition: "iv is not 12 bytes."
+        - name: "oxicrypt::Error::LengthMismatch"
+          condition: "plaintext_out is not ciphertext's length."
+
+  - name: ml_dsa::keygen
+    module: daemonseed_core::oxi::ml_dsa
+    description: >-
+      The ML-DSA-87 key pair generated from a 32-byte seed.
+    signature: "pub fn keygen(xi: &[u8; SEED_LEN]) -> Result<([u8; PK_LEN], MlDsa87SecretKey), Error>"
+    returns:
+      type: "Result<([u8; PK_LEN], MlDsa87SecretKey), oxicrypt::Error>"
+      description: "The public key, and the secret key in oxicrypt's self-zeroing type."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+
+  - name: ml_dsa::sign
+    module: daemonseed_core::oxi::ml_dsa
+    description: >-
+      The deterministic ML-DSA-87 signature of message under context ctx (at most 255 bytes).
+    signature: "pub fn sign(sk: &MlDsa87SecretKey, message: &[u8], ctx: &[u8]) -> Result<[u8; SIG_LEN], Error>"
+    returns:
+      type: "Result<[u8; SIG_LEN], oxicrypt::Error>"
+      description: "The signature."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+        - name: "oxicrypt::Error::InvalidInput"
+          condition: "ctx is longer than 255 bytes."
+
+  - name: ml_dsa::verify
+    module: daemonseed_core::oxi::ml_dsa
+    description: >-
+      ML-DSA-87 verification of sig over message under context ctx.
+    signature: "pub fn verify(pk: &[u8; PK_LEN], message: &[u8], ctx: &[u8], sig: &[u8; SIG_LEN]) -> Result<(), Error>"
+    returns:
+      type: "Result<(), oxicrypt::Error>"
+      description: "Ok only for a valid signature."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+        - name: "oxicrypt::Error::SignatureInvalid"
+          condition: "The signature did not verify, or the signature or key did not decode."
+
+  - name: ml_kem::keygen
+    module: daemonseed_core::oxi::ml_kem
+    description: >-
+      The ML-KEM-1024 key pair generated from seeds d and z.
+    signature: "pub fn keygen(d: &[u8; SEED_LEN], z: &[u8; SEED_LEN]) -> Result<([u8; EK_LEN], MlKem1024DecapsulationKey), Error>"
+    returns:
+      type: "Result<([u8; EK_LEN], MlKem1024DecapsulationKey), oxicrypt::Error>"
+      description: "The encapsulation key, and the decapsulation key in oxicrypt's self-zeroing type."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+
+  - name: ml_kem::encapsulate
+    module: daemonseed_core::oxi::ml_kem
+    description: >-
+      Encapsulation against ek with randomness m.
+    signature: "pub fn encapsulate(ek: &[u8; EK_LEN], m: &[u8; SEED_LEN]) -> Result<(SharedSecret, [u8; CT_LEN]), Error>"
+    returns:
+      type: "Result<(SharedSecret, [u8; CT_LEN]), oxicrypt::Error>"
+      description: "The shared secret in oxicrypt's self-zeroing type, and the ciphertext."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
+
+  - name: ml_kem::decapsulate
+    module: daemonseed_core::oxi::ml_kem
+    description: >-
+      Decapsulation of ct with dk. A modified ciphertext yields the implicit-rejection secret, not an error.
+    signature: "pub fn decapsulate(dk: &MlKem1024DecapsulationKey, ct: &[u8; CT_LEN]) -> Result<SharedSecret, Error>"
+    returns:
+      type: "Result<SharedSecret, oxicrypt::Error>"
+      description: "The shared secret in oxicrypt's self-zeroing type."
+      error_variants:
+        - name: "oxicrypt::Error::NotOperational"
+          condition: "initialize_module has not succeeded."
 
   # ── dm::block_list ──────────────────────────────────────────────────
   - name: BlockList::iter
@@ -4544,7 +4695,7 @@ functions:
       description: A SignKeypair + KemKeypair bundle for the chosen branch.
       error_variants:
         - name: KeyDerivationError
-          condition: HKDF, oxicrypt-module, or KEM keygen failed.
+          condition: HKDF, oxicrypt, or KEM keygen failed.
     preconditions:
       - description: The oxicrypt module must be operational.
 
@@ -4582,7 +4733,7 @@ functions:
     module: daemonseed_core::identity::keys
     description: >-
       Build a SignKeypair directly from a raw 32-byte ML-DSA-87 seed via
-      oxicrypt_ml_dsa::keygen. The server path (server identity is a bare seed,
+      oxi::ml_dsa::keygen. The server path (server identity is a bare seed,
       not a mnemonic); deterministic.
     signature: "pub fn from_ml_dsa_seed(seed: &[u8; ML_DSA_SEED_LEN]) -> Result<Self, KeyDerivationError>"
     parameters:
@@ -5544,14 +5695,14 @@ functions:
   - name: chunk_addr
     module: daemonseed_core::storage::cas
     description: "SHA-384(chunk) (ISC-2)."
-    signature: "pub fn chunk_addr(chunk: &[u8]) -> Result<ChunkAddr, oxicrypt_module::Error>"
+    signature: "pub fn chunk_addr(chunk: &[u8]) -> Result<ChunkAddr, oxicrypt::Error>"
     parameters:
       - name: chunk
         type: "&[u8]"
         direction: in
         description: The chunk bytes to address.
     returns:
-      type: "Result<ChunkAddr, oxicrypt_module::Error>"
+      type: "Result<ChunkAddr, oxicrypt::Error>"
       description: The SHA-384 content address of the chunk.
       error_variants:
         - name: NotOperational
@@ -5566,7 +5717,7 @@ functions:
       SHA-384(cot_key.as_bytes() || server_id) (ISC-8). Transient key||id buffer
       is zeroed after hashing. server_id must be the same stable wire server-id
       representation on member + relay.
-    signature: "pub fn asset_address(cot_key: &circle::key::CircleKey, server_id: &[u8]) -> Result<AssetAddr, oxicrypt_module::Error>"
+    signature: "pub fn asset_address(cot_key: &circle::key::CircleKey, server_id: &[u8]) -> Result<AssetAddr, oxicrypt::Error>"
     parameters:
       - name: cot_key
         type: "&circle::key::CircleKey"
@@ -5577,7 +5728,7 @@ functions:
         direction: in
         description: The stable wire server-id, namespacing the address per relay.
     returns:
-      type: "Result<AssetAddr, oxicrypt_module::Error>"
+      type: "Result<AssetAddr, oxicrypt::Error>"
       description: The rendezvous asset address.
       error_variants:
         - name: NotOperational
@@ -5596,7 +5747,7 @@ functions:
       variant (post-MVP) will derive an analogous address keyed by a
       share-CoT key and wrap each ShareFrame in an AEAD seal — same wire
       mechanism, additional secret + encryption layer.
-    signature: "pub fn public_share_asset_address(share_id: &[u8], server_id: &[u8]) -> Result<AssetAddr, oxicrypt_module::Error>"
+    signature: "pub fn public_share_asset_address(share_id: &[u8], server_id: &[u8]) -> Result<AssetAddr, oxicrypt::Error>"
     parameters:
       - name: share_id
         type: "&[u8]"
@@ -5607,7 +5758,7 @@ functions:
         direction: in
         description: The stable wire server-id, namespacing the address per relay.
     returns:
-      type: "Result<AssetAddr, oxicrypt_module::Error>"
+      type: "Result<AssetAddr, oxicrypt::Error>"
       description: The public-share rendezvous asset address.
     iscs: ["19"]
 
@@ -7046,14 +7197,14 @@ functions:
   - name: content_address
     module: daemonseed_core::public_space
     description: "SHA-384(signed_payload) (ISC-17)."
-    signature: "pub fn content_address(signed_payload: &[u8]) -> Result<ContentAddress, oxicrypt_module::Error>"
+    signature: "pub fn content_address(signed_payload: &[u8]) -> Result<ContentAddress, oxicrypt::Error>"
     parameters:
       - name: signed_payload
         type: "&[u8]"
         direction: in
         description: The signed artifact bytes to address.
     returns:
-      type: "Result<ContentAddress, oxicrypt_module::Error>"
+      type: "Result<ContentAddress, oxicrypt::Error>"
       description: The SHA-384 content address.
       error_variants:
         - name: NotOperational
@@ -7397,14 +7548,14 @@ functions:
     description: >-
       ISC-12 gate: project-announce always authorized; FullKey by exact bytes;
       Handle by SHA-384 hash-prefix match computed without touching the signature.
-    signature: "pub fn authorizes(&self, pubkey: &[u8]) -> Result<bool, oxicrypt_module::Error>"
+    signature: "pub fn authorizes(&self, pubkey: &[u8]) -> Result<bool, oxicrypt::Error>"
     parameters:
       - name: pubkey
         type: "&[u8]"
         direction: in
         description: The candidate signer public key.
     returns:
-      type: "Result<bool, oxicrypt_module::Error>"
+      type: "Result<bool, oxicrypt::Error>"
       description: True if the key is authorized by the whitelist.
       error_variants:
         - name: NotOperational
@@ -8840,7 +8991,7 @@ error_types:
     module: daemonseed_core::identity::keys
     variants:
       - name: KeyDerivationError
-        description: HKDF, oxicrypt-module, or KEM keygen failure.
+        description: HKDF, oxicrypt, or KEM keygen failure.
         recoverable: false
         user_action: Ensure the oxicrypt module was initialized before derivation.
 
@@ -8848,9 +8999,9 @@ error_types:
     module: daemonseed_core::identity::keys
     variants:
       - name: Module
-        description: Wraps oxicrypt_module::Error (e.g. module not operational).
+        description: Wraps oxicrypt::Error (e.g. module not operational).
         recoverable: false
-        user_action: Call oxicrypt_module::initialize() before signing/verifying.
+        user_action: Call oxi::initialize_module() before signing/verifying.
       - name: BadSignature
         description: >-
           Uniform verify failure across tampered-message / wrong-key / forged-sig
@@ -8942,7 +9093,7 @@ error_types:
     module: daemonseed_core::storage::cas
     variants:
       - name: Hash
-        description: Wraps oxicrypt_module::Error during chunk addressing.
+        description: Wraps oxicrypt::Error during chunk addressing.
         recoverable: false
         user_action: Ensure the oxicrypt module was initialized.
       - name: Io
@@ -9074,7 +9225,7 @@ error_types:
     module: daemonseed_core::circle
     variants:
       - name: Hkdf
-        description: HKDF derivation failed (wraps oxicrypt_kdf::KdfError).
+        description: HKDF derivation failed (wraps oxicrypt::Error).
         recoverable: false
         user_action: Ensure the oxicrypt module was initialized.
 
@@ -9106,7 +9257,7 @@ error_types:
         recoverable: false
         user_action: Reject the artifact; it was not validly signed.
       - name: Module
-        description: Wraps oxicrypt_module::Error.
+        description: Wraps oxicrypt::Error.
         recoverable: false
         user_action: Ensure the oxicrypt module was initialized.
 
@@ -9156,7 +9307,7 @@ error_types:
         recoverable: false
         user_action: Reject the release artifact.
       - name: Module
-        description: Wraps oxicrypt_module::Error.
+        description: Wraps oxicrypt::Error.
         recoverable: false
         user_action: Ensure the oxicrypt module was initialized.
 
@@ -9684,9 +9835,8 @@ gotchas:
 
   - description: >-
       Every test in this crate that touches crypto must call
-      `oxicrypt_module::initialize()` (or the test-only `let _ =
-      oxicrypt_module::initialize();` idiom) before any cryptographic
-      function. Without it, every primitive returns ModuleNotOperational.
+      `oxi::initialize_module()` before any cryptographic function.
+      Without it, every primitive returns oxicrypt::Error::NotOperational.
     severity: error
     scope: all crypto-touching modules
 

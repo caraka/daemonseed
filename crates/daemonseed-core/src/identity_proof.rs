@@ -289,12 +289,12 @@ pub fn verify_envelope(
     // signature over the canonical input. channel_binding + negotiated_version
     // are the caller's locally-recomputed values, so a captured envelope from
     // another session fails here.
-    let pubkey: [u8; oxicrypt_ml_dsa::PK_LEN] = envelope
+    let pubkey: [u8; crate::oxi::ml_dsa::PK_LEN] = envelope
         .claimed_pubkey
         .as_slice()
         .try_into()
         .map_err(|_| VerifyRejection)?;
-    let sig: [u8; oxicrypt_ml_dsa::SIG_LEN] = envelope
+    let sig: [u8; crate::oxi::ml_dsa::SIG_LEN] = envelope
         .signature
         .as_slice()
         .try_into()
@@ -344,7 +344,7 @@ mod tests {
     const ALL_ZEROS_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
 
     fn ensure_oxicrypt_initialized() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     /// Records the args passed to the exporter so tests can assert the
@@ -456,7 +456,7 @@ mod tests {
             1_700_000_000_000,
             5,
         );
-        let sig: [u8; oxicrypt_ml_dsa::SIG_LEN] = env.signature.clone().try_into().unwrap();
+        let sig: [u8; crate::oxi::ml_dsa::SIG_LEN] = env.signature.clone().try_into().unwrap();
         verify_signature(keys.signing.public_key(), &input, &sig).unwrap();
     }
 

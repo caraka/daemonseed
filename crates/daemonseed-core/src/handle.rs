@@ -9,7 +9,7 @@
 //!
 //! The hash family is SHA-384, not SHA-256: CNSA 2.0 mandates a hash with
 //! ≥192-bit security level (SHA-384 / SHA-512 / SHA3-384 / SHA3-512), and
-//! oxicrypt-module's `AlgorithmProfile::Cnsa2` enforces that at the gate.
+//! the oxicrypt module's CNSA 2.0 profile enforces that at the gate.
 //! The 12-hex prefix selects 48 bits regardless of the underlying digest
 //! length, so handle identification strength is unchanged from the pre-bump
 //! shape; the change is about compliance, not strength.
@@ -33,8 +33,8 @@ pub mod display_name;
 use core::fmt;
 use core::str::FromStr;
 
-use oxicrypt_module::Error as OxicryptError;
-use oxicrypt_sha::sha384;
+use crate::oxi::sha384;
+use oxicrypt::Error as OxicryptError;
 
 /// Hash-prefix length in bytes (6 bytes = 12 hex chars = 48 bits).
 ///
@@ -333,7 +333,7 @@ mod tests {
     /// `initialize` is idempotent — after the first call it returns
     /// `AlreadyInitialized`, which we deliberately ignore.
     fn ensure_oxicrypt_initialized() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     fn alice() -> Handle {

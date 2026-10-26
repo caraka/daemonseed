@@ -27,8 +27,8 @@
 //! deriving member and the relay (the relay's canonical wire server-id); the
 //! choice of representation is pinned at the wire layer, not here.
 
-use oxicrypt_module::Error as OxicryptError;
-use oxicrypt_sha::sha384;
+use crate::oxi::sha384;
+use oxicrypt::Error as OxicryptError;
 use zeroize::Zeroize;
 
 use crate::circle::key::{COT_KEY_LEN, CircleKey};
@@ -141,7 +141,7 @@ mod tests {
     const RELAY_B: &[u8] = b"relay-bravo#66778899aabb";
 
     fn example_key() -> CircleKey {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         derive_cot_key(EXAMPLE_ENTROPY, &CNSA_2_0).unwrap()
     }
 
@@ -168,7 +168,7 @@ mod tests {
     /// phrases) on the same relay get different addresses.
     #[test]
     fn asset_address_keyed_by_circle() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let circle_one = derive_cot_key("phrase alpha here", &CNSA_2_0).unwrap();
         let circle_two = derive_cot_key("phrase bravo here", &CNSA_2_0).unwrap();
         let addr_one = asset_address(&circle_one, RELAY_A).unwrap();
@@ -190,7 +190,7 @@ mod tests {
     /// fetcher and the sharer meet at the same point on the relay.
     #[test]
     fn public_share_asset_address_is_deterministic() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let a = public_share_asset_address(b"share-alice-1", RELAY_A).unwrap();
         let b = public_share_asset_address(b"share-alice-1", RELAY_A).unwrap();
         assert_eq!(a, b);
@@ -201,7 +201,7 @@ mod tests {
     /// distinct addresses (server_id namespacing).
     #[test]
     fn public_share_asset_address_namespaced_per_relay() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let on_a = public_share_asset_address(b"share-1", RELAY_A).unwrap();
         let on_b = public_share_asset_address(b"share-1", RELAY_B).unwrap();
         assert_ne!(on_a, on_b);
@@ -210,7 +210,7 @@ mod tests {
     /// Different shares on the same relay get different addresses.
     #[test]
     fn public_share_asset_address_keyed_by_share_id() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let s1 = public_share_asset_address(b"share-1", RELAY_A).unwrap();
         let s2 = public_share_asset_address(b"share-2", RELAY_A).unwrap();
         assert_ne!(s1, s2);
@@ -222,7 +222,7 @@ mod tests {
     /// concatenations would be identical; with it the digests diverge.
     #[test]
     fn public_share_asset_address_separator_prevents_boundary_collision() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let a = public_share_asset_address(b"foo", b"bar").unwrap();
         let b = public_share_asset_address(b"fo", b"obar").unwrap();
         assert_ne!(
@@ -238,7 +238,7 @@ mod tests {
     /// by construction.
     #[test]
     fn public_share_does_not_collide_with_chat_address_scheme() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let circle = public_share_asset_address(b"any-share-id", RELAY_A).unwrap();
         let chat = asset_address(&example_key(), RELAY_A).unwrap();
         assert_ne!(circle, chat);

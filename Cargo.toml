@@ -13,24 +13,6 @@ members = [
     "xtask",
 ]
 
-# Crypto runs at full optimization even in dev builds. oxicrypt's portable
-# constant-time paths (accelerated backends are off by default) are unusable at
-# opt-level 0 for bulk work: a debug manual test measured ~5 s to AEAD-seal one
-# 1 MiB share chunk — past veilid's 5 s app_call answer window on its own — and
-# the fetch side pays the same tax on its SHA-384 chunk verify (#123).
-[profile.dev.package.oxicrypt-aes]
-opt-level = 3
-[profile.dev.package.oxicrypt-sha]
-opt-level = 3
-[profile.dev.package.oxicrypt-kdf]
-opt-level = 3
-[profile.dev.package.oxicrypt-ml-dsa]
-opt-level = 3
-[profile.dev.package.oxicrypt-ml-kem]
-opt-level = 3
-[profile.dev.package.oxicrypt-module]
-opt-level = 3
-
 # Integer overflow panics in release as well as dev (#258). Release wraps silently
 # by default, and much of this codebase's arithmetic is over quantities where a wrap
 # is a security event rather than a rounding error — it yields a value
@@ -77,15 +59,15 @@ walkdir = "2.5"
 # TUI framework (MIT or Apache-2.0). daemonseed-tui (AGPL-3.0-or-later) consumes
 # ratatui under its permissive license — FSF-compatible combined-work shape.
 # Pinned at workspace level so future M11 TUI integration uses a single version.
-ratatui = "0.29"
+ratatui = "0.30"
 
 # Slint GUI toolkit for daemonseed-gui (ISC-C6). Consumed under GPLv3
 # (AGPLv3-compatible) — daemonseed-gui is AGPL-3.0-or-later. Base build is
 # software-renderer-only (no GL) so it compiles + offscreen-renders even from a
 # headless terminal; the crate's `desktop` feature forwards `slint/backend-winit`
 # for a real window on a desktop session.
-slint = { version = "1.13", default-features = false, features = ["compat-1-2", "renderer-software", "std"] }
-slint-build = "1.13"
+slint = { version = "1.18", default-features = false, features = ["compat-1-2", "renderer-software", "std"] }
+slint-build = "1.18"
 
 # ── Crypto stack (oxicrypt, from the registry) ───────────────────────────────
 # Pinned to a published version rather than consumed from `../oxicrypt`. A path
@@ -96,39 +78,9 @@ slint-build = "1.13"
 # a CHANGELOG to read.
 #
 # To iterate across both repos, uncomment the `[patch.crates-io]` block at the
-# foot of this file; it redirects every one of these to the local checkout
-# without touching the versions above.
-oxicrypt-module = { version = "0.24.0" }
-oxicrypt-ml-dsa = { version = "0.24.0" }
-oxicrypt-ml-kem = { version = "0.24.0" }
-# accel-aes ON (#123, ratified 2026-07-03): runtime-CPUID dispatch to AES-NI when
-# present, else the portable constant-time path. Adds the oxicrypt-aes-accel path
-# dep to the lock; correctness is covered by oxicrypt's own AES KATs.
-oxicrypt-aes = { version = "0.24.0", features = ["accel-aes"] }
-oxicrypt-kdf = { version = "0.24.0" }
-oxicrypt-sha = { version = "0.24.0" }
-# The pre-operational software integrity self-test. `initialize_with_profile`
-# takes its inventory as the first argument, and a module initialized with an
-# empty group latches `IntegrityUnverified` instead of reaching `Operational`,
-# so this is a required dependency of the boot path rather than an option.
-oxicrypt-integrity = { version = "0.24.0" }
-# The signer that writes the integrity slot into a built artifact. A BUILD TOOL,
-# outside the cryptographic boundary and never linked into anything daemonseed
-# ships. Invoked as a binary against the artifact, last, after anything that
-# rewrites the file.
-#
-# Declared as a dev-dependency of the crates that produce signable artifacts, and
-# it is the pin `packaging/lib/sign.sh` reads: the signer it resolves is this
-# entry, resolved the same way the runtime beside it is. That is what keeps the
-# two halves of the slot contract from drifting — the tool that writes a slot and
-# the `oxicrypt-integrity` that verifies it come from one resolution, not from
-# one version number that both happen to share.
-oxicrypt-integrity-sign = { version = "0.24.0" }
-# Additional oxicrypt primitives reached by daemonseed-core for assembling the
-# production KATS slice that drives `oxicrypt_module::initialize_with_profile`.
-oxicrypt-hmac = { version = "0.24.0" }
-oxicrypt-drbg = { version = "0.24.0" }
-oxicrypt-ecdh = { version = "0.24.0" }
+# foot of this file; it redirects the binding to the local checkout
+# without touching the version above.
+oxicrypt = { version = "0.26" }
 # Filesystem fixtures for test scaffolding.
 tempfile = "3"
 
@@ -196,8 +148,8 @@ portable-pty = "0.9"
 vt100 = "0.15"
 
 # ── Local oxicrypt, for cross-repo work ──────────────────────────────────────
-# Uncomment to build every oxicrypt dependency from `../oxicrypt` instead of the
-# registry, without editing a single version above. This is how you iterate on
+# Uncomment to build the `oxicrypt` binding from `../oxicrypt` instead of the
+# registry, without editing the version above. This is how you iterate on
 # both repos at once; `cargo` reports the redirect at the top of every build, so
 # it is hard to leave on by accident.
 #
@@ -206,14 +158,4 @@ vt100 = "0.15"
 # version — which is the whole property the pin exists to buy.
 #
 # [patch.crates-io]
-# oxicrypt-module = { path = "../oxicrypt/crates/oxicrypt-module" }
-# oxicrypt-ml-dsa = { path = "../oxicrypt/crates/oxicrypt-ml-dsa" }
-# oxicrypt-ml-kem = { path = "../oxicrypt/crates/oxicrypt-ml-kem" }
-# oxicrypt-aes = { path = "../oxicrypt/crates/oxicrypt-aes" }
-# oxicrypt-kdf = { path = "../oxicrypt/crates/oxicrypt-kdf" }
-# oxicrypt-sha = { path = "../oxicrypt/crates/oxicrypt-sha" }
-# oxicrypt-hmac = { path = "../oxicrypt/crates/oxicrypt-hmac" }
-# oxicrypt-drbg = { path = "../oxicrypt/crates/oxicrypt-drbg" }
-# oxicrypt-ecdh = { path = "../oxicrypt/crates/oxicrypt-ecdh" }
-# oxicrypt-integrity = { path = "../oxicrypt/crates/oxicrypt-integrity" }
-# oxicrypt-integrity-sign = { path = "../oxicrypt/tools/oxicrypt-integrity-sign" }
+# oxicrypt = { path = "../oxicrypt/oxicrypt" }

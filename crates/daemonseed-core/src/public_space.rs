@@ -27,10 +27,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use oxicrypt_kdf::HkdfSha384;
-use oxicrypt_ml_dsa as ml_dsa;
-use oxicrypt_module::Error as OxicryptError;
-use oxicrypt_sha::sha384;
+use crate::oxi::HkdfSha384;
+use crate::oxi::ml_dsa;
+use crate::oxi::sha384;
+use oxicrypt::Error as OxicryptError;
 use zeroize::Zeroizing;
 
 use crate::handle::{Handle, HandleParseError};
@@ -579,7 +579,7 @@ redacted_secret_newtype! {
 #[derive(Debug)]
 pub enum AnnounceOwnerError {
     /// The HKDF extract/expand step failed.
-    Hkdf(oxicrypt_kdf::KdfError),
+    Hkdf(oxicrypt::Error),
 }
 
 impl fmt::Display for AnnounceOwnerError {
@@ -1242,7 +1242,7 @@ mod tests {
     /// `initialize` is idempotent; the `AlreadyInitialized` second call is
     /// deliberately ignored.
     fn ensure_module() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
     }
 
     /// ISC-17: the content address is exactly `SHA-384(signed_payload)`.
@@ -1827,7 +1827,7 @@ mod tests {
     /// (distinct project seeds → distinct channels).
     #[test]
     fn announce_owner_seed_is_deterministic_and_per_seed() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let a = derive_project_announce_veilid_owner_seed(&[0x5d; 32]).unwrap();
         let b = derive_project_announce_veilid_owner_seed(&[0x5d; 32]).unwrap();
         assert_eq!(a.as_bytes(), b.as_bytes());
@@ -1842,7 +1842,7 @@ mod tests {
     /// owner seed HKDF-expands it under a distinct label.)
     #[test]
     fn announce_owner_seed_disjoint_from_content_signing_seed() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let project_seed = [0x11; PROJECT_ANNOUNCE_SEED_LEN];
         let owner = derive_project_announce_veilid_owner_seed(&project_seed).unwrap();
         // The owner seed must not equal the raw project seed (the ML-DSA content
@@ -1870,7 +1870,7 @@ mod tests {
         use crate::public_room::{
             derive_room_presence_veilid_owner_seed, derive_room_veilid_owner_seed,
         };
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let owner =
             derive_project_announce_veilid_owner_seed(&[0x11; PROJECT_ANNOUNCE_SEED_LEN]).unwrap();
         assert_ne!(
@@ -1902,7 +1902,7 @@ mod tests {
     /// `Debug` never leaks the announce owner seed (ISC-A-C1 log-surface hygiene).
     #[test]
     fn announce_owner_seed_debug_is_redacted() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let s = derive_project_announce_veilid_owner_seed(&[7; 32]).unwrap();
         assert_eq!(
             format!("{s:?}"),
@@ -1944,7 +1944,7 @@ mod tests {
     /// a drift in the consolidated extract/expand/zeroize/Box path fails the test.
     #[test]
     fn announce_owner_seed_kat_byte_identity() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         assert_eq!(
             hex::encode(
                 derive_project_announce_veilid_owner_seed(&[0x5d; 32])

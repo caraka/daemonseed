@@ -437,7 +437,7 @@ mod tests {
     fn plan_file(dest_rel: &str, bytes: &[u8]) -> (PlannedFile, HashMap<ChunkAddr, Vec<u8>>) {
         let mut chunks = Vec::new();
         let mut map = HashMap::new();
-        let _ = daemonseed_core::kats::initialize_module_unsigned_test_binary();
+        let _ = daemonseed_core::oxi::initialize_module();
         for chunk in bytes.chunks(CHUNK_SIZE) {
             let addr = chunk_addr(chunk).unwrap();
             chunks.push(addr);

@@ -121,7 +121,7 @@
 //! as a field that happens to land wrong. The store's AEAD speaks to bytes that
 //! were tampered with; this speaks to bytes that are the wrong shape.
 
-use oxicrypt_ml_dsa as ml_dsa;
+use crate::oxi::ml_dsa;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Bytes in a correspondence's address root `AR`.
@@ -1107,7 +1107,7 @@ mod tests {
     /// any low-entropy value, or on nothing at all, fails one of the two halves.
     #[test]
     fn a_placeholder_address_root_is_refused_at_both_doors() {
-        let _ = crate::kats::initialize_module_unsigned_test_binary();
+        let _ = crate::oxi::initialize_module();
         let build = |root: [u8; ROOT_LEN]| {
             ContactRecord::new(pk(0x01), Some(pk(0x80)), Zeroizing::new(root), 0, 0)
         };
