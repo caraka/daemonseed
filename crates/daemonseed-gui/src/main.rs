@@ -26,6 +26,12 @@
 //! rename-identity overlay prefilled with a sample name (#66);
 //! `--show-circle-detail` materializes a circle, applies a synthetic rendezvous,
 //! and slides the context sheet open showing the two name vectors (#36).
+//! `--show-lobby-messages` seeds three Lobby messages, one of them our own, and the
+//! same three into a circle when one materializes, so the PNG shows the chat list
+//! drawing delivered items.
+//! `--show-circle-sequence` delivers circle messages one after another, writing
+//! `<path>.1.png` after the first and `<path>.2.png` after the third delivery
+//! before the final render.
 
 // The windowed (`desktop`) build must not spawn a console. Without this attribute the
 // GUI links as a console-subsystem executable and Windows attaches a stray terminal
@@ -77,11 +83,12 @@ use std::time::Duration;
 /// materialized circle (index ≥1) routes its Send to the `SendCircle` seam.
 const LOBBY: usize = 0;
 
-/// #84: large-negative `scroll_y` sentinel meaning "pin to the bottom". `apply_view`
-/// writes it into the Flickable's `content-y`, which Slint clamps against the current
-/// content height — so it lands exactly at the newest message without the GUI needing
-/// to know the visible height. Any value below the real minimum (≈ -msg_count*52px)
-/// works; this is safely beyond it.
+/// #84: large-negative `scroll_y` sentinel meaning "pin to the bottom". The
+/// view-apply functions request it through [`request_scroll`], and the chat list
+/// clamps the request against its laid-out content height — so it lands exactly at
+/// the newest message without the GUI needing to know the visible height. Any value
+/// below the real minimum (the visible height minus the transcript height) works;
+/// this is safely beyond it.
 const STICK_BOTTOM: f32 = -1.0e7;
 
 /// Default relay (the alpha1 fra1 VPS). Overridable via env so a tester can point
@@ -341,18 +348,28 @@ fn messages_model(messages: &[Msg]) -> ModelRc<MsgData> {
     ModelRc::from(Rc::new(VecModel::from(rows)))
 }
 
+/// Ask the chat list to scroll to content-y `y`, or to its bottom with
+/// [`STICK_BOTTOM`]. Each call is a new request, even one equal to the last: the
+/// list clamps it to the transcript, and again if the content height then changes,
+/// and reports where it lands through `scroll-y`. Read the position back with
+/// `get_scroll_position`, which also covers a request the list has not taken yet.
+fn request_scroll(ui: &AppWindow, y: f32) {
+    ui.set_scroll_request(y);
+    ui.set_scroll_request_seq(ui.get_scroll_request_seq().wrapping_add(1));
+}
+
 /// The SINGLE path that pushes a circle's state into the UI props.
 ///
-/// ORDER MATTERS (ISC-39): set `messages` FIRST so the Flickable's content
-/// height is current, then name/sub/draft/active, and write `scroll-y` LAST — so a
-/// restored negative scroll is clamped against the new content height, not stale.
+/// ORDER MATTERS: set `messages` FIRST, then name/sub/draft/active, and request
+/// the scroll position LAST. The list clamps the request at once and again when the
+/// new transcript's content height changes.
 fn apply_view(ui: &AppWindow, c: &CircleState, active: i32) {
     ui.set_messages(messages_model(&c.messages));
     ui.set_header_name(SharedString::from(c.name.as_str()));
     ui.set_header_sub(SharedString::from(c.header_sub.as_str()));
     ui.set_draft(SharedString::from(c.draft.as_str()));
     ui.set_active(active);
-    ui.set_scroll_y(c.scroll_y);
+    request_scroll(ui, c.scroll_y);
 }
 
 /// Re-render variant of [`apply_view`] for events that are NOT a rail switch — an
@@ -368,7 +385,7 @@ fn apply_view_preserving_draft(ui: &AppWindow, c: &CircleState, active: i32) {
     ui.set_header_name(SharedString::from(c.name.as_str()));
     ui.set_header_sub(SharedString::from(c.header_sub.as_str()));
     ui.set_active(active);
-    ui.set_scroll_y(c.scroll_y);
+    request_scroll(ui, c.scroll_y);
 }
 
 /// #36: push the active circle's two name vectors into the context-sheet props.
@@ -499,7 +516,7 @@ fn materialize_and_select(
             Ok(idx) => {
                 // Capture the current circle's live edits before activating the new one.
                 let live_draft = ui.get_draft().to_string();
-                let live_scroll = ui.get_scroll_y();
+                let live_scroll = ui.get_scroll_position();
                 st.switch_to(idx, live_draft, live_scroll);
                 let active = st.active();
                 rebuild_rail(ui, &st);
@@ -598,7 +615,7 @@ fn build_ui(project_announce_seed: Option<ProjectAnnounceSeedText>) -> BuiltUi {
             ui.set_publish_open(false);
             ui.set_rename_open(false);
             let live_draft = ui.get_draft().to_string();
-            let live_scroll = ui.get_scroll_y();
+            let live_scroll = ui.get_scroll_position();
             let refresh_public_shares = {
                 let mut st = state.borrow_mut();
                 st.switch_to(target as usize, live_draft, live_scroll);
@@ -2095,7 +2112,7 @@ fn apply_net_event(
             // #84: capture scroll intent from the LIVE view BEFORE the transcript grows.
             // Own sends always pin to bottom; an incoming message pins only if the reader
             // was already at the bottom — otherwise we hold their current position.
-            let live = ui.get_scroll_y();
+            let live = ui.get_scroll_position();
             let stick = mine || ui.get_chat_at_bottom();
             // Always fold the message into the Lobby's RAM state; refresh the
             // visible transcript only when the Lobby is the active circle. #126: order
@@ -2185,7 +2202,7 @@ fn apply_net_event(
             // #84: capture scroll intent from the LIVE view before the transcript grows
             // (see the Lobby branch). Own sends pin to bottom; incoming pins only if the
             // reader was already at the bottom.
-            let live = ui.get_scroll_y();
+            let live = ui.get_scroll_position();
             let stick = mine || ui.get_chat_at_bottom();
             // Route by the GUI-assigned circle_id → rail index. Always fold into
             // that circle's RAM state; refresh the transcript only when it's active.
@@ -3078,6 +3095,8 @@ fn main() {
     // the offscreen PNG shows the rename UI. Mirrors --show-about / --show-join.
     let show_rename = args.iter().any(|a| a == "--show-rename");
     let show_unread = args.iter().any(|a| a == "--show-unread");
+    let show_lobby_messages = args.iter().any(|a| a == "--show-lobby-messages");
+    let show_circle_sequence = args.iter().any(|a| a == "--show-circle-sequence");
     let show_tab_coherence = args.iter().any(|a| a == "--show-tab-coherence");
     // ISC-C62 proof: materialize a circle then apply a synthetic relay rendezvous so
     // the rail shows the relay-derived adj-noun label instead of the `#<hex>`
@@ -3129,6 +3148,8 @@ fn main() {
         || show_about
         || show_rename
         || show_unread
+        || show_lobby_messages
+        || show_circle_sequence
         || show_tab_coherence
         || show_joined_label
         || show_circle_detail
@@ -3620,6 +3641,87 @@ fn main() {
             // unfocused one carrying the dot.
             apply_view(&ui, st.current(), 0);
         }
+        if show_lobby_messages {
+            // Fixture: three Lobby messages, one of them our own, delivered through
+            // the real `NetEvent` path, and the same three into a circle when one
+            // materializes, so `--switch 1` renders the circle for comparison. Then
+            // the startup mask is dismissed, as its settle timer would.
+            let circle =
+                if materialize_and_select(&ui, &state, &net, "demo lobby comparison phrase") {
+                    state.borrow().active_circle_id()
+                } else {
+                    None
+                };
+            ui.invoke_switch_circle(LOBBY as i32);
+            let now = now_unix_ms();
+            for (who, text, mine, age_ms) in [
+                ("ally", "first message", false, 2_000),
+                ("me", "my own reply", true, 1_000),
+                ("ally", "third message", false, 0),
+            ] {
+                apply_net_event(
+                    &ui,
+                    &state,
+                    &browser,
+                    NetEvent::Message {
+                        who: who.into(),
+                        text: text.into(),
+                        mine,
+                        sent_unix_ms: now - age_ms,
+                    },
+                );
+                if let Some(circle_id) = circle {
+                    apply_net_event(
+                        &ui,
+                        &state,
+                        &browser,
+                        NetEvent::CircleMessage {
+                            circle_id,
+                            who: who.into(),
+                            text: format!("circle: {text}"),
+                            mine,
+                            sent_unix_ms: now - age_ms,
+                        },
+                    );
+                }
+            }
+            ui.set_startup_overlay_open(false);
+        }
+        if show_circle_sequence {
+            // Fixture: messages reach the active circle one after another through the
+            // real `NetEvent` path, with a render after the first (`<path>.1.png`) and
+            // after the third (`<path>.2.png`); the final render follows a switch to
+            // the Lobby and back.
+            let base = screenshot
+                .clone()
+                .unwrap_or_else(|| "daemonseed-gui.png".into());
+            if materialize_and_select(&ui, &state, &net, "demo circle sequence phrase") {
+                let circle_id = state.borrow().active_circle_id().unwrap_or_default();
+                ui.set_startup_overlay_open(false);
+                let now = now_unix_ms();
+                let deliver = |who: &str, text: &str, mine: bool, age_ms: i64| {
+                    apply_net_event(
+                        &ui,
+                        &state,
+                        &browser,
+                        NetEvent::CircleMessage {
+                            circle_id,
+                            who: who.into(),
+                            text: text.into(),
+                            mine,
+                            sent_unix_ms: now - age_ms,
+                        },
+                    );
+                };
+                deliver("ally", "first message", false, 3_000);
+                render_png(&window, &format!("{base}.1.png"));
+                deliver("me", "my own reply", true, 2_000);
+                deliver("ally", "third message", false, 1_000);
+                render_png(&window, &format!("{base}.2.png"));
+                ui.invoke_switch_circle(LOBBY as i32);
+                ui.invoke_switch_circle(1);
+            }
+        }
         if show_tab_coherence {
             // Tidiness proof: with the public Shares tab open, entering a circle from
             // the rail should land on "Circle shares" (tab 2), not the public tab.
@@ -3632,7 +3734,7 @@ fn main() {
             ui.invoke_switch_circle(n);
         }
         if let Some(s) = scroll {
-            ui.set_scroll_y(s);
+            request_scroll(&ui, s);
         }
     }
 
@@ -3836,6 +3938,1137 @@ mod tests {
         if let Err(panic) = joined {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// A request to pin the chat transcript to the bottom lands in bounds. Rust asks
+    /// with `STICK_BOTTOM`, far beyond any real content height, and the chat list
+    /// must clamp it to its last message and report that position back through
+    /// `scroll-y`; a list left at `STICK_BOTTOM` would sit far outside its content.
+    #[test]
+    fn a_stick_to_bottom_request_is_clamped_to_the_transcript() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            let msgs: Vec<state::Msg> = (0..3)
+                .map(|i| state::Msg {
+                    who: "ally".into(),
+                    text: format!("message {i}"),
+                    mine: false,
+                    sent_unix_ms: 1_700_000_000_000 + i,
+                    order_ms: 1_700_000_000_000 + i,
+                })
+                .collect();
+            ui.set_messages(messages_model(&msgs));
+            request_scroll(&ui, STICK_BOTTOM);
+            let mut buf = vec![Rgb565Pixel(0); (W * H) as usize];
+            for _ in 0..3 {
+                slint::platform::update_timers_and_animations();
+                window.draw_if_needed(|r| {
+                    r.render(&mut buf, W as usize);
+                });
+            }
+            // Three bubbles fit the window, so the bottom of the transcript is its top.
+            let y = ui.get_scroll_y();
+            assert_eq!(y, 0.0, "the chat list stayed at {y}, outside its content");
+        });
+    }
+
+    /// [`with_offscreen_window_of`] for the app as `main` builds it: the window,
+    /// its state and its wired callbacks, shown at the offscreen size.
+    fn with_built_ui(f: impl FnOnce(BuiltUi, Rc<MinimalSoftwareWindow>) + Send + 'static) {
+        let joined = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
+                let _ = slint::platform::set_platform(Box::new(GuiPlatform {
+                    window: window.clone(),
+                }));
+                let built = build_ui(None);
+                built.0.show().expect("show");
+                window.set_size(slint::PhysicalSize::new(W, H));
+                built.0.set_screen(SharedString::from("main"));
+                f(built, window);
+            })
+            .expect("spawn the window thread")
+            .join();
+        if let Err(panic) = joined {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Run timers and draw frames until the window's change handlers have settled.
+    fn settle(window: &Rc<MinimalSoftwareWindow>) {
+        let mut buf = vec![Rgb565Pixel(0); (W * H) as usize];
+        for _ in 0..4 {
+            slint::platform::update_timers_and_animations();
+            window.draw_if_needed(|r| {
+                r.render(&mut buf, W as usize);
+            });
+        }
+    }
+
+    /// `n` transcript rows, enough at 40 to be taller than the chat list.
+    fn transcript(n: i64) -> Vec<state::Msg> {
+        (0..n)
+            .map(|i| state::Msg {
+                who: "ally".into(),
+                text: format!("message {i}"),
+                mine: false,
+                sent_unix_ms: 1_700_000_000_000 + i,
+                order_ms: 1_700_000_000_000 + i,
+            })
+            .collect()
+    }
+
+    /// The list's position after a request for `y`, once it has settled.
+    fn request(ui: &AppWindow, window: &Rc<MinimalSoftwareWindow>, y: f32) -> f32 {
+        request_scroll(ui, y);
+        settle(window);
+        ui.get_scroll_y()
+    }
+
+    /// Asserts `y` is the list's true bottom: in bounds one pixel above it, and
+    /// clamped back to it one pixel below.
+    fn assert_true_bottom(ui: &AppWindow, window: &Rc<MinimalSoftwareWindow>, y: f32) {
+        assert!(
+            y < 0.0,
+            "a transcript taller than the list must scroll, not sit at {y}"
+        );
+        assert!(
+            (request(ui, window, y + 1.0) - (y + 1.0)).abs() < 0.5,
+            "one pixel above {y} must be in bounds"
+        );
+        assert!(
+            (request(ui, window, y - 1.0) - y).abs() < 0.5,
+            "one pixel below {y} must clamp back to it"
+        );
+    }
+
+    /// A stick-to-bottom request on a transcript taller than the list settles at
+    /// the true bottom, `-(content height - list height)`. Catches a clamp that
+    /// lands anywhere else, 0 included, which would show the top of a long
+    /// transcript instead of its newest messages.
+    #[test]
+    fn a_stick_to_bottom_request_on_an_overflowing_transcript_lands_at_the_true_bottom() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            ui.set_messages(messages_model(&transcript(40)));
+            settle(&window);
+            let y = request(&ui, &window, STICK_BOTTOM);
+            assert_true_bottom(&ui, &window, y);
+        });
+    }
+
+    /// After the list settles at the bottom, more messages arrive and the next
+    /// stick-to-bottom request settles at the new, lower bottom. Catches a list
+    /// that stays at the old bottom, or beyond the new one.
+    #[test]
+    fn a_second_stick_to_bottom_request_follows_the_transcript_down() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            ui.set_messages(messages_model(&transcript(40)));
+            settle(&window);
+            let first = request(&ui, &window, STICK_BOTTOM);
+            assert_true_bottom(&ui, &window, first);
+            ui.set_messages(messages_model(&transcript(50)));
+            settle(&window);
+            let second = request(&ui, &window, STICK_BOTTOM);
+            assert!(
+                second < first,
+                "the new bottom {second} must lie below {first}"
+            );
+            assert_true_bottom(&ui, &window, second);
+        });
+    }
+
+    /// A reader scrolled up stays where they are when a message arrives: the real
+    /// Lobby delivery path sees the list is not at the bottom and keeps the
+    /// position. Catches a delivery that yanks the reader to the bottom.
+    #[test]
+    fn a_message_arriving_while_scrolled_up_leaves_the_reader_in_place() {
+        with_built_ui(|(ui, state, _net, browser), window| {
+            for i in 0..40 {
+                apply_net_event(
+                    &ui,
+                    &state,
+                    &browser,
+                    NetEvent::Message {
+                        who: "ally".into(),
+                        text: format!("message {i}"),
+                        mine: false,
+                        sent_unix_ms: now_unix_ms() - 60_000 + i,
+                    },
+                );
+                settle(&window);
+            }
+            let bottom = request(&ui, &window, STICK_BOTTOM);
+            assert!(bottom < 0.0, "the Lobby transcript must overflow the list");
+            // Scroll up the way a reader does: a wheel over the list moves its
+            // content-y, which the list reports through scroll-y.
+            window.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(500.0, 300.0),
+                delta_x: 0.0,
+                delta_y: 200.0,
+            });
+            settle(&window);
+            let reading = ui.get_scroll_y();
+            assert!(
+                reading > bottom + 50.0,
+                "the wheel must have scrolled up from {bottom}"
+            );
+            assert!(
+                !ui.get_chat_at_bottom(),
+                "the reader is no longer at the bottom"
+            );
+            apply_net_event(
+                &ui,
+                &state,
+                &browser,
+                NetEvent::Message {
+                    who: "ally".into(),
+                    text: "a new message".into(),
+                    mine: false,
+                    sent_unix_ms: now_unix_ms(),
+                },
+            );
+            settle(&window);
+            let after = ui.get_scroll_y();
+            assert!(
+                (after - reading).abs() < 0.5,
+                "the reader at {reading} was moved to {after}"
+            );
+        });
+    }
+
+    /// A circle's position survives switching to another circle and back through
+    /// the real rail callback, and comes back in bounds. Catches a switch that
+    /// loses the position or restores one the list cannot show.
+    #[test]
+    fn a_circle_position_is_restored_after_switching_away_and_back() {
+        with_built_ui(|(ui, state, net, browser), window| {
+            let _ = daemonseed_core::oxi::initialize_module();
+            for i in 0..40 {
+                apply_net_event(
+                    &ui,
+                    &state,
+                    &browser,
+                    NetEvent::Message {
+                        who: "ally".into(),
+                        text: format!("message {i}"),
+                        mine: false,
+                        sent_unix_ms: now_unix_ms() - 60_000 + i,
+                    },
+                );
+                settle(&window);
+            }
+            assert!(
+                request(&ui, &window, STICK_BOTTOM) < 0.0,
+                "the Lobby transcript must overflow the list"
+            );
+            window.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(500.0, 300.0),
+                delta_x: 0.0,
+                delta_y: 200.0,
+            });
+            settle(&window);
+            let held = ui.get_scroll_y();
+            assert!(held < 0.0, "the Lobby must be scrolled into its transcript");
+            assert!(
+                materialize_and_select(&ui, &state, &net, "scroll restore test phrase"),
+                "a second circle to switch to"
+            );
+            settle(&window);
+            assert_eq!(ui.get_active(), 1, "the circle is on screen");
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            let restored = ui.get_scroll_y();
+            assert!(
+                (restored - held).abs() < 0.5,
+                "the Lobby left at {held} came back at {restored}"
+            );
+            assert!(
+                (request(&ui, &window, restored) - restored).abs() < 0.5,
+                "the restored position {restored} is in bounds"
+            );
+        });
+    }
+
+    /// `n` Lobby messages delivered one at a time through the real delivery path
+    /// from another member, the window settling after each.
+    fn deliver_to_lobby(built: &BuiltUi, window: &Rc<MinimalSoftwareWindow>, n: i64) {
+        let (ui, state, _net, browser) = built;
+        for i in 0..n {
+            apply_net_event(
+                ui,
+                state,
+                browser,
+                NetEvent::Message {
+                    who: "ally".into(),
+                    text: format!("message {i}"),
+                    mine: false,
+                    sent_unix_ms: now_unix_ms() - 60_000 + i,
+                },
+            );
+            settle(window);
+        }
+    }
+
+    /// A reader at the bottom of the Lobby follows it down as messages arrive one
+    /// by one, until the transcript is taller than the list. Catches a list that
+    /// stays at the top because each delivery's request was clamped against the
+    /// rows on screen before the new one was laid out.
+    #[test]
+    fn messages_delivered_to_a_reader_at_the_bottom_end_at_the_true_bottom() {
+        with_built_ui(|built, window| {
+            deliver_to_lobby(&built, &window, 40);
+            let y = built.0.get_scroll_y();
+            assert_true_bottom(&built.0, &window, y);
+        });
+    }
+
+    /// A stick-to-bottom request made together with a transcript taller than the
+    /// list, before its rows are laid out, still lands at the true bottom. Catches
+    /// a request clamped only against the rows already on screen.
+    #[test]
+    fn a_stick_to_bottom_request_made_with_its_transcript_lands_at_the_true_bottom() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            settle(&window);
+            ui.set_messages(messages_model(&transcript(40)));
+            request_scroll(&ui, STICK_BOTTOM);
+            settle(&window);
+            let y = ui.get_scroll_y();
+            assert_true_bottom(&ui, &window, y);
+        });
+    }
+
+    /// A list at the bottom that is given a longer transcript and a stick-to-bottom
+    /// request together lands at the new bottom.
+    #[test]
+    fn a_stick_to_bottom_request_made_with_a_longer_transcript_follows_it_down() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            ui.set_messages(messages_model(&transcript(40)));
+            settle(&window);
+            let first = request(&ui, &window, STICK_BOTTOM);
+            ui.set_messages(messages_model(&transcript(50)));
+            request_scroll(&ui, STICK_BOTTOM);
+            settle(&window);
+            let second = ui.get_scroll_y();
+            assert!(
+                second < first,
+                "the new bottom {second} must lie below {first}"
+            );
+            assert_true_bottom(&ui, &window, second);
+        });
+    }
+
+    /// A list at the bottom whose transcript grows with no scroll request, as when
+    /// the age captions are refreshed, stays at the bottom. Catches a list that
+    /// follows the transcript only when asked to. The request is made together with
+    /// its transcript, so it has landed on those rows before the transcript grows.
+    #[test]
+    fn a_transcript_that_grows_without_a_request_keeps_the_list_at_the_bottom() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            settle(&window);
+            ui.set_messages(messages_model(&transcript(40)));
+            request_scroll(&ui, STICK_BOTTOM);
+            settle(&window);
+            let first = ui.get_scroll_y();
+            ui.set_messages(messages_model(&transcript(50)));
+            settle(&window);
+            let second = ui.get_scroll_y();
+            assert!(
+                second < first,
+                "the list stayed at {second}, above the new bottom"
+            );
+            assert_true_bottom(&ui, &window, second);
+        });
+    }
+
+    /// A request equal to the previous one still moves the list. The reader scrolls
+    /// up between two stick-to-bottom requests, and the second brings the list back
+    /// down. Catches a request that only takes effect when its value changes.
+    #[test]
+    fn a_repeated_stick_to_bottom_request_is_not_dropped() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            ui.set_messages(messages_model(&transcript(40)));
+            settle(&window);
+            let bottom = request(&ui, &window, STICK_BOTTOM);
+            assert!(bottom < 0.0, "the transcript must overflow the list");
+            window.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(500.0, 300.0),
+                delta_x: 0.0,
+                delta_y: 200.0,
+            });
+            settle(&window);
+            assert!(
+                ui.get_scroll_y() > bottom + 50.0,
+                "the wheel must have scrolled up from {bottom}"
+            );
+            let again = request(&ui, &window, STICK_BOTTOM);
+            assert!(
+                (again - bottom).abs() < 0.5,
+                "the second request left the list at {again}, not {bottom}"
+            );
+        });
+    }
+
+    /// A reader who scrolls up and then back down to the bottom follows the next
+    /// message down, and keeps following the transcript as it grows. Catches a list
+    /// that forgets it is at the bottom once the reader has scrolled away from it.
+    #[test]
+    fn a_reader_back_at_the_bottom_follows_the_next_message() {
+        with_built_ui(|built, window| {
+            deliver_to_lobby(&built, &window, 40);
+            let ui = &built.0;
+            let bottom = request(ui, &window, STICK_BOTTOM);
+            assert!(bottom < 0.0, "the Lobby transcript must overflow the list");
+            for delta_y in [200.0, -400.0] {
+                window.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                    position: slint::LogicalPosition::new(500.0, 300.0),
+                    delta_x: 0.0,
+                    delta_y,
+                });
+                settle(&window);
+            }
+            assert!(
+                ui.get_chat_at_bottom(),
+                "the wheel must have brought the reader back to the bottom"
+            );
+            apply_net_event(
+                ui,
+                &built.1,
+                &built.3,
+                NetEvent::Message {
+                    who: "ally".into(),
+                    text: "a new message".into(),
+                    mine: false,
+                    sent_unix_ms: now_unix_ms(),
+                },
+            );
+            settle(&window);
+            let after = ui.get_scroll_y();
+            assert!(
+                after < bottom,
+                "the reader at the bottom {bottom} stayed at {after}"
+            );
+            // The transcript grows again with no request, as an age refresh does.
+            ui.set_messages(messages_model(&transcript(60)));
+            settle(&window);
+            let grown = ui.get_scroll_y();
+            assert!(grown < after, "the reader at {after} stayed at {grown}");
+            assert_true_bottom(ui, &window, grown);
+        });
+    }
+
+    /// A circle left at the top of its transcript is shown at the top again after
+    /// switching to a circle the reader scrolled, even though the two requests made
+    /// on switching back are equal. Catches a request that only takes effect when
+    /// its value changes, which would show the circle at the other one's offset.
+    #[test]
+    fn a_circle_left_at_the_top_is_shown_at_the_top_again() {
+        with_built_ui(|(ui, state, net, browser), window| {
+            let _ = daemonseed_core::oxi::initialize_module();
+            assert!(
+                materialize_and_select(&ui, &state, &net, "scroll top test phrase"),
+                "a second circle to switch to"
+            );
+            settle(&window);
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            let built = (ui, state, net, browser);
+            deliver_to_lobby(&built, &window, 40);
+            let (ui, state, _net, _browser) = built;
+            for i in 0..40 {
+                let _ = state.borrow_mut().push_message(
+                    1,
+                    "ally".into(),
+                    format!("circle message {i}"),
+                    false,
+                    now_unix_ms() - 60_000 + i,
+                );
+            }
+            assert_eq!(request(&ui, &window, 0.0), 0.0, "the Lobby is at its top");
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            assert_eq!(ui.get_active(), 1, "the circle is on screen");
+            window.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                position: slint::LogicalPosition::new(500.0, 300.0),
+                delta_x: 0.0,
+                delta_y: -200.0,
+            });
+            settle(&window);
+            let scrolled = ui.get_scroll_y();
+            assert!(scrolled < -50.0, "the wheel must have scrolled the circle");
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert_eq!(shown, 0.0, "the Lobby left at 0 came back at {shown}");
+        });
+    }
+
+    /// Once a request has landed, more frames leave the list where it is and in
+    /// bounds. The request is made together with a longer transcript, from a
+    /// position away from both bottoms. Catches the list's reported position being
+    /// read back as the request, which keeps the bottom of the shorter transcript.
+    #[test]
+    fn a_settled_request_stays_where_it_landed() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            ui.set_messages(messages_model(&transcript(40)));
+            settle(&window);
+            let held = request(&ui, &window, -300.0);
+            assert!(
+                (held + 300.0).abs() < 0.5,
+                "the list must hold -300, not {held}"
+            );
+            ui.set_messages(messages_model(&transcript(50)));
+            request_scroll(&ui, STICK_BOTTOM);
+            settle(&window);
+            let landed = ui.get_scroll_y();
+            for _ in 0..3 {
+                settle(&window);
+                let now = ui.get_scroll_y();
+                assert_eq!(now, landed, "the list moved from {landed} to {now}");
+            }
+            assert_true_bottom(&ui, &window, landed);
+        });
+    }
+
+    /// A mouse wheel over the chat list, `delta_y` positive to scroll up.
+    fn wheel(window: &Rc<MinimalSoftwareWindow>, delta_y: f32) {
+        window.dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+            position: slint::LogicalPosition::new(500.0, 300.0),
+            delta_x: 0.0,
+            delta_y,
+        });
+    }
+
+    /// A reader scrolled up in the Lobby who leaves the Chat tab and comes back is
+    /// shown the same position, and a request made while the tab was closed is
+    /// taken when it reopens. Catches a rebuilt list that replays the last request
+    /// over the reader's position, and one that ignores a request it missed.
+    #[test]
+    fn the_chat_tab_reopens_where_the_reader_left_it() {
+        with_built_ui(|built, window| {
+            deliver_to_lobby(&built, &window, 40);
+            let ui = &built.0;
+            wheel(&window, 200.0);
+            settle(&window);
+            let reading = ui.get_scroll_y();
+            assert!(
+                reading < 0.0 && !ui.get_chat_at_bottom(),
+                "the reader must be scrolled up into the transcript, not at {reading}"
+            );
+            ui.set_active_tab(1);
+            settle(&window);
+            ui.set_active_tab(0);
+            settle(&window);
+            let back = ui.get_scroll_y();
+            assert!(
+                (back - reading).abs() < 0.5,
+                "the reader left at {reading} came back at {back}"
+            );
+            ui.set_active_tab(1);
+            settle(&window);
+            request_scroll(ui, -300.0);
+            settle(&window);
+            ui.set_active_tab(0);
+            settle(&window);
+            let taken = ui.get_scroll_y();
+            assert!(
+                (taken + 300.0).abs() < 0.5,
+                "a request for -300 made while the tab was closed came back at {taken}"
+            );
+        });
+    }
+
+    /// A transcript replaced by one of the same height, together with a request for
+    /// a saved position, lands on that position and keeps it, and a message arriving
+    /// after the reader scrolls away from it leaves the reader where they are.
+    /// Catches a request that takes effect only when the content height changes.
+    #[test]
+    fn a_position_is_restored_on_a_transcript_of_the_same_height() {
+        with_built_ui(|built, window| {
+            deliver_to_lobby(&built, &window, 40);
+            let (ui, state, _net, browser) = &built;
+            let bottom = request(ui, &window, STICK_BOTTOM);
+            assert!(
+                bottom < -300.0,
+                "the Lobby transcript must overflow the list"
+            );
+            {
+                let mut st = state.borrow_mut();
+                st.set_scroll(LOBBY, -300.0);
+                apply_view(ui, st.current(), LOBBY as i32);
+            }
+            settle(&window);
+            let restored = ui.get_scroll_y();
+            assert_eq!(
+                restored, -300.0,
+                "the Lobby restored to -300 came back at {restored}"
+            );
+            for _ in 0..3 {
+                settle(&window);
+                let now = ui.get_scroll_y();
+                assert_eq!(now, restored, "the list moved from {restored} to {now}");
+            }
+            wheel(&window, 100.0);
+            settle(&window);
+            let reading = ui.get_scroll_y();
+            assert!(
+                reading > restored + 50.0,
+                "the wheel must have scrolled up from {restored}"
+            );
+            apply_net_event(
+                ui,
+                state,
+                browser,
+                NetEvent::Message {
+                    who: "ally".into(),
+                    text: "a new message".into(),
+                    mine: false,
+                    sent_unix_ms: now_unix_ms(),
+                },
+            );
+            settle(&window);
+            let after = ui.get_scroll_y();
+            assert!(
+                (after - reading).abs() < 0.5,
+                "the reader at {reading} was moved to {after}"
+            );
+        });
+    }
+
+    /// A saved position below the bottom of a shorter transcript is restored as
+    /// that transcript's bottom, in bounds.
+    #[test]
+    fn a_saved_position_beyond_a_shorter_transcript_is_restored_in_bounds() {
+        with_built_ui(|(ui, state, net, browser), window| {
+            let _ = daemonseed_core::oxi::initialize_module();
+            assert!(
+                materialize_and_select(&ui, &state, &net, "scroll out of range phrase"),
+                "a second circle to switch to"
+            );
+            settle(&window);
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            let built = (ui, state, net, browser);
+            deliver_to_lobby(&built, &window, 60);
+            let (ui, state, _net, _browser) = built;
+            for i in 0..30 {
+                let _ = state.borrow_mut().push_message(
+                    1,
+                    "ally".into(),
+                    format!("circle message {i}"),
+                    false,
+                    now_unix_ms() - 60_000 + i,
+                );
+            }
+            let lobby_bottom = request(&ui, &window, STICK_BOTTOM);
+            state.borrow_mut().set_scroll(1, lobby_bottom);
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                shown > lobby_bottom,
+                "the circle was left at {shown}, below its own transcript"
+            );
+            assert_true_bottom(&ui, &window, shown);
+        });
+    }
+
+    /// The reader's wheel overrides a request still waiting for its rows. A request
+    /// that does not change the content height stays waiting; the reader then
+    /// scrolls, and the transcript grows with no request, as an age refresh does.
+    /// The list stays where the reader put it. Catches a waiting request that is
+    /// applied again over the reader's own scrolling.
+    #[test]
+    fn the_wheel_overrides_a_request_waiting_for_its_rows() {
+        with_offscreen_window_of(RepaintBufferType::NewBuffer, |ui, window| {
+            ui.show().expect("show");
+            window.set_size(slint::PhysicalSize::new(W, H));
+            ui.set_screen(SharedString::from("main"));
+            ui.set_messages(messages_model(&transcript(40)));
+            settle(&window);
+            let held = request(&ui, &window, -300.0);
+            assert_eq!(held, -300.0, "the list must hold -300");
+            wheel(&window, 100.0);
+            settle(&window);
+            let reading = ui.get_scroll_y();
+            assert!(
+                reading > held + 50.0,
+                "the wheel must have scrolled up from {held}"
+            );
+            ui.set_messages(messages_model(&transcript(50)));
+            settle(&window);
+            let after = ui.get_scroll_y();
+            assert!(
+                (after - reading).abs() < 0.5,
+                "the reader at {reading} was moved to {after}"
+            );
+        });
+    }
+
+    /// Builds a Lobby and a second circle, each with a transcript taller than the
+    /// list, and scrolls the reader to a different position in each. Returns the
+    /// Lobby's position and the circle's, with the circle on screen.
+    fn two_scrolled_circles(built: &BuiltUi, window: &Rc<MinimalSoftwareWindow>) -> (f32, f32) {
+        let (ui, state, net, _browser) = built;
+        let _ = daemonseed_core::oxi::initialize_module();
+        assert!(
+            materialize_and_select(ui, state, net, "scroll two circles phrase"),
+            "a second circle to switch to"
+        );
+        settle(window);
+        ui.invoke_switch_circle(LOBBY as i32);
+        settle(window);
+        for i in 0..40 {
+            let _ = state.borrow_mut().push_message(
+                1,
+                "ally".into(),
+                format!("circle message {i}"),
+                false,
+                now_unix_ms() - 60_000 + i,
+            );
+        }
+        deliver_to_lobby(built, window, 40);
+        wheel(window, 200.0);
+        settle(window);
+        let lobby = ui.get_scroll_y();
+        assert!(
+            lobby < 0.0 && !ui.get_chat_at_bottom(),
+            "the Lobby reader must be scrolled up into the transcript, not at {lobby}"
+        );
+        ui.invoke_switch_circle(1);
+        settle(window);
+        assert_eq!(ui.get_scroll_y(), 0.0, "the circle opens at its saved top");
+        wheel(window, -200.0);
+        settle(window);
+        let circle = ui.get_scroll_y();
+        assert!(circle < -50.0, "the wheel must have scrolled the circle");
+        assert!(
+            (circle - lobby).abs() > 50.0,
+            "the two positions must differ to tell them apart"
+        );
+        (lobby, circle)
+    }
+
+    /// Switching circles while the Shares tab is open keeps each circle's own
+    /// position: Lobby to circle and back with the chat list closed, then the Chat
+    /// tab reopens on the Lobby. Catches a switch that saves the closed list's last
+    /// reported position as the circle's own.
+    #[test]
+    fn switching_circles_with_the_shares_tab_open_keeps_each_position() {
+        with_built_ui(|built, window| {
+            let (lobby, circle) = two_scrolled_circles(&built, &window);
+            let ui = &built.0;
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            ui.set_active_tab(1);
+            settle(&window);
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            ui.set_active_tab(0);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - lobby).abs() < 0.5,
+                "the Lobby left at {lobby} came back at {shown}"
+            );
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - circle).abs() < 0.5,
+                "the circle left at {circle} came back at {shown}"
+            );
+        });
+    }
+
+    /// A trip through the Direct messages section keeps each circle's own position:
+    /// with the Shares tab open the reader goes from the Lobby to the circle, opens
+    /// Direct messages, and comes back through the Chats header. Catches leaving
+    /// the circle's chat pane saving the closed list's last reported position, the
+    /// Lobby's, as the circle's own.
+    #[test]
+    fn a_trip_through_direct_messages_keeps_each_position() {
+        with_built_ui(|built, window| {
+            let (lobby, circle) = two_scrolled_circles(&built, &window);
+            let ui = &built.0;
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            ui.set_active_tab(1);
+            settle(&window);
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            ui.invoke_open_section(1);
+            settle(&window);
+            ui.invoke_open_section(0);
+            settle(&window);
+            assert_eq!(
+                ui.get_active(),
+                LOBBY as i32,
+                "the Chats header opens the Lobby"
+            );
+            ui.set_active_tab(0);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - lobby).abs() < 0.5,
+                "the Lobby left at {lobby} came back at {shown}"
+            );
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - circle).abs() < 0.5,
+                "the circle left at {circle} came back at {shown}"
+            );
+        });
+    }
+
+    /// Opening the Chats header from a circle's chat pane, after reaching the
+    /// circle with the Shares tab open, keeps the circle's own position. Catches
+    /// the header saving the closed list's last reported position, the Lobby's,
+    /// as the circle's own.
+    #[test]
+    fn the_chats_header_from_a_circle_keeps_its_position() {
+        with_built_ui(|built, window| {
+            let (lobby, circle) = two_scrolled_circles(&built, &window);
+            let ui = &built.0;
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            ui.set_active_tab(1);
+            settle(&window);
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            ui.invoke_open_section(0);
+            settle(&window);
+            assert_eq!(
+                ui.get_active(),
+                LOBBY as i32,
+                "the Chats header opens the Lobby"
+            );
+            ui.set_active_tab(0);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - lobby).abs() < 0.5,
+                "the Lobby left at {lobby} came back at {shown}"
+            );
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - circle).abs() < 0.5,
+                "the circle left at {circle} came back at {shown}"
+            );
+        });
+    }
+
+    /// A circle message that arrives while the Chat tab is closed, after a switch
+    /// to a circle the reader left scrolled up, holds that circle's position.
+    /// Catches the delivery saving the closed list's last reported position, which
+    /// is the Lobby's, as the circle's own.
+    #[test]
+    fn a_circle_message_with_the_chat_tab_closed_holds_a_reader_scrolled_up() {
+        with_built_ui(|built, window| {
+            let (_lobby, circle) = two_scrolled_circles(&built, &window);
+            let (ui, state, _net, browser) = &built;
+            let circle_id = state.borrow().active_circle_id().expect("a circle id");
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            let bottom = request(ui, &window, STICK_BOTTOM);
+            assert!(ui.get_chat_at_bottom(), "the Lobby reader is at {bottom}");
+            ui.set_active_tab(1);
+            settle(&window);
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            apply_net_event(
+                ui,
+                state,
+                browser,
+                NetEvent::CircleMessage {
+                    circle_id,
+                    who: "ally".into(),
+                    text: "a new message".into(),
+                    mine: false,
+                    sent_unix_ms: now_unix_ms(),
+                },
+            );
+            settle(&window);
+            ui.set_active_tab(0);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - circle).abs() < 0.5,
+                "the circle reader at {circle} was moved to {shown}"
+            );
+        });
+    }
+
+    /// A circle message that arrives in the same turn as the switch to a circle the
+    /// reader left scrolled up, with the Lobby at its bottom, holds the circle's
+    /// position. Catches an at-bottom test that judges the Lobby's last reported
+    /// position instead of the circle's requested one.
+    #[test]
+    fn a_circle_message_in_the_turn_of_a_switch_holds_a_reader_scrolled_up() {
+        with_built_ui(|built, window| {
+            let (_lobby, circle) = two_scrolled_circles(&built, &window);
+            let (ui, state, _net, browser) = &built;
+            let circle_id = state.borrow().active_circle_id().expect("a circle id");
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            let bottom = request(ui, &window, STICK_BOTTOM);
+            assert!(ui.get_chat_at_bottom(), "the Lobby reader is at {bottom}");
+            ui.invoke_switch_circle(1);
+            apply_net_event(
+                ui,
+                state,
+                browser,
+                NetEvent::CircleMessage {
+                    circle_id,
+                    who: "ally".into(),
+                    text: "a new message".into(),
+                    mine: false,
+                    sent_unix_ms: now_unix_ms(),
+                },
+            );
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - circle).abs() < 0.5,
+                "the circle reader at {circle} was moved to {shown}"
+            );
+        });
+    }
+
+    /// Two switches in one turn, circle to Lobby and back with no frame between,
+    /// leave each circle its own position. Catches the second switch saving the
+    /// position the list reported before the first.
+    #[test]
+    fn two_switches_in_one_turn_keep_each_position() {
+        with_built_ui(|built, window| {
+            let (lobby, circle) = two_scrolled_circles(&built, &window);
+            let ui = &built.0;
+            ui.invoke_switch_circle(LOBBY as i32);
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - circle).abs() < 0.5,
+                "the circle left at {circle} came back at {shown}"
+            );
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert!(
+                (shown - lobby).abs() < 0.5,
+                "the Lobby left at {lobby} came back at {shown}"
+            );
+        });
+    }
+
+    /// A circle whose saved position is the top of a long transcript, opened while
+    /// the Shares tab is up and then shown on the Chat tab, stays at the top when
+    /// its transcript grows with no request, as the age-caption refresh does.
+    /// Catches a rebuilt list that still counts itself at the bottom.
+    #[test]
+    fn a_reopened_list_at_the_top_stays_there_as_the_transcript_grows() {
+        with_built_ui(|built, window| {
+            let _ = daemonseed_core::oxi::initialize_module();
+            let (ui, state, net, _browser) = &built;
+            assert!(
+                materialize_and_select(ui, state, net, "scroll reopen top phrase"),
+                "a second circle to switch to"
+            );
+            settle(&window);
+            ui.invoke_switch_circle(LOBBY as i32);
+            settle(&window);
+            for i in 0..40 {
+                let _ = state.borrow_mut().push_message(
+                    1,
+                    "ally".into(),
+                    format!("circle message {i}"),
+                    false,
+                    now_unix_ms() - 60_000 + i,
+                );
+            }
+            deliver_to_lobby(&built, &window, 40);
+            ui.set_active_tab(1);
+            settle(&window);
+            ui.invoke_switch_circle(1);
+            settle(&window);
+            ui.set_active_tab(0);
+            settle(&window);
+            assert_eq!(ui.get_scroll_y(), 0.0, "the circle opens at its saved top");
+            for i in 40..50 {
+                let _ = state.borrow_mut().push_message(
+                    1,
+                    "ally".into(),
+                    format!("circle message {i}"),
+                    false,
+                    now_unix_ms() - 60_000 + i,
+                );
+            }
+            ui.set_messages(messages_model(&state.borrow().current().messages));
+            settle(&window);
+            let shown = ui.get_scroll_y();
+            assert_eq!(shown, 0.0, "the reader at the top was moved to {shown}");
+        });
+    }
+
+    /// A circle message through the real delivery path follows a reader at the
+    /// bottom and holds a reader who has scrolled up. Catches a circle delivery
+    /// that always holds the position, or always pins to the bottom.
+    #[test]
+    fn a_circle_message_follows_a_reader_at_the_bottom_and_holds_one_scrolled_up() {
+        with_built_ui(|(ui, state, net, browser), window| {
+            let _ = daemonseed_core::oxi::initialize_module();
+            assert!(
+                materialize_and_select(&ui, &state, &net, "scroll circle message phrase"),
+                "a circle to deliver to"
+            );
+            settle(&window);
+            let circle_id = state.borrow().active_circle_id().expect("a circle id");
+            let deliver = |text: String, sent_unix_ms: i64| {
+                apply_net_event(
+                    &ui,
+                    &state,
+                    &browser,
+                    NetEvent::CircleMessage {
+                        circle_id,
+                        who: "ally".into(),
+                        text,
+                        mine: false,
+                        sent_unix_ms,
+                    },
+                );
+            };
+            for i in 0..40 {
+                deliver(format!("circle message {i}"), now_unix_ms() - 60_000 + i);
+                settle(&window);
+            }
+            let bottom = ui.get_scroll_y();
+            assert_true_bottom(&ui, &window, bottom);
+            wheel(&window, 200.0);
+            settle(&window);
+            let reading = ui.get_scroll_y();
+            assert!(
+                reading > bottom + 50.0,
+                "the wheel must have scrolled up from {bottom}"
+            );
+            deliver("a new message".into(), now_unix_ms());
+            settle(&window);
+            let after = ui.get_scroll_y();
+            assert!(
+                (after - reading).abs() < 0.5,
+                "the reader at {reading} was moved to {after}"
+            );
+        });
+    }
+
+    /// Two Lobby messages delivered in one turn, with no frame between, to a reader
+    /// at the bottom leave the list at the new true bottom.
+    #[test]
+    fn two_messages_in_one_turn_keep_a_reader_at_the_bottom() {
+        with_built_ui(|built, window| {
+            deliver_to_lobby(&built, &window, 40);
+            let (ui, state, _net, browser) = &built;
+            let before = ui.get_scroll_y();
+            for text in ["one more", "and another"] {
+                apply_net_event(
+                    ui,
+                    state,
+                    browser,
+                    NetEvent::Message {
+                        who: "ally".into(),
+                        text: text.into(),
+                        mine: false,
+                        sent_unix_ms: now_unix_ms(),
+                    },
+                );
+            }
+            settle(&window);
+            use slint::Model as _;
+            let rows = ui.get_messages();
+            let texts: Vec<String> = (0..rows.row_count())
+                .filter_map(|i| rows.row_data(i))
+                .map(|m| m.text.to_string())
+                .collect();
+            assert_eq!(texts.len(), 42, "both messages must be in the transcript");
+            assert_eq!(
+                texts[40..],
+                ["one more".to_owned(), "and another".to_owned()],
+                "the last two rows must be the two messages"
+            );
+            let after = ui.get_scroll_y();
+            assert!(
+                after < before,
+                "the list stayed at {after}, above the new bottom"
+            );
+            assert_true_bottom(ui, &window, after);
+        });
+    }
+
+    /// A reader scrolled up who sends a message, with an incoming one arriving in
+    /// the same turn, ends at the true bottom: the own message pins the list, and
+    /// the incoming one sees that pin rather than the position before it.
+    #[test]
+    fn an_own_message_then_an_incoming_one_in_one_turn_end_at_the_bottom() {
+        with_built_ui(|built, window| {
+            deliver_to_lobby(&built, &window, 40);
+            let (ui, state, _net, browser) = &built;
+            let bottom = ui.get_scroll_y();
+            wheel(&window, 200.0);
+            settle(&window);
+            let reading = ui.get_scroll_y();
+            assert!(
+                reading > bottom + 50.0 && !ui.get_chat_at_bottom(),
+                "the wheel must have scrolled up from {bottom}"
+            );
+            for (who, text, mine) in [("me", "my reply", true), ("ally", "an answer", false)] {
+                apply_net_event(
+                    ui,
+                    state,
+                    browser,
+                    NetEvent::Message {
+                        who: who.into(),
+                        text: text.into(),
+                        mine,
+                        sent_unix_ms: now_unix_ms(),
+                    },
+                );
+            }
+            settle(&window);
+            let after = ui.get_scroll_y();
+            assert!(
+                after < bottom,
+                "the list stayed at {after}, above the new bottom"
+            );
+            assert_true_bottom(ui, &window, after);
+        });
     }
 
     /// The window's preferred size defaults to the setup and unlock screens' size,

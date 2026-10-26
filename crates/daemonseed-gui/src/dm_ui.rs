@@ -327,7 +327,7 @@ fn keep_live_chat(ui: &AppWindow, st: &mut GuiState) {
     if st.main_pane() == MainPane::Chat {
         let active = st.active();
         st.set_draft(active, ui.get_draft().to_string());
-        st.set_scroll(active, ui.get_scroll_y());
+        st.set_scroll(active, ui.get_scroll_position());
     }
 }
 
@@ -403,7 +403,7 @@ pub fn wire_dm(ui: &AppWindow, state: &Rc<RefCell<GuiState>>) {
             match section_from_code(code) {
                 RailSection::Chats => {
                     let live_draft = ui.get_draft().to_string();
-                    let live_scroll = ui.get_scroll_y();
+                    let live_scroll = ui.get_scroll_position();
                     st.open_rail_section(RailSection::Chats, live_draft, live_scroll);
                     let refresh_public_shares = refresh_active_room(&ui, &st);
                     drop(st);

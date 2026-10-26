@@ -733,7 +733,23 @@ export component AppWindow inherits Window {
     in property <string> download-label;
     in property <float> download-progress: 0.0;
     in-out property <string> draft;           // live composer text, read by Rust on switch
-    in-out property <length> scroll-y: 0px;   // Flickable content-y (negative when scrolled)
+    // Chat transcript position. Rust asks for a content-y with `scroll-request` and
+    // bumps `scroll-request-seq` for every request, so a repeated equal request
+    // still takes effect. The list clamps the request to its content and reports
+    // where it actually is through `scroll-y` (negative when scrolled down).
+    in property <length> scroll-request: 0px;
+    in property <int> scroll-request-seq: 0;
+    out property <length> scroll-y: 0px;
+    // The last `scroll-request-seq` the chat list has taken. The list is rebuilt when
+    // the Chat tab reopens: it then takes a request made while it was gone, and
+    // otherwise returns to the position it reported last.
+    property <int> scroll-request-taken: 0;
+    // The position the chat list is at or about to take: a request the list has not
+    // taken yet (the Chat tab is closed, or the list has not yet processed it), and
+    // otherwise the reported `scroll-y`. Rust saves a circle's position and decides
+    // stick-to-bottom from this, not from `scroll-y`.
+    out property <length> scroll-position:
+        root.scroll-request-taken != root.scroll-request-seq ? root.scroll-request : root.scroll-y;
     // #84/#86: the chat transcript's real laid-out content height, pushed up from inside
     // the chat Flickable. Bubbles are variable-height since #86, so a fixed per-message
     // stride no longer measures the content; 0px until the chat tab first instantiates.
@@ -743,7 +759,7 @@ export component AppWindow inherits Window {
     // `chat-area` is the always-present content wrapper (its height == the chat
     // Flickable's visible height).
     out property <bool> chat-at-bottom:
-        root.scroll-y <= -(root.chat-content-h - chat-area.height) + 24px;
+        root.scroll-position <= -(root.chat-content-h - chat-area.height) + 24px;
     in-out property <bool> sheet-open: false;
     // #36 circle-detail name vectors, set from `GuiState` for the active circle (both
     // blank for the Lobby, which has no net contract → the vector rows hide):
@@ -1308,9 +1324,68 @@ export component AppWindow inherits Window {
                                 // not a fixed per-message stride. Mirrored into root.chat-content-h
                                 // so the #84 at-bottom test can use it (root can't see into this `if`).
                                 content-height: chat-content.preferred-height;
-                                content-y <=> root.scroll-y;
+                                // content-y has no binding: the list writes it only from
+                                // the functions and change handlers below, and the user's
+                                // wheel or drag moves it. A request can arrive before the
+                                // rows of a new transcript are laid out, so it is clamped now
+                                // against the old content and kept `pending` until the
+                                // content height changes, when it is clamped again against
+                                // the new rows. `stick` records whether the list is within
+                                // 24px of its bottom. It is consulted when no request is
+                                // pending, so a transcript that grows with no request (a
+                                // refreshed age caption) keeps a reader at the bottom there.
+                                property <int> request-seq: root.scroll-request-seq;
+                                property <length> target: 0px;
+                                property <length> applied-y: 0px;
+                                property <bool> pending: false;
+                                property <bool> stick: true;
+                                // Move the list to `y` and report it at once, without
+                                // waiting for `changed content-y`, which does not fire
+                                // when `y` equals the current content-y.
+                                function land(y: length) {
+                                    self.applied-y = y;
+                                    self.content-y = y;
+                                    self.stick = y <= min(0px, self.height - self.content-height) + 24px;
+                                    root.scroll-y = y;
+                                }
+                                function apply() {
+                                    self.land(max(min(0px, self.height - self.content-height), min(0px, self.target)));
+                                }
+                                function take-request() {
+                                    self.target = root.scroll-request;
+                                    root.scroll-request-taken = root.scroll-request-seq;
+                                    self.pending = true;
+                                    self.apply();
+                                }
+                                changed request-seq => { self.take-request(); }
+                                changed content-height => {
+                                    if (self.pending) {
+                                        self.pending = false;
+                                        self.apply();
+                                    } else if (self.stick) {
+                                        self.land(min(0px, self.height - self.content-height));
+                                    }
+                                }
+                                changed content-y => {
+                                    self.stick = self.content-y <= min(0px, self.height - self.content-height) + 24px;
+                                    if (self.content-y != self.applied-y) {
+                                        // The user moved the list, which overrides a request
+                                        // still waiting for its rows.
+                                        self.pending = false;
+                                    }
+                                    root.scroll-y = self.content-y;
+                                }
                                 property <length> content-h: chat-content.preferred-height;
-                                init => { root.chat-content-h = self.content-h; }
+                                init => {
+                                    if (root.scroll-request-taken != root.scroll-request-seq) {
+                                        self.take-request();
+                                    } else {
+                                        self.target = root.scroll-y;
+                                        self.pending = true;
+                                        self.apply();
+                                    }
+                                    root.chat-content-h = self.content-h;
+                                }
                                 changed content-h => { root.chat-content-h = self.content-h; }
                                 chat-content := VerticalLayout {
                                     padding: 16px; spacing: 8px;
