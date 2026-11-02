@@ -818,11 +818,87 @@ fn list_gate_steps(group: Option<GateGroup>) {
     }
 }
 
+/// The file name the `oxicrypt` crate's build script looks for in `OXICRYPT_LIB_DIR`
+/// on Linux.
+const OXICRYPT_LIB: &str = "liboxicrypt_ffi.so";
+
+/// Whether `dir` holds the oxicrypt shared library the `oxicrypt` crate links: a
+/// non-empty regular file (or a link to one) under the name the build script reads.
+fn oxicrypt_lib_present(dir: &Path) -> bool {
+    fs::metadata(dir.join(OXICRYPT_LIB)).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
+/// Whether the gate may fetch the library into `dir`: only under `target/oxicrypt-ffi/`,
+/// where `.cargo/config.toml` points `OXICRYPT_LIB_DIR` by default. A directory set by
+/// an override belongs to whoever set it, and the gate does not unpack into it. A
+/// path with a `..` component is refused, since it can lead out of that directory.
+fn oxicrypt_fetch_allowed(repo: &Path, dir: &Path) -> bool {
+    dir.is_absolute()
+        && !dir
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        && dir.starts_with(repo.join("target").join("oxicrypt-ffi"))
+}
+
+/// Make sure the signed oxicrypt shared library is in `OXICRYPT_LIB_DIR`, fetching it
+/// with `scripts/fetch-oxicrypt-ffi.sh` (which checks the pinned sha256) when it is
+/// not. Every compiling gate step needs the library, and without it each one fails
+/// only after building every dependency. `.cargo/config.toml` sets the variable, as an
+/// absolute path, for any program cargo runs, `cargo xtask` included. The script
+/// fetches the x86_64 Linux library only, so on other hosts the check is skipped and
+/// the build script reports a missing library itself.
+fn ensure_oxicrypt_lib(repo: &Path) -> Result<()> {
+    if !(cfg!(target_os = "linux") && cfg!(target_arch = "x86_64")) {
+        return Ok(());
+    }
+    let dir = match std::env::var_os("OXICRYPT_LIB_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => bail!(
+            "gate: OXICRYPT_LIB_DIR is not set; run the gate as `cargo xtask gate`, which takes it from .cargo/config.toml"
+        ),
+    };
+    if oxicrypt_lib_present(&dir) {
+        return Ok(());
+    }
+    if !oxicrypt_fetch_allowed(repo, &dir) {
+        bail!(
+            "gate: OXICRYPT_LIB_DIR is {}, which holds no {OXICRYPT_LIB}; the gate fetches the library only into target/oxicrypt-ffi/, so put it there or unset the override",
+            dir.display()
+        );
+    }
+    println!(
+        "gate: {OXICRYPT_LIB} is not in {}; fetching it with scripts/fetch-oxicrypt-ffi.sh …",
+        dir.display()
+    );
+    let status = Command::new("bash")
+        .arg(repo.join("scripts/fetch-oxicrypt-ffi.sh"))
+        .arg("linux-x86_64")
+        .arg(&dir)
+        .current_dir(repo)
+        .stdout(Stdio::null())
+        .status()
+        .context("gate: could not run scripts/fetch-oxicrypt-ffi.sh")?;
+    if !status.success() {
+        bail!(
+            "gate: scripts/fetch-oxicrypt-ffi.sh failed ({status}); the gate needs {OXICRYPT_LIB} in {}. The script downloads the pinned release, so it needs network access; its own error is printed above, and it can be rerun by hand.",
+            dir.display()
+        );
+    }
+    if !oxicrypt_lib_present(&dir) {
+        bail!(
+            "gate: scripts/fetch-oxicrypt-ffi.sh succeeded but {OXICRYPT_LIB} is still not in {}",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Run the gate — every group, or only `group` — and exit non-zero naming any red
 /// step. With no group this is the full Definition-of-Done gate, which
 /// `release-gate` runs (#62).
 fn run_gate(group: Option<GateGroup>) -> Result<()> {
     let repo = workspace_root_from_xtask()?;
+    ensure_oxicrypt_lib(&repo)?;
     let cargo = cargo_bin();
     let steps = RELEASE_GATE_STEPS
         .iter()
@@ -873,6 +949,45 @@ fn run_gate(group: Option<GateGroup>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_oxicrypt_library_is_found_only_as_a_non_empty_file_by_its_linked_name() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        assert!(!oxicrypt_lib_present(dir.path()));
+        fs::write(dir.path().join("liboxicrypt_ffi.a"), b"archive")
+            .expect("write the static archive");
+        assert!(!oxicrypt_lib_present(dir.path()));
+        fs::write(dir.path().join(OXICRYPT_LIB), b"").expect("write an empty library");
+        assert!(!oxicrypt_lib_present(dir.path()));
+        fs::write(dir.path().join(OXICRYPT_LIB), b"\x7fELF").expect("write the shared library");
+        assert!(oxicrypt_lib_present(dir.path()));
+        assert!(!oxicrypt_lib_present(&dir.path().join("absent")));
+        let as_dir = tempfile::tempdir().expect("a temp dir");
+        fs::create_dir(as_dir.path().join(OXICRYPT_LIB))
+            .expect("a directory under the library's name");
+        assert!(!oxicrypt_lib_present(as_dir.path()));
+    }
+
+    #[test]
+    fn the_gate_fetches_only_into_target_oxicrypt_ffi() {
+        let repo = Path::new("/work/daemonseed");
+        let default = repo.join("target/oxicrypt-ffi/v0.26.0/linux-x86_64");
+        assert!(oxicrypt_fetch_allowed(repo, &default));
+        assert!(!oxicrypt_fetch_allowed(
+            repo,
+            Path::new("/opt/oxicrypt/lib")
+        ));
+        assert!(!oxicrypt_fetch_allowed(repo, repo));
+        assert!(!oxicrypt_fetch_allowed(repo, &repo.join("target")));
+        assert!(!oxicrypt_fetch_allowed(
+            repo,
+            &repo.join("target/oxicrypt-ffi/../../custom-lib")
+        ));
+        assert!(!oxicrypt_fetch_allowed(
+            repo,
+            Path::new("target/oxicrypt-ffi/v0.26.0/linux-x86_64")
+        ));
+    }
 
     #[test]
     fn green_only_when_every_step_passes() {
