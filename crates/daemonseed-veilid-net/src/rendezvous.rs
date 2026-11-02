@@ -412,7 +412,7 @@ pub async fn open_or_create(
     let open1 = gated_bounded_open(
         gate,
         "open_or_create",
-        rc.open_dht_record(key.clone(), Some(owner.clone())),
+        rc.open_dht_record(key.clone(), Some(owner.clone()), None),
     )
     .await;
     // Only a genuine absence justifies creating. Every other error — `Timeout`,
@@ -455,7 +455,7 @@ pub async fn open_or_create(
     let r = gated_bounded_open(
         gate,
         "open_or_create reopen",
-        rc.open_dht_record(key.clone(), Some(owner.clone())),
+        rc.open_dht_record(key.clone(), Some(owner.clone()), None),
     )
     .await
     .map(|_| handle)
@@ -523,7 +523,7 @@ pub async fn open_only(
     let opened = gated_bounded_open(
         gate,
         "open_only",
-        rc.open_dht_record(key, Some(owner.clone())),
+        rc.open_dht_record(key, Some(owner.clone()), None),
     )
     .await;
     open_outcome("open_only", opened, handle)
@@ -599,7 +599,8 @@ pub async fn open_read_only(
     // the call, taken at raw-call granularity inside `gated_bounded_open`. This
     // function issues no gated GET, so the single-permit rule (CRSH-ISC-17) is
     // respected.
-    let opened = gated_bounded_open(gate, "open_read_only", rc.open_dht_record(key, None)).await;
+    let opened =
+        gated_bounded_open(gate, "open_read_only", rc.open_dht_record(key, None, None)).await;
     open_outcome("open_read_only", opened, handle)
 }
 
@@ -937,6 +938,7 @@ fn write_options(owner: &KeyPair) -> SetDHTValueOptions {
     SetDHTValueOptions {
         writer: Some(owner.clone()),
         allow_offline: None,
+        min_seqnum: None,
     }
 }
 

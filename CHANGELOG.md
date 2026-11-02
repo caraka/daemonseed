@@ -39,6 +39,7 @@ work lives in the maintainer's own planning notes, not here.
 - `daemonseed-core`: `oxi::initialize_module` initialises the oxicrypt library; crypto errors are `oxicrypt::Error` (re-exported as `oxi::Error`); `kdf` functions return `oxicrypt::Error`.
 - `daemonseed-core`: `SignKeypair::secret_key` returns `&MlDsa87SecretKey` and `KemKeypair::decapsulation_key` returns `&MlKem1024DecapsulationKey`, oxicrypt's self-zeroing types.
 - CI: every gate group fetches the oxicrypt library through `scripts/fetch-oxicrypt-ffi.sh`, which checks a pinned sha256.
+- `daemonseed-veilid-net`: veilid-core 0.5.7 → 0.5.8.
 
 ### Removed
 

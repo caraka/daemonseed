@@ -84,20 +84,20 @@ pub(crate) enum VeilidFailure {
     Refused,
 }
 
-/// Every variant of `VeilidAPIError` (`veilid-core-0.5.7
-/// src/veilid_api/error.rs:128-216`), classed once, here.
+/// Every variant of `VeilidAPIError` (`veilid-core-0.5.8
+/// src/veilid_api/types/error.rs:132-220`), classed once, here.
 ///
 /// Local: the API not attached or already attached, shutting down, a feature
 /// this build lacks, an argument that would not parse, was rejected or was
 /// missing, and a transaction handle already completed
-/// (`src/veilid_api/dht_transaction.rs:74`). None of these can have reached the
+/// (`src/veilid_api/dht_transaction.rs:59, 69, 103`). None of these can have reached the
 /// network. Refused: retry later, an unreachable target, no connection, a record
 /// this node does not hold, Veilid's generic error, and an internal failure,
 /// which Veilid also raises after a fanout has run
-/// (`src/storage_manager/inspect_record.rs:249,649`,
-/// `src/storage_manager/open_record.rs:266`,
-/// `src/rpc_processor/fanout/fanout_call.rs:365`,
-/// `src/rpc_processor/fanout/fanout_queue.rs:274`). The match names every
+/// (`src/storage_manager/inspect_record.rs:379, 850`,
+/// `src/storage_manager/open_record.rs:147, 232, 244, 307`,
+/// `src/rpc_processor/fanout/fanout_call.rs:775`,
+/// `src/rpc_processor/fanout/fanout_queue.rs:332`). The match names every
 /// variant, so a variant a later Veilid adds does not compile until it is
 /// classed.
 pub(crate) fn veilid_failure(error: &veilid_core::VeilidAPIError) -> VeilidFailure {
@@ -249,7 +249,7 @@ mod tests {
             .all(|e| e.fetch_class() != FetchErrorClass::Local));
     }
 
-    /// Every variant of veilid-core 0.5.7's `VeilidAPIError` is classed as the
+    /// Every variant of veilid-core 0.5.8's `VeilidAPIError` is classed as the
     /// source says it can have failed: out of time, before it left this node, or
     /// refused by the network. The class reaches the error the call reports.
     #[test]
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(
             table.len(),
             15,
-            "one row per variant of veilid-core 0.5.7's VeilidAPIError"
+            "one row per variant of veilid-core 0.5.8's VeilidAPIError"
         );
         for (error, expected) in table {
             let shown = error.to_string();

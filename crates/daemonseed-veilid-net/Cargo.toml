@@ -22,7 +22,7 @@ test-support = []
 [dependencies]
 # D4: join the PUBLIC Veilid network (no network_key_password). Private routes
 # (the proven path) need no footgun feature.
-veilid-core = { version = "0.5.7", default-features = false, features = ["default-tokio"] }
+veilid-core = { version = "0.5.8", default-features = false, features = ["default-tokio"] }
 
 # D3 identity binding: VeilidNodeSeed lives in daemonseed-core (keys.rs).
 # In-tree sibling crate (this crate is workspace-excluded, so a plain path dep).
@@ -60,4 +60,8 @@ daemonseed-proto = { path = "../daemonseed-proto" }
 # Per-test scratch directories for the direct-messaging runner's tests and oracles.
 # Already a workspace dependency and a dev-dep of five sibling crates.
 tempfile = { workspace = true }
+# Builds `veilid_core::ValueData` in unit tests through its serde form, since
+# veilid-core keeps its constructors crate-private. Already in the dependency
+# tree through veilid-core.
+serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }

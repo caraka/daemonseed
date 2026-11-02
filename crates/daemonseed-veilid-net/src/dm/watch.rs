@@ -251,6 +251,7 @@ pub(crate) fn claim(
 pub(crate) mod tests {
     use super::*;
 
+    use base64::Engine as _;
     use veilid_core::{
         BareOpaqueRecordKey, BarePublicKey, BareRecordKey, PublicKey, ValueData,
         ValueSubkeyRangeSet, CRYPTO_KIND_VLD0,
@@ -277,12 +278,15 @@ pub(crate) mod tests {
             subkeys,
             count,
             value: value.map(|bytes| {
-                ValueData::new_with_seq(
-                    7.into(),
-                    bytes.to_vec(),
-                    PublicKey::new(CRYPTO_KIND_VLD0, BarePublicKey::new(&[9; 32])),
-                )
-                .expect("a value")
+                // veilid-core 0.5.8 keeps the `ValueData` constructors
+                // crate-private, so a test builds one through its serde form.
+                let writer = PublicKey::new(CRYPTO_KIND_VLD0, BarePublicKey::new(&[9; 32]));
+                let json = serde_json::json!({
+                    "seq": 7,
+                    "data": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+                    "writer": writer.to_string(),
+                });
+                serde_json::from_value::<ValueData>(json).expect("a value")
             }),
         })
     }

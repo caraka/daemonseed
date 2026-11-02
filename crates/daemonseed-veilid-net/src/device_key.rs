@@ -17,10 +17,65 @@
 //! keeps is in them.
 
 use std::path::Path;
+use std::time::Duration;
 
 use veilid_core::{api_startup, VeilidAPI, VeilidAPIError, VeilidAPIResult, VeilidConfig};
 
-/// The message `veilid-core` 0.5.7's table store fails its startup with when
+/// How long a start keeps retrying while a store lock is held. `veilid-core`
+/// 0.5.8 locks the protected-store keyring file and the table-store namespace
+/// for the life of a node, and releases the keyring lock on a background task
+/// after `shutdown` returns (`protected_store/mod.rs`, `terminate_async`). A
+/// start right after a shutdown in the same process can find it still held.
+const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// The pause between starts while a store lock is held.
+const STORE_LOCK_RETRY: Duration = Duration::from_millis(200);
+
+/// Whether a startup failure is a store lock another node holds: the
+/// protected-store keyring (`keyring-manager`, `insecure.rs`) or the table-store
+/// namespace lock (`veilid-core` 0.5.8 `table_store/native.rs`).
+fn is_store_lock(error: &VeilidAPIError) -> bool {
+    let message = error.to_string();
+    message.contains("File is already locked")
+        || message.contains("another veilid instance is using table store namespace")
+}
+
+/// `api_startup`, started again while it fails on a held store lock, until
+/// `wait` has passed. The deadline is checked after each start, so the last
+/// start can begin up to [`STORE_LOCK_RETRY`] after it. Any other result, and
+/// the lock failure once `wait` has passed, is returned.
+async fn start_waiting_for_locks(
+    update_callback: veilid_core::UpdateCallback,
+    config: VeilidConfig,
+    wait: Duration,
+) -> VeilidAPIResult<VeilidAPI> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut held = 0u32;
+    loop {
+        match api_startup(update_callback.clone(), config.clone()).await {
+            Err(error) if is_store_lock(&error) && tokio::time::Instant::now() < deadline => {
+                held += 1;
+                tokio::time::sleep(STORE_LOCK_RETRY).await;
+            }
+            started => {
+                if held > 0 {
+                    crate::vtrace!(
+                        "start: a store lock was held for {held} start(s); \
+                         the last start {}",
+                        if started.is_ok() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        }
+                    );
+                }
+                return started;
+            }
+        }
+    }
+}
+
+/// The message `veilid-core` 0.5.8's table store fails its startup with when
 /// the stored device encryption key was stored without a password and a
 /// password is configured (`table_store/mod.rs`,
 /// `maybe_unprotect_device_encryption_key`): the key has the length of an
@@ -32,8 +87,10 @@ const UNPROTECTED_KEY: &str = "password protected device encryption key is not v
 /// reports that inner error, [`VeilidAPIError::Generic`], rather than the
 /// context the table store wraps it in. A table that does not decrypt fails
 /// with an AEAD error too, which is why a match is confirmed before anything
-/// is removed.
-const WRONG_PASSWORD: &str = "aead::Error";
+/// is removed. The text is the `Display` of the AEAD error in
+/// `veilid-core-optimized` (`error.rs`), the crate `veilid-core` 0.5.8 runs its
+/// ciphers through.
+const WRONG_PASSWORD: &str = "aead error";
 
 /// Whether a startup failure has the shape of the table store refusing the
 /// stored device encryption key under the configured password.
@@ -105,7 +162,7 @@ pub(crate) async fn startup_protected(
     update_callback: veilid_core::UpdateCallback,
     config: VeilidConfig,
 ) -> VeilidAPIResult<VeilidAPI> {
-    match api_startup(update_callback.clone(), config.clone()).await {
+    match start_waiting_for_locks(update_callback.clone(), config.clone(), STORE_LOCK_WAIT).await {
         Err(error)
             if refuses_device_key(&error)
                 && key_refused_without_tables(update_callback.clone(), &config).await =>
@@ -116,7 +173,7 @@ pub(crate) async fn startup_protected(
                 "start: the stored device key does not open under this password; \
                  cleared {removed} storage entr(ies) of this namespace and starting again"
             );
-            api_startup(update_callback, config).await
+            start_waiting_for_locks(update_callback, config, STORE_LOCK_WAIT).await
         }
         started => started,
     }
@@ -125,7 +182,9 @@ pub(crate) async fn startup_protected(
 /// Whether the stored device encryption key is refused under `config`'s
 /// password when no table is read: a start over the same protected store and a
 /// fresh, empty table directory, removed afterwards. That start runs the same
-/// key check, and a refusal from it can only be the key's.
+/// key check, and a refusal from it can only be the key's. It does not wait on
+/// a held store lock: a lock held here means another node has the store open,
+/// and nothing is removed from under it.
 async fn key_refused_without_tables(
     update_callback: veilid_core::UpdateCallback,
     config: &VeilidConfig,
@@ -183,6 +242,116 @@ mod tests {
         let api = start.await?;
         api.shutdown().await;
         Ok(())
+    }
+
+    /// The protected-store keyring file of `config`, opened for locking.
+    fn keyring_file(config: &VeilidConfig) -> std::fs::File {
+        let path = Path::new(&config.protected_store.directory)
+            .join(format!("insecure_keyring_{}", config.namespace));
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("the keyring file a first start wrote")
+    }
+
+    /// Lock `file` once the node that held it has released it, within 5 s.
+    async fn lock_when_released(file: &std::fs::File) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while file.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the previous node released the keyring lock"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Both store-lock messages are recognised, and other failures are not.
+    #[test]
+    fn only_a_held_store_lock_is_waited_on() {
+        assert!(is_store_lock(&VeilidAPIError::generic(
+            "failed to create insecure keyring: Keyring IO error: File is already locked"
+        )));
+        assert!(is_store_lock(&VeilidAPIError::generic(
+            "another veilid instance is using table store namespace 'x' (\"/d\")"
+        )));
+        assert!(!is_store_lock(&VeilidAPIError::generic("aead error")));
+        assert!(!is_store_lock(&VeilidAPIError::internal("something else")));
+    }
+
+    /// A start that finds the keyring locked starts again once the lock is
+    /// released, within the wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_waits_for_a_keyring_lock_to_be_released() {
+        let tmp = tempfile::tempdir().expect("a directory");
+        let cfg = config(tmp.path(), "dk-lock-released", "a password");
+        start_and_stop(api_startup(quiet(), cfg.clone()))
+            .await
+            .expect("the first start writes the keyring");
+        let holder = keyring_file(&cfg);
+        lock_when_released(&holder).await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            drop(holder);
+        });
+        let started = std::time::Instant::now();
+        start_and_stop(start_waiting_for_locks(
+            quiet(),
+            cfg,
+            Duration::from_secs(5),
+        ))
+        .await
+        .expect("the start succeeds once the lock is released");
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(700),
+            "the start waited for the lock: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(4),
+            "the start began soon after the release: {took:?}"
+        );
+        release.await.expect("the holder task ends");
+    }
+
+    /// The production start, [`startup_protected`], waits for a held keyring
+    /// lock to be released rather than failing on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_protected_start_waits_for_a_keyring_lock_to_be_released() {
+        let tmp = tempfile::tempdir().expect("a directory");
+        let cfg = config(tmp.path(), "dk-lock-protected", "a password");
+        start_and_stop(api_startup(quiet(), cfg.clone()))
+            .await
+            .expect("the first start writes the keyring");
+        let holder = keyring_file(&cfg);
+        lock_when_released(&holder).await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            drop(holder);
+        });
+        start_and_stop(startup_protected(quiet(), cfg))
+            .await
+            .expect("the protected start succeeds once the lock is released");
+        release.await.expect("the holder task ends");
+    }
+
+    /// A lock held past the wait is reported as the lock failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lock_held_past_the_wait_is_reported() {
+        let tmp = tempfile::tempdir().expect("a directory");
+        let cfg = config(tmp.path(), "dk-lock-held", "a password");
+        start_and_stop(api_startup(quiet(), cfg.clone()))
+            .await
+            .expect("the first start writes the keyring");
+        let holder = keyring_file(&cfg);
+        lock_when_released(&holder).await;
+        let failed = match start_waiting_for_locks(quiet(), cfg, Duration::from_millis(600)).await {
+            Ok(_) => panic!("a start succeeded while the keyring lock was held"),
+            Err(error) => error,
+        };
+        assert!(is_store_lock(&failed), "{failed:?}");
+        drop(holder);
     }
 
     /// Storage created under a password does not open without it or under
